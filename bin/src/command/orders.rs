@@ -398,6 +398,16 @@ impl CommandServer {
       return;
     }
 
+    // the worker might be loading a large state, so we must wait for it to finish
+    // before we tell the old worker to stop listening, otherwise the sockets
+    // present in the accept queue might timeout
+    worker.channel.set_blocking(true);
+    worker.channel.write_message(&ProxyRequest { id: String::from(message_id), order: ProxyRequestData::Status });
+    debug!("requested status from new worker");
+    let message = worker.channel.read_message();
+    debug!("new worker returned: {:?}", message);
+    worker.channel.set_blocking(false);
+
     let mut listeners = None;
     {
       let old_worker = self.workers.values_mut().filter(|worker| worker.id == id).next().unwrap();

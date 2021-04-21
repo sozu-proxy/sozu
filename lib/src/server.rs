@@ -145,7 +145,7 @@ pub struct Server {
 }
 
 impl Server {
-  pub fn new_from_config(channel: ProxyChannel, scm: ScmSocket, config: Config, config_state: ConfigState) -> Self {
+  pub fn new_from_config(channel: ProxyChannel, scm: ScmSocket, config: Config, config_state: ConfigState, expects_initial_status: bool) -> Self {
     let event_loop  = Poll::new().expect("could not create event loop");
     let pool = Rc::new(RefCell::new(Pool::with_capacity(2*config.max_buffers, config.buffer_size)));
     let backends = Rc::new(RefCell::new(BackendMap::new()));
@@ -173,7 +173,8 @@ impl Server {
     let https = HttpsProvider::new(use_openssl, pool.clone(), backends.clone());
 
     let server_config = ServerConfig::from_config(&config);
-    Server::new(event_loop, channel, scm, sessions, pool, backends, None, Some(https), None, server_config, Some(config_state))
+    Server::new(event_loop, channel, scm, sessions, pool, backends, None,
+                Some(https), None, server_config, Some(config_state), expects_initial_status)
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
@@ -184,7 +185,8 @@ impl Server {
     https: Option<HttpsProvider>,
     tcp:  Option<tcp::Proxy>,
     server_config: ServerConfig,
-    config_state: Option<ConfigState>) -> Self {
+    config_state: Option<ConfigState>,
+    expects_initial_status: bool) -> Self {
 
     FEATURES.with(|features| {
       // initializing feature flags
@@ -255,6 +257,16 @@ impl Server {
       QUEUE.with(|queue| {
         (*queue.borrow_mut()).clear();
       });
+    }
+
+    if expects_initial_status {
+        // the main process sends a Status message, so we can notify it
+        // when the initial state is loaded
+        server.channel.set_nonblocking(false);
+        let msg = server.channel.read_message();
+        debug!("got message: {:?}", msg);
+        server.channel.write_message(&ProxyResponse{ id: msg.unwrap().id, status: ProxyResponseStatus::Ok, data: None});
+        server.channel.set_nonblocking(true);
     }
 
     info!("will try to receive listeners");

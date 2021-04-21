@@ -1838,7 +1838,8 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
       let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
       let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-        sessions, pool, backends, None, Some(HttpsProvider::Openssl(configuration)), None, server_config, None);
+        sessions, pool, backends, None, Some(HttpsProvider::Openssl(configuration)),
+        None, server_config, None, false);
 
       info!("starting event loop");
       server.run();

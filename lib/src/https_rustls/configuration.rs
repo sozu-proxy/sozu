@@ -767,8 +767,9 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
       let (scm_server, _scm_client) = UnixStream::pair().unwrap();
       let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
-      let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      sessions, pool, backends, None, Some(HttpsProvider::Rustls(configuration)), None, server_config, None);
+      let mut server  = Server::new(event_loop, channel,ScmSocket::new(scm_server.as_raw_fd()),
+          sessions, pool, backends, None, Some(HttpsProvider::Rustls(configuration)),
+          None, server_config, None, false);
 
       info!("starting event loop");
       server.run();

@@ -33,7 +33,7 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
-use sozu_command::proxy::{ProxyRequest,ProxyResponse};
+use sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyRequestData};
 use sozu::server::Server;
 use sozu::metrics;
 
@@ -52,7 +52,11 @@ pub fn start_workers(executable_path: String, config: &Config) -> nix::Result<Ve
     });
     match start_worker_process(&index.to_string(), config, executable_path.clone(), &state, listeners) {
       Ok((pid, command, scm)) => {
-        let w =  Worker::new(index as u32, pid, command, scm, config);
+        let mut w =  Worker::new(index as u32, pid, command, scm, config);
+        // the new worker expects a status message at startup
+        w.channel.set_blocking(true);
+        w.channel.write_message(&ProxyRequest { id: format!("start-status-{}", index), order: ProxyRequestData::Status });
+        w.channel.set_nonblocking(true);
         workers.push(w);
       },
       Err(e) => return Err(e)
@@ -105,7 +109,7 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
     metrics::setup(&metrics.address, worker_id, metrics.tagged_metrics, metrics.prefix.clone());
   }
 
-  let mut server = Server::new_from_config(command, ScmSocket::new(scm), worker_config, config_state);
+  let mut server = Server::new_from_config(command, ScmSocket::new(scm), worker_config, config_state, true);
 
   info!("starting event loop");
   server.run();

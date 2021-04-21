@@ -18,7 +18,7 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::command::{self,CommandRequest,CommandResponse,CommandResponseData,CommandStatus,RunState};
-use sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyResponseData};
+use sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyRequestData,ProxyResponseData};
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 
 pub mod executor;
@@ -623,6 +623,12 @@ impl CommandServer {
           Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
           PollOpt::edge()).unwrap();
         worker.token = Some(Token(worker_token));
+
+        // the new worker expects a status message at startup
+        worker.channel.set_blocking(true);
+        worker.channel.write_message(&ProxyRequest { id: format!("RESTART-{}-STATUS", id), order: ProxyRequestData::Status });
+        worker.channel.set_nonblocking(true);
+
         self.workers.insert(Token(worker_token), worker);
 
       }

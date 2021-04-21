@@ -1116,7 +1116,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   let mut server_config: server::ServerConfig = Default::default();
   server_config.max_connections = max_buffers;
   let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), sessions,
-    pool, backends, None ,None, Some(configuration), server_config, None);
+    pool, backends, None ,None, Some(configuration), server_config, None, false);
 
   info!("starting event loop");
   server.run();
@@ -1292,7 +1292,8 @@ mod tests {
       let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
       let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.into_raw_fd()),
-        sessions, pool, backends, None, None, Some(configuration), server_config, None);
+        sessions, pool, backends, None, None, Some(configuration), server_config, None,
+        false);
       info!("will run");
       s.run();
       info!("ending event loop");
