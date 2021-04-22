@@ -14,15 +14,15 @@ Sōzu configuration process involves 3 major sources of parameters:
 
 ### Global parameters
 
-Parameters in the global section allow you to define the global settings shared by the master and workers (like the log level):
+Parameters in the global section allow you to define the global settings shared by the main process and workers (like the log level):
 
 * `command_socket` path to the unix socket command (see sozuctl for more information)
 * `saved_state` path from which sozu tries to load its state at startup
 * `log_level` possible values are: `debug, trace, error, warn, info`
 * `log_target` possible values are: `stdout, tcp or udp address`
 * `log_access_target` possible values are: `stdout, tcp or udp address` (if activated, sends access logs to a separate target)
-* `command_buffer_size` size of the buffer used by the master to process commands.
-* `max_command_buffer_size` maximum size of the buffer used by the master to process commands.
+* `command_buffer_size` size of the buffer used by the main process to handle commands.
+* `max_command_buffer_size` maximum size of the buffer used by the main process to handle commands.
 * `worker_count` number of workers
 * `worker_automatic_restart` if activated, workers that panicked or crashed are restarted (activated by default)
 * `handle_process_affinity` bind workers to cpu cores.
@@ -143,7 +143,7 @@ backends  = [
 
 ## Metrics
 
-Sōzu reports its own state to another network component through a `UDP` socket. The master and the workers are responsible to send their states. We implement the [statsd](https://github.com/b/statsd_spec) protocol to send the statistics.
+Sōzu reports its own state to another network component through a `UDP` socket. The main process and the workers are responsible to send their states. We implement the [statsd](https://github.com/b/statsd_spec) protocol to send the statistics.
 Any service that understands the `statsd` protocol can then gather metrics from Sōzu.
 
 ### Configure

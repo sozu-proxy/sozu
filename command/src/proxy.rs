@@ -44,7 +44,7 @@ pub enum ProxyResponseData {
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 pub struct AggregatedMetricsData {
-  pub master: BTreeMap<String, FilteredData>,
+  pub main: BTreeMap<String, FilteredData>,
   pub workers: BTreeMap<String, MetricsData>,
 }
 

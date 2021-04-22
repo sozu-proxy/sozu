@@ -58,7 +58,7 @@ worker_automatic_restart = true
 
 # indicates if worker process will be pinned on a core. If you activate this, be sure
 # that you do not have more workers than CPU cores (and leave at least one core for
-# the kernel and the master process)
+# the kernel and the main process)
 handle_process_affinity = false
 
 # maximum number of connections to a worker. If it reached that number and
@@ -85,7 +85,7 @@ buffer_size = 16384
 # Defaults to 1000 milliseconds
 #ctl_command_timeout = 1000
 
-# PID file is a file containing the PID of the master process of sozu.
+# PID file is a file containing the PID of the main process of sozu.
 # It can be helpful to help systemd or any other service system to keep track
 # of the main process across upgrades. PID file is not created unless this option
 # is set or if SOZU_PID_FILE_PATH environment variable was defined at build time.

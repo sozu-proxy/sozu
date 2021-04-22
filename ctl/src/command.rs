@@ -265,7 +265,7 @@ pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
   );
 }
 
-pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
+pub fn upgrade_main(mut channel: Channel<CommandRequest,CommandResponse>,
                   config: &Config) {
   println!("Preparing to upgrade proxy...");
 
@@ -307,18 +307,18 @@ pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
             table.printstd();
             println!("");
 
-            let id = generate_tagged_id("UPGRADE-MASTER");
+            let id = generate_tagged_id("UPGRADE-MAIN");
             channel.write_message(&CommandRequest::new(
               id.clone(),
-              CommandRequestData::UpgradeMaster,
+              CommandRequestData::UpgradeMain,
               None,
             ));
-            println!("Upgrading master process");
+            println!("Upgrading main process");
 
             loop {
               match channel.read_message() {
                 None          => {
-                  eprintln!("Error: the proxy didn't start master upgrade");
+                  eprintln!("Error: the proxy didn't start main upgrade");
                   exit(1);
                 },
                 Some(message) => {
@@ -329,11 +329,11 @@ pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
                   match message.status {
                     CommandStatus::Processing => {},
                     CommandStatus::Error => {
-                      eprintln!("Error: failed to upgrade the master: {}", message.message);
+                      eprintln!("Error: failed to upgrade the main: {}", message.message);
                       exit(1);
                     },
                     CommandStatus::Ok => {
-                      println!("Master process upgrade succeeded: {}", message.message);
+                      println!("Main process upgrade succeeded: {}", message.message);
                       break;
                     },
                   }
@@ -341,8 +341,8 @@ pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
               }
             }
 
-            // Reconnect to the new master
-            println!("Reconnecting to new master process...");
+            // Reconnect to the new main
+            println!("Reconnecting to new main process...");
             let mut channel = create_channel(&config).expect("could not reconnect to the command unix socket");
 
             // Do a rolling restart of the workers
@@ -607,22 +607,22 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                   return;
                 }
 
-                let mut master_table = Table::new();
-                master_table.add_row(row![String::from("Master process")]);
-                master_table.add_row(row![String::from("key"), String::from("Count"), String::from("Gauge")]);
+                let mut main_table = Table::new();
+                main_table.add_row(row![String::from("Main process")]);
+                main_table.add_row(row![String::from("key"), String::from("Count"), String::from("Gauge")]);
 
-                for (ref key, ref value) in data.master.iter() {
+                for (ref key, ref value) in data.main.iter() {
                   match value {
-                    FilteredData::Count(c) => {master_table.add_row(row![key.to_string(), c, String::new()]);},
-                    FilteredData::Gauge(c) => { master_table.add_row(row![key.to_string(), String::new(), c]);},
+                    FilteredData::Count(c) => {main_table.add_row(row![key.to_string(), c, String::new()]);},
+                    FilteredData::Gauge(c) => { main_table.add_row(row![key.to_string(), String::new(), c]);},
                     r => {
                       println!("unexpected metric: {:?}", r);
-                      master_table.add_row(row![key.to_string(), String::new(), String::new()]);
+                      main_table.add_row(row![key.to_string(), String::new(), String::new()]);
                     }
                   }
                 }
 
-                master_table.printstd();
+                main_table.printstd();
 
                 println!("\nworker metrics:\n");
 

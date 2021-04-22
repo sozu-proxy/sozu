@@ -62,8 +62,8 @@ fn main() {
 
   // Init parsing of arguments
   let matches = cli::init();
-  // Check if we are upgrading workers or master
-  let upgrade = cli::upgrade_worker(&matches).or_else(|| cli::upgrade_master(&matches));
+  // Check if we are upgrading workers or main
+  let upgrade = cli::upgrade_worker(&matches).or_else(|| cli::upgrade_main(&matches));
 
   // If we are not, then we want to start sozu
   if upgrade == None {
@@ -92,7 +92,7 @@ fn main() {
     });
 
     match start {
-      Ok(_) => info!("master process stopped"), // Ok() is only called when the proxy exits
+      Ok(_) => info!("main process stopped"), // Ok() is only called when the proxy exits
       Err(StartupError::ConfigurationFileNotSpecified) => {
         error!("Configuration file hasn't been specified. Either use -c with the start command \
                or use the SOZU_CONFIG environment variable when building sozu.");
@@ -145,7 +145,7 @@ fn load_configuration(config_file: &str) -> Result<Config, StartupError> {
 }
 
 /// Set workers process affinity, see man sched_setaffinity
-/// Bind each worker (including the master) process to a CPU core.
+/// Bind each worker (including the main) process to a CPU core.
 /// Can bind multiple processes to a CPU core if there are more processes
 /// than CPU cores. Only works on Linux.
 #[cfg(target_os = "linux")]
@@ -153,15 +153,15 @@ fn set_workers_affinity(workers: &Vec<Worker>) {
   let mut cpu_count = 0;
   let max_cpu = num_cpus::get();
 
-  // +1 for the master process that will also be bound to its CPU core
+  // +1 for the main process that will also be bound to its CPU core
   if (workers.len() + 1) > max_cpu {
     warn!("There are more workers than available CPU cores, \
           multiple workers will be bound to the same CPU core. \
           This may impact performances");
   }
 
-  let master_pid = unsafe { libc::getpid() };
-  set_process_affinity(master_pid, cpu_count);
+  let main_pid = unsafe { libc::getpid() };
+  set_process_affinity(main_pid, cpu_count);
   cpu_count = cpu_count + 1;
 
   for ref worker in workers {
@@ -176,7 +176,7 @@ fn set_workers_affinity(workers: &Vec<Worker>) {
 }
 
 /// Set workers process affinity, see man sched_setaffinity
-/// Bind each worker (including the master) process to a CPU core.
+/// Bind each worker (including the main) process to a CPU core.
 /// Can bind multiple processes to a CPU core if there are more processes
 /// than CPU cores. Only works on Linux.
 #[cfg(not(target_os = "linux"))]

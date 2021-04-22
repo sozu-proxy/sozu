@@ -46,7 +46,7 @@ pub enum MessageStatus {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StateChange {
   StopWorker(Token),
-  StopMaster,
+  StopMain,
 }
 
 impl Runner {
@@ -113,9 +113,9 @@ impl Executor {
     queue.push_back(StateChange::StopWorker(worker));
   }
 
-  pub fn stop_master() {
+  pub fn stop_main() {
     let mut queue = EXECUTOR.state_queue.lock().unwrap();
-    queue.push_back(StateChange::StopMaster);
+    queue.push_back(StateChange::StopMain);
   }
 
   pub fn get_state_change() -> Option<StateChange> {

@@ -356,7 +356,7 @@ impl CommandServer {
         StateChange::StopWorker(token) => {
           self.workers.get_mut(&token).map(|w| w.run_state = RunState::Stopped);
         },
-        StateChange::StopMaster => {
+        StateChange::StopMain => {
           self.must_stop = true;
         }
       }

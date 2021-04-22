@@ -2,9 +2,9 @@
 
 This part is mostly for people who want to understand how sōzu works.
 
-## Master/worker model
+## Main/worker model
 
-Sōzu works with one master process and multiple worker processes. This allows it to keep running if a worker encounters an issue and crashes, and upgrading workers one by one when necessary.
+Sōzu works with one main process and multiple worker processes. This allows it to keep running if a worker encounters an issue and crashes, and upgrading workers one by one when necessary.
 
 ### Single thread, shared nothing architecture
 
@@ -13,12 +13,12 @@ All of the listening TCP sockets are opened with the [SO_REUSEPORT](https://lwn.
 
 ### Configuration
 
-External tools interact with the master process through a unix socket, and configuration change messages will be dispatched to the workers by the master.
+External tools interact with the main process through a unix socket, and configuration change messages will be dispatched to the workers by the main.
 The configuration messages are "diffs", like "add a backend server", or "remove a HTTP frontend", instead of changing the whole configuration at once. This allows sōzu to be smarter about handling the configuration changes while under traffic.
 
-The configuration messages are transmitted in JSON format, and they are defined in the [command library](https://github.com/sozu-proxy/sozu/tree/master/command). There are three possible message answers: processing (meaning the message has been received but the change is not active yet), error or ok.
+The configuration messages are transmitted in JSON format, and they are defined in the [command library](https://github.com/sozu-proxy/sozu/tree/main/command). There are three possible message answers: processing (meaning the message has been received but the change is not active yet), error or ok.
 
-The master exposes a unix socket for configuration instead of a HTTP server on localhost because unix socket access can be secured through file system permissions.
+The main exposes a unix socket for configuration instead of a HTTP server on localhost because unix socket access can be secured through file system permissions.
 
 ## Proxying
 

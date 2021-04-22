@@ -55,7 +55,7 @@ pub struct UpgradeData {
   pub token_count: usize,
 }
 
-pub fn start_new_master_process(executable_path: String, upgrade_data: UpgradeData) -> (pid_t, Channel<(),bool>) {
+pub fn start_new_main_process(executable_path: String, upgrade_data: UpgradeData) -> (pid_t, Channel<(),bool>) {
   trace!("parent({})", unsafe { libc::getpid() });
 
   let mut upgrade_file = tempfile().expect("could not create temporary file for upgrade");
@@ -76,11 +76,11 @@ pub fn start_new_master_process(executable_path: String, upgrade_data: UpgradeDa
   );
   command.set_nonblocking(false);
 
-  info!("launching new master");
+  info!("launching new main");
   //FIXME: remove the expect, return a result?
   match fork().expect("fork failed") {
     ForkResult::Parent{ child } => {
-      info!("master launched: {}", child);
+      info!("main launched: {}", child);
       command.set_nonblocking(true);
 
       return (child.into(), command);
@@ -105,7 +105,7 @@ pub fn start_new_master_process(executable_path: String, upgrade_data: UpgradeDa
   }
 }
 
-pub fn begin_new_master_process(fd: i32, upgrade_fd: i32, command_buffer_size: usize, max_command_buffer_size: usize) {
+pub fn begin_new_main_process(fd: i32, upgrade_fd: i32, command_buffer_size: usize, max_command_buffer_size: usize) {
   let mut command: Channel<bool,()> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     command_buffer_size,
@@ -120,21 +120,21 @@ pub fn begin_new_master_process(fd: i32, upgrade_fd: i32, command_buffer_size: u
 
   util::setup_logging(&config);
   util::setup_metrics(&config);
-  //info!("new master got upgrade data: {:?}", upgrade_data);
+  //info!("new main got upgrade data: {:?}", upgrade_data);
 
   let mut server = CommandServer::from_upgrade_data(upgrade_data);
   server.enable_cloexec_after_upgrade();
-  info!("starting new master loop");
+  info!("starting new main loop");
   match util::write_pid_file(&config) {
     Ok(()) => {
       command.write_message(&true);
       server.run();
-      info!("master process stopped");
+      info!("main process stopped");
     },
     Err(e) => {
       command.write_message(&false);
       error!("Couldn't write PID file. Error: {:?}", e);
-      error!("Couldn't upgrade master process");
+      error!("Couldn't upgrade main process");
     }
   }
 }

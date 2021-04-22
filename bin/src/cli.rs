@@ -1,13 +1,13 @@
 use clap::{App,Arg,SubCommand,ArgMatches};
 use worker::begin_worker_process;
-use upgrade::begin_new_master_process;
+use upgrade::begin_new_main_process;
 
 pub fn init<'a>() -> ArgMatches<'a> {
   App::new("sozu")
     .version(crate_version!())
     .about("hot reconfigurable proxy")
     .subcommand(SubCommand::with_name("start")
-                .about("launch the master process")
+                .about("launch the main process")
                 .arg(Arg::with_name("config")
                     .short("c")
                     .long("config")
@@ -30,15 +30,15 @@ pub fn init<'a>() -> ArgMatches<'a> {
                 .arg(Arg::with_name("max-command-buffer-size").long("max-command-buffer-size")
                      .takes_value(true).required(true).help("Worker's channel max buffer size")))
     .subcommand(SubCommand::with_name("upgrade")
-                .about("start a new master process (internal command, should not be used directly)")
+                .about("start a new main process (internal command, should not be used directly)")
                 .arg(Arg::with_name("fd").long("fd")
                      .takes_value(true).required(true).help("IPC file descriptor"))
                 .arg(Arg::with_name("upgrade-fd").long("upgrade-fd")
                      .takes_value(true).required(true).help("upgrade data file descriptor"))
                 .arg(Arg::with_name("command-buffer-size").long("command-buffer-size")
-                     .takes_value(true).required(true).help("Master's command buffer size"))
+                     .takes_value(true).required(true).help("Maino process command buffer size"))
                 .arg(Arg::with_name("max-command-buffer-size").long("max-command-buffer-size")
-                     .takes_value(true).required(false).help("Master's max command buffer size")))
+                     .takes_value(true).required(false).help("Main process max command buffer size")))
     .get_matches()
 }
 
@@ -94,14 +94,14 @@ pub fn upgrade_worker<'a>(matches: &ArgMatches<'a>) -> Option<()> {
   })
 }
 
-pub fn upgrade_master<'a>(matches: &ArgMatches<'a>) -> Option<()> {
+pub fn upgrade_main<'a>(matches: &ArgMatches<'a>) -> Option<()> {
  matches.subcommand_matches("upgrade").and_then(|upgrade_matches| {
     let fd = get_fd(upgrade_matches);
     let upgrade_fd = get_upgrade_fd(upgrade_matches);
     let buffer_size = get_buffer_size(upgrade_matches);
     let max_buffer_size = get_max_buffer_size(upgrade_matches, buffer_size);
 
-    begin_new_master_process(fd, upgrade_fd, buffer_size, max_buffer_size);
+    begin_new_main_process(fd, upgrade_fd, buffer_size, max_buffer_size);
     Some(())
   })
 }

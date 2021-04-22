@@ -31,7 +31,7 @@ pub enum SubCmd {
     #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
     json: bool
   },
-  #[structopt(name = "metrics", about = "gets statistics on the master and its workers")]
+  #[structopt(name = "metrics", about = "gets statistics on the main process and its workers")]
   Metrics {
     #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
     json: bool

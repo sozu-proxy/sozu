@@ -34,14 +34,14 @@ pub fn disable_close_on_exec(fd: RawFd) -> Option<i32> {
 }
 
 pub fn setup_logging(config: &Config) {
-  //FIXME: should have an id for the master too
-  logging::setup("MASTER".to_string(), &config.log_level,
+  //FIXME: should have an id for the main too
+  logging::setup("MAIN".to_string(), &config.log_level,
     &config.log_target, config.log_access_target.as_ref().map(|s| s.as_str()));
 }
 
 pub fn setup_metrics(config: &Config) {
   if let Some(ref metrics) = config.metrics.as_ref() {
-    metrics::setup(&metrics.address, "MASTER", metrics.tagged_metrics, metrics.prefix.clone());
+    metrics::setup(&metrics.address, "MAIN", metrics.tagged_metrics, metrics.prefix.clone());
   }
 }
 

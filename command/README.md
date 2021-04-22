@@ -76,7 +76,7 @@ with the same id and the `Ok` status.
 
 ## Message types
 
-### Master messages
+### Main process messages
 
 #### Save state message
 
@@ -171,7 +171,7 @@ The dump state message is defined like this:
   "id":      "ID_TEST",
   "version": 0,
   "data": {
-    "type": "UPGRADE_MASTER",
+    "type": "UPGRADE_MAIN",
   }
 }
 ```

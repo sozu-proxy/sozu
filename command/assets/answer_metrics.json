@@ -6,7 +6,7 @@
   "data": {
     "type": "METRICS",
     "data": {
-      "master": {
+      "main": {
         "sozu.count": {
           "type": "COUNT",
           "data": -2

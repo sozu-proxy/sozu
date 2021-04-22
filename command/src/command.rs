@@ -16,7 +16,7 @@ pub enum CommandRequestData {
   DumpState,
   ListWorkers,
   LaunchWorker(String),
-  UpgradeMaster,
+  UpgradeMain,
   UpgradeWorker(u32),
   SubscribeEvents,
 }
@@ -357,10 +357,10 @@ mod tests {
       worker_id: None
     });
 
-  test_message!(upgrade_master, "../assets/upgrade_master.json", CommandRequest {
+  test_message!(upgrade_main, "../assets/upgrade_main.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::UpgradeMaster,
+      data:     CommandRequestData::UpgradeMain,
       worker_id: None
     });
 
@@ -396,7 +396,7 @@ mod tests {
       status:   CommandStatus::Ok,
       message:  String::from(""),
       data:     Some(CommandResponseData::Metrics(AggregatedMetricsData {
-        master: [
+        main: [
           (String::from("sozu.gauge"), FilteredData::Gauge(1)),
           (String::from("sozu.count"), FilteredData::Count(-2)),
           (String::from("sozu.time"),  FilteredData::Time(1234)),

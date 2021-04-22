@@ -27,7 +27,7 @@ use sozu::metrics::METRICS;
 use super::{CommandServer,FrontToken,Worker};
 use super::client::parse;
 use worker::{start_worker,get_executable_path};
-use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
+use upgrade::{start_new_main_process,SerializedWorker,UpgradeData};
 use util;
 
 use super::executor;
@@ -55,8 +55,8 @@ impl CommandServer {
       CommandRequestData::LaunchWorker(tag) => {
         self.launch_worker(token, message, &tag);
       },
-      CommandRequestData::UpgradeMaster => {
-        self.upgrade_master(token, &message.id);
+      CommandRequestData::UpgradeMain => {
+        self.upgrade_main(token, &message.id);
       },
       CommandRequestData::Proxy(order) => {
         match order {
@@ -467,7 +467,7 @@ impl CommandServer {
     self.answer_success(token, message_id, "", None);
   }
 
-  pub fn upgrade_master(&mut self, token: FrontToken, message_id: &str) {
+  pub fn upgrade_main(&mut self, token: FrontToken, message_id: &str) {
     self.disable_cloexec_before_upgrade();
     //FIXME: do we need to be blocking here?
     self.clients[token].channel.set_blocking(true);
@@ -477,7 +477,7 @@ impl CommandServer {
         "".to_string(),
         None
         ));
-    let (pid, mut channel) = start_new_master_process(self.executable_path.clone(), self.generate_upgrade_data());
+    let (pid, mut channel) = start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data());
     channel.set_blocking(true);
     let res = channel.read_message();
     debug!("upgrade channel sent: {:?}", res);
@@ -485,7 +485,7 @@ impl CommandServer {
       self.clients[token].channel.write_message(&CommandResponse::new(
         message_id.into(),
         CommandStatus::Ok,
-        format!("new master process launched with pid {}, closing the old one", pid),
+        format!("new main process launched with pid {}, closing the old one", pid),
         None
       ));
       info!("wrote final message, closing");
@@ -493,7 +493,7 @@ impl CommandServer {
       sleep(Duration::from_secs(2));
       process::exit(0);
     } else {
-      self.answer_error(token, message_id, "could not upgrade master process", None);
+      self.answer_error(token, message_id, "could not upgrade main process", None);
     }
   }
 
@@ -512,7 +512,7 @@ impl CommandServer {
       );
     }
 
-    let master_metrics = METRICS.with(|metrics| {
+    let main_metrics = METRICS.with(|metrics| {
       (*metrics.borrow_mut()).dump_process_data()
     });
 
@@ -528,7 +528,7 @@ impl CommandServer {
         }).collect();
 
         let aggregated_data = AggregatedMetricsData {
-          master: master_metrics,
+          main: main_metrics,
           workers: data,
         };
 
@@ -572,10 +572,10 @@ impl CommandServer {
 
     match &query {
       &Query::ApplicationsHashes => {
-        let master = QueryAnswer::ApplicationsHashes(self.state.hash_state());
+        let main = QueryAnswer::ApplicationsHashes(self.state.hash_state());
 
         executor::Executor::execute(f.map(move |mut data| {
-          data.insert(String::from("master"), master);
+          data.insert(String::from("main"), main);
 
           executor::Executor::send_client(token, CommandResponse::new(
             id,
@@ -589,7 +589,7 @@ impl CommandServer {
         }));
       },
       &Query::Applications(ref query_type) => {
-        let master = match query_type {
+        let main = match query_type {
           QueryApplicationType::AppId(ref app_id) => vec!(self.state.application_state(app_id)),
           QueryApplicationType::Domain(ref domain) => {
             let app_ids = get_application_ids_by_domain(&self.state, domain.hostname.clone(), domain.path_begin.clone());
@@ -598,7 +598,7 @@ impl CommandServer {
         };
 
         executor::Executor::execute(f.map(move |mut data| {
-          data.insert(String::from("master"), QueryAnswer::Applications(master));
+          data.insert(String::from("main"), QueryAnswer::Applications(main));
 
           executor::Executor::send_client(token, CommandResponse::new(
             id,
@@ -637,7 +637,7 @@ impl CommandServer {
     }
 
     if let &ProxyRequestData::Logging(ref logging_filter) = &order {
-      debug!("Changing master log level to {}", logging_filter);
+      debug!("Changing main log level to {}", logging_filter);
       logging::LOGGER.with(|l| {
         let directives = logging::parse_logging_spec(&logging_filter);
         l.borrow_mut().set_directives(directives);
@@ -721,10 +721,10 @@ impl CommandServer {
     }
 
     let id = message_id.to_string();
-    let should_stop_master = (order == ProxyRequestData::SoftStop || order == ProxyRequestData::HardStop) && worker_id.is_none();
+    let should_stop_main = (order == ProxyRequestData::SoftStop || order == ProxyRequestData::HardStop) && worker_id.is_none();
     let f = join_all(futures).map(move |r| {
-      if should_stop_master {
-        executor::Executor::stop_master();
+      if should_stop_main {
+        executor::Executor::stop_main();
       }
 
       r

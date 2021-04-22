@@ -20,7 +20,7 @@ use sozu_command::command::{CommandRequest,CommandResponse};
 use sozu_command::proxy::ListenerType;
 
 use command::{add_application,remove_application,dump_state,load_state,
-  save_state, soft_stop, hard_stop, upgrade_master, status,metrics,
+  save_state, soft_stop, hard_stop, upgrade_main, status,metrics,
   remove_backend, add_backend, remove_http_frontend, add_http_frontend,
   remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
   replace_certificate, query_application, logging_filter, upgrade_worker,
@@ -53,7 +53,7 @@ fn main() {
         soft_stop(channel, worker);
       }
     },
-    SubCmd::Upgrade { worker: None } => upgrade_master(channel, &config),
+    SubCmd::Upgrade { worker: None } => upgrade_main(channel, &config),
     SubCmd::Upgrade { worker: Some(id) } => { upgrade_worker(channel, timeout, id); },
     SubCmd::Status{ json } => status(channel, json),
     SubCmd::Metrics{ json } => metrics(channel, json),

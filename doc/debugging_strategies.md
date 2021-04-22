@@ -39,7 +39,7 @@ unless you set the compilation features `logs-debug` and `logs-trace`.
 
 Various metrics are generated while sozu is running. They can be accessed in two ways:
 
-* through `sozuctl metrics`, which will display metrics for the master and workers. Counters are refreshed between each call
+* through `sozuctl metrics`, which will display metrics for the main process and workers. Counters are refreshed between each call
 * by UDP, following the statsd protocol (optionally with support for InfluxDB's tags)
 
 Here is how you can set up metrics with statsd in the configuration file:
@@ -72,7 +72,7 @@ From left to right:
 * date in ISO8601 format, UTC timezone
 * monotonic clock (in case some messages appear in the wrong order)
 * PID
-* worker name ("MASTER" for the master process)
+* worker name ("MAIN" for the main process)
 * log level
 * request id (UUID, generated randomly for each request, changes on the same connection if doing multiple requests in keep-alive)
 * application id
@@ -181,7 +181,7 @@ active requests (an inactive session can keep a backend connection around).
 These metrics are closely linked to resource usage, which is tracked by the following:
 
 * `sozu.slab.count`: number of slots used in the slab allocator. Typically, there's one slot per listener socket,
-one for the connection to the master process, one for the metrics socket, then one per frontend connection and
+one for the connection to the main process, one for the metrics socket, then one per frontend connection and
 one per backend connection. So the number of connections should always be close (but lower) to the slab count
 * `sozu.buffer.count`: number of buffers used in the buffer pool. Inactive sessions and requests for which we send
 a default answer (400, 404, 413, 503 HTTP errors) do not use buffers. Active HTTP sessions use one buffer (except
