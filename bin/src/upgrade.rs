@@ -55,55 +55,66 @@ pub struct UpgradeData {
   pub token_count: usize,
 }
 
-pub fn start_new_master_process(executable_path: String, upgrade_data: UpgradeData) -> (pid_t, Channel<(),bool>) {
+pub fn start_new_master_process(executable_path: String, upgrade_data: UpgradeData) -> Result<(pid_t, Channel<(),bool>), &'static str> {
   trace!("parent({})", unsafe { libc::getpid() });
 
-  let mut upgrade_file = tempfile().expect("could not create temporary file for upgrade");
+
+  let mut upgrade_file = match tempfile() {
+    Ok(f) => f,
+    Err(_e) => return Err("could not create temporary file for upgrade")
+  };
 
   util::disable_close_on_exec(upgrade_file.as_raw_fd());
 
-  serde_json::to_writer(&mut upgrade_file, &upgrade_data).expect("could not write upgrade data to temporary file");
-  upgrade_file.seek(SeekFrom::Start(0)).expect("could not seek to beginning of file");
+  serde_json::to_writer(&mut upgrade_file, &upgrade_data).or_else(|_e| {
+    return Err("could not write upgrade data to temporary file")
+  }).ok();
 
-  let (server, client) = UnixStream::pair().unwrap();
+  upgrade_file.seek(SeekFrom::Start(0)).or_else(|_e| {
+    return Err("could not seek to beginning of file")
+  }).ok();
 
-  util::disable_close_on_exec(client.as_raw_fd());
+    match UnixStream::pair() {
+        Ok((server, client)) => {
+            util::disable_close_on_exec(client.as_raw_fd());
 
-  let mut command: Channel<(),bool> = Channel::new(
-    server,
-    upgrade_data.config.command_buffer_size,
-    upgrade_data.config.max_command_buffer_size
-  );
-  command.set_nonblocking(false);
+            let mut command: Channel<(),bool> = Channel::new(
+                server,
+                upgrade_data.config.command_buffer_size,
+                upgrade_data.config.max_command_buffer_size
+            );
+            command.set_nonblocking(false);
+            info!("launching new master");
+            match fork() {
+                Ok(ForkResult::Parent{ child }) => {
+                    info!("master launched: {}", child);
+                    command.set_nonblocking(true);
 
-  info!("launching new master");
-  //FIXME: remove the expect, return a result?
-  match fork().expect("fork failed") {
-    ForkResult::Parent{ child } => {
-      info!("master launched: {}", child);
-      command.set_nonblocking(true);
+                    return Ok((child.into(), command));
+                }
+                Ok(ForkResult::Child) => {
+                    trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
+                    let res = Command::new(executable_path)
+                        .arg("upgrade")
+                        .arg("--fd")
+                        .arg(client.as_raw_fd().to_string())
+                        .arg("--upgrade-fd")
+                        .arg(upgrade_file.as_raw_fd().to_string())
+                        .arg("--command-buffer-size")
+                        .arg(upgrade_data.config.command_buffer_size.to_string())
+                        .arg("--max-command-buffer-size")
+                        .arg(upgrade_data.config.max_command_buffer_size.to_string())
+                        .exec();
 
-      return (child.into(), command);
-    }
-    ForkResult::Child => {
-      trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
-      let res = Command::new(executable_path)
-        .arg("upgrade")
-        .arg("--fd")
-        .arg(client.as_raw_fd().to_string())
-        .arg("--upgrade-fd")
-        .arg(upgrade_file.as_raw_fd().to_string())
-        .arg("--command-buffer-size")
-        .arg(upgrade_data.config.command_buffer_size.to_string())
-        .arg("--max-command-buffer-size")
-        .arg(upgrade_data.config.max_command_buffer_size.to_string())
-        .exec();
-
-      error!("exec call failed: {:?}", res);
-      unreachable!();
-    }
-  }
-}
+                    error!("exec call failed: {:?}", res);
+                    unreachable!();
+                }
+                Err(_) => { return Err("fork failed")}
+            }
+        }
+        Err(_e) => {return Err("could not create socket")}
+    };
+ }
 
 pub fn begin_new_master_process(fd: i32, upgrade_fd: i32, command_buffer_size: usize, max_command_buffer_size: usize) {
   let mut command: Channel<bool,()> = Channel::new(
