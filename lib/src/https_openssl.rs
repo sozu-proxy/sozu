@@ -949,6 +949,7 @@ impl Listener {
         TlsVersion::TLSv1_1 => versions.remove(ssl::SslOptions::NO_TLSV1_1),
         TlsVersion::TLSv1_2 => versions.remove(ssl::SslOptions::NO_TLSV1_2),
         //TlsVersion::TLSv1_3 => versions.remove(ssl::SslOptions::NO_TLSV1_3),
+        TlsVersion::TLSv1_3 => {},
         s         => error!("unrecognized TLS version: {:?}", s)
       };
     }
