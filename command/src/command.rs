@@ -133,7 +133,7 @@ mod tests {
   use certificate::split_certificate_chain;
   use proxy::{Application,CertificateAndKey,CertFingerprint,ProxyRequestData,HttpFront,Backend,
     AppMetricsData,MetricsData,FilteredData,Percentiles,RemoveBackend,
-    AddCertificate,RemoveCertificate,LoadBalancingParams};
+    AddCertificate,RemoveCertificate,LoadBalancingParams,TlsVersion};
   use config::{LoadBalancingAlgorithms,ProxyProtocolConfig};
 
   #[test]
@@ -265,7 +265,7 @@ mod tests {
                   certificate: String::from(CERTIFICATE),
                   certificate_chain: split_certificate_chain(String::from(CHAIN)),
                   key: String::from(KEY),
-                  versions: vec![],
+                  versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
         },
         names: Vec::new()
       })),

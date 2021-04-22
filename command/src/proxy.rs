@@ -73,7 +73,11 @@ pub enum FilteredData {
 #[derive(Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct FilteredTimeSerie {
   pub last_second: u32,
+  #[serde(default)]
+  #[serde(skip_serializing_if="Vec::is_empty")]
   pub last_minute: Vec<u32>,
+  #[serde(default)]
+  #[serde(skip_serializing_if="Vec::is_empty")]
   pub last_hour:   Vec<u32>,
 }
 
@@ -221,12 +225,21 @@ impl<'de> serde::Deserialize<'de> for CertFingerprint {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Application {
     pub app_id:            String,
+    #[serde(default)]
+    #[serde(skip_serializing_if="is_false")]
     pub sticky_session:    bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if="is_false")]
     pub https_redirect:    bool,
     #[serde(default)]
+    #[serde(skip_serializing_if="is_default")]
     pub proxy_protocol:    Option<ProxyProtocolConfig>,
     #[serde(rename = "load_balancing_policy")]
+    #[serde(default)]
+    #[serde(skip_serializing_if="is_default")]
     pub load_balancing_policy: LoadBalancingAlgorithms,
+    #[serde(default)]
+    #[serde(skip_serializing_if="is_default")]
     pub answer_503:        Option<String>,
 }
 
@@ -239,6 +252,8 @@ pub struct HttpFront {
     pub app_id:     String,
     pub address:    SocketAddr,
     pub hostname:   String,
+    #[serde(default)]
+    #[serde(skip_serializing_if="String::is_empty")]
     pub path_begin: String,
 }
 
@@ -262,6 +277,8 @@ pub struct CertificateAndKey {
     pub certificate:       String,
     pub certificate_chain: Vec<String>,
     pub key:               String,
+    #[serde(default)]
+    #[serde(skip_serializing_if="Vec::is_empty")]
     pub versions:          Vec<TlsVersion>,
 }
 
@@ -322,11 +339,13 @@ pub struct Backend {
     pub backend_id: String,
     pub address:    SocketAddr,
     #[serde(default)]
+    #[serde(skip_serializing_if="Option::is_none")]
     pub sticky_id:  Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if="Option::is_none")]
     pub load_balancing_parameters: Option<LoadBalancingParams>,
     #[serde(default)]
+    #[serde(skip_serializing_if="Option::is_none")]
     pub backup:     Option<bool>,
 }
 
@@ -406,6 +425,7 @@ pub struct HttpListener {
     pub answer_404:     String,
     pub answer_503:     String,
     #[serde(default)]
+    #[serde(skip_serializing_if="is_false")]
     pub expect_proxy:   bool,
     #[serde(default = "default_sticky_name")]
     pub sticky_name:    String,
@@ -543,8 +563,11 @@ impl Default for HttpsListener {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TcpListener {
   pub front:          SocketAddr,
+  #[serde(default)]
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub public_address: Option<SocketAddr>,
   #[serde(default)]
+  #[serde(skip_serializing_if = "is_false")]
   pub expect_proxy:   bool,
 }
 
@@ -655,6 +678,18 @@ pub enum Topic {
     HttpProxyConfig,
     HttpsProxyConfig,
     TcpProxyConfig
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+    t == &T::default()
 }
 
 #[cfg(test)]
