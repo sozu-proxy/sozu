@@ -108,6 +108,9 @@ pub enum Event {
   BackendDown(String, SocketAddr),
   BackendUp(String, SocketAddr),
   NoAvailableBackends(String),
+  /// indicates a backend that was removed from configuration has no lingering connections
+  /// so it can be safely stopped
+  RemovedBackendHasNoConnections(String, SocketAddr),
 }
 
 impl From<ProxyEvent> for Event {
@@ -116,6 +119,7 @@ impl From<ProxyEvent> for Event {
       ProxyEvent::BackendDown(id, addr) => Event::BackendDown(id, addr),
       ProxyEvent::BackendUp(id, addr) => Event::BackendUp(id, addr),
       ProxyEvent::NoAvailableBackends(app_id) => Event::NoAvailableBackends(app_id),
+      ProxyEvent::RemovedBackendHasNoConnections(id, addr) => Event::RemovedBackendHasNoConnections(id, addr),
     }
   }
 }

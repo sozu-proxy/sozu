@@ -219,7 +219,7 @@ use std::cell::RefCell;
 use time::{Instant,Duration};
 use mio_extras::timer::{Timer,Timeout};
 
-use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams};
+use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams,ProxyEvent};
 
 use self::retry::RetryPolicy;
 
@@ -495,6 +495,15 @@ impl Backend {
 
     conn
   }
+}
+
+// when a backend has been removed from configuration and the last connection to
+// it has stopped, it will be dropped, so we can notify that the backend server
+// can be safely stopped
+impl std::ops::Drop for Backend {
+    fn drop(&mut self) {
+        server::push_event(ProxyEvent::RemovedBackendHasNoConnections(self.backend_id.clone(), self.address));
+    }
 }
 
 #[derive(Clone)]

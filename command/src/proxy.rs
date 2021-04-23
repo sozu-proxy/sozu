@@ -115,6 +115,7 @@ pub enum ProxyEvent {
   BackendDown(String, SocketAddr),
   BackendUp(String, SocketAddr),
   NoAvailableBackends(String),
+  RemovedBackendHasNoConnections(String, SocketAddr),
 }
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
