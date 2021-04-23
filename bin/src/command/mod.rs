@@ -111,6 +111,7 @@ pub struct CommandServer {
   backends_count:    usize,
   //caching the number of frontends instead of going through the whole state.http/hhtps/tcp_fronts hashmaps
   frontends_count:   usize,
+  current_events:    HashMap<sozu_command::proxy::ProxyEvent, u32>,
 }
 
 impl CommandServer {
@@ -194,6 +195,7 @@ impl CommandServer {
       executable_path:   path,
       backends_count:    backends_count,
       frontends_count:   frontends_count,
+      current_events:    HashMap::new(),
     }
   }
 
@@ -537,16 +539,26 @@ impl CommandServer {
 
   fn handle_worker_message(&mut self, token: Token, msg: ProxyResponse) {
     if let Some(ProxyResponseData::Event(data)) = msg.data {
-      let event: command::Event = data.into();
-      for client_token in self.event_subscribers.iter() {
-        let event = CommandResponse::new(
-          msg.id.to_string(),
-          CommandStatus::Processing,
-          format!("{}", token.0),
-          Some(CommandResponseData::Event(event.clone()))
-        );
+      let counter = {
+        let event_counter = self.current_events.entry(data.clone()).or_insert(1);
+        *event_counter += 1;
+        *event_counter
+      };
 
-        self.clients.get_mut(*client_token).map(|cl| cl.push_message(event));
+      if counter == self.config.worker_count as u32 {
+        self.current_events.remove(&data);
+
+        let event: command::Event = data.into();
+        for client_token in self.event_subscribers.iter() {
+          let event = CommandResponse::new(
+            msg.id.to_string(),
+            CommandStatus::Processing,
+            format!("{}", token.0),
+            Some(CommandResponseData::Event(event.clone()))
+          );
+
+          self.clients.get_mut(*client_token).map(|cl| cl.push_message(event));
+        }
       }
     } else {
       Executor::handle_message(token, msg);

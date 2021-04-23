@@ -109,7 +109,7 @@ pub struct BackendMetricsData {
   pub percentiles: Percentiles,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyEvent {
   BackendDown(String, SocketAddr),

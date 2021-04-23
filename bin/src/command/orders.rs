@@ -924,6 +924,7 @@ impl CommandServer {
       executable_path:   path,
       backends_count:    backends_count,
       frontends_count:   frontends_count,
+      current_events:    HashMap::new(),
     }
   }
 }
