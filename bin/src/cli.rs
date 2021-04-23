@@ -36,7 +36,7 @@ pub fn init<'a>() -> ArgMatches<'a> {
                 .arg(Arg::with_name("upgrade-fd").long("upgrade-fd")
                      .takes_value(true).required(true).help("upgrade data file descriptor"))
                 .arg(Arg::with_name("command-buffer-size").long("command-buffer-size")
-                     .takes_value(true).required(true).help("Maino process command buffer size"))
+                     .takes_value(true).required(true).help("Main process command buffer size"))
                 .arg(Arg::with_name("max-command-buffer-size").long("max-command-buffer-size")
                      .takes_value(true).required(false).help("Main process max command buffer size")))
     .get_matches()
