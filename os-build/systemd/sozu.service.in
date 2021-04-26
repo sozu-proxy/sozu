@@ -7,6 +7,7 @@ Wants=network-online.target
 [Service]
 PIDFile=__RUNDIR__/sozu/sozu.pid
 ExecStart=__BINDIR__/sozu start --config __SYSCONFDIR__/sozu/config.toml
+ExecReload=__BINDIR__/sozuctl --config __SYSCONFDIR__/sozu/config.toml reload
 Restart=on-failure
 
 [Install]

@@ -29,6 +29,7 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/bin/sozu start --config /etc/sozu/config.toml
+ExecReload=/usr/bin/sozuctl --config /etc/sozu/config.toml reload
 Restart=on-failure
 User=sozu
 AmbientCapabilities=CAP_NET_BIND_SERVICE

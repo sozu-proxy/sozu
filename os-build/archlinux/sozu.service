@@ -8,6 +8,7 @@ Wants=network-online.target
 Type=simple
 PIDFile=/run/sozu.pid
 ExecStart=/usr/bin/sozu start --config /etc/sozu/config.toml
+ExecReload=/usr/bin/sozuctl --config /etc/sozu/config.toml reload
 
 [Install]
 WantedBy=multi-user.target
