@@ -20,7 +20,8 @@ use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer, QueryApplicationType,
 MetricsData, AggregatedMetricsData, ProxyResponseData, HttpFront, TcpFront, ProxyResponseStatus};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
-use sozu_command::state::get_application_ids_by_domain;
+use sozu_command::state::{ConfigState, get_application_ids_by_domain};
+use sozu_command::config::Config;
 use sozu_command::logging;
 use sozu::metrics::METRICS;
 
@@ -72,6 +73,9 @@ impl CommandServer {
       },
       CommandRequestData::SubscribeEvents => {
         self.event_subscribers.push(token);
+      },
+      CommandRequestData::ReloadConfiguration { path }=> {
+        self.reload_configuration(Some(token), &message.id, path);
       },
     }
   }
@@ -627,6 +631,93 @@ impl CommandServer {
         }));
       },
     };
+  }
+
+  pub fn reload_configuration(&mut self, token_opt: Option<FrontToken>, message_id: &str, config_path: Option<String>) {
+      let new_config = match Config::load_from_path(config_path.as_deref().unwrap_or(&self.config.config_path)) {
+          Err(e) => {
+                  if let Some(token) = token_opt {
+                      self.answer_error(token, message_id,
+                                        format!("cannot load configuration from '{}': {:?}", self.config.config_path, e),
+                                        None);
+                  }
+              return
+          },
+          Ok(c) => c,
+      };
+
+      let mut new_state = ConfigState::default();
+      for message in new_config.generate_config_messages() {
+          if let CommandRequestData::Proxy(order) = message.data {
+              new_state.handle_order(&order);
+          }
+      }
+
+      let mut futures = Vec::new();
+      let mut diff_counter = 0usize;
+      let diff = self.state.diff(&new_state);
+      for order in diff {
+          diff_counter += 1;
+          self.state.handle_order(&order);
+
+          let mut found = false;
+          let id = format!("RELOAD-{}-{}", message_id, diff_counter);
+
+          for ref mut worker in self.workers.values_mut()
+              .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
+                  let o = order.clone();
+                  futures.push(
+                      executor::send(worker.token.expect("worker should have a token"), ProxyRequest { id: id.clone(), order: o })
+                      );
+                  found = true;
+
+              }
+
+          if !found {
+              // FIXME: should send back error here
+              error!("no worker found");
+          }
+      }
+
+      if diff_counter > 0 {
+          info!("state loaded from {}, will start sending {} messages to workers", new_config.config_path, diff_counter);
+          let id = message_id.to_string();
+          executor::Executor::execute(
+              //FIXME: join_all will stop at the first error, and we will end up accumulating messages
+              join_all(futures).map(move |v| {
+                  info!("load_state: {} messages loaded", v.len());
+                  if let Some(token) = token_opt {
+                      executor::Executor::send_client(token, CommandResponse::new(
+                              id,
+                              CommandStatus::Ok,
+                              format!("ok: {} messages, error: 0", v.len()),
+                              None
+                              ));
+                  }
+              }).map_err(|e| {
+                  error!("load_state error: {}", e);
+              })
+              );
+      } else {
+          info!("no messages sent to workers: local state already had those messages");
+          if let Some(token) = token_opt {
+              let answer = CommandResponse::new(
+                  message_id.to_string(),
+                  CommandStatus::Ok,
+                  format!("ok: 0 messages, error: 0"),
+                  None
+                  );
+              self.clients[token].push_message(answer);
+          }
+      }
+
+    self.backends_count = self.state.count_backends();
+    self.frontends_count = self.state.count_frontends();
+    gauge!("configuration.applications", self.state.applications.len());
+    gauge!("configuration.backends", self.backends_count);
+    gauge!("configuration.frontends", self.frontends_count);
+
+    self.config = new_config;
   }
 
   pub fn worker_order(&mut self, token: FrontToken, message_id: &str, order: ProxyRequestData, worker_id: Option<u32>) {

@@ -25,7 +25,7 @@ use command::{add_application,remove_application,dump_state,load_state,
   remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
   replace_certificate, query_application, logging_filter, upgrade_worker,
   events, query_certificate, add_tcp_listener, add_http_listener, add_https_listener,
-  remove_listener, activate_listener, deactivate_listener};
+  remove_listener, activate_listener, deactivate_listener, reload_configuration};
 
 use cli::*;
 
@@ -65,6 +65,7 @@ fn main() {
         StateCmd::Dump{ json } => dump_state(channel, timeout, json),
       }
     },
+    SubCmd::Reload { file, json } => reload_configuration(channel, file, json),
     SubCmd::Application{ cmd } => {
       match cmd {
         ApplicationCmd::Add{ id, sticky_session, https_redirect, send_proxy, expect_proxy, load_balancing_policy } => add_application(channel, timeout, &id, sticky_session, https_redirect, send_proxy, expect_proxy, load_balancing_policy),

@@ -19,6 +19,7 @@ pub enum CommandRequestData {
   UpgradeMain,
   UpgradeWorker(u32),
   SubscribeEvents,
+  ReloadConfiguration { path: Option<String> },
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]

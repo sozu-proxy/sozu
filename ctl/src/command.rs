@@ -963,6 +963,49 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   }
 }
 
+pub fn reload_configuration(mut channel: Channel<CommandRequest,CommandResponse>, path: Option<String>, json: bool) {
+  let id = generate_id();
+  channel.write_message(&CommandRequest::new(
+    id.clone(),
+    CommandRequestData::ReloadConfiguration { path },
+    None,
+  ));
+
+  match channel.read_message() {
+    None          => {
+      eprintln!("the proxy didn't answer");
+      exit(1);
+    },
+    Some(message) => {
+      if id != message.id {
+        eprintln!("received message with invalid id: {:?}", message);
+        exit(1);
+      }
+      match message.status {
+        CommandStatus::Processing => {
+          eprintln!("should have obtained an answer immediately");
+          exit(1);
+        },
+        CommandStatus::Error => {
+          if json {
+            print_json_response(&message.message);
+          } else {
+            eprintln!("could not get the worker list: {}", message.message);
+          }
+          exit(1);
+        },
+        CommandStatus::Ok => {
+          if json {
+            print_json_response(&message.message);
+          } else {
+            println!("Reloaded configuration: {}", message.message);
+          }
+        }
+      }
+    }
+  }
+}
+
 pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing_policy: LoadBalancingAlgorithms) {
   let proxy_protocol = match (send_proxy, expect_proxy) {
     (true, true) => Some(ProxyProtocolConfig::RelayHeader),

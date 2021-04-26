@@ -46,6 +46,13 @@ pub enum SubCmd {
     #[structopt(subcommand)]
     cmd: StateCmd,
   },
+  #[structopt(name = "reload", about = "Reloads routing configuration (applications, frontends and backends)")]
+  Reload{
+    #[structopt(short = "f", long = "file", help = "use a different configuration file from the current one")]
+    file: Option<String>,
+    #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
+    json: bool
+  },
   #[structopt(name = "application", about = "application management")]
   Application {
     #[structopt(subcommand)]
