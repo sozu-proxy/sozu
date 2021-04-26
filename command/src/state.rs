@@ -228,7 +228,10 @@ impl ConfigState {
         let backend_vec = self.backends.entry(backend.app_id.clone()).or_insert_with(Vec::new);
 
         // we might be modifying the sticky id or load balancing parameters
-        backend_vec.retain(|b| b.backend_id != backend.backend_id);
+        backend_vec.retain(|b| {
+            b.backend_id != backend.backend_id
+            || b.address != backend.address
+        });
         backend_vec.push(backend.clone());
 
         true
@@ -236,7 +239,10 @@ impl ConfigState {
       &ProxyRequestData::RemoveBackend(ref backend) => {
         if let Some(backend_list) = self.backends.get_mut(&backend.app_id) {
           let len = backend_list.len();
-          backend_list.retain(|el| el.address != backend.address);
+          backend_list.retain(|b| {
+              b.backend_id != backend.backend_id
+              || b.address != backend.address
+          });
           backend_list.len() != len
         } else {
           false

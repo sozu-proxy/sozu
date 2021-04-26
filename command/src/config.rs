@@ -571,7 +571,7 @@ impl HttpAppConfig {
 
         v.push(ProxyRequestData::AddBackend(Backend {
           app_id:     self.app_id.clone(),
-          backend_id: backend.backend_id.clone().unwrap_or_else(|| format!("{}-{}", self.app_id, backend_count)),
+          backend_id: backend.backend_id.clone().unwrap_or_else(|| format!("{}-{}-{}", self.app_id, backend_count, backend.address)),
           address:    backend.address,
           load_balancing_parameters,
           sticky_id:  backend.sticky_id.clone(),
@@ -628,7 +628,7 @@ impl TcpAppConfig {
 
       v.push(ProxyRequestData::AddBackend(Backend {
         app_id:     self.app_id.clone(),
-        backend_id: backend.backend_id.clone().unwrap_or_else(|| format!("{}-{}", self.app_id, backend_count)),
+        backend_id: backend.backend_id.clone().unwrap_or_else(|| format!("{}-{}-{}", self.app_id, backend_count, backend.address)),
         address:    backend.address,
         load_balancing_parameters,
         sticky_id:  backend.sticky_id.clone(),

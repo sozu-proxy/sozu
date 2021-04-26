@@ -158,10 +158,23 @@ impl BackendList {
   }
 
   pub fn add_backend(&mut self, backend: Backend) {
-    if self.backends.iter().find(|b| (*b.borrow()).address == backend.address).is_none() {
-      let backend = Rc::new(RefCell::new(backend));
-      self.backends.push(backend);
-      self.next_id += 1;
+    match self.backends.iter_mut().find(|b| {
+        (*b.borrow()).address == backend.address
+            && (*b.borrow()).backend_id == backend.backend_id
+    }) {
+        None => {
+            let backend = Rc::new(RefCell::new(backend));
+            self.backends.push(backend);
+            self.next_id += 1;
+        },
+        // the backend already exists, update the configuration while
+        // keeping connection retry state
+        Some(old_backend) => {
+            let mut b = old_backend.borrow_mut();
+            b.sticky_id = backend.sticky_id.clone();
+            b.load_balancing_parameters = backend.load_balancing_parameters.clone();
+            b.backup = backend.backup;
+        }
     }
   }
 
