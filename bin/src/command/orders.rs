@@ -215,37 +215,34 @@ impl CommandServer {
                 break;
               }
 
-              let mut new_state = self.state.clone();
               for message in orders {
                 if let CommandRequestData::Proxy(order) = message.data {
                   message_counter += 1;
-                  new_state.handle_order(&order);
+
+                  if self.state.handle_order(&order) {
+                      diff_counter += 1;
+
+                      let mut found = false;
+                      let id = format!("LOAD-STATE-{}-{}", message_id, diff_counter);
+
+                      for ref mut worker in self.workers.values_mut()
+                          .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
+                              let o = order.clone();
+                              futures.push(
+                                  executor::send(worker.token.expect("worker should have a token"), ProxyRequest { id: id.clone(), order: o })
+                                  );
+                              found = true;
+
+                          }
+
+                      if !found {
+                          // FIXME: should send back error here
+                          error!("no worker found");
+                      }
+                  }
                 }
               }
 
-              let diff = self.state.diff(&new_state);
-              for order in diff {
-                diff_counter += 1;
-                self.state.handle_order(&order);
-
-                let mut found = false;
-                let id = format!("LOAD-STATE-{}-{}", message_id, diff_counter);
-
-                for ref mut worker in self.workers.values_mut()
-                  .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
-                  let o = order.clone();
-                  futures.push(
-                    executor::send(worker.token.expect("worker should have a token"), ProxyRequest { id: id.clone(), order: o })
-                  );
-                  found = true;
-
-                }
-
-                if !found {
-                  // FIXME: should send back error here
-                  error!("no worker found");
-                }
-              }
             },
             Err(Err::Incomplete(_)) => {
               if buffer.available_data() == buffer.capacity() {
