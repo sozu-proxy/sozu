@@ -30,8 +30,8 @@ pub struct HttpsProxy {
 
 #[derive(Debug,Default,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct ConfigState {
-  pub applications:    HashMap<AppId, Application>,
-  pub backends:        HashMap<AppId, Vec<Backend>>,
+  pub applications:    BTreeMap<AppId, Application>,
+  pub backends:        BTreeMap<AppId, Vec<Backend>>,
   /// the bool indicates if it is active or not
   pub http_listeners:  HashMap<SocketAddr, (HttpListener, bool)>,
   pub https_listeners: HashMap<SocketAddr, (HttpsListener, bool)>,
@@ -50,8 +50,8 @@ pub struct ConfigState {
 impl ConfigState {
   pub fn new() -> ConfigState {
     ConfigState {
-      applications:    HashMap::new(),
-      backends:        HashMap::new(),
+      applications:    BTreeMap::new(),
+      backends:        BTreeMap::new(),
       http_listeners:  HashMap::new(),
       https_listeners: HashMap::new(),
       tcp_listeners:   HashMap::new(),
@@ -233,6 +233,7 @@ impl ConfigState {
             || b.address != backend.address
         });
         backend_vec.push(backend.clone());
+        backend_vec.sort();
 
         true
       },
@@ -243,6 +244,7 @@ impl ConfigState {
               b.backend_id != backend.backend_id
               || b.address != backend.address
           });
+          backend_list.sort();
           backend_list.len() != len
         } else {
           false
@@ -553,56 +555,52 @@ impl ConfigState {
       }
     }
 
-
-    let my_apps: HashSet<&AppId>    = self.applications.keys().collect();
-    let their_apps: HashSet<&AppId> = other.applications.keys().collect();
-
-    let mut removed_apps: HashSet<&AppId> = my_apps.difference(&their_apps).cloned().collect();
-    let mut added_apps: Vec<&Application> = their_apps.difference(&my_apps)
-        .filter_map(|app_id| other.applications.get(app_id.as_str())).collect();
-
-    for app in my_apps.intersection(&their_apps) {
-      if self.applications.get(*app) != other.applications.get(*app) {
-        removed_apps.insert(app);
-        added_apps.push(other.applications.get(*app).as_ref().unwrap());
-      }
-    }
-
-    for app_id in removed_apps {
-      v.push(ProxyRequestData::RemoveApplication(app_id.to_string()));
-    }
-
-    for app in added_apps {
-      v.push(ProxyRequestData::AddApplication(app.clone()));
+    for (app_id, res) in diff_map(self.applications.iter(), other.applications.iter()) {
+        match res {
+            DiffResult::Added | DiffResult::Changed =>
+                v.push(ProxyRequestData::AddApplication(other.applications.get(app_id)
+                                                        .unwrap()
+                                                        .clone())),
+            DiffResult::Removed => v.push(ProxyRequestData::RemoveApplication(app_id.to_string())),
+        }
     }
 
 
-    let mut my_backends: HashSet<(&AppId, &Backend)> = HashSet::new();
-    for (ref app_id, ref backend_list) in self.backends.iter() {
-      for ref backend in backend_list.iter() {
-        my_backends.insert((&app_id, &backend));
-      }
-    }
-    let mut their_backends: HashSet<(&AppId, &Backend)> = HashSet::new();
-    for (ref app_id, ref backend_list) in other.backends.iter() {
-      for ref backend in backend_list.iter() {
-        their_backends.insert((&app_id, &backend));
-      }
-    }
+    for ((app_id, backend_id), res) in diff_map(
+        self.backends.iter().map(|(app_id, v)| v.iter().map(move |backend| ((app_id, &backend.backend_id), backend))).flatten(),
+        other.backends.iter().map(|(app_id, v)| v.iter().map(move |backend| ((app_id, &backend.backend_id), backend))).flatten(),
+        ) {
+        match res {
+            DiffResult::Added => {
+                let backend = other.backends.get(app_id)
+                                  .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
+                                  .unwrap();
+                v.push(ProxyRequestData::AddBackend(backend.clone()));
+            },
+            DiffResult::Removed => {
+                let backend = self.backends.get(app_id).and_then(|v| v.iter().find(|b| &b.backend_id == backend_id)).unwrap();
 
-    let removed_backends = my_backends.difference(&their_backends);
-    let added_backends   = their_backends.difference(&my_backends);
+                v.push(ProxyRequestData::RemoveBackend(RemoveBackend{
+                    app_id:     backend.app_id.clone(),
+                    backend_id: backend.backend_id.clone(),
+                    address:    backend.address,
+                }));
+            },
+            DiffResult::Changed => {
+                let backend = self.backends.get(app_id).and_then(|v| v.iter().find(|b| &b.backend_id == backend_id)).unwrap();
 
-    for &(_, backend) in added_backends {
-      v.push(ProxyRequestData::AddBackend(backend.clone()));
-    }
+                v.push(ProxyRequestData::RemoveBackend(RemoveBackend{
+                    app_id:     backend.app_id.clone(),
+                    backend_id: backend.backend_id.clone(),
+                    address:    backend.address,
+                }));
 
-    for &(_, backend) in removed_backends {
-      v.push(ProxyRequestData::RemoveBackend(RemoveBackend{
-        app_id: backend.app_id.clone(),
-        backend_id: backend.backend_id.clone(),
-        address:    backend.address,
-      }));
+                let backend = other.backends.get(app_id)
+                                  .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
+                                  .unwrap();
+                v.push(ProxyRequestData::AddBackend(backend.clone()));
+            }
+        }
     }
 
 
@@ -799,6 +797,72 @@ pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(Strin
   state.certificates.values().filter_map(|h| h.get(&CertFingerprint(fingerprint.to_vec())))
     .map(|(c, names)| (c.certificate.clone(), names.clone())).next()
 }
+
+use std::collections::btree_map::Iter;
+struct DiffMap<'a, K:Ord, V, I1, I2> {
+  my_it: I1,
+  other_it: I2,
+  my: Option<(K, &'a V)>,
+  other: Option<(K, &'a V)>,
+}
+
+//fn diff_map<'a, K:Ord, V: PartialEq>(my: &'a BTreeMap<K,V>, other: &'a BTreeMap<K,V>) -> DiffMap<'a,K,V> {
+fn diff_map<'a, K:Ord, V: PartialEq, I1: Iterator<Item=(K, &'a V)>, I2: Iterator<Item=(K, &'a V)>>(my: I1, other: I2) -> DiffMap<'a,K,V, I1, I2> {
+    DiffMap { my_it: my, other_it: other, my: None, other: None }
+}
+
+enum DiffResult {
+    Added,
+    Removed,
+    Changed,
+}
+
+// this will iterate over the keys of both iterators
+// since keys are sorted, it should be easy to see which ones are in common or not
+impl<'a, K:Ord, V:PartialEq, I1: Iterator<Item=(K, &'a V)>, I2: Iterator<Item=(K, &'a V)>> std::iter::Iterator for DiffMap<'a, K, V, I1, I2> {
+    type Item = (K, DiffResult);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.my.is_none() {
+                self.my = self.my_it.next();
+            }
+            if self.other.is_none() {
+                self.other = self.other_it.next();
+            }
+
+            match (self.my.take(), self.other.take()) {
+                // there are no more elements in my_it, all the next elements in other
+                // should be added
+                // if other was none, we will stop the iterator there
+                (None, other) => return other.map(|(k,_)| (k, DiffResult::Added)),
+                // there are no more elements in other_it, all the next elements in my
+                // should be removed
+                (Some((k,_)), None) =>  return Some((k, DiffResult::Removed)),
+                (Some((k1,v1)), Some((k2, v2))) => {
+                    // element is present in my but not other
+                    if k1 < k2 {
+                        self.other = Some((k2, v2));
+                        return Some((k1, DiffResult::Removed));
+                    // element is present in other byt not in my
+                    } else if k1 > k2 {
+                        self.my = Some((k1, v1));
+                        return Some((k2, DiffResult::Added));
+                    } else {
+                        // key is present in both, if elements have changed
+                        // return a value, otherwise go to the next key for both maps
+                        if v1 != v2 {
+                            return Some((k1, DiffResult::Changed));
+                        }
+                    }
+                }
+
+            }
+        }
+        //None
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
