@@ -363,19 +363,6 @@ impl ConfigState {
   }
 
   pub fn diff(&self, other:&ConfigState) -> Vec<ProxyRequestData> {
-    let my_apps: HashSet<&AppId>    = self.applications.keys().collect();
-    let their_apps: HashSet<&AppId> = other.applications.keys().collect();
-
-    let mut removed_apps: HashSet<&AppId> = my_apps.difference(&their_apps).cloned().collect();
-    let mut added_apps: Vec<&Application> = their_apps.difference(&my_apps)
-        .filter_map(|app_id| other.applications.get(app_id.as_str())).collect();
-
-    for app in my_apps.intersection(&their_apps) {
-      if self.applications.get(*app) != other.applications.get(*app) {
-        removed_apps.insert(app);
-        added_apps.push(other.applications.get(*app).as_ref().unwrap());
-      }
-    }
 
     //pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
     let my_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
@@ -392,83 +379,6 @@ impl ConfigState {
     let their_https_listeners: HashSet<&SocketAddr> = other.https_listeners.keys().collect();
     let removed_https_listeners = my_https_listeners.difference(&their_https_listeners);
     let added_https_listeners = their_https_listeners.difference(&my_https_listeners);
-
-    let mut my_http_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
-    for (ref app_id, ref front_list) in self.http_fronts.iter() {
-      for ref front in front_list.iter() {
-        my_http_fronts.insert((&app_id, &front));
-      }
-    }
-    let mut their_http_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
-    for (ref app_id, ref front_list) in other.http_fronts.iter() {
-      for ref front in front_list.iter() {
-        their_http_fronts.insert((&app_id, &front));
-      }
-    }
-
-    let removed_http_fronts = my_http_fronts.difference(&their_http_fronts);
-    let added_http_fronts   = their_http_fronts.difference(&my_http_fronts);
-
-    let mut my_https_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
-    for (ref app_id, ref front_list) in self.https_fronts.iter() {
-      for ref front in front_list.iter() {
-        my_https_fronts.insert((&app_id, &front));
-      }
-    }
-    let mut their_https_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
-    for (ref app_id, ref front_list) in other.https_fronts.iter() {
-      for ref front in front_list.iter() {
-        their_https_fronts.insert((&app_id, &front));
-      }
-    }
-
-    let removed_https_fronts = my_https_fronts.difference(&their_https_fronts);
-    let added_https_fronts   = their_https_fronts.difference(&my_https_fronts);
-
-    let mut my_tcp_fronts: HashSet<(&AppId, &TcpFront)> = HashSet::new();
-    for (ref app_id, ref front_list) in self.tcp_fronts.iter() {
-      for ref front in front_list.iter() {
-        my_tcp_fronts.insert((&app_id, &front));
-      }
-    }
-    let mut their_tcp_fronts: HashSet<(&AppId, &TcpFront)> = HashSet::new();
-    for (ref app_id, ref front_list) in other.tcp_fronts.iter() {
-      for ref front in front_list.iter() {
-        their_tcp_fronts.insert((&app_id, &front));
-      }
-    }
-
-    let removed_tcp_fronts = my_tcp_fronts.difference(&their_tcp_fronts);
-    let added_tcp_fronts   = their_tcp_fronts.difference(&my_tcp_fronts);
-
-    let mut my_backends: HashSet<(&AppId, &Backend)> = HashSet::new();
-    for (ref app_id, ref backend_list) in self.backends.iter() {
-      for ref backend in backend_list.iter() {
-        my_backends.insert((&app_id, &backend));
-      }
-    }
-    let mut their_backends: HashSet<(&AppId, &Backend)> = HashSet::new();
-    for (ref app_id, ref backend_list) in other.backends.iter() {
-      for ref backend in backend_list.iter() {
-        their_backends.insert((&app_id, &backend));
-      }
-    }
-
-    let removed_backends = my_backends.difference(&their_backends);
-    let added_backends   = their_backends.difference(&my_backends);
-
-    //pub certificates:    HashMap<SocketAddr, HashMap<CertFingerprint, (CertificateAndKey, Vec<String>)>>,
-    let my_certificates:    HashSet<(SocketAddr, &CertFingerprint)> =
-      HashSet::from_iter(self.certificates.iter().flat_map(|(addr, certs)| {
-        repeat(*addr).zip(certs.keys())
-      }));
-    let their_certificates: HashSet<(SocketAddr, &CertFingerprint)> =
-      HashSet::from_iter(other.certificates.iter().flat_map(|(addr, certs)| {
-        repeat(*addr).zip(certs.keys())
-      }));
-
-    let removed_certificates = my_certificates.difference(&their_certificates);
-    let added_certificates   = their_certificates.difference(&my_certificates);
 
     let mut v = vec!();
 
@@ -644,6 +554,20 @@ impl ConfigState {
     }
 
 
+    let my_apps: HashSet<&AppId>    = self.applications.keys().collect();
+    let their_apps: HashSet<&AppId> = other.applications.keys().collect();
+
+    let mut removed_apps: HashSet<&AppId> = my_apps.difference(&their_apps).cloned().collect();
+    let mut added_apps: Vec<&Application> = their_apps.difference(&my_apps)
+        .filter_map(|app_id| other.applications.get(app_id.as_str())).collect();
+
+    for app in my_apps.intersection(&their_apps) {
+      if self.applications.get(*app) != other.applications.get(*app) {
+        removed_apps.insert(app);
+        added_apps.push(other.applications.get(*app).as_ref().unwrap());
+      }
+    }
+
     for app_id in removed_apps {
       v.push(ProxyRequestData::RemoveApplication(app_id.to_string()));
     }
@@ -652,28 +576,22 @@ impl ConfigState {
       v.push(ProxyRequestData::AddApplication(app.clone()));
     }
 
-    for &(front, fingerprint) in added_certificates {
-      if let Some((ref certificate_and_key, ref names)) = other.certificates.get(&front)
-          .and_then(|certs| certs.get(fingerprint)) {
-              v.push(ProxyRequestData::AddCertificate(AddCertificate{
-                  front,
-                  certificate: certificate_and_key.clone(),
-                  names: names.clone(),
-              }));
-          }
+
+    let mut my_backends: HashSet<(&AppId, &Backend)> = HashSet::new();
+    for (ref app_id, ref backend_list) in self.backends.iter() {
+      for ref backend in backend_list.iter() {
+        my_backends.insert((&app_id, &backend));
+      }
+    }
+    let mut their_backends: HashSet<(&AppId, &Backend)> = HashSet::new();
+    for (ref app_id, ref backend_list) in other.backends.iter() {
+      for ref backend in backend_list.iter() {
+        their_backends.insert((&app_id, &backend));
+      }
     }
 
-    for &(_, front) in removed_http_fronts {
-     v.push(ProxyRequestData::RemoveHttpFront(front.clone()));
-    }
-
-    for &(_, front) in removed_https_fronts {
-     v.push(ProxyRequestData::RemoveHttpsFront(front.clone()));
-    }
-
-    for &(_, front) in removed_tcp_fronts {
-     v.push(ProxyRequestData::RemoveTcpFront(front.clone()));
-    }
+    let removed_backends = my_backends.difference(&their_backends);
+    let added_backends   = their_backends.difference(&my_backends);
 
     for &(_, backend) in added_backends {
       v.push(ProxyRequestData::AddBackend(backend.clone()));
@@ -687,17 +605,93 @@ impl ConfigState {
       }));
     }
 
+
+    let mut my_http_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in self.http_fronts.iter() {
+      for ref front in front_list.iter() {
+        my_http_fronts.insert((&app_id, &front));
+      }
+    }
+    let mut their_http_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in other.http_fronts.iter() {
+      for ref front in front_list.iter() {
+        their_http_fronts.insert((&app_id, &front));
+      }
+    }
+
+    let removed_http_fronts = my_http_fronts.difference(&their_http_fronts);
+    let added_http_fronts   = their_http_fronts.difference(&my_http_fronts);
+
+    for &(_, front) in removed_http_fronts {
+     v.push(ProxyRequestData::RemoveHttpFront(front.clone()));
+    }
+
     for &(_, front) in added_http_fronts {
       v.push(ProxyRequestData::AddHttpFront(front.clone()));
+    }
+
+    let mut my_https_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in self.https_fronts.iter() {
+      for ref front in front_list.iter() {
+        my_https_fronts.insert((&app_id, &front));
+      }
+    }
+    let mut their_https_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in other.https_fronts.iter() {
+      for ref front in front_list.iter() {
+        their_https_fronts.insert((&app_id, &front));
+      }
+    }
+
+    let removed_https_fronts = my_https_fronts.difference(&their_https_fronts);
+    let added_https_fronts   = their_https_fronts.difference(&my_https_fronts);
+
+    for &(_, front) in removed_https_fronts {
+     v.push(ProxyRequestData::RemoveHttpsFront(front.clone()));
     }
 
     for &(_, front) in added_https_fronts {
       v.push(ProxyRequestData::AddHttpsFront(front.clone()));
     }
 
+
+    let mut my_tcp_fronts: HashSet<(&AppId, &TcpFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in self.tcp_fronts.iter() {
+      for ref front in front_list.iter() {
+        my_tcp_fronts.insert((&app_id, &front));
+      }
+    }
+    let mut their_tcp_fronts: HashSet<(&AppId, &TcpFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in other.tcp_fronts.iter() {
+      for ref front in front_list.iter() {
+        their_tcp_fronts.insert((&app_id, &front));
+      }
+    }
+
+    let removed_tcp_fronts = my_tcp_fronts.difference(&their_tcp_fronts);
+    let added_tcp_fronts   = their_tcp_fronts.difference(&my_tcp_fronts);
+
+    for &(_, front) in removed_tcp_fronts {
+     v.push(ProxyRequestData::RemoveTcpFront(front.clone()));
+    }
+
     for &(_, front) in added_tcp_fronts {
       v.push(ProxyRequestData::AddTcpFront(front.clone()));
     }
+
+
+    //pub certificates:    HashMap<SocketAddr, HashMap<CertFingerprint, (CertificateAndKey, Vec<String>)>>,
+    let my_certificates:    HashSet<(SocketAddr, &CertFingerprint)> =
+      HashSet::from_iter(self.certificates.iter().flat_map(|(addr, certs)| {
+        repeat(*addr).zip(certs.keys())
+      }));
+    let their_certificates: HashSet<(SocketAddr, &CertFingerprint)> =
+      HashSet::from_iter(other.certificates.iter().flat_map(|(addr, certs)| {
+        repeat(*addr).zip(certs.keys())
+      }));
+
+    let removed_certificates = my_certificates.difference(&their_certificates);
+    let added_certificates   = their_certificates.difference(&my_certificates);
 
     for  &(front, fingerprint) in removed_certificates {
       v.push(ProxyRequestData::RemoveCertificate(RemoveCertificate {
@@ -706,6 +700,18 @@ impl ConfigState {
         names: Vec::new(),
       }));
     }
+
+    for &(front, fingerprint) in added_certificates {
+      if let Some((ref certificate_and_key, ref names)) = other.certificates.get(&front)
+          .and_then(|certs| certs.get(fingerprint)) {
+              v.push(ProxyRequestData::AddCertificate(AddCertificate{
+                  front,
+                  certificate: certificate_and_key.clone(),
+                  names: names.clone(),
+              }));
+          }
+    }
+
 
     for address in added_tcp_listeners {
       let listener = &other.tcp_listeners[address];
