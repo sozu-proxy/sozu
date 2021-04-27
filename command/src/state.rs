@@ -367,13 +367,13 @@ impl ConfigState {
     let their_apps: HashSet<&AppId> = other.applications.keys().collect();
 
     let mut removed_apps: HashSet<&AppId> = my_apps.difference(&their_apps).cloned().collect();
-    let mut added_apps: Vec<&Application> = their_apps.difference(&my_apps).filter_map(|app_id| other.applications.get(app_id.as_str())).collect();
+    let mut added_apps: Vec<&Application> = their_apps.difference(&my_apps)
+        .filter_map(|app_id| other.applications.get(app_id.as_str())).collect();
 
-    let common_apps: HashSet<&AppId> = my_apps.intersection(&their_apps).cloned().collect();
-    for app in common_apps {
-      if self.applications.get(app) != other.applications.get(app) {
+    for app in my_apps.intersection(&their_apps) {
+      if self.applications.get(*app) != other.applications.get(*app) {
         removed_apps.insert(app);
-        added_apps.push(other.applications.get(app).as_ref().unwrap());
+        added_apps.push(other.applications.get(*app).as_ref().unwrap());
       }
     }
 
@@ -381,20 +381,17 @@ impl ConfigState {
     let my_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
     let their_tcp_listeners: HashSet<&SocketAddr> = other.tcp_listeners.keys().collect();
     let removed_tcp_listeners = my_tcp_listeners.difference(&their_tcp_listeners);
-    let added_tcp_listeners: Vec<&SocketAddr> = their_tcp_listeners.difference(&my_tcp_listeners)
-      .cloned().collect();
+    let added_tcp_listeners = their_tcp_listeners.difference(&my_tcp_listeners);
 
     let my_http_listeners: HashSet<&SocketAddr> = self.http_listeners.keys().collect();
     let their_http_listeners: HashSet<&SocketAddr> = other.http_listeners.keys().collect();
     let removed_http_listeners = my_http_listeners.difference(&their_http_listeners);
-    let added_http_listeners: Vec<&SocketAddr> = their_http_listeners.difference(&my_http_listeners)
-      .cloned().collect();
+    let added_http_listeners = their_http_listeners.difference(&my_http_listeners);
 
     let my_https_listeners: HashSet<&SocketAddr> = self.https_listeners.keys().collect();
     let their_https_listeners: HashSet<&SocketAddr> = other.https_listeners.keys().collect();
     let removed_https_listeners = my_https_listeners.difference(&their_https_listeners);
-    let added_https_listeners: Vec<&SocketAddr> = their_https_listeners.difference(&my_https_listeners)
-      .cloned().collect();
+    let added_https_listeners = their_https_listeners.difference(&my_https_listeners);
 
     let mut my_http_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in self.http_fronts.iter() {
@@ -460,13 +457,14 @@ impl ConfigState {
     let removed_backends = my_backends.difference(&their_backends);
     let added_backends   = their_backends.difference(&my_backends);
 
-    let my_certificates:    HashSet<(SocketAddr, &CertFingerprint, &(CertificateAndKey, Vec<String>))> =
+    //pub certificates:    HashMap<SocketAddr, HashMap<CertFingerprint, (CertificateAndKey, Vec<String>)>>,
+    let my_certificates:    HashSet<(SocketAddr, &CertFingerprint)> =
       HashSet::from_iter(self.certificates.iter().flat_map(|(addr, certs)| {
-        certs.iter().zip(repeat(*addr)).map(|((k, v), addr)| (addr, k, v))
+        repeat(*addr).zip(certs.keys())
       }));
-    let their_certificates: HashSet<(SocketAddr, &CertFingerprint, &(CertificateAndKey, Vec<String>))> =
+    let their_certificates: HashSet<(SocketAddr, &CertFingerprint)> =
       HashSet::from_iter(other.certificates.iter().flat_map(|(addr, certs)| {
-        certs.iter().zip(repeat(*addr)).map(|((k, v), addr)| (addr, k, v))
+        repeat(*addr).zip(certs.keys())
       }));
 
     let removed_certificates = my_certificates.difference(&their_certificates);
@@ -494,7 +492,7 @@ impl ConfigState {
 
       if other.tcp_listeners[address].1 {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: *address,
+          front: **address,
           proxy: ListenerType::TCP,
           from_scm: false,
         }));
@@ -521,7 +519,7 @@ impl ConfigState {
 
       if other.http_listeners[address].1 {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: *address,
+          front: **address,
           proxy: ListenerType::HTTP,
           from_scm: false,
         }));
@@ -548,7 +546,7 @@ impl ConfigState {
 
       if other.https_listeners[address].1 {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: *address,
+          front: **address,
           proxy: ListenerType::HTTPS,
           from_scm: false,
         }));
@@ -654,12 +652,15 @@ impl ConfigState {
       v.push(ProxyRequestData::AddApplication(app.clone()));
     }
 
-    for &(front, _, &(ref certificate_and_key, ref names)) in added_certificates {
-      v.push(ProxyRequestData::AddCertificate(AddCertificate{
-        front,
-        certificate: certificate_and_key.clone(),
-        names: names.clone(),
-      }));
+    for &(front, fingerprint) in added_certificates {
+      if let Some((ref certificate_and_key, ref names)) = other.certificates.get(&front)
+          .and_then(|certs| certs.get(fingerprint)) {
+              v.push(ProxyRequestData::AddCertificate(AddCertificate{
+                  front,
+                  certificate: certificate_and_key.clone(),
+                  names: names.clone(),
+              }));
+          }
     }
 
     for &(_, front) in removed_http_fronts {
@@ -698,7 +699,7 @@ impl ConfigState {
       v.push(ProxyRequestData::AddTcpFront(front.clone()));
     }
 
-    for  &(front, fingerprint, _) in removed_certificates {
+    for  &(front, fingerprint) in removed_certificates {
       v.push(ProxyRequestData::RemoveCertificate(RemoveCertificate {
         front,
         fingerprint: fingerprint.clone(),
