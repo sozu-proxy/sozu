@@ -191,6 +191,7 @@ impl Notify for Executor {
 }
 
 pub struct FutureAnswer {
+  registered: bool,
   worker_id: Token,
   message_id: String,
 }
@@ -209,7 +210,11 @@ impl Future for FutureAnswer {
         }
       },
       None => {
-        Executor::register(self.worker_id, &self.message_id, MessageStatus::Other, task::current());
+        if !self.registered {
+          Executor::register(self.worker_id, &self.message_id, MessageStatus::Other, task::current());
+          self.registered = true;
+        }
+
         Ok(Async::NotReady)
       }
     }
@@ -256,6 +261,7 @@ pub fn send_processing(worker_id: Token, message: ProxyRequest) -> (FutureProces
   },
 
   FutureAnswer {
+    registered: false,
     worker_id,
     message_id
   })
@@ -265,6 +271,7 @@ pub fn send(worker_id: Token, message: ProxyRequest) -> FutureAnswer {
   let message_id = message.id.to_string();
   Executor::send_worker(worker_id, message);
   FutureAnswer {
+    registered: false,
     worker_id,
     message_id,
   }
