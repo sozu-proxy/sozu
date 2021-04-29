@@ -19,7 +19,6 @@ use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{Application,ProxyRequestData,HttpFront,HttpListener,
   ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent};
 use sozu_command::logging;
-use sozu_command::buffer::fixed::Buffer;
 
 use super::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
@@ -1371,11 +1370,11 @@ mod tests {
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
     assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
-    assert_size!(Http<mio::net::TcpStream>, 1016);
-    assert_size!(Pipe<mio::net::TcpStream>, 224);
-    assert_size!(State, 1024);
+    assert_size!(Http<mio::net::TcpStream>, 1232);
+    assert_size!(Pipe<mio::net::TcpStream>, 272);
+    assert_size!(State, 1240);
     // fails depending on the platform?
-    //assert_size!(Session, 1240);
+    assert_size!(Session, 1592);
   }
   */
 

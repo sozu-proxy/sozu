@@ -7,7 +7,6 @@ use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
 use rusty_ulid::Ulid;
 use time::{Instant, Duration};
-use sozu_command::buffer::fixed::Buffer;
 use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
 use buffer_queue::BufferQueue;
 use socket::{SocketHandler, SocketResult, TransportProtocol};
@@ -1542,12 +1541,14 @@ mod tests {
   fn size_test() {
     assert_size!(SessionStatus, 24);
     assert_size!(String, 24);
-    assert_size!(Rc<String>, 8);
     assert_size!(Option<String>, 24);
-    assert_size!(Vec<u8>, 24);
-    assert_size!(Rc<Vec<u8>>, 8);
     assert_size!(DefaultAnswerStatus, 1);
     assert_size!(Readiness, 16);
+    assert_size!(Option<BufferQueue>, 88);
+    assert_size!(Option<SocketAddr>, 32);
+    assert_size!(Option<RequestState>, 288);
+    assert_size!(Option<ResponseState>, 256);
+    assert_size!(Option<AddedRequestHeader>, 88);
   }
   */
 }
