@@ -21,14 +21,14 @@ Parameters in the global section allow you to define the global settings shared 
 * `log_level` possible values are: `debug, trace, error, warn, info`
 * `log_target` possible values are: `stdout, tcp or udp address`
 * `log_access_target` possible values are: `stdout, tcp or udp address` (if activated, sends access logs to a separate target)
-* `command_buffer_size` size of the buffer used by the main process to handle commands.
+* `command_buffer_size` size, in bytes, of the buffer used by the main process to handle commands.
 * `max_command_buffer_size` maximum size of the buffer used by the main process to handle commands.
 * `worker_count` number of workers
 * `worker_automatic_restart` if activated, workers that panicked or crashed are restarted (activated by default)
 * `handle_process_affinity` bind workers to cpu cores.
 * `max_connections` maximum number of simultaneous / opened connections
 * `max_buffers` maximum number of buffers use to proxying
-* `buffer_size` size of requests buffer use by the workers
+* `buffer_size` size, in bytes, of requests buffer use by the workers
 * `ctl_command_timeout` maximum time sozuctl will wait for a command to complete
 * `pid_file_path` stores the pid in a specific file location
 * `tls_provider` specifies which TLS implementation to use (openssl or rustls)
