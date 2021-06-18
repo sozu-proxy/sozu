@@ -265,7 +265,8 @@ impl Session {
         _ => result
       }
     } else {
-      error!("failed protocol upgrade");
+      // currently, only happens in expect proxy protocol with AF_UNSPEC address
+      //error!("failed protocol upgrade");
       SessionResult::CloseSession
     }
   }

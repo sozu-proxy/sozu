@@ -154,7 +154,8 @@ impl Session {
         }
       }
 
-      error!("failed to upgrade from expect");
+      // currently, only happens in expect proxy protocol with AF_UNSPEC address
+      //error!("failed to upgrade from expect");
       self.protocol = Some(State::Expect(expect, ssl));
       false
     } else if let State::Handshake(handshake) = protocol {
