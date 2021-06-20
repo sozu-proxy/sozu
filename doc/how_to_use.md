@@ -6,7 +6,7 @@
 
 If you used the `cargo install` way, `sozu` and `sozuctl` are already in your `$PATH`.
 
-`sozu -c <path/to/your/config.toml>`
+`sozu start -c <path/to/your/config.toml>`
 
 However, if you built the project from source, `sozu` and `sozuctl` are placed in the `target` directory.
 
