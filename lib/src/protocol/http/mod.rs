@@ -15,6 +15,7 @@ use util::UnwrapLog;
 use server::TIMER;
 use timer::TimeoutContainer;
 use sozu_command::ready::Ready;
+use crate::Backend;
 
 pub mod parser;
 pub mod cookies;
@@ -79,7 +80,7 @@ pub struct Http<Front:SocketHandler> {
   pub back_readiness: Readiness,
   pub public_address: SocketAddr,
   pub session_address: Option<SocketAddr>,
-  pub backend_address: Option<SocketAddr>,
+  pub backend_data:   Option<Rc<RefCell<Backend>>>,
   pub sticky_name:    String,
   pub sticky_session: Option<StickySession>,
   pub protocol:       Protocol,
@@ -122,7 +123,7 @@ impl<Front:SocketHandler> Http<Front> {
       back_readiness:     Readiness::new(),
       public_address,
       session_address,
-      backend_address:    None,
+      backend_data: None,
       sticky_name,
       sticky_session:     None,
       protocol,
@@ -300,9 +301,9 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn close(&mut self) {
   }
 
-  pub fn set_back_socket(&mut self, socket: TcpStream, address: SocketAddr) {
+  pub fn set_back_socket(&mut self, socket: TcpStream, backend: Option<Rc<RefCell<Backend>>>) {
     self.backend = Some(socket);
-    self.backend_address = Some(address);
+    self.backend_data = backend;
   }
 
   pub fn set_app_id(&mut self, app_id: String) {
@@ -442,7 +443,8 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn get_backend_address(&self) -> Option<SocketAddr> {
-    self.backend_address.or_else( || self.backend.as_ref().and_then(|backend| backend.peer_addr().ok()))
+    self.backend_data.as_ref().map(|b| b.borrow().address)
+        .or_else( || self.backend.as_ref().and_then(|backend| backend.peer_addr().ok()))
   }
 
   pub fn websocket_context(&self) -> String {

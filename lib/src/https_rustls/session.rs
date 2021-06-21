@@ -423,7 +423,7 @@ impl Session {
 
   pub fn set_back_socket(&mut self, sock:TcpStream) {
     if let State::Http(ref mut http) = unwrap_msg!(self.protocol.as_mut()) {
-      http.set_back_socket(sock, self.backend.as_ref().map(|b| b.borrow().address).unwrap())
+      http.set_back_socket(sock, self.backend.clone())
     }
   }
 
