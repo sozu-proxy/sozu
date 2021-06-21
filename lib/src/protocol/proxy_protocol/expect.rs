@@ -2,7 +2,7 @@ use std::io::Read;
 
 use mio::*;
 use mio::net::TcpStream;
-use nom::Err;
+use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
 use SessionResult;
 use Readiness;
@@ -111,8 +111,8 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
         };
         (ProtocolResult::Continue, SessionResult::Continue)
       },
-      Err(e) => {
-        error!("[{:?}] front socket parse error, closing the connection: {:?}", self.frontend_token, e);
+      Err(Err::Error(e)) | Err(Err::Failure(e)) => {
+        error!("[{:?}] expect proxy protocol front socket parse error, closing the connection:\n{}", self.frontend_token, e.input.to_hex(16));
         metrics.service_stop();
         incr!("proxy_protocol.errors");
         self.readiness.reset();
