@@ -79,15 +79,15 @@ impl TlsHandshake {
                     // SNI error
                     self.log_request_error(metrics, &e);
                   } else {
-                    error!("accept: handshake failed (client = {:?}): {:?}", self.address, e);
+                    error!("accept: handshake failed (client = {:?}): {} ({:?})", self.address, e.error(), e);
                   }
                 } else if errors.len() == 2 && errors[0].code() == 0x1412E0E2 && errors[1].code() == 0x1408A0E3 {
                   incr!("openssl.sni.error");
                 } else {
-                  error!("accept: handshake failed (client = {:?}): {:?}", self.address, e);
+                  error!("accept: handshake failed (client = {:?}): {} ({:?})", self.address, e.error(), e);
                 }
               } else {
-                error!("accept: handshake failed (client = {:?}): {:?}", self.address, e);
+                error!("accept: handshake failed (client = {:?}): {} ({:?})", self.address, e.error(), e);
               }
             }
             self.state = TlsState::Error(HandshakeError::Failure(e));
