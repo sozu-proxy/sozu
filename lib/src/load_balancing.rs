@@ -1,4 +1,4 @@
-use rand::{thread_rng, seq::SliceRandom};
+use rand::{thread_rng, seq::SliceRandom, Rng};
 
 use Backend;
 
@@ -61,8 +61,57 @@ impl LoadBalancingAlgorithm for LeastConnectionsAlgorithm {
       .min_by_key(|backend| backend.borrow().active_connections)
       .map(|backend| (*backend).clone())
   }
+}
+
+#[derive(Debug)]
+pub struct PowerOfTwo;
+
+impl LoadBalancingAlgorithm for PowerOfTwo {
+    fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
+        let mut first = None;
+        let mut second = None;
+
+        for backend in backends.iter() {
+            let connections = backend.borrow().active_connections;
+
+            if first.is_none() {
+                first = Some((connections, backend));
+            } else if second.is_none() {
+                if first.as_ref().unwrap().0 <= connections {
+                    second = Some((connections, backend));
+                } else {
+                    second = first.take();
+                    first = Some((connections, backend));
+                }
+            } else {
+                if first.as_ref().unwrap().0 <= connections {
+                    if connections < second.as_ref().unwrap().0 {
+                        second = Some((connections, backend));
+                    } // other case: we don't change anything
+                } else {
+                    second = first.take();
+                    first = Some((connections, backend));
+                }
+            }
+        }
+
+        match (first, second) {
+            (None, None) => None,
+            (Some((_, b)), None) => Some(b.clone()),
+            // should not happen, but let's be exhaustive
+            (None, Some((_, b))) => Some(b.clone()),
+            (Some((_, b1)), Some((_, b2))) => {
+                if thread_rng().gen_bool(0.5) {
+                    Some(b1.clone())
+                } else {
+                    Some(b2.clone())
+                }
+            }
+        }
+    }
 
 }
+
 
 #[cfg(test)]
 mod test {

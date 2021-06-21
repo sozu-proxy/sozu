@@ -376,6 +376,7 @@ pub enum LoadBalancingAlgorithms {
   RoundRobin,
   Random,
   LeastConnections,
+  PowerOfTwo,
 }
 
 impl Default for LoadBalancingAlgorithms {
