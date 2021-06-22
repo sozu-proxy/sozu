@@ -832,7 +832,7 @@ impl Listener {
 #[derive(Debug)]
 pub struct ApplicationConfiguration {
   proxy_protocol: Option<ProxyProtocolConfig>,
-  load_balancing_policy: LoadBalancingAlgorithms,
+  load_balancing: LoadBalancingAlgorithms,
 }
 
 pub struct Proxy {
@@ -1009,7 +1009,7 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::AddApplication(application) => {
         let config = ApplicationConfiguration {
           proxy_protocol: application.proxy_protocol,
-          load_balancing_policy: application.load_balancing_policy,
+          load_balancing: application.load_balancing,
         };
         self.configs.insert(application.app_id.clone(), config);
 

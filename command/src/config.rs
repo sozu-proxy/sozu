@@ -358,16 +358,16 @@ pub enum FileAppProtocolConfig {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileAppConfig {
-  pub frontends:             Vec<FileAppFrontendConfig>,
-  pub backends:              Vec<BackendConfig>,
-  pub protocol:              FileAppProtocolConfig,
-  pub sticky_session:        Option<bool>,
-  pub https_redirect:        Option<bool>,
+  pub frontends: Vec<FileAppFrontendConfig>,
+  pub backends: Vec<BackendConfig>,
+  pub protocol: FileAppProtocolConfig,
+  pub sticky_session: Option<bool>,
+  pub https_redirect: Option<bool>,
   #[serde(default)]
-  pub send_proxy:            Option<bool>,
+  pub send_proxy: Option<bool>,
   #[serde(default)]
-  pub load_balancing_policy: LoadBalancingAlgorithms,
-  pub answer_503:            Option<String>,
+  pub load_balancing: LoadBalancingAlgorithms,
+  pub answer_503: Option<String>,
   #[serde(default)]
   pub load_metric: Option<LoadMetric>,
 }
@@ -466,11 +466,11 @@ impl FileAppConfig {
         };
 
         Ok(AppConfig::Tcp(TcpAppConfig {
-          app_id:         app_id.to_string(),
+          app_id: app_id.to_string(),
           frontends,
-          backends:       self.backends,
+          backends: self.backends,
           proxy_protocol,
-          load_balancing_policy: self.load_balancing_policy,
+          load_balancing: self.load_balancing,
           load_metric: self.load_metric,
         }))
       },
@@ -489,12 +489,12 @@ impl FileAppConfig {
         }).ok());
 
         Ok(AppConfig::Http(HttpAppConfig {
-          app_id:            app_id.to_string(),
+          app_id: app_id.to_string(),
           frontends,
-          backends:          self.backends,
-          sticky_session:    self.sticky_session.unwrap_or(false),
-          https_redirect:    self.https_redirect.unwrap_or(false),
-          load_balancing_policy: self.load_balancing_policy,
+          backends: self.backends,
+          sticky_session: self.sticky_session.unwrap_or(false),
+          https_redirect: self.https_redirect.unwrap_or(false),
+          load_balancing: self.load_balancing,
           load_metric: self.load_metric,
           answer_503,
         }))
@@ -556,14 +556,14 @@ impl HttpFrontendConfig {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpAppConfig {
-  pub app_id:            String,
-  pub frontends:         Vec<HttpFrontendConfig>,
-  pub backends:          Vec<BackendConfig>,
-  pub sticky_session:    bool,
-  pub https_redirect:    bool,
-  pub load_balancing_policy: LoadBalancingAlgorithms,
+  pub app_id: String,
+  pub frontends: Vec<HttpFrontendConfig>,
+  pub backends: Vec<BackendConfig>,
+  pub sticky_session: bool,
+  pub https_redirect: bool,
+  pub load_balancing: LoadBalancingAlgorithms,
   pub load_metric: Option<LoadMetric>,
-  pub answer_503:        Option<String>,
+  pub answer_503: Option<String>,
 }
 
 impl HttpAppConfig {
@@ -575,7 +575,7 @@ impl HttpAppConfig {
       sticky_session: self.sticky_session,
       https_redirect: self.https_redirect,
       proxy_protocol: None,
-      load_balancing_policy: self.load_balancing_policy,
+      load_balancing: self.load_balancing,
       answer_503: self.answer_503.clone(),
       load_metric: self.load_metric.clone(),
     }));
@@ -614,12 +614,12 @@ pub struct TcpFrontendConfig {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct TcpAppConfig {
-  pub app_id:            String,
-  pub frontends:         Vec<TcpFrontendConfig>,
-  pub backends:          Vec<BackendConfig>,
+  pub app_id: String,
+  pub frontends: Vec<TcpFrontendConfig>,
+  pub backends: Vec<BackendConfig>,
   #[serde(default)]
-  pub proxy_protocol:    Option<ProxyProtocolConfig>,
-  pub load_balancing_policy: LoadBalancingAlgorithms,
+  pub proxy_protocol: Option<ProxyProtocolConfig>,
+  pub load_balancing: LoadBalancingAlgorithms,
   pub load_metric: Option<LoadMetric>,
 }
 
@@ -632,7 +632,7 @@ impl TcpAppConfig {
       sticky_session: false,
       https_redirect: false,
       proxy_protocol: self.proxy_protocol.clone(),
-      load_balancing_policy: self.load_balancing_policy,
+      load_balancing: self.load_balancing,
       load_metric: self.load_metric.clone(),
       answer_503: None,
     }));

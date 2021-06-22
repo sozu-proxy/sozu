@@ -225,23 +225,23 @@ impl<'de> serde::Deserialize<'de> for CertFingerprint {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Application {
-    pub app_id:            String,
+    pub app_id: String,
     #[serde(default)]
     #[serde(skip_serializing_if="is_false")]
-    pub sticky_session:    bool,
+    pub sticky_session: bool,
     #[serde(default)]
     #[serde(skip_serializing_if="is_false")]
-    pub https_redirect:    bool,
+    pub https_redirect: bool,
     #[serde(default)]
     #[serde(skip_serializing_if="is_default")]
-    pub proxy_protocol:    Option<ProxyProtocolConfig>,
-    #[serde(rename = "load_balancing_policy")]
+    pub proxy_protocol: Option<ProxyProtocolConfig>,
+    #[serde(rename = "load_balancing")]
     #[serde(default)]
     #[serde(skip_serializing_if="is_default")]
-    pub load_balancing_policy: LoadBalancingAlgorithms,
+    pub load_balancing: LoadBalancingAlgorithms,
     #[serde(default)]
     #[serde(skip_serializing_if="is_default")]
-    pub answer_503:        Option<String>,
+    pub answer_503: Option<String>,
     #[serde(skip_serializing_if="Option::is_none")]
     pub load_metric: Option<LoadMetric>,
 }

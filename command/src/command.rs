@@ -190,7 +190,7 @@ mod tests {
                   sticky_session: true,
                   https_redirect: true,
                   proxy_protocol: Some(ProxyProtocolConfig::ExpectHeader),
-                  load_balancing_policy: LoadBalancingAlgorithms::RoundRobin,
+                  load_balancing: LoadBalancingAlgorithms::RoundRobin,
                   load_metric: None,
                   answer_503: None,
       })),
