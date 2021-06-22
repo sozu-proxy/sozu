@@ -145,15 +145,15 @@ impl TimeoutContainer {
   }
 
   pub fn reset(&mut self) -> bool {
-      self.timeout = match self.timeout.take() {
+      match self.timeout.take() {
         None => {
             //error!("cannot reset non existing timeout");
             return false;
         },
         Some(timeout) => {
-            TIMER.with(|timer| {
+            self.timeout = TIMER.with(|timer| {
                 timer.borrow_mut().reset_timeout(&timeout, self.duration)
-            })
+            });
         },
       };
       self.timeout.is_some()
