@@ -705,9 +705,10 @@ pub enum Topic {
     TcpProxyConfig
 }
 
+/*
 fn is_true(b: &bool) -> bool {
     *b
-}
+}*/
 
 fn is_false(b: &bool) -> bool {
     !*b

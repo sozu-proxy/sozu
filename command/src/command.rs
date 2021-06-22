@@ -1,5 +1,3 @@
-use serde::ser::SerializeMap;
-
 use std::net::SocketAddr;
 use std::collections::BTreeMap;
 
@@ -97,11 +95,6 @@ pub struct WorkerInfo {
   pub id:         u32,
   pub pid:        i32,
   pub run_state:  RunState,
-}
-
-#[derive(Deserialize)]
-struct SaveStateData {
-  path : String
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]

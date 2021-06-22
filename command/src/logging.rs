@@ -667,7 +667,7 @@ macro_rules! setup_test_logger {
 }
 
 pub struct Rfc3339Time {
-  inner: ::time::PrimitiveDateTime,
+  inner: ::time::OffsetDateTime,
 }
 
 impl std::fmt::Display for Rfc3339Time {
@@ -682,6 +682,6 @@ impl std::fmt::Display for Rfc3339Time {
 }
 
 pub fn now() -> (Rfc3339Time, i128) {
-  let t = time::PrimitiveDateTime::now();
-  (Rfc3339Time { inner: t, }, (t - time::PrimitiveDateTime::unix_epoch()).whole_nanoseconds())
+  let t = time::OffsetDateTime::now_utc();
+  (Rfc3339Time { inner: t, }, (t - time::OffsetDateTime::unix_epoch()).whole_nanoseconds())
 }

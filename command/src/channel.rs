@@ -1,4 +1,3 @@
-use mio::*;
 use mio::net::UnixStream;
 use mio::event::Source;
 use std::fmt::Debug;

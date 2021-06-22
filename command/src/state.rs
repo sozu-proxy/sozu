@@ -798,7 +798,6 @@ pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(Strin
     .map(|(c, names)| (c.certificate.clone(), names.clone())).next()
 }
 
-use std::collections::btree_map::Iter;
 struct DiffMap<'a, K:Ord, V, I1, I2> {
   my_it: I1,
   other_it: I2,
