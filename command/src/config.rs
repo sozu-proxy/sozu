@@ -373,11 +373,11 @@ pub struct FileAppConfig {
 }
 
 #[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum LoadBalancingAlgorithms {
   RoundRobin,
   Random,
-  LeastConnections,
+  LeastLoaded,
   PowerOfTwo,
 }
 

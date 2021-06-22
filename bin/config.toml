@@ -232,8 +232,10 @@ tls_versions = ["TLSv1.3"]
 protocol = "http"
 
 # per application load balancing algorithm. The possible values are
-# "roundrobin" and "random". Defaults to "roundrobin"
-# load_balancing_policy="roundrobin"
+# "round_robin" and "random". Defaults to "round_robin"
+# load_balancing_policy="round_robin"
+# metric evaluating the load on the backend. available options: connections, requests
+# load_metric = "connections"
 
 # frontends configuration
 # this specifies which listeners; domains, certificates that will be configured for an application
@@ -256,7 +258,6 @@ frontends = [
 # - address: IP and port of the backend server
 # - weight: weight used by the load balancing algorithm
 # - sticky-id: sticky session identifier
-# - load_metric: which metric is used to evaluate the load on the backend: available options; LeastConnections, LeastRequests
 backends = [
   { address = "127.0.0.1:1026" }
 ]

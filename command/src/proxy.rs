@@ -379,26 +379,24 @@ pub struct RemoveBackend {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
 pub struct LoadBalancingParams {
     pub weight: u8,
-    #[serde(skip_serializing_if="Option::is_none")]
-    pub metric: Option<LoadMetric>,
 }
 
 impl Default for LoadBalancingParams {
   fn default() -> Self {
     Self {
       weight: 0,
-      metric: None,
     }
   }
 }
 
 /// how sozu measures which backend is less loaded
 #[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LoadMetric {
     /// number of TCP connections
-    LeastConnections,
+    Connections,
     /// number of active HTTP requests
-    LeastRequests,
+    Requests,
 }
 
 pub fn default_sticky_name() -> String {
