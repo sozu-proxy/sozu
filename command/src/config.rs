@@ -368,6 +368,8 @@ pub struct FileAppConfig {
   #[serde(default)]
   pub load_balancing_policy: LoadBalancingAlgorithms,
   pub answer_503:            Option<String>,
+  #[serde(default)]
+  pub load_metric: Option<LoadMetric>,
 }
 
 #[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -425,7 +427,6 @@ pub struct BackendConfig {
   pub sticky_id: Option<String>,
   pub backup: Option<bool>,
   pub backend_id: Option<String>,
-  pub load_metric: Option<LoadMetric>,
 }
 
 impl FileAppConfig {
@@ -470,6 +471,7 @@ impl FileAppConfig {
           backends:       self.backends,
           proxy_protocol,
           load_balancing_policy: self.load_balancing_policy,
+          load_metric: self.load_metric,
         }))
       },
       FileAppProtocolConfig::Http => {
@@ -493,6 +495,7 @@ impl FileAppConfig {
           sticky_session:    self.sticky_session.unwrap_or(false),
           https_redirect:    self.https_redirect.unwrap_or(false),
           load_balancing_policy: self.load_balancing_policy,
+          load_metric: self.load_metric,
           answer_503,
         }))
       }
@@ -559,6 +562,7 @@ pub struct HttpAppConfig {
   pub sticky_session:    bool,
   pub https_redirect:    bool,
   pub load_balancing_policy: LoadBalancingAlgorithms,
+  pub load_metric: Option<LoadMetric>,
   pub answer_503:        Option<String>,
 }
 
@@ -573,6 +577,7 @@ impl HttpAppConfig {
       proxy_protocol: None,
       load_balancing_policy: self.load_balancing_policy,
       answer_503: self.answer_503.clone(),
+      load_metric: self.load_metric.clone(),
     }));
 
     for frontend in &self.frontends {
@@ -584,7 +589,6 @@ impl HttpAppConfig {
     for backend in &self.backends {
         let load_balancing_parameters = Some(LoadBalancingParams {
           weight: backend.weight.unwrap_or(100),
-          metric: backend.load_metric.clone(),
         });
 
         v.push(ProxyRequestData::AddBackend(Backend {
@@ -616,6 +620,7 @@ pub struct TcpAppConfig {
   #[serde(default)]
   pub proxy_protocol:    Option<ProxyProtocolConfig>,
   pub load_balancing_policy: LoadBalancingAlgorithms,
+  pub load_metric: Option<LoadMetric>,
 }
 
 impl TcpAppConfig {
@@ -628,6 +633,7 @@ impl TcpAppConfig {
       https_redirect: false,
       proxy_protocol: self.proxy_protocol.clone(),
       load_balancing_policy: self.load_balancing_policy,
+      load_metric: self.load_metric.clone(),
       answer_503: None,
     }));
 
@@ -642,7 +648,6 @@ impl TcpAppConfig {
     for backend in &self.backends {
       let load_balancing_parameters = Some(LoadBalancingParams {
         weight: backend.weight.unwrap_or(100),
-        metric: backend.load_metric.clone(),
       });
 
       v.push(ProxyRequestData::AddBackend(Backend {

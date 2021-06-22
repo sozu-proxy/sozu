@@ -242,6 +242,8 @@ pub struct Application {
     #[serde(default)]
     #[serde(skip_serializing_if="is_default")]
     pub answer_503:        Option<String>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub load_metric: Option<LoadMetric>,
 }
 
 fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
