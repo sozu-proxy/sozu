@@ -1,14 +1,9 @@
 #!/bin/sh
 
-BINDIR="/usr/local/bin"
-SYSCONFDIR="/etc"
-DATADIR="/var/lib/sozu"
-RUNDIR="/run"
-
 substitute() {
     sed -e "s:__BINDIR__:${BINDIR}:"         \
         -e "s:__SYSCONFDIR__:${SYSCONFDIR}:" \
-        -e "s:__DATADIR__:${DATADIR}:"       \
+        -e "s:__DATADIR__:${DATADIR}:g"       \
         -e "s:__RUNDIR__:${RUNDIR}:"         \
         -e "s:__SOZU_USER__:root:"           \
         -e "s:__SOZU_GROUP__:root:"          \
