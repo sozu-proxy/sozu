@@ -2,12 +2,13 @@ use std::net::SocketAddr;
 use mio::*;
 use mio::net::*;
 use rusty_ulid::Ulid;
-use time::Duration;
+use time::{Instant, Duration};
 use {SessionResult,Readiness,SessionMetrics};
 use sozu_command::ready::Ready;
 use socket::{SocketHandler,SocketResult,TransportProtocol};
 use pool::Checkout;
 use {Protocol, LogDuration};
+use server::TIMER;
 use timer::TimeoutContainer;
 
 #[derive(PartialEq)]
@@ -128,9 +129,25 @@ impl<Front:SocketHandler> Pipe<Front> {
     self.backend_token
   }
 
-  pub fn timeout(&mut self, _token: Token, _metrics: &mut SessionMetrics) -> SessionResult {
-      //FIXME
-      SessionResult::CloseSession
+  pub fn timeout(&mut self, token: Token, _metrics: &mut SessionMetrics) -> SessionResult {
+      //info!("got timeout for token: {:?}", token);
+    if self.frontend_token == token {
+      if let Some(timeout) = self.front_timeout.as_mut() {
+        timeout.triggered();
+        SessionResult::CloseSession
+      } else {
+        SessionResult::CloseSession
+      }
+    } else if self.backend_token == Some(token) {
+        //info!("backend timeout triggered for token {:?}", token);
+        if let Some(timeout) = self.back_timeout.as_mut() {
+          timeout.triggered();
+        }
+        SessionResult::CloseSession
+    } else {
+        error!("got timeout for an invalid token");
+        SessionResult::CloseSession
+    }
   }
 
   pub fn cancel_timeouts(&mut self) {
@@ -493,6 +510,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   // Forward content to application
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("pipe back_writable");
+
     if self.front_buf.available_data() == 0 {
       self.front_readiness.interest.insert(Ready::readable());
       self.back_readiness.interest.remove(Ready::writable());

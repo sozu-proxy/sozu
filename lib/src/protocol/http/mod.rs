@@ -1242,6 +1242,8 @@ impl<Front:SocketHandler> Http<Front> {
     if let Some(ResponseState::ResponseUpgrade(_,_, ref protocol)) = self.response {
       debug!("got an upgrade state[{}]: {:?}", line!(), protocol);
       if compare_no_case(protocol.as_bytes(), "websocket".as_bytes()) {
+        self.front_timeout.reset();
+        self.back_timeout.reset();
         return (ProtocolResult::Upgrade, SessionResult::Continue);
       } else {
         //FIXME: should we upgrade to a pipe or send an error?
@@ -1384,6 +1386,8 @@ impl<Front:SocketHandler> Http<Front> {
         if let Some(ResponseState::ResponseUpgrade(_,_, ref protocol)) = self.response {
           debug!("got an upgrade state[{}]: {:?}", line!(), protocol);
           if compare_no_case(protocol.as_bytes(), "websocket".as_bytes()) {
+            self.front_timeout.reset();
+            self.back_timeout.reset();
             return (ProtocolResult::Upgrade, SessionResult::Continue);
           } else {
             //FIXME: should we upgrade to a pipe or send an error?
