@@ -575,9 +575,21 @@ impl ProxySession for Session {
 
   fn timeout(&mut self, token: Token) -> SessionResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Expect(_,_) => SessionResult::CloseSession,
-      State::Handshake(_) => SessionResult::CloseSession,
-      State::WebSocket(_) => SessionResult::CloseSession,
+      State::Expect(_,_) => {
+          if token == self.frontend_token {
+              self.front_timeout.triggered();
+          }
+
+          SessionResult::CloseSession
+      },
+      State::Handshake(_) => {
+          if token == self.frontend_token {
+              self.front_timeout.triggered();
+          }
+
+          SessionResult::CloseSession
+      },
+      State::WebSocket(ref mut pipe) => pipe.timeout(token, &mut self.metrics),
       State::Http(ref mut http) => http.timeout(token, &mut self.metrics),
     }
   }
