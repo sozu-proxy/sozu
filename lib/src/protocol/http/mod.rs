@@ -170,6 +170,11 @@ impl<Front:SocketHandler> Http<Front> {
     self.request_id = request_id;
     self.keepalive_count += 1;
 
+    if let Some(ref mut b) = self.backend_data {
+      let mut backend = b.borrow_mut();
+      backend.active_requests = backend.active_requests.saturating_sub(1);
+    }
+
     // reset the front timeout and cancel the back timeout while we are
     // waiting for a new request
     self.front_timeout.reset();

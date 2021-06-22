@@ -512,6 +512,7 @@ impl ProxyConfiguration<Session> for Proxy {
         //matched on keepalive
         session.metrics.backend_id = session.backend.as_ref().map(|i| i.borrow().backend_id.clone());
         session.metrics.backend_start();
+        session.http_mut().map(|h| h.backend_data.as_mut().map(|b| b.borrow_mut().active_requests += 1));
         return Ok(BackendConnectAction::Reuse);
       } else if let Some(token) = session.back_token() {
         session.close_backend(token, poll);

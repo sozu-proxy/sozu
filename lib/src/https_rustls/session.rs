@@ -453,6 +453,8 @@ impl Session {
           push_event(ProxyEvent::BackendUp(backend.backend_id.clone(), backend.address));
         }
 
+        backend.active_requests += 1;
+
         backend.failures = 0;
         backend.retry_policy.succeed();
       });
@@ -545,10 +547,21 @@ impl ProxySession for Session {
     //FIXME: should we really pass a token here?
     self.close_backend(Token(0), poll);
 
-    if let Some(State::Http(ref http)) = self.protocol {
+    if let Some(State::Http(ref mut http)) = self.protocol {
       //if the state was initial, the connection was already reset
       if http.request != Some(RequestState::Initial) {
         gauge_add!("http.active_requests", -1);
+        if let Some(b) = http.backend_data.as_mut() {
+          let mut backend = b.borrow_mut();
+          backend.active_requests = backend.active_requests.saturating_sub(1);
+        }
+      }
+    }
+
+    if let Some(State::WebSocket(_)) = self.protocol {
+      if let Some(b) = self.backend.as_mut() {
+        let mut backend = b.borrow_mut();
+        backend.active_requests = backend.active_requests.saturating_sub(1);
       }
     }
 

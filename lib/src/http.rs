@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
-use std::convert::TryFrom;
 use std::os::unix::io::IntoRawFd;
 use std::net::{SocketAddr,Shutdown};
 use std::str::from_utf8_unchecked;
@@ -384,6 +383,8 @@ impl Session {
           push_event(ProxyEvent::BackendUp(backend.backend_id.clone(), backend.address));
         }
 
+        backend.active_requests += 1;
+
         //successful connection, reset failure counter
         backend.failures = 0;
         backend.retry_policy.succeed();
@@ -480,10 +481,22 @@ impl ProxySession for Session {
     //FIXME: should we really pass a token here?
     self.close_backend(Token(0), poll);
 
-    if let Some(State::Http(ref http)) = self.protocol {
+    if let Some(State::Http(ref mut http)) = self.protocol {
       //if the state was initial, the connection was already reset
       if http.request != Some(RequestState::Initial) {
         gauge_add!("http.active_requests", -1);
+
+        if let Some(b) = http.backend_data.as_mut() {
+         let mut backend = b.borrow_mut();
+         backend.active_requests = backend.active_requests.saturating_sub(1);
+        }
+      }
+    }
+
+    if let Some(State::WebSocket(_)) = self.protocol {
+      if let Some(b) = self.backend.as_mut() {
+        let mut backend = b.borrow_mut();
+        backend.active_requests = backend.active_requests.saturating_sub(1);
       }
     }
 
@@ -1113,6 +1126,7 @@ impl ProxyConfiguration<Session> for Proxy {
         //matched on keepalive
         session.metrics.backend_id = session.backend.as_ref().map(|i| i.borrow().backend_id.clone());
         session.metrics.backend_start();
+        session.http_mut().map(|h| h.backend_data.as_mut().map(|b| b.borrow_mut().active_requests += 1));
         return Ok(BackendConnectAction::Reuse);
       } else if let Some(token) = session.back_token() {
         session.close_backend(token, poll);
