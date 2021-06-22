@@ -95,7 +95,6 @@ pub struct Http<Front:SocketHandler> {
   answers:             Rc<RefCell<answers::HttpAnswers>>,
   pub closing:         bool,
   pool:                Weak<RefCell<Pool>>,
-  pub frontend_last_event: Instant,
   pub front_timeout:   TimeoutContainer,
   pub back_timeout:    TimeoutContainer,
   pub frontend_timeout_duration: Duration,
@@ -136,7 +135,6 @@ impl<Front:SocketHandler> Http<Front> {
       keepalive_count: 0,
       backend_stop:    None,
       closing:         false,
-      frontend_last_event: Instant::now(),
       front_timeout,
       back_timeout: TimeoutContainer::new_empty(backend_timeout_duration),
       frontend_timeout_duration,
@@ -592,7 +590,6 @@ impl<Front:SocketHandler> Http<Front> {
     if !self.front_timeout.reset() {
         //error!("could not reset front timeout");
     }
-    self.frontend_last_event = Instant::now();
 
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       self.front_readiness.interest.insert(Ready::writable());
@@ -823,7 +820,6 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   fn writable_default_answer(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    self.frontend_last_event = Instant::now();
     let res = if let SessionStatus::DefaultAnswer(_, ref buf, mut index) = self.status {
       let len = buf.len();
 
@@ -867,8 +863,6 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Forward content to session
   pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    self.frontend_last_event = Instant::now();
-
     //handle default answers
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       return self.writable_default_answer(metrics);
@@ -1047,7 +1041,6 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Forward content to application
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    self.frontend_last_event = Instant::now();
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       error!("{}\tsending default answer, should not write to back", self.log_context());
       self.back_readiness.interest.remove(Ready::writable());
@@ -1190,8 +1183,6 @@ impl<Front:SocketHandler> Http<Front> {
     if !self.back_timeout.reset() {
         error!("could not reset back timeout {:?}:\n{}", self.back_timeout, self.print_state(""));
     }
-
-    self.frontend_last_event = Instant::now();
 
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       error!("{}\tsending default answer, should not read from back socket", self.log_context());
@@ -1422,29 +1413,20 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> SessionResult {
     //info!("got timeout for token: {:?}", token);
     if self.frontend_token == token {
-      let dur = Instant::now() - self.frontend_last_event;
-      let front_timeout = self.front_timeout.duration();
-      if dur < front_timeout {
-        TIMER.with(|timer| {
-            timer.borrow_mut().set_timeout(front_timeout - dur, token);
-        });
-        SessionResult::Continue
-      } else {
-        //info!("frontend timeout triggered for token {:?}", token);
-        self.front_timeout.triggered();
-        match self.timeout_status() {
-          TimeoutStatus::Request => {
-            self.set_answer(DefaultAnswerStatus::Answer408, None);
-            self.writable(metrics)
-          },
-          TimeoutStatus::WaitingForResponse => {
-            SessionResult::CloseSession
-          },
-          TimeoutStatus::Response => {
-            SessionResult::CloseSession
-          },
-          TimeoutStatus::WaitingForNewRequest => SessionResult::CloseSession,
-        }
+      self.front_timeout.triggered();
+      match self.timeout_status() {
+        TimeoutStatus::Request => {
+          self.set_answer(DefaultAnswerStatus::Answer408, None);
+          self.writable(metrics)
+        },
+        TimeoutStatus::WaitingForResponse => {
+          self.set_answer(DefaultAnswerStatus::Answer504, None);
+          self.writable(metrics)
+        },
+        TimeoutStatus::Response => {
+          SessionResult::CloseSession
+        },
+        TimeoutStatus::WaitingForNewRequest => SessionResult::CloseSession,
       }
     } else if self.backend_token == Some(token) {
         //info!("backend timeout triggered for token {:?}", token);
