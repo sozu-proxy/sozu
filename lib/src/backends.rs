@@ -143,7 +143,7 @@ impl BackendList {
     BackendList {
       backends:       Vec::new(),
       next_id:        0,
-      load_balancing: Box::new(RandomAlgorithm{}),
+      load_balancing: Box::new(Random),
     }
   }
 
@@ -225,9 +225,9 @@ impl BackendList {
 
   pub fn set_load_balancing_policy(&mut self, load_balancing_policy: LoadBalancingAlgorithms, metric: Option<proxy::LoadMetric>) {
     match load_balancing_policy {
-      LoadBalancingAlgorithms::RoundRobin => self.load_balancing = Box::new(RoundRobinAlgorithm{ next_backend: 0 }),
-      LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(RandomAlgorithm{}),
-      LoadBalancingAlgorithms::LeastLoaded => self.load_balancing = Box::new(LeastLoadedAlgorithm{ metric: metric.clone().unwrap_or(proxy::LoadMetric::Connections) }),
+      LoadBalancingAlgorithms::RoundRobin => self.load_balancing = Box::new(RoundRobin{ next_backend: 0 }),
+      LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(Random{}),
+      LoadBalancingAlgorithms::LeastLoaded => self.load_balancing = Box::new(LeastLoaded{ metric: metric.clone().unwrap_or(proxy::LoadMetric::Connections) }),
       LoadBalancingAlgorithms::PowerOfTwo => self.load_balancing = Box::new(PowerOfTwo{ metric: metric.clone().unwrap_or(proxy::LoadMetric::Connections) }),
     }
   }

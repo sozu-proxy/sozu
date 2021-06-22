@@ -12,11 +12,11 @@ pub trait LoadBalancingAlgorithm: Debug {
 }
 
 #[derive(Debug)]
-pub struct RoundRobinAlgorithm {
+pub struct RoundRobin {
   pub next_backend: u32,
 }
 
-impl LoadBalancingAlgorithm for RoundRobinAlgorithm {
+impl LoadBalancingAlgorithm for RoundRobin {
 
   fn next_available_backend(&mut self , backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
     let res = backends.get(self.next_backend as usize % backends.len())
@@ -28,7 +28,7 @@ impl LoadBalancingAlgorithm for RoundRobinAlgorithm {
 
 }
 
-impl RoundRobinAlgorithm {
+impl RoundRobin {
 
   fn new() -> Self {
     Self {
@@ -39,9 +39,9 @@ impl RoundRobinAlgorithm {
 }
 
 #[derive(Debug)]
-pub struct RandomAlgorithm;
+pub struct Random;
 
-impl LoadBalancingAlgorithm for RandomAlgorithm {
+impl LoadBalancingAlgorithm for Random {
 
   fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
     let mut rng = thread_rng();
@@ -61,9 +61,9 @@ impl LoadBalancingAlgorithm for RandomAlgorithm {
 }
 
 #[derive(Debug)]
-pub struct LeastLoadedAlgorithm { pub metric: LoadMetric }
+pub struct LeastLoaded { pub metric: LoadMetric }
 
-impl LoadBalancingAlgorithm for LeastLoadedAlgorithm {
+impl LoadBalancingAlgorithm for LeastLoaded {
 
   fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
     backends
@@ -137,6 +137,7 @@ mod test {
   use std::net::{IpAddr, Ipv4Addr, SocketAddr};
   use BackendStatus;
   use retry::{RetryPolicyWrapper, ExponentialBackoffPolicy};
+  use sozu_command::proxy::LoadMetric;
 
   fn create_backend(id: String, connections: Option<usize>) -> Backend {
     Backend {
@@ -146,6 +147,7 @@ mod test {
       status: BackendStatus::Normal,
       retry_policy: RetryPolicyWrapper::ExponentialBackoff(ExponentialBackoffPolicy::new(1)),
       active_connections: connections.unwrap_or(0),
+      active_requests: 0,
       failures: 0,
       load_balancing_parameters: None,
       backup: false,
@@ -162,7 +164,7 @@ mod test {
       backend_with_least_connection.clone(),
     ];
 
-    let mut least_connection_algorithm = LeastConnectionsAlgorithm{};
+    let mut least_connection_algorithm = LeastLoaded{ metric: LoadMetric::Connections };
 
     let backend_res = least_connection_algorithm.next_available_backend(&backends).unwrap();
     let backend = backend_res.borrow();
@@ -174,7 +176,7 @@ mod test {
   fn it_shouldnt_find_backend_with_least_connections_when_list_is_empty() {
     let backends = vec![];
 
-    let mut least_connection_algorithm = LeastConnectionsAlgorithm{};
+    let mut least_connection_algorithm = LeastLoaded{ metric: LoadMetric::Connections };
 
     let backend = least_connection_algorithm.next_available_backend(&backends);
     assert!(backend.is_none());
@@ -188,7 +190,7 @@ mod test {
       Rc::new(RefCell::new(create_backend("yoto".to_string(), None)))
     ];
 
-    let mut roundrobin = RoundRobinAlgorithm { next_backend: 1 };
+    let mut roundrobin = RoundRobin { next_backend: 1 };
     let backend = roundrobin.next_available_backend(&backends);
     assert_eq!(backend.as_ref(), backends.get(1));
 
