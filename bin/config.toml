@@ -256,6 +256,7 @@ frontends = [
 # - address: IP and port of the backend server
 # - weight: weight used by the load balancing algorithm
 # - sticky-id: sticky session identifier
+# - load_metric: which metric is used to evaluate the load on the backend: available options; LeastConnections, LeastRequests
 backends = [
   { address = "127.0.0.1:1026" }
 ]

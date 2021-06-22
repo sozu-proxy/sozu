@@ -1,4 +1,5 @@
-use rand::{thread_rng, seq::SliceRandom, Rng};
+use rand::{thread_rng, seq::SliceRandom,
+  distributions::{Distribution, WeightedIndex}, Rng};
 
 use Backend;
 
@@ -43,9 +44,17 @@ impl LoadBalancingAlgorithm for RandomAlgorithm {
 
   fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
     let mut rng = thread_rng();
+    let weights: Vec<u8> = backends.iter()
+        .map(|b| b.borrow().load_balancing_parameters.as_ref().map(|p| p.weight).unwrap_or(100))
+        .collect();
 
-    (*backends).choose(&mut rng)
-      .map(|backend| (*backend).clone())
+    if let Ok(dist) = WeightedIndex::new(&weights) {
+        let index = dist.sample(&mut rng);
+        backends.get(index).cloned()
+    } else {
+        (*backends).choose(&mut rng)
+            .map(|backend| (*backend).clone())
+    }
   }
 
 }
