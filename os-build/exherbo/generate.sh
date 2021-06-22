@@ -14,5 +14,4 @@ mkdir -p generated
 scriptdir="$(dirname "${0}")"
 
 substitute "${scriptdir}"/../systemd/sozu.service.in generated/sozu.service
-substitute "${scriptdir}"/../systemd/sozu.conf.in generated/sozu.conf
 substitute "${scriptdir}"/../config.toml.in generated/config.toml
