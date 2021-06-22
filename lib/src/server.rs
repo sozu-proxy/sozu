@@ -626,7 +626,7 @@ impl Server {
     match message {
       ProxyRequest { order: ProxyRequestData::AddApplication(ref application), .. } => {
         self.backends.borrow_mut().set_load_balancing_policy_for_app(&application.app_id,
-          application.load_balancing_policy);
+          application.load_balancing_policy, application.load_metric.clone());
         //not returning because the message must still be handled by each proxy
       },
       ProxyRequest { ref id, order: ProxyRequestData::AddBackend(ref backend) } => {

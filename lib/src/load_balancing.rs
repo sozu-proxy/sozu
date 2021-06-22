@@ -5,6 +5,7 @@ use Backend;
 
 use std::{ rc::Rc, cell::RefCell };
 use std::fmt::Debug;
+use sozu_command::proxy::LoadMetric;
 
 pub trait LoadBalancingAlgorithm: Debug {
   fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>>;
@@ -60,20 +61,25 @@ impl LoadBalancingAlgorithm for RandomAlgorithm {
 }
 
 #[derive(Debug)]
-pub struct LeastConnectionsAlgorithm;
+pub struct LeastLoadedAlgorithm { pub metric: LoadMetric }
 
-impl LoadBalancingAlgorithm for LeastConnectionsAlgorithm {
+impl LoadBalancingAlgorithm for LeastLoadedAlgorithm {
 
   fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
     backends
       .iter()
-      .min_by_key(|backend| backend.borrow().active_connections)
+      .min_by_key(|backend| {
+          match self.metric {
+           LoadMetric::Connections => backend.borrow().active_connections,
+           LoadMetric::Requests => backend.borrow().active_requests,
+          }
+      })
       .map(|backend| (*backend).clone())
   }
 }
 
 #[derive(Debug)]
-pub struct PowerOfTwo;
+pub struct PowerOfTwo{ pub metric: LoadMetric }
 
 impl LoadBalancingAlgorithm for PowerOfTwo {
     fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
@@ -81,25 +87,28 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
         let mut second = None;
 
         for backend in backends.iter() {
-            let connections = backend.borrow().active_connections;
+            let measure = match self.metric {
+                LoadMetric::Connections => backend.borrow().active_connections,
+                LoadMetric::Requests => backend.borrow().active_requests,
+            };
 
             if first.is_none() {
-                first = Some((connections, backend));
+                first = Some((measure, backend));
             } else if second.is_none() {
-                if first.as_ref().unwrap().0 <= connections {
-                    second = Some((connections, backend));
+                if first.as_ref().unwrap().0 <= measure {
+                    second = Some((measure, backend));
                 } else {
                     second = first.take();
-                    first = Some((connections, backend));
+                    first = Some((measure, backend));
                 }
             } else {
-                if first.as_ref().unwrap().0 <= connections {
-                    if connections < second.as_ref().unwrap().0 {
-                        second = Some((connections, backend));
+                if first.as_ref().unwrap().0 <= measure {
+                    if measure < second.as_ref().unwrap().0 {
+                        second = Some((measure, backend));
                     } // other case: we don't change anything
                 } else {
                     second = first.take();
-                    first = Some((connections, backend));
+                    first = Some((measure, backend));
                 }
             }
         }
