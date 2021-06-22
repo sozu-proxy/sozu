@@ -1,5 +1,10 @@
 #!/bin/sh
 
+BINDIR="/usr/local/bin"
+SYSCONFDIR="/etc"
+DATADIR="/var/lib/sozu"
+RUNDIR="/run"
+
 substitute() {
     sed -e "s:__BINDIR__:${BINDIR}:"         \
         -e "s:__SYSCONFDIR__:${SYSCONFDIR}:" \
