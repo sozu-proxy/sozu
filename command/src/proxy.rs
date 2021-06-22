@@ -377,14 +377,26 @@ pub struct RemoveBackend {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
 pub struct LoadBalancingParams {
     pub weight: u8,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub metric: Option<LoadMetric>,
 }
 
 impl Default for LoadBalancingParams {
   fn default() -> Self {
     Self {
       weight: 0,
+      metric: None,
     }
   }
+}
+
+/// how sozu measures which backend is less loaded
+#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
+pub enum LoadMetric {
+    /// number of TCP connections
+    LeastConnections,
+    /// number of active HTTP requests
+    LeastRequests,
 }
 
 pub fn default_sticky_name() -> String {
@@ -760,7 +772,7 @@ mod tests {
       backend_id: String::from("xxx-0"),
       address: "0.0.0.0:8080".parse().unwrap(),
       sticky_id: None,
-      load_balancing_parameters: Some(LoadBalancingParams{ weight: 0 }),
+      load_balancing_parameters: Some(LoadBalancingParams{ weight: 0, ..Default::default() }),
       backup: None,
     }));
   }

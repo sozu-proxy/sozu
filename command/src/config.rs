@@ -13,7 +13,7 @@ use toml;
 
 use crate::proxy::{CertificateAndKey,ProxyRequestData,HttpFront,TcpFront,Backend,
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
-  Application, TlsVersion,ActivateListener,ListenerType};
+  LoadMetric, Application, TlsVersion,ActivateListener,ListenerType};
 
 use crate::command::{CommandRequestData,CommandRequest,PROTOCOL_VERSION};
 
@@ -425,6 +425,7 @@ pub struct BackendConfig {
   pub sticky_id: Option<String>,
   pub backup: Option<bool>,
   pub backend_id: Option<String>,
+  pub load_metric: Option<LoadMetric>,
 }
 
 impl FileAppConfig {
@@ -583,6 +584,7 @@ impl HttpAppConfig {
     for backend in &self.backends {
         let load_balancing_parameters = Some(LoadBalancingParams {
           weight: backend.weight.unwrap_or(100),
+          metric: backend.load_metric.clone(),
         });
 
         v.push(ProxyRequestData::AddBackend(Backend {
@@ -640,6 +642,7 @@ impl TcpAppConfig {
     for backend in &self.backends {
       let load_balancing_parameters = Some(LoadBalancingParams {
         weight: backend.weight.unwrap_or(100),
+        metric: backend.load_metric.clone(),
       });
 
       v.push(ProxyRequestData::AddBackend(Backend {
