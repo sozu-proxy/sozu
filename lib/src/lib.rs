@@ -256,8 +256,17 @@ pub trait ProxySession {
 #[derive(Clone,Copy,Debug,PartialEq)]
 pub enum BackendConnectionStatus {
   NotConnected,
-  Connecting,
+  Connecting(Instant),
   Connected,
+}
+
+impl BackendConnectionStatus {
+    pub fn is_connecting(&self) -> bool {
+        match self {
+            BackendConnectionStatus::Connecting(_) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug,PartialEq)]

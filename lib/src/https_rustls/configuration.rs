@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::str::from_utf8_unchecked;
 use rustls::{ServerConfig, ServerSession, NoClientAuth, ProtocolVersion,
   ALL_CIPHERSUITES};
-use time::Duration;
+use time::{Duration, Instant};
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,
@@ -552,7 +552,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
     let connect_timeout = time::Duration::seconds(i64::from(self.listeners.get(&session.listen_token).as_ref().map(|l| l.config.connect_timeout).unwrap()));
 
-    session.back_connected = BackendConnectionStatus::Connecting;
+    session.back_connected = BackendConnectionStatus::Connecting(Instant::now());
     if let Some(back_token) = old_back_token {
       session.set_back_token(back_token);
       if let Err(e) = poll.registry().register(

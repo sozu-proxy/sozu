@@ -440,6 +440,7 @@ impl Session {
   }
 
   fn set_back_connected(&mut self, connected: BackendConnectionStatus) {
+    let last = self.back_connected.clone();
     self.back_connected = connected;
 
     if connected == BackendConnectionStatus::Connected {
@@ -451,6 +452,10 @@ impl Session {
           incr!("up", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
           info!("backend server {} at {} is up", backend.backend_id, backend.address);
           push_event(ProxyEvent::BackendUp(backend.backend_id.clone(), backend.address));
+        }
+
+        if let BackendConnectionStatus::Connecting(start) = last {
+          backend.set_connection_time(Instant::now() - start);
         }
 
         backend.active_requests += 1;
@@ -644,7 +649,7 @@ impl ProxySession for Session {
 
     self.metrics().service_start();
 
-    if self.back_connected() == BackendConnectionStatus::Connecting &&
+    if self.back_connected().is_connecting() &&
       self.back_readiness().map(|r| r.event != Ready::empty()).unwrap_or(false) {
 
       self.http_mut().map(|h| h.cancel_backend_timeout());
@@ -659,6 +664,7 @@ impl ProxySession for Session {
         self.fail_backend_connection();
 
         let backend_token = self.back_token();
+        self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
         return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else {
         self.metrics().backend_connected();

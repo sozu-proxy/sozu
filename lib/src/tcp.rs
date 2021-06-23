@@ -417,7 +417,9 @@ impl Session {
   }
 
   fn set_back_connected(&mut self, status: BackendConnectionStatus) {
+    let last = self.back_connected.clone();
     self.back_connected = status;
+
     if status == BackendConnectionStatus::Connected {
       gauge_add!("connections", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       if let Some(State::SendProxyProtocol(ref mut pp)) = self.protocol {
@@ -431,6 +433,10 @@ impl Session {
           incr!("up", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
           info!("backend server {} at {} is up", backend.backend_id, backend.address);
           push_event(ProxyEvent::BackendUp(backend.backend_id.clone(), backend.address));
+        }
+
+        if let BackendConnectionStatus::Connecting(start) = last {
+          backend.set_connection_time(Instant::now() - start);
         }
 
         //successful connection, rest failure counter
@@ -601,7 +607,7 @@ impl ProxySession for Session {
 
     self.metrics().service_start();
 
-    if self.back_connected() == BackendConnectionStatus::Connecting {
+    if self.back_connected().is_connecting() {
       if self.back_readiness().unwrap().event.is_hup() || !self.test_back_socket() {
         //retry connecting the backend
         error!("error connecting to backend, trying again");
@@ -615,6 +621,7 @@ impl ProxySession for Session {
         self.reset_connection_attempt();
         let back_token = self.backend_token.unwrap();
         self.back_timeout.set(back_token);
+        self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
 
         self.set_back_connected(BackendConnectionStatus::Connected);
       }
@@ -940,7 +947,7 @@ impl ProxyConfiguration<Session> for Proxy {
         if let Err(e) = stream.set_nodelay(true) {
           error!("error setting nodelay on back socket({:?}): {:?}", stream, e);
         }
-        session.back_connected = BackendConnectionStatus::Connecting;
+        session.back_connected = BackendConnectionStatus::Connecting(Instant::now());
 
         if let Err(e) = poll.registry().register(
           &mut stream,

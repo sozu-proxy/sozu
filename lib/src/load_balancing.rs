@@ -135,7 +135,7 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
 mod test {
   use super::*;
   use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-  use BackendStatus;
+  use {BackendStatus, PeakEWMA};
   use retry::{RetryPolicyWrapper, ExponentialBackoffPolicy};
   use sozu_command::proxy::LoadMetric;
 
@@ -151,6 +151,7 @@ mod test {
       failures: 0,
       load_balancing_parameters: None,
       backup: false,
+      connection_time: PeakEWMA::new(),
     }
   }
 
