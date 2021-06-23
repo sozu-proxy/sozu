@@ -1,7 +1,6 @@
 use futures::SinkExt;
 use libc::pid_t;
-use mio::Token;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::os::unix::io::AsRawFd;
 
@@ -9,7 +8,6 @@ use sozu_command::channel::Channel;
 use sozu_command::command::RunState;
 use sozu_command::config::Config;
 use sozu_command::proxy::{ProxyRequest, ProxyRequestData, ProxyResponse};
-use sozu_command::ready::Ready;
 use sozu_command::scm_socket::ScmSocket;
 
 pub struct Worker {
@@ -46,11 +44,13 @@ impl Worker {
 
     pub async fn send(&mut self, request_id: String, data: ProxyRequestData) {
         if let Some(tx) = self.sender.as_mut() {
-            tx.send(ProxyRequest {
+            if let Err(e) = tx.send(ProxyRequest {
                 id: request_id,
                 order: data,
             })
-            .await;
+            .await {
+                error!("error sending message to worker {:?}: {:?}", self.id, e);
+            }
         }
     }
 

@@ -294,23 +294,27 @@ impl CommandServer {
 
                 if let Some(mut sender) = client_tx {
                     if error == 0 {
-                        sender
+                        if let Err(e) = sender
                             .send(CommandResponse::new(
                                 message_id.to_string(),
                                 CommandStatus::Ok,
                                 format!("ok: {} messages, error: 0", ok),
                                 None,
                             ))
-                            .await;
+                            .await {
+                                error!("could not send message to client {:?}: {:?}", client_id, e);
+                            }
                     } else {
-                        sender
+                        if let Err(e) =  sender
                             .send(CommandResponse::new(
                                 message_id.to_string(),
                                 CommandStatus::Error,
                                 format!("ok: {} messages, error: {}", ok, error),
                                 None,
                             ))
-                            .await;
+                            .await {
+                                error!("could not send message to client {:?}: {:?}", client_id, e);
+                            }
                     }
                 } else {
                     if error == 0 {
@@ -364,14 +368,16 @@ impl CommandServer {
             None,
         ) {
             if let Some(sender) = self.clients.get_mut(&client_id) {
-                sender
+                if let Err(e) = sender
                     .send(CommandResponse::new(
                         request_id.clone(),
                         CommandStatus::Processing,
                         "sending configuration orders".to_string(),
                         None,
                     ))
-                    .await;
+                    .await{
+                        error!("could not send message to client {:?}: {:?}", client_id, e);
+                    }
             }
 
             info!("created new worker: {}", worker.id);
@@ -439,14 +445,16 @@ impl CommandServer {
         self.disable_cloexec_before_upgrade();
 
         if let Some(sender) = self.clients.get_mut(&client_id) {
-            sender
+            if let Err(e) = sender
                 .send(CommandResponse::new(
                     request_id.clone(),
                     CommandStatus::Processing,
                     "".to_string(),
                     None,
                 ))
-                .await;
+                .await {
+                    error!("could not send message to client {:?}: {:?}", client_id, e);
+                }
         }
 
         let (pid, mut channel) =
@@ -456,10 +464,13 @@ impl CommandServer {
         debug!("upgrade channel sent: {:?}", res);
 
         // signaling the accept loop that it should stop
-        self.accept_cancel.take().unwrap().send(());
+        if let Err(e) = self.accept_cancel.take().unwrap().send(()) {
+            error!("could not close the accept loop: {:?}", e);
+        }
+
         if let Some(true) = res {
             if let Some(sender) = self.clients.get_mut(&client_id) {
-                sender
+                if let Err(e) = sender
                     .send(CommandResponse::new(
                         request_id.clone(),
                         CommandStatus::Ok,
@@ -469,7 +480,9 @@ impl CommandServer {
                         ),
                         None,
                     ))
-                    .await;
+                    .await{
+                        error!("could not send message to client {:?}: {:?}", client_id, e);
+                    }
             }
 
             info!("wrote final message, closing");
@@ -496,7 +509,7 @@ impl CommandServer {
 
         // same as launch_worker
         let next_id = self.next_id;
-        let mut worker = if let Ok(mut worker) = start_worker(
+        let mut worker = if let Ok(worker) = start_worker(
             next_id,
             &self.config,
             self.executable_path.clone(),
@@ -504,14 +517,16 @@ impl CommandServer {
             None,
         ) {
             if let Some(sender) = self.clients.get_mut(&client_id) {
-                sender
+                if let Err(e) = sender
                     .send(CommandResponse::new(
                         request_id.clone(),
                         CommandStatus::Processing,
                         "sending configuration orders".to_string(),
                         None,
                     ))
-                    .await;
+                    .await {
+                        error!("could not send message to client {:?}: {:?}", client_id, e);
+                    }
             }
             info!("created new worker: {}", next_id);
 
@@ -544,7 +559,7 @@ impl CommandServer {
         let (worker_tx, worker_rx) = channel(10000);
         worker.sender = Some(worker_tx);
 
-        worker
+        if let Err(e) = worker
             .sender
             .as_mut()
             .unwrap()
@@ -552,7 +567,9 @@ impl CommandServer {
                 id: format!("UPGRADE-{}-STATUS", id),
                 order: ProxyRequestData::Status,
             })
-        .await;
+        .await {
+            error!("could not send status message to worker {:?}: {:?}", worker.id, e);
+        }
 
 
         let mut listeners = None;
@@ -631,9 +648,11 @@ impl CommandServer {
                     match proxy_response.status {
                         ProxyResponseStatus::Ok => {
                             info!("softstop OK");
-                            command_tx
-                                .send(CommandMessage::WorkerClose { id: worker_id })
-                                .await;
+                            if let Err(e) = command_tx
+                                .send(CommandMessage::WorkerClose { id: worker_id.clone() })
+                                .await {
+                                    error!("could not send worker close message to {}: {:?}", worker_id, e);
+                                }
                             break;
                         }
                         ProxyResponseStatus::Processing => {
@@ -705,7 +724,7 @@ impl CommandServer {
             Ok(c) => c,
         };
 
-        let mut message_counter = 0usize;
+        let message_counter = 0usize;
         let mut diff_counter = 0usize;
 
         let (load_state_tx, mut load_state_rx) = futures::channel::mpsc::channel(10000);
@@ -767,23 +786,25 @@ impl CommandServer {
 
                 if let Some(mut sender) = client_tx {
                     if error == 0 {
-                        sender
+                        if let Err(e) = sender
                             .send(CommandResponse::new(
                                 message_id.to_string(),
                                 CommandStatus::Ok,
                                 format!("ok: {} messages, error: 0", ok),
                                 None,
-                            ))
-                            .await;
+                            )).await {
+                                error!("could not send message to client {:?}: {:?}", client_id, e);
+                            }
                     } else {
-                        sender
+                        if let Err(e) = sender
                             .send(CommandResponse::new(
                                 message_id.to_string(),
                                 CommandStatus::Error,
                                 format!("ok: {} messages, error: {}", ok, error),
                                 None,
-                            ))
-                            .await;
+                            )).await{
+                                error!("could not send message to client {:?}: {:?}", client_id, e);
+                            }
                     }
                 } else {
                     if error == 0 {
@@ -870,14 +891,15 @@ impl CommandServer {
                 workers: data,
             };
 
-            client_tx
+            if let Err(e) = client_tx
                 .send(CommandResponse::new(
                     request_id.clone(),
                     CommandStatus::Ok,
                     "".to_string(),
                     Some(CommandResponseData::Metrics(aggregated_data)),
-                ))
-                .await;
+                )).await{
+                    error!("could not send message to client {:?}: {:?}", client_id, e);
+                }
         })
         .detach();
     }
@@ -961,38 +983,44 @@ impl CommandServer {
                     let main = main_query_answer.unwrap();
                     data.insert(String::from("main"), main);
 
-                    client_tx
+                    if let Err(e) = client_tx
                         .send(CommandResponse::new(
                             request_id.clone(),
                             CommandStatus::Ok,
                             "".to_string(),
                             Some(CommandResponseData::Query(data)),
                         ))
-                        .await;
+                        .await{
+                            error!("could not send message to client {:?}: {:?}", client_id, e);
+                        }
                 }
                 &Query::Applications(ref query_type) => {
                     let main = main_query_answer.unwrap();
                     data.insert(String::from("main"), main);
 
-                    client_tx
+                    if let Err(e) = client_tx
                         .send(CommandResponse::new(
                             request_id.clone(),
                             CommandStatus::Ok,
                             "".to_string(),
                             Some(CommandResponseData::Query(data)),
                         ))
-                        .await;
+                        .await{
+                            error!("could not send message to client {:?}: {:?}", client_id, e);
+                        }
                 }
                 &Query::Certificates(_) => {
                     info!("certificates query received: {:?}", data);
-                    client_tx
+                    if let Err(e) = client_tx
                         .send(CommandResponse::new(
                             request_id.clone(),
                             CommandStatus::Ok,
                             "".to_string(),
                             Some(CommandResponseData::Query(data)),
                         ))
-                        .await;
+                        .await{
+                            error!("could not send message to client {:?}: {:?}", client_id, e);
+                        }
                 }
             };
         })
@@ -1033,7 +1061,7 @@ impl CommandServer {
                             backend.backend_id, backend.address, backend.app_id
                         );
                         error!("{}", msg);
-                        self.answer_error(client_id, request_id, msg, None);
+                        self.answer_error(client_id, request_id, msg, None).await;
                         return;
                     }
                     ProxyRequestData::RemoveHttpFront(HttpFront {
@@ -1123,7 +1151,9 @@ impl CommandServer {
 
                         let id: u32 = tag.parse().unwrap();
                         if stopping_workers.contains(&id) {
-                            command_tx.send(CommandMessage::WorkerClose { id }).await;
+                            if let Err(e) = command_tx.send(CommandMessage::WorkerClose { id: id.clone() }).await {
+                                error!("could not send worker close message to {}", id);
+                            }
                         }
                     }
                     ProxyResponseStatus::Processing => {
@@ -1143,7 +1173,9 @@ impl CommandServer {
             }
 
             if should_stop_main {
-                command_tx.send(CommandMessage::MasterStop).await;
+                if let Err(e) = command_tx.send(CommandMessage::MasterStop).await {
+                    error!("could not send main stop message");
+                }
             }
 
             let mut messages = vec![];
@@ -1158,23 +1190,25 @@ impl CommandServer {
             }
 
             if has_error {
-                client_tx
+                if let Err(e) = client_tx
                     .send(CommandResponse::new(
                         request_id,
                         CommandStatus::Error,
                         messages.join(", "),
                         None,
-                    ))
-                    .await;
+                    )).await{
+                        error!("could not send message to client {:?}: {:?}", client_id, e);
+                    }
             } else {
-                client_tx
+                if let Err(e) = client_tx
                     .send(CommandResponse::new(
                         request_id,
                         CommandStatus::Ok,
                         "".to_string(),
                         None,
-                    ))
-                    .await;
+                    )).await {
+                        error!("could not send message to client {:?}: {:?}", client_id, e);
+                    }
             }
         })
         .detach();

@@ -17,7 +17,6 @@ use async_io::Async;
 use blocking::block_on;
 use smol::Task;
 
-use sozu::metrics::METRICS;
 use sozu_command::command::{
     CommandRequestData, CommandResponse, CommandResponseData, CommandStatus, Event, RunState,
 };
@@ -429,7 +428,7 @@ impl CommandServer {
                 let mut count = 0usize;
                 let mut orders = self.state.generate_activate_orders();
                 for order in orders.drain(..) {
-                    worker
+                    if let Err(e) = worker
                         .sender
                         .as_mut()
                         .unwrap()
@@ -437,11 +436,13 @@ impl CommandServer {
                             id: format!("RESTART-{}-ACTIVATE-{}", id, count),
                             order,
                         })
-                        .await;
+                        .await {
+                            error!("could not send activate order to worker {:?}: {:?}", worker.id, e);
+                        }
                     count += 1;
                 }
 
-                worker
+                if let Err(e) = worker
                     .sender
                     .as_mut()
                     .unwrap()
@@ -449,7 +450,9 @@ impl CommandServer {
                         id: format!("RESTART-{}-STATUS", id),
                         order: ProxyRequestData::Status,
                     })
-                .await;
+                .await{
+                    error!("could not send status message to worker {:?}: {:?}", worker.id, e);
+                }
 
                 self.workers.push(worker);
             }
@@ -682,14 +685,16 @@ impl CommandServer {
             data
         );
         if let Some(sender) = self.clients.get_mut(&client_id) {
-            sender
+            if let Err(e) = sender
                 .send(CommandResponse::new(
                     id.into(),
                     CommandStatus::Ok,
                     message.into(),
                     data,
                 ))
-                .await;
+                .await {
+                    error!("could not send message to client {:?}: {:?}", client_id, e);
+                }
         }
     }
 
@@ -711,14 +716,16 @@ impl CommandServer {
             data
         );
         if let Some(sender) = self.clients.get_mut(&client_id) {
-            sender
+            if let Err(e) = sender
                 .send(CommandResponse::new(
                     id.into(),
                     CommandStatus::Error,
                     message.into(),
                     data,
                 ))
-                .await;
+                .await{
+                    error!("could not send message to client {:?}: {:?}", client_id, e);
+                }
         }
     }
 }
