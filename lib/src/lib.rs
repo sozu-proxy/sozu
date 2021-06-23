@@ -492,8 +492,8 @@ impl Backend {
       self.connection_time.observe(dur.whole_nanoseconds() as f64);
   }
 
-  pub fn peak_ewma_cost(&mut self) -> f64 {
-      self.connection_time.get(self.active_requests)
+  pub fn peak_ewma_connection(&mut self) -> f64 {
+      self.connection_time.get(self.active_connections)
   }
 
   pub fn try_connect(&mut self) -> Result<mio::net::TcpStream, ConnectionError> {

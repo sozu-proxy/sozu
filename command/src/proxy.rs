@@ -397,6 +397,8 @@ pub enum LoadMetric {
     Connections,
     /// number of active HTTP requests
     Requests,
+    /// time to connect to the backend, weighted by the number of active connections (peak EWMA)
+    ConnectionTime,
 }
 
 pub fn default_sticky_name() -> String {

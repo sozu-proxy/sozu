@@ -232,9 +232,9 @@ tls_versions = ["TLSv1.3"]
 protocol = "http"
 
 # per application load balancing algorithm. The possible values are
-# "roundrobin", "random", "least_loaded" and "power_of_two". Defaults to "roundi_robin"
-# load_balancing = "round_robin"
-# metric evaluating the load on the backend. available options: connections, requests
+# "round_robin", "random", "least_loaded" and "power_of_two". Defaults to "round_robin"
+load_balancing = "round_robin"
+# metric evaluating the load on the backend. available options: connections, requests, connection_time
 # load_metric = "connections"
 
 # frontends configuration

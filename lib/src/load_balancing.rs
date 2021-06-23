@@ -8,7 +8,7 @@ use std::fmt::Debug;
 use sozu_command::proxy::LoadMetric;
 
 pub trait LoadBalancingAlgorithm: Debug {
-  fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>>;
+  fn next_available_backend(&mut self, backends: &mut Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>>;
 }
 
 #[derive(Debug)]
@@ -18,7 +18,7 @@ pub struct RoundRobin {
 
 impl LoadBalancingAlgorithm for RoundRobin {
 
-  fn next_available_backend(&mut self , backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
+  fn next_available_backend(&mut self , backends: &mut Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
     let res = backends.get(self.next_backend as usize % backends.len())
                       .map(|backend| (*backend).clone());
 
@@ -43,7 +43,7 @@ pub struct Random;
 
 impl LoadBalancingAlgorithm for Random {
 
-  fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
+  fn next_available_backend(&mut self, backends: &mut Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
     let mut rng = thread_rng();
     let weights: Vec<u8> = backends.iter()
         .map(|b| b.borrow().load_balancing_parameters.as_ref().map(|p| p.weight).unwrap_or(100))
@@ -65,16 +65,35 @@ pub struct LeastLoaded { pub metric: LoadMetric }
 
 impl LoadBalancingAlgorithm for LeastLoaded {
 
-  fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
-    backends
-      .iter()
-      .min_by_key(|backend| {
-          match self.metric {
-           LoadMetric::Connections => backend.borrow().active_connections,
-           LoadMetric::Requests => backend.borrow().active_requests,
-          }
-      })
-      .map(|backend| (*backend).clone())
+  fn next_available_backend(&mut self, backends: &mut Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
+    let opt_b = match self.metric {
+        LoadMetric::Connections => backends
+            .iter_mut()
+            .min_by_key(|backend| backend.borrow().active_connections),
+        LoadMetric::Requests => backends
+            .iter_mut()
+            .min_by_key(|backend| backend.borrow().active_requests),
+        LoadMetric::ConnectionTime => {
+            let mut b = None;
+            for backend in backends.iter_mut() {
+                let cost2 = backend.borrow_mut().peak_ewma_connection();
+
+                match b.take() {
+                    None => b = Some((cost2, backend)),
+                    Some((cost1, back1)) => {
+                        if cost1 <= cost2 {
+                            b = Some((cost1, back1));
+                        } else {
+                            b = Some((cost2, backend));
+                        }
+                    }
+                }
+            }
+
+            b.map(|(_cost, backend)| backend)
+        }
+    };
+    opt_b.map(|backend| (*backend).clone())
   }
 }
 
@@ -82,14 +101,15 @@ impl LoadBalancingAlgorithm for LeastLoaded {
 pub struct PowerOfTwo{ pub metric: LoadMetric }
 
 impl LoadBalancingAlgorithm for PowerOfTwo {
-    fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
+    fn next_available_backend(&mut self, backends: &mut Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
         let mut first = None;
         let mut second = None;
 
-        for backend in backends.iter() {
+        for backend in backends.iter_mut() {
             let measure = match self.metric {
-                LoadMetric::Connections => backend.borrow().active_connections,
-                LoadMetric::Requests => backend.borrow().active_requests,
+                LoadMetric::Connections => backend.borrow().active_connections as f64,
+                LoadMetric::Requests => backend.borrow().active_requests as f64,
+                LoadMetric::ConnectionTime => backend.borrow_mut().peak_ewma_connection(),
             };
 
             if first.is_none() {
@@ -167,7 +187,7 @@ mod test {
 
     let mut least_connection_algorithm = LeastLoaded{ metric: LoadMetric::Connections };
 
-    let backend_res = least_connection_algorithm.next_available_backend(&backends).unwrap();
+    let backend_res = least_connection_algorithm.next_available_backend(&mut backends).unwrap();
     let backend = backend_res.borrow();
 
     assert!(*backend == *backend_with_least_connection.borrow());
@@ -179,7 +199,7 @@ mod test {
 
     let mut least_connection_algorithm = LeastLoaded{ metric: LoadMetric::Connections };
 
-    let backend = least_connection_algorithm.next_available_backend(&backends);
+    let backend = least_connection_algorithm.next_available_backend(&mut backends);
     assert!(backend.is_none());
   }
 
@@ -192,12 +212,12 @@ mod test {
     ];
 
     let mut roundrobin = RoundRobin { next_backend: 1 };
-    let backend = roundrobin.next_available_backend(&backends);
+    let backend = roundrobin.next_available_backend(&mut backends);
     assert_eq!(backend.as_ref(), backends.get(1));
 
     backends.remove(1);
 
-    let backend2 = roundrobin.next_available_backend(&backends);
+    let backend2 = roundrobin.next_available_backend(&mut backends);
     assert_eq!(backend2.as_ref(),  backends.get(0));
   }
 }
