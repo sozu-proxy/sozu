@@ -398,7 +398,7 @@ pub enum BackendStatus {
   Closed,
 }
 
-#[derive(Debug,PartialEq,Eq,Clone)]
+#[derive(Debug,PartialEq,Clone)]
 pub struct Backend {
   pub sticky_id:                 Option<String>,
   pub backend_id:                String,
@@ -410,6 +410,7 @@ pub struct Backend {
   pub failures:                  usize,
   pub load_balancing_parameters: Option<LoadBalancingParams>,
   pub backup:                    bool,
+  pub connection_time: PeakEWMA,
 }
 
 impl Backend {
@@ -426,6 +427,7 @@ impl Backend {
       failures:           0,
       load_balancing_parameters,
       backup: backup.unwrap_or(false),
+      connection_time: PeakEWMA::new(),
     }
   }
 
@@ -475,6 +477,14 @@ impl Backend {
         }
       },
     }
+  }
+
+  pub fn set_connection_time(&mut self, dur: Duration) {
+      self.connection_time.observe(dur.whole_nanoseconds() as f64);
+  }
+
+  pub fn peak_ewma_cost(&mut self) -> f64 {
+      self.connection_time.get(self.active_requests)
   }
 
   pub fn try_connect(&mut self) -> Result<mio::net::TcpStream, ConnectionError> {
@@ -720,3 +730,58 @@ impl fmt::Display for LogDuration {
   }
 }
 
+/// exponentially weighted moving average with high sensibility to latency bursts
+///
+/// cf Finagle for the original implementation: https://github.com/twitter/finagle/blob/9cc08d15216497bb03a1cafda96b7266cfbbcff1/finagle-core/src/main/scala/com/twitter/finagle/loadbalancer/PeakEwma.scala
+#[derive(Debug,PartialEq,Clone)]
+pub struct PeakEWMA {
+    /// decay in nanoseconds
+    ///
+    /// higher values will make the EWMA decay slowly to 0
+    pub decay: f64,
+    /// estimated RTT in nanoseconds
+    ///
+    /// must be set to a high enough default value so that new backends do not
+    /// get all the traffic right away
+    pub rtt: f64,
+    /// last modification
+    pub last_event: Instant,
+}
+
+impl PeakEWMA {
+    // hardcoded default values for now
+    pub fn new() -> Self {
+        PeakEWMA {
+            // 1s
+            decay: 1_000_000_000f64,
+            // 50ms
+            rtt: 50_000_000f64,
+            last_event: Instant::now(),
+        }
+    }
+
+    pub fn observe(&mut self, rtt: f64) {
+        let now = Instant::now();
+        let dur = now - self.last_event;
+
+        // if latency is rising, we will immediately raise the cost
+        if rtt > self.rtt {
+            self.rtt = rtt;
+        } else {
+            // new_rtt = old_rtt * e^(-elapsed/decay) + observed_rtt * (1 - e^(-elapsed/decay))
+            let weight = (-1.0 * dur.whole_nanoseconds() as f64 / self.decay).exp();
+            self.rtt = self.rtt * weight + rtt * (1.0 - weight);
+        }
+
+        self.last_event = now;
+    }
+
+    pub fn get(&mut self, active_requests: usize) -> f64 {
+        let before = self.rtt;
+        // decay the current value
+        // (we might not have seen a request in a long time)
+        self.observe(0.0);
+
+        (active_requests + 1) as f64 * self.rtt
+    }
+}
