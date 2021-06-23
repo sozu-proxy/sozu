@@ -1451,7 +1451,8 @@ impl<Front:SocketHandler> Http<Front> {
                 self.writable(metrics)
             },
             TimeoutStatus::Response => {
-                error!("backend timeout while sending response");
+                error!("backend {:?} timeout while receiving response (application {:?})",
+                  self.backend_id, self.app_id);
                 SessionResult::CloseSession
             },
             TimeoutStatus::WaitingForNewRequest => SessionResult::Continue,
