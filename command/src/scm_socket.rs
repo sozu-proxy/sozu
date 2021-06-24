@@ -1,6 +1,7 @@
 use nix::sys::socket;
 use nix::sys::uio;
 use nix::Result as NixResult;
+use nix::cmsg_space;
 use std::iter::repeat;
 use std::net::SocketAddr;
 use std::str::from_utf8;
@@ -135,7 +136,7 @@ impl ScmSocket {
   }
 
   pub fn rcv_msg(&self, buffer: &mut [u8], fds: &mut [RawFd]) -> NixResult<(usize, usize)> {
-    let mut cmsg = socket::CmsgSpace::<[RawFd; MAX_FDS_OUT]>::new();
+    let mut cmsg = cmsg_space!([RawFd; MAX_FDS_OUT]);
     let iov = [uio::IoVec::from_mut_slice(buffer)];
 
     let flags = if self.blocking {
