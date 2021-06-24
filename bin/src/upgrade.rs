@@ -1,4 +1,3 @@
-use mio::Token;
 use mio::net::UnixStream;
 use libc::{self,pid_t};
 use std::process::Command;

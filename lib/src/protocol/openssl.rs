@@ -1,4 +1,3 @@
-use mio::*;
 use mio::net::*;
 use rusty_ulid::Ulid;
 use {SessionResult,Readiness};

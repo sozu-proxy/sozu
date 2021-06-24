@@ -132,7 +132,6 @@ impl Checkout {
   }
 
   pub fn consume(&mut self, count: usize) -> usize {
-    let before = self.inner.position;
     let cnt = cmp::min(count, self.available_data());
     self.inner.position += cnt;
     if self.inner.position > self.capacity() / 2 {
@@ -143,8 +142,6 @@ impl Checkout {
   }
 
   pub fn fill(&mut self, count: usize) -> usize {
-    let before = self.inner.end;
-
     let cnt = cmp::min(count, self.available_space());
     self.inner.end += cnt;
     if self.available_space() < self.available_data() + cnt {
@@ -172,10 +169,10 @@ impl Checkout {
   pub fn shift(&mut self) {
     let pos = self.inner.position;
     let end = self.inner.end;
-    if self.inner.position > 0 {
+    if pos > 0 {
       unsafe {
-        let length = self.inner.end - self.inner.position;
-        ptr::copy( (&self.inner.extra()[self.inner.position..self.inner.end]).as_ptr(),
+        let length = end - pos;
+        ptr::copy( (&self.inner.extra()[pos..end]).as_ptr(),
           (&mut self.inner.extra_mut()[..length]).as_mut_ptr(), length);
         self.inner.position = 0;
         self.inner.end      = length;

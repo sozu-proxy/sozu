@@ -29,8 +29,7 @@ impl LoadBalancingAlgorithm for RoundRobin {
 }
 
 impl RoundRobin {
-
-  fn new() -> Self {
+  pub fn new() -> Self {
     Self {
       next_backend: 0,
     }

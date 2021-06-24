@@ -30,7 +30,7 @@ use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
 use sozu_command::logging;
 use sozu_command::ready::Ready;
 
-use protocol::http::{parser::{RequestState,RRequestLine,hostname_and_port}, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
+use protocol::http::{parser::{RequestState,RRequestLine,hostname_and_port}, answers::HttpAnswers};
 use pool::Pool;
 use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
@@ -378,6 +378,7 @@ impl Session {
     }
   }
 
+  /*
   fn front_socket(&self) -> Option<&TcpStream> {
     match unwrap_msg!(self.protocol.as_ref()) {
       &State::Expect(ref expect,_)     => Some(expect.front_socket()),
@@ -386,6 +387,7 @@ impl Session {
       &State::WebSocket(ref pipe)      => Some(pipe.front_socket()),
     }
   }
+  */
 
   fn front_socket_mut(&mut self) -> Option<&mut TcpStream> {
     match *unwrap_msg!(self.protocol.as_mut()) {
@@ -396,6 +398,7 @@ impl Session {
     }
   }
 
+  /*
   fn back_socket(&self)  -> Option<&TcpStream> {
     match unwrap_msg!(self.protocol.as_ref()) {
       &State::Expect(_,_)         => None,
@@ -404,6 +407,7 @@ impl Session {
       &State::WebSocket(ref pipe) => pipe.back_socket(),
     }
   }
+  */
 
   fn back_socket_mut(&mut self)  -> Option<&mut TcpStream> {
     match *unwrap_msg!(self.protocol.as_mut()) {
@@ -1008,7 +1012,7 @@ impl Listener {
         TlsVersion::TLSv1_2 => versions.remove(ssl::SslOptions::NO_TLSV1_2),
         //TlsVersion::TLSv1_3 => versions.remove(ssl::SslOptions::NO_TLSV1_3),
         TlsVersion::TLSv1_3 => {},
-        s         => error!("unrecognized TLS version: {:?}", s)
+        //s         => error!("unrecognized TLS version: {:?}", s)
       };
     }
 
@@ -1178,7 +1182,7 @@ impl Listener {
           &f.hostname == &front.hostname &&
           &f.path_begin == &front.path_begin
         }) {
-          let front = fronts.remove(pos);
+          let _front = fronts.remove(pos);
         }
       }
 
@@ -1758,7 +1762,7 @@ impl ProxyConfiguration<Session> for Proxy {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
-        let res = self.listeners.iter().map(|(addr, listener)| {
+        let res = self.listeners.values().map(|listener| {
           let mut domains = unwrap_msg!(listener.domains.lock()).to_hashmap();
           let res = domains.drain().map(|(k, v)| {
             (String::from_utf8(k).unwrap(), v.0.clone())
@@ -1773,7 +1777,7 @@ impl ProxyConfiguration<Session> for Proxy {
           data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::All(res)))) }
       },
       ProxyRequestData::Query(Query::Certificates(QueryCertificateType::Domain(d))) => {
-        let res = self.listeners.iter().map(|(addr, listener)| {
+        let res = self.listeners.values().map(|listener| {
           let domains  = unwrap_msg!(listener.domains.lock());
           (listener.address, domains.domain_lookup(d.as_bytes(), true).map(|(k, v)| {
             (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
@@ -1881,7 +1885,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   let token = {
     let entry = sessions.vacant_entry();
     let key = entry.key();
-    let e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
+    let _e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
     Token(key)
   };
 
@@ -2139,7 +2143,7 @@ fn parse_sni_name_list(i: &[u8]) -> Option<&[u8]> {
 fn parse_sni_name(i: &[u8]) -> Option<(&[u8], &[u8])> {
     use nom::{multi::length_data, sequence::preceded,
       bytes::complete::tag,
-      number::complete::{be_u8, be_u16}
+      number::complete::be_u16
     };
 
     if i.is_empty() {

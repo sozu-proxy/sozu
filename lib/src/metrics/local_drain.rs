@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::str;
 use std::time::{Duration,Instant};
 use std::iter::repeat;
@@ -24,7 +25,9 @@ impl AggregatedMetric {
       MetricData::Time(value)  => {
         //FIXME: do not unwrap here
         let mut h = ::hdrhistogram::Histogram::new(3).unwrap();
-        h.record(value as u64);
+        if let Err(e) = h.record(value as u64) {
+            error!("could not record time metric: {:?}", e);
+        }
         AggregatedMetric::Time(h)
       }
     }
@@ -42,7 +45,9 @@ impl AggregatedMetric {
         *v1 += v2;
       },
       (&mut AggregatedMetric::Time(ref mut v1), MetricData::Time(v2)) => {
-        (*v1).record(v2 as u64);
+        if let Err(e) = (*v1).record(v2 as u64) {
+            error!("could not record time metric: {:?}", e);
+        }
       },
       (s,m) => panic!("tried to update metric {} of value {:?} with an incompatible metric: {:?}", key, s, m)
     }
@@ -85,7 +90,7 @@ pub struct BackendMetrics {
 }
 
 impl BackendMetrics {
-  pub fn new(app_id: String, h: Histogram<u32>) -> BackendMetrics {
+  pub fn new(app_id: String, _h: Histogram<u32>) -> BackendMetrics {
     BackendMetrics {
       app_id,
       data: BTreeMap::new(),

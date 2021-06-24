@@ -184,12 +184,14 @@ impl Session {
     }
   }
 
+  /*
   fn request_id(&self) -> Option<&Ulid> {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => Some(&pipe.request_id),
       _ => None,
     }
   }
+  */
 
   fn log_context(&self) -> String {
     format!("{} {} {}\t",
@@ -287,6 +289,7 @@ impl Session {
     }
   }
 
+  /*
   fn back_socket(&self)  -> Option<&TcpStream> {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.back_socket(),
@@ -296,6 +299,7 @@ impl Session {
       _ => unreachable!(),
     }
   }
+  */
 
   fn back_socket_mut(&mut self)  -> Option<&mut TcpStream> {
     match self.protocol {
@@ -1147,7 +1151,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   let token = {
     let entry = sessions.vacant_entry();
     let key = entry.key();
-    let e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
+    let _e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
     Token(key)
   };
 

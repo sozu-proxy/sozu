@@ -1,4 +1,3 @@
-use sozu_command::buffer::fixed::Buffer;
 use pool_crate::Reset;
 use std::io::{self,Write};
 use std::cmp::{min,max};

@@ -224,7 +224,7 @@ impl Write for MetricSocket {
 }
 
 pub fn udp_bind() -> UdpSocket {
-  UdpSocket::bind(("0.0.0.0:0".parse().unwrap())).expect("could not parse address")
+  UdpSocket::bind("0.0.0.0:0".parse().unwrap()).expect("could not parse address")
 }
 
 #[macro_export]

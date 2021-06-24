@@ -75,7 +75,7 @@ impl CommandServer {
             CommandRequestData::ReloadConfiguration { path }=> {
                 self.reload_configuration(Some(client_id), request.id, path).await;
             },
-            r => error!("unknown request: {:?}", r),
+            //r => error!("unknown request: {:?}", r),
         }
     }
 
@@ -274,7 +274,6 @@ impl CommandServer {
                 "state loaded from {}, will start sending {} messages to workers",
                 path, diff_counter
             );
-            let id = message_id.to_string();
             Task::spawn(async move {
                 let mut ok = 0usize;
                 let mut error = 0usize;
@@ -359,7 +358,7 @@ impl CommandServer {
         .await;
     }
 
-    pub async fn launch_worker(&mut self, client_id: String, request_id: String, tag: &str) {
+    pub async fn launch_worker(&mut self, client_id: String, request_id: String, _tag: &str) {
         if let Ok(mut worker) = start_worker(
             self.next_id,
             &self.config,
@@ -724,7 +723,6 @@ impl CommandServer {
             Ok(c) => c,
         };
 
-        let message_counter = 0usize;
         let mut diff_counter = 0usize;
 
         let (load_state_tx, mut load_state_rx) = futures::channel::mpsc::channel(10000);
@@ -766,7 +764,6 @@ impl CommandServer {
 
         if diff_counter > 0 {
             info!("state loaded from {}, will start sending {} messages to workers", new_config.config_path, diff_counter);
-            let id = message_id.to_string();
             Task::spawn(async move {
                 let mut ok = 0usize;
                 let mut error = 0usize;
@@ -994,7 +991,7 @@ impl CommandServer {
                             error!("could not send message to client {:?}: {:?}", client_id, e);
                         }
                 }
-                &Query::Applications(ref query_type) => {
+                &Query::Applications(_) => {
                     let main = main_query_answer.unwrap();
                     data.insert(String::from("main"), main);
 
@@ -1124,7 +1121,6 @@ impl CommandServer {
                 stopping_workers.insert(worker.id);
             }
 
-            let id = worker.id.clone();
             let req_id = format!("{}-worker-{}", request_id, worker.id);
             worker.send(req_id.clone(), order.clone()).await;
             self.in_flight.insert(req_id, (tx.clone(), 1));
@@ -1152,7 +1148,7 @@ impl CommandServer {
                         let id: u32 = tag.parse().unwrap();
                         if stopping_workers.contains(&id) {
                             if let Err(e) = command_tx.send(CommandMessage::WorkerClose { id: id.clone() }).await {
-                                error!("could not send worker close message to {}", id);
+                                error!("could not send worker close message to {}: {:?}", id, e);
                             }
                         }
                     }
@@ -1174,7 +1170,7 @@ impl CommandServer {
 
             if should_stop_main {
                 if let Err(e) = command_tx.send(CommandMessage::MasterStop).await {
-                    error!("could not send main stop message");
+                    error!("could not send main stop message: {:?}", e);
                 }
             }
 

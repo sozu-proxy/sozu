@@ -76,7 +76,9 @@ fn main() {
         set_workers_affinity(&workers);
       }
       let command_socket_path = config.command_socket_path();
-      command::start(config, command_socket_path, workers);
+      if let Err(e) = command::start(config, command_socket_path, workers) {
+          error!("could not start worker: {:?}", e);
+      }
     });
 
     match start {

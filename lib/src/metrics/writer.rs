@@ -179,7 +179,7 @@ impl MetricsWriter {
                     self.packet_indexes.clear();
                     break;
                   } else {
-                    for i in 0..(sent as usize) {
+                    for _i in 0..(sent as usize) {
                       let _ = self.packet_indexes.remove(0);
                     }
                   }

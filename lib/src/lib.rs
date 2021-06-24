@@ -649,7 +649,6 @@ impl SessionMetrics {
     }
 
     self.service_start = Some(now);
-    let prev = self.wait_time;
     self.wait_time = self.wait_time + (now - self.wait_start);
   }
 

@@ -65,8 +65,8 @@ impl NetworkDrain {
     let mut send_count = 0;
 
     // remove metrics that were not touched in the last 10mn
-    self.app_data.retain(|ref key, ref value| value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00));
-    self.backend_data.retain(|ref key, ref value| value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00));
+    self.app_data.retain(|_, ref value| value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00));
+    self.backend_data.retain(|_, ref value| value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00));
 
     if self.is_writable {
 

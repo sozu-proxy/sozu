@@ -202,7 +202,7 @@ impl CommandServer {
                 futures::pin_mut!(f);
                 let (stream, _) =
                     match futures::future::select(accept_cancel_rx.take().unwrap(), f).await {
-                        futures::future::Either::Left((canceled, _)) => {
+                        futures::future::Either::Left((_canceled, _)) => {
                             info!("stopping listener");
                             break;
                         }
@@ -465,8 +465,6 @@ pub fn start(
     command_socket_path: String,
     workers: Vec<Worker>,
 ) -> std::io::Result<()> {
-    let saved_state = config.saved_state_path();
-
     let addr = PathBuf::from(&command_socket_path);
     if let Err(e) = fs::remove_file(&addr) {
         match e.kind() {
@@ -526,7 +524,7 @@ pub fn start(
                 futures::pin_mut!(f);
                 let (stream, _) =
                     match futures::future::select(accept_cancel_rx.take().unwrap(), f).await {
-                        futures::future::Either::Left((canceled, _)) => {
+                        futures::future::Either::Left((_canceled, _)) => {
                             info!("stopping listener");
                             break;
                         }
@@ -632,7 +630,9 @@ impl CommandServer {
                                     format!("{}", id),
                                     Some(CommandResponseData::Event(event.clone())),
                                 );
-                                tx.send(event).await;
+                                if let Err(e) = tx.send(event).await {
+                                    error!("could not send message to client: {:?}", e);
+                                }
                             }
                         }
                     } else {

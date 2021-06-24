@@ -145,7 +145,6 @@ pub struct Server {
   sessions:        Slab<Rc<RefCell<dyn ProxySessionCast>>>,
   max_connections: usize,
   nb_connections:  usize,
-  front_timeout:   Duration,
   pool:            Rc<RefCell<Pool>>,
   backends:        Rc<RefCell<BackendMap>>,
   scm_listeners:   Option<Listeners>,
@@ -199,7 +198,7 @@ impl Server {
     config_state: Option<ConfigState>,
     expects_initial_status: bool) -> Self {
 
-    FEATURES.with(|features| {
+    FEATURES.with(|_features| {
       // initializing feature flags
     });
 
@@ -234,7 +233,6 @@ impl Server {
       scm_listeners:   None,
       pool,
       backends,
-      front_timeout: Duration::seconds(i64::from(server_config.front_timeout)),
       zombie_check_interval: Duration::seconds(i64::from(server_config.zombie_check_interval)),
       accept_queue:    VecDeque::new(),
       accept_queue_timeout: Duration::seconds(i64::from(server_config.accept_queue_timeout)),
@@ -437,7 +435,7 @@ impl Server {
 
         let mut count = 0;
         let duration = self.zombie_check_interval;
-        for (index, session) in self.sessions.iter_mut().filter(|(_, c)| {
+        for (_index, session) in self.sessions.iter_mut().filter(|(_, c)| {
           now - c.borrow().last_event() > duration
         }) {
           let t = session.borrow().tokens();
@@ -1315,7 +1313,7 @@ impl Server {
       }
       let entry = self.sessions.vacant_entry();
       let back_token = Token(entry.key());
-      let entry = entry.insert(cl);
+      let _entry = entry.insert(cl);
 
       let (protocol, res) = match protocol {
         Protocol::TCP   => {

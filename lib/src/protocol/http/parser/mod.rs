@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use super::cookies::{RequestCookie, parse_request_cookies};
 
 use nom::{

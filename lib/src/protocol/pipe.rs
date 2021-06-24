@@ -2,13 +2,11 @@ use std::net::SocketAddr;
 use mio::*;
 use mio::net::*;
 use rusty_ulid::Ulid;
-use time::{Instant, Duration};
 use {SessionResult,Readiness,SessionMetrics};
 use sozu_command::ready::Ready;
 use socket::{SocketHandler,SocketResult,TransportProtocol};
 use pool::Checkout;
 use {Protocol, LogDuration};
-use server::TIMER;
 use timer::TimeoutContainer;
 
 #[derive(PartialEq)]

@@ -170,7 +170,7 @@ impl Listener {
             f.path_begin == front.path_begin
           }) {
 
-          let front = fronts.remove(pos);
+          let _front = fronts.remove(pos);
         }
       }
 
@@ -754,7 +754,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   let token = {
     let entry = sessions.vacant_entry();
     let key = entry.key();
-    let e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
+    let _e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
     Token(key)
   };
 

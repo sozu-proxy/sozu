@@ -12,7 +12,6 @@ use socket::{SocketHandler, SocketResult, TransportProtocol};
 use protocol::ProtocolResult;
 use pool::Pool;
 use util::UnwrapLog;
-use server::TIMER;
 use timer::TimeoutContainer;
 use sozu_command::ready::Ready;
 use crate::Backend;
@@ -141,7 +140,7 @@ impl<Front:SocketHandler> Http<Front> {
       answers,
       pool,
     };
-    session.added_req_header = Some(session.added_request_header(public_address, session_address));
+    session.added_req_header = Some(session.added_request_header(session_address));
     session.added_res_header = session.added_response_header();
 
     session
@@ -156,7 +155,7 @@ impl<Front:SocketHandler> Http<Front> {
     self.response = Some(ResponseState::Initial);
     self.req_header_end = None;
     self.res_header_end = None;
-    self.added_req_header = Some(self.added_request_header(self.public_address, self.session_address));
+    self.added_req_header = Some(self.added_request_header(self.session_address));
     self.added_res_header = self.added_response_header();
 
     // if HTTP requests are pipelined, we might still have some data in the front buffer
@@ -227,7 +226,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   }
 
-  pub fn added_request_header(&self, public_address: SocketAddr, client_address: Option<SocketAddr>) -> AddedRequestHeader {
+  fn added_request_header(&self, client_address: Option<SocketAddr>) -> AddedRequestHeader {
       AddedRequestHeader {
           request_id: self.request_id,
           closing: self.closing,
@@ -345,7 +344,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   fn must_continue_request(&self) -> bool {
-    if let Some(Continue::Expects(sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().as_ref().map(|conn| conn.continues)) {
+    if let Some(Continue::Expects(_sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().as_ref().map(|conn| conn.continues)) {
       true
     } else {
       false
@@ -487,7 +486,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
-    let wait_time  = metrics.wait_time;
+    let _wait_time  = metrics.wait_time;
 
     let app_id = OptionalString::new(self.app_id.as_ref().map(|s| s.as_str()));
     time!("response_time", app_id.as_str(), response_time.whole_milliseconds());
@@ -1609,11 +1608,15 @@ impl AddedRequestHeader {
         let mut s = String::new();
 
         if !headers.x_proto {
-            write!(&mut s, "X-Forwarded-Proto: {}\r\n", proto);
+            if let Err(e) = write!(&mut s, "X-Forwarded-Proto: {}\r\n", proto) {
+                error!("could not append request header: {:?}", e);
+            }
         }
 
         if !headers.x_port {
-            write!(&mut s, "X-Forwarded-Port: {}\r\n", front_port);
+            if let Err(e) = write!(&mut s, "X-Forwarded-Port: {}\r\n", front_port) {
+                error!("could not append request header: {:?}", e);
+            }
         }
 
         if let Some(peer_addr) = self.peer_address {
@@ -1621,43 +1624,61 @@ impl AddedRequestHeader {
             let peer_port = peer_addr.port();
             match &headers.x_for {
                 None => {
-                    write!(&mut s, "X-Forwarded-For: {}\r\n", peer_ip);
+                    if let Err(e) = write!(&mut s, "X-Forwarded-For: {}\r\n", peer_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
                 Some(value) => {
-                    write!(&mut s, "X-Forwarded-For: {}, {}\r\n", value, peer_ip);
+                    if let Err(e) = write!(&mut s, "X-Forwarded-For: {}, {}\r\n", value, peer_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
             }
 
             match &headers.forwarded {
                 None => {
-                    write!(&mut s, "Forwarded: ");
+                    if let Err(e) = write!(&mut s, "Forwarded: ") {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
                 Some(value) => {
-                    write!(&mut s, "Forwarded: {}, ", value);
+                    if let Err(e) = write!(&mut s, "Forwarded: {}, ", value) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
             }
 
             match (peer_ip, peer_port, front_ip) {
                 (IpAddr::V4(_), peer_port, IpAddr::V4(_)) => {
-                    write!(&mut s, "proto={};for={}:{};by={}\r\n",
-                           proto, peer_ip, peer_port, front_ip)
+                    if let Err(e) = write!(&mut s, "proto={};for={}:{};by={}\r\n",
+                           proto, peer_ip, peer_port, front_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
                 (IpAddr::V4(_), peer_port, IpAddr::V6(_)) => {
-                    write!(&mut s, "proto={};for={}:{};by=\"{}\"\r\n",
-                           proto, peer_ip, peer_port, front_ip)
+                    if let Err(e) = write!(&mut s, "proto={};for={}:{};by=\"{}\"\r\n",
+                           proto, peer_ip, peer_port, front_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
                 (IpAddr::V6(_), peer_port, IpAddr::V4(_)) => {
-                    write!(&mut s, "proto={};for=\"{}:{}\";by={}\r\n",
-                           proto, peer_ip, peer_port, front_ip)
+                    if let Err(e) = write!(&mut s, "proto={};for=\"{}:{}\";by={}\r\n",
+                           proto, peer_ip, peer_port, front_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
                 (IpAddr::V6(_), peer_port, IpAddr::V6(_)) => {
-                    write!(&mut s, "proto={};for=\"{}:{}\";by=\"{}\"\r\n",
-                           proto, peer_ip, peer_port, front_ip)
+                    if let Err(e) = write!(&mut s, "proto={};for=\"{}:{}\";by=\"{}\"\r\n",
+                           proto, peer_ip, peer_port, front_ip) {
+                        error!("could not append request header: {:?}", e);
+                    }
                 },
             };
         }
 
-        write!(&mut s, "Sozu-Id: {}\r\n{}", self.request_id, closing_header);
+        if let Err(e) = write!(&mut s, "Sozu-Id: {}\r\n{}", self.request_id, closing_header) {
+            error!("could not append request header: {:?}", e);
+        }
 
         s
     }
