@@ -68,7 +68,6 @@ pub struct Session {
   back_connected:     BackendConnectionStatus,
   protocol:           Option<State>,
   public_address:     SocketAddr,
-  ssl:                Option<Ssl>,
   pool:               Weak<RefCell<Pool>>,
   sticky_name:        String,
   metrics:            SessionMetrics,
@@ -117,7 +116,6 @@ impl Session {
       back_connected:     BackendConnectionStatus::NotConnected,
       protocol,
       public_address,
-      ssl:                None,
       pool,
       sticky_name,
       metrics,
@@ -215,7 +213,6 @@ impl Session {
       gauge_add!("protocol.tls.handshake", -1);
       gauge_add!("protocol.https", 1);
 
-      self.ssl = handshake.ssl;
       self.protocol = Some(State::Http(http));
       return true;
     } else if let State::Http(http) = protocol {
@@ -899,7 +896,7 @@ pub struct Listener {
   default_context: SslContext,
   answers:         Rc<RefCell<HttpAnswers>>,
   config:          HttpsListener,
-  ssl_options:     SslOptions,
+  _ssl_options:    SslOptions,
   pub token:       Token,
   active:          bool,
 }
@@ -922,13 +919,13 @@ impl Listener {
       listener:        None,
       address:         config.front.clone(),
       domains:         rc_domains,
-      default_context: default_context,
+      default_context,
       contexts:        rc_ctx,
       answers:         Rc::new(RefCell::new(HttpAnswers::new(&config.answer_404, &config.answer_503))),
       active:          false,
       fronts,
       config,
-      ssl_options,
+      _ssl_options: ssl_options,
       token,
     }
   }
