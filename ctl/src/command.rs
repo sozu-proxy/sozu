@@ -1006,7 +1006,7 @@ pub fn reload_configuration(mut channel: Channel<CommandRequest,CommandResponse>
   }
 }
 
-pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing_policy: LoadBalancingAlgorithms) {
+pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing: LoadBalancingAlgorithms) {
   let proxy_protocol = match (send_proxy, expect_proxy) {
     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
     (true, false) => Some(ProxyProtocolConfig::SendHeader),
@@ -1019,7 +1019,8 @@ pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout
     sticky_session,
     https_redirect,
     proxy_protocol,
-    load_balancing_policy,
+    load_balancing,
+    load_metric: None,
     answer_503: None,
   }));
 }
