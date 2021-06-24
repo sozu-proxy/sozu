@@ -178,7 +178,7 @@ mod test {
   fn it_should_find_the_backend_with_least_connections() {
     let backend_with_least_connection = Rc::new(RefCell::new(create_backend("yolo".to_string(), Some(1))));
 
-    let backends = vec![
+    let mut backends = vec![
       Rc::new(RefCell::new(create_backend("nolo".to_string(), Some(10)))),
       Rc::new(RefCell::new(create_backend("philo".to_string(), Some(20)))),
       backend_with_least_connection.clone(),
@@ -194,7 +194,7 @@ mod test {
 
   #[test]
   fn it_shouldnt_find_backend_with_least_connections_when_list_is_empty() {
-    let backends = vec![];
+    let mut backends = vec![];
 
     let mut least_connection_algorithm = LeastLoaded{ metric: LoadMetric::Connections };
 
