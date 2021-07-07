@@ -144,7 +144,7 @@ pub fn start_worker_process(id: &str, config: &Config, executable_path: String, 
 
   info!("{} launching worker", id);
   debug!("executable path is {}", executable_path);
-  match fork() {
+  match unsafe { fork() } {
     Ok(ForkResult::Parent{ child }) => {
       info!("{} worker launched: {}", id, child);
       command.write_message(config);

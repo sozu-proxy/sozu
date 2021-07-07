@@ -77,7 +77,7 @@ pub fn start_new_main_process(executable_path: String, upgrade_data: UpgradeData
 
   info!("launching new main");
   //FIXME: remove the expect, return a result?
-  match fork().expect("fork failed") {
+  match unsafe { fork().expect("fork failed") } {
     ForkResult::Parent{ child } => {
       info!("main launched: {}", child);
       command.set_nonblocking(true);

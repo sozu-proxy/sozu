@@ -50,12 +50,12 @@ quickcheck = "^1.0"
 ureq = "2.1"
 
 [dependencies.nom]
-version = "^6.0"
+version = "^7.0.0-alpha1"
 default-features = false
 features = ["std"]
 
 [dependencies.rusty_ulid]
-version = "^0.10"
+version = "^0.11"
 default-features = false
 features = ["ulid-generation"]
 
