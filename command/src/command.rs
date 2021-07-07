@@ -132,8 +132,9 @@ mod tests {
   use crate::certificate::split_certificate_chain;
   use crate::proxy::{Application,CertificateAndKey,CertFingerprint,ProxyRequestData,HttpFront,Backend,
     AppMetricsData,MetricsData,FilteredData,Percentiles,RemoveBackend,
-    AddCertificate,RemoveCertificate,LoadBalancingParams,TlsVersion};
-  use crate::config::{LoadBalancingAlgorithms,ProxyProtocolConfig};
+    AddCertificate,RemoveCertificate,LoadBalancingParams,TlsVersion,
+    LoadBalancingAlgorithms};
+  use crate::config::ProxyProtocolConfig;
 
   #[test]
   fn config_message_test() {

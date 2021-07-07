@@ -1404,8 +1404,8 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use sozu_command::proxy::{ProxyRequestData,HttpFront,Backend,HttpListener,ProxyRequest,LoadBalancingParams};
-  use sozu_command::config::LoadBalancingAlgorithms;
+  use sozu_command::proxy::{ProxyRequestData,HttpFront,Backend,HttpListener,
+    ProxyRequest,LoadBalancingParams, LoadBalancingAlgorithms};
   use sozu_command::channel::Channel;
 
   /*

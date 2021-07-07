@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::collections::{HashMap,BTreeMap,HashSet};
 use std::str::FromStr;
 
-use crate::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
+use crate::config::{ProxyProtocolConfig};
 
 pub type MessageId = String;
 
@@ -376,6 +376,51 @@ pub struct RemoveBackend {
     pub address:    SocketAddr,
 }
 
+#[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalancingAlgorithms {
+  RoundRobin,
+  Random,
+  LeastLoaded,
+  PowerOfTwo,
+}
+
+impl Default for LoadBalancingAlgorithms {
+  fn default() -> Self {
+    LoadBalancingAlgorithms::RoundRobin
+  }
+}
+
+#[derive(Debug)]
+pub struct ParseErrorLoadBalancing;
+
+impl fmt::Display for ParseErrorLoadBalancing {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Cannot find the load balancing policy asked")
+    }
+}
+
+impl error::Error for ParseErrorLoadBalancing {
+    fn description(&self) -> &str {
+        "Cannot find the load balancing policy asked"
+    }
+
+    fn cause(&self) -> Option<&dyn error::Error> {
+        None
+    }
+}
+
+impl FromStr for LoadBalancingAlgorithms {
+  type Err = ParseErrorLoadBalancing;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    match s {
+      "roundrobin" => Ok(LoadBalancingAlgorithms::RoundRobin),
+      "random" => Ok(LoadBalancingAlgorithms::Random),
+      _ => Err(ParseErrorLoadBalancing{}),
+    }
+  }
+}
 #[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
 pub struct LoadBalancingParams {
     pub weight: u8,
@@ -390,7 +435,7 @@ impl Default for LoadBalancingParams {
 }
 
 /// how sozu measures which backend is less loaded
-#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadMetric {
     /// number of TCP connections

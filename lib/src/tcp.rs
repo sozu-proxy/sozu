@@ -11,8 +11,9 @@ use rusty_ulid::Ulid;
 use time::{Duration,Instant};
 
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
-use sozu_command::proxy::{ProxyRequestData,ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent};
+use sozu_command::config::ProxyProtocolConfig;
+use sozu_command::proxy::{ProxyRequestData,ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent,
+  LoadBalancingAlgorithms};
 use sozu_command::proxy::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
 use sozu_command::ready::Ready;

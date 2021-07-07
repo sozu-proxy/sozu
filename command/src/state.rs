@@ -866,8 +866,8 @@ impl<'a, K:Ord, V:PartialEq, I1: Iterator<Item=(K, &'a V)>, I2: Iterator<Item=(K
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::config::LoadBalancingAlgorithms;
-  use crate::proxy::{ProxyRequestData,HttpFront,Backend,LoadBalancingParams,TlsProvider};
+  use crate::proxy::{ProxyRequestData,HttpFront,Backend,LoadBalancingParams,TlsProvider,
+    LoadBalancingAlgorithms};
 
   #[test]
   fn serialize() {

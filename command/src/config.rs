@@ -1,8 +1,7 @@
 //! parsing data from the configuration file
-use std::{error, fmt, env};
+use std::env;
 use std::fs::File;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::iter::repeat;
 use std::net::SocketAddr;
 use std::collections::{HashMap,HashSet};
@@ -13,7 +12,7 @@ use toml;
 
 use crate::proxy::{CertificateAndKey,ProxyRequestData,HttpFront,TcpFront,Backend,
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
-  LoadMetric, Application, TlsVersion,ActivateListener,ListenerType};
+  LoadMetric, Application, TlsVersion,ActivateListener,ListenerType, LoadBalancingAlgorithms};
 
 use crate::command::{CommandRequestData,CommandRequest,PROTOCOL_VERSION};
 
@@ -372,51 +371,6 @@ pub struct FileAppConfig {
   pub load_metric: Option<LoadMetric>,
 }
 
-#[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoadBalancingAlgorithms {
-  RoundRobin,
-  Random,
-  LeastLoaded,
-  PowerOfTwo,
-}
-
-impl Default for LoadBalancingAlgorithms {
-  fn default() -> Self {
-    LoadBalancingAlgorithms::RoundRobin
-  }
-}
-
-#[derive(Debug)]
-pub struct ParseErrorLoadBalancing;
-
-impl fmt::Display for ParseErrorLoadBalancing {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Cannot find the load balancing policy asked")
-    }
-}
-
-impl error::Error for ParseErrorLoadBalancing {
-    fn description(&self) -> &str {
-        "Cannot find the load balancing policy asked"
-    }
-
-    fn cause(&self) -> Option<&dyn error::Error> {
-        None
-    }
-}
-
-impl FromStr for LoadBalancingAlgorithms {
-  type Err = ParseErrorLoadBalancing;
-
-  fn from_str(s: &str) -> Result<Self, Self::Err> {
-    match s {
-      "roundrobin" => Ok(LoadBalancingAlgorithms::RoundRobin),
-      "random" => Ok(LoadBalancingAlgorithms::Random),
-      _ => Err(ParseErrorLoadBalancing{}),
-    }
-  }
-}
 
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]

@@ -1,5 +1,4 @@
-use sozu_command::config::LoadBalancingAlgorithms;
-use sozu_command::proxy::TlsVersion;
+use sozu_command::proxy::{LoadBalancingAlgorithms, TlsVersion};
 use std::net::SocketAddr;
 
 #[derive(StructOpt, PartialEq, Debug)]

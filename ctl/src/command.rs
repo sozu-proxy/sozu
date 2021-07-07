@@ -1,4 +1,4 @@
-use sozu_command::config::{Config, ProxyProtocolConfig, LoadBalancingAlgorithms, Listener, FileListenerProtocolConfig};
+use sozu_command::config::{Config, ProxyProtocolConfig, Listener, FileListenerProtocolConfig};
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
@@ -6,7 +6,7 @@ use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, Tcp
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
   FilteredData,
   AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend, TcpListener, ListenerType,
-  TlsVersion, QueryCertificateType, QueryAnswerCertificate, RemoveListener, ActivateListener, DeactivateListener};
+  TlsVersion, QueryCertificateType, QueryAnswerCertificate, RemoveListener, ActivateListener, DeactivateListener, LoadBalancingAlgorithms};
 
 use serde_json;
 use std::collections::{HashMap,HashSet,BTreeMap};

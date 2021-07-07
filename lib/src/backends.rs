@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::collections::HashMap;
 use mio::net::TcpStream;
 
-use sozu_command::{proxy, config::LoadBalancingAlgorithms};
+use sozu_command::proxy::{self, LoadBalancingAlgorithms};
 
 use super::{AppId,Backend,ConnectionError,load_balancing::*};
 use server::push_event;
@@ -119,7 +119,7 @@ impl BackendMap {
     }
   }
 
-  pub fn set_load_balancing_policy_for_app(&mut self, app_id: &str, lb_algo: LoadBalancingAlgorithms, metric: Option<proxy::LoadMetric>) {
+  pub fn set_load_balancing_policy_for_app(&mut self, app_id: &str, lb_algo: proxy::LoadBalancingAlgorithms, metric: Option<proxy::LoadMetric>) {
     // The application can be created before the backends were registered because of the async config messages.
     // So when we set the load balancing policy, we have to create the backend list if if it doesn't exist yet.
     let app_backends = self.get_or_create_backend_list_for_app(app_id);
