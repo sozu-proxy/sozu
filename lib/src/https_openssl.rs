@@ -1051,6 +1051,7 @@ impl Listener {
     Some((context.build(), ssl_options))
   }
 
+  #[allow(dead_code)]
   fn create_servername_callback(ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
     ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>)
     -> impl Fn(&mut SslRef, &mut SslAlert) -> Result<(), SniError> + 'static + Sync + Send {
@@ -1313,7 +1314,7 @@ impl Listener {
     }
   }
 
-  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
+  fn accept(&mut self, _token: ListenToken) -> Result<TcpStream, AcceptError> {
     if let Some(ref sock) = self.listener {
       sock.accept().map_err(|e| {
         match e.kind() {

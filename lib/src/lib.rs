@@ -784,7 +784,6 @@ impl PeakEWMA {
     }
 
     pub fn get(&mut self, active_requests: usize) -> f64 {
-        let before = self.rtt;
         // decay the current value
         // (we might not have seen a request in a long time)
         self.observe(0.0);

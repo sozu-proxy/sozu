@@ -211,7 +211,7 @@ impl Listener {
     (*self.resolver).add_certificate(add);
   }
 
-  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
+  fn accept(&mut self, _token: ListenToken) -> Result<TcpStream, AcceptError> {
 
     if let Some(ref listener) = self.listener.as_ref() {
       listener.accept().map_err(|e| {
