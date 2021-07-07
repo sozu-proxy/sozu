@@ -10,7 +10,6 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use async_io::Async;
-use smol::Task;
 
 use sozu::metrics::METRICS;
 use sozu_command::buffer::fixed::Buffer;
@@ -274,7 +273,7 @@ impl CommandServer {
                 "state loaded from {}, will start sending {} messages to workers",
                 path, diff_counter
             );
-            Task::spawn(async move {
+            smol::spawn(async move {
                 let mut ok = 0usize;
                 let mut error = 0usize;
                 while let Some(proxy_response) = load_state_rx.next().await {
@@ -406,7 +405,7 @@ impl CommandServer {
             let id = worker.id;
             let command_tx = self.command_tx.clone();
             //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
-            Task::spawn(async move {
+            smol::spawn(async move {
                 super::worker_loop(id, stream, command_tx, worker_rx)
                     .await
                     .unwrap();
@@ -594,7 +593,7 @@ impl CommandServer {
                 .await;
 
             info!("sent ReturnListenSockets to old worker");
-            Task::spawn(async move {
+            smol::spawn(async move {
                 while let Some(proxy_response) = rx.next().await {
                     match proxy_response.status {
                         ProxyResponseStatus::Ok => {
@@ -642,7 +641,7 @@ impl CommandServer {
 
             let mut command_tx = self.command_tx.clone();
             let worker_id = old_worker.id;
-            Task::spawn(async move {
+            smol::spawn(async move {
                 while let Some(proxy_response) = rx.next().await {
                     match proxy_response.status {
                         ProxyResponseStatus::Ok => {
@@ -688,7 +687,7 @@ impl CommandServer {
         let id = worker.id;
         let command_tx = self.command_tx.clone();
         //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
-        Task::spawn(async move {
+        smol::spawn(async move {
             super::worker_loop(id, stream, command_tx, worker_rx)
                 .await
                 .unwrap();
@@ -764,7 +763,7 @@ impl CommandServer {
 
         if diff_counter > 0 {
             info!("state loaded from {}, will start sending {} messages to workers", new_config.config_path, diff_counter);
-            Task::spawn(async move {
+            smol::spawn(async move {
                 let mut ok = 0usize;
                 let mut error = 0usize;
                 while let Some(proxy_response) = load_state_rx.next().await {
@@ -847,7 +846,7 @@ impl CommandServer {
 
         let mut client_tx = self.clients.get_mut(&client_id).unwrap().clone();
         let prefix = format!("{}-metrics-", request_id);
-        Task::spawn(async move {
+        smol::spawn(async move {
             let mut v = Vec::new();
             let mut i = 0;
             while let Some(proxy_response) = rx.next().await {
@@ -939,7 +938,7 @@ impl CommandServer {
 
         let mut client_tx = self.clients.get_mut(&client_id).unwrap().clone();
         let prefix = format!("{}-query-", request_id);
-        Task::spawn(async move {
+        smol::spawn(async move {
             let mut v = Vec::new();
             let mut i = 0;
             while let Some(proxy_response) = rx.next().await {
@@ -1136,7 +1135,7 @@ impl CommandServer {
         let mut client_tx = self.clients.get_mut(&client_id).unwrap().clone();
         let mut command_tx = self.command_tx.clone();
         let prefix = format!("{}-worker-", request_id);
-        Task::spawn(async move {
+        smol::spawn(async move {
             let mut v = Vec::new();
             let mut i = 0usize;
             while let Some(proxy_response) = rx.next().await {

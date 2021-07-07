@@ -8,7 +8,7 @@ use std::io::{Seek,SeekFrom};
 use nix::unistd::*;
 use serde_json;
 use tempfile::tempfile;
-use blocking::block_on;
+use futures_lite::future;
 
 use sozu_command::config::Config;
 use sozu_command::command::RunState;
@@ -127,7 +127,7 @@ pub fn begin_new_main_process(fd: i32, upgrade_fd: i32, command_buffer_size: usi
   match util::write_pid_file(&config) {
     Ok(()) => {
       command.write_message(&true);
-      block_on(async {
+      future::block_on(async {
         server.run().await;
       });
       info!("main process stopped");

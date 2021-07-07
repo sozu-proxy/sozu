@@ -1,7 +1,7 @@
 use async_dup::Arc;
 use futures::channel::{mpsc::*, oneshot};
 use futures::{SinkExt, StreamExt};
-use futures_lite::io::*;
+use futures_lite::{future, io::*};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use serde_json;
@@ -14,8 +14,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
 use async_io::Async;
-use blocking::block_on;
-use smol::Task;
 
 use sozu_command::command::{
     CommandRequestData, CommandResponse, CommandResponseData, CommandStatus, Event, RunState,
@@ -123,7 +121,7 @@ impl CommandServer {
 
             let id = worker.id;
             let command_tx = command_tx.clone();
-            Task::spawn(async move {
+            smol::spawn(async move {
                 worker_loop(id, stream, command_tx, worker_rx)
                     .await
                     .unwrap();
@@ -189,7 +187,7 @@ impl CommandServer {
         let (command_tx, command_rx) = channel(10000);
         let mut tx = command_tx.clone();
 
-        Task::spawn(async move {
+        smol::spawn(async move {
             let mut counter = 0usize;
             let mut accept_cancel_rx = Some(accept_cancel_rx);
             loop {
@@ -215,7 +213,7 @@ impl CommandServer {
 
                 let (client_tx, client_rx) = channel(10000);
                 let id = format!("CL-up-{}", counter);
-                Task::spawn(client(id.clone(), stream, tx.clone(), client_rx)).detach();
+                smol::spawn(client(id.clone(), stream, tx.clone(), client_rx)).detach();
                 tx.send(CommandMessage::ClientNew {
                     id,
                     sender: client_tx,
@@ -247,7 +245,7 @@ impl CommandServer {
                 let id = serialized.id;
                 let command_tx = tx.clone();
                 //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
-                Task::spawn(async move {
+                smol::spawn(async move {
                     worker_loop(id, stream, command_tx, worker_rx)
                         .await
                         .unwrap();
@@ -418,7 +416,7 @@ impl CommandServer {
 
                 let id = worker.id;
                 let command_tx = self.command_tx.clone();
-                Task::spawn(async move {
+                smol::spawn(async move {
                     worker_loop(id, stream, command_tx, worker_rx)
                         .await
                         .unwrap();
@@ -507,7 +505,7 @@ pub fn start(
         }
     };
 
-    block_on(async {
+    future::block_on(async {
         // Create a listener.
         let fd = srv.as_raw_fd();
         let listener = Async::new(srv)?;
@@ -517,7 +515,7 @@ pub fn start(
         let (accept_cancel_tx, accept_cancel_rx) = oneshot::channel();
         let (mut command_tx, command_rx) = channel(10000);
         let tx = command_tx.clone();
-        Task::spawn(async move {
+        smol::spawn(async move {
             let mut accept_cancel_rx = Some(accept_cancel_rx);
             loop {
                 let f = listener.accept();
@@ -538,7 +536,7 @@ pub fn start(
 
                 let (client_tx, client_rx) = channel(10000);
                 let id = format!("CL-{}", counter);
-                Task::spawn(client(id.clone(), stream, command_tx.clone(), client_rx)).detach();
+                smol::spawn(client(id.clone(), stream, command_tx.clone(), client_rx)).detach();
                 command_tx
                     .send(CommandMessage::ClientNew {
                         id,
@@ -739,7 +737,7 @@ async fn client(
     let stream = Arc::new(stream);
     let mut s = stream.clone();
 
-    Task::spawn(async move {
+    smol::spawn(async move {
         while let Some(msg) = rx.next().await {
             //info!("sending back message to client: {:?}", msg);
             let mut message: Vec<u8> = serde_json::to_string(&msg)
@@ -793,7 +791,7 @@ async fn worker_loop(
     let stream = Arc::new(stream);
     let mut s = stream.clone();
 
-    Task::spawn(async move {
+    smol::spawn(async move {
         debug!("will start sending messages to worker {}", id);
         while let Some(msg) = rx.next().await {
             info!("sending to worker {}: {:?}", id, msg);

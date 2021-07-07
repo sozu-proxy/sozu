@@ -37,11 +37,10 @@ futures = "^0.3"
 lazy_static = "^1.1"
 regex = "1.0"
 jemallocator = {version = "^0.3", optional = true }
-smol = "0.2"
-blocking = "0.4"
-async-io = "0.1"
+smol = "^1"
+async-io = "^1"
 async-dup = "1.2"
-futures-lite = "0.1"
+futures-lite = "^1"
 log = "^0.4"
 
 sozu-lib = { version = "^0.12.0", path = "../lib" }
