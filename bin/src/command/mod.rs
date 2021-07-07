@@ -635,7 +635,9 @@ impl CommandServer {
                         }
                     } else {
                         match self.in_flight.remove(&message.id) {
-                            None => error!("unknown message id: {}", message.id),
+                            None => {
+                                debug!("unknown message id: {}", message.id);
+                            },
                             Some((mut tx, mut nb)) => {
                                 let message_id = message.id.clone();
 
