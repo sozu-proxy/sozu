@@ -25,7 +25,7 @@ include = [
 hex = "^0.4"
 log = "^0.4"
 pem = "^0.8"
-nix = "^0.21"
+nix = "^0.22"
 mio = { version = "^0.7", features = [ "os-poll", "tcp", "uds" ] }
 libc = "^0.2"
 pool = "^0.1"
