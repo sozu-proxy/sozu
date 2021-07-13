@@ -153,6 +153,20 @@ impl<Front:SocketHandler> Pipe<Front> {
       self.back_timeout.as_mut().map(|t| t.cancel());
   }
 
+  fn reset_timeouts(&mut self) {
+    if let Some(t) = self.front_timeout.as_mut() {
+      if !t.reset() {
+        error!("{} could not reset front timeout (pipe)", self.request_id);
+      }
+    }
+
+    if let Some(t) = self.back_timeout.as_mut() {
+      if !t.reset() {
+        error!("{} could not reset back timeout (pipe)", self.request_id);
+      }
+    }
+  }
+
   pub fn close(&mut self) {
   }
 
@@ -352,11 +366,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Read content from the session
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    if let Some(t) = self.front_timeout.as_mut() {
-      if !t.reset() {
-        error!("could not reset front timeout (pipe readable)");
-      }
-    }
+    self.reset_timeouts();
 
     trace!("pipe readable");
     if self.front_buf.available_space() == 0 {
@@ -588,11 +598,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Read content from application
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    if let Some(t) = self.back_timeout.as_mut() {
-      if !t.reset() {
-        error!("could not reset back timeout");
-      }
-    }
+    self.reset_timeouts();
 
     trace!("pipe back_readable");
     if self.back_buf.available_space() == 0 {
