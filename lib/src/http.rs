@@ -117,7 +117,7 @@ impl Session {
   pub fn upgrade(&mut self) -> bool {
     debug!("HTTP::upgrade");
     let protocol = unwrap_msg!(self.protocol.take());
-    if let State::Http(http) = protocol {
+    if let State::Http(mut http) = protocol {
       debug!("switching to pipe");
       let front_token = self.frontend_token;
       let back_token  = unwrap_msg!(http.back_token());
@@ -158,6 +158,8 @@ impl Session {
 
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
+      http.front_timeout.set_duration(self.frontend_timeout_duration);
+      http.back_timeout.set_duration(self.backend_timeout_duration);
       pipe.front_timeout = Some(http.front_timeout);
       pipe.back_timeout = Some(http.back_timeout);
       pipe.set_back_token(back_token);

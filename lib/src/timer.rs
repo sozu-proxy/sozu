@@ -79,6 +79,7 @@ pub struct TimeoutContainer {
     // mark it as an option, so we do not try to cancel a timeout multiple times
     timeout: Option<Timeout>,
     duration: Duration,
+    token: Option<Token>,
 }
 
 impl TimeoutContainer {
@@ -86,17 +87,18 @@ impl TimeoutContainer {
     let timeout = TIMER.with(|timer| {
         timer.borrow_mut().set_timeout(duration, token)
     });
-    TimeoutContainer { timeout: Some(timeout), duration }
+    TimeoutContainer { timeout: Some(timeout), duration, token: Some(token) }
   }
 
   pub fn new_empty(duration: Duration) -> TimeoutContainer {
-    TimeoutContainer { timeout: None, duration }
+    TimeoutContainer { timeout: None, duration, token: None }
   }
 
   pub fn take(&mut self) -> TimeoutContainer {
     TimeoutContainer {
         timeout: self.timeout.take(),
         duration: self.duration,
+        token: self.token.take(),
     }
   }
 
@@ -116,12 +118,25 @@ impl TimeoutContainer {
           timer.borrow_mut().set_timeout(self.duration, token)
       });
 
-    self.timeout = Some(timeout);
+      self.timeout = Some(timeout);
+      self.token = Some(token);
   }
 
   /// warning: this does not reset the timer
   pub fn set_duration(&mut self, duration: Duration) {
       self.duration = duration;
+
+      if let Some(timeout) = self.timeout.take() {
+          TIMER.with(|timer| {
+              timer.borrow_mut().cancel_timeout(&timeout)
+          });
+      }
+
+      if let Some(token) = self.token {
+          self.timeout = Some(TIMER.with(|timer| {
+              timer.borrow_mut().set_timeout(self.duration, token)
+          }));
+      }
   }
 
   pub fn duration(&mut self) -> Duration {
@@ -147,8 +162,14 @@ impl TimeoutContainer {
   pub fn reset(&mut self) -> bool {
       match self.timeout.take() {
         None => {
-            //error!("cannot reset non existing timeout");
-            return false;
+            if let Some(token) = self.token {
+                self.timeout = Some(TIMER.with(|timer| {
+                    timer.borrow_mut().set_timeout(self.duration, token)
+                }));
+            } else {
+                //error!("cannot reset non existing timeout");
+                return false;
+            }
         },
         Some(timeout) => {
             self.timeout = TIMER.with(|timer| {
