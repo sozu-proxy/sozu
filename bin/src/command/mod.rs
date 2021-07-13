@@ -532,8 +532,6 @@ pub fn start(
                         }
                     };
 
-                println!("Accepted a client");
-
                 let (client_tx, client_rx) = channel(10000);
                 let id = format!("CL-{}", counter);
                 smol::spawn(client(id.clone(), stream, command_tx.clone(), client_rx)).detach();
@@ -751,7 +749,7 @@ async fn client(
     })
     .detach();
 
-    info!("will start receiving messages from client {}", id);
+    debug!("will start receiving messages from client {}", id);
     let mut it = BufReader::new(stream).split(0);
     while let Some(message) = it.next().await {
         let message = match message {
