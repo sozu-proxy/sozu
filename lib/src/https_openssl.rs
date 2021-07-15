@@ -248,6 +248,7 @@ impl Session {
 
       gauge_add!("protocol.https", -1);
       gauge_add!("http.active_requests", -1);
+      gauge_add!("websocket.active_requests", 1);
       gauge_add!("protocol.wss", 1);
 
       let mut pipe = Pipe::new(http.frontend, front_token, http.request_id, http.app_id, http.backend_id,

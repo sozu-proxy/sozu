@@ -254,6 +254,10 @@ impl<Front:SocketHandler> Pipe<Front> {
     }
 
     let proto = self.protocol_string();
+    match self.protocol {
+      Protocol::TCP  => {},
+      _ => gauge_add!("websocket.active_requests", -1),
+    }
 
     info_access!("{}{} -> {}\t{} {} {} {}\t{} {}",
       self.log_ctx, session, backend,
