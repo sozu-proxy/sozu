@@ -288,13 +288,17 @@ impl Server {
     let mut last_sessions_len = self.sessions.len();
     let mut should_poll_at: Option<Instant> = None;
 
+    let mut loop_start = Instant::now();
     loop {
+      let now = Instant::now();
+      time!("event_loop_time", (now - loop_start).whole_milliseconds());
+      loop_start = now;
+
       if current_poll_errors == max_poll_errors {
         error!("Something is going very wrong. Last {} poll() calls failed, crashing..", current_poll_errors);
         panic!("poll() calls failed {} times in a row", current_poll_errors);
       }
 
-      let now = Instant::now();
       let timeout = match should_poll_at.as_ref() {
           None => poll_timeout,
           Some(i) => if *i <= now {
@@ -311,6 +315,9 @@ impl Server {
       } else {
         current_poll_errors = 0;
       }
+      let after_epoll = Instant::now();
+      time!("epoll_time", (after_epoll - loop_start).whole_milliseconds());
+      loop_start = after_epoll;
 
       self.send_queue();
 
