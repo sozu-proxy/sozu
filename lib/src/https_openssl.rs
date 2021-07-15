@@ -542,6 +542,151 @@ impl Session {
           _ => {},
       }
   }
+
+  fn ready_inner(&mut self) -> SessionResult {
+    let mut counter = 0;
+    let max_loop_iterations = 100000;
+
+    if self.back_connected().is_connecting() &&
+      self.back_readiness().map(|r| r.event != Ready::empty()).unwrap_or(false) {
+
+      self.http_mut().map(|h| h.cancel_backend_timeout());
+
+      if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) ||
+        !self.http_mut().map(|h| h.test_back_socket()).unwrap_or(false) {
+
+        //retry connecting the backend
+        error!("{} error connecting to backend, trying again", self.log_context());
+        self.connection_attempt += 1;
+        self.fail_backend_connection();
+
+        let backend_token = self.back_token();
+        self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
+        return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
+      } else {
+        self.metrics().backend_connected();
+        self.reset_connection_attempt();
+        self.set_back_connected(BackendConnectionStatus::Connected);
+      }
+    }
+
+    if self.front_readiness().event.is_hup() {
+      let order = self.front_hup();
+      match order {
+        SessionResult::CloseSession => {
+          return order;
+        },
+        _ => {
+          self.front_readiness().event.remove(Ready::hup());
+          return order;
+        }
+      }
+    }
+
+    let token = self.frontend_token.clone();
+    while counter < max_loop_iterations {
+      let front_interest = self.front_readiness().interest & self.front_readiness().event;
+      let back_interest  = self.back_readiness().map(|r| r.interest & r.event).unwrap_or(Ready::empty());
+
+      trace!("PROXY\t{} {:?} {:?} -> {:?}", self.log_context(), token, self.front_readiness().clone(), self.back_readiness());
+
+      if front_interest == Ready::empty() && back_interest == Ready::empty() {
+        break;
+      }
+
+      if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) && self.front_readiness().interest.is_writable() &&
+        ! self.front_readiness().event.is_writable() {
+        break;
+      }
+
+      if front_interest.is_readable() {
+        let order = self.readable();
+        trace!("front readable\tinterpreting session order {:?}", order);
+
+        if order != SessionResult::Continue {
+          return order;
+        }
+      }
+
+      if back_interest.is_writable() {
+        let order = self.back_writable();
+        if order != SessionResult::Continue {
+          return order;
+        }
+      }
+
+      if back_interest.is_readable() {
+        let order = self.back_readable();
+        if order != SessionResult::Continue {
+          return order;
+        }
+      }
+
+      if front_interest.is_writable() {
+        let order = self.writable();
+        trace!("front writable\tinterpreting session order {:?}", order);
+        if order != SessionResult::Continue {
+          return order;
+        }
+      }
+
+      if back_interest.is_hup() {
+        let order = self.back_hup();
+        match order {
+          SessionResult::CloseSession => {
+            return order;
+          },
+          SessionResult::Continue => {
+            /*self.front_readiness().interest.insert(Ready::writable());
+            if ! self.front_readiness().event.is_writable() {
+              error!("got back socket HUP but there's still data, and front is not writable yet(openssl)[{:?} => {:?}]", self.frontend_token, self.back_token());
+              break;
+            }*/
+          },
+          _ => {
+            self.back_readiness().map(|r| r.event.remove(Ready::hup()));
+            return order;
+          }
+        };
+      }
+
+      if front_interest.is_error() {
+          error!("PROXY session {:?} front error, disconnecting", self.frontend_token);
+          self.front_readiness().interest = Ready::empty();
+          self.back_readiness().map(|r| r.interest  = Ready::empty());
+          return SessionResult::CloseSession;
+      }
+
+      if back_interest.is_error() {
+          if self.back_hup() == SessionResult::CloseSession {
+              self.front_readiness().interest = Ready::empty();
+              self.back_readiness().map(|r| r.interest  = Ready::empty());
+              error!("PROXY session {:?} back error, disconnecting", self.frontend_token);
+              return SessionResult::CloseSession;
+          }
+      }
+
+      counter += 1;
+    }
+
+    if counter == max_loop_iterations {
+      error!("PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
+      incr!("https_openssl.infinite_loop.error");
+
+      let front_interest = self.front_readiness().interest & self.front_readiness().event;
+      let back_interest  = self.back_readiness().map(|r| r.interest & r.event);
+
+      let token = self.frontend_token.clone();
+      let back = self.back_readiness().cloned();
+      error!("PROXY\t{:?} readiness: {:?} -> {:?} | front: {:?} | back: {:?} ", token,
+        self.front_readiness(), back, front_interest, back_interest);
+      self.print_state();
+
+      return SessionResult::CloseSession;
+    }
+
+    SessionResult::Continue
+  }
 }
 
 impl ProxySession for Session {
@@ -672,151 +817,10 @@ impl ProxySession for Session {
   }
 
   fn ready(&mut self) -> SessionResult {
-    let mut counter = 0;
-    let max_loop_iterations = 100000;
-
     self.metrics().service_start();
-
-    if self.back_connected().is_connecting() &&
-      self.back_readiness().map(|r| r.event != Ready::empty()).unwrap_or(false) {
-
-      self.http_mut().map(|h| h.cancel_backend_timeout());
-
-      if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) ||
-        !self.http_mut().map(|h| h.test_back_socket()).unwrap_or(false) {
-
-        //retry connecting the backend
-        error!("{} error connecting to backend, trying again", self.log_context());
-        self.metrics().service_stop();
-        self.connection_attempt += 1;
-        self.fail_backend_connection();
-
-        let backend_token = self.back_token();
-        self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
-        return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
-      } else {
-        self.metrics().backend_connected();
-        self.reset_connection_attempt();
-        self.set_back_connected(BackendConnectionStatus::Connected);
-      }
-    }
-
-    if self.front_readiness().event.is_hup() {
-      let order = self.front_hup();
-      match order {
-        SessionResult::CloseSession => {
-          return order;
-        },
-        _ => {
-          self.front_readiness().event.remove(Ready::hup());
-          return order;
-        }
-      }
-    }
-
-    let token = self.frontend_token.clone();
-    while counter < max_loop_iterations {
-      let front_interest = self.front_readiness().interest & self.front_readiness().event;
-      let back_interest  = self.back_readiness().map(|r| r.interest & r.event).unwrap_or(Ready::empty());
-
-      trace!("PROXY\t{} {:?} {:?} -> {:?}", self.log_context(), token, self.front_readiness().clone(), self.back_readiness());
-
-      if front_interest == Ready::empty() && back_interest == Ready::empty() {
-        break;
-      }
-
-      if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) && self.front_readiness().interest.is_writable() &&
-        ! self.front_readiness().event.is_writable() {
-        break;
-      }
-
-      if front_interest.is_readable() {
-        let order = self.readable();
-        trace!("front readable\tinterpreting session order {:?}", order);
-
-        if order != SessionResult::Continue {
-          return order;
-        }
-      }
-
-      if back_interest.is_writable() {
-        let order = self.back_writable();
-        if order != SessionResult::Continue {
-          return order;
-        }
-      }
-
-      if back_interest.is_readable() {
-        let order = self.back_readable();
-        if order != SessionResult::Continue {
-          return order;
-        }
-      }
-
-      if front_interest.is_writable() {
-        let order = self.writable();
-        trace!("front writable\tinterpreting session order {:?}", order);
-        if order != SessionResult::Continue {
-          return order;
-        }
-      }
-
-      if back_interest.is_hup() {
-        let order = self.back_hup();
-        match order {
-          SessionResult::CloseSession => {
-            return order;
-          },
-          SessionResult::Continue => {
-            /*self.front_readiness().interest.insert(Ready::writable());
-            if ! self.front_readiness().event.is_writable() {
-              error!("got back socket HUP but there's still data, and front is not writable yet(openssl)[{:?} => {:?}]", self.frontend_token, self.back_token());
-              break;
-            }*/
-          },
-          _ => {
-            self.back_readiness().map(|r| r.event.remove(Ready::hup()));
-            return order;
-          }
-        };
-      }
-
-      if front_interest.is_error() {
-          error!("PROXY session {:?} front error, disconnecting", self.frontend_token);
-          self.front_readiness().interest = Ready::empty();
-          self.back_readiness().map(|r| r.interest  = Ready::empty());
-          return SessionResult::CloseSession;
-      }
-
-      if back_interest.is_error() {
-          if self.back_hup() == SessionResult::CloseSession {
-              self.front_readiness().interest = Ready::empty();
-              self.back_readiness().map(|r| r.interest  = Ready::empty());
-              error!("PROXY session {:?} back error, disconnecting", self.frontend_token);
-              return SessionResult::CloseSession;
-          }
-      }
-
-      counter += 1;
-    }
-
-    if counter == max_loop_iterations {
-      error!("PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
-      incr!("https_openssl.infinite_loop.error");
-
-      let front_interest = self.front_readiness().interest & self.front_readiness().event;
-      let back_interest  = self.back_readiness().map(|r| r.interest & r.event);
-
-      let token = self.frontend_token.clone();
-      let back = self.back_readiness().cloned();
-      error!("PROXY\t{:?} readiness: {:?} -> {:?} | front: {:?} | back: {:?} ", token,
-        self.front_readiness(), back, front_interest, back_interest);
-      self.print_state();
-
-      return SessionResult::CloseSession;
-    }
-
-    SessionResult::Continue
+    let res = self.ready_inner();
+    self.metrics().service_stop();
+    res
   }
 
   fn shutting_down(&mut self) -> SessionResult {

@@ -475,127 +475,9 @@ impl Session {
       }
   }
 
-}
-
-impl ProxySession for Session {
-  fn close(&mut self, poll: &mut Poll) -> CloseResult {
-    self.metrics.service_stop();
-    self.cancel_timeouts();
-    if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
-      if e.kind() != ErrorKind::NotConnected {
-        error!("error shutting down front socket({:?}): {:?}", self.front_socket(), e);
-      }
-    }
-
-    if let Err(e) = poll.registry().deregister(self.front_socket_mut()) {
-      error!("error deregistering front socket({:?}): {:?}", self.front_socket(), e);
-    }
-
-    let mut result = CloseResult::default();
-
-    if let Some(tk) = self.back_token() {
-      result.tokens.push(tk)
-    }
-
-    //FIXME: should we really pass a token here?
-    self.close_backend(Token(0), poll);
-
-    if let Some(State::Http(ref mut http)) = self.protocol {
-      //if the state was initial, the connection was already reset
-      if http.request != Some(RequestState::Initial) {
-        gauge_add!("http.active_requests", -1);
-
-        if let Some(b) = http.backend_data.as_mut() {
-         let mut backend = b.borrow_mut();
-         backend.active_requests = backend.active_requests.saturating_sub(1);
-        }
-      }
-    }
-
-    if let Some(State::WebSocket(_)) = self.protocol {
-      if let Some(b) = self.backend.as_mut() {
-        let mut backend = b.borrow_mut();
-        backend.active_requests = backend.active_requests.saturating_sub(1);
-      }
-    }
-
-    match self.protocol {
-      Some(State::Expect(_)) => gauge_add!("protocol.proxy.expect", -1),
-      Some(State::Http(_)) => gauge_add!("protocol.http", -1),
-      Some(State::WebSocket(_)) => gauge_add!("protocol.ws", -1),
-      None => {},
-    }
-
-    result.tokens.push(self.frontend_token);
-
-    result
-  }
-
-  fn timeout(&mut self, token: Token) -> SessionResult {
-    match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Expect(_)  => {
-          if token == self.frontend_token {
-              self.front_timeout.triggered();
-          }
-          SessionResult::CloseSession
-      },
-      State::Http(ref mut http) => http.timeout(token, &mut self.metrics),
-      State::WebSocket(ref mut pipe) => pipe.timeout(token, &mut self.metrics),
-    }
-  }
-
-  //FIXME: check the token passed as argument
-  fn close_backend(&mut self, _: Token, poll: &mut Poll) {
-    self.remove_backend();
-
-    let back_connected = self.back_connected();
-    if back_connected != BackendConnectionStatus::NotConnected {
-      self.back_readiness().map(|r| r.event = Ready::empty());
-      if let Some(sock) = self.back_socket_mut() {
-        if let Err(e) = sock.shutdown(Shutdown::Both) {
-          if e.kind() != ErrorKind::NotConnected {
-            error!("error shutting down back socket({:?}): {:?}", sock, e);
-          }
-        }
-        if let Err(e) = poll.registry().deregister(sock) {
-          error!("error shutting down back socket({:?}): {:?}", sock, e);
-        }
-      }
-    }
-
-    if back_connected == BackendConnectionStatus::Connected {
-      gauge_add!("connections", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
-    }
-
-    self.set_back_connected(BackendConnectionStatus::NotConnected);
-
-    self.http_mut().map(|h| {
-      h.clear_back_token();
-      h.remove_backend();
-    });
-  }
-
-  fn protocol(&self) -> Protocol {
-    Protocol::HTTP
-  }
-
-  fn process_events(&mut self, token: Token, events: Ready) {
-    trace!("token {:?} got event {}", token, super::ready_to_string(events));
-    self.last_event = Instant::now();
-    self.metrics.wait_start();
-
-    if self.frontend_token == token {
-      self.front_readiness().event = self.front_readiness().event | events;
-    } else if self.back_token() == Some(token) {
-      self.back_readiness().map(|r| r.event = r.event | events);
-    }
-  }
-
-  fn ready(&mut self) -> SessionResult {
+  fn ready_inner(&mut self) -> SessionResult {
     let mut counter = 0;
     let max_loop_iterations = 100000;
-
-    self.metrics().service_start();
 
     if self.back_connected().is_connecting() &&
       self.back_readiness().map(|r| r.event != Ready::empty()).unwrap_or(false) {
@@ -607,7 +489,7 @@ impl ProxySession for Session {
 
         //retry connecting the backend
         error!("{} error connecting to backend, trying again", self.log_context());
-        self.metrics().service_stop();
+
         self.connection_attempt += 1;
         self.fail_backend_connection();
 
@@ -738,6 +620,128 @@ impl ProxySession for Session {
     }
 
     SessionResult::Continue
+  }
+}
+
+impl ProxySession for Session {
+  fn close(&mut self, poll: &mut Poll) -> CloseResult {
+    self.metrics.service_stop();
+    self.cancel_timeouts();
+    if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
+      if e.kind() != ErrorKind::NotConnected {
+        error!("error shutting down front socket({:?}): {:?}", self.front_socket(), e);
+      }
+    }
+
+    if let Err(e) = poll.registry().deregister(self.front_socket_mut()) {
+      error!("error deregistering front socket({:?}): {:?}", self.front_socket(), e);
+    }
+
+    let mut result = CloseResult::default();
+
+    if let Some(tk) = self.back_token() {
+      result.tokens.push(tk)
+    }
+
+    //FIXME: should we really pass a token here?
+    self.close_backend(Token(0), poll);
+
+    if let Some(State::Http(ref mut http)) = self.protocol {
+      //if the state was initial, the connection was already reset
+      if http.request != Some(RequestState::Initial) {
+        gauge_add!("http.active_requests", -1);
+
+        if let Some(b) = http.backend_data.as_mut() {
+         let mut backend = b.borrow_mut();
+         backend.active_requests = backend.active_requests.saturating_sub(1);
+        }
+      }
+    }
+
+    if let Some(State::WebSocket(_)) = self.protocol {
+      if let Some(b) = self.backend.as_mut() {
+        let mut backend = b.borrow_mut();
+        backend.active_requests = backend.active_requests.saturating_sub(1);
+      }
+    }
+
+    match self.protocol {
+      Some(State::Expect(_)) => gauge_add!("protocol.proxy.expect", -1),
+      Some(State::Http(_)) => gauge_add!("protocol.http", -1),
+      Some(State::WebSocket(_)) => gauge_add!("protocol.ws", -1),
+      None => {},
+    }
+
+    result.tokens.push(self.frontend_token);
+
+    result
+  }
+
+  fn timeout(&mut self, token: Token) -> SessionResult {
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Expect(_)  => {
+          if token == self.frontend_token {
+              self.front_timeout.triggered();
+          }
+          SessionResult::CloseSession
+      },
+      State::Http(ref mut http) => http.timeout(token, &mut self.metrics),
+      State::WebSocket(ref mut pipe) => pipe.timeout(token, &mut self.metrics),
+    }
+  }
+
+  //FIXME: check the token passed as argument
+  fn close_backend(&mut self, _: Token, poll: &mut Poll) {
+    self.remove_backend();
+
+    let back_connected = self.back_connected();
+    if back_connected != BackendConnectionStatus::NotConnected {
+      self.back_readiness().map(|r| r.event = Ready::empty());
+      if let Some(sock) = self.back_socket_mut() {
+        if let Err(e) = sock.shutdown(Shutdown::Both) {
+          if e.kind() != ErrorKind::NotConnected {
+            error!("error shutting down back socket({:?}): {:?}", sock, e);
+          }
+        }
+        if let Err(e) = poll.registry().deregister(sock) {
+          error!("error shutting down back socket({:?}): {:?}", sock, e);
+        }
+      }
+    }
+
+    if back_connected == BackendConnectionStatus::Connected {
+      gauge_add!("connections", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+    }
+
+    self.set_back_connected(BackendConnectionStatus::NotConnected);
+
+    self.http_mut().map(|h| {
+      h.clear_back_token();
+      h.remove_backend();
+    });
+  }
+
+  fn protocol(&self) -> Protocol {
+    Protocol::HTTP
+  }
+
+  fn process_events(&mut self, token: Token, events: Ready) {
+    trace!("token {:?} got event {}", token, super::ready_to_string(events));
+    self.last_event = Instant::now();
+    self.metrics.wait_start();
+
+    if self.frontend_token == token {
+      self.front_readiness().event = self.front_readiness().event | events;
+    } else if self.back_token() == Some(token) {
+      self.back_readiness().map(|r| r.event = r.event | events);
+    }
+  }
+
+  fn ready(&mut self) -> SessionResult {
+    self.metrics().service_start();
+    let res = self.ready_inner();
+    self.metrics().service_stop();
+    res
   }
 
   fn shutting_down(&mut self) -> SessionResult {
