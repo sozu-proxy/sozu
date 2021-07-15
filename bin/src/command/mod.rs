@@ -209,7 +209,7 @@ impl CommandServer {
                             res.unwrap()
                         }
                     };
-                println!("Accepted a client from upgraded");
+                debug!("Accepted a client from upgraded");
 
                 let (client_tx, client_rx) = channel(10000);
                 let id = format!("CL-up-{}", counter);
