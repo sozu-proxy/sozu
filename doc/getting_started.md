@@ -26,14 +26,14 @@ They will be built and available in the `~/.cargo/bin` folder.
 
 Build the sozu executable:
 
-`cd bin && cargo build --release`
+`cd bin && cargo build --release --features use-openssl`
 
 > The `--release` parameter inform cargo to compile sozu with optimizations turned on.
 > Only use `--release` to make a production version.
 
 Build the sozuctl executable to manage the reverse proxy:
 
-`cd ctl && cargo build --release;`
+`cd ctl && cargo build --release`
 
 This will create the `sozu` executable for the reverse proxy, and `sozuctl` to command it.
 
