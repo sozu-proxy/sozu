@@ -380,6 +380,15 @@ impl Session {
 
     if connected == BackendConnectionStatus::Connected {
       gauge_add!("connections", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+
+      // the back timeout was of connect_timeout duration before,
+      // now that we're connected, move to backend_timeout duration
+      let t = self.backend_timeout_duration;
+      self.http_mut().map(|h| {
+          h.set_back_timeout(t);
+          h.cancel_backend_timeout();
+      });
+
       self.backend.as_ref().map(|backend| {
         let ref mut backend = *backend.borrow_mut();
 
