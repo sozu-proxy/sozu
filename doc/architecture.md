@@ -73,9 +73,10 @@ It decrypts the traffic using the SSL key and certificate, and forwards it, unen
 ### Buffers
 
 Sōzu is optimised for very limited memory use.
-All traffic is stored in a pool of fix-sized (usually 16 kB), reusable buffers.
+All traffic is (briefly) stored in a pool of fix-sized (usually 16 kB), reusable buffers.
 
 ### futures
 
-Sōzu receives orders on a unix socket, in JSON format. This could be cumbersome.
+Sōzu receives orders on a unix socket, in JSON format.
+Writing commands that way could be cumbersome.
 The `futures` lib is an asynchronous toolkit, based on tokio, that allows developers to write Sōzu-commanding software.
