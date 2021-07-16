@@ -29,7 +29,7 @@
 //!
 //! let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 //!
-//! let jg            = thread::spawn(move || {
+//! let jg = thread::spawn(move || {
 //!    network::http::start(config, channel);
 //! });
 //!
@@ -240,16 +240,37 @@ pub struct CloseResult {
   pub tokens:   Vec<Token>,
 }
 
+/// trait that must be implemented by listeners and client sessions
 pub trait ProxySession {
+  /// indicates the protocol associated with the session
+  ///
+  /// this is used to distinguish sessions from listenrs, channels, metrics
+  /// and timers
   fn protocol(&self)  -> Protocol;
+  /// if a session received an event or can still execute, the event loop will
+  /// call this method. Its result indicates if it can still execute, needs to
+  /// connect to a backend server, close the session
   fn ready(&mut self) -> SessionResult;
+  /// if the event loop got an event for a token associated with the session,
+  /// it will call this method on the session
   fn process_events(&mut self, token: Token, events: Ready);
+  /// closes a session
   fn close(&mut self, poll: &mut Poll) -> CloseResult;
+  /// closes the backend socket of a session
   fn close_backend(&mut self, token: Token, poll: &mut Poll);
+  /// if a timeout associated with the session triggers, the event loop will
+  /// call this method with the timeout's token
   fn timeout(&mut self, t: Token) -> SessionResult;
+  /// last time the session got an event
   fn last_event(&self) -> Instant;
+  /// displays the session's internal state (for debugging purpose)
   fn print_state(&self);
+  /// list the tokens associated with the session
   fn tokens(&self) -> Vec<Token>;
+  /// tells the session to shut down if possible
+  ///
+  /// if the session handles HTTP requests, it will not close until the response
+  /// is completely sent back to the client
   fn shutting_down(&mut self) -> SessionResult;
 }
 
@@ -739,7 +760,7 @@ impl fmt::Display for LogDuration {
 
 /// exponentially weighted moving average with high sensibility to latency bursts
 ///
-/// cf Finagle for the original implementation: https://github.com/twitter/finagle/blob/9cc08d15216497bb03a1cafda96b7266cfbbcff1/finagle-core/src/main/scala/com/twitter/finagle/loadbalancer/PeakEwma.scala
+/// cf Finagle for the original implementation: <https://github.com/twitter/finagle/blob/9cc08d15216497bb03a1cafda96b7266cfbbcff1/finagle-core/src/main/scala/com/twitter/finagle/loadbalancer/PeakEwma.scala>
 #[derive(Debug,PartialEq,Clone)]
 pub struct PeakEWMA {
     /// decay in nanoseconds

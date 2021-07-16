@@ -1,3 +1,4 @@
+//! event loop management
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -125,6 +126,22 @@ impl Default for ServerConfig {
   }
 }
 
+/// `Server` handles the event loop, the listeners, the sessions and
+/// communication with the configuration channel.
+///
+/// A listener wraps a listen socket, the associated proxying protocols
+/// (HTTP, HTTPS and TCP) and the routing configuration for applications.
+/// Listeners handle creating sessions from accepted sockets.
+///
+/// A session manages a "front" socket for a connected client, and all
+/// of the associated data (back socket, protocol state machine, buffers,
+/// metrics...).
+///
+/// `Server` gets configuration updates from the channel (domIN/path routes,
+/// backend server address...).
+///
+/// Listeners and sessions are all stored in a slab structure to index them
+/// by a [Token], they all have to implement the [ProxySession] trait.
 pub struct Server {
   pub poll:        Poll,
   shutting_down:   Option<MessageId>,
