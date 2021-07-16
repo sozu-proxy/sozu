@@ -1053,30 +1053,29 @@ impl CommandServer {
                 match order {
                     ProxyRequestData::RemoveBackend(ref backend) => {
                         let msg = format!(
-                            "No such backend {} at {} for the application {}",
-                            backend.backend_id, backend.address, backend.app_id
+                            "cannot remove backend: application {} has no backends {} at {}",
+                            backend.app_id, backend.backend_id, backend.address,
                         );
                         error!("{}", msg);
                         self.answer_error(client_id, request_id, msg, None).await;
                         return;
                     }
-                    ProxyRequestData::RemoveHttpFront(HttpFront {
-                        ref app_id,
-                        ref address,
-                        ..
-                    })
-                    | ProxyRequestData::RemoveHttpsFront(HttpFront {
-                        ref app_id,
-                        ref address,
-                        ..
-                    })
-                    | ProxyRequestData::RemoveTcpFront(TcpFront {
+                    ProxyRequestData::RemoveHttpFront(h) | ProxyRequestData::RemoveHttpsFront(h) => {
+                        let msg = format!(
+                            "cannot remove HTTP frontend: application {} has no frontends on {} for {} {}",
+                            h.app_id, h.address, h.hostname, h.path_begin,
+                        );
+                        error!("{}", msg);
+                        self.answer_error(client_id, request_id, msg, None).await;
+                        return;
+                    }
+                    ProxyRequestData::RemoveTcpFront(TcpFront {
                         ref app_id,
                         ref address,
                     }) => {
                         let msg = format!(
-                            "No such frontend at {} for the application {}",
-                            address, app_id
+                            "cannot remove TCP frontend: application {} has no frontends at {}",
+                            app_id, address,
                         );
                         error!("{}", msg);
                         self.answer_error(client_id, request_id, msg, None).await;
