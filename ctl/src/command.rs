@@ -30,12 +30,12 @@ struct WorkerStatus<'a> {
 }
 
 fn generate_id() -> String {
-  let s: String = thread_rng().sample_iter(&Alphanumeric).take(6).collect();
+  let s: String = thread_rng().sample_iter(&Alphanumeric).take(6).map(|c| c as char).collect();
   format!("ID-{}", s)
 }
 
 fn generate_tagged_id(tag: &str) -> String {
-  let s: String = thread_rng().sample_iter(&Alphanumeric).take(6).collect();
+  let s: String = thread_rng().sample_iter(&Alphanumeric).take(6).map(|c| c as char).collect();
   format!("{}-{}", tag, s)
 }
 
