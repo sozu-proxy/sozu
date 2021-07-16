@@ -304,6 +304,7 @@ impl Server {
     let mut last_zombie_check = Instant::now();
     let mut last_sessions_len = self.sessions.len();
     let mut should_poll_at: Option<Instant> = None;
+    let mut last_shutting_down_message = None;
 
     let mut loop_start = Instant::now();
     loop {
@@ -516,8 +517,16 @@ impl Server {
         }
 
         if !closing_tokens.is_empty() {
-          info!("closed {} sessions, {} sessions left, base_sessions_count = {}",
-            closing_tokens.len(), self.sessions.len(), self.base_sessions_count);
+            let now = Instant::now();
+            if let Some(last) = last_shutting_down_message {
+                if (now - last) > Duration::seconds(5) {
+                    info!("closed {} sessions, {} sessions left, base_sessions_count = {}",
+                          closing_tokens.len(), self.sessions.len(), self.base_sessions_count);
+                    last_shutting_down_message = Some(now);
+                }
+            } else {
+                last_shutting_down_message = Some(now);
+            }
         }
 
         let count = self.sessions.len();
