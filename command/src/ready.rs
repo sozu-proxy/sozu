@@ -161,6 +161,9 @@ impl std::convert::From<&mio::event::Event> for Ready {
             r.insert(Ready::error());
         }
         //FIXME: handle HUP events
+        if e.is_read_closed() || e.is_write_closed() {
+            r.insert(Ready::hup());
+        }
 
         r
     }

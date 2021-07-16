@@ -412,7 +412,13 @@ impl<Front:SocketHandler> Http<Front> {
         SessionResult::Continue
       }
     } else {
-      SessionResult::CloseSession
+
+        if self.request == Some(RequestState::Initial) &&
+            self.response == Some(ResponseState::Initial) {
+                SessionResult::CloseBackend(self.backend_token.clone())
+            } else {
+                SessionResult::Continue
+            }
     }
   }
 

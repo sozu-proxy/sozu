@@ -628,7 +628,7 @@ impl Session {
       if back_interest.is_hup() {
         let order = self.back_hup();
         match order {
-          SessionResult::CloseSession => {
+          SessionResult::CloseSession | SessionResult::CloseBackend(_) => {
             return order;
           },
           SessionResult::Continue => {},
