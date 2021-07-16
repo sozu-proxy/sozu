@@ -57,21 +57,25 @@ The logger can be invoked through a thread local storage variable accessible fro
 
 [Metrics](https://github.com/sozu-proxy/sozu/tree/3111e2db420d2773b1f0404d6556f40b2f2ea85b/lib/src/network/metrics) work like the logger, accessible from anywhere with macros and TLS. We support two "drains": one that sends the metrics on the networks with a statsd compatible protocol, and one aggregating metrics locally, to be queried through the configuration socket.
 
-
 ## Load balancing
 
-TODO
+For a given application, Sōzu keeps a list of backends to which the connection is redirected.
+Sōzu detects broken servers and redirects traffic only to healthy ones, with several available loadbalancing algorithms:
+round robin (default), random, least_loaded, and power of two.
 
 ## SSL
 
-TODO
+Sōzu is the SSL endpoint of the application, powered by either openssl or rustls.
+It decrypts SSL the traffic using the SSL key and certificate, and forwards it, unencrypted, to the backends.
 
 ## Deep dive
 
 ### Buffers
 
-TODO
+Sōzu is optimised for very limited memory use.
+All traffic is stored in a pool of fix-sized (usually 16 kB), reusable buffers.
 
-### Channel
+### futures
 
-TODO
+Sōzu receives orders on a unix socket, in JSON format. This could be cumbersome.
+The `futures` lib is an asynchronous toolkit, based on tokio, that allows developers to write Sōzu-commanding software.
