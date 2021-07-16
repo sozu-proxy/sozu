@@ -33,7 +33,7 @@ fn test() {
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
     let jg = thread::spawn(move || {
-        Logger::init("SOZU".to_string(), "info", LoggerBackend::Stdout(stdout()), None);
+        Logger::init("SOZU".to_string(), "trace", LoggerBackend::Stdout(stdout()), None);
         let max_buffers = 20;
         let buffer_size = 16384;
         sozu::http::start(config, channel, max_buffers, buffer_size);

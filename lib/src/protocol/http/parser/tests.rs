@@ -578,7 +578,7 @@ fn parse_request_delete_forwarded_headers() {
           X-Forwarded-Port: 1234\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     let added = Some(AddedRequestHeader {
@@ -1092,7 +1092,7 @@ fn parse_response_304() {
           \r\n";
     let initial = ResponseState::Initial;
     let is_head = true;
-    let (pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
     println!("buffer input: {:?}", buf.input_queue);
 

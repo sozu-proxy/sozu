@@ -1690,11 +1690,11 @@ impl AddedRequestHeader {
     }
 }
 
+  /*
 #[cfg(test)]
 mod tests {
   use super::*;
 
-  /*
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
@@ -1709,5 +1709,5 @@ mod tests {
     assert_size!(Option<ResponseState>, 256);
     assert_size!(Option<AddedRequestHeader>, 88);
   }
-  */
 }
+*/

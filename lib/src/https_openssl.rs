@@ -1925,7 +1925,6 @@ mod tests {
   use std::str::FromStr;
   use std::rc::Rc;
   use std::sync::{Arc,Mutex};
-  use protocol::http::answers::DefaultAnswers;
   use trie::TrieNode;
   use openssl::ssl::{SslContext, SslMethod};
 

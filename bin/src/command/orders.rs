@@ -19,7 +19,7 @@ use sozu_command::command::{
 };
 use sozu_command::logging;
 use sozu_command::proxy::{
-    AggregatedMetricsData, HttpFront, MetricsData, ProxyRequestData, ProxyResponseData,
+    AggregatedMetricsData, MetricsData, ProxyRequestData, ProxyResponseData,
     ProxyResponseStatus, Query, QueryAnswer, QueryApplicationType, TcpFront,
     ProxyRequest,
 };

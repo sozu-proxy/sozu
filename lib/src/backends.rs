@@ -246,7 +246,7 @@ mod backends_test {
 
     thread::spawn(move || {
       while run {
-        for stream in listener.incoming() {
+        for _stream in listener.incoming() {
           // accept connections
           if let Ok(()) = stopper.try_recv() {
             run = false;

@@ -871,11 +871,11 @@ fn ciphersuite_str(cipher: &'static SupportedCipherSuite) -> &'static str {
   }
 }
 
+/*
 #[cfg(test)]
 mod tests {
   use super::*;
 
-  /*
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
@@ -890,5 +890,5 @@ mod tests {
     assert_size!(FrontRustls, 1456);
     assert_size!(ServerSession, 1440);
   }
-  */
 }
+*/
