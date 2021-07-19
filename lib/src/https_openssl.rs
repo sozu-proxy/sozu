@@ -916,6 +916,7 @@ pub struct Listener {
   _ssl_options:    SslOptions,
   pub token:       Token,
   active:          bool,
+  name_fingerprint_idx: HashMap<String, HashSet<CertFingerprint>>,
 }
 
 impl Listener {
@@ -944,6 +945,7 @@ impl Listener {
       config,
       _ssl_options: ssl_options,
       token,
+      name_fingerprint_idx: HashMap::new(),
     }
   }
 
@@ -1209,6 +1211,38 @@ impl Listener {
     }
   }
 
+  // get certificate using its fingerprint, this method use internally a lock
+  pub fn get_certificate(&self, fingerprint: &CertFingerprint) -> Option<X509> {
+    unwrap_msg!(self.contexts.lock())
+        .get(fingerprint)
+        .map(|tlsdata| unwrap_msg!(X509::from_pem(&tlsdata.certificate)))
+  }
+
+  // get a bunch of certificates using their fingerprints, this method use internally a lock
+  pub fn get_certificates(&self, fingerprints: &HashSet<&CertFingerprint>) -> HashMap<CertFingerprint, X509> {
+    let mut certificates = HashMap::new();
+    let contexts = unwrap_msg!(self.contexts.lock());
+
+    for fingerprint in fingerprints {
+      if let Some(tlsdata) = contexts.get(fingerprint) {
+        certificates.insert((*fingerprint).to_owned(), unwrap_msg!(X509::from_pem(&tlsdata.certificate)));
+      }
+    }
+
+    certificates
+  }
+
+  pub fn find_fingerprints_by_names(&self, names: &HashSet<String>) -> HashSet<&CertFingerprint> {
+    let mut fingerprints = HashSet::new();
+    for name in names {
+      if let Some(fprints) = self.name_fingerprint_idx.get(name) {
+        fprints.iter().for_each(|fingerprint| { fingerprints.insert(fingerprint); });
+      }
+    }
+
+    fingerprints
+  }
+
   pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey) -> bool {
     //FIXME: insert some error management with a Result here
 
@@ -1221,10 +1255,57 @@ impl Listener {
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&mut cert_read), PKey::private_key_from_pem(&mut key_read)) {
       //FIXME: would need more logs here
 
-      //FIXME
+      // We do not need to update the entry, if the certificate is already registered
       let fingerprint = CertFingerprint(unwrap_msg!(cert.digest(MessageDigest::sha256()).map(|d| d.to_vec())));
+      if self.get_certificate(&fingerprint).is_some() {
+        return true;
+      }
+
       let names = get_cert_names(&cert);
       debug!("got certificate names: {:?}", names);
+
+      // We need to know, if the new certificate can replace an already existent one.
+      let fingerprints = self.find_fingerprints_by_names(&names);
+      let certificates = self.get_certificates(&fingerprints);
+
+      let mut should_insert = false;
+      let mut certs_to_remove = vec![];
+      let mut certs_names = HashSet::new();
+
+      for (fingerprint, x509) in certificates {
+        // could not failed as this operation has been already done when loading
+        // the certificate
+        let certificate_names = get_cert_names(&x509);
+        let extra_names: HashSet<&String> = certificate_names
+            .difference(&names)
+            .collect();
+
+        // if the certificate has at least the same name or less and the expiration date
+        // is closer than the new one. We could remove it and allow the new insertion.
+        if extra_names.is_empty() && x509.not_after() < cert.not_after() {
+          certs_to_remove.push((fingerprint, certificate_names.to_owned()));
+          should_insert = true;
+        }
+
+        // We keep a track of all name of certificates that match our query to
+        // check, if the new certificate provide an extra domain which is not
+        // already exposed
+        for name in certificate_names {
+          certs_names.insert(name);
+        }
+      }
+
+      // In the case, where we do not insert the certificate, because there is
+      // no additional value. We have to check, if it provide an extra domain
+      // name not registered yet.
+      if !should_insert {
+        let diff: HashSet<&String> = names.difference(&certs_names).collect();
+        if diff.is_empty() {
+          // We already have all domain names registered and there is no update
+          // for expiration date of certificate. So, skipping the update.
+          return true;
+        }
+      }
 
       let versions = if !certificate_and_key.versions.is_empty() {
         &certificate_and_key.versions
@@ -1261,12 +1342,33 @@ impl Listener {
         if !contexts.contains_key(&fingerprint) {
           contexts.insert(fingerprint.clone(), tls_data);
         }
+
+        // We remove certificates that we don't need anymore
+        for (fingerprint, _) in &certs_to_remove {
+          contexts.remove(fingerprint);
+        }
       }
       {
         let mut domains = unwrap_msg!(self.domains.lock());
 
+        for name in &names {
+          domains.domain_insert(name.to_owned().into_bytes(), fingerprint.to_owned());
+        }
+      }
+
+      // Update index, add new fingerprint to associated domains and remove old
+      // fingerprints for deleted certificates
+      for name in names {
+        self.name_fingerprint_idx.entry(name.to_owned())
+            .or_insert_with(|| HashSet::new())
+            .insert(fingerprint.to_owned());
+      }
+
+      for (fingerprint, names) in &certs_to_remove {
         for name in names {
-          domains.domain_insert(name.into_bytes(), fingerprint.clone());
+          if let Some(fingerprints) = self.name_fingerprint_idx.get_mut(name) {
+            fingerprints.remove(fingerprint);
+          }
         }
       }
 
@@ -1277,16 +1379,20 @@ impl Listener {
   }
 
   // FIXME: return an error if the cert is still in use
-  pub fn remove_certificate(&mut self, fingerprint: CertFingerprint) {
+  pub fn remove_certificate(&mut self, fingerprint: &CertFingerprint) {
     debug!("removing certificate {:?}", fingerprint);
     let mut contexts = unwrap_msg!(self.contexts.lock());
     let mut domains  = unwrap_msg!(self.domains.lock());
 
-    if let Some(data) = contexts.remove(&fingerprint) {
+    if let Some(data) = contexts.remove(fingerprint) {
       if let Ok(cert) = X509::from_pem(&data.certificate) {
         let names = get_cert_names(&cert);
 
         for name in names {
+          if let Some(fingerprints) = self.name_fingerprint_idx.get_mut(&name) {
+            fingerprints.remove(fingerprint);
+          }
+
           domains.domain_remove(&name.into_bytes());
         }
       }
@@ -1711,7 +1817,7 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::RemoveCertificate(remove_certificate) => {
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.front) {
           //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
-          listener.remove_certificate(remove_certificate.fingerprint);
+          listener.remove_certificate(&remove_certificate.fingerprint);
           //FIXME: should return an error if certificate still has fronts referencing it
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
@@ -1722,7 +1828,7 @@ impl ProxyConfiguration<Session> for Proxy {
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == replace.front) {
           //info!("TLS\t{} replace certificate of fingerprint {:?} with {:?}", id,
           //  replace.old_fingerprint, replace.new_certificate);
-          listener.remove_certificate(replace.old_fingerprint);
+          listener.remove_certificate(&replace.old_fingerprint);
           listener.add_certificate(replace.new_certificate);
           //FIXME: should return an error if certificate still has fronts referencing it
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
@@ -1921,6 +2027,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
 mod tests {
   extern crate tiny_http;
   use super::*;
+  use std::error::Error;
   use std::collections::HashMap;
   use std::net::SocketAddr;
   use std::str::FromStr;
@@ -1994,6 +2101,7 @@ mod tests {
         ssl::SslOptions::NO_SSLV2 | ssl::SslOptions::NO_SSLV3 | ssl::SslOptions::NO_TLSV1 | ssl::SslOptions::NO_TLSV1_1,
       token: Token(0),
       active: true,
+      name_fingerprint_idx: HashMap::new(),
     };
 
 
@@ -2078,6 +2186,97 @@ mod tests {
     assert_eq!(
       trie.domain_lookup(b"hello.sub.test.example.com", true),
       Some(&("hello.sub.test.example.com".as_bytes().to_vec(), 2u8)));
+  }
+
+  #[test]
+  fn certificate_lifecycle() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut listener = Listener::new(HttpsListener::default(),Token(0));
+
+    let certificate_and_key = CertificateAndKey {
+      certificate:       String::from(include_str!("../assets/certificate.pem")),
+      key:               String::from( include_str!("../assets/key.pem")),
+      certificate_chain: vec![],
+      versions:          vec![],
+    };
+
+    let certificate = X509::from_pem(certificate_and_key.certificate.as_bytes())?;
+    let fingerprint = CertFingerprint(certificate.digest(MessageDigest::sha256()).map(|d| d.to_vec())?);
+
+    let names = get_cert_names(&certificate);
+    if !listener.find_fingerprints_by_names(&names).is_empty() {
+      return Err("name -> fingerprint index should be empty".into());
+    }
+
+    if !listener.add_certificate(certificate_and_key) {
+      return Err("failed to add certificate".into());
+    }
+
+    if listener.find_fingerprints_by_names(&names).is_empty() {
+      return Err("certificate must be in name -> fingerprint index".into());
+    }
+
+    if listener.get_certificate(&fingerprint).is_none() {
+      return Err("failed to get certificate in listener".into());
+    }
+
+    listener.remove_certificate(&fingerprint);
+    if !listener.find_fingerprints_by_names(&names).is_empty() || listener.get_certificate(&fingerprint).is_some() {
+      return Err("failed to remove certificate from listener or index".into());
+    }
+
+    Ok(())
+  }
+
+  #[test]
+  fn certificate_replacement() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut listener = Listener::new(HttpsListener::default(), Token(0));
+
+    // Below, certificates both provide a self-signed certificate for the localhost domain. The only
+    // difference between them are the expiration date.
+    let certificate_and_key_1y = CertificateAndKey {
+      certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
+      key: String::from(include_str!("../assets/tests/key-1y.pem")),
+      certificate_chain: vec![],
+      versions: vec![],
+    };
+
+    let certificate_1y = X509::from_pem(certificate_and_key_1y.certificate.as_bytes())?;
+    let fingerprint_1y = CertFingerprint(certificate_1y.digest(MessageDigest::sha256()).map(|d| d.to_vec())?);
+    if !listener.add_certificate(certificate_and_key_1y) {
+      return Err("failed to add 1y expiration certificate".into());
+    }
+
+    let certificate_and_key_2y = CertificateAndKey {
+      certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
+      key: String::from(include_str!("../assets/tests/key-2y.pem")),
+      certificate_chain: vec![],
+      versions: vec![],
+    };
+
+    let certificate_2y = X509::from_pem(certificate_and_key_2y.certificate.as_bytes())?;
+    let fingerprint_2y = CertFingerprint(certificate_2y.digest(MessageDigest::sha256()).map(|d| d.to_vec())?);
+    if !listener.add_certificate(certificate_and_key_2y) {
+      return Err("failed to add 2y expiration certificate".into());
+    }
+
+    if listener.get_certificate(&fingerprint_1y).is_some() {
+      return Err("certificate must be replaced by the 2y expiration one".into());
+    }
+
+    if listener.get_certificate(&fingerprint_2y).is_none() {
+      return Err("certificate must be added instead of the 1y expiration one".into());
+    }
+
+    let fingerprints = listener.find_fingerprints_by_names(&get_cert_names(&certificate_1y));
+    if fingerprints.get(&fingerprint_1y).is_some() {
+      return Err("index must not reference the 1y expiration certificate".into());
+    }
+
+    if fingerprints.get(&fingerprint_2y).is_none() {
+      return Err("index have to reference the 2y expiration certificate".into());
+    }
+
+    Ok(())
   }
 }
 
