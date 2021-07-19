@@ -41,7 +41,7 @@ variable convention, so you can precisely trace what happens.
 
 We ([Clever Cloud](https://www.clever-cloud.com)) will ask you to sign a
 [copyright assignment agreement](https://gist.github.com/Geal/c61fc84f0a32a9b76ff606274848370d)
-before accepting code into the project. In short, the agreement allows us
+before accepting your code into the project. In short, the agreement allows us
 to change the license of the project (currently in
 [AGPL 3](https://github.com/sozu-proxy/sozu/blob/master/LICENSE)) if needed.
 You can of course keep using the published version of sōzu with your contribution
