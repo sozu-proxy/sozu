@@ -49,7 +49,7 @@ brew install openssl
 brew link --force openssl
 ```
 
-If it does not work, set the following environment variables before building:
+If this does not work, set the following environment variables before building:
 
 ```bash
 export OPENSSL_LIB_DIR=/usr/local/opt/openssl/lib/
