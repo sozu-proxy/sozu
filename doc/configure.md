@@ -58,7 +58,7 @@ The _listener_ section describes a set of listening sockets accepting client con
 You can define as many listeners as you want.
 They follow the format:
 
-*General parameters:*
+_General parameters:_
 
 ```toml
 [[listeners]]
@@ -115,9 +115,9 @@ rustls_cipher_list = ["TLS13_CHACHA20_POLY1305_SHA256"]
 You can declare the list of your _applications_ under the `[applications]` section.
 They follow the format:
 
-*Mandatories parameters:*
+_Mandatories parameters:_
 
-``` toml
+```toml
 [applications]
 
 [applications.NameOfYourApp]
@@ -192,8 +192,8 @@ More information here: [proxy-protocol spec](https://www.haproxy.org/download/1.
 Configures the client-facing connection to receive a PROXY protocol header before any byte sent by the client is read from the socket.
 
 ```txt
-                            send PROXY               expect PROXY
-                            protocol header          protocol header
+                           send PROXY                    expect PROXY
+                           protocol header               protocol header
     +--------+
     | client |             +---------+                   +------------+      +-----------+
     |        |             | proxy   |                   | Sozu       |      | upstream  |
@@ -204,7 +204,7 @@ Configures the client-facing connection to receive a PROXY protocol header befor
 
 It is supported by HTTP, HTTPS and TCP proxies.
 
-*Configuration:*
+_Configuration:_
 
 ```toml
 [[listeners]]
@@ -212,13 +212,13 @@ address = "0.0.0.0:80"
 expect_proxy = true
 ```
 
-### Configuring Sōzu to *send* a PROXY Protocol header to an upstream backend
+### Configuring Sōzu to _send_ a PROXY Protocol header to an upstream backend
 
 Send a PROXY protocol header over any connection established to the backends declared in the application.
 
 ```txt
-                                send PROXY
-    +--------+                  protocol header
+                           send PROXY
+    +--------+             protocol header
     | client |             +---------+                +-----------------+
     |        |             | Sozu    |                | proxy/upstream  |
     +--------+  ---------> |         |  ------------> | server          |
@@ -226,7 +226,7 @@ Send a PROXY protocol header over any connection established to the backends dec
   /________/               +---------+                +-----------------+
 ```
 
-*Configuration:*
+_Configuration:_
 
 ```toml
 [[listeners]]
@@ -257,7 +257,7 @@ Sōzu will receive a PROXY protocol header from the client connection, check its
   /________/               +---------+                      +------------+             +-------------------+
 ```
 
-*Configuration:*
+_Configuration:_
 
 This only concerns TCP applications (HTTP and HTTPS proxies can work directly in expect mode, and will use the forwarding headers).
 
