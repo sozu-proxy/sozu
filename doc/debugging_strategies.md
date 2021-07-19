@@ -109,7 +109,7 @@ bytes in and out from the point of view of the backend server.
 
 Client sessions can be at various state of their network protocols. As an example, a connection
 could go from "Expect proxy protocol" (assuming there's a TCP proxy in front) to TLS handshake,
-to HTTPS, to WSS (websiockets over TLS).
+to HTTPS, to WSS (websockets over TLS).
 
 You can track the following gauges indicating the current protocol usage:
 
@@ -125,7 +125,7 @@ You can track the following gauges indicating the current protocol usage:
 
 ### Tracking failed requests
 
-Sozu has a way to answer to invalid traffic with minimal resource usage, sending predefined answers.
+Sozu has a way of answering to invalid traffic with minimal resource usage, sending predefined answers.
 It does that for invalid traffic (not standard compliant) and routing issues (unknown host and/or path,
 unresponsive backend server).
 
@@ -165,7 +165,7 @@ The retry policy marking a backend server as down will write the following log m
 
 ### Scalability
 
-Sozu handles finely its resource usage, and puts hard limits on the number of requests
+Sozu handles its resource usage finely, and puts hard limits on the number of requests
 or memory usage.
 
 To track connections, follow these gauges:
@@ -182,21 +182,21 @@ These metrics are closely linked to resource usage, which is tracked by the foll
 
 * `sozu.slab.count`: number of slots used in the slab allocator. Typically, there's one slot per listener socket,
 one for the connection to the main process, one for the metrics socket, then one per frontend connection and
-one per backend connection. So the number of connections should always be close (but lower) to the slab count
+one per backend connection. So the number of connections should always be close to (but lower than) the slab count.
 * `sozu.buffer.count`: number of buffers used in the buffer pool. Inactive sessions and requests for which we send
 a default answer (400, 404, 413, 503 HTTP errors) do not use buffers. Active HTTP sessions use one buffer (except
 in pipelining mode), WebSocket sessions use two buffers. So the number of buffers should always be lower than the
 slab count, and lower than the number of connections.
-* `sozu.zombies`: sozu integrates a zombie session checker. If some sessions did not do anything for a while, there's
-probably a bug in the event loop or protocol implementations, so their internal state is logged, and this counter
-is incremented for each zombie session that was deleted
+* `sozu.zombies`: sozu integrates a zombie session checker. If some session did not do anything for a while, there's
+probably a bug in the event loop or the protocol implementations, so its internal state is logged. This counter
+is incremented for each zombie session that gets deleted.
 
-New connections are put in a queue, and wait them until the session is created (if we have available resources),
-or until a configurable timeout. The following metrics observe the accept queue usage:
+New connections are put into a queue, and wait until the session is created (if we have available resources),
+or until a configurable timeout has elapsed. The following metrics observe the accept queue usage:
 
 * `sozu.accept_queue.count`: number of sockets in the accept queue
 * `sozu.accept_queue.timeout`: incremented every time a socket stayed too long in the queue and is closed
-* `sozu.accept_queue.wait_time`: every time a session is created, this metric record how long the socket waited in the accept queue
+* `sozu.accept_queue.wait_time`: every time a session is created, this metric records how long the socket had to wait in the accept queue
 
 ### TLS specific information
 
@@ -257,7 +257,7 @@ to find out which application is affected
 ### Zombies
 
 if the `sozu.zombies` metric triggers, this means there's an event loop or protocol implementation
-bug. The logs should contain the interla state of the sessions that were killed. Please copy those
+bug. The logs should contain the internal state of the sessions that were killed. Please copy those
 logs and open an issue to sozu.
 
 It usually comes with the `sozu.slab.count` increasing while the number of connections or active requests stays
@@ -266,12 +266,12 @@ the same. The slab count will then drop when the zombie checker activates.
 ### Invalid session close
 
 if the slab count and active requests stay the same but `sozu.client.connections` and/or `sozu.backend.connections`
-are increasing, it means sessions are not closed correctly by sozu, please open an issue for this.
+are increasing, it means sessions are not properly closed by sozu, please open an issue for this.
 (if the slab count stays constant, sockets should still be closed properly, though)
 
 ### Openssl.sni.error increases
 
-Handshakes are failing because sozu does not have the certificate that's required by clients
+Handshakes are failing because sozu does not have the certificate that is required by clients
 
 ### accept queue filling up
 
