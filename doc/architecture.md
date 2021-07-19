@@ -75,6 +75,10 @@ It decrypts the traffic using the SSL key and certificate, and forwards it, unen
 Sōzu is optimised for very limited memory use.
 All traffic is (briefly) stored in a pool of fix-sized (usually 16 kB), reusable buffers.
 
+### channels
+
+They are an abstraction layer over a unix socket, making chatting with a sōzu easier.
+
 ### futures
 
 Sōzu receives orders on a unix socket, in JSON format.
