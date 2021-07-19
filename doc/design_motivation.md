@@ -1,6 +1,6 @@
 # Design Motivation
 
-This document represent the goals we should have in mind while developing sōzu.
+This document presents the goals we should have in mind while developing sōzu.
 It will inform feature decisions, bugfixes and areas of focus.
 
 ## Origin
@@ -22,7 +22,7 @@ change. This causes a few issues:
 
 ### Configuration changes at runtime
 
-changing the proxy's configuration should be a routine task performed at runtime.
+Changing the proxy's configuration should be a routine task performed at runtime.
 We should not need to restart an entire process just to handle this.
 
 This means that configuration management must support dynamic changes, so it must be
@@ -39,8 +39,8 @@ are using it).
 
 ### Bounded resource usage
 
-We should be able to fix the limits in resource (CPU, RAM, connections, etc) usage
-directly in sōzu's configuration. Instead of growing usage indefinitely under load,
+We should be able to fix the limits in resource usage (CPU, RAM, connections, etc)
+directly in sōzu's configuration. Instead of indefinitely increasing resource usage under load,
 we will refuse new traffic right away. This provides back pressure and allows clients
 to be smart about their retries, and keep a predictable latency and behaviour for
 existing connections.
@@ -69,7 +69,7 @@ To that end, we chose Rust for its memory safety features.
 Sōzu should have a very predictable behaviour in its memory usage and its latency.
 Any irregularity should be observed and removed.
 
-It drove various decisions:
+This standpoint has driven various decisions:
 
 - Rust allowed us to avoid garbage collection pauses
 - preallocations and pooling to avoid some allocations in the hot path
@@ -81,10 +81,10 @@ While sōzu is able to handle fine grained configuration changes, it is not its 
 to connect to every configuration management tool under the sun (etcd, kubernetes, etc).
 Instead, we should provide means to write tools connecting sōzu and the rest of the system.
 
-Going further, the code handling configuration changes should be reusable outside of sōzu.
+Going further, the code that handles configuration changes should be reusable outside of sōzu.
 It is currently quite easy to write a tool that loads a configuration state from a file,
 get the current state from sōzu, generate a diff then send configuration messages for the diff
 to sōzu.
 
-Writing configuration tools should be easy enough, and the configuration protocol accessible
-from any language.
+Writing configuration tools should be easy enough, and the configuration protocol should be
+accessible from any language.
