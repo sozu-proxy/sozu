@@ -1,15 +1,16 @@
 # Recipes: solutions for common problems, tips and tricks
 
-* [Using port 80 or 443 as non root user](#using-port-80-or-443-as-non-root-user)
-  + [Capabilities](#capabilities)
-  + [iptables](#iptables)
-* [High availability architecture](#high-availability-architecture)
+- [Recipes: solutions for common problems, tips and tricks](#recipes-solutions-for-common-problems-tips-and-tricks)
+- [Using port 80 or 443 as non root user](#using-port-80-or-443-as-non-root-user)
+  - [Capabilities](#capabilities)
+  - [iptables](#iptables)
+- [High availability architecture](#high-availability-architecture)
 
 # Using port 80 or 443 as non root user
 
-Port numbers under 1024 are usually not accessible to non root users. With sozu,
+Port numbers under 1024 are usually not accessible to non root users. With sōzu,
 we often need to listen on ports 80 (HTTP) and 443 (HTTPS). To avoid running
-sozu as root, here are some solutions to access those ports.
+sōzu as root, here are some solutions to access those ports.
 
 ## Capabilities
 
@@ -40,7 +41,7 @@ WantedBy=multi-user.target
 
 It is also possible to give the capability directly to the sozu binary with
 `setcap 'cap_net_bind_service=+eip' /usr/bin/sozu`,
-but then reserved ports would be accessible by any user than can execute sozu (so they
+but then reserved ports would be accessible by any user than can execute sōzu (so they
 could setup of TCP proxy for SSH, SMTP etc to their own software).
 The unit file is the recommended way.
 
@@ -54,8 +55,8 @@ iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 8080
 iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-ports 8443
 ```
 
-Note that any software running under the same uid as sozu will be able to listen on
-the 8080 and 8443 ports, because those ports are unprivileged and sozu sets up
+Note that any software running under the same uid as sōzu will be able to listen on
+the 8080 and 8443 ports, because those ports are unprivileged and sōzu sets up
 listen socket with the `SO_REUSEPORT` option.
 
 # High availability architecture
