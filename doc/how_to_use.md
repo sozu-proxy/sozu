@@ -32,7 +32,8 @@ Checkout sozuctl [documentation](../ctl/README.md) for more informations.
 
 ## Logging
 
-The reverse proxy uses `env_logger`. You can select which module displays logs at which level with an environment variable. Here is an example to display most logs at `info` level, but use `trace` level for the HTTP parser module:
+The reverse proxy uses `env_logger`. You can select which module displays logs at which level with an environment variable.
+Here is an example to display most logs at the `info` level, but at `trace` level for the HTTP parser module:
 
 ```bash
 RUST_LOG=info,sozu_lib::parser::http11=trace ./target/debug/sozu
