@@ -380,6 +380,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ee2393c4a91429dffb4bedf19f4d6abf27d8a732c8ce4980305d782e5426d57"
+
+[[package]]
+name = "der-oid-macro"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4cccf60bb98c0fca115a581f894aed0e43fa55bf289fdac5599bec440bb4fd6"
+dependencies = [
+ "nom 6.2.1",
+ "num-bigint",
+ "num-traits",
+ "syn",
+]
+
+[[package]]
+name = "der-parser"
+version = "5.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc78bc286418c19333af99233e74abe9d38254d51d8dcc4f571aeb11d25ad194"
+dependencies = [
+ "der-oid-macro",
+ "nom 6.2.1",
+ "num-bigint",
+ "num-traits",
+ "rusticata-macros",
+]
+
+[[package]]
 name = "digest"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -899,6 +930,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-bigint"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e0d047c1062aa51e256408c560894e5251f08925980e53cf1aa5bd00eec6512"
+dependencies = [
+ "autocfg",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-integer"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -925,6 +967,15 @@ checksum = "05499f3756671c15885fee9034446956fff3f243d6077b91e5767df161f766b3"
 dependencies = [
  "hermit-abi",
  "libc",
+]
+
+[[package]]
+name = "oid-registry"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6aae73e474f83beacd8ae2179e328e03d63d9223949d97e1b7c108059a34715"
+dependencies = [
+ "der-parser",
 ]
 
 [[package]]
@@ -1279,6 +1330,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusticata-macros"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8db3e42c9a4a9479e121c66d4925d15a87734f6fa37f1df0434708718d316ce"
+dependencies = [
+ "nom 6.2.1",
+]
+
+[[package]]
 name = "rustls"
 version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1290,6 +1350,12 @@ dependencies = [
  "sct",
  "webpki 0.21.4",
 ]
+
+[[package]]
+name = "rustversion"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61b3909d758bb75c79f23d4736fac9433868679d3ad2ea7a61e3c25cfda9a088"
 
 [[package]]
 name = "rusty_ulid"
@@ -1519,6 +1585,7 @@ dependencies = [
  "time",
  "toml",
  "trailer",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1543,13 +1610,16 @@ dependencies = [
  "rand",
  "rustls",
  "rusty_ulid",
+ "sha2",
  "slab",
  "sozu-command-lib",
+ "thiserror",
  "time",
  "tiny_http",
  "ureq",
  "url",
  "webpki 0.22.0",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1726,6 +1796,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d326610f408c7a4eb6f51c37c330e496b08506c9457c9d34287ecc38809fb060"
 dependencies = [
  "unicode-width",
+]
+
+[[package]]
+name = "thiserror"
+version = "1.0.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93119e4feac1cbe6c798c34d3a53ea0026b0b1de6a120deef895137c0529bfe2"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "060d69a0afe7796bf42e9e2ff91f5ee691fb15c53d38b4b62a9a53eb23164745"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -2104,3 +2194,21 @@ name = "wyz"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85e60b0d1b5f99db2556934e21937020776a5d31520bf169e851ac44e6420214"
+
+[[package]]
+name = "x509-parser"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64abca276c58f8341ddc13fd4bd6ae75993cc669043f5b34813c90f7dff04771"
+dependencies = [
+ "base64",
+ "chrono",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom 6.2.1",
+ "oid-registry",
+ "rusticata-macros",
+ "rustversion",
+ "thiserror",
+]

@@ -1,26 +1,28 @@
-use std::sync::Arc;
+use std::sync::{Arc};
 use std::rc::Rc;
 use std::cell::RefCell;
 use mio::*;
 use mio::net::*;
 use std::os::unix::io::{AsRawFd};
 use std::io::ErrorKind;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use slab::Slab;
 use std::net::SocketAddr;
 use std::str::from_utf8_unchecked;
 use rustls::{ServerConfig, ServerSession, NoClientAuth, ProtocolVersion,
   ALL_CIPHERSUITES};
 use time::{Duration, Instant};
+use server::HttpsProvider;
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,
   ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
-  ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
+  ProxyResponseStatus,AddCertificate,RemoveCertificate,
   TlsVersion,ProxyResponseData,Query, QueryCertificateType,QueryAnswer,
-  QueryAnswerCertificate};
+  QueryAnswerCertificate, CertFingerprint, CertificateAndKey};
 use sozu_command::logging;
 use sozu_command::ready::Ready;
+use crate::tls::{CertificateResolver, MutexWrappedCertificateResolver, GenericCertificateResolverError};
 
 use protocol::http::{parser::{RRequestLine,hostname_and_port}, answers::HttpAnswers};
 use pool::Pool;
@@ -34,7 +36,6 @@ use protocol::StickySession;
 use protocol::http::DefaultAnswerStatus;
 use util::UnwrapLog;
 
-use super::resolver::CertificateResolverWrapper;
 use super::session::Session;
 
 #[derive(Debug,Clone,PartialEq,Eq)]
@@ -47,6 +48,14 @@ pub struct TlsApp {
 pub type HostName  = String;
 pub type PathBegin = String;
 
+#[derive(thiserror::Error, Debug)]
+pub enum ListenerError {
+  #[error("failed to acquired the lock, {0}")]
+  LockError(String),
+  #[error("failed to handle certificate operation, got resolver error, {0}")]
+  ResolverError(GenericCertificateResolverError),
+}
+
 pub struct Listener {
   listener:   Option<TcpListener>,
   address:    SocketAddr,
@@ -54,9 +63,45 @@ pub struct Listener {
   answers:    Rc<RefCell<HttpAnswers>>,
   config:     HttpsListener,
   ssl_config: Arc<ServerConfig>,
-  resolver:   Arc<CertificateResolverWrapper>,
+  resolver:   Arc<MutexWrappedCertificateResolver>,
   pub token:  Token,
   active:     bool,
+}
+
+impl CertificateResolver for Listener {
+  type Error = ListenerError;
+
+  fn get_certificate(&self, fingerprint: &CertFingerprint) -> Option<CertificateAndKey> {
+    let resolver = self.resolver.0.lock()
+        .map_err(|err| ListenerError::LockError(err.to_string()))
+        .ok()?;
+
+    resolver.get_certificate(fingerprint)
+  }
+
+  fn find_certificates_by_names(&self, names: &HashSet<String>) -> Result<HashSet<CertFingerprint>, Self::Error> {
+    let resolver = self.resolver.0.lock()
+        .map_err(|err| ListenerError::LockError(err.to_string()))?;
+
+    resolver.find_certificates_by_names(names)
+      .map_err(|err| ListenerError::ResolverError(err))
+  }
+
+  fn add_certificate(&mut self, opts: &AddCertificate) -> Result<CertFingerprint, Self::Error> {
+    let mut resolver = self.resolver.0.lock()
+        .map_err(|err| ListenerError::LockError(err.to_string()))?;
+
+    resolver.add_certificate(opts)
+        .map_err(|err| ListenerError::ResolverError(err))
+  }
+
+  fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error> {
+    let mut resolver = self.resolver.0.lock()
+        .map_err(|err| ListenerError::LockError(err.to_string()))?;
+
+    resolver.remove_certificate(opts)
+        .map_err(|err| ListenerError::ResolverError(err))
+  }
 }
 
 impl Listener {
@@ -74,8 +119,8 @@ impl Listener {
       }
     }).collect();
 
-    let resolver = Arc::new(CertificateResolverWrapper::new());
-    server_config.cert_resolver = resolver.clone();
+    let resolver = Arc::new(MutexWrappedCertificateResolver::new());
+    server_config.cert_resolver = resolver.to_owned();
 
     //FIXME: we should have another way than indexes in ALL_CIPHERSUITES,
     //but rustls does not export the static SupportedCipherSuite instances yet
@@ -180,35 +225,6 @@ impl Listener {
     if should_delete {
       self.fronts.domain_remove(&front.hostname.into());
     }
-  }
-
-  pub fn add_certificate(&mut self, add_certificate: AddCertificate) -> bool {
-    (*self.resolver).add_certificate(add_certificate).is_some()
-  }
-
-  // FIXME: return an error if the cert is still in use
-  pub fn remove_certificate(&mut self, remove_certificate: RemoveCertificate) {
-    debug!("removing certificate {:?}", remove_certificate);
-    (*self.resolver).remove_certificate(remove_certificate)
-  }
-
-  pub fn replace_certificate(&mut self, replace_certificate: ReplaceCertificate) {
-    debug!("replacing certificate {:?}", replace_certificate);
-    let ReplaceCertificate { front, new_certificate, old_fingerprint, old_names, new_names } = replace_certificate;
-    let remove = RemoveCertificate {
-      front,
-      fingerprint: old_fingerprint,
-      names: old_names,
-    };
-    let add = AddCertificate {
-      front,
-      certificate: new_certificate,
-      names: new_names,
-    };
-
-    //FIXME: handle results
-    (*self.resolver).remove_certificate(remove);
-    (*self.resolver).add_certificate(add);
   }
 
   fn accept(&mut self, _token: ListenToken) -> Result<TcpStream, AcceptError> {
@@ -615,26 +631,30 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::AddCertificate(add_certificate) => {
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == add_certificate.front) {
-          listener.add_certificate(add_certificate);
-          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+          match listener.add_certificate(&add_certificate) {
+            Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+            Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err.to_string()), data: None },
+          }
         } else {
           panic!()
         }
       },
       ProxyRequestData::RemoveCertificate(remove_certificate) => {
-        //FIXME: should return an error if certificate still has fronts referencing it
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.front) {
-          listener.remove_certificate(remove_certificate);
-          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+          match listener.remove_certificate(&remove_certificate) {
+            Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+            Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err.to_string()), data: None },
+          }
         } else {
           panic!()
         }
       },
       ProxyRequestData::ReplaceCertificate(replace_certificate) => {
-        //FIXME: should return an error if certificate still has fronts referencing it
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == replace_certificate.front) {
-          listener.replace_certificate(replace_certificate);
-          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+          match listener.replace_certificate(&replace_certificate) {
+            Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+            Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err.to_string()), data: None },
+          }
         } else {
           panic!()
         }
@@ -717,7 +737,7 @@ impl ProxyConfiguration<Session> for Proxy {
   }
 }
 
-use server::HttpsProvider;
+
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   use server::{self,ProxySessionCast};
 

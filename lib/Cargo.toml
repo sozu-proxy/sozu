@@ -37,12 +37,15 @@ openssl-sys = {version="^0.9", optional = true}
 rustls = "^0.19"
 webpki = "^0.22"
 hdrhistogram = "^7.0"
+sha2 = "^0.9.5"
 sozu-command-lib = { version = "^0.13.0", path = "../command" }
 idna = "^0.2"
 memchr = "2.3"
 foreign-types-shared = "0.1"
 poule = "0.3.2"
 lazycell = "1.2"
+x509-parser = "^0.9.2"
+thiserror = "^1.0.26"
 
 [dev-dependencies]
 tiny_http = "^0.8"

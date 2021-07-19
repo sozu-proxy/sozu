@@ -268,7 +268,8 @@ mod tests {
                   key: String::from(KEY),
                   versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
         },
-        names: Vec::new()
+        names: None,
+        expired_at: None,
       })),
       worker_id: None
     });
@@ -279,7 +280,6 @@ mod tests {
       data:     CommandRequestData::Proxy(ProxyRequestData::RemoveCertificate(RemoveCertificate {
           front: "0.0.0.0:443".parse().unwrap(),
           fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
-          names: Vec::new(),
       })),
       worker_id: None
     });

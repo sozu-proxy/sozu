@@ -484,7 +484,8 @@ impl HttpFrontendConfig {
           certificate_chain: self.certificate_chain.clone().unwrap_or_default(),
           versions:          self.tls_versions.clone(),
         },
-        names: vec!(self.hostname.clone()),
+        names: Some(vec!(self.hostname.clone())),
+        expired_at: None
       }));
 
       v.push(ProxyRequestData::AddHttpsFront(HttpFront {

@@ -3,7 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::iter::{repeat,FromIterator};
-use crate::certificate::calculate_fingerprint;
+use crate::certificate::{calculate_fingerprint, get_certificate_names};
 
 use crate::proxy::{Application,CertFingerprint,CertificateAndKey,ProxyRequestData,
   HttpFront,TcpFront,Backend,QueryAnswerApplication,
@@ -156,11 +156,24 @@ impl ConfigState {
           }
         };
 
+        let names = match &add.names {
+          Some(names) => names.to_owned(),
+          None =>  {
+            match get_certificate_names(add.certificate.certificate.as_bytes()) {
+              Ok(names) => names.iter().map(ToOwned::to_owned).collect(),
+              Err(err) => {
+                error!("could not retrieve certificate names, {}", err);
+                return false;
+              }
+            }
+          }
+        };
+
         if !self.certificates.contains_key(&add.front) {
           self.certificates.insert(add.front.clone(), HashMap::new());
         }
         if !self.certificates.get(&add.front).unwrap().contains_key(&fingerprint) {
-          self.certificates.get_mut(&add.front).unwrap().insert(fingerprint.clone(), (add.certificate.clone(), add.names.clone()));
+          self.certificates.get_mut(&add.front).unwrap().insert(fingerprint.clone(), (add.certificate.clone(), names));
           true
         } else {
           false
@@ -180,9 +193,22 @@ impl ConfigState {
           }
         };
 
+        let names = match &replace.new_names {
+          Some(names) => names.to_owned(),
+          None =>  {
+            match get_certificate_names(replace.new_certificate.certificate.as_bytes()) {
+              Ok(names) => names.iter().map(ToOwned::to_owned).collect(),
+              Err(err) => {
+                error!("could not retrieve certificate names, {}", err);
+                return false;
+              }
+            }
+          }
+        };
+
         if !self.certificates.get(&replace.front).unwrap().contains_key(&fingerprint) {
           self.certificates.get_mut(&replace.front).map(|certs| certs.insert(fingerprint.clone(),
-            (replace.new_certificate.clone(), replace.new_names.clone())));
+            (replace.new_certificate.clone(), names)));
           true
         } else {
           changed
@@ -310,7 +336,8 @@ impl ConfigState {
         v.push(ProxyRequestData::AddCertificate(AddCertificate{
           front: **front,
           certificate: certificate_and_key.clone(),
-          names: names.clone(),
+          names: Some(names.clone()),
+          expired_at: None
         }));
       }
     }
@@ -695,7 +722,6 @@ impl ConfigState {
       v.push(ProxyRequestData::RemoveCertificate(RemoveCertificate {
         front,
         fingerprint: fingerprint.clone(),
-        names: Vec::new(),
       }));
     }
 
@@ -705,7 +731,8 @@ impl ConfigState {
               v.push(ProxyRequestData::AddCertificate(AddCertificate{
                   front,
                   certificate: certificate_and_key.clone(),
-                  names: names.clone(),
+                  names: Some(names.clone()),
+                  expired_at: None
               }));
           }
     }

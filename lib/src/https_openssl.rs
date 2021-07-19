@@ -1,4 +1,4 @@
-use std::sync::{Arc,Mutex};
+use std::sync::{Arc, Mutex};
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::net::Shutdown;
@@ -17,10 +17,11 @@ use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod, SslAlert,
 use openssl::x509::X509;
 use openssl::dh::Dh;
 use openssl::pkey::{PKey, Private};
-use openssl::hash::MessageDigest;
 use openssl::nid;
 use openssl::error::ErrorStack;
 use openssl::ssl::SslVersion;
+use server::HttpsProvider;
+use tls::{GenericCertificateResolver, CertificateResolver, GenericCertificateResolverError};
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
@@ -873,43 +874,31 @@ impl ProxySession for Session {
   }
 }
 
-fn get_cert_common_name(cert: &X509) -> Option<String> {
-    cert.subject_name().entries_by_nid(nid::Nid::COMMONNAME).next().and_then(|name| name.data().as_utf8().ok().map(|name| (&*name).to_string()))
-}
-
-fn get_cert_names(cert: &X509) -> HashSet<String> {
-  let mut  h = HashSet::new();
-
-  // warning: we should not use the common name anymore
-  if let Some(name) = get_cert_common_name(&cert) {
-    h.insert(name);
-  }
-
-  if let Some(names) = cert.subject_alt_names() {
-    for name in names.iter().filter_map(|general_name|
-        general_name.dnsname().map(|name| String::from(name))
-      ) {
-      h.insert(name);
-    }
-  }
-
-  h
-}
-
 
 pub type HostName  = String;
 pub type PathBegin = String;
 pub struct TlsData {
   context:     SslContext,
-  certificate: Vec<u8>,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ListenerError {
+  #[error("failed to acquire the lock, {0}")]
+  LockError(String),
+  #[error("failed to handle certificate request, got a resolver error, {0}")]
+  ResolverError(GenericCertificateResolverError),
+  #[error("failed to parse pem, {0}")]
+  PemParseError(String),
+  #[error("failed to build openssl context")]
+  BuildOpenSslError,
 }
 
 pub struct Listener {
   listener:        Option<TcpListener>,
   address:         SocketAddr,
   fronts:          TrieNode<Vec<TlsApp>>,
-  domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
-  contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
+  resolver:        Arc<Mutex<GenericCertificateResolver>>,
+  contexts:        Arc<Mutex<HashMap<CertFingerprint, (SslContext, SslOptions)>>>,
   default_context: SslContext,
   answers:         Rc<RefCell<HttpAnswers>>,
   config:          HttpsListener,
@@ -918,29 +907,101 @@ pub struct Listener {
   active:          bool,
 }
 
+impl CertificateResolver for Listener {
+  type Error = ListenerError;
+
+  fn get_certificate(&self, fingerprint: &CertFingerprint) -> Option<CertificateAndKey> {
+    let resolver = self.resolver.lock()
+        .map_err(|err| ListenerError::LockError(err.to_string()))
+        .ok()?;
+
+    resolver.get_certificate(fingerprint)
+  }
+
+  fn find_certificates_by_names(&self, names: &HashSet<String>) -> Result<HashSet<CertFingerprint>, Self::Error> {
+    let resolver = self.resolver.lock()
+        .map_err(|err| ListenerError::LockError(err.to_string()))?;
+
+    resolver.find_certificates_by_names(names)
+        .map_err(|err| ListenerError::ResolverError(err))
+  }
+
+  fn add_certificate(&mut self, opts: &sozu_command_lib::proxy::AddCertificate) -> Result<CertFingerprint, Self::Error> {
+    let (fingerprint, certificate_and_key) = {
+      let mut resolver = self.resolver.lock()
+          .map_err(|err| ListenerError::LockError(err.to_string()))?;
+
+      let fingerprint = resolver.add_certificate(opts)
+          .map_err(|err| ListenerError::ResolverError(err))?;
+
+      let certificate_and_key = resolver.get_certificate(&fingerprint)
+          .expect("to retrieve certificate and key has they just been inserted");
+
+      (fingerprint, certificate_and_key)
+    };
+
+    let certificate = X509::from_pem(certificate_and_key.certificate.as_bytes())
+        .map_err(|err| ListenerError::PemParseError(err.to_string()))?;
+    let key = PKey::private_key_from_pem(certificate_and_key.key.as_bytes())
+        .map_err(|err| ListenerError::PemParseError(err.to_string()))?;
+    let chains = certificate_and_key.certificate_chain.iter()
+        .filter_map(|chain| X509::from_pem(chain.as_bytes()).ok())
+        .collect::<Vec<_>>();
+
+    let versions = if !certificate_and_key.versions.is_empty() {
+      &certificate_and_key.versions
+    } else {
+      &self.config.versions
+    };
+
+    let context = match Self::create_context(versions, &self.config.cipher_list, &certificate, &key, &chains, self.resolver.to_owned(), self.contexts.to_owned()) {
+      None => { return Err(ListenerError::BuildOpenSslError) }
+      Some(context) => context,
+    };
+
+    let mut contexts = self.contexts.lock()
+        .map_err(|err| ListenerError::LockError(err.to_string()))?;
+
+    contexts.insert(fingerprint.to_owned(), context);
+
+    Ok(fingerprint)
+  }
+
+  fn remove_certificate(&mut self, opts: &sozu_command_lib::proxy::RemoveCertificate) -> Result<(), Self::Error> {
+    {
+      let mut resolver = self.resolver.lock()
+          .map_err(|err| ListenerError::LockError(err.to_string()))?;
+
+      resolver.remove_certificate(opts)
+          .map_err(|err| ListenerError::ResolverError(err))?;
+    }
+
+    let mut contexts = self.contexts.lock()
+        .map_err(|err| ListenerError::LockError(err.to_string()))?;
+
+    contexts.remove(&opts.fingerprint);
+
+    Ok(())
+  }
+}
+
 impl Listener {
   pub fn new(config: HttpsListener, token: Token) -> Listener {
-
-    let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
-    let domains      = TrieNode::root();
-    let fronts       = TrieNode::root();
-    let rc_ctx       = Arc::new(Mutex::new(contexts));
-    let ref_ctx      = rc_ctx.clone();
-    let rc_domains   = Arc::new(Mutex::new(domains));
-    let ref_domains  = rc_domains.clone();
+    let resolver = Arc::new(Mutex::new(GenericCertificateResolver::new()));
+    let contexts = Arc::new(Mutex::new(HashMap::new()));
 
     let (default_context, ssl_options):(SslContext, SslOptions) =
-      Self::create_default_context(&config, ref_ctx, ref_domains).expect("could not create default context");
+      Self::create_default_context(&config, resolver.to_owned(), contexts.to_owned()).expect("could not create default context");
 
     Listener {
       listener:        None,
       address:         config.front.clone(),
-      domains:         rc_domains,
+      resolver,
+      contexts,
       default_context,
-      contexts:        rc_ctx,
       answers:         Rc::new(RefCell::new(HttpAnswers::new(&config.answer_404, &config.answer_503))),
       active:          false,
-      fronts,
+      fronts:          TrieNode::root(),
       config,
       _ssl_options: ssl_options,
       token,
@@ -970,8 +1031,7 @@ impl Listener {
     Some(self.token)
   }
 
-  pub fn create_default_context(config: &HttpsListener, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
-    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>) -> Option<(SslContext, SslOptions)> {
+  pub fn create_default_context(config: &HttpsListener, resolver: Arc<Mutex<GenericCertificateResolver>>, contexts: Arc<Mutex<HashMap<CertFingerprint, (SslContext, SslOptions)>>>) -> Option<(SslContext, SslOptions)> {
 
     let mut cert_read  = config.certificate.as_ref().map(|c| c.as_bytes())
         .unwrap_or(include_bytes!("../assets/certificate.pem"));
@@ -985,7 +1045,7 @@ impl Listener {
       Self::create_context(
         &config.versions, &config.cipher_list,
         &cert, &key, &cert_chain[..],
-        ref_ctx, ref_domains
+        resolver, contexts,
       )
     } else {
       None
@@ -994,8 +1054,8 @@ impl Listener {
 
   pub fn create_context(tls_versions: &[TlsVersion], cipher_list: &str,
     cert: &X509, key: &PKey<Private>, cert_chain: &[X509],
-    ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
-    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>) -> Option<(SslContext, SslOptions)> {
+    resolver: Arc<Mutex<GenericCertificateResolver>>,
+    contexts: Arc<Mutex<HashMap<CertFingerprint, (SslContext, SslOptions)>>>) -> Option<(SslContext, SslOptions)> {
     let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
       error!("error building SSL context: {:?}", e);
@@ -1063,7 +1123,7 @@ impl Listener {
     }
 
     //context.set_servername_callback(Self::create_servername_callback(ref_ctx.clone(), ref_domains.clone()));
-    context.set_client_hello_callback(Self::create_client_hello_callback(ref_ctx.clone(), ref_domains.clone()));
+    context.set_client_hello_callback(Self::create_client_hello_callback(resolver, contexts));
 
     Some((context.build(), ssl_options))
   }
@@ -1108,14 +1168,11 @@ impl Listener {
     }
   }
 
-  fn create_client_hello_callback(ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
-    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>)
+  fn create_client_hello_callback(resolver: Arc<Mutex<GenericCertificateResolver>>, contexts: Arc<Mutex<HashMap<CertFingerprint, (SslContext, SslOptions)>>>)
 -> impl Fn(&mut SslRef, &mut SslAlert)
         -> Result<ssl::ClientHelloResponse, ErrorStack> + 'static + Sync + Send {
     move |ssl: &mut SslRef, alert: &mut SslAlert| {
       use nom::HexDisplay;
-      let contexts = unwrap_msg!(ref_ctx.lock());
-      let domains  = unwrap_msg!(ref_domains.lock());
 
       debug!("client hello callback: TLS version = {:?}", ssl.version_str());
 
@@ -1127,6 +1184,8 @@ impl Listener {
       }
 
       let mut sni_names = server_name_opt.unwrap();
+      let resolver = unwrap_msg!(resolver.lock());
+      let contexts = unwrap_msg!(contexts.lock());
 
       while !sni_names.is_empty() {
           debug!("name list:\n{}", sni_names.to_hex(16));
@@ -1136,12 +1195,11 @@ impl Listener {
                   debug!("parsed name:\n{}", servername.to_hex(16));
                   sni_names = i;
 
-                  if let Some(kv) = domains.domain_lookup(servername, true) {
+                  if let Some(kv) = resolver.domains.domain_lookup(servername, true) {
                       debug!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
-                      if let Some(ref tls_data) = contexts.get(&kv.1) {
+                      if let Some((context, _)) = contexts.get(&kv.1) {
                           debug!("found context for {:?}", servername);
 
-                          let context: &SslContext = &tls_data.context;
                           if let Ok(()) = ssl.set_ssl_context(context) {
                               ssl_set_options(ssl, context);
 
@@ -1206,90 +1264,6 @@ impl Listener {
 
     if should_delete {
       self.fronts.domain_remove(&front.hostname.into());
-    }
-  }
-
-  pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey) -> bool {
-    //FIXME: insert some error management with a Result here
-
-    let mut cert_read  = &certificate_and_key.certificate.as_bytes()[..];
-    let mut key_read   = &certificate_and_key.key.as_bytes()[..];
-    let cert_chain: Vec<X509> = certificate_and_key.certificate_chain.iter().filter_map(|c| {
-      X509::from_pem(c.as_bytes()).ok()
-    }).collect();
-
-    if let (Ok(cert), Ok(key)) = (X509::from_pem(&mut cert_read), PKey::private_key_from_pem(&mut key_read)) {
-      //FIXME: would need more logs here
-
-      //FIXME
-      let fingerprint = CertFingerprint(unwrap_msg!(cert.digest(MessageDigest::sha256()).map(|d| d.to_vec())));
-      let names = get_cert_names(&cert);
-      debug!("got certificate names: {:?}", names);
-
-      let versions = if !certificate_and_key.versions.is_empty() {
-        &certificate_and_key.versions
-      } else {
-        &self.config.versions
-      };
-
-      let ref_ctx = self.contexts.clone();
-      let ref_domains = self.domains.clone();
-      let ctx_opt = Self::create_context(
-        versions, &self.config.cipher_list,
-        &cert, &key, &cert_chain,
-        ref_ctx, ref_domains);
-
-      if ctx_opt.is_none() {
-        return false;
-      }
-
-      let (context, _) = ctx_opt.unwrap();
-
-      let tls_data = TlsData {
-        context,
-        certificate: cert_read.to_vec(),
-      };
-
-      // if the name or the fingerprint are already used,
-      // those insertions should fail, because it would be
-      // from the same certificate
-      // Add a refcount?
-      //FIXME: this is blocking
-      //this lock is only obtained from this thread, so is it alright?
-      {
-        let mut contexts = unwrap_msg!(self.contexts.lock());
-        if !contexts.contains_key(&fingerprint) {
-          contexts.insert(fingerprint.clone(), tls_data);
-        }
-      }
-      {
-        let mut domains = unwrap_msg!(self.domains.lock());
-
-        for name in names {
-          domains.domain_insert(name.into_bytes(), fingerprint.clone());
-        }
-      }
-
-      true
-    } else {
-      false
-    }
-  }
-
-  // FIXME: return an error if the cert is still in use
-  pub fn remove_certificate(&mut self, fingerprint: CertFingerprint) {
-    debug!("removing certificate {:?}", fingerprint);
-    let mut contexts = unwrap_msg!(self.contexts.lock());
-    let mut domains  = unwrap_msg!(self.domains.lock());
-
-    if let Some(data) = contexts.remove(&fingerprint) {
-      if let Ok(cert) = X509::from_pem(&data.certificate) {
-        let names = get_cert_names(&cert);
-
-        for name in names {
-          domains.domain_remove(&name.into_bytes());
-        }
-      }
     }
   }
 
@@ -1701,8 +1675,10 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::AddCertificate(add_certificate) => {
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == add_certificate.front) {
           //info!("HTTPS\t{} add certificate: {:?}", id, certificate_and_key);
-          listener.add_certificate(add_certificate.certificate);
-          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+          match listener.add_certificate(&add_certificate) {
+            Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+            Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err.to_string()), data: None },
+          }
         } else {
           error!("adding certificate to unknown listener");
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }
@@ -1711,9 +1687,10 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::RemoveCertificate(remove_certificate) => {
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.front) {
           //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
-          listener.remove_certificate(remove_certificate.fingerprint);
-          //FIXME: should return an error if certificate still has fronts referencing it
-          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+          match listener.remove_certificate(&remove_certificate) {
+            Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+            Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err.to_string()), data: None },
+          }
         } else {
           panic!();
         }
@@ -1722,10 +1699,11 @@ impl ProxyConfiguration<Session> for Proxy {
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == replace.front) {
           //info!("TLS\t{} replace certificate of fingerprint {:?} with {:?}", id,
           //  replace.old_fingerprint, replace.new_certificate);
-          listener.remove_certificate(replace.old_fingerprint);
-          listener.add_certificate(replace.new_certificate);
-          //FIXME: should return an error if certificate still has fronts referencing it
-          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+
+          match listener.replace_certificate(&replace) {
+            Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+            Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err.to_string()), data: None },
+          }
         } else {
           panic!();
         }
@@ -1778,8 +1756,8 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
         let res = self.listeners.values().map(|listener| {
-          let mut domains = unwrap_msg!(listener.domains.lock()).to_hashmap();
-          let res = domains.drain().map(|(k, v)| {
+          let resolver = unwrap_msg!(listener.resolver.lock());
+          let res = resolver.domains.to_hashmap().drain().map(|(k, v)| {
             (String::from_utf8(k).unwrap(), v.0.clone())
           }).collect();
 
@@ -1793,8 +1771,8 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::Query(Query::Certificates(QueryCertificateType::Domain(d))) => {
         let res = self.listeners.values().map(|listener| {
-          let domains  = unwrap_msg!(listener.domains.lock());
-          (listener.address, domains.domain_lookup(d.as_bytes(), true).map(|(k, v)| {
+          let resolver = unwrap_msg!(listener.resolver.lock());
+          (listener.address, resolver.domains.domain_lookup(d.as_bytes(), true).map(|(k, v)| {
             (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
           }))
         }).collect::<HashMap<_,_>>();
@@ -1863,7 +1841,8 @@ yD0TrUjkXyjV/zczIYiYSROg9OE5UgYqswIBAg==
   ctx.set_tmp_dh(&dh)
 }
 
-use server::HttpsProvider;
+
+
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   use server::{self,ProxySessionCast};
 
@@ -1973,11 +1952,6 @@ mod tests {
       },
     ]);
 
-    let contexts   = HashMap::new();
-    let rc_ctx     = Arc::new(Mutex::new(contexts));
-    let domains    = TrieNode::root();
-    let rc_domains = Arc::new(Mutex::new(domains));
-
     let context    = SslContext::builder(SslMethod::tls()).expect("could not create a SslContextBuilder");
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1032").expect("test address 127.0.0.1:1032 should be parsed");
@@ -1985,9 +1959,9 @@ mod tests {
       listener:  None,
       address:   front,
       fronts:    fronts,
-      domains:   rc_domains,
       default_context: context.build(),
-      contexts: rc_ctx,
+      resolver: Arc::new(Mutex::new(GenericCertificateResolver::new())),
+      contexts: Arc::new(Mutex::new(HashMap::new())),
       answers:   Rc::new(RefCell::new(HttpAnswers::new("HTTP/1.1 404 Not Found\r\n\r\n", "HTTP/1.1 503 Service Unavailable\r\n\r\n"))),
       config: Default::default(),
       _ssl_options: ssl::SslOptions::CIPHER_SERVER_PREFERENCE | ssl::SslOptions::NO_COMPRESSION | ssl::SslOptions::NO_TICKET |
@@ -2017,15 +1991,6 @@ mod tests {
 
   #[test]
   fn wildcard_certificate_names() {
-    let data = include_bytes!("../assets/services.crt");
-    let cert = X509::from_pem(data).unwrap();
-
-    let names = get_cert_names(&cert);
-
-    assert_eq!(names, ["services.clever-cloud.com", "*.services.clever-cloud.com"].iter().map(|s| String::from(*s)).collect());
-
-    println!("got names: {:?}", names);
-
     let mut trie = TrieNode::root();
 
     trie.domain_insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
@@ -2047,7 +2012,6 @@ mod tests {
 
   #[test]
   fn wildcard_with_subdomains() {
-
     let mut trie = TrieNode::root();
 
     trie.domain_insert("*.test.example.com".as_bytes().to_vec(), 1u8);

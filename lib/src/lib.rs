@@ -179,6 +179,8 @@ extern crate quickcheck;
 #[cfg(feature = "use-openssl")]
 extern crate openssl_sys;
 extern crate foreign_types_shared;
+extern crate x509_parser;
+extern crate sha2;
 
 #[macro_use] pub mod util;
 #[macro_use] pub mod metrics;
@@ -194,6 +196,7 @@ pub mod retry;
 pub mod load_balancing;
 pub mod features;
 pub mod timer;
+pub mod tls;
 
 #[cfg(feature = "splice")]
 mod splice;

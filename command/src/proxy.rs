@@ -289,18 +289,16 @@ pub struct CertificateAndKey {
 pub struct AddCertificate {
     pub front:       SocketAddr,
     pub certificate: CertificateAndKey,
-    #[serde(default)]
-    #[serde(skip_serializing_if="Vec::is_empty")]
-    pub names: Vec<String>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub names: Option<Vec<String>>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub expired_at: Option<i64>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct RemoveCertificate {
     pub front:       SocketAddr,
     pub fingerprint: CertFingerprint,
-    #[serde(default)]
-    #[serde(skip_serializing_if="Vec::is_empty")]
-    pub names: Vec<String>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -308,12 +306,10 @@ pub struct ReplaceCertificate {
     pub front:           SocketAddr,
     pub new_certificate: CertificateAndKey,
     pub old_fingerprint: CertFingerprint,
-    #[serde(default)]
-    #[serde(skip_serializing_if="Vec::is_empty")]
-    pub old_names: Vec<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if="Vec::is_empty")]
-    pub new_names: Vec<String>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub new_names: Option<Vec<String>>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub new_expired_at: Option<i64>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]

@@ -54,7 +54,7 @@ macro_rules! command_timeout {
       thread::spawn(move || {
         $block
         serde::__private::Ok::<(), anyhow::Error>(send.send(())?)
-        
+
       });
 
       if recv.recv_timeout(Duration::from_millis($duration)).is_err() {
@@ -64,7 +64,7 @@ macro_rules! command_timeout {
   )
 }
 
-pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String) 
+pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String)
   -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
@@ -99,7 +99,7 @@ pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   Ok(())
 }
 
-pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String) 
+pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String)
   -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
@@ -134,7 +134,7 @@ pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   Ok(())
 }
 
-pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, json: bool) 
+pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, json: bool)
   -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
@@ -219,7 +219,7 @@ pub fn soft_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
   Ok(())
 }
 
-pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id: Option<u32>, timeout: u64) 
+pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id: Option<u32>, timeout: u64)
   -> Result<(), anyhow::Error> {
   println!("shutting down proxy");
   let id = generate_id();
@@ -351,7 +351,7 @@ pub fn upgrade_main(mut channel: Channel<CommandRequest,CommandResponse>,
   }
 }
 
-pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, worker_id: u32) 
+pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, worker_id: u32)
   -> Result<Channel<CommandRequest,CommandResponse>, anyhow::Error>  {
   println!("upgrading worker {}", worker_id);
   let id = generate_id();
@@ -399,7 +399,7 @@ pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, time
   })?
 }
 
-pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
+pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
@@ -547,7 +547,7 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   }
 }
 
-pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
+pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   -> Result<(), anyhow::Error> {
   let id = generate_id();
   //println!("will send message for metrics with id {}", id);
@@ -942,7 +942,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   Ok(())
 }
 
-pub fn reload_configuration(mut channel: Channel<CommandRequest,CommandResponse>, path: Option<String>, json: bool) 
+pub fn reload_configuration(mut channel: Channel<CommandRequest,CommandResponse>, path: Option<String>, json: bool)
   -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
@@ -1006,7 +1006,7 @@ pub fn remove_application(channel: Channel<CommandRequest,CommandResponse>, time
 }
 
 pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  address: SocketAddr, hostname: &str, path_begin: &str, https: bool) 
+  address: SocketAddr, hostname: &str, path_begin: &str, https: bool)
   -> Result<(), anyhow::Error> {
   if https {
     order_command(channel, timeout, ProxyRequestData::AddHttpsFront(HttpFront {
@@ -1026,7 +1026,7 @@ pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeo
 }
 
 pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  address: SocketAddr, hostname: &str, path_begin: &str, https: bool) 
+  address: SocketAddr, hostname: &str, path_begin: &str, https: bool)
   -> Result<(), anyhow::Error> {
   if https {
     order_command(channel, timeout, ProxyRequestData::RemoveHttpsFront(HttpFront {
@@ -1047,7 +1047,7 @@ pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>, ti
 
 
 pub fn add_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  backend_id: &str, address: SocketAddr, sticky_id: Option<String>, backup: Option<bool>) 
+  backend_id: &str, address: SocketAddr, sticky_id: Option<String>, backup: Option<bool>)
   -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::AddBackend(Backend {
       app_id: String::from(app_id),
@@ -1060,7 +1060,7 @@ pub fn add_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u6
 }
 
 pub fn remove_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  backend_id: &str, address: SocketAddr) 
+  backend_id: &str, address: SocketAddr)
   -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::RemoveBackend(RemoveBackend {
     app_id: String::from(app_id),
@@ -1070,7 +1070,7 @@ pub fn remove_backend(channel: Channel<CommandRequest,CommandResponse>, timeout:
 }
 
 pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
-  certificate_path: &str, certificate_chain_path: &str, key_path: &str, versions: Vec<TlsVersion>) 
+  certificate_path: &str, certificate_chain_path: &str, key_path: &str, versions: Vec<TlsVersion>)
   -> Result<(), anyhow::Error> {
   if let Some(new_certificate) = load_full_certificate(certificate_path,
                                                        certificate_chain_path,
@@ -1078,14 +1078,15 @@ pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout
     order_command(channel, timeout, ProxyRequestData::AddCertificate(AddCertificate {
       front: address,
       certificate: new_certificate,
-      names: Vec::new(),
+      names: None,
+      expired_at: None,
     }))?;
   }
   Ok(())
 }
 
 pub fn remove_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
-  certificate_path: Option<&str>, fingerprint: Option<&str>) 
+  certificate_path: Option<&str>, fingerprint: Option<&str>)
   -> Result<(), anyhow::Error> {
   if certificate_path.is_some() && fingerprint.is_some() {
     bail!("Error: Either provide the certificate's path or its fingerprint");
@@ -1107,8 +1108,7 @@ pub fn remove_certificate(channel: Channel<CommandRequest,CommandResponse>, time
     order_command(channel, timeout, ProxyRequestData::RemoveCertificate(RemoveCertificate {
       front: address,
       fingerprint: fingerprint,
-      names: Vec::new(),
-    }))?
+    }))?;
   }
   Ok(())
 }
@@ -1142,8 +1142,8 @@ pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, tim
         front: address,
         new_certificate,
         old_fingerprint,
-        new_names: Vec::new(),
-        old_names: Vec::new()
+        new_names: None,
+        new_expired_at: None
       }))?;
     }
   }
@@ -1167,7 +1167,7 @@ pub fn remove_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, tim
 }
 
 pub fn add_http_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, public_address: Option<SocketAddr>,
-  answer_404: Option<String>, answer_503: Option<String>, expect_proxy: bool, sticky_name: Option<String>) 
+  answer_404: Option<String>, answer_503: Option<String>, expect_proxy: bool, sticky_name: Option<String>)
   -> Result<(), anyhow::Error> {
   let mut listener = Listener::new(address, FileListenerProtocolConfig::Http);
   listener.public_address = public_address;
@@ -1186,7 +1186,7 @@ pub fn add_http_listener(channel: Channel<CommandRequest,CommandResponse>, timeo
 
 pub fn add_https_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, public_address: Option<SocketAddr>,
   answer_404: Option<String>, answer_503: Option<String>, tls_versions: Vec<TlsVersion>, cipher_list: Option<String>,
-  rustls_cipher_list: Vec<String>, expect_proxy: bool, sticky_name: Option<String>) 
+  rustls_cipher_list: Vec<String>, expect_proxy: bool, sticky_name: Option<String>)
   -> Result<(), anyhow::Error> {
   let mut listener = Listener::new(address, FileListenerProtocolConfig::Https);
   listener.public_address = public_address;
@@ -1207,7 +1207,7 @@ pub fn add_https_listener(channel: Channel<CommandRequest,CommandResponse>, time
 }
 
 pub fn add_tcp_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
-  public_address: Option<SocketAddr>, expect_proxy: bool) 
+  public_address: Option<SocketAddr>, expect_proxy: bool)
   -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::AddTcpListener(TcpListener {
     front: address,
@@ -1219,7 +1219,7 @@ pub fn add_tcp_listener(channel: Channel<CommandRequest,CommandResponse>, timeou
   }))
 }
 
-pub fn remove_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType) 
+pub fn remove_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType)
   -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::RemoveListener(RemoveListener {
     front: address,
@@ -1227,7 +1227,7 @@ pub fn remove_listener(channel: Channel<CommandRequest,CommandResponse>, timeout
   }))
 }
 
-pub fn activate_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType) 
+pub fn activate_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType)
 -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::ActivateListener(ActivateListener {
     front: address,
@@ -1236,7 +1236,7 @@ pub fn activate_listener(channel: Channel<CommandRequest,CommandResponse>, timeo
   }))
 }
 
-pub fn deactivate_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType) 
+pub fn deactivate_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType)
   -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::DeactivateListener(DeactivateListener {
     front: address,
@@ -1245,7 +1245,7 @@ pub fn deactivate_listener(channel: Channel<CommandRequest,CommandResponse>, tim
   }))
 }
 
-pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, application_id: Option<String>, domain: Option<String>) 
+pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, application_id: Option<String>, domain: Option<String>)
   -> Result<(), anyhow::Error> {
   if application_id.is_some() && domain.is_some() {
     bail!("Error: Either request an application ID or a domain name");
@@ -1518,7 +1518,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
   }
 }
 
-pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, fingerprint: Option<String>, domain: Option<String>) 
+pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, fingerprint: Option<String>, domain: Option<String>)
   -> Result<(), anyhow::Error> {
 
   let query = match (fingerprint, domain) {
@@ -1635,7 +1635,7 @@ pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, j
   }
 }
 
-pub fn logging_filter(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, filter: &str) 
+pub fn logging_filter(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, filter: &str)
   -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::Logging(String::from(filter)))
 }
@@ -1673,7 +1673,7 @@ pub fn events(mut channel: Channel<CommandRequest,CommandResponse>) -> Result<()
   }
 }
 
-fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, order: ProxyRequestData) 
+fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, order: ProxyRequestData)
 -> Result<(), anyhow::Error>  {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
