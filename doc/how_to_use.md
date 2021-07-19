@@ -80,7 +80,7 @@ To change the path of the configuration socket, modify the `command_socket` opti
 
 ### Provide an initial configuration state
 
-Sozu can use a JSON file to load an initial configuration state for its routing. You can mount it by using a volume, you can start your sozu container with this in a volume (note that only the directory path of the custom config file is used in this command):
+Sōzu can use a JSON file to load an initial configuration state for its routing. You can mount it by using a volume, you can start your sozu container with this in a volume (note that only the directory path of the custom config file is used in this command):
 `docker run -v /my/state:/var/lib/sozu sozu`
 
 To change the path of the saved state file, modify the `saved_state` option in the configuration file (default value is `/var/lib/sozu/state.json`).
