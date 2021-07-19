@@ -13,7 +13,7 @@ file.
 
 ## Command socket message format
 
-The proxy receives order through a unix socket. The path to this unix socket can
+The proxy receives orders through a unix socket. The path to this unix socket can
 be defined by the `command_socket` option in the TOML configuration file.
 
 The messages are sent as JSON messages, separated by the 0 byte.
