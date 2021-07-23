@@ -75,7 +75,8 @@ impl SocketHandler for TcpStream {
         Ok(sz) => size += sz,
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
-          ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
+          ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe
+              | ErrorKind::ConnectionRefused => {
             incr!("tcp.write.error");
             return (size, SocketResult::Closed)
           },
@@ -96,7 +97,8 @@ impl SocketHandler for TcpStream {
       Ok(sz) => return (sz, SocketResult::Continue),
       Err(e) => match e.kind() {
         ErrorKind::WouldBlock => return (0, SocketResult::WouldBlock),
-        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionRefused => {
           incr!("tcp.write.error");
           return (0, SocketResult::Closed)
         },
