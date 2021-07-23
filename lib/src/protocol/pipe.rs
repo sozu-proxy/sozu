@@ -127,9 +127,10 @@ impl<Front:SocketHandler> Pipe<Front> {
     self.backend_token
   }
 
-  pub fn timeout(&mut self, token: Token, _metrics: &mut SessionMetrics) -> SessionResult {
+  pub fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> SessionResult {
       //info!("got timeout for token: {:?}", token);
     if self.frontend_token == token {
+      self.log_request_error(metrics, "front socket timeout");
       if let Some(timeout) = self.front_timeout.as_mut() {
         timeout.triggered();
         SessionResult::CloseSession
@@ -141,9 +142,11 @@ impl<Front:SocketHandler> Pipe<Front> {
         if let Some(timeout) = self.back_timeout.as_mut() {
           timeout.triggered();
         }
+        self.log_request_error(metrics, "back socket timeout");
         SessionResult::CloseSession
     } else {
         error!("got timeout for an invalid token");
+        self.log_request_error(metrics, "invalid token timeout");
         SessionResult::CloseSession
     }
   }
