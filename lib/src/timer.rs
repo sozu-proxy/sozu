@@ -337,7 +337,7 @@ impl<T> Timer<T> {
         let links = match self.entries.get(timeout.token.into()) {
             Some(e) => e.links,
             None => {
-                error!("timeout token {:?} not found", timeout.token);
+                debug!("timeout token {:?} not found", timeout.token);
                 return None
             },
         };
