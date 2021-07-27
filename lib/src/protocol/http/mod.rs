@@ -399,9 +399,13 @@ impl<Front:SocketHandler> Http<Front> {
           self.back_readiness.interest.insert(Ready::readable());
           SessionResult::Continue
         } else {
-          self.set_answer(DefaultAnswerStatus::Answer502, None);
+          if self.response == Some(ResponseState::Initial) {
+            self.set_answer(DefaultAnswerStatus::Answer503, None);
+          } else {
+            self.set_answer(DefaultAnswerStatus::Answer502, None);
+          }
           // we're not expecting any more data from the backend
-          self.back_readiness.interest  = Ready::empty();
+          self.back_readiness.interest = Ready::empty();
           SessionResult::Continue
         }
       } else {
