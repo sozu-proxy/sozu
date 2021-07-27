@@ -613,7 +613,7 @@ impl ProxySession for Session {
     self.metrics().service_start();
 
     if self.back_connected().is_connecting() {
-      if self.back_readiness().unwrap().event.is_hup() || !self.test_back_socket() {
+      if self.back_readiness().unwrap().event.is_hup() && !self.test_back_socket() {
         //retry connecting the backend
         error!("error connecting to backend, trying again");
         self.metrics().service_stop();

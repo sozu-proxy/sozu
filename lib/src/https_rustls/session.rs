@@ -547,9 +547,8 @@ impl Session {
 
       self.http_mut().map(|h| h.cancel_backend_timeout());
 
-      if (self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false)
-          || !self.http_mut().map(|h| h.test_back_socket()).unwrap_or(false))
-        && !self.back_readiness().map(|r| r.event.is_readable()).unwrap_or(false) {
+      if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false)
+          && !self.http_mut().map(|h| h.test_back_socket()).unwrap_or(false) {
 
         //retry connecting the backend
         error!("{} error connecting to backend, trying again", self.log_context());
