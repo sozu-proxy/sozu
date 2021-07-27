@@ -155,6 +155,93 @@ fn test() {
             e => panic!("invalid response: {:?}", e),
         };
 
+    command.write_message(&proxy::ProxyRequest {
+        id:    String::from("ID_EFGH-2"),
+        order: proxy::ProxyRequestData::RemoveBackend(proxy::RemoveBackend {
+            app_id: String::from("test"),
+            backend_id: String::from("test-0"),
+            address: "127.0.0.1:2048".parse().unwrap(),
+        })
+    });
+
+    let http_backend = proxy::Backend {
+        app_id:                    String::from("test"),
+        backend_id:                String::from("test-0"),
+        address:                   "127.0.0.1:2048".parse().unwrap(),
+        load_balancing_parameters: Some(LoadBalancingParams::default()),
+        sticky_id:                 None,
+        backup:                    None,
+    };
+
+    command.write_message(&proxy::ProxyRequest {
+        id:    String::from("ID_EFGH-3"),
+        order: proxy::ProxyRequestData::AddBackend(http_backend)
+    });
+
+    let barrier2 = barrier.clone();
+    let _ = thread::spawn(move || {
+        let listener = TcpListener::bind("127.0.0.1:2048").expect("could not parse address");
+        barrier2.wait();
+        let mut stream = listener.incoming().next().unwrap().unwrap();
+        let response = b"HTTP/1.1 200 Ok\r\nConnection: close\r\nContent-Length: 5\r\n\r\nHello";
+        stream.write(&response[..]).unwrap();
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+    });
+
+    barrier.wait();
+    info!("expecting 200 then close");
+    let res = agent
+        .get("http://example.com:8080/")
+        .call().unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.status_text(), "Ok");
+    assert_eq!(res.header("Content-Length"), Some("5"));
+    assert_eq!(res.into_string().unwrap(), "Hello");
+
+
+    let barrier2 = barrier.clone();
+    let _ = thread::spawn(move || {
+        let listener = TcpListener::bind("127.0.0.1:2048").expect("could not parse address");
+        barrier2.wait();
+        let stream = listener.incoming().next().unwrap().unwrap();
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+    });
+
+    barrier.wait();
+    info!("server closes, expecting 503");
+    match agent
+        .get("http://example.com:8080/")
+        .call().unwrap_err() {
+            ureq::Error::Status(503, res) => {
+                println!("res: {:?}", res);
+                assert_eq!(res.status_text(), "Service Unavailable");
+            },
+            e => panic!("invalid response: {:?}", e),
+        };
+
+    command.write_message(&proxy::ProxyRequest {
+        id:    String::from("ID_EFGH-2"),
+        order: proxy::ProxyRequestData::RemoveBackend(proxy::RemoveBackend {
+            app_id: String::from("test"),
+            backend_id: String::from("test-0"),
+            address: "127.0.0.1:2048".parse().unwrap(),
+        })
+    });
+
+    let http_backend = proxy::Backend {
+        app_id:                    String::from("test"),
+        backend_id:                String::from("test-0"),
+        address:                   "127.0.0.1:2048".parse().unwrap(),
+        load_balancing_parameters: Some(LoadBalancingParams::default()),
+        sticky_id:                 None,
+        backup:                    None,
+    };
+
+    command.write_message(&proxy::ProxyRequest {
+        id:    String::from("ID_EFGH-3"),
+        order: proxy::ProxyRequestData::AddBackend(http_backend)
+    });
+
     start_server(2048, barrier.clone());
 
     barrier.wait();
