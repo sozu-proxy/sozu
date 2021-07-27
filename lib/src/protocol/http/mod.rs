@@ -412,13 +412,18 @@ impl<Front:SocketHandler> Http<Front> {
         SessionResult::Continue
       }
     } else {
+        if self.back_readiness.event.is_readable()
+            && self.back_readiness.interest.is_readable(){
 
-        if self.request == Some(RequestState::Initial) &&
-            self.response == Some(ResponseState::Initial) {
-                SessionResult::CloseBackend(self.backend_token.clone())
-            } else {
-                SessionResult::Continue
+            SessionResult::Continue
+        } else {
+            if self.response == Some(ResponseState::Initial) {
+                self.set_answer(DefaultAnswerStatus::Answer503, None);
+                // we're not expecting any more data from the backend
+                self.back_readiness.interest  = Ready::empty();
             }
+            SessionResult::CloseBackend(self.backend_token.clone())
+        }
     }
   }
 
