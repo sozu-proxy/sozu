@@ -1684,7 +1684,7 @@ mod tests {
       listener: None,
       address:  front,
       fronts,
-      answers: Rc::new(RefCell::new(HttpAnswers::new("HTTP/1.1 404 Not Found\r\n\r\n", "HTTP/1.1 503 your application is in deployment\r\n\r\n"))),
+      answers: Rc::new(RefCell::new(HttpAnswers::new("HTTP/1.1 404 Not Found\r\n\r\n", "HTTP/1.1 503 Service Unavailable\r\n\r\n"))),
       config: Default::default(),
       token: Token(0),
       active: true,
