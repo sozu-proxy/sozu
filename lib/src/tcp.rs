@@ -426,7 +426,8 @@ impl Session {
     self.back_connected = status;
 
     if status == BackendConnectionStatus::Connected {
-      gauge_add!("connections", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("backend.connections", 1);
+      gauge_add!("connections_per_backend", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       if let Some(State::SendProxyProtocol(ref mut pp)) = self.protocol {
         pp.set_back_connected(BackendConnectionStatus::Connected);
       }
@@ -584,7 +585,8 @@ impl ProxySession for Session {
     }
 
     if back_connected == BackendConnectionStatus::Connected {
-      gauge_add!("connections", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("backend.connections", -1);
+      gauge_add!("connections_per_backend", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
     }
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);

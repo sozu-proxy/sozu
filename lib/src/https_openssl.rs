@@ -449,7 +449,8 @@ impl Session {
     self.back_connected = connected;
 
     if connected == BackendConnectionStatus::Connected {
-      gauge_add!("connections", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("backend.connections", 1);
+      gauge_add!("connections_per_backend", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
 
       // the back timeout was of connect_timeout duration before,
       // now that we're connected, move to backend_timeout duration
@@ -790,7 +791,8 @@ impl ProxySession for Session {
     }
 
     if back_connected == BackendConnectionStatus::Connected {
-      gauge_add!("connections", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("backend.connections", -1);
+      gauge_add!("connections_per_backend", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
     }
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
