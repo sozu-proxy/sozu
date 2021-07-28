@@ -198,8 +198,6 @@ impl serde::Serialize for CertFingerprint {
   }
 }
 
-
-
 struct CertFingerprintVisitor;
 
 impl<'de> Visitor<'de> for CertFingerprintVisitor {

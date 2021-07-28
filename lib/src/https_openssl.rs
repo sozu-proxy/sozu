@@ -1378,25 +1378,45 @@ impl Listener {
     }
   }
 
-  // FIXME: return an error if the cert is still in use
-  pub fn remove_certificate(&mut self, fingerprint: &CertFingerprint) {
+  fn is_certificate_mandatory_for_a_frontend(&self, names: &HashSet<String>, fingerprint: &CertFingerprint) -> bool {
+    let mut hashset = HashSet::new();
+    hashset.insert(fingerprint.to_owned());
+
+    for name in names {
+      if let Some(fingerprints) = self.name_fingerprint_idx.get(name) {
+        if 1 == fingerprints.len() && fingerprints == &hashset {
+          return true;
+        }
+      }
+    }
+
+    false
+  }
+
+  pub fn remove_certificate(&mut self, fingerprint: &CertFingerprint) -> bool {
     debug!("removing certificate {:?}", fingerprint);
     let mut contexts = unwrap_msg!(self.contexts.lock());
     let mut domains  = unwrap_msg!(self.domains.lock());
 
-    if let Some(data) = contexts.remove(fingerprint) {
+    if let Some(data) = contexts.get(fingerprint) {
       if let Ok(cert) = X509::from_pem(&data.certificate) {
         let names = get_cert_names(&cert);
+        if self.is_certificate_mandatory_for_a_frontend(&names, fingerprint) {
+          return false;
+        }
 
         for name in names {
           if let Some(fingerprints) = self.name_fingerprint_idx.get_mut(&name) {
             fingerprints.remove(fingerprint);
           }
 
+          contexts.remove(fingerprint);
           domains.domain_remove(&name.into_bytes());
         }
       }
     }
+
+    true
   }
 
   // ToDo factor out with http.rs
@@ -1817,9 +1837,11 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::RemoveCertificate(remove_certificate) => {
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.front) {
           //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
-          listener.remove_certificate(&remove_certificate.fingerprint);
-          //FIXME: should return an error if certificate still has fronts referencing it
-          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+          if listener.remove_certificate(&remove_certificate.fingerprint) {
+            ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+          } else {
+            ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error("Certificate is still in use by a front-end".to_string()), data: None }
+          }
         } else {
           panic!();
         }
@@ -1828,10 +1850,12 @@ impl ProxyConfiguration<Session> for Proxy {
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == replace.front) {
           //info!("TLS\t{} replace certificate of fingerprint {:?} with {:?}", id,
           //  replace.old_fingerprint, replace.new_certificate);
-          listener.remove_certificate(&replace.old_fingerprint);
           listener.add_certificate(replace.new_certificate);
-          //FIXME: should return an error if certificate still has fronts referencing it
-          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+          if listener.remove_certificate(&replace.old_fingerprint) {
+            ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+          } else {
+            ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error("Certificate is still in use by a front-end".to_string()), data: None }
+          }
         } else {
           panic!();
         }
@@ -2219,9 +2243,12 @@ mod tests {
       return Err("failed to get certificate in listener".into());
     }
 
-    listener.remove_certificate(&fingerprint);
-    if !listener.find_fingerprints_by_names(&names).is_empty() || listener.get_certificate(&fingerprint).is_some() {
-      return Err("failed to remove certificate from listener or index".into());
+    if listener.remove_certificate(&fingerprint) {
+      return Err("failed to keep the certificate which is mandatory for a frontend".into());
+    }
+
+    if listener.find_fingerprints_by_names(&names).is_empty() || listener.get_certificate(&fingerprint).is_none() {
+      return Err("failed to retrieve certificate that we had the command to remove, but is mandatory for a frontend".into());
     }
 
     Ok(())
