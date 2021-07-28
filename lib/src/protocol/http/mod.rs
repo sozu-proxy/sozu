@@ -421,7 +421,8 @@ impl<Front:SocketHandler> Http<Front> {
 
             SessionResult::Continue
         } else {
-            if self.response == Some(ResponseState::Initial) {
+            if self.request.as_ref().map(|r| r.is_proxying()).unwrap_or(false) &&
+              self.response == Some(ResponseState::Initial) {
                 self.set_answer(DefaultAnswerStatus::Answer503, None);
                 // we're not expecting any more data from the backend
                 self.back_readiness.interest  = Ready::empty();
