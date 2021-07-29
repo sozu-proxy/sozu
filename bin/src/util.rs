@@ -4,8 +4,8 @@ use std::fs::File;
 use std::io::Write;
 use libc;
 
+use anyhow;
 use crate::logging;
-use crate::StartupError;
 use sozu_command::config::Config;
 use sozu::metrics;
 
@@ -46,27 +46,22 @@ pub fn setup_metrics(config: &Config) {
   }
 }
 
-pub fn write_pid_file(config: &Config) -> Result<(), StartupError> {
+pub fn write_pid_file(config: &Config) -> Result<(), anyhow::Error> {
   let pid_file_path = match config.pid_file_path {
     Some(ref pid_file_path) => Some(pid_file_path.as_ref()),
     None => option_env!("SOZU_PID_FILE_PATH")
   };
 
   if let Some(ref pid_file_path) = pid_file_path {
-    File::create(pid_file_path)
-      .and_then(|mut file| {
-        let pid = unsafe { libc::getpid() };
-        file
-          .write_all(format!("{}", pid).as_bytes())
-          .map(|()| file)
-      })
-      .and_then(|file| file.sync_all())
-      .map(|()| ())
-      .or_else(|err| return Err(
-        StartupError::PIDFileNotWritable(
-          format!("Couldn't write the PID file to {}. Error: {:?}", pid_file_path, err))
-        )
-      )
+
+    let mut file = File::create(pid_file_path)?;
+
+    let pid = unsafe { libc::getpid() };
+
+    file.write_all(format!("{}", pid).as_bytes())?;
+    file.sync_all()?;
+
+    Ok(())
   } else {
     Ok(())
   }

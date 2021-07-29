@@ -90,7 +90,8 @@ fn start(matches: &ArgMatches) -> Result<(), StartupError> {
   util::setup_logging(&config);
   info!("Starting up");
   util::setup_metrics(&config);
-  util::write_pid_file(&config)?;
+  util::write_pid_file(&config)
+    .or_else(|e| Err(StartupError::PIDFileNotWritable(e.to_string())))?;
 
   update_process_limits(&config)?;
 
@@ -102,7 +103,7 @@ fn start(matches: &ArgMatches) -> Result<(), StartupError> {
 
   let command_socket_path = config.command_socket_path();
 
-  // this should be transformed into a new StartupError that contains std::io::Error
+  // this could be transformed into a new StartupError that contains std::io::Error
   if let Err(e) = command::start(config, command_socket_path, workers) {
       error!("could not start worker: {:?}", e);
   }
