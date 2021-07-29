@@ -5,6 +5,7 @@ use std::io::Write;
 use libc;
 
 use crate::logging;
+use crate::StartupError;
 use sozu_command::config::Config;
 use sozu::metrics;
 
@@ -45,7 +46,7 @@ pub fn setup_metrics(config: &Config) {
   }
 }
 
-pub fn write_pid_file(config: &Config) -> Result<(), String> {
+pub fn write_pid_file(config: &Config) -> Result<(), StartupError> {
   let pid_file_path = match config.pid_file_path {
     Some(ref pid_file_path) => Some(pid_file_path.as_ref()),
     None => option_env!("SOZU_PID_FILE_PATH")
@@ -61,7 +62,11 @@ pub fn write_pid_file(config: &Config) -> Result<(), String> {
       })
       .and_then(|file| file.sync_all())
       .map(|()| ())
-      .or_else(|err| Err(format!("Couldn't write the PID file to {}. Error: {:?}", pid_file_path, err)))
+      .or_else(|err| return Err(
+        StartupError::PIDFileNotWritable(
+          format!("Couldn't write the PID file to {}. Error: {:?}", pid_file_path, err))
+        )
+      )
   } else {
     Ok(())
   }
