@@ -34,7 +34,8 @@ use crate::command::Worker;
 use crate::worker::{start_workers,get_executable_path};
 use sozu::metrics::METRICS;
 
-enum StartupError {
+#[derive(Debug)]
+pub enum StartupError {
   ConfigurationFileNotSpecified,
   ConfigurationFileLoadError(std::io::Error),
   #[allow(dead_code)]
@@ -52,36 +53,10 @@ fn main() {
   let matches = cli::init();
   // Check if we are upgrading workers or main
   let upgrade = cli::upgrade_worker(&matches).or_else(|| cli::upgrade_main(&matches));
-
+            
   // If we are not, then we want to start sozu
   if upgrade == None {
-    let start = get_config_file_path(&matches)
-    .and_then(|config_file| load_configuration(config_file))
-    .map(|config| {
-      util::setup_logging(&config);
-      info!("Starting up");
-      util::setup_metrics(&config);
-
-      config
-    })
-    .and_then(|config| {
-      util::write_pid_file(&config)
-        .map(|()| config)
-        .map_err(|err| StartupError::PIDFileNotWritable(err))
-    })
-    .and_then(|config| update_process_limits(&config).map(|()| config))
-    .and_then(|config| init_workers(&config).map(|workers| (config, workers)))
-    .map(|(config, workers)| {
-      if config.handle_process_affinity {
-        set_workers_affinity(&workers);
-      }
-      let command_socket_path = config.command_socket_path();
-      if let Err(e) = command::start(config, command_socket_path, workers) {
-          error!("could not start worker: {:?}", e);
-      }
-    });
-
-    match start {
+    match start(&matches) {
       Ok(_) => info!("main process stopped"), // Ok() is only called when the proxy exits
       Err(StartupError::ConfigurationFileNotSpecified) => {
         error!("Configuration file hasn't been specified. Either use -c with the start command \
@@ -106,6 +81,33 @@ fn main() {
       }
     }
   }
+}
+
+fn start(matches: &ArgMatches) -> Result<(), StartupError> {
+
+  let config = load_configuration(get_config_file_path(&matches)?)?;
+
+  util::setup_logging(&config);
+  info!("Starting up");
+  util::setup_metrics(&config);
+  util::write_pid_file(&config)?;
+
+  update_process_limits(&config)?;
+
+  let workers = init_workers(&config)?;
+
+  if config.handle_process_affinity {
+    set_workers_affinity(&workers);
+  }
+
+  let command_socket_path = config.command_socket_path();
+
+  // this should be transformed into a new StartupError that contains std::io::Error
+  if let Err(e) = command::start(config, command_socket_path, workers) {
+      error!("could not start worker: {:?}", e);
+  }
+
+  Ok(())
 }
 
 fn init_workers(config: &Config) -> Result<Vec<Worker>, StartupError> {
