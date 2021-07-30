@@ -32,7 +32,8 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 
 ## Going deeper
 
-TODO
+
+* [Lifetime of a session][li]
 
 ## Release Notes
 
@@ -52,3 +53,4 @@ TODO
 [tl]: ./tools_libraries.md
 [ws]: ./why_you_should_use.md
 [r]: ./recipes.md
+[li]: ./lifetime_of_a_session.md
