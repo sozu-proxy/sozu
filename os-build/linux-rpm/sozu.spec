@@ -1,8 +1,8 @@
 %global	sozu_user	sozu
 
-Summary:	A runtime-configurable HTTP/S reverse proxy.
+Summary:	A lightweight, fast, always-up reverse proxy server.
 Name:		sozu
-Version:	0.1.1
+Version:	0.13.6
 Release:	1%{?dist}
 Epoch:		1
 License:	AGPL-3.0
@@ -25,7 +25,7 @@ BuildRoot:	%{_tmppath}/%{name}-%{version}-%{release}-root
 
 %package ctl
 Group:		System Environment/Daemons
-Summary:	Sozu command line binary.
+Summary:	Command-line control tool for the sozu proxy server.
 Requires:	sozu
 
 %description ctl
@@ -65,7 +65,7 @@ mkdir -p %{buildroot}%{_sysconfdir}/profile.d/
 echo 'alias sozuctl="`which sozuctl` --config %{_sysconfdir}/%{name}/%{name}.toml"' > %{buildroot}%{_sysconfdir}/profile.d/%{name}.sh
 
 # service file - no check for _libdir as it's a systemd constant.
-mkdir -p %{buildroot}%/usr/lib/systemd/system/
+mkdir -p %{buildroot}/usr/lib/systemd/system/
 m4 -D __BINDIR__=%{_bindir} -D __SYSCONFDIR__=%{_sysconfdir} os-build/systemd/sozu.service.in > %{buildroot}%{_localstatedir}/run/sozu/sozu.service
 
 # selinux
@@ -106,5 +106,5 @@ semodule -r sozu
 %{_sysconfdir}/profile.d/%{name}.sh
 
 %changelog
+* Sat Jul 31 2021 Igal Alkon <igal.alkon@versatile.ai>
 * Mon May 15 2017 Philip Woolford <woolford.philip@gmail.com> 0.1-1
-- First RPM build

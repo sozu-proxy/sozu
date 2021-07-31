@@ -1,32 +1,30 @@
 #!/bin/bash
 
 set -e
-cd `dirname $BASH_SOURCE`
 
 # get required packages
-echo 'installing packages'
-sudo dnf install openssl-devel m4 selinux-policy-devel
+echo 'installing build dependencies ...'
+sudo dnf builddep sozu.spec
 
 # define internal variables
-arch=`uname -m`
-output_dir=`pwd`
-rpmbuild_root=`mktemp -d`
-version=`grep -P "^Version:" linux-rpm/sozu.spec | cut -f2`
+arch=$(uname -m)
+output_dir=$(pwd)
+rpmbuild_root=$(mktemp -d)
+version=$(grep -P "^Version:" sozu.spec | cut -f2)
 
 # create RPM build environment
-echo "building in $rpmbuild_root"
-mkdir -p $rpmbuild_root/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS/tmp}
+echo "building in ${rpmbuild_root} ..."
+mkdir -p "${rpmbuild_root}"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS/tmp}
 
 # copy sources
-cp -p linux-rpm/sozu.spec $rpmbuild_root/SPECS
+cp -p sozu.spec "${rpmbuild_root}"/SPECS
 cd ..
-tar -czf $rpmbuild_root/SOURCES/$version.tar.gz  --transform 's,^,sozu-0.1.1/,' ./*
+tar -czf "${rpmbuild_root}/SOURCES/${version}.tar.gz"  --transform "s,^,sozu-${version}/," ../*
 
-cd $rpmbuild_root
-echo `pwd`
+cd "${rpmbuild_root}"
+pwd
 rpmbuild -bb --define "_topdir ${rpmbuild_root}" SPECS/sozu.spec
 
-cp  ${rpmbuild_root}/RPMS/${arch}/*.rpm $output_dir
-
-rm -rf $rpmbuild_root
+cp "${rpmbuild_root}"/RPMS/"${arch}"/*.rpm "${output_dir}"
+rm -rf "${rpmbuild_root}"
 set +e
