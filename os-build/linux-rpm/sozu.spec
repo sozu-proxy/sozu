@@ -32,7 +32,12 @@ Requires:	sozu
 %{summary}
 
 %prep
+
+%if "%{_build_mode}" == "RELEASE"
+%setup -n %{name}-%{version}
+%else
 %setup -q
+%endif
 
 %build
 cargo build --release --all
