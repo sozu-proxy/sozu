@@ -1556,6 +1556,7 @@ dependencies = [
 name = "sozuctl"
 version = "0.13.6"
 dependencies = [
+ "anyhow",
  "hex",
  "prettytable-rs",
  "rand",
