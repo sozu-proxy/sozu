@@ -20,6 +20,7 @@ use rand::{thread_rng, Rng};
 use prettytable::{Table, Row};
 use super::create_channel;
 use rand::distributions::Alphanumeric;
+use anyhow::{self, Context, bail};
 
 
 // Used to display the JSON response of the status command
@@ -52,17 +53,19 @@ macro_rules! command_timeout {
 
       thread::spawn(move || {
         $block
-        send.send(()).unwrap();
+        serde::__private::Ok::<(), anyhow::Error>(send.send(())?)
+        
       });
 
       if recv.recv_timeout(Duration::from_millis($duration)).is_err() {
-        eprintln!("Command timeout. The proxy didn't send answer");
+        bail!("Command timeout. The proxy didn't send an answer");
       }
     }
   )
 }
 
-pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String) {
+pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String) 
+  -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
@@ -98,9 +101,11 @@ pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
       }
     }
   });
+  Ok(())
 }
 
-pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String) {
+pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String) 
+  -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
@@ -111,34 +116,33 @@ pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   command_timeout!(timeout, {
     match channel.read_message() {
       None          => {
-        eprintln!("the proxy didn't answer");
-        exit(1);
+        bail!("the proxy didn't answer")
       },
       Some(message) => {
         if id != message.id {
-          eprintln!("received message with invalid id: {:?}", message);
-          exit(1);
+          bail!("received message with invalid id: {:?}", message);
         }
         match message.status {
           CommandStatus::Processing => {
             // do nothing here
             // for other messages, we would loop over read_message
             // until an error or ok message was sent
+            Ok::<(), anyhow::Error>(())
           },
-          CommandStatus::Error => {
-            eprintln!("could not load proxy state: {}", message.message);
-            exit(1);
-          },
+          CommandStatus::Error => bail!("could not load proxy state: {}", message.message),
           CommandStatus::Ok => {
             println!("Proxy state loaded successfully from {}", path);
+            Ok(())
           }
-        }
+        }?;
       }
-    };
+    }
   });
+  Ok(())
 }
 
-pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, json: bool) {
+pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, json: bool) 
+  -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
@@ -149,13 +153,11 @@ pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   command_timeout!(timeout, {
     match channel.read_message() {
       None          => {
-        eprintln!("the proxy didn't answer");
-        exit(1);
+        bail!("the proxy didn't answer");
       },
       Some(message) => {
         if id != message.id {
-          eprintln!("received message with invalid id: {:?}", message);
-          exit(1);
+          bail!("received message with invalid id: {:?}", message);
         }
         match message.status {
           CommandStatus::Processing => {
@@ -165,31 +167,33 @@ pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
           },
           CommandStatus::Error => {
             if json {
-              print_json_response(&message.message);
+              print_json_response(&message.message)?;
+              return Ok(());
             } else {
-              eprintln!("could not dump proxy state: {}", message.message);
+              bail!("could not dump proxy state: {}", message.message);
             }
-            exit(1);
           },
           CommandStatus::Ok => {
             if let Some(CommandResponseData::State(state)) = message.data {
               if json {
-                print_json_response(&state);
+                print_json_response(&state)?;
               } else {
                 println!("{:#?}", state);
               }
+              return Ok(());
             } else {
-              eprintln!("state dump was empty");
-              exit(1);
+              bail!("state dump was empty");
             }
           }
         }
       }
     }
   });
+  Ok(())
 }
 
-pub fn soft_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id: Option<u32>) {
+pub fn soft_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id: Option<u32>)
+  -> Result<(), anyhow::Error> {
   println!("shutting down proxy");
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
@@ -201,21 +205,18 @@ pub fn soft_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
   loop {
     match channel.read_message() {
       None          => {
-        eprintln!("the proxy didn't answer");
-        exit(1);
+        bail!("the proxy didn't answer");
       },
       Some(message) => {
         if &id != &message.id {
-          eprintln!("received message with invalid id: {:?}", message);
-          exit(1);
+          bail!("received message with invalid id: {:?}", message);
         }
         match message.status {
           CommandStatus::Processing => {
             println!("Proxy is processing: {}", message.message);
           },
           CommandStatus::Error => {
-            eprintln!("could not stop the proxy: {}", message.message);
-            exit(1);
+            bail!("could not stop the proxy: {}", message.message);
           },
           CommandStatus::Ok => {
             println!("Proxy shut down with message: \"{}\"", message.message);
@@ -225,9 +226,11 @@ pub fn soft_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
       }
     }
   }
+  Ok(())
 }
 
-pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id: Option<u32>, timeout: u64) {
+pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id: Option<u32>, timeout: u64) 
+  -> Result<(), anyhow::Error> {
   println!("shutting down proxy");
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
@@ -240,8 +243,7 @@ pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
     loop {
       match channel.read_message() {
         None          => {
-          eprintln!("the proxy didn't answer");
-          exit(1);
+          bail!("the proxy didn't answer");
         },
         Some(message) => {
           match message.status {
@@ -249,8 +251,7 @@ pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
               println!("Proxy is processing: {}", message.message);
             },
             CommandStatus::Error => {
-              eprintln!("could not stop the proxy: {}", message.message);
-              exit(1);
+              bail!("could not stop the proxy: {}", message.message);
             },
             CommandStatus::Ok => {
               if &id == &message.id {
@@ -263,10 +264,11 @@ pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
       }
     }
   );
+  Ok(())
 }
 
 pub fn upgrade_main(mut channel: Channel<CommandRequest,CommandResponse>,
-                  config: &Config) {
+                  config: &Config) -> Result<(), anyhow::Error> {
   println!("Preparing to upgrade proxy...");
 
   let id = generate_tagged_id("LIST-WORKERS");
@@ -278,22 +280,18 @@ pub fn upgrade_main(mut channel: Channel<CommandRequest,CommandResponse>,
 
   match channel.read_message() {
     None          => {
-      eprintln!("Error: the proxy didn't list workers");
-      exit(1);
+      bail!("Error: the proxy didn't list workers");
     },
     Some(message) => {
       if id != message.id {
-        eprintln!("Error: received unexpected message: {:?}", message);
-        exit(1);
+        bail!("Error: received unexpected message: {:?}", message);
       }
       match message.status {
         CommandStatus::Processing => {
-          eprintln!("Error: the proxy didn't return list of workers immediately");
-          exit(1);
+          bail!("Error: the proxy didn't return list of workers immediately");
         },
         CommandStatus::Error => {
-          eprintln!("Error: failed to get the list of worker: {}", message.message);
-          exit(1);
+          bail!("Error: failed to get the list of worker: {}", message.message);
         },
         CommandStatus::Ok => {
           if let Some(CommandResponseData::Workers(ref workers)) = message.data {
@@ -318,19 +316,16 @@ pub fn upgrade_main(mut channel: Channel<CommandRequest,CommandResponse>,
             loop {
               match channel.read_message() {
                 None          => {
-                  eprintln!("Error: the proxy didn't start main upgrade");
-                  exit(1);
+                  bail!("Error: the proxy didn't start main upgrade");
                 },
                 Some(message) => {
                   if &id != &message.id {
-                    eprintln!("Error: received unexpected message: {:?}", message);
-                    exit(1);
+                    bail!("Error: received unexpected message: {:?}", message);
                   }
                   match message.status {
                     CommandStatus::Processing => {},
                     CommandStatus::Error => {
-                      eprintln!("Error: failed to upgrade the main: {}", message.message);
-                      exit(1);
+                      bail!("Error: failed to upgrade the main: {}", message.message);
                     },
                     CommandStatus::Ok => {
                       println!("Main process upgrade succeeded: {}", message.message);
@@ -343,7 +338,7 @@ pub fn upgrade_main(mut channel: Channel<CommandRequest,CommandResponse>,
 
             // Reconnect to the new main
             println!("Reconnecting to new main process...");
-            let mut channel = create_channel(&config).expect("could not reconnect to the command unix socket");
+            let mut channel = create_channel(&config).context("could not reconnect to the command unix socket")?;
 
             // Do a rolling restart of the workers
             let running_workers = workers.iter()
@@ -353,19 +348,21 @@ pub fn upgrade_main(mut channel: Channel<CommandRequest,CommandResponse>,
             for (i, ref worker) in running_workers.iter().enumerate() {
               println!("Upgrading worker {} (of {})", i+1, running_count);
 
-              channel = upgrade_worker(channel, 0, worker.id);
+              channel = upgrade_worker(channel, 0, worker.id)?;
               //thread::sleep(Duration::from_millis(1000));
             }
 
             println!("Proxy successfully upgraded!");
           }
+          Ok(())
         }
       }
     }
   }
 }
 
-pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, worker_id: u32) -> Channel<CommandRequest,CommandResponse> {
+pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, worker_id: u32) 
+  -> Result<Channel<CommandRequest,CommandResponse>, anyhow::Error>  {
   println!("upgrading worker {}", worker_id);
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
@@ -410,14 +407,14 @@ pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, time
   });
 
   if timeout > 0 && recv.recv_timeout(Duration::from_millis(timeout)).is_err() {
-    eprintln!("Command timeout. The proxy didn't send answer");
-    exit(1);
+    bail!("Command timeout. The proxy didn't send answer");
   }
 
-  timeout_thread.join().expect("upgrade_worker: Timeout thread should correctly terminate")
+  Ok(timeout_thread.join().expect("upgrade_worker: Timeout thread should correctly terminate"))
 }
 
-pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) {
+pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
+  -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
@@ -427,26 +424,23 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
 
   match channel.read_message() {
     None          => {
-      eprintln!("the proxy didn't answer");
-      exit(1);
+      bail!("the proxy didn't answer");
     },
     Some(message) => {
       if id != message.id {
-        eprintln!("received message with invalid id: {:?}", message);
-        exit(1);
+        bail!("received message with invalid id: {:?}", message);
       }
       match message.status {
         CommandStatus::Processing => {
-          eprintln!("should have obtained an answer immediately");
-          exit(1);
+          bail!("should have obtained an answer immediately");
         },
         CommandStatus::Error => {
           if json {
-            print_json_response(&message.message);
+            print_json_response(&message.message)?;
+            Ok(())
           } else {
-            eprintln!("could not get the worker list: {}", message.message);
+            bail!("could not get the worker list: {}", message.message);
           }
-          exit(1);
         },
         CommandStatus::Ok => {
           //println!("Worker list:\n{:?}", message.data);
@@ -549,7 +543,7 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
                   status: h2.get(&worker.id).unwrap_or(&placeholder)
                 }
               }).collect();
-              print_json_response(&workers_status);
+              print_json_response(&workers_status)?;
             } else {
               let mut table = Table::new();
 
@@ -562,13 +556,15 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
               table.printstd();
             }
           }
+          Ok(())
         }
       }
     }
   }
 }
 
-pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) {
+pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
+  -> Result<(), anyhow::Error> {
   let id = generate_id();
   //println!("will send message for metrics with id {}", id);
   channel.write_message(&CommandRequest::new(
@@ -581,8 +577,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   loop {
     match channel.read_message() {
       None          => {
-        eprintln!("the proxy didn't answer");
-        exit(1);
+        bail!("the proxy didn't answer");
       },
       Some(message) => {
         match message.status {
@@ -591,10 +586,9 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
           },
           CommandStatus::Error => {
             if json {
-              print_json_response(&message.message);
+              print_json_response(&message.message)?;
             } else {
-              eprintln!("could not stop the proxy: {}", message.message);
-              exit(1);
+              bail!("could not stop the proxy: {}", message.message);
             }
           },
           CommandStatus::Ok => {
@@ -603,8 +597,8 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
 
               if let Some(CommandResponseData::Metrics(data)) = message.data {
                 if json {
-                  print_json_response(&data);
-                  return;
+                  print_json_response(&data)?;
+                  return Ok(());
                 }
 
                 let mut main_table = Table::new();
@@ -961,9 +955,11 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
       }
     }
   }
+  Ok(())
 }
 
-pub fn reload_configuration(mut channel: Channel<CommandRequest,CommandResponse>, path: Option<String>, json: bool) {
+pub fn reload_configuration(mut channel: Channel<CommandRequest,CommandResponse>, path: Option<String>, json: bool) 
+  -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
@@ -973,40 +969,37 @@ pub fn reload_configuration(mut channel: Channel<CommandRequest,CommandResponse>
 
   match channel.read_message() {
     None          => {
-      eprintln!("the proxy didn't answer");
-      exit(1);
+      bail!("the proxy didn't answer");
     },
     Some(message) => {
       if id != message.id {
-        eprintln!("received message with invalid id: {:?}", message);
-        exit(1);
+        bail!("received message with invalid id: {:?}", message);
       }
       match message.status {
         CommandStatus::Processing => {
-          eprintln!("should have obtained an answer immediately");
-          exit(1);
+          bail!("should have obtained an answer immediately");
         },
         CommandStatus::Error => {
           if json {
-            print_json_response(&message.message);
+            print_json_response(&message.message)
           } else {
-            eprintln!("could not get the worker list: {}", message.message);
+            bail!("could not get the worker list: {}", message.message);
           }
-          exit(1);
         },
         CommandStatus::Ok => {
           if json {
-            print_json_response(&message.message);
+            print_json_response(&message.message)?;
           } else {
             println!("Reloaded configuration: {}", message.message);
           }
+          Ok(())
         }
       }
     }
   }
 }
 
-pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing: LoadBalancingAlgorithms) {
+pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing: LoadBalancingAlgorithms) -> Result<(), anyhow::Error> {
   let proxy_protocol = match (send_proxy, expect_proxy) {
     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
     (true, false) => Some(ProxyProtocolConfig::SendHeader),
@@ -1022,54 +1015,57 @@ pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout
     load_balancing,
     load_metric: None,
     answer_503: None,
-  }));
+  }))
 }
 
-pub fn remove_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str) {
-  order_command(channel, timeout, ProxyRequestData::RemoveApplication(String::from(app_id)));
+pub fn remove_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str) -> Result<(), anyhow::Error> {
+  order_command(channel, timeout, ProxyRequestData::RemoveApplication(String::from(app_id)))
 }
 
 pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  address: SocketAddr, hostname: &str, path_begin: &str, https: bool) {
+  address: SocketAddr, hostname: &str, path_begin: &str, https: bool) 
+  -> Result<(), anyhow::Error> {
   if https {
     order_command(channel, timeout, ProxyRequestData::AddHttpsFront(HttpFront {
       app_id: String::from(app_id),
       address,
       hostname: String::from(hostname),
       path_begin: String::from(path_begin),
-    }));
+    }))
   } else {
     order_command(channel, timeout, ProxyRequestData::AddHttpFront(HttpFront {
       app_id: String::from(app_id),
       address,
       hostname: String::from(hostname),
       path_begin: String::from(path_begin),
-    }));
+    }))
   }
 }
 
 pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  address: SocketAddr, hostname: &str, path_begin: &str, https: bool) {
+  address: SocketAddr, hostname: &str, path_begin: &str, https: bool) 
+  -> Result<(), anyhow::Error> {
   if https {
     order_command(channel, timeout, ProxyRequestData::RemoveHttpsFront(HttpFront {
       app_id: String::from(app_id),
       address,
       hostname: String::from(hostname),
       path_begin: String::from(path_begin),
-    }));
+    }))
   } else {
     order_command(channel, timeout, ProxyRequestData::RemoveHttpFront(HttpFront {
       app_id: String::from(app_id),
       address,
       hostname: String::from(hostname),
       path_begin: String::from(path_begin),
-    }));
+    }))
   }
 }
 
 
 pub fn add_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  backend_id: &str, address: SocketAddr, sticky_id: Option<String>, backup: Option<bool>) {
+  backend_id: &str, address: SocketAddr, sticky_id: Option<String>, backup: Option<bool>) 
+  -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::AddBackend(Backend {
       app_id: String::from(app_id),
       address: address,
@@ -1077,20 +1073,22 @@ pub fn add_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u6
       load_balancing_parameters: Some(LoadBalancingParams::default()),
       sticky_id: sticky_id,
       backup:    backup
-    }));
+    }))
 }
 
 pub fn remove_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  backend_id: &str, address: SocketAddr) {
+  backend_id: &str, address: SocketAddr) 
+  -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::RemoveBackend(RemoveBackend {
     app_id: String::from(app_id),
     address: address,
     backend_id: String::from(backend_id),
-  }));
+  }))
 }
 
 pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
-  certificate_path: &str, certificate_chain_path: &str, key_path: &str, versions: Vec<TlsVersion>) {
+  certificate_path: &str, certificate_chain_path: &str, key_path: &str, versions: Vec<TlsVersion>) 
+  -> Result<(), anyhow::Error> {
   if let Some(new_certificate) = load_full_certificate(certificate_path,
                                                        certificate_chain_path,
                                                        key_path, versions) {
@@ -1098,52 +1096,51 @@ pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout
       front: address,
       certificate: new_certificate,
       names: Vec::new(),
-    }));
+    }))?;
   }
+  Ok(())
 }
 
 pub fn remove_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
-  certificate_path: Option<&str>, fingerprint: Option<&str>) {
+  certificate_path: Option<&str>, fingerprint: Option<&str>) 
+  -> Result<(), anyhow::Error> {
   if certificate_path.is_some() && fingerprint.is_some() {
-    eprintln!("Error: Either provide the certificate's path or its fingerprint");
-    exit(1);
+    bail!("Error: Either provide the certificate's path or its fingerprint");
   }
 
   if certificate_path.is_none() && fingerprint.is_none() {
-    eprintln!("Error: Either provide the certificate's path or its fingerprint");
-    exit(1);
+    bail!("Error: Either provide the certificate's path or its fingerprint");
   }
 
-    if let Some(fingerprint) = fingerprint.and_then(|s| {
-        match hex::decode(s) {
-            Ok(v) => Some(CertFingerprint(v)),
-            Err(e) => {
-                eprintln!("Error decoding the certificate fingerprint (expected hexadecimal data): {:?}", e);
-                None
-            }
-        }
-    }).or(certificate_path.and_then(get_certificate_fingerprint)) {
+  if let Some(fingerprint) = fingerprint.and_then(|s| {
+      match hex::decode(s) {
+          Ok(v) => Some(CertFingerprint(v)),
+          Err(e) => {
+              eprintln!("Error decoding the certificate fingerprint (expected hexadecimal data): {:?}", e);
+              None
+          }
+      }
+  }).or(certificate_path.and_then(get_certificate_fingerprint)) {
     order_command(channel, timeout, ProxyRequestData::RemoveCertificate(RemoveCertificate {
       front: address,
       fingerprint: fingerprint,
       names: Vec::new(),
-    }));
+    }))?
   }
+  Ok(())
 }
 
 pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
   new_certificate_path: &str, new_certificate_chain_path: &str, new_key_path: &str,
   old_certificate_path: Option<&str>, old_fingerprint: Option<&str>,
-  versions: Vec<TlsVersion>)
+  versions: Vec<TlsVersion>) -> Result<(), anyhow::Error>
 {
   if old_certificate_path.is_some() && old_fingerprint.is_some() {
-    eprintln!("Error: Either provide the old certificate's path or its fingerprint");
-    exit(1);
+    bail!("Error: Either provide the old certificate's path or its fingerprint");
   }
 
   if old_certificate_path.is_none() && old_fingerprint.is_none() {
-    eprintln!("Error: Either provide the old certificate's path or its fingerprint");
-    exit(1);
+    bail!("Error: Either provide the old certificate's path or its fingerprint");
   }
 
   if let Some(new_certificate) = load_full_certificate(new_certificate_path,
@@ -1164,29 +1161,31 @@ pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, tim
         old_fingerprint,
         new_names: Vec::new(),
         old_names: Vec::new()
-      }));
+      }))?;
     }
   }
+  Ok(())
 }
 
 pub fn add_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  address: SocketAddr) {
+  address: SocketAddr) -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::AddTcpFront(TcpFront {
     app_id: String::from(app_id),
     address,
-  }));
+  }))
 }
 
 pub fn remove_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  address: SocketAddr) {
+  address: SocketAddr) -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::RemoveTcpFront(TcpFront {
     app_id: String::from(app_id),
     address,
-  }));
+  }))
 }
 
 pub fn add_http_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, public_address: Option<SocketAddr>,
-  answer_404: Option<String>, answer_503: Option<String>, expect_proxy: bool, sticky_name: Option<String>) {
+  answer_404: Option<String>, answer_503: Option<String>, expect_proxy: bool, sticky_name: Option<String>) 
+  -> Result<(), anyhow::Error> {
   let mut listener = Listener::new(address, FileListenerProtocolConfig::Http);
   listener.public_address = public_address;
   listener.answer_404 = answer_404;
@@ -1198,13 +1197,14 @@ pub fn add_http_listener(channel: Channel<CommandRequest,CommandResponse>, timeo
 
   match listener.to_http(None, None, None) {
     Some(conf) => order_command(channel, timeout, ProxyRequestData::AddHttpListener(conf)),
-    None => eprintln!("Error creating HTTP listener")
-  };
+    None => bail!("Error creating HTTP listener")
+  }
 }
 
 pub fn add_https_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, public_address: Option<SocketAddr>,
   answer_404: Option<String>, answer_503: Option<String>, tls_versions: Vec<TlsVersion>, cipher_list: Option<String>,
-  rustls_cipher_list: Vec<String>, expect_proxy: bool, sticky_name: Option<String>) {
+  rustls_cipher_list: Vec<String>, expect_proxy: bool, sticky_name: Option<String>) 
+  -> Result<(), anyhow::Error> {
   let mut listener = Listener::new(address, FileListenerProtocolConfig::Https);
   listener.public_address = public_address;
   listener.answer_404 = answer_404;
@@ -1219,12 +1219,13 @@ pub fn add_https_listener(channel: Channel<CommandRequest,CommandResponse>, time
 
   match listener.to_tls(None, None, None) {
     Some(conf) => order_command(channel, timeout, ProxyRequestData::AddHttpsListener(conf)),
-    None => eprintln!("Error creating HTTPS listener")
-  };
+    None => bail!("Error creating HTTPS listener")
+  }
 }
 
 pub fn add_tcp_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
-  public_address: Option<SocketAddr>, expect_proxy: bool) {
+  public_address: Option<SocketAddr>, expect_proxy: bool) 
+  -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::AddTcpListener(TcpListener {
     front: address,
     public_address,
@@ -1232,33 +1233,37 @@ pub fn add_tcp_listener(channel: Channel<CommandRequest,CommandResponse>, timeou
     front_timeout: 60,
     back_timeout: 30,
     connect_timeout: 3,
-  }));
+  }))
 }
 
-pub fn remove_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType) {
+pub fn remove_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType) 
+  -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::RemoveListener(RemoveListener {
     front: address,
     proxy
-  }));
+  }))
 }
 
-pub fn activate_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType) {
+pub fn activate_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType) 
+-> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::ActivateListener(ActivateListener {
     front: address,
     proxy,
     from_scm: false
-  }));
+  }))
 }
 
-pub fn deactivate_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType) {
+pub fn deactivate_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType) 
+  -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::DeactivateListener(DeactivateListener {
     front: address,
     proxy,
     to_scm: false
-  }));
+  }))
 }
 
-pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, application_id: Option<String>, domain: Option<String>) {
+pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, application_id: Option<String>, domain: Option<String>) 
+  -> Result<(), anyhow::Error> {
   if application_id.is_some() && domain.is_some() {
     eprintln!("Error: Either request an application ID or a domain name");
     exit(1);
@@ -1275,7 +1280,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
     }
 
     let query_domain = QueryApplicationDomain {
-      hostname: splitted.get(0).expect("Domain can't be empty").clone(),
+      hostname: splitted.get(0).context("Domain can't be empty")?.clone(),
       path_begin: splitted.get(1).cloned().map(|path| format!("/{}", path)) // We add the / again because of the splitn removing it
     };
 
@@ -1306,10 +1311,11 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
           // do nothing here
           // for other messages, we would loop over read_message
           // until an error or ok message was sent
+          Ok(())
         },
         CommandStatus::Error => {
           if json {
-            print_json_response(&message.message);
+            print_json_response(&message.message)?;
           } else {
             eprintln!("could not query proxy state: {}", message.message);
           }
@@ -1319,8 +1325,8 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
           if let Some(needle) = application_id.or(domain) {
             if let Some(CommandResponseData::Query(data)) = message.data {
               if json {
-                print_json_response(&data);
-                return;
+                print_json_response(&data)?;
+                return Ok(());
               }
 
               let application_headers = vec!["id", "sticky_session", "https_redirect"];
@@ -1481,6 +1487,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
 
               backend_table.printstd();
             }
+            Ok(())
           } else {
             if let Some(CommandResponseData::Query(data)) = message.data {
               let mut table = Table::new();
@@ -1527,6 +1534,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
 
               table.printstd();
             }
+            Ok(())
           }
         }
       }
@@ -1534,7 +1542,8 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
   }
 }
 
-pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, fingerprint: Option<String>, domain: Option<String>) {
+pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, fingerprint: Option<String>, domain: Option<String>) 
+  -> Result<(), anyhow::Error> {
 
   let query = match (fingerprint, domain) {
     (None, None) => QueryCertificateType::All,
@@ -1570,28 +1579,28 @@ pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, j
     },
     Some(message) => {
       if id != message.id {
-        eprintln!("received message with invalid id: {:?}", message);
-        exit(1);
+        bail!("received message with invalid id: {:?}", message);
       }
       match message.status {
         CommandStatus::Processing => {
           // do nothing here
           // for other messages, we would loop over read_message
           // until an error or ok message was sent
+          Ok(())
         },
         CommandStatus::Error => {
           if json {
-            print_json_response(&message.message);
+            print_json_response(&message.message)?;
+            bail!("We received an error message");
           } else {
-            eprintln!("could not query proxy state: {}", message.message);
+            bail!("could not query proxy state: {}", message.message);
           }
-          exit(1);
         },
         CommandStatus::Ok => {
             if let Some(CommandResponseData::Query(data)) = message.data {
               if json {
-                print_json_response(&data);
-                return;
+                print_json_response(&data)?;
+                return Ok(());
               }
 
               //println!("received: {:?}", data);
@@ -1642,11 +1651,10 @@ pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, j
                 }
                 println!("");
               }
+              Ok(())
 
             } else {
-              eprintln!("unexpected response: {:?}", message.data);
-              exit(1);
-
+              bail!("unexpected response: {:?}", message.data);
             }
         }
       }
@@ -1654,11 +1662,12 @@ pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, j
   }
 }
 
-pub fn logging_filter(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, filter: &str) {
-  order_command(channel, timeout, ProxyRequestData::Logging(String::from(filter)));
+pub fn logging_filter(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, filter: &str) 
+  -> Result<(), anyhow::Error> {
+  order_command(channel, timeout, ProxyRequestData::Logging(String::from(filter)))
 }
 
-pub fn events(mut channel: Channel<CommandRequest,CommandResponse>) {
+pub fn events(mut channel: Channel<CommandRequest,CommandResponse>) -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
@@ -1669,8 +1678,7 @@ pub fn events(mut channel: Channel<CommandRequest,CommandResponse>) {
   loop {
     match channel.read_message() {
       None          => {
-        eprintln!("the proxy didn't answer");
-        exit(1);
+        bail!("the proxy didn't answer");
       },
       Some(message) => {
         match message.status {
@@ -1680,12 +1688,11 @@ pub fn events(mut channel: Channel<CommandRequest,CommandResponse>) {
             }
           },
           CommandStatus::Error => {
-            eprintln!("could not get proxy events: {}", message.message);
-            exit(1);
+            bail!("could not get proxy events: {}", message.message);
           },
           CommandStatus::Ok => {
             println!("{}", message.message);
-            return;
+            return Ok(());
           }
         }
       }
@@ -1693,7 +1700,8 @@ pub fn events(mut channel: Channel<CommandRequest,CommandResponse>) {
   }
 }
 
-fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, order: ProxyRequestData) {
+fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, order: ProxyRequestData) 
+-> Result<(), anyhow::Error>  {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
@@ -1704,25 +1712,22 @@ fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: 
   command_timeout!(timeout, {
     match channel.read_message() {
       None          => {
-        eprintln!("the proxy didn't answer");
-        exit(1);
+        bail!("the proxy didn't answer");
       },
       Some(message) => {
         if id != message.id {
-          eprintln!("received message with invalid id: {:?}", message);
-          exit(1);
+          bail!("received message with invalid id: {:?}", message);
         }
         match message.status {
           CommandStatus::Processing => {
             // do nothing here
             // for other messages, we would loop over read_message
             // until an error or ok message was sent
+            Ok::<(), anyhow::Error>(())
           },
-          CommandStatus::Error => {
-            eprintln!("could not execute order: {}", message.message);
-            exit(1);
-          },
+          CommandStatus::Error => bail!("could not execute order: {}", message.message),
           CommandStatus::Ok => {
+            Ok(())
             //deactivate success messages for now
             /*
             match order {
@@ -1740,20 +1745,16 @@ fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: 
             }
             */
           }
-        }
+        }?;
       }
     }
   });
+  Ok(())
 }
 
-fn print_json_response<T: ::serde::Serialize>(input: &T) {
-  match serde_json::to_string_pretty(&input) {
-    Ok(to_print) => println!("{}", to_print),
-    Err(e) => {
-      eprintln!("Error while parsing response to JSON: {:?}", e);
-      exit(1);
-    }
-  };
+fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), anyhow::Error> {
+  println!("{}", serde_json::to_string_pretty(&input).context("Error while parsing response to JSON")?);
+  Ok(())
 }
 
 fn load_full_certificate(certificate_path: &str, certificate_chain_path: &str,

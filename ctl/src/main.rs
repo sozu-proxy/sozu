@@ -7,12 +7,14 @@ extern crate serde;
 extern crate serde_json;
 #[macro_use] extern crate serde_derive;
 extern crate hex;
+extern crate anyhow;
 
 mod command;
 mod cli;
 
 use std::io;
 use structopt::StructOpt;
+// use anyhow;
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
@@ -29,7 +31,7 @@ use command::{add_application,remove_application,dump_state,load_state,
 
 use cli::*;
 
-fn main() {
+fn main() -> Result<(), anyhow::Error> {
   let matches = App::from_args();
 
   let config_file = matches.config.or(option_env!("SOZU_CONFIG").map(|s| s.to_string())).expect("missing --config <configuration file> option");
@@ -48,13 +50,13 @@ fn main() {
   match matches.cmd {
     SubCmd::Shutdown{ hard, worker} => {
       if hard {
-        hard_stop(channel, worker, timeout);
+        hard_stop(channel, worker, timeout)
       } else {
-        soft_stop(channel, worker);
+        soft_stop(channel, worker)
       }
     },
     SubCmd::Upgrade { worker: None } => upgrade_main(channel, &config),
-    SubCmd::Upgrade { worker: Some(id) } => { upgrade_worker(channel, timeout, id); },
+    SubCmd::Upgrade { worker: Some(id) } => { upgrade_worker(channel, timeout, id)?; Ok(()) },
     SubCmd::Status{ json } => status(channel, json),
     SubCmd::Metrics{ json } => metrics(channel, json),
     SubCmd::Logging{ level } => logging_filter(channel, timeout, &level),
@@ -152,7 +154,7 @@ fn main() {
         QueryCmd::Certificates{ fingerprint, domain } => query_certificate(channel, json, fingerprint, domain),
       }
     },
-    SubCmd::Config{ cmd: _ } => {}, // noop, handled at the beginning of the method
+    SubCmd::Config{ cmd: _ } => Ok(()), // noop, handled at the beginning of the method
     SubCmd::Events => events(channel),
   }
 }
