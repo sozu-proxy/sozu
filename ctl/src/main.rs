@@ -14,7 +14,6 @@ mod cli;
 
 use std::io;
 use structopt::StructOpt;
-// use anyhow;
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
@@ -56,7 +55,10 @@ fn main() -> Result<(), anyhow::Error> {
       }
     },
     SubCmd::Upgrade { worker: None } => upgrade_main(channel, &config),
-    SubCmd::Upgrade { worker: Some(id) } => { upgrade_worker(channel, timeout, id)?; Ok(()) },
+    SubCmd::Upgrade { worker: Some(id) } => {
+      upgrade_worker(channel, timeout, id)?;
+      Ok(())
+    },
     SubCmd::Status{ json } => status(channel, json),
     SubCmd::Metrics{ json } => metrics(channel, json),
     SubCmd::Logging{ level } => logging_filter(channel, timeout, &level),

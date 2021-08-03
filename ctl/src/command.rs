@@ -168,10 +168,8 @@ pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
           CommandStatus::Error => {
             if json {
               print_json_response(&message.message)?;
-              return Ok(());
-            } else {
-              bail!("could not dump proxy state: {}", message.message);
             }
+            bail!("could not dump proxy state: {}", message.message);
           },
           CommandStatus::Ok => {
             if let Some(CommandResponseData::State(state)) = message.data {
@@ -338,7 +336,7 @@ pub fn upgrade_main(mut channel: Channel<CommandRequest,CommandResponse>,
 
             // Reconnect to the new main
             println!("Reconnecting to new main process...");
-            let mut channel = create_channel(&config).context("could not reconnect to the command unix socket")?;
+            let mut channel = create_channel(&config).with_context(|| "could not reconnect to the command unix socket")?;
 
             // Do a rolling restart of the workers
             let running_workers = workers.iter()
@@ -437,10 +435,8 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
         CommandStatus::Error => {
           if json {
             print_json_response(&message.message)?;
-            Ok(())
-          } else {
-            bail!("could not get the worker list: {}", message.message);
           }
+          bail!("could not get the worker list: {}", message.message);
         },
         CommandStatus::Ok => {
           //println!("Worker list:\n{:?}", message.data);
@@ -587,9 +583,8 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
           CommandStatus::Error => {
             if json {
               print_json_response(&message.message)?;
-            } else {
-              bail!("could not stop the proxy: {}", message.message);
             }
+            bail!("could not stop the proxy: {}", message.message);
           },
           CommandStatus::Ok => {
             if &id == &message.id {
@@ -981,10 +976,9 @@ pub fn reload_configuration(mut channel: Channel<CommandRequest,CommandResponse>
         },
         CommandStatus::Error => {
           if json {
-            print_json_response(&message.message)
-          } else {
-            bail!("could not get the worker list: {}", message.message);
+            print_json_response(&message.message)?;
           }
+          bail!("could not get the worker list: {}", message.message);
         },
         CommandStatus::Ok => {
           if json {
@@ -1316,17 +1310,14 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
         CommandStatus::Error => {
           if json {
             print_json_response(&message.message)?;
-          } else {
-            eprintln!("could not query proxy state: {}", message.message);
           }
-          exit(1);
+          bail!("could not query proxy state: {}", message.message);
         },
         CommandStatus::Ok => {
           if let Some(needle) = application_id.or(domain) {
             if let Some(CommandResponseData::Query(data)) = message.data {
               if json {
-                print_json_response(&data)?;
-                return Ok(());
+                return Ok(print_json_response(&data)?);
               }
 
               let application_headers = vec!["id", "sticky_session", "https_redirect"];
