@@ -349,7 +349,7 @@ impl CommandServer {
             .expect("there should be a worker at that token");
         let res = kill(Pid::from_raw(worker.pid), None);
 
-        if let Ok(()) = res {
+        if res.is_ok() {
             if worker.run_state == RunState::Running {
                 error!(
                     "worker process {} (PID = {}) not answering, killing and replacing",
@@ -357,8 +357,6 @@ impl CommandServer {
                 );
                 if let Err(e) = kill(Pid::from_raw(worker.pid), Signal::SIGKILL) {
                     error!("failed to kill the worker process: {:?}", e);
-                } else {
-                    worker.run_state = RunState::Stopped;
                 }
             } else {
                 return;
@@ -382,7 +380,7 @@ impl CommandServer {
             }
         }
 
-        worker.run_state = RunState::Stopped;
+        worker.run_state = RunState::Stopping;
 
         if self.config.worker_automatic_restart {
             incr!("worker_restart");
