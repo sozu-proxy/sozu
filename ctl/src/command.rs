@@ -404,7 +404,11 @@ pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, time
     bail!("Command timeout. The proxy didn't send answer");
   }
 
-  Ok(timeout_thread.join().expect("upgrade_worker: Timeout thread should correctly terminate"))
+  timeout_thread.join().map_err(|error| {
+    anyhow::Error::msg(
+      format!("upgrade worker: thread timeout exceeded on join, {:?}", error)
+    )
+  })
 }
 
 pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
@@ -1270,7 +1274,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
     }
 
     let query_domain = QueryApplicationDomain {
-      hostname: splitted.get(0).context("Domain can't be empty")?.clone(),
+      hostname: splitted.get(0).with_context(|| "Domain can't be empty")?.clone(),
       path_begin: splitted.get(1).cloned().map(|path| format!("/{}", path)) // We add the / again because of the splitn removing it
     };
 
