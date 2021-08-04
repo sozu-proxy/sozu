@@ -58,7 +58,7 @@ macro_rules! command_timeout {
       });
 
       if recv.recv_timeout(Duration::from_millis($duration)).is_err() {
-        bail!("Command timeout. The proxy didn't send an answer");
+        eprintln!("Command timeout. The proxy didn't send an answer");
       }
     }
   )
@@ -76,13 +76,11 @@ pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   command_timeout!(timeout, {
     match channel.read_message() {
       None          => {
-        eprintln!("the proxy didn't answer");
-        exit(1);
+        bail!("the proxy didn't answer");
       },
       Some(message) => {
         if id != message.id {
-          eprintln!("received message with invalid id: {:?}", message);
-          exit(1);
+          bail!("received message with invalid id: {:?}", message);
         }
         match message.status {
           CommandStatus::Processing => {
@@ -91,8 +89,7 @@ pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
             // until an error or ok message was sent
           },
           CommandStatus::Error => {
-            eprintln!("could not save proxy state: {}", message.message);
-            exit(1);
+            bail!("could not save proxy state: {}", message.message);
           },
           CommandStatus::Ok => {
             println!("{}", message.message);
@@ -179,9 +176,8 @@ pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
                 println!("{:#?}", state);
               }
               return Ok(());
-            } else {
-              bail!("state dump was empty");
             }
+            bail!("state dump was empty");
           }
         }
       }
