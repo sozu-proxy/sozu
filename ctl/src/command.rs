@@ -88,9 +88,7 @@ pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
             // for other messages, we would loop over read_message
             // until an error or ok message was sent
           },
-          CommandStatus::Error => {
-            bail!("could not save proxy state: {}", message.message);
-          },
+          CommandStatus::Error => bail!("could not save proxy state: {}", message.message),
           CommandStatus::Ok => {
             println!("{}", message.message);
           }
@@ -124,14 +122,12 @@ pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
             // do nothing here
             // for other messages, we would loop over read_message
             // until an error or ok message was sent
-            Ok::<(), anyhow::Error>(())
           },
           CommandStatus::Error => bail!("could not load proxy state: {}", message.message),
           CommandStatus::Ok => {
             println!("Proxy state loaded successfully from {}", path);
-            Ok(())
           }
-        }?;
+        }
       }
     }
   });
@@ -373,19 +369,11 @@ pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, time
   let timeout_thread = thread::spawn(move || {
     loop {
       match channel.read_message() {
-        None          => {
-          eprintln!("the proxy didn't answer");
-          exit(1);
-        },
+        None          => bail!("the proxy didn't answer"),
         Some(message) => {
           match message.status {
-            CommandStatus::Processing => {
-              eprintln!("Worker {} is processing: {}", worker_id, message.message);
-            },
-            CommandStatus::Error => {
-              eprintln!("could not stop the worker {}: {}", worker_id, message.message);
-              exit(1);
-            },
+            CommandStatus::Processing => bail!("Worker {} is processing: {}", worker_id, message.message),
+            CommandStatus::Error => bail!("could not stop the worker {}: {}", worker_id, message.message),
             CommandStatus::Ok => {
               if &id == &message.id {
                 println!("Worker {} shut down: {}", worker_id, message.message);
@@ -396,8 +384,8 @@ pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, time
         }
       }
     }
-    send.send(()).unwrap();
-    channel
+    send.send(())?;
+    Ok(channel)
   });
 
   if timeout > 0 && recv.recv_timeout(Duration::from_millis(timeout)).is_err() {
@@ -408,7 +396,7 @@ pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, time
     anyhow::Error::msg(
       format!("upgrade worker: thread timeout exceeded on join, {:?}", error)
     )
-  })
+  })?
 }
 
 pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
@@ -1085,7 +1073,7 @@ pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout
   -> Result<(), anyhow::Error> {
   if let Some(new_certificate) = load_full_certificate(certificate_path,
                                                        certificate_chain_path,
-                                                       key_path, versions) {
+                                                       key_path, versions)? {
     order_command(channel, timeout, ProxyRequestData::AddCertificate(AddCertificate {
       front: address,
       certificate: new_certificate,
@@ -1139,7 +1127,7 @@ pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, tim
 
   if let Some(new_certificate) = load_full_certificate(new_certificate_path,
                                                        new_certificate_chain_path,
-                                                       new_key_path, versions) {
+                                                       new_key_path, versions)? {
     if let Some(old_fingerprint) = old_fingerprint.and_then(|s| {
         match hex::decode(s) {
             Ok(v) => Some(CertFingerprint(v)),
@@ -1259,8 +1247,7 @@ pub fn deactivate_listener(channel: Channel<CommandRequest,CommandResponse>, tim
 pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, application_id: Option<String>, domain: Option<String>) 
   -> Result<(), anyhow::Error> {
   if application_id.is_some() && domain.is_some() {
-    eprintln!("Error: Either request an application ID or a domain name");
-    exit(1);
+    bail!("Error: Either request an application ID or a domain name");
   }
 
   let command = if let Some(ref app_id) = application_id {
@@ -1269,8 +1256,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
     let splitted: Vec<String> = domain.splitn(2, "/").map(|elem| elem.to_string()).collect();
 
     if splitted.len() == 0 {
-      eprintln!("Domain can't be empty");
-      exit(1);
+      bail!("Domain can't be empty");
     }
 
     let query_domain = QueryApplicationDomain {
@@ -1292,13 +1278,11 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
 
   match channel.read_message() {
     None          => {
-      eprintln!("the proxy didn't answer");
-      exit(1);
+      bail!("the proxy didn't answer");
     },
     Some(message) => {
       if id != message.id {
-        eprintln!("received message with invalid id: {:?}", message);
-        exit(1);
+        bail!("received message with invalid id: {:?}", message);
       }
       match message.status {
         CommandStatus::Processing => {
@@ -1541,16 +1525,14 @@ pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, j
     (Some(f), None) => {
       match hex::decode(f) {
         Err(e) => {
-          eprintln!("invalid fingerprint: {:?}", e);
-          exit(1);
+          bail!("invalid fingerprint: {:?}", e);
         },
         Ok(f) => QueryCertificateType::Fingerprint(f),
       }
     },
     (None, Some(d)) => QueryCertificateType::Domain(d),
     (Some(_), Some(_)) => {
-      eprintln!("Error: Either request a fingerprint or a domain name");
-      exit(1);
+      bail!("Error: Either request a fingerprint or a domain name");
     }
   };
 
@@ -1565,8 +1547,7 @@ pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, j
 
   match channel.read_message() {
     None          => {
-      eprintln!("the proxy didn't answer");
-      exit(1);
+      bail!("the proxy didn't answer");
     },
     Some(message) => {
       if id != message.id {
@@ -1714,11 +1695,9 @@ fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: 
             // do nothing here
             // for other messages, we would loop over read_message
             // until an error or ok message was sent
-            Ok::<(), anyhow::Error>(())
           },
           CommandStatus::Error => bail!("could not execute order: {}", message.message),
           CommandStatus::Ok => {
-            Ok(())
             //deactivate success messages for now
             /*
             match order {
@@ -1736,7 +1715,7 @@ fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: 
             }
             */
           }
-        }?;
+        };
       }
     }
   });
@@ -1749,31 +1728,29 @@ fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), anyhow::E
 }
 
 fn load_full_certificate(certificate_path: &str, certificate_chain_path: &str,
-                         key_path: &str, versions: Vec<TlsVersion>) -> Option<CertificateAndKey> {
+                         key_path: &str, versions: Vec<TlsVersion>)
+    -> Result<Option<CertificateAndKey>, anyhow::Error> {
   match Config::load_file(certificate_path) {
     Err(e) => {
-      eprintln!("could not load certificate: {:?}", e);
-      exit(1);
+      bail!("could not load certificate: {:?}", e);
     },
     Ok(certificate) => {
       match Config::load_file(certificate_chain_path).map(split_certificate_chain) {
         Err(e) => {
-          eprintln!("could not load certificate chain: {:?}", e);
-          exit(1);
+          bail!("could not load certificate chain: {:?}", e);
         },
         Ok(certificate_chain) => {
           match Config::load_file(key_path) {
             Err(e) => {
-              eprintln!("could not load key: {:?}", e);
-              exit(1);
+              bail!("could not load key: {:?}", e);
             },
             Ok(key) => {
-              Some(CertificateAndKey {
+              Ok(Some(CertificateAndKey {
                 certificate,
                 certificate_chain,
                 key,
                 versions,
-              })
+              }))
             }
           }
         }
