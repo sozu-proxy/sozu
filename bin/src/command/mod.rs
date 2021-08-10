@@ -608,8 +608,10 @@ impl CommandServer {
                     if let Some(w) = self.workers.iter_mut().filter(|w| w.id == id).next() {
                         if self.config.worker_automatic_restart && w.run_state == RunState::Running
                         {
+                            // we should rename this for clarity
                             self.check_worker_status(id).await;
                         }
+                        // add some stuff to ensure the worker is down in other cases
                     }
                 }
                 CommandMessage::WorkerResponse { id, message } => {
