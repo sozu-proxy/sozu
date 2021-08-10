@@ -644,6 +644,7 @@ impl CommandServer {
             smol::spawn(async move {
                 while let Some(proxy_response) = rx.next().await {
                     match proxy_response.status {
+                        // this never comes actually
                         ProxyResponseStatus::Ok => {
                             info!("softstop OK");
                             if let Err(e) = command_tx
