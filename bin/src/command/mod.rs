@@ -342,6 +342,7 @@ impl CommandServer {
         gauge!("configuration.frontends", self.frontends_count);
     }
 
+    // what is this supposed to do anyway
     pub async fn check_worker_status(&mut self, worker_id: u32) {
         let ref mut worker = self
             .workers
@@ -350,6 +351,8 @@ impl CommandServer {
         let res = kill(Pid::from_raw(worker.pid), None);
 
         if res.is_ok() {
+            // this is redundant, the whole function is called only
+            // if run_state is Stopping
             if worker.run_state == RunState::Running {
                 error!(
                     "worker process {} (PID = {}) not answering, killing and replacing",
@@ -362,6 +365,8 @@ impl CommandServer {
                 return;
             }
         } else {
+            // this is redundant, the whole function is called only
+            // if run_state is Stopping
             if worker.run_state == RunState::Running {
                 error!(
                     "worker process {} (PID = {}) stopped running, replacing",
@@ -382,6 +387,8 @@ impl CommandServer {
 
         worker.run_state = RunState::Stopping;
 
+        // this is redundant, the whole function is called only when this config variable
+        // is set to true
         if self.config.worker_automatic_restart {
             incr!("worker_restart");
 
@@ -606,12 +613,22 @@ impl CommandServer {
                 CommandMessage::WorkerClose { id } => {
                     info!("removing worker {}", id);
                     if let Some(w) = self.workers.iter_mut().filter(|w| w.id == id).next() {
+                        // there is little chance the run state would be Running,
+                        // the upgrade_worker() method sends a WorkerClose only after setting
+                        // the run state to Stopping
                         if self.config.worker_automatic_restart && w.run_state == RunState::Running
                         {
                             // we should rename this for clarity
                             self.check_worker_status(id).await;
                         }
-                        // add some stuff to ensure the worker is down in other cases
+                        // we could add some stuff to ensure the worker is down in other cases
+                        // but mainly we SHOULD set the worker's run state to Stopped at some point
+                        // suggestion:
+                        // else {
+                        //     info!("Setting the worker to stopped");
+                        //     self.ensure_that_the_worker_pid_is_actually_dead(id);
+                        //     w.run_state = RunState::Stopped;
+                        // }
                     }
                 }
                 CommandMessage::WorkerResponse { id, message } => {
