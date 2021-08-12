@@ -342,123 +342,102 @@ impl CommandServer {
         gauge!("configuration.frontends", self.frontends_count);
     }
 
-    // what is this supposed to do anyway
-    pub async fn check_worker_status(&mut self, worker_id: u32) {
+    // in case a worker has crashed while Running and automatic_worker_restart is set to true
+    pub async fn restart_worker(&mut self, worker_id: u32) {
         let ref mut worker = self
             .workers
             .get_mut(worker_id as usize)
             .expect("there should be a worker at that token");
-        let res = kill(Pid::from_raw(worker.pid), None);
 
-        if res.is_ok() {
-            // this is redundant, the whole function is called only
-            // if run_state is Stopping
-            if worker.run_state == RunState::Running {
+        match kill(Pid::from_raw(worker.pid), None) {
+            Ok(_) => {
+                error!(
+                    "worker process {} (PID = {}) is alive but the worker must have crashed. Killing and replacing",
+                    worker.id, worker.pid
+                );
+            },
+            Err(_) => {
                 error!(
                     "worker process {} (PID = {}) not answering, killing and replacing",
                     worker.id, worker.pid
                 );
-                if let Err(e) = kill(Pid::from_raw(worker.pid), Signal::SIGKILL) {
-                    error!("failed to kill the worker process: {:?}", e);
-                }
-            } else {
-                return;
-            }
-        } else {
-            // this is redundant, the whole function is called only
-            // if run_state is Stopping
-            if worker.run_state == RunState::Running {
-                error!(
-                    "worker process {} (PID = {}) stopped running, replacing",
-                    worker.id, worker.pid
-                );
-            } else if worker.run_state == RunState::Stopping {
-                info!(
-                    "worker process {} (PID = {}) not detected, assuming it stopped",
-                    worker.id, worker.pid
-                );
-                worker.run_state = RunState::Stopped;
-                return;
-            } else {
-                error!("failed to check process status: {:?}", res);
-                return;
             }
         }
 
-        worker.run_state = RunState::Stopping;
+        kill(Pid::from_raw(worker.pid), Signal::SIGKILL)
+            .map_err(|e| error!("failed to kill the worker process: {:?}", e))
+            .unwrap();
 
-        // this is redundant, the whole function is called only when this config variable
-        // is set to true
-        if self.config.worker_automatic_restart {
-            incr!("worker_restart");
+        worker.run_state = RunState::Stopped;
 
-            let id = self.next_id;
-            let listeners = Some(Listeners {
-                http: Vec::new(),
-                tls: Vec::new(),
-                tcp: Vec::new(),
-            });
+        incr!("worker_restart");
 
-            if let Ok(mut worker) = start_worker(
-                id,
-                &self.config,
-                self.executable_path.clone(),
-                &self.state,
-                listeners,
-            ) {
-                info!("created new worker: {}", id);
-                self.next_id += 1;
+        let id = self.next_id;
+        let listeners = Some(Listeners {
+            http: Vec::new(),
+            tls: Vec::new(),
+            tcp: Vec::new(),
+        });
 
-                let sock = worker.channel.take().unwrap().sock;
-                let (worker_tx, worker_rx) = channel(10000);
-                worker.sender = Some(worker_tx);
+        if let Ok(mut worker) = start_worker(
+            id,
+            &self.config,
+            self.executable_path.clone(),
+            &self.state,
+            listeners,
+        ) {
+            info!("created new worker: {}", id);
+            self.next_id += 1;
 
-                let stream = Async::new(unsafe {
-                    let fd = sock.into_raw_fd();
-                    UnixStream::from_raw_fd(fd)
-                })
-                .unwrap();
+            let sock = worker.channel.take().unwrap().sock;
+            let (worker_tx, worker_rx) = channel(10000);
+            worker.sender = Some(worker_tx);
 
-                let id = worker.id;
-                let command_tx = self.command_tx.clone();
-                smol::spawn(async move {
-                    worker_loop(id, stream, command_tx, worker_rx)
-                        .await
-                        .unwrap();
-                })
-                .detach();
+            let stream = Async::new(unsafe {
+                let fd = sock.into_raw_fd();
+                UnixStream::from_raw_fd(fd)
+            })
+            .unwrap();
 
-                let mut count = 0usize;
-                let mut orders = self.state.generate_activate_orders();
-                for order in orders.drain(..) {
-                    if let Err(e) = worker
-                        .sender
-                        .as_mut()
-                        .unwrap()
-                        .send(ProxyRequest {
-                            id: format!("RESTART-{}-ACTIVATE-{}", id, count),
-                            order,
-                        })
-                        .await {
-                            error!("could not send activate order to worker {:?}: {:?}", worker.id, e);
-                        }
-                    count += 1;
-                }
+            let id = worker.id;
+            let command_tx = self.command_tx.clone();
+            smol::spawn(async move {
+                worker_loop(id, stream, command_tx, worker_rx)
+                    .await
+                    .unwrap();
+            })
+            .detach();
 
+            let mut count = 0usize;
+            let mut orders = self.state.generate_activate_orders();
+            for order in orders.drain(..) {
                 if let Err(e) = worker
                     .sender
                     .as_mut()
                     .unwrap()
                     .send(ProxyRequest {
-                        id: format!("RESTART-{}-STATUS", id),
-                        order: ProxyRequestData::Status,
+                        id: format!("RESTART-{}-ACTIVATE-{}", id, count),
+                        order,
                     })
-                .await{
-                    error!("could not send status message to worker {:?}: {:?}", worker.id, e);
-                }
-
-                self.workers.push(worker);
+                    .await {
+                        error!("could not send activate order to worker {:?}: {:?}", worker.id, e);
+                    }
+                count += 1;
             }
+
+            if let Err(e) = worker
+                .sender
+                .as_mut()
+                .unwrap()
+                .send(ProxyRequest {
+                    id: format!("RESTART-{}-STATUS", id),
+                    order: ProxyRequestData::Status,
+                })
+            .await{
+                error!("could not send status message to worker {:?}: {:?}", worker.id, e);
+            }
+
+            self.workers.push(worker);
         }
     }
 }
@@ -613,22 +592,25 @@ impl CommandServer {
                 CommandMessage::WorkerClose { id } => {
                     info!("removing worker {}", id);
                     if let Some(w) = self.workers.iter_mut().filter(|w| w.id == id).next() {
-                        // there is little chance the run state would be Running,
-                        // the upgrade_worker() method sends a WorkerClose only after setting
-                        // the run state to Stopping
-                        if self.config.worker_automatic_restart && w.run_state == RunState::Running
-                        {
-                            // we should rename this for clarity
-                            self.check_worker_status(id).await;
+                        // In case a worker crashes and should be restarted
+                        if self.config.worker_automatic_restart && w.run_state == RunState::Running {
+                            self.restart_worker(id).await;
+                            return;
                         }
-                        // we could add some stuff to ensure the worker is down in other cases
-                        // but mainly we SHOULD set the worker's run state to Stopped at some point
-                        // suggestion:
-                        // else {
-                        //     info!("Setting the worker to stopped");
-                        //     self.ensure_that_the_worker_pid_is_actually_dead(id);
-                        //     w.run_state = RunState::Stopped;
-                        // }
+
+                        info!("Closing the worker {}.", w.id);
+                        if !w.the_pid_is_alive() {
+                            info!("Worker {} is dead, setting to Stopped.", w.id);
+                            w.run_state = RunState::Stopped;
+                            return;
+                        }
+
+                        info!("Worker {} is not dead but should be. Let's kill it.", w.id);
+                        kill(Pid::from_raw(w.pid), Signal::SIGKILL)
+                            .map_err(|e| error!("failed to kill the worker process: {:?}", e))
+                            .unwrap();
+
+                        w.run_state = RunState::Stopped;
                     }
                 }
                 CommandMessage::WorkerResponse { id, message } => {

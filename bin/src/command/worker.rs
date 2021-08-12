@@ -3,6 +3,8 @@ use libc::pid_t;
 use std::collections::VecDeque;
 use std::fmt;
 use std::os::unix::io::AsRawFd;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 
 use sozu_command::channel::Channel;
 use sozu_command::command::RunState;
@@ -51,6 +53,14 @@ impl Worker {
             .await {
                 error!("error sending message to worker {:?}: {:?}", self.id, e);
             }
+        }
+    }
+
+    pub fn the_pid_is_alive(&self) -> bool {
+        // send a kill -0 to check on the pid, if it's dead it should be an error
+        match kill(Pid::from_raw(self.pid), None) {
+            Ok(_) => true,
+            Err(_) => false,
         }
     }
 
