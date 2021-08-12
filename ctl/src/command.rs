@@ -558,6 +558,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   ));
   //println!("message sent");
 
+  // we should add a timeout somehow, otherwise it hangs
   loop {
     match channel.read_message() {
       None          => {
