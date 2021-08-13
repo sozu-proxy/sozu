@@ -44,7 +44,8 @@ pub enum StartupError {
   #[allow(dead_code)]
   TooManyAllowedConnectionsForWorker(String),
   WorkersSpawnFail(nix::Error),
-  PIDFileNotWritable(String)
+  PIDFileNotWritable(String),
+  UnknownSubcommand,
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -83,6 +84,10 @@ fn main() -> Result<(), anyhow::Error> {
       },
       Err(StartupError::PIDFileNotWritable(err)) => {
         error!("{}", err);
+        bail!("exit");
+      },
+      Err(StartupError::UnknownSubcommand) => {
+        error!("Unknown subcommand");
         bail!("exit");
       }
     }
@@ -130,10 +135,13 @@ fn init_workers(config: &Config) -> Result<Vec<Worker>, StartupError> {
 }
 
 fn get_config_file_path<'a>(matches: &'a ArgMatches<'a>) -> Result<&'a str, StartupError> {
-  let start_matches = matches.subcommand_matches("start").expect("unknown subcommand");
-  match start_matches.value_of("config") {
-    Some(config_file) => Ok(config_file),
-    None => option_env!("SOZU_CONFIG").ok_or(StartupError::ConfigurationFileNotSpecified)
+  if let Some(start_matches) = matches.subcommand_matches("start") { //(|e| StartupError::UnknownedSubcommand(e));
+    match start_matches.value_of("config") {
+      Some(config_file) => Ok(config_file),
+      None => option_env!("SOZU_CONFIG").ok_or(StartupError::ConfigurationFileNotSpecified)
+    }
+  } else {
+    Err(StartupError::UnknownSubcommand)
   }
 }
 
