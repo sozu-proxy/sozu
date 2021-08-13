@@ -206,7 +206,7 @@ impl CommandServer {
                         }
                         futures::future::Either::Right((res, cancel_rx)) => {
                             accept_cancel_rx = Some(cancel_rx);
-                            res?
+                            res.unwrap()
                         }
                     };
                 debug!("Accepted a client from upgraded");
@@ -218,10 +218,10 @@ impl CommandServer {
                     id,
                     sender: client_tx,
                 })
-                .await?;
+                .await
+                .unwrap();
                 counter += 1;
             }
-            Ok::<(), anyhow::Error>(())
         })
         .detach();
 
@@ -247,8 +247,8 @@ impl CommandServer {
                 //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
                 smol::spawn(async move {
                     worker_loop(id, stream, command_tx, worker_rx)
-                        .await?;
-                    Ok::<(), anyhow::Error>(())
+                        .await
+                        .unwrap();
                 })
                 .detach();
 
@@ -507,7 +507,7 @@ pub fn start(
                         }
                         futures::future::Either::Right((res, cancel_rx)) => {
                             accept_cancel_rx = Some(cancel_rx);
-                            res?
+                            res.unwrap()
                         }
                     };
 
@@ -519,10 +519,10 @@ pub fn start(
                         id,
                         sender: client_tx,
                     })
-                    .await?;
+                    .await
+                    .unwrap();
                 counter += 1;
             }
-            Ok::<(), anyhow::Error>(())
         })
         .detach();
 

@@ -61,12 +61,15 @@ pub fn start_new_main_process(
 ) -> Result<(pid_t, Channel<(),bool>), anyhow::Error> {
   trace!("parent({})", unsafe { libc::getpid() });
 
-  let mut upgrade_file = tempfile().context("could not create temporary file for upgrade")?;
+  let mut upgrade_file = tempfile()
+    .with_context(|| "could not create temporary file for upgrade")?;
 
   util::disable_close_on_exec(upgrade_file.as_raw_fd())?;
 
-  serde_json::to_writer(&mut upgrade_file, &upgrade_data).context("could not write upgrade data to temporary file")?;
-  upgrade_file.seek(SeekFrom::Start(0)).context("could not seek to beginning of file")?;
+  serde_json::to_writer(&mut upgrade_file, &upgrade_data)
+    .with_context(|| "could not write upgrade data to temporary file")?;
+  
+  upgrade_file.seek(SeekFrom::Start(0)).with_context(|| "could not seek to beginning of file")?;
 
   let (server, client) = UnixStream::pair()?;
 
