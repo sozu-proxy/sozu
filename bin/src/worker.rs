@@ -93,9 +93,9 @@ pub fn begin_worker_process(
 
   let configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
   let config_state: ConfigState = serde_json::from_reader(configuration_state_file)
-    .context("could not parse configuration state data")?;
+    .with_context(|| "could not parse configuration state data")?;
 
-  let worker_config = command.read_message().context("worker could not read configuration from socket")?;
+  let worker_config = command.read_message().with_context(|| "worker could not read configuration from socket")?;
   //println!("got message: {:?}", worker_config);
 
   let worker_id = format!("{}-{:02}", "WRK", id);
@@ -132,11 +132,12 @@ pub fn start_worker_process(
 ) -> Result<(pid_t, Channel<ProxyRequest,ProxyResponse>, ScmSocket), anyhow::Error> {
   trace!("parent({})", unsafe { libc::getpid() });
 
-  let mut state_file = tempfile().context("could not create temporary file for configuration state")?;
+  let mut state_file = tempfile()
+    .with_context(|| "could not create temporary file for configuration state")?;
   util::disable_close_on_exec(state_file.as_raw_fd())?;
 
-  serde_json::to_writer(&mut state_file, state).context("could not write upgrade data to temporary file")?;
-  state_file.seek(SeekFrom::Start(0)).context("could not seek to beginning of file")?;
+  serde_json::to_writer(&mut state_file, state).with_context(|| "could not write upgrade data to temporary file")?;
+  state_file.seek(SeekFrom::Start(0)).with_context(|| "could not seek to beginning of file")?;
 
   let (server, client) = UnixStream::pair()?;
   let (scm_server_fd, scm_client) = UnixStream::pair()?;
@@ -203,7 +204,7 @@ pub fn start_worker_process(
 pub unsafe fn get_executable_path() -> Result<String, anyhow::Error> {
   use std::fs;
 
-  let path= fs::read_link("/proc/self/exe").context("/proc/self/exe doesn't exist")?;
+  let path= fs::read_link("/proc/self/exe").with_context(|| "/proc/self/exe doesn't exist")?;
   let mut path_str = match path.into_os_string().into_string() {
     Ok(s) => s,
     Err(_) => bail!("Failed to convert PathBuf to String"),

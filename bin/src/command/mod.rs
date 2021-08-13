@@ -451,7 +451,7 @@ pub fn start(
 ) -> anyhow::Result<()> {
     let addr = PathBuf::from(&command_socket_path);
     
-    fs::remove_file(&addr).context(format!("could not delete previous socket at {:?}", addr))?;
+    fs::remove_file(&addr).with_context(|| format!("could not delete previous socket at {:?}", addr))?;
 
     let srv = match UnixListener::bind(&addr) {
         Err(e) => {

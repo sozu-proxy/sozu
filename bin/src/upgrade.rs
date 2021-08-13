@@ -83,7 +83,7 @@ pub fn start_new_main_process(
   command.set_nonblocking(false);
 
   info!("launching new main");
-  match unsafe { fork().context("fork failed")? } {
+  match unsafe { fork().with_context(|| "fork failed")? } {
     ForkResult::Parent{ child } => {
       info!("main launched: {}", child);
       command.set_nonblocking(true);
@@ -125,7 +125,7 @@ pub fn begin_new_main_process(
   command.set_blocking(true);
 
   let upgrade_file = unsafe { File::from_raw_fd(upgrade_fd) };
-  let upgrade_data: UpgradeData = serde_json::from_reader(upgrade_file).context("could not parse upgrade data")?;
+  let upgrade_data: UpgradeData = serde_json::from_reader(upgrade_file).with_context(|| "could not parse upgrade data")?;
   let config = upgrade_data.config.clone();
 
   util::setup_logging(&config);

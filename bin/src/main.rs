@@ -44,6 +44,7 @@ pub enum StartupError {
   #[allow(dead_code)]
   TooManyAllowedConnectionsForWorker(String),
   WorkersSpawnFail(anyhow::Error),
+  SozuMainStartFail(anyhow::Error),
   PIDFileNotWritable(String),
   UnknownSubcommand,
 }
@@ -86,6 +87,10 @@ fn main() -> Result<(), anyhow::Error> {
         error!("{}", err);
         bail!("exit");
       },
+      Err(StartupError::SozuMainStartFail(err)) => {
+        error!("Failed to start Sōzu: {}", err);
+        bail!("exit");
+      }
       Err(StartupError::UnknownSubcommand) => {
         error!("Unknown subcommand");
         bail!("exit");
@@ -115,28 +120,23 @@ fn start(matches: &ArgMatches) -> Result<(), StartupError> {
 
   let command_socket_path = config.command_socket_path();
 
-  // this could be transformed into a new StartupError that contains std::io::Error
-  if let Err(e) = command::start(config, command_socket_path, workers) {
-      error!("could not start worker: {:?}", e);
-  }
+  command::start(config, command_socket_path, workers)
+    .map_err(|e| StartupError::SozuMainStartFail(e))?;
 
   Ok(())
 }
 
 fn init_workers(config: &Config) -> Result<Vec<Worker>, StartupError> {
   let path = unsafe {
-    match get_executable_path() {
-      Ok(p) => p,
-      Err(e) => return Err(StartupError::WorkersSpawnFail(e)),
-    }
+    get_executable_path()
+      .map_err(|e| StartupError::WorkersSpawnFail(e))?
   };
-  match start_workers(path, &config) {
-    Ok(workers) => {
-      info!("created workers: {:?}", workers);
-      Ok(workers)
-    },
-    Err(e) => Err(StartupError::WorkersSpawnFail(e))
-  }
+
+  let workers = start_workers(path, &config)
+    .map_err(|e| StartupError::WorkersSpawnFail(e))?;
+  
+  info!("created workers: {:?}", workers);
+  Ok(workers)
 }
 
 fn get_config_file_path<'a>(matches: &'a ArgMatches<'a>) -> Result<&'a str, StartupError> {
@@ -151,10 +151,9 @@ fn get_config_file_path<'a>(matches: &'a ArgMatches<'a>) -> Result<&'a str, Star
 }
 
 fn load_configuration(config_file: &str) -> Result<Config, StartupError> {
-  match Config::load_from_path(config_file) {
-    Ok(config) => Ok(config),
-    Err(e) => Err(StartupError::ConfigurationFileLoadError(e))
-  }
+  Config::load_from_path(config_file).map_err(
+    |e| StartupError::ConfigurationFileLoadError(e)
+  )
 }
 
 /// Set workers process affinity, see man sched_setaffinity

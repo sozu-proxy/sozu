@@ -11,7 +11,7 @@ use sozu::metrics;
 
 pub fn enable_close_on_exec(fd: RawFd) -> Result<i32, anyhow::Error> {
   let file_descriptor = fcntl(fd, FcntlArg::F_GETFD)
-    .context("could not get file descriptor flags")?;
+    .with_context(|| "could not get file descriptor flags")?;
 
   let mut new_flags = FdFlag::from_bits(file_descriptor).ok_or_else(
     || anyhow::format_err!("could not convert flags for file descriptor")
