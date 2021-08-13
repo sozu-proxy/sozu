@@ -1,4 +1,3 @@
-use anyhow::Error;
 use clap::{App,Arg,SubCommand,ArgMatches};
 use crate::worker::begin_worker_process;
 use crate::upgrade::begin_new_main_process;

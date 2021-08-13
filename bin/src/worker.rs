@@ -133,7 +133,7 @@ pub fn start_worker_process(
   trace!("parent({})", unsafe { libc::getpid() });
 
   let mut state_file = tempfile().context("could not create temporary file for configuration state")?;
-  util::disable_close_on_exec(state_file.as_raw_fd());
+  util::disable_close_on_exec(state_file.as_raw_fd())?;
 
   serde_json::to_writer(&mut state_file, state).context("could not write upgrade data to temporary file")?;
   state_file.seek(SeekFrom::Start(0)).context("could not seek to beginning of file")?;
@@ -143,8 +143,8 @@ pub fn start_worker_process(
 
   let scm_server = ScmSocket::new(scm_server_fd.into_raw_fd());
 
-  util::disable_close_on_exec(client.as_raw_fd());
-  util::disable_close_on_exec(scm_client.as_raw_fd());
+  util::disable_close_on_exec(client.as_raw_fd())?;
+  util::disable_close_on_exec(scm_client.as_raw_fd())?;
 
   let mut command: Channel<Config,ProxyResponse> = Channel::new(
     server,
@@ -167,7 +167,7 @@ pub fn start_worker_process(
         info!("sent listeners from main: {:?}", res);
         l.close();
       };
-      util::disable_close_on_exec(scm_server.fd);
+      util::disable_close_on_exec(scm_server.fd)?;
 
       let command: Channel<ProxyRequest,ProxyResponse> = command.into();
       Ok((child.into(), command, scm_server))

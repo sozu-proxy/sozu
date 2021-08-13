@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::Write;
 use libc;
 
-use anyhow;
+use anyhow::{bail, Context};
 use crate::logging;
 use sozu_command::config::Config;
 use sozu::metrics;
@@ -23,15 +23,17 @@ pub fn enable_close_on_exec(fd: RawFd) -> Option<i32> {
 // FD_CLOEXEC is set by default on every fd in Rust standard lib,
 // so we need to remove the flag on the client, otherwise
 // it won't be accessible
-pub fn disable_close_on_exec(fd: RawFd) -> Option<i32> {
-  fcntl(fd, FcntlArg::F_GETFD).map_err(|e| {
-    error!("could not get file descriptor flags: {:?}", e);
-  }).ok().and_then(FdFlag::from_bits).and_then(|mut new_flags| {
-    new_flags.remove(FdFlag::FD_CLOEXEC);
-    fcntl(fd, FcntlArg::F_SETFD(new_flags)).map_err(|e| {
-      error!("could not set file descriptor flags: {:?}", e);
-    }).ok()
-  })
+pub fn disable_close_on_exec(fd: RawFd) -> Result<i32, anyhow::Error> {
+  let file_descriptor = fcntl(fd, FcntlArg::F_GETFD).context("could not get file descriptor flags")?;
+  let mut new_flags = match FdFlag::from_bits(file_descriptor) {
+    Some(f) => f,
+    None => bail!("could not find flags for file descriptor"),
+  };
+
+  new_flags.remove(FdFlag::FD_CLOEXEC);
+
+  fcntl(fd, FcntlArg::F_SETFD(new_flags))
+    .context("could not set file descriptor flags")
 }
 
 pub fn setup_logging(config: &Config) {

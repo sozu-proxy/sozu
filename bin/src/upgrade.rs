@@ -63,14 +63,14 @@ pub fn start_new_main_process(
 
   let mut upgrade_file = tempfile().context("could not create temporary file for upgrade")?;
 
-  util::disable_close_on_exec(upgrade_file.as_raw_fd());
+  util::disable_close_on_exec(upgrade_file.as_raw_fd())?;
 
   serde_json::to_writer(&mut upgrade_file, &upgrade_data).context("could not write upgrade data to temporary file")?;
   upgrade_file.seek(SeekFrom::Start(0)).context("could not seek to beginning of file")?;
 
   let (server, client) = UnixStream::pair()?;
 
-  util::disable_close_on_exec(client.as_raw_fd());
+  util::disable_close_on_exec(client.as_raw_fd())?;
 
   let mut command: Channel<(),bool> = Channel::new(
     server,

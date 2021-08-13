@@ -8,7 +8,6 @@ use std::io::{self, Read, Write};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
-use anyhow::{Context, bail};
 
 use async_io::Async;
 
@@ -453,7 +452,7 @@ impl CommandServer {
         client_id: String,
         request_id: String
     ) -> Result<(), anyhow::Error> {
-        self.disable_cloexec_before_upgrade();
+        self.disable_cloexec_before_upgrade()?;
 
         if let Some(sender) = self.clients.get_mut(&client_id) {
             if let Err(e) = sender

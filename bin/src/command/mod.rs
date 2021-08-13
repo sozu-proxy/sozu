@@ -8,7 +8,6 @@ use nix::unistd::Pid;
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -291,14 +290,15 @@ impl CommandServer {
         })
     }
 
-    pub fn disable_cloexec_before_upgrade(&mut self) {
+    pub fn disable_cloexec_before_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                util::disable_close_on_exec(worker.fd);
+                util::disable_close_on_exec(worker.fd)?;
             }
         }
         trace!("disabling cloexec on listener: {}", self.fd);
-        util::disable_close_on_exec(self.fd);
+        util::disable_close_on_exec(self.fd)?;
+        Ok(())
     }
 
     pub fn enable_cloexec_after_upgrade(&mut self) {
