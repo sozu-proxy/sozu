@@ -130,7 +130,7 @@ pub fn begin_new_main_process(
   //info!("new main got upgrade data: {:?}", upgrade_data);
 
   let mut server = CommandServer::from_upgrade_data(upgrade_data)?;
-  server.enable_cloexec_after_upgrade();
+  server.enable_cloexec_after_upgrade()?;
   info!("starting new main loop");
   match util::write_pid_file(&config) {
     Ok(()) => {

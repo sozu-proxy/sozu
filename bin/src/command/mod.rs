@@ -301,13 +301,14 @@ impl CommandServer {
         Ok(())
     }
 
-    pub fn enable_cloexec_after_upgrade(&mut self) {
+    pub fn enable_cloexec_after_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                util::enable_close_on_exec(worker.fd);
+                util::enable_close_on_exec(worker.fd)?;
             }
         }
-        util::enable_close_on_exec(self.fd);
+        util::enable_close_on_exec(self.fd)?;
+        Ok(())
     }
 
     pub async fn load_static_application_configuration(&mut self) {
@@ -581,6 +582,7 @@ impl CommandServer {
                 }
                 CommandMessage::ClientRequest { id, message } => {
                     debug!("client {} sent {:?}", id, message);
+                    // todo: handle the result that comes from here:
                     self.handle_client_message(id, message).await;
                 }
                 CommandMessage::WorkerClose { id } => {
