@@ -43,7 +43,7 @@ pub enum StartupError {
   TooManyAllowedConnections(String),
   #[allow(dead_code)]
   TooManyAllowedConnectionsForWorker(String),
-  WorkersSpawnFail(nix::Error),
+  WorkersSpawnFail(anyhow::Error),
   PIDFileNotWritable(String),
   UnknownSubcommand,
 }

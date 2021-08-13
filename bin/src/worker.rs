@@ -42,7 +42,7 @@ use crate::util;
 use crate::logging;
 use crate::command::Worker;
 
-pub fn start_workers(executable_path: String, config: &Config) -> nix::Result<Vec<Worker>> {
+pub fn start_workers(executable_path: String, config: &Config) -> Result<Vec<Worker>, anyhow::Error> {
   let state = ConfigState::new();
   let mut workers = Vec::new();
   for index in 0..config.worker_count {
@@ -51,31 +51,29 @@ pub fn start_workers(executable_path: String, config: &Config) -> nix::Result<Ve
       tls:  Vec::new(),
       tcp:  Vec::new(),
     });
-    match start_worker_process(&index.to_string(), config, executable_path.clone(), &state, listeners) {
-      Ok((pid, command, scm)) => {
-        let mut w =  Worker::new(index as u32, pid, command, scm, config);
-        // the new worker expects a status message at startup
-        if let Some(channel) = w.channel.as_mut() {
-            channel.set_blocking(true);
-            channel.write_message(&ProxyRequest { id: format!("start-status-{}", index), order: ProxyRequestData::Status });
-            channel.set_nonblocking(true);
-        }
-        workers.push(w);
-      },
-      Err(e) => return Err(e)
-    };
+    let (pid, command, scm) = start_worker_process(&index.to_string(), config, executable_path.clone(), &state, listeners)?;
+    let mut w =  Worker::new(index as u32, pid, command, scm, config);
+    // the new worker expects a status message at startup
+    if let Some(channel) = w.channel.as_mut() {
+        channel.set_blocking(true);
+        channel.write_message(&ProxyRequest { id: format!("start-status-{}", index), order: ProxyRequestData::Status });
+        channel.set_nonblocking(true);
+    }
+    workers.push(w);
   }
   Ok(workers)
 }
 
-pub fn start_worker(id: u32, config: &Config, executable_path: String, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<Worker> {
-  match start_worker_process(&id.to_string(), config, executable_path, state, listeners) {
-    Ok((pid, command, scm)) => {
-      let w = Worker::new(id, pid, command, scm, config);
-      Ok(w)
-    },
-    Err(e) => Err(e)
-  }
+pub fn start_worker(
+  id: u32,
+  config: &Config,
+  executable_path: String,
+  state: &ConfigState,
+  listeners: Option<Listeners>
+) -> Result<Worker, anyhow::Error> {
+  let (pid, command, scm) = start_worker_process(&id.to_string(), config, executable_path, state, listeners)?;
+  
+  Ok(Worker::new(id, pid, command, scm, config))
 }
 
 pub fn begin_worker_process(
@@ -126,17 +124,23 @@ pub fn begin_worker_process(
   Ok(())
 }
 
-pub fn start_worker_process(id: &str, config: &Config, executable_path: String, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<(pid_t, Channel<ProxyRequest,ProxyResponse>, ScmSocket)> {
+pub fn start_worker_process(
+  id: &str,
+  config: &Config,
+  executable_path: String,
+  state: &ConfigState,
+  listeners: Option<Listeners>
+) -> Result<(pid_t, Channel<ProxyRequest,ProxyResponse>, ScmSocket), anyhow::Error> {
   trace!("parent({})", unsafe { libc::getpid() });
 
-  let mut state_file = tempfile().expect("could not create temporary file for configuration state");
+  let mut state_file = tempfile().context("could not create temporary file for configuration state")?;
   util::disable_close_on_exec(state_file.as_raw_fd());
 
-  serde_json::to_writer(&mut state_file, state).expect("could not write upgrade data to temporary file");
-  state_file.seek(SeekFrom::Start(0)).expect("could not seek to beginning of file");
+  serde_json::to_writer(&mut state_file, state).context("could not write upgrade data to temporary file")?;
+  state_file.seek(SeekFrom::Start(0)).context("could not seek to beginning of file")?;
 
-  let (server, client) = UnixStream::pair().unwrap();
-  let (scm_server_fd, scm_client) = UnixStream::pair().unwrap();
+  let (server, client) = UnixStream::pair()?;
+  let (scm_server_fd, scm_client) = UnixStream::pair()?;
 
   let scm_server = ScmSocket::new(scm_server_fd.into_raw_fd());
 
@@ -191,7 +195,7 @@ pub fn start_worker_process(id: &str, config: &Config, executable_path: String, 
     },
     Err(e) => {
       error!("Error during fork(): {}", e);
-      Err(e)
+      Err(anyhow::Error::from(e))
     }
   }
 }
