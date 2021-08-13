@@ -9,6 +9,7 @@ use nix::unistd::*;
 use serde_json;
 use tempfile::tempfile;
 use futures_lite::future;
+use anyhow::{Context, bail};
 
 use sozu_command::config::Config;
 use sozu_command::command::RunState;
@@ -54,17 +55,20 @@ pub struct UpgradeData {
   //pub token_count: usize,
 }
 
-pub fn start_new_main_process(executable_path: String, upgrade_data: UpgradeData) -> (pid_t, Channel<(),bool>) {
+pub fn start_new_main_process(
+  executable_path: String,
+  upgrade_data: UpgradeData
+) -> Result<(pid_t, Channel<(),bool>), anyhow::Error> {
   trace!("parent({})", unsafe { libc::getpid() });
 
-  let mut upgrade_file = tempfile().expect("could not create temporary file for upgrade");
+  let mut upgrade_file = tempfile().context("could not create temporary file for upgrade")?;
 
   util::disable_close_on_exec(upgrade_file.as_raw_fd());
 
-  serde_json::to_writer(&mut upgrade_file, &upgrade_data).expect("could not write upgrade data to temporary file");
-  upgrade_file.seek(SeekFrom::Start(0)).expect("could not seek to beginning of file");
+  serde_json::to_writer(&mut upgrade_file, &upgrade_data).context("could not write upgrade data to temporary file")?;
+  upgrade_file.seek(SeekFrom::Start(0)).context("could not seek to beginning of file")?;
 
-  let (server, client) = UnixStream::pair().unwrap();
+  let (server, client) = UnixStream::pair()?;
 
   util::disable_close_on_exec(client.as_raw_fd());
 
@@ -76,13 +80,12 @@ pub fn start_new_main_process(executable_path: String, upgrade_data: UpgradeData
   command.set_nonblocking(false);
 
   info!("launching new main");
-  //FIXME: remove the expect, return a result?
-  match unsafe { fork().expect("fork failed") } {
+  match unsafe { fork().context("fork failed")? } {
     ForkResult::Parent{ child } => {
       info!("main launched: {}", child);
       command.set_nonblocking(true);
 
-      return (child.into(), command);
+      return Ok((child.into(), command));
     }
     ForkResult::Child => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
@@ -104,7 +107,12 @@ pub fn start_new_main_process(executable_path: String, upgrade_data: UpgradeData
   }
 }
 
-pub fn begin_new_main_process(fd: i32, upgrade_fd: i32, command_buffer_size: usize, max_command_buffer_size: usize) {
+pub fn begin_new_main_process(
+  fd: i32,
+  upgrade_fd: i32,
+  command_buffer_size: usize,
+  max_command_buffer_size: usize
+) -> Result<(), anyhow::Error> {
   let mut command: Channel<bool,()> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     command_buffer_size,
@@ -114,7 +122,7 @@ pub fn begin_new_main_process(fd: i32, upgrade_fd: i32, command_buffer_size: usi
   command.set_blocking(true);
 
   let upgrade_file = unsafe { File::from_raw_fd(upgrade_fd) };
-  let upgrade_data: UpgradeData = serde_json::from_reader(upgrade_file).expect("could not parse upgrade data");
+  let upgrade_data: UpgradeData = serde_json::from_reader(upgrade_file).context("could not parse upgrade data")?;
   let config = upgrade_data.config.clone();
 
   util::setup_logging(&config);
@@ -131,11 +139,13 @@ pub fn begin_new_main_process(fd: i32, upgrade_fd: i32, command_buffer_size: usi
         server.run().await;
       });
       info!("main process stopped");
+      Ok(())
     },
     Err(e) => {
       command.write_message(&false);
       error!("Couldn't write PID file. Error: {:?}", e);
       error!("Couldn't upgrade main process");
+      bail!("begin_new_main_process() failed");
     }
   }
 }

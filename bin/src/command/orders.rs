@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
+use anyhow::{Context, bail};
 
 use async_io::Async;
 
@@ -36,28 +37,34 @@ impl CommandServer {
         &mut self,
         client_id: String,
         request: sozu_command::command::CommandRequest,
-    ) {
+    ) -> Result<(), anyhow::Error> {
         match request.data {
             CommandRequestData::SaveState { path } => {
                 self.save_state(client_id, &request.id, &path).await;
+                Ok(())
             }
             CommandRequestData::DumpState => {
                 self.dump_state(client_id, &request.id).await;
+                Ok(())
             }
             CommandRequestData::ListWorkers => {
                 self.list_workers(client_id, request.id).await;
+                Ok(())
             }
             CommandRequestData::LoadState { path } => {
                 self.load_state(Some(client_id), request.id, &path).await;
+                Ok(())
             }
             CommandRequestData::LaunchWorker(tag) => {
                 self.launch_worker(client_id, request.id, &tag).await;
+                Ok(())
             }
             CommandRequestData::UpgradeMain => {
-                self.upgrade_main(client_id, request.id).await;
+                self.upgrade_main(client_id, request.id).await
             }
             CommandRequestData::UpgradeWorker(worker_id) => {
                 self.upgrade_worker(client_id, request.id, worker_id).await;
+                Ok(())
             }
 
             CommandRequestData::Proxy(proxy_request) => match proxy_request {
@@ -65,14 +72,16 @@ impl CommandServer {
                 ProxyRequestData::Query(query) => self.query(client_id, request.id, query).await,
                 order => {
                     self.worker_order(client_id, request.id, order, request.worker_id)
-                        .await;
+                        .await
                 }
             },
             CommandRequestData::SubscribeEvents => {
                 self.event_subscribers.insert(client_id);
+                Ok(())
             }
             CommandRequestData::ReloadConfiguration { path }=> {
                 self.reload_configuration(Some(client_id), request.id, path).await;
+                Ok(())
             },
             //r => error!("unknown request: {:?}", r),
         }
@@ -439,7 +448,11 @@ impl CommandServer {
         }
     }
 
-    pub async fn upgrade_main(&mut self, client_id: String, request_id: String) {
+    pub async fn upgrade_main(
+        &mut self,
+        client_id: String,
+        request_id: String
+    ) -> Result<(), anyhow::Error> {
         self.disable_cloexec_before_upgrade();
 
         if let Some(sender) = self.clients.get_mut(&client_id) {
@@ -456,7 +469,7 @@ impl CommandServer {
         }
 
         let (pid, mut channel) =
-            start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data());
+            start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data())?;
         channel.set_blocking(true);
         let res = channel.read_message();
         debug!("upgrade channel sent: {:?}", res);
@@ -496,6 +509,7 @@ impl CommandServer {
                 None,
             )
             .await;
+            Ok(())
         }
     }
 
@@ -828,7 +842,7 @@ impl CommandServer {
         self.config = new_config;
     }
 
-    pub async fn metrics(&mut self, client_id: String, request_id: String) {
+    pub async fn metrics(&mut self, client_id: String, request_id: String) -> Result<(), anyhow::Error> {
         let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
@@ -898,9 +912,10 @@ impl CommandServer {
                 }
         })
         .detach();
+        Ok(())
     }
 
-    pub async fn query(&mut self, client_id: String, request_id: String, query: Query) {
+    pub async fn query(&mut self, client_id: String, request_id: String, query: Query) -> Result<(), anyhow::Error> {
         let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
@@ -1021,6 +1036,7 @@ impl CommandServer {
             };
         })
         .detach();
+        Ok(())
     }
 
     pub async fn worker_order(
@@ -1029,7 +1045,7 @@ impl CommandServer {
         request_id: String,
         order: ProxyRequestData,
         worker_id: Option<u32>,
-    ) {
+    ) -> Result<(), anyhow::Error> {
         if let &ProxyRequestData::AddCertificate(_) = &order {
             debug!("workerconfig client order AddCertificate()");
         } else {
@@ -1050,24 +1066,22 @@ impl CommandServer {
         if !self.state.handle_order(&order) {
             // Check if the backend or frontend exist before deleting it
             if worker_id.is_none() {
-                match order {
+                match &order {
                     ProxyRequestData::RemoveBackend(ref backend) => {
                         let msg = format!(
                             "cannot remove backend: application {} has no backends {} at {}",
                             backend.app_id, backend.backend_id, backend.address,
                         );
                         error!("{}", msg);
-                        self.answer_error(client_id, request_id, msg, None).await;
-                        return;
+                        self.answer_error(client_id.clone(), request_id.clone(), msg, None).await;
                     }
-                    ProxyRequestData::RemoveHttpFront(h) | ProxyRequestData::RemoveHttpsFront(h) => {
+                    ProxyRequestData::RemoveHttpFront(http_front) | ProxyRequestData::RemoveHttpsFront(http_front) => {
                         let msg = format!(
                             "cannot remove HTTP frontend: application {} has no frontends on {} for {} {}",
-                            h.app_id, h.address, h.hostname, h.path_begin,
+                            http_front.app_id, http_front.address, http_front.hostname, http_front.path_begin,
                         );
                         error!("{}", msg);
-                        self.answer_error(client_id, request_id, msg, None).await;
-                        return;
+                        self.answer_error(client_id.clone(), request_id.clone(), msg, None).await;
                     }
                     ProxyRequestData::RemoveTcpFront(TcpFront {
                         ref app_id,
@@ -1078,8 +1092,7 @@ impl CommandServer {
                             app_id, address,
                         );
                         error!("{}", msg);
-                        self.answer_error(client_id, request_id, msg, None).await;
-                        return;
+                        self.answer_error(client_id.clone(), request_id.clone(), msg, None).await;
                     }
                     _ => {}
                 };
@@ -1230,6 +1243,7 @@ impl CommandServer {
         gauge!("configuration.applications", self.state.applications.len());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
+        Ok(())
     }
 }
 

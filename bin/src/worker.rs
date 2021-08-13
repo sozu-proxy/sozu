@@ -1,3 +1,4 @@
+use anyhow::{bail, Context};
 use mio::net::UnixStream;
 use libc::{self,pid_t};
 use std::io::{Seek,SeekFrom};
@@ -77,8 +78,14 @@ pub fn start_worker(id: u32, config: &Config, executable_path: String, state: &C
   }
 }
 
-pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: i32,
-  command_buffer_size: usize, max_command_buffer_size: usize) {
+pub fn begin_worker_process(
+  fd: i32,
+  scm: i32,
+  configuration_state_fd: i32,
+  id: i32,
+  command_buffer_size: usize,
+  max_command_buffer_size: usize
+) -> Result<(), anyhow::Error> {
   let mut command: Channel<ProxyResponse,Config> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     command_buffer_size,
@@ -89,9 +96,9 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
 
   let configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
   let config_state: ConfigState = serde_json::from_reader(configuration_state_file)
-    .expect("could not parse configuration state data");
+    .context("could not parse configuration state data")?;
 
-  let worker_config = command.read_message().expect("worker could not read configuration from socket");
+  let worker_config = command.read_message().context("worker could not read configuration from socket")?;
   //println!("got message: {:?}", worker_config);
 
   let worker_id = format!("{}-{:02}", "WRK", id);
@@ -116,6 +123,7 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   info!("starting event loop");
   server.run();
   info!("ending event loop");
+  Ok(())
 }
 
 pub fn start_worker_process(id: &str, config: &Config, executable_path: String, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<(pid_t, Channel<ProxyRequest,ProxyResponse>, ScmSocket)> {

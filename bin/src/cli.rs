@@ -1,3 +1,4 @@
+use anyhow::Error;
 use clap::{App,Arg,SubCommand,ArgMatches};
 use crate::worker::begin_worker_process;
 use crate::upgrade::begin_new_main_process;
@@ -80,8 +81,8 @@ pub fn get_upgrade_fd<'a>(matches: &ArgMatches<'a>) -> i32 {
     .parse::<i32>().expect("the file descriptor must be a number")
 }
 
-pub fn upgrade_worker<'a>(matches: &ArgMatches<'a>) -> Option<()> {
-  matches.subcommand_matches("worker").and_then(|worker_matches| {
+pub fn upgrade_worker<'a>(matches: &ArgMatches<'a>) -> Result<Option<()>, anyhow::Error> {
+  if let Some(worker_matches) = matches.subcommand_matches("worker") {
     let fd = get_fd(worker_matches);
     let scm = get_scm(worker_matches);
     let configuration_state_fd = get_configuration_state_fd(worker_matches);
@@ -89,19 +90,21 @@ pub fn upgrade_worker<'a>(matches: &ArgMatches<'a>) -> Option<()> {
     let buffer_size = get_buffer_size(worker_matches);
     let max_buffer_size = get_max_buffer_size(worker_matches, buffer_size);
 
-    begin_worker_process(fd, scm, configuration_state_fd, id, buffer_size, max_buffer_size);
-    Some(())
-  })
+    Ok(Some(begin_worker_process(fd, scm, configuration_state_fd, id, buffer_size, max_buffer_size)?))
+  } else {
+    Ok(None)
+  }
 }
 
-pub fn upgrade_main<'a>(matches: &ArgMatches<'a>) -> Option<()> {
- matches.subcommand_matches("upgrade").and_then(|upgrade_matches| {
+pub fn upgrade_main<'a>(matches: &ArgMatches<'a>) -> Result<Option<()>, anyhow::Error> {
+  if let Some(upgrade_matches) = matches.subcommand_matches("upgrade") {
     let fd = get_fd(upgrade_matches);
     let upgrade_fd = get_upgrade_fd(upgrade_matches);
     let buffer_size = get_buffer_size(upgrade_matches);
     let max_buffer_size = get_max_buffer_size(upgrade_matches, buffer_size);
-
-    begin_new_main_process(fd, upgrade_fd, buffer_size, max_buffer_size);
-    Some(())
-  })
+      
+    Ok(Some(begin_new_main_process(fd, upgrade_fd, buffer_size, max_buffer_size)?))
+  } else {
+    Ok(None)
+  }
 }

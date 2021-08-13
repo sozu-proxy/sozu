@@ -23,6 +23,7 @@ mod upgrade;
 mod cli;
 mod util;
 
+use anyhow::bail;
 use std::panic;
 use sozu_command::config::Config;
 use clap::ArgMatches;
@@ -46,41 +47,47 @@ pub enum StartupError {
   PIDFileNotWritable(String)
 }
 
-fn main() {
+fn main() -> Result<(), anyhow::Error> {
   register_panic_hook();
 
   // Init parsing of arguments
   let matches = cli::init();
-  // Check if we are upgrading workers or main
-  let upgrade = cli::upgrade_worker(&matches).or_else(|| cli::upgrade_main(&matches));
+  // Check if we are upgrading workers
+  let mut upgrade = cli::upgrade_worker(&matches)?;
+
+  // check if we are upgrading main (overrides worker upgrading)
+  if let Some(upgrade_main) = cli::upgrade_main(&matches)? {
+    upgrade = Some(upgrade_main);
+  }
             
   // If we are not, then we want to start sozu
   if upgrade == None {
     match start(&matches) {
-      Ok(_) => info!("main process stopped"), // Ok() is only called when the proxy exits
+      Ok(_) => {info!("main process stopped"); }, // Ok() is only called when the proxy exits
       Err(StartupError::ConfigurationFileNotSpecified) => {
         error!("Configuration file hasn't been specified. Either use -c with the start command \
                or use the SOZU_CONFIG environment variable when building sozu.");
-        std::process::exit(1);
+        bail!("exit");
       },
       Err(StartupError::ConfigurationFileLoadError(err)) => {
         error!("Invalid configuration file. Error: {:?}", err);
-        std::process::exit(1);
+        bail!("exit");
       },
       Err(StartupError::TooManyAllowedConnections(err)) | Err(StartupError::TooManyAllowedConnectionsForWorker(err)) => {
         error!("{}", err);
-        std::process::exit(1);
+        bail!("exit");
       },
       Err(StartupError::WorkersSpawnFail(err)) => {
         error!("At least one worker failed to spawn. Error: {:?}", err);
-        std::process::exit(1);
+        bail!("exit");
       },
       Err(StartupError::PIDFileNotWritable(err)) => {
         error!("{}", err);
-        std::process::exit(1);
+        bail!("exit");
       }
     }
   }
+  Ok(())
 }
 
 fn start(matches: &ArgMatches) -> Result<(), StartupError> {
