@@ -171,7 +171,7 @@ impl CommandServer {
         }
     }
 
-    pub fn from_upgrade_data(upgrade_data: UpgradeData) -> CommandServer {
+    pub fn from_upgrade_data(upgrade_data: UpgradeData) -> anyhow::Result<CommandServer> {
         let UpgradeData {
             command,
             config,
@@ -181,7 +181,7 @@ impl CommandServer {
         } = upgrade_data;
 
         debug!("listener is: {}", command);
-        let listener = Async::new(unsafe { UnixListener::from_raw_fd(command) }).unwrap();
+        let listener = Async::new(unsafe { UnixListener::from_raw_fd(command) })?;
 
         let (accept_cancel_tx, accept_cancel_rx) = oneshot::channel();
         let (command_tx, command_rx) = channel(10000);
@@ -206,7 +206,7 @@ impl CommandServer {
                         }
                         futures::future::Either::Right((res, cancel_rx)) => {
                             accept_cancel_rx = Some(cancel_rx);
-                            res.unwrap()
+                            res?
                         }
                     };
                 debug!("Accepted a client from upgraded");
@@ -218,10 +218,10 @@ impl CommandServer {
                     id,
                     sender: client_tx,
                 })
-                .await
-                .unwrap();
+                .await?;
                 counter += 1;
             }
+            Ok::<(), anyhow::Error>(())
         })
         .detach();
 
@@ -247,8 +247,8 @@ impl CommandServer {
                 //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
                 smol::spawn(async move {
                     worker_loop(id, stream, command_tx, worker_rx)
-                        .await
-                        .unwrap();
+                        .await?;
+                    Ok::<(), anyhow::Error>(())
                 })
                 .detach();
 
@@ -272,7 +272,7 @@ impl CommandServer {
 
         let executable_path = unsafe { get_executable_path() };
 
-        CommandServer {
+        Ok(CommandServer {
             fd: command,
             config,
             state,
@@ -287,7 +287,7 @@ impl CommandServer {
             backends_count,
             frontends_count,
             accept_cancel: Some(accept_cancel_tx),
-        }
+        })
     }
 
     pub fn disable_cloexec_before_upgrade(&mut self) {
