@@ -37,7 +37,6 @@ use sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyRequestData};
 use sozu_command::ready::Ready;
 use sozu::server::Server;
 use sozu::metrics;
-
 use crate::util;
 use crate::logging;
 use crate::command::Worker;
@@ -201,11 +200,14 @@ pub fn start_worker_process(
 }
 
 #[cfg(target_os = "linux")]
-pub unsafe fn get_executable_path() -> String {
+pub unsafe fn get_executable_path() -> Result<String, anyhow::Error> {
   use std::fs;
 
-  let path         = fs::read_link("/proc/self/exe").expect("/proc/self/exe doesn't exist");
-  let mut path_str = path.into_os_string().into_string().expect("Failed to convert PathBuf to String");
+  let path= fs::read_link("/proc/self/exe").context("/proc/self/exe doesn't exist")?;
+  let mut path_str = match path.into_os_string().into_string() {
+    Ok(s) => s,
+    Err(_) => bail!("Failed to convert PathBuf to String"),
+  };
 
   if path_str.ends_with(" (deleted)") {
     // The kernel appends " (deleted)" to the symlink when the original executable has been replaced
@@ -213,7 +215,7 @@ pub unsafe fn get_executable_path() -> String {
     path_str.truncate(len - 10)
   }
 
-  path_str
+  Ok(path_str)
 }
 
 #[cfg(target_os = "macos")]

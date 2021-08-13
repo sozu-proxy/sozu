@@ -124,7 +124,12 @@ fn start(matches: &ArgMatches) -> Result<(), StartupError> {
 }
 
 fn init_workers(config: &Config) -> Result<Vec<Worker>, StartupError> {
-  let path = unsafe { get_executable_path() };
+  let path = unsafe {
+    match get_executable_path() {
+      Ok(p) => p,
+      Err(e) => return Err(StartupError::WorkersSpawnFail(e)),
+    }
+  };
   match start_workers(path, &config) {
     Ok(workers) => {
       info!("created workers: {:?}", workers);

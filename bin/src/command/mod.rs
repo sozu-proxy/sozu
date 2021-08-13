@@ -1,3 +1,4 @@
+use anyhow::{Context, bail};
 use async_dup::Arc;
 use futures::channel::{mpsc::*, oneshot};
 use futures::{SinkExt, StreamExt};
@@ -94,7 +95,7 @@ impl CommandServer {
         command_rx: Receiver<CommandMessage>,
         mut workers: Vec<Worker>,
         accept_cancel: oneshot::Sender<()>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         //FIXME
         if config.metrics.is_some() {
             /*METRICS.with(|metrics| {
@@ -130,11 +131,11 @@ impl CommandServer {
         }
 
         let next_id = workers.len() as u32;
-        let executable_path = unsafe { get_executable_path() };
+        let executable_path = unsafe { get_executable_path()? };
         let backends_count = state.count_backends();
         let frontends_count = state.count_frontends();
 
-        CommandServer {
+        Ok(CommandServer {
             fd,
             config,
             state,
@@ -149,7 +150,7 @@ impl CommandServer {
             backends_count,
             frontends_count,
             accept_cancel: Some(accept_cancel),
-        }
+        })
     }
 
     pub fn generate_upgrade_data(&self) -> UpgradeData {
@@ -270,7 +271,7 @@ impl CommandServer {
         let backends_count = config_state.count_backends();
         let frontends_count = config_state.count_frontends();
 
-        let executable_path = unsafe { get_executable_path() };
+        let executable_path = unsafe { get_executable_path()? };
 
         Ok(CommandServer {
             fd: command,
@@ -446,17 +447,10 @@ pub fn start(
     config: Config,
     command_socket_path: String,
     workers: Vec<Worker>,
-) -> std::io::Result<()> {
+) -> anyhow::Result<()> {
     let addr = PathBuf::from(&command_socket_path);
-    if let Err(e) = fs::remove_file(&addr) {
-        match e.kind() {
-            ErrorKind::NotFound => {}
-            _ => {
-                error!("could not delete previous socket at {:?}: {:?}", addr, e);
-                return Ok(());
-            }
-        }
-    }
+    
+    fs::remove_file(&addr).context(format!("could not delete previous socket at {:?}", addr))?;
 
     let srv = match UnixListener::bind(&addr) {
         Err(e) => {
@@ -468,7 +462,7 @@ pub fn start(
                     error!("could not kill worker: {:?}", e);
                 });
             }
-            return Ok(());
+            bail!("couldn't start server");
         }
         Ok(srv) => {
             if let Err(e) = fs::set_permissions(&addr, fs::Permissions::from_mode(0o600)) {
@@ -483,7 +477,7 @@ pub fn start(
                         error!("could not kill worker: {:?}", e);
                     });
                 }
-                return Ok(());
+                bail!("couldn't start server");
             }
             srv
         }
@@ -512,7 +506,7 @@ pub fn start(
                         }
                         futures::future::Either::Right((res, cancel_rx)) => {
                             accept_cancel_rx = Some(cancel_rx);
-                            res.unwrap()
+                            res?
                         }
                     };
 
@@ -524,15 +518,15 @@ pub fn start(
                         id,
                         sender: client_tx,
                     })
-                    .await
-                    .unwrap();
+                    .await?;
                 counter += 1;
             }
+            Ok::<(), anyhow::Error>(())
         })
         .detach();
 
         let saved_state = config.saved_state_path();
-        let mut server = CommandServer::new(fd, config, tx, command_rx, workers, accept_cancel_tx);
+        let mut server = CommandServer::new(fd, config, tx, command_rx, workers, accept_cancel_tx)?;
         server.load_static_application_configuration().await;
 
         if let Some(path) = saved_state {
