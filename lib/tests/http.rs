@@ -250,8 +250,25 @@ fn test() {
         .get("http://example.com:8080/")
         .call().unwrap();
     assert_eq!(res.status(), 200);
+    assert_eq!(res.into_string().unwrap(), "hello world");
 
     //let _ = jg.join();
+    //barrier.wait();
+    info!("expecting 200");
+    let res = agent
+        .get("http://example.com:8080/100")
+        .set("Expect", "100-continue")
+        .call().unwrap();
+    assert_eq!(res.status(), 100);
+    assert_eq!(res.header("Content-Length"), Some("1024"));
+
+    // check that there's no actual body
+    /*let mut reader = res.into_reader();
+    let mut buf = [0u8; 1024];
+    // we should do that in async, to add a short timeout
+    assert!(reader.read(&mut buf).is_err());
+    */
+
     info!("good bye");
 }
 
@@ -262,18 +279,30 @@ fn start_server(port: u16, barrier: Arc<Barrier>) {
 
         barrier.wait();
         for request in server.incoming_requests() {
-            println!("backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
+            eprintln!("backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
                      request.method(),
                      request.url(),
                      request.headers()
                     );
+            eprintln!("url: {:?}", request.url());
 
-            let response = Response::from_string("hello world");
-            request.respond(response).unwrap();
-            println!("backend web server sent response");
-            println!("server session stopped");
+            if request.url() == "/100" {
+                let response = Response::new(
+                    tiny_http::StatusCode(100),
+                    vec![tiny_http::Header::from_bytes(&b"Content-Length"[..], &b"1024"[..]).unwrap()],
+                    &b""[..],
+                    None,
+                    None);
+                request.respond(response).unwrap();
+            } else {
+                let response = Response::from_string("hello world");
+                request.respond(response).unwrap();
+            }
+
+            eprintln!("backend web server sent response");
+            eprintln!("server session stopped");
         }
 
-        println!("server on port {} closed", port);
+        eprintln!("server on port {} closed", port);
     });
 }
