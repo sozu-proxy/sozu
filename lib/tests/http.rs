@@ -261,6 +261,27 @@ fn test() {
         order: proxy::ProxyRequestData::AddBackend(http_backend)
     });
 
+    let barrier2 = barrier.clone();
+    let _ = thread::spawn(move || {
+        let listener = TcpListener::bind("127.0.0.1:2048").expect("could not parse address");
+        barrier2.wait();
+        let mut stream = listener.incoming().next().unwrap().unwrap();
+        let response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n";
+        stream.write(&response[..]).unwrap();
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+    });
+
+    barrier.wait();
+    info!("expecting upgrade (101 switching protocols)");
+    let res = agent
+        .get("http://example.com:8080/")
+        .call().unwrap();
+    println!("res: {:?}", res);
+    assert_eq!(res.status(), 101);
+    assert_eq!(res.header("Upgrade"), Some("WebSocket"));
+    assert_eq!(res.header("Connection"), Some("Upgrade"));
+    info!("good bye");
+
     start_server(2048, barrier.clone());
 
     barrier.wait();
