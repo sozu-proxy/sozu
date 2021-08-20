@@ -198,6 +198,25 @@ fn test() {
     assert_eq!(res.header("Content-Length"), Some("5"));
     assert_eq!(res.into_string().unwrap(), "Hello");
 
+    let barrier2 = barrier.clone();
+    let _ = thread::spawn(move || {
+        let listener = TcpListener::bind("127.0.0.1:2048").expect("could not parse address");
+        barrier2.wait();
+        let mut stream = listener.incoming().next().unwrap().unwrap();
+        let response = b"HTTP/1.1 200 Ok\r\nConnection: close\r\n\r\nHello world!";
+        stream.write(&response[..]).unwrap();
+        stream.shutdown(std::net::Shutdown::Both).unwrap();
+    });
+
+    barrier.wait();
+    info!("expecting 200 then close, without content length");
+    let res = agent
+        .get("http://example.com:8080/")
+        .call().unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.status_text(), "Ok");
+    assert_eq!(res.into_string().unwrap(), "Hello world!");
+
 
     let barrier2 = barrier.clone();
     let _ = thread::spawn(move || {
@@ -254,7 +273,7 @@ fn test() {
 
     //let _ = jg.join();
     //barrier.wait();
-    info!("expecting 200");
+    info!("expecting 100");
     let res = agent
         .get("http://example.com:8080/100")
         .set("Expect", "100-continue")

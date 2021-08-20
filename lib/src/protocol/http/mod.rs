@@ -402,7 +402,14 @@ impl<Front:SocketHandler> Http<Front> {
           if self.response == Some(ResponseState::Initial) {
             self.set_answer(DefaultAnswerStatus::Answer503, None);
           } else {
-            self.set_answer(DefaultAnswerStatus::Answer502, None);
+            if let Some(ResponseState::ResponseWithBodyCloseDelimited(_, _, ref mut back_closed)) = self.response.as_mut() {
+                *back_closed = true;
+                // trick the protocol into calling readable() again
+                self.back_readiness.event.insert(Ready::readable());
+                return SessionResult::Continue;
+            } else {
+                self.set_answer(DefaultAnswerStatus::Answer502, None);
+            }
           }
           // we're not expecting any more data from the backend
           self.back_readiness.interest = Ready::empty();
