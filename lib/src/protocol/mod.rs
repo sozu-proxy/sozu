@@ -11,7 +11,7 @@ macro_rules! take_while_complete (
     }
   });
   ($input:expr, $f:expr) => (
-    take_while_complete!($input, call!($f));
+    take_while_complete!($input, call!($f))
   );
 );
 

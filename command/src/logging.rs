@@ -532,10 +532,10 @@ macro_rules! log_access {
 #[macro_export]
 macro_rules! error {
     ($format:expr, $($arg:tt)*) => {
-        log!($crate::logging::LogLevel::Error, $format, "ERROR", $($arg)*);
+        log!($crate::logging::LogLevel::Error, $format, "ERROR", $($arg)*)
     };
     ($format:expr) => {
-        log!($crate::logging::LogLevel::Error, $format, "ERROR");
+        log!($crate::logging::LogLevel::Error, $format, "ERROR")
     };
 }
 

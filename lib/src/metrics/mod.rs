@@ -239,7 +239,7 @@ macro_rules! count (
 
 #[macro_export]
 macro_rules! incr (
-  ($key:expr) => (count!($key, 1););
+  ($key:expr) => (count!($key, 1));
   ($key:expr, $app_id:expr, $backend_id:expr) => {
     use $crate::metrics::Subscriber;
 
@@ -251,7 +251,7 @@ macro_rules! incr (
 
 #[macro_export]
 macro_rules! decr (
-  ($key:expr) => (count!($key, -1);)
+  ($key:expr) => (count!($key, -1))
 );
 
 #[macro_export]
