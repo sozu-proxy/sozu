@@ -1754,8 +1754,7 @@ pub fn query_metrics(
                     }
                     CommandStatus::Error => {
                         if json {
-                            print_json_response(&message.message);
-                            return Ok(());
+                            return print_json_response(&message.message);
                         } else {
                             bail!("could not query proxy state: {}", message.message);
                         }
@@ -1763,8 +1762,7 @@ pub fn query_metrics(
                     CommandStatus::Ok => {
                         if let Some(CommandResponseData::Query(data)) = message.data {
                             if json {
-                                print_json_response(&data);
-                                return Ok(());
+                                return print_json_response(&data);
                             }
 
                             //println!("got data: {:#?}", data);

@@ -909,14 +909,17 @@ impl CommandServer {
                 }
             }
 
-            client_tx
+            if let Err(e) = client_tx
                 .send(CommandResponse::new(
                     request_id.clone(),
                     CommandStatus::Ok,
                     "".to_string(),
                     None,
                 ))
-                .await;
+                .await
+            {
+                error!("could not send back metrics to client: {:?}", e);
+            }
         })
         .detach();
     }
