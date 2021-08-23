@@ -118,7 +118,7 @@ fn main() {
             max_command_buffer_size,
         );
     } else {
-        ctl::ctl(matches);
+        ctl::ctl(matches).unwrap()
     }
 }
 
