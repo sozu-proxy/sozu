@@ -1,4 +1,9 @@
-use nom::number::streaming::{be_u8, be_u16};
+use nom::{
+    IResult, Err,
+    error::{Error, ErrorKind, ParseError},
+    number::streaming::{be_u8, be_u16},
+    bytes::streaming::{tag, take},
+};
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::convert::From;
@@ -7,76 +12,68 @@ use protocol::proxy_protocol::header::*;
 
 const PROTOCOL_SIGNATURE_V2: [u8; 12] = [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A];
 
-named!(parse_command<Command>,
-  switch!(be_u8,
-    0x20 => value!(Command::Local) |
-    0x21 => value!(Command::Proxy)
-  )
-);
+fn parse_command(i: &[u8]) -> IResult<&[u8], Command> {
+  let i2 = i;
+  let (i, cmd) = be_u8(i)?;
+  match cmd {
+      0x20 => Ok((i, Command::Local)),
+      0x21 => Ok((i, Command::Proxy)),
+      _ => Err(Err::Error(Error::from_error_kind(i2, ErrorKind::Switch))),
+  }
+}
 
-named!(pub parse_v2_header<HeaderV2>,
-  do_parse!(
-    tag!(&PROTOCOL_SIGNATURE_V2) >>
-    command: parse_command >>
-    family: be_u8 >>
-    len: be_u16 >>
-    addr: flat_map!(take!(len), call!(parse_addr_v2, family)) >>
-    (
-      HeaderV2 {
-        command,
-        family,
-        addr
-      }
-    )
-  )
-);
+pub fn parse_v2_header(i: &[u8]) -> IResult<&[u8], HeaderV2>
+ {
+   let (i, _) = tag(&PROTOCOL_SIGNATURE_V2)(i)?;
+   let (i, command) = parse_command(i)?;
+   let (i, family) = be_u8(i)?;
+   let (i, len) = be_u16(i)?;
+   let (i, data) = take(len)(i)?;
+   let (_, addr) = parse_addr_v2(family)(data)?;
 
-named_args!(address_family(family: u8)<u8>, value!((family >> 4) & 0x0f));
+   Ok((i, (
+    HeaderV2 {
+      command,
+      family,
+      addr
+    }
+  )))
+ }
 
-named!(unspec<ProxyAddr>, value!(ProxyAddr::AfUnspec));
+fn parse_addr_v2(family: u8) -> impl Fn(&[u8]) -> IResult<&[u8], ProxyAddr> {
+  move |i: &[u8]| {
+    match (family >> 4) & 0x0f {
+      0x00 => Ok((i, ProxyAddr::AfUnspec)),
+      0x01 => parse_ipv4_on_v2(i),
+      0x02 => parse_ipv6_on_v2(i),
+      _ => Err(Err::Error(Error::from_error_kind(i, ErrorKind::Switch))),
+    }
+  }
+}
 
-named_args!(parse_addr_v2(family: u8)<ProxyAddr>,
-  // family: 4 bits for address family and 4 bits for transport protocol
-  switch!(call!(address_family, family),
-    0x00 => call!(unspec) |
-    0x01 => call!(parse_ipv4_on_v2) |
-    0x02 => call!(parse_ipv6_on_v2)
-  )
-);
+fn parse_ipv4_on_v2(i: &[u8]) -> IResult<&[u8], ProxyAddr> {
+  let (i, src_ip) = take(4u8)(i)?;
+  let (i, dest_ip) = take(4u8)(i)?;
+  let (i, src_port) = be_u16(i)?;
+  let (i, dest_port) = be_u16(i)?;
 
-named!(take_4_bytes, take!(4));
+  Ok((i, ProxyAddr::Ipv4Addr {
+      src_addr: SocketAddrV4::new(Ipv4Addr::new(src_ip[0], src_ip[1], src_ip[2], src_ip[3]), src_port),
+      dst_addr: SocketAddrV4::new(Ipv4Addr::new(dest_ip[0], dest_ip[1], dest_ip[2], dest_ip[3]), dest_port)
+    }))
+}
 
-named!(parse_ipv4_on_v2<ProxyAddr>,
-  do_parse!(
-    src_ip: take_4_bytes >>
-    dest_ip: take_4_bytes >>
-    src_port: be_u16 >>
-    dest_port: be_u16 >>
-    (
-      ProxyAddr::Ipv4Addr {
-        src_addr: SocketAddrV4::new(Ipv4Addr::new(src_ip[0], src_ip[1], src_ip[2], src_ip[3]), src_port),
-        dst_addr: SocketAddrV4::new(Ipv4Addr::new(dest_ip[0], dest_ip[1], dest_ip[2], dest_ip[3]), dest_port)
-      }
-    )
-  )
-);
+fn parse_ipv6_on_v2(i: &[u8]) -> IResult<&[u8], ProxyAddr> {
+  let (i, src_ip) = take(16u8)(i)?;
+  let (i, dest_ip) = take(16u8)(i)?;
+  let (i, src_port) = be_u16(i)?;
+  let (i, dest_port) = be_u16(i)?;
 
-named!(take_16_bytes, take!(16));
-
-named!(parse_ipv6_on_v2<ProxyAddr>,
-  do_parse!(
-    src_ip: take_16_bytes >>
-    dest_ip: take_16_bytes >>
-    src_port: be_u16 >>
-    dest_port: be_u16 >>
-    (
-      ProxyAddr::Ipv6Addr {
-        src_addr: SocketAddrV6::new(slice_to_ipv6(&src_ip[..]), src_port, 0 ,0),
-        dst_addr: SocketAddrV6::new(slice_to_ipv6(&dest_ip[..]), dest_port, 0 ,0),
-      }
-    )
-  )
-);
+  Ok((i, ProxyAddr::Ipv6Addr {
+    src_addr: SocketAddrV6::new(slice_to_ipv6(&src_ip[..]), src_port, 0 ,0),
+    dst_addr: SocketAddrV6::new(slice_to_ipv6(&dest_ip[..]), dest_port, 0 ,0),
+  }))
+}
 
 // assumes the slice has 16 bytes
 pub fn slice_to_ipv6(sl: &[u8]) -> Ipv6Addr {

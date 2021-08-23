@@ -1233,14 +1233,19 @@ impl CommandServer {
     }
 }
 
+use nom::{
+    multi::many0,
+    combinator::{complete, map_res},
+    sequence::terminated,
+    bytes::streaming::is_not,
+    character::streaming::char,
+};
 pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<CommandRequest>> {
     use serde_json::from_slice;
-    many0!(
-        input,
-        //complete!(terminated!(map_res!(map_res!(is_not!("\0"), from_utf8), from_str), char!('\0')))
-        complete!(terminated!(
-            map_res!(is_not!("\0"), from_slice),
-            char!('\0')
+    many0(
+    complete(terminated(
+            map_res(is_not("\0"), from_slice),
+            char('\0')
         ))
-    )
+    )(input)
 }

@@ -1,4 +1,10 @@
-use nom::{IResult, character::is_space};
+use nom::{IResult,
+  combinator::opt,
+  bytes::complete::{tag, take_while, is_not},
+  character::is_space,
+  sequence::terminated,
+  multi::many0,
+};
 
 #[derive(Debug)]
 pub struct RequestCookie<'a> {
@@ -22,24 +28,22 @@ pub fn is_cookie_value_char(chr: u8) -> bool {
   chr != 32 && chr != 44 && chr != 59
 }
 
-named!(pub single_request_cookie<RequestCookie>,
-  do_parse!(
-    name: is_not!("=") >>
-          tag!("=") >>
-    value: take_while_complete!(is_cookie_value_char) >>
-    semicolon: opt!(complete!(tag!(";"))) >>
-    spaces: take_while_complete!(is_space) >>
-    (RequestCookie {
-      name: name,
-      value: value,
-      semicolon: semicolon,
-      spaces: spaces
-    })
-  )
-);
+pub fn single_request_cookie(i: &[u8]) -> IResult<&[u8], RequestCookie> {
+  let (i, name) = terminated(is_not("="), tag("="))(i)?;
+  let (i, value) = take_while(is_cookie_value_char)(i)?;
+  let (i, semicolon) = opt(tag(";"))(i)?;
+  let (i, spaces) = take_while(is_space)(i)?;
+
+  Ok((i, RequestCookie {
+    name: name,
+    value: value,
+    semicolon: semicolon,
+    spaces: spaces
+  }))
+}
 
 pub fn parse_request_cookies(input: &[u8]) -> Option<Vec<RequestCookie>> {
-  let res: IResult<&[u8], Vec<RequestCookie>> = many0!(input, complete!(single_request_cookie));
+  let res: IResult<&[u8], Vec<RequestCookie>> = many0(single_request_cookie)(input);
 
   if let Ok((_, o)) = res {
     Some(o)

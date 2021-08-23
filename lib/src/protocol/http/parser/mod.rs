@@ -1,22 +1,11 @@
 #![allow(dead_code)]
 use super::cookies::{RequestCookie, parse_request_cookies};
 
-use nom::{
-  IResult,Offset,Err,Needed,
-  error::{Error, ErrorKind},
-  character::{
+use nom::{Err, IResult, Needed, Offset, branch::alt, bytes::{self, complete::{take_while1 as take_while1_complete}, streaming::{is_not, tag, tag_no_case, take, take_while, take_while1}}, character::{
     is_alphanumeric, is_space,
     streaming::{char, one_of},
     complete::digit1 as digit_complete
-  },
-  bytes::{
-    self,
-    streaming::{tag, take, take_while, take_while1},
-    complete::{take_while1 as take_while1_complete}
-  },
-  sequence::{preceded, terminated, tuple},
-  combinator::{opt, map_res}
-};
+  }, combinator::{complete, map_res, opt, recognize}, error::{Error, ErrorKind}, multi::many0, sequence::{delimited, preceded, terminated, tuple}};
 
 use std::{fmt,str};
 use std::str::from_utf8;
@@ -294,32 +283,32 @@ fn single_header_value(i:&[u8]) -> IResult<&[u8], &[u8]> {
 // Content-Disposition header, cf https://tools.ietf.org/html/rfc6266#section-4
 pub fn content_disposition_header_value(i: &[u8]) -> IResult<&[u8], &[u8]> {
     //println!("header value:{}", String::from_utf8_lossy(i));
-    let (i, _) = alt!(i, tag_no_case!("inline") | tag_no_case!("attachment") | token)?;
-    let (i, o) = recognize!(i, many0!(content_disposition_parm))?;
+    let (i, _) = alt((tag_no_case("inline"), tag_no_case("attachment"), token))(i)?;
+    let (i, o) = recognize(many0(content_disposition_parm))(i)?;
 
     Ok((i, o))
 }
 
 pub fn content_disposition_parm(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    let (i, _) = opt!(i, take_while!(is_space))?;
-    let (i, _) = tag!(i, ";")?;
-    let (i, _) = opt!(i, take_while!(is_space))?;
+    let (i, _) = opt(take_while(is_space))(i)?;
+    let (i, _) = tag(";")(i)?;
+    let (i, _) = opt(take_while(is_space))(i)?;
 
-    let (i, o) = recognize!(i, alt!(
-            content_disposition_filename_parm |
-            content_disposition_filename_star_parm |
-            content_disposition_ext_parm1 |
+    let (i, o) = recognize(alt((
+            content_disposition_filename_parm,
+            content_disposition_filename_star_parm,
+            content_disposition_ext_parm1,
             content_disposition_ext_parm2
-        ))?;
+    )))(i)?;
 
     Ok((i, o))
 }
 
 pub fn content_disposition_filename_parm(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    let (i, _) = tag_no_case!(i, "filename")?;
-    let (i, _) = opt!(i, take_while!(is_space))?;
-    let (i, _) = tag!(i, "=")?;
-    let (i, _) = opt!(i, take_while!(is_space))?;
+    let (i, _) = tag_no_case("filename")(i)?;
+    let (i, _) = opt(take_while(is_space))(i)?;
+    let (i, _) = tag("=")(i)?;
+    let (i, _) = opt(take_while(is_space))(i)?;
     let (i, o) = content_disposition_value(i)?;
 
     //println!("recognized filename: {:?}", from_utf8(o));
@@ -327,38 +316,38 @@ pub fn content_disposition_filename_parm(i: &[u8]) -> IResult<&[u8], &[u8]> {
 }
 
 pub fn content_disposition_filename_star_parm(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    let (i, _) = tag_no_case!(i, "filename*")?;
-    let (i, _) = opt!(i, take_while!(is_space))?;
-    let (i, _) = tag!(i, "=")?;
-    let (i, _) = opt!(i, take_while!(is_space))?;
+    let (i, _) = tag_no_case("filename*")(i)?;
+    let (i, _) = opt(take_while(is_space))(i)?;
+    let (i, _) = tag("=")(i)?;
+    let (i, _) = opt(take_while(is_space))(i)?;
 
     content_disposition_ext_value(i)
 }
 
 pub fn content_disposition_ext_parm1(i: &[u8]) -> IResult<&[u8], &[u8]> {
     let (i, _) = token(i)?;
-    let (i, _) = opt!(i, take_while!(is_space))?;
-    let (i, _) = tag!(i, "=")?;
-    let (i, _) = opt!(i, take_while!(is_space))?;
+    let (i, _) = opt(take_while(is_space))(i)?;
+    let (i, _) = tag("=")(i)?;
+    let (i, _) = opt(take_while(is_space))(i)?;
     content_disposition_value(i)
 }
 
 pub fn content_disposition_ext_parm2(i: &[u8]) -> IResult<&[u8], &[u8]> {
     let (i, _) = token(i)?;
-    let (i, _) = tag!(i, "*")?;
-    let (i, _) = opt!(i, take_while!(is_space))?;
-    let (i, _) = tag!(i, "=")?;
-    let (i, _) = opt!(i, take_while!(is_space))?;
+    let (i, _) = tag("*")(i)?;
+    let (i, _) = opt(take_while(is_space))(i)?;
+    let (i, _) = tag("=")(i)?;
+    let (i, _) = opt(take_while(is_space))(i)?;
     content_disposition_ext_value(i)
 }
 
 pub fn content_disposition_value(i: &[u8]) -> IResult<&[u8], &[u8]> {
     //println!("will parse:{}", String::from_utf8_lossy(i));
-    let (i, o) = recognize!(i, alt!(
+    let (i, o) = recognize(alt((
               // FIXME: escaping
-              delimited!(char!('"'), is_not!("\""), char!('"')) |
+              delimited(char('"'), is_not("\""), char('"')),
               token
-            ))?;
+            )))(i)?;
 
     //println!("parsed:{}", String::from_utf8_lossy(o));
     Ok((i, o))
@@ -370,12 +359,12 @@ pub fn content_disposition_value(i: &[u8]) -> IResult<&[u8], &[u8]> {
 pub fn content_disposition_ext_value(i: &[u8]) -> IResult<&[u8], &[u8]> {
     //println!("will parse ext-value:{}", String::from_utf8_lossy(i));
 
-    let (i, o) = recognize!(i,
-        preceded!(
-            alt!(tag_no_case!("UTF-8") | tag_no_case!("ISO-8859-1")),
-            preceded!(
-                delimited!(tag!("'"), is_not!("'"), tag!("'")),
-                take_while!(|c| {
+    let (i, o) = recognize(
+        preceded(
+            alt((tag_no_case("UTF-8"), tag_no_case("ISO-8859-1"))),
+            preceded(
+                delimited(tag("'"), is_not("'"), tag("'")),
+                take_while(|c| {
                     is_alphanumeric(c) ||
                     "!#$&+-.^_`|~".contains(c as char) ||
                     //FIXME: percent encoding
@@ -383,7 +372,7 @@ pub fn content_disposition_ext_value(i: &[u8]) -> IResult<&[u8], &[u8]> {
                     c as char== '%'
                 })
             )
-        ))?;
+        ))(i)?;
 
     Ok((i, o))
 }
@@ -646,12 +635,9 @@ impl<'a> Header<'a> {
           }
 
           while input.len() != 0 {
-            match do_parse!(input,
-              opt!(complete!(sp)) >>
-              complete!(char!(',')) >>
-              opt!(sp) >>
-              v: single_header_value >> (v)
-            ) {
+            match preceded(
+              tuple((opt(complete(sp)), complete(char(',')), opt(sp))),
+              single_header_value)(input) {
               Ok((i, v)) => {
                 if compare_no_case(v, b"upgrade") {
                   has_upgrade = true;
@@ -719,12 +705,9 @@ impl<'a> Header<'a> {
             false
           } else {
             while input.len() != 0 {
-              match do_parse!(input,
-                opt!(complete!(sp)) >>
-                complete!(char!(',')) >>
-                opt!(sp) >>
-                v: single_header_value >> (v)
-              ) {
+              match preceded(
+                tuple((opt(complete(sp)), complete(char(',')), opt(sp))),
+                single_header_value)(input) {
                 Ok((i, v)) => {
                   if compare_no_case(v, b"upgrade") {
                     return false;
