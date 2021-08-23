@@ -509,7 +509,7 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
             LoggerBackend::Stdout(stdout())
         } else {
             let mut dir = env::temp_dir();
-            let s: String = thread_rng().sample_iter(&Alphanumeric).take(12).collect();
+            let s: String = thread_rng().sample_iter(&Alphanumeric).take(12).map(|c| c as char).collect();
             dir.push(s);
             let socket = UnixDatagram::bind(dir).unwrap();
             socket.connect(path).unwrap();
@@ -785,6 +785,6 @@ pub fn now() -> (Rfc3339Time, i128) {
     let t = time::OffsetDateTime::now_utc();
     (
         Rfc3339Time { inner: t },
-        (t - time::OffsetDateTime::unix_epoch()).whole_nanoseconds(),
+        (t - time::OffsetDateTime::UNIX_EPOCH).whole_nanoseconds(),
     )
 }
