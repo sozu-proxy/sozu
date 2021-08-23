@@ -1,13 +1,13 @@
+use sozu_command::logging::{target_to_backend, Logger, LoggerBackend};
 use std::env;
 use std::sync::{Arc, Mutex};
-use sozu_command::logging::{Logger,LoggerBackend,target_to_backend};
 
 lazy_static! {
-  pub static ref MAIN_LOGGER: Arc<Mutex<Logger>> = Arc::new(Mutex::new(Logger::new()));
-  pub static ref TAG:    String          = {
-      let logger= MAIN_LOGGER.lock().unwrap();
-      (*logger).tag.clone()
-  };
+    pub static ref MAIN_LOGGER: Arc<Mutex<Logger>> = Arc::new(Mutex::new(Logger::new()));
+    pub static ref TAG: String = {
+        let logger = MAIN_LOGGER.lock().unwrap();
+        (*logger).tag.clone()
+    };
 }
 
 #[macro_export]
@@ -48,35 +48,39 @@ macro_rules! log {
     };
 }
 
-pub fn init(tag: String, spec: &str, backend: LoggerBackend, access_backend: Option<LoggerBackend>) {
-  let directives = crate::sozu_command::logging::parse_logging_spec(spec);
-  let mut logger = MAIN_LOGGER.lock().unwrap();
-  if !logger.initialized {
-      println!("initializing logger");
-      logger.set_directives(directives);
-      logger.backend        = backend;
-      logger.access_backend = access_backend;
-      logger.tag            = tag;
-      logger.pid            = unsafe { libc::getpid() };
-      logger.initialized    = true;
+pub fn init(
+    tag: String,
+    spec: &str,
+    backend: LoggerBackend,
+    access_backend: Option<LoggerBackend>,
+) {
+    let directives = crate::sozu_command::logging::parse_logging_spec(spec);
+    let mut logger = MAIN_LOGGER.lock().unwrap();
+    if !logger.initialized {
+        println!("initializing logger");
+        logger.set_directives(directives);
+        logger.backend = backend;
+        logger.access_backend = access_backend;
+        logger.tag = tag;
+        logger.pid = unsafe { libc::getpid() };
+        logger.initialized = true;
 
-      //let _ = log::set_logger(&crate::sozu_command::logging::COMPAT_LOGGER).map_err(|e| println!("could not register compat logger: {:?}", e));
-      log::set_max_level(log::LevelFilter::Info);
-  }
+        //let _ = log::set_logger(&crate::sozu_command::logging::COMPAT_LOGGER).map_err(|e| println!("could not register compat logger: {:?}", e));
+        log::set_max_level(log::LevelFilter::Info);
+    }
 }
 
 pub fn setup(tag: String, level: &str, target: &str, access_target: Option<&str>) {
-  let backend = target_to_backend(target);
-  let access_backend = access_target.map(target_to_backend);
+    let backend = target_to_backend(target);
+    let access_backend = access_target.map(target_to_backend);
 
-  if let Ok(log_level) = env::var("RUST_LOG") {
-    init(tag, &log_level, backend, access_backend);
-  } else {
-    // We set the env variable so every worker can access it
-    env::set_var("RUST_LOG", level);
-    init(tag, level, backend, access_backend);
-  }
-  //initialize TAG here to avoid deadlocks
-  let _ = &*TAG;
+    if let Ok(log_level) = env::var("RUST_LOG") {
+        init(tag, &log_level, backend, access_backend);
+    } else {
+        // We set the env variable so every worker can access it
+        env::set_var("RUST_LOG", level);
+        init(tag, level, backend, access_backend);
+    }
+    //initialize TAG here to avoid deadlocks
+    let _ = &*TAG;
 }
-

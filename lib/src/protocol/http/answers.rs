@@ -1,41 +1,41 @@
-use std::rc::Rc;
-use std::collections::HashMap;
-use ClusterId;
 use super::DefaultAnswerStatus;
+use std::collections::HashMap;
+use std::rc::Rc;
+use ClusterId;
 
 #[allow(non_snake_case)]
 pub struct DefaultAnswers {
-  /// 400
-  pub BadRequest:         Rc<Vec<u8>>,
-  /// 401
-  pub Unauthorized:       Rc<Vec<u8>>,
-  /// 404
-  pub NotFound:           Rc<Vec<u8>>,
-  /// 408
-  pub RequestTimeout:     Rc<Vec<u8>>,
-  /// 413
-  pub PayloadTooLarge:    Rc<Vec<u8>>,
-  /// 502
-  pub BadGateway:         Rc<Vec<u8>>,
-  /// 503
-  pub ServiceUnavailable: Rc<Vec<u8>>,
-  /// 504
-  pub GatewayTimeout:     Rc<Vec<u8>>,
+    /// 400
+    pub BadRequest: Rc<Vec<u8>>,
+    /// 401
+    pub Unauthorized: Rc<Vec<u8>>,
+    /// 404
+    pub NotFound: Rc<Vec<u8>>,
+    /// 408
+    pub RequestTimeout: Rc<Vec<u8>>,
+    /// 413
+    pub PayloadTooLarge: Rc<Vec<u8>>,
+    /// 502
+    pub BadGateway: Rc<Vec<u8>>,
+    /// 503
+    pub ServiceUnavailable: Rc<Vec<u8>>,
+    /// 504
+    pub GatewayTimeout: Rc<Vec<u8>>,
 }
 
 #[allow(non_snake_case)]
 pub struct CustomAnswers {
-  pub ServiceUnavailable: Option<Rc<Vec<u8>>>,
+    pub ServiceUnavailable: Option<Rc<Vec<u8>>>,
 }
 
 pub struct HttpAnswers {
-  pub default: DefaultAnswers,
-  pub custom:  HashMap<ClusterId, CustomAnswers>,
+    pub default: DefaultAnswers,
+    pub custom: HashMap<ClusterId, CustomAnswers>,
 }
 
 impl HttpAnswers {
-  pub fn new(answer_404: &str, answer_503: &str) -> Self {
-    HttpAnswers {
+    pub fn new(answer_404: &str, answer_503: &str) -> Self {
+        HttpAnswers {
       default: DefaultAnswers {
         BadRequest: Rc::new(Vec::from(
           &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
@@ -60,35 +60,36 @@ impl HttpAnswers {
       },
       custom: HashMap::new(),
     }
-  }
-
-  pub fn add_custom_answer(&mut self, cluster_id: &str, answer_503: &str) {
-    let a = answer_503.to_owned();
-    self.custom
-      .entry(cluster_id.to_string())
-      .and_modify(|c| c.ServiceUnavailable = Some(Rc::new(a.into_bytes())))
-      .or_insert(CustomAnswers{ ServiceUnavailable: Some(Rc::new(answer_503.to_owned().into_bytes())) });
-  }
-
-  pub fn remove_custom_answer(&mut self, cluster_id: &str) {
-    self.custom.remove(cluster_id);
-  }
-
-  pub fn get(&self, answer: DefaultAnswerStatus, cluster_id: Option<&str>) -> Rc<Vec<u8>> {
-    match answer {
-      DefaultAnswerStatus::Answer301 => panic!("the 301 answer is generated dynamically"),
-      DefaultAnswerStatus::Answer400 => self.default.BadRequest.clone(),
-      DefaultAnswerStatus::Answer401 => self.default.Unauthorized.clone(),
-      DefaultAnswerStatus::Answer404 => self.default.NotFound.clone(),
-      DefaultAnswerStatus::Answer408 => self.default.RequestTimeout.clone(),
-      DefaultAnswerStatus::Answer413 => self.default.PayloadTooLarge.clone(),
-      DefaultAnswerStatus::Answer502 => self.default.BadGateway.clone(),
-      DefaultAnswerStatus::Answer503 => cluster_id.and_then(|id: &str| self.custom.get(id))
-        .and_then(|c| c.ServiceUnavailable.clone()).unwrap_or_else(|| self.default.ServiceUnavailable.clone()),
-      DefaultAnswerStatus::Answer504 => self.default.GatewayTimeout.clone(),
-
     }
 
-  }
+    pub fn add_custom_answer(&mut self, cluster_id: &str, answer_503: &str) {
+        let a = answer_503.to_owned();
+        self.custom
+            .entry(cluster_id.to_string())
+            .and_modify(|c| c.ServiceUnavailable = Some(Rc::new(a.into_bytes())))
+            .or_insert(CustomAnswers {
+                ServiceUnavailable: Some(Rc::new(answer_503.to_owned().into_bytes())),
+            });
+    }
 
+    pub fn remove_custom_answer(&mut self, cluster_id: &str) {
+        self.custom.remove(cluster_id);
+    }
+
+    pub fn get(&self, answer: DefaultAnswerStatus, cluster_id: Option<&str>) -> Rc<Vec<u8>> {
+        match answer {
+            DefaultAnswerStatus::Answer301 => panic!("the 301 answer is generated dynamically"),
+            DefaultAnswerStatus::Answer400 => self.default.BadRequest.clone(),
+            DefaultAnswerStatus::Answer401 => self.default.Unauthorized.clone(),
+            DefaultAnswerStatus::Answer404 => self.default.NotFound.clone(),
+            DefaultAnswerStatus::Answer408 => self.default.RequestTimeout.clone(),
+            DefaultAnswerStatus::Answer413 => self.default.PayloadTooLarge.clone(),
+            DefaultAnswerStatus::Answer502 => self.default.BadGateway.clone(),
+            DefaultAnswerStatus::Answer503 => cluster_id
+                .and_then(|id: &str| self.custom.get(id))
+                .and_then(|c| c.ServiceUnavailable.clone())
+                .unwrap_or_else(|| self.default.ServiceUnavailable.clone()),
+            DefaultAnswerStatus::Answer504 => self.default.GatewayTimeout.clone(),
+        }
+    }
 }

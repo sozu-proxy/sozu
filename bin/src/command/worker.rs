@@ -1,10 +1,10 @@
 use futures::SinkExt;
 use libc::pid_t;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use std::collections::VecDeque;
 use std::fmt;
 use std::os::unix::io::AsRawFd;
-use nix::sys::signal::kill;
-use nix::unistd::Pid;
 
 use sozu_command::channel::Channel;
 use sozu_command::command::RunState;
@@ -46,11 +46,13 @@ impl Worker {
 
     pub async fn send(&mut self, request_id: String, data: ProxyRequestData) {
         if let Some(tx) = self.sender.as_mut() {
-            if let Err(e) = tx.send(ProxyRequest {
-                id: request_id,
-                order: data,
-            })
-            .await {
+            if let Err(e) = tx
+                .send(ProxyRequest {
+                    id: request_id,
+                    order: data,
+                })
+                .await
+            {
                 error!("error sending message to worker {:?}: {:?}", self.id, e);
             }
         }

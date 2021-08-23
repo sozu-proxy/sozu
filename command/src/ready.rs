@@ -115,11 +115,14 @@ impl fmt::Debug for Ready {
             (Ready::readable(), "Readable"),
             (Ready::writable(), "Writable"),
             (Ready(ERROR), "Error"),
-            (Ready(HUP), "Hup")];
+            (Ready(HUP), "Hup"),
+        ];
 
         for &(flag, msg) in &flags {
             if self.contains(flag) {
-                if one { write!(fmt, " | ")? }
+                if one {
+                    write!(fmt, " | ")?
+                }
                 write!(fmt, "{}", msg)?;
 
                 one = true
