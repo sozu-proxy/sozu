@@ -1078,7 +1078,6 @@ mod tests {
       request_timeout: 10,
       back_timeout: 30,
       connect_timeout: 3,
-      request_timeout: 10,
     }));
     state.handle_order(&ProxyRequestData::AddHttpsListener(HttpsListener {
       address: "0.0.0.0:8443".parse().unwrap(),
@@ -1098,7 +1097,6 @@ mod tests {
       request_timeout: 10,
       back_timeout: 30,
       connect_timeout: 3,
-      request_timeout: 10,
     }));
     state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       address: "0.0.0.0:8443".parse().unwrap(),
@@ -1126,7 +1124,6 @@ mod tests {
       request_timeout: 10,
       back_timeout: 30,
       connect_timeout: 3,
-      request_timeout: 10,
     }));
     state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       address: "0.0.0.0:8080".parse().unwrap(),
@@ -1151,7 +1148,6 @@ mod tests {
       request_timeout: 10,
       back_timeout: 30,
       connect_timeout: 3,
-      request_timeout: 10,
     }));
     state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       address: "0.0.0.0:8443".parse().unwrap(),
@@ -1192,7 +1188,6 @@ mod tests {
         request_timeout: 10,
         back_timeout: 30,
         connect_timeout: 3,
-        request_timeout: 10,
       }),
       ProxyRequestData::ActivateListener(ActivateListener {
         address: "0.0.0.0:8080".parse().unwrap(),
@@ -1221,7 +1216,6 @@ mod tests {
         request_timeout: 10,
         back_timeout: 30,
         connect_timeout: 3,
-        request_timeout: 10,
       }),
     );
 
