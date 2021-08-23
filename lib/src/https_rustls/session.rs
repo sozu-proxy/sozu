@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::net::{Shutdown, SocketAddr};
+
 use crate::sozu_command::proxy::ProxyEvent;
 use mio::net::*;
 use mio::unix::SourceFd;
@@ -6,19 +9,17 @@ use rustls::{
     CipherSuite, ProtocolVersion, ServerSession, Session as ClientSession, SupportedCipherSuite,
 };
 use rusty_ulid::Ulid;
-use std::cell::RefCell;
 use std::io::{ErrorKind, Read};
-use std::net::{Shutdown, SocketAddr};
 use std::os::unix::prelude::AsRawFd;
 use std::rc::{Rc, Weak};
 use std::str::from_utf8_unchecked;
 use time::{Duration, Instant};
 
 use super::configuration::Proxy;
-use crate::buffer_queue::BufferQueue;
 use crate::pool::Pool;
-use crate::protocol::http::parser::{hostname_and_port, Method, RRequestLine, RequestState};
-use crate::protocol::http::{answers::HttpAnswers, DefaultAnswerStatus};
+use crate::protocol::http::parser::request2::RequestState;
+use crate::protocol::http::parser::{hostname_and_port, Method, RRequestLine};
+use crate::protocol::http::{answers::HttpAnswers, buffer::HttpBuffer, DefaultAnswerStatus};
 use crate::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use crate::protocol::rustls::TlsHandshake;
 use crate::protocol::{Http, Pipe, ProtocolResult, StickySession};
@@ -241,9 +242,9 @@ impl Session {
                 }
             }
 
-            let sz = front_buf.available_data();
-            let mut buf = BufferQueue::with_buffer(front_buf);
-            buf.sliced_input(sz);
+            let _sz = front_buf.available_data();
+            let buf = HttpBuffer::with_buffer(front_buf);
+            //buf.sliced_input(sz);
 
             gauge_add!("protocol.tls.handshake", -1);
             gauge_add!("protocol.https", 1);
@@ -260,7 +261,7 @@ impl Session {
             let ws_context = http.websocket_context();
 
             let front_buf = match http.front_buf {
-                Some(buf) => buf.buffer,
+                Some(buf) => buf.into_inner(),
                 None => {
                     if let Some(p) = self.pool.upgrade() {
                         if let Some(buf) = p.borrow_mut().checkout() {
@@ -274,7 +275,7 @@ impl Session {
                 }
             };
             let back_buf = match http.back_buf {
-                Some(buf) => buf.buffer,
+                Some(buf) => buf.into_inner(),
                 None => {
                     if let Some(p) = self.pool.upgrade() {
                         if let Some(buf) = p.borrow_mut().checkout() {

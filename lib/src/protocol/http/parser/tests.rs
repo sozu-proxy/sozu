@@ -1,10 +1,13 @@
 use super::*;
-use crate::buffer_queue::{buf_with_capacity, OutputElement};
-#[cfg(test)]
-use crate::protocol::http::AddedRequestHeader;
 use nom::{error::ErrorKind, Err, HexDisplay};
+#[cfg(test)]
+use pretty_assertions::assert_eq;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use super::super::buffer::http_buf_with_capacity;
+#[cfg(test)]
+use crate::protocol::http::AddedHeader;
 
 /*
 #[test]
@@ -103,43 +106,41 @@ fn parse_state_host_in_url_test() {
           Content-Length: 200\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
-    println!("buffer input: {:?}", buf.input_queue);
+    //println!("buffer input: {:?}", buf.input_queue);
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("result: {:?}", state);
     println!("input length: {}", input.len());
-    println!("buffer input: {:?}", buf.input_queue);
-    println!("buffer output: {:?}", buf.output_queue);
+    state = state.consume(header_end.unwrap(), &mut buf);
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(49),
-            OutputElement::Slice(25),
-            OutputElement::Slice(13),
-            OutputElement::Slice(21),
-            OutputElement::Slice(202)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 310);
-    assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::RequestWithBody(
-                RRequestLine {
+            RequestState::RequestWithBody {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("http://example.com:8888/index.html"),
                     version: Version::V11
                 },
-                Connection::new(),
-                String::from("example.com"),
-                200
-            ),
+                connection: Connection::keep_alive(),
+                host: String::from("example.com"),
+                length: 200,
+            },
             Some(110)
         )
     );
+    /*
+    println!("buffer input: {:?}", buf.input_queue);
+    println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(49), OutputElement::Slice(25),
+      OutputElement::Slice(13), OutputElement::Slice(21),
+      OutputElement::Insert(vec!()), OutputElement::Slice(202)));
+    assert_eq!(buf.start_parsing_position, 310);
+    */
 }
 
 #[test]
@@ -151,38 +152,29 @@ fn parse_state_host_in_url_conflict_test() {
           Content-Length: 200\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
-    println!("buffer input: {:?}", buf.input_queue);
+    //println!("buffer input: {:?}", buf.input_queue);
 
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
     println!("result: {:?}", result);
     println!("input length: {}", input.len());
+    /*
     println!("buffer input: {:?}", buf.input_queue);
     println!("buffer output: {:?}", buf.output_queue);
-    assert_eq!(
-        buf.output_queue,
-        vec!(OutputElement::Slice(49), OutputElement::Slice(16))
-    );
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(49), OutputElement::Slice(16)));
     assert_eq!(buf.start_parsing_position, 65);
-    assert_eq!(
-        result,
-        (
-            RequestState::Error(
-                Some(RRequestLine {
-                    method: Method::Get,
-                    uri: String::from("http://example.com:8888/index.html"),
-                    version: Version::V11
-                },),
-                Some(Connection::new()),
-                Some(String::from("example.com")),
-                None,
-                None
-            ),
-            None
-        )
-    );
+    */
+    assert!(result.0.is_front_error());
+    if let RequestState::Error { host, .. } = result.0 {
+        assert_eq!(host, Some(String::from("example.com")));
+    } else {
+        panic!("unexpected error: {:?}", result);
+    }
+
+    //panic!();
 }
 
 #[test]
@@ -194,44 +186,41 @@ fn parse_state_content_length_test() {
           Content-Length: 200\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
-    println!("buffer input: {:?}", buf.input_queue);
+    //println!("buffer input: {:?}", buf.input_queue);
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("result: {:?}", state);
     println!("input length: {}", input.len());
-    println!("buffer input: {:?}", buf.input_queue);
-    println!("buffer output: {:?}", buf.output_queue);
+    state = state.consume(header_end.unwrap(), &mut buf);
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(26),
-            OutputElement::Slice(22),
-            OutputElement::Slice(25),
-            OutputElement::Slice(13),
-            OutputElement::Slice(21),
-            OutputElement::Slice(202)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 309);
-    assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::RequestWithBody(
-                RRequestLine {
+            RequestState::RequestWithBody {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
                 },
-                Connection::new(),
-                String::from("localhost:8888"),
-                200
-            ),
+                connection: Connection::keep_alive(),
+                host: String::from("localhost:8888"),
+                length: 200,
+            },
             Some(109)
         )
     );
+    /*
+    println!("buffer input: {:?}", buf.input_queue);
+    println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(26), OutputElement::Slice(22), OutputElement::Slice(25),
+      OutputElement::Slice(13), OutputElement::Slice(21),
+      OutputElement::Insert(vec!()), OutputElement::Slice(202)));
+    assert_eq!(buf.start_parsing_position, 309);
+    */
 }
 
 #[test]
@@ -242,64 +231,60 @@ fn parse_state_content_length_partial() {
           Accept: */*\r\n\
           Content-Length: 200\r\n\
           \r\n";
+    let initial = RequestState::Initial;
+    /*
     let initial = RequestState::HasRequestLine(
         RRequestLine {
-            method: Method::Get,
-            uri: String::from("/index.html"),
-            version: Version::V11,
+          method: Method::Get,
+          uri: String::from("/index.html"),
+          version: Version::V11
         },
-        Connection::keep_alive(),
-    );
+        Connection::keep_alive()
+      );
+    */
 
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     println!("skipping input:\n{}", (&input[..26]).to_hex(16));
     buf.write(&input[..]).unwrap();
-    println!("unparsed data:\n{}", buf.unparsed_data().to_hex(16));
-    println!("buffer output: {:?}", buf.output_queue);
-    buf.consume_parsed_data(26);
-    buf.slice_output(26);
-    println!(
-        "unparsed data after consume(26):\n{}",
-        buf.unparsed_data().to_hex(16)
-    );
-    println!("buffer output: {:?}", buf.output_queue);
+    //println!("unparsed data:\n{}", buf.unparsed_data().to_hex(16));
+    /*   println!("buffer output: {:?}", buf.output_queue);
+        buf.consume_parsed_data(26);
+        buf.slice_output(26);
+        println!("unparsed data after consume(26):\n{}", buf.unparsed_data().to_hex(16));
+        println!("buffer output: {:?}", buf.output_queue);
+    */
 
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!(
-        "unparsed data after parsing:\n{}",
-        buf.unparsed_data().to_hex(16)
-    );
-    println!("result: {:?}", result);
-    println!("input length: {}", input.len());
-    println!("buffer output: {:?}", buf.output_queue);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    //println!("unparsed data after parsing:\n{}", buf.unparsed_data().to_hex(16));
+    println!("result: {:?}", state);
+    state = state.consume(header_end.unwrap(), &mut buf);
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(26),
-            OutputElement::Slice(22),
-            OutputElement::Slice(25),
-            OutputElement::Slice(13),
-            OutputElement::Slice(21),
-            OutputElement::Slice(202)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 309);
-    assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::RequestWithBody(
-                RRequestLine {
+            RequestState::RequestWithBody {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
                 },
-                Connection::keep_alive(),
-                String::from("localhost:8888"),
-                200
-            ),
+                connection: Connection::keep_alive(),
+                host: String::from("localhost:8888"),
+                length: 200,
+            },
             Some(109)
         )
     );
+    /*
+    println!("input length: {}", input.len());
+    println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(26), OutputElement::Slice(22),
+      OutputElement::Slice(25), OutputElement::Slice(13),
+      OutputElement::Slice(21), OutputElement::Insert(vec!()),
+      OutputElement::Slice(202)));
+    assert_eq!(buf.start_parsing_position, 309);
+    */
 }
 
 #[test]
@@ -311,29 +296,31 @@ fn parse_state_chunked_test() {
           Accept: */*\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
-    assert_eq!(buf.start_parsing_position, 116);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("result: {:?}", state);
+    state = state.consume(header_end.unwrap(), &mut buf);
     assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::RequestWithBodyChunks(
-                RRequestLine {
+            RequestState::RequestWithBodyChunks {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
                 },
-                Connection::new(),
-                String::from("localhost:8888"),
-                Chunk::Initial
-            ),
+                connection: Connection::keep_alive(),
+                host: String::from("localhost:8888"),
+                chunk: Chunk::Initial,
+            },
             Some(116)
         )
     );
+    //assert_eq!(buf.start_parsing_position, 116);
 }
 
 #[test]
@@ -347,29 +334,24 @@ fn parse_state_duplicate_content_length_test() {
           \r\n";
     let initial = RequestState::Initial;
 
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
     println!("result: {:?}", result);
-    assert_eq!(buf.start_parsing_position, 128);
-    assert_eq!(
-        result,
-        (
-            RequestState::Error(
-                Some(RRequestLine {
-                    method: Method::Get,
-                    uri: String::from("/index.html"),
-                    version: Version::V11
-                },),
-                Some(Connection::new()),
-                Some(String::from("localhost:8888")),
-                Some(LengthInformation::Length(120)),
-                None
-            ),
-            None
-        )
-    );
+    //assert_eq!(buf.start_parsing_position, 128);
+    assert!(result.0.is_front_error());
+    /*assert_eq!(
+      result,
+      (
+        RequestState::Error(Some(
+          RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
+        ),
+          Some(Connection::new()), Some(String::from("localhost:8888")),
+          Some(LengthInformation::Length(120)), None),
+        None
+      )
+    );*/
 }
 
 // if there was a content-length, the chunked transfer encoding takes precedence
@@ -383,26 +365,29 @@ fn parse_state_content_length_and_chunked_test() {
           Accept: */*\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
-    assert_eq!(buf.start_parsing_position, 136);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("result: {:?}", state);
+    //assert_eq!(buf.start_parsing_position, 136);
+    println!("result: {:?}", state);
+    state = state.consume(header_end.unwrap(), &mut buf);
     assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::RequestWithBodyChunks(
-                RRequestLine {
+            RequestState::RequestWithBodyChunks {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
                 },
-                Connection::new(),
-                String::from("localhost:8888"),
-                Chunk::Initial
-            ),
+                connection: Connection::keep_alive(),
+                host: String::from("localhost:8888"),
+                chunk: Chunk::Initial,
+            },
             Some(136)
         )
     );
@@ -416,39 +401,37 @@ fn parse_request_without_length() {
           Connection: close\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("result: {:?}", state);
     println!("input length: {}", input.len());
-    println!("buffer output: {:?}", buf.output_queue);
+    state = state.consume(header_end.unwrap(), &mut buf);
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(16),
-            OutputElement::Slice(22),
-            OutputElement::Delete(19),
-            OutputElement::Slice(2)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 59);
-    assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::Request(
-                RRequestLine {
+            RequestState::Request {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/"),
                     version: Version::V11
                 },
-                Connection::close(),
-                String::from("localhost:8888")
-            ),
+                connection: Connection::close(),
+                host: String::from("localhost:8888"),
+            },
             Some(59)
         )
     );
+    /*
+    println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(16), OutputElement::Slice(22), OutputElement::Delete(19),
+      OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 59);
+    */
 }
 
 // HTTP 1.0 is connection close by default
@@ -458,29 +441,31 @@ fn parse_request_http_1_0_connection_close() {
           Host: localhost:8888\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
-    assert_eq!(buf.start_parsing_position, 40);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("result: {:?}", state);
+    //assert_eq!(buf.start_parsing_position, 40);
+    state = state.consume(header_end.unwrap(), &mut buf);
+    assert!(!state.should_keep_alive());
     assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::Request(
-                RRequestLine {
+            RequestState::Request {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/"),
                     version: Version::V10
                 },
-                Connection::new(),
-                String::from("localhost:8888")
-            ),
+                connection: Connection::close(),
+                host: String::from("localhost:8888"),
+            },
             Some(40)
         )
     );
-    assert!(!result.0.should_keep_alive());
 }
 
 #[test]
@@ -491,40 +476,39 @@ fn parse_request_http_1_0_connection_keep_alive() {
           Connection: keep-alive\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("result: {:?}", state);
     println!("input length: {}", input.len());
-    println!("buffer output: {:?}", buf.output_queue);
+    state = state.consume(header_end.unwrap(), &mut buf);
+    assert!(state.should_keep_alive());
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(16),
-            OutputElement::Slice(22),
-            OutputElement::Delete(24),
-            OutputElement::Slice(2)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 64);
-    assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::Request(
-                RRequestLine {
+            RequestState::Request {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/"),
                     version: Version::V10
                 },
-                Connection::keep_alive(),
-                String::from("localhost:8888")
-            ),
+                connection: Connection::keep_alive(),
+                host: String::from("localhost:8888"),
+            },
             Some(64)
         )
     );
-    assert!(result.0.should_keep_alive());
+
+    /*
+    println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(16), OutputElement::Slice(22), OutputElement::Delete(24),
+      OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 64);
+    */
 }
 
 #[test]
@@ -534,38 +518,37 @@ fn parse_request_http_1_1_connection_keep_alive() {
           Host: localhost:8888\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("end buf:\n{}", buf.buffer.data().to_hex(16));
-    println!("result: {:?}", result);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("end buf:\n{}", buf.unparsed_data().to_hex(16));
+    println!("result: {:?}", state);
+    state = state.consume(header_end.unwrap(), &mut buf);
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(16),
-            OutputElement::Slice(22),
-            OutputElement::Slice(2)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 40);
-    assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::Request(
-                RRequestLine {
+            RequestState::Request {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/"),
                     version: Version::V11
                 },
-                Connection::new(),
-                String::from("localhost:8888")
-            ),
+                connection: Connection::keep_alive(),
+                host: String::from("localhost:8888"),
+            },
             Some(40)
         )
     );
+    /*
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(16), OutputElement::Slice(22),
+      OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 40);
     assert!(result.0.should_keep_alive());
+    */
 }
 
 #[test]
@@ -576,39 +559,37 @@ fn parse_request_http_1_1_connection_close() {
           Host: localhost:8888\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("end buf:\n{}", buf.buffer.data().to_hex(16));
-    println!("result: {:?}", result);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("end buf:\n{}", buf.unparsed_data().to_hex(16));
+    println!("result: {:?}", state);
+    state = state.consume(header_end.unwrap(), &mut buf);
+    assert!(!state.should_keep_alive());
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(16),
-            OutputElement::Delete(19),
-            OutputElement::Slice(22),
-            OutputElement::Slice(2)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 59);
-    assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::Request(
-                RRequestLine {
+            RequestState::Request {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/"),
                     version: Version::V11
                 },
-                Connection::close(),
-                String::from("localhost:8888")
-            ),
+                connection: Connection::close(),
+                host: String::from("localhost:8888"),
+            },
             Some(59)
         )
     );
-    assert!(!result.0.should_keep_alive());
+    /*
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(16), OutputElement::Delete(19), OutputElement::Slice(22),
+      OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 59);
+    */
 }
 
 #[test]
@@ -621,10 +602,10 @@ fn parse_request_add_header_test() {
           Content-Length: 200\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
-    let added = Some(AddedRequestHeader {
+    let added = Some(AddedHeader {
         request_id: rusty_ulid::Ulid::from(0),
         public_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
         peer_address: Some(SocketAddr::new(
@@ -635,46 +616,39 @@ fn parse_request_add_header_test() {
         closing: false,
     });
 
-    let result = parse_request_until_stop(initial, None, &mut buf, added.as_ref(), "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, added.as_ref(), "SOZUBALANCEID");
+    println!("result: {:?}", state);
     println!("input length: {}", input.len());
-    println!("buffer output: {:?}", buf.output_queue);
-
-    let new_header = b"X-Forwarded-Proto: http\r\n\
-    X-Forwarded-Port: 8080\r\n\
-    X-Forwarded-For: 192.168.0.2\r\n\
-    Forwarded: proto=http;for=192.168.0.2:1234;by=127.0.0.1\r\n\
-    Sozu-Id: 00000000000000000000000000\r\n";
+    assert_eq!(header_end.unwrap(), 109);
+    // we add some request headers; so we must consume more
+    let to_consume = 109 + 173;
+    state = state.consume(to_consume, &mut buf);
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(26),
-            OutputElement::Slice(22),
-            OutputElement::Slice(25),
-            OutputElement::Slice(13),
-            OutputElement::Slice(21),
-            OutputElement::Insert(Vec::from(&new_header[..])),
-            OutputElement::Slice(202)
-        )
-    );
-    println!("buf:\n{}", buf.buffer.data().to_hex(16));
-    assert_eq!(buf.start_parsing_position, 309);
-    assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::RequestWithBody(
-                RRequestLine {
+            RequestState::RequestWithBody {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
                 },
-                Connection::new(),
-                String::from("localhost:8888"),
-                200
-            ),
+                connection: Connection::keep_alive(),
+                host: String::from("localhost:8888"),
+                length: 200,
+            },
             Some(109)
         )
     );
+    /*
+    println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(26), OutputElement::Slice(22), OutputElement::Slice(25),
+      OutputElement::Slice(13), OutputElement::Slice(21), OutputElement::Insert(Vec::from(&new_header[..])),
+    OutputElement::Slice(202)));
+    println!("buf:\n{}", buf.buffer.data().to_hex(16));
+    assert_eq!(buf.start_parsing_position, 309);
+    */
 }
 
 #[test]
@@ -688,10 +662,10 @@ fn parse_request_delete_forwarded_headers() {
           X-Forwarded-Port: 1234\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
-    let added = Some(AddedRequestHeader {
+    let added = Some(AddedHeader {
         request_id: rusty_ulid::Ulid::from(0),
         public_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
         peer_address: Some(SocketAddr::new(
@@ -702,45 +676,25 @@ fn parse_request_delete_forwarded_headers() {
         closing: false,
     });
 
-    let result = parse_request_until_stop(initial, None, &mut buf, added.as_ref(), "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, added.as_ref(), "SOZUBALANCEID");
+    println!("result: {:?}", state);
     println!("input length: {}", input.len());
-    println!("buffer output: {:?}", buf.output_queue);
-
-    let new_header = b"X-Forwarded-For: 10.0.0.2, 192.168.0.2\r\n\
-    Forwarded: proto:https;for=10.0.0.2:1234;by:1.2.3.4, proto=http;for=192.168.0.2:1234;by=127.0.0.1\r\n\
-    Sozu-Id: 00000000000000000000000000\r\n";
-
+    assert_eq!(header_end.unwrap(), 180);
+    // we add some request headers; so we must consume more
+    let to_consume = 180 + 176;
+    state = state.consume(to_consume, &mut buf);
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(26),
-            OutputElement::Slice(22),
-            // Forwarded
-            OutputElement::Delete(53),
-            // X-Forwarded-Proto
-            OutputElement::Slice(26),
-            // X-Forwarded-For
-            OutputElement::Delete(27),
-            // X-Forwarded-Port
-            OutputElement::Slice(24),
-            OutputElement::Insert(Vec::from(&new_header[..])),
-            OutputElement::Slice(2)
-        )
-    );
-    println!("buf:\n{}", buf.buffer.data().to_hex(16));
-    assert_eq!(buf.start_parsing_position, 180);
-    assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::Request(
-                RRequestLine {
+            RequestState::Request {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
                 },
-                Connection {
-                    keep_alive: None,
+                connection: Connection {
+                    keep_alive: Some(true),
                     has_upgrade: false,
                     upgrade: None,
                     continues: Continue::None,
@@ -750,15 +704,37 @@ fn parse_request_delete_forwarded_headers() {
                         x_proto: true,
                         x_host: false,
                         x_port: true,
-                        x_for: Some(String::from("10.0.0.2")),
-                        forwarded: Some(String::from("proto:https;for=10.0.0.2:1234;by:1.2.3.4")),
+                        x_for: Some("10.0.0.2".to_string()),
+                        forwarded: Some("proto:https;for=10.0.0.2:1234;by:1.2.3.4".to_string()),
                     },
                 },
-                String::from("localhost:8888"),
-            ),
+                host: String::from("localhost:8888"),
+            },
             Some(180)
         )
     );
+    /*
+    println!("buffer output: {:?}", buf.output_queue);
+
+    let new_header = b"X-Forwarded-For: 10.0.0.2, 192.168.0.2\r\n\
+    Forwarded: proto:https;for=10.0.0.2:1234;by:1.2.3.4, proto=http;for=192.168.0.2:1234;by=127.0.0.1\r\n\
+    Sozu-Id: 00000000000000000000000000\r\n";
+
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(26), OutputElement::Slice(22),
+      // Forwarded
+      OutputElement::Delete(53),
+      // X-Forwarded-Proto
+      OutputElement::Slice(26),
+      // X-Forwarded-For
+      OutputElement::Delete(27),
+      // X-Forwarded-Port
+      OutputElement::Slice(24),
+      OutputElement::Insert(Vec::from(&new_header[..])),
+    OutputElement::Slice(2)));
+    println!("buf:\n{}", buf.buffer.data().to_hex(16));
+    assert_eq!(buf.start_parsing_position, 179);
+    */
 }
 
 #[test]
@@ -776,7 +752,10 @@ fn parse_chunk() {
 
     let res = initial.parse(&input[..]);
     println!("result: {:?}", res);
-    assert_eq!(res, (BufferMove::Advance(43), Chunk::Ended));
+    assert_eq!(
+        res,
+        (BufferMove::Advance(43), Chunk::CopyingLastHeader(43, true))
+    );
 }
 
 #[test]
@@ -795,12 +774,15 @@ fn parse_chunk_partial() {
     println!("parsing input:\n{}", (&input[..12]).to_hex(16));
     let res = initial.parse(&input[..12]);
     println!("result: {:?}", res);
-    assert_eq!(res, (BufferMove::Advance(17), Chunk::Copying));
+    assert_eq!(res, (BufferMove::Advance(17), Chunk::Copying(17)));
 
     println!("consuming input:\n{}", (&input[..17]).to_hex(16));
     println!("parsing input:\n{}", (&input[17..]).to_hex(16));
     let res2 = res.1.parse(&input[17..]);
-    assert_eq!(res2, (BufferMove::Advance(26), Chunk::Ended));
+    assert_eq!(
+        res2,
+        (BufferMove::Advance(26), Chunk::CopyingLastHeader(43, true))
+    );
 }
 
 #[test]
@@ -820,28 +802,77 @@ fn parse_requests_and_chunks_test() {
           0\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
-    assert_eq!(buf.start_parsing_position, 160);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("result: {:?}", state);
+    //assert_eq!(buf.start_parsing_position, 160);
+    state = state.consume(header_end.unwrap(), &mut buf);
     assert_eq!(
-        result,
+        (&state, header_end),
         (
-            RequestState::RequestWithBodyChunks(
-                RRequestLine {
+            &RequestState::RequestWithBodyChunks {
+                request: RRequestLine {
                     method: Method::Post,
                     uri: String::from("/index.html"),
                     version: Version::V11
                 },
-                Connection::new(),
-                String::from("localhost:8888"),
-                Chunk::Ended
-            ),
+                connection: Connection::keep_alive(),
+                host: String::from("localhost:8888"),
+                chunk: Chunk::Initial,
+            },
             Some(117)
         )
+    );
+
+    //buf.consume_parsed_data(header_end.unwrap());
+
+    loop {
+        match state {
+            RequestState::RequestWithBodyChunks { chunk, .. } => match chunk {
+                Chunk::Initial | Chunk::Copying(_) | Chunk::CopyingLastHeader(_, _) => {
+                    let (st, advance) = super::request2::parse_chunks(state, &mut buf);
+
+                    state = st;
+                    if let Some(sz) = advance {
+                        println!(
+                            "parsed: {:?}",
+                            std::str::from_utf8(&(buf.unparsed_data())[..sz])
+                        );
+                        //buf.consume_parsed_data(sz);
+                        state = state.consume(sz, &mut buf);
+                    } else {
+                        break;
+                    }
+                }
+                Chunk::Error => {
+                    panic!();
+                }
+                Chunk::Ended => {
+                    break;
+                }
+            },
+            st => {
+                panic!("unexpected state: {:?}", st);
+            }
+        }
+    }
+
+    assert_eq!(
+        state,
+        RequestState::RequestWithBodyChunks {
+            request: RRequestLine {
+                method: Method::Post,
+                uri: String::from("/index.html"),
+                version: Version::V11
+            },
+            connection: Connection::keep_alive(),
+            host: String::from("localhost:8888"),
+            chunk: Chunk::Ended,
+        },
     );
 }
 
@@ -862,74 +893,214 @@ fn parse_requests_and_chunks_partial_test() {
           0\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..125]).unwrap();
-    println!("parsing\n{}", buf.buffer.data().to_hex(16));
+    println!(
+        "[{}]parsing request\n{}",
+        line!(),
+        buf.unparsed_data().to_hex(16)
+    );
 
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result({}): {:?}", line!(), result);
-    assert_eq!(buf.start_parsing_position, 124);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("result({}): {:?}", line!(), state);
+    state = state.consume(header_end.unwrap(), &mut buf);
+    //assert_eq!(buf.start_parsing_position, 124);
     assert_eq!(
-        result,
+        (&state, header_end),
         (
-            RequestState::RequestWithBodyChunks(
-                RRequestLine {
+            &RequestState::RequestWithBodyChunks {
+                request: RRequestLine {
                     method: Method::Post,
                     uri: String::from("/index.html"),
                     version: Version::V11
                 },
-                Connection::new(),
-                String::from("localhost:8888"),
-                Chunk::Copying
-            ),
+                connection: Connection::keep_alive(),
+                host: String::from("localhost:8888"),
+                chunk: Chunk::Initial,
+            },
             Some(117)
         )
     );
 
+    println!(
+        "[{}]parsing first chunks\n{}",
+        line!(),
+        buf.unparsed_data().to_hex(16)
+    );
+    println!(
+        "buf: available_data(: {}, parsed position: {}, buffer position: {}",
+        buf.unparsed_data().len(),
+        buf.parsed_position,
+        buf.buffer_position
+    );
+
+    loop {
+        match state {
+            RequestState::RequestWithBodyChunks { chunk, .. } => match chunk {
+                Chunk::Initial | Chunk::Copying(_) | Chunk::CopyingLastHeader(_, _) => {
+                    let (st, advance) = super::request2::parse_chunks(state, &mut buf);
+
+                    state = st;
+                    if let Some(sz) = advance {
+                        let index = std::cmp::min(sz, buf.unparsed_data().len());
+                        println!(
+                            "parsed: {:?}",
+                            std::str::from_utf8(&(buf.unparsed_data())[..index])
+                        );
+                        state = state.consume(index, &mut buf);
+                    } else {
+                        break;
+                    }
+                }
+                Chunk::Error => {
+                    panic!();
+                }
+                Chunk::Ended => {
+                    break;
+                }
+            },
+            st => {
+                panic!("unexpected state: {:?}", st);
+            }
+        }
+    }
+
+    assert_eq!(
+        state,
+        RequestState::RequestWithBodyChunks {
+            request: RRequestLine {
+                method: Method::Post,
+                uri: String::from("/index.html"),
+                version: Version::V11
+            },
+            connection: Connection::keep_alive(),
+            host: String::from("localhost:8888"),
+            chunk: Chunk::Copying(0),
+        },
+    );
+
+    println!("state is now {:?}", state);
     //buf.consume(124);
     buf.write(&input[125..140]).unwrap();
-    println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-    let result = parse_request_until_stop(result.0, result.1, &mut buf, None, "SOZUBALANCEID");
-    println!("result({}): {:?}", line!(), result);
-    assert_eq!(buf.start_parsing_position, 153);
+    let next_len = state.next_slice(buf.unparsed_data()).len();
+    println!("next_len: {}", next_len);
+    if next_len != 0 {
+        state = state.consume(next_len, &mut buf);
+    }
+
+    println!("state is now {:?}", state);
+
+    /*
+    println!("[{}]parsing next chunks\n{}", line!(), buf.unparsed_data().to_hex(16));
+    println!("buf: available_data(: {}, parsed position: {}, buffer position: {}",
+      buf.buffer.available_data(), buf.parsed_position, buf.buffer_position);
+
+    loop {
+      match state {
+        RequestState::RequestWithBodyChunks{chunk, ..} => match chunk {
+          Chunk::Initial | Chunk::Copying(_) | Chunk::CopyingLastHeader(_,_) => {
+            let (st, advance) = super::request2::parse_chunks(state, &mut buf);
+
+            state = st;
+            if let Some(sz) = advance {
+              let index = std::cmp::min(sz, buf.unparsed_data().len());
+              println!("parsed: {:?}",
+                std::str::from_utf8(&(buf.unparsed_data())[..index]));
+              buf.consume_parsed_data(index);
+              if state.next_slice(buf.unparsed_data()).len() == 0 {
+                break;
+              }
+            } else {
+              break;
+            }
+          },
+          Chunk::Error => {
+            panic!();
+          },
+          Chunk::Ended => {
+            break;
+          }
+        }protocol::http::parser::tests::parse_chunkprotocol::http::parser::tests::parse_chunk
+
     assert_eq!(
-        result,
-        (
-            RequestState::RequestWithBodyChunks(
-                RRequestLine {
-                    method: Method::Post,
-                    uri: String::from("/index.html"),
-                    version: Version::V11
-                },
-                Connection::new(),
-                String::from("localhost:8888"),
-                Chunk::Copying
-            ),
-            Some(117)
-        )
+      state,
+      RequestState::RequestWithBodyChunks {
+        request: RRequestLine { method: Method::Post, uri: String::from("/index.html"), version: Version::V11 },
+        connection: Connection::keep_alive(),
+        host: String::from("localhost:8888"),
+        chunk: Chunk::Copying(36),
+    },
+    );*/
+
+    buf.write(&input[140..]).unwrap();
+
+    let next_len = state.next_slice(buf.unparsed_data()).len();
+    println!("next_len: {}", next_len);
+    if next_len != 0 {
+        state = state.consume(next_len, &mut buf);
+    }
+    println!("state is now {:?}", state);
+
+    println!(
+        "[{}]parsing end\n{}",
+        line!(),
+        buf.unparsed_data().to_hex(16)
+    );
+    println!(
+        "buf: available_data(: {}, parsed position: {}, buffer position: {}",
+        buf.unparsed_data().len(),
+        buf.parsed_position,
+        buf.buffer_position
     );
 
-    buf.write(&input[153..]).unwrap();
-    println!("parsing\n{}", buf.buffer.data().to_hex(16));
-    let result = parse_request_until_stop(result.0, result.1, &mut buf, None, "SOZUBALANCEID");
-    println!("result({}): {:?}", line!(), result);
-    assert_eq!(buf.start_parsing_position, 160);
+    loop {
+        match state {
+            RequestState::RequestWithBodyChunks { chunk, .. } => match chunk {
+                Chunk::Initial | Chunk::Copying(_) | Chunk::CopyingLastHeader(_, _) => {
+                    let (st, advance) = super::request2::parse_chunks(state, &mut buf);
+
+                    state = st;
+                    if let Some(sz) = advance {
+                        let index = std::cmp::min(sz, buf.unparsed_data().len());
+                        println!(
+                            "parsed: {:?}",
+                            std::str::from_utf8(&(buf.unparsed_data())[..index])
+                        );
+                        state = state.consume(index, &mut buf);
+                    } else {
+                        break;
+                    }
+                }
+                Chunk::Error => {
+                    panic!();
+                }
+                Chunk::Ended => {
+                    break;
+                }
+            },
+            st => {
+                panic!("unexpected state: {:?}", st);
+            }
+        }
+    }
+
+    //let result = parse_request_until_stop(result.0, result.1, &mut buf, None, "SOZUBALANCEID");
+    //println!("result({}): {:?}", line!(), result);
+    //assert_eq!(buf.start_parsing_position, 160);
     assert_eq!(
-        result,
-        (
-            RequestState::RequestWithBodyChunks(
-                RRequestLine {
-                    method: Method::Post,
-                    uri: String::from("/index.html"),
-                    version: Version::V11
-                },
-                Connection::new(),
-                String::from("localhost:8888"),
-                Chunk::Ended
-            ),
-            Some(117)
-        )
+        state,
+        RequestState::RequestWithBodyChunks {
+            request: RRequestLine {
+                method: Method::Post,
+                uri: String::from("/index.html"),
+                version: Version::V11
+            },
+            connection: Connection::keep_alive(),
+            host: String::from("localhost:8888"),
+            chunk: Chunk::Ended,
+        },
     );
 }
 
@@ -949,131 +1120,160 @@ fn parse_response_and_chunks_partial_test() {
           0\r\n\
           \r\n";
     let initial = ResponseState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..78]).unwrap();
-    println!("parsing\n{}", buf.buffer.data().to_hex(16));
+    println!("parsing\n{}", buf.unparsed_data().to_hex(16));
 
-    let result = parse_response_until_stop(
+    let (mut state, header_end) = parse_response_until_stop(
         initial,
         None,
         &mut buf,
         false,
-        "",
+        None,
         "SOZUBALANCEID",
         None,
         None,
     );
-    println!("result({}): {:?}", line!(), result);
-    assert_eq!(buf.start_parsing_position, 81);
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(header_end, Some(74));
+    state = state.consume(header_end.unwrap(), &mut buf);
+    /*println!("result({}): {:?}", line!(), result);
+    assert_eq!(buf.start_parsing_position, 81);*/
     assert_eq!(
-        result,
-        (
-            ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 200,
-                    reason: String::from("OK")
-                },
-                Connection::new(),
-                Chunk::Copying
-            ),
-            Some(74)
-        )
+        state,
+        ResponseState::ResponseWithBodyChunks {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 200,
+                reason: String::from("OK")
+            },
+            connection: Connection::keep_alive(),
+            chunk: Chunk::Initial,
+        }
+    );
+
+    buf.write(&input[78..81]).unwrap();
+    let (mut state, advanced) = parse_response_until_stop(
+        state,
+        header_end,
+        &mut buf,
+        false,
+        None,
+        "SOZUBALANCEID",
+        None,
+        None,
+    );
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(74 + advanced.as_ref().unwrap(), 81);
+    state = state.consume(advanced.unwrap(), &mut buf);
+    assert_eq!(
+        state,
+        ResponseState::ResponseWithBodyChunks {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 200,
+                reason: String::from("OK")
+            },
+            connection: Connection::keep_alive(),
+            chunk: Chunk::Copying(0),
+        }
     );
 
     //buf.consume(78);
     buf.write(&input[81..100]).unwrap();
-    println!("parsing\n{}", buf.buffer.data().to_hex(16));
+    println!("parsing\n{}", buf.unparsed_data().to_hex(16));
 
-    let result = parse_response_until_stop(
-        result.0,
-        result.1,
+    let (mut state, advanced) = parse_response_until_stop(
+        state,
+        header_end,
         &mut buf,
         false,
-        "",
+        None,
         "SOZUBALANCEID",
         None,
         None,
     );
-    println!("result({}): {:?}", line!(), result);
-    assert_eq!(buf.start_parsing_position, 110);
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(81 + advanced.as_ref().unwrap(), 110);
+
+    /*println!("result({}): {:?}", line!(), result);
+    assert_eq!(buf.start_parsing_position, 110);*/
     assert_eq!(
-        result,
-        (
-            ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 200,
-                    reason: String::from("OK")
-                },
-                Connection::new(),
-                Chunk::Copying
-            ),
-            Some(74)
-        )
+        state,
+        ResponseState::ResponseWithBodyChunks {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 200,
+                reason: String::from("OK")
+            },
+            connection: Connection::keep_alive(),
+            chunk: Chunk::Copying(29),
+        }
     );
+    state = state.consume(19, &mut buf);
 
     //buf.consume(19);
-    println!("remaining:\n{}", &input[110..].to_hex(16));
+    println!("remaining:\n{}", buf.unparsed_data().to_hex(16));
     buf.write(&input[110..116]).unwrap();
-    println!("parsing\n{}", buf.buffer.data().to_hex(16));
-    let result = parse_response_until_stop(
-        result.0,
-        result.1,
+    println!("parsing\n{}", buf.unparsed_data().to_hex(16));
+    let (mut state, header_end) = parse_response_until_stop(
+        state,
+        header_end,
         &mut buf,
         false,
-        "",
+        None,
         "SOZUBALANCEID",
         None,
         None,
     );
-    println!("result({}): {:?}", line!(), result);
-    assert_eq!(buf.start_parsing_position, 115);
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(header_end, Some(5));
+
+    /*println!("result({}): {:?}", line!(), result);
+    assert_eq!(buf.start_parsing_position, 115);*/
     assert_eq!(
-        result,
-        (
-            ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 200,
-                    reason: String::from("OK")
-                },
-                Connection::new(),
-                Chunk::CopyingLastHeader
-            ),
-            Some(74)
-        )
+        state,
+        ResponseState::ResponseWithBodyChunks {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 200,
+                reason: String::from("OK")
+            },
+            connection: Connection::keep_alive(),
+            chunk: Chunk::CopyingLastHeader(15, false),
+        }
     );
 
+    state = state.consume(5, &mut buf);
     //buf.consume(5);
     buf.write(&input[116..]).unwrap();
-    println!("parsing\n{}", buf.buffer.data().to_hex(16));
-    let result = parse_response_until_stop(
-        result.0,
-        result.1,
+    println!("parsing\n{}", buf.unparsed_data().to_hex(16));
+    let (mut state, header_end) = parse_response_until_stop(
+        state,
+        header_end,
         &mut buf,
         false,
-        "",
+        None,
         "SOZUBALANCEID",
         None,
         None,
     );
-    println!("result({}): {:?}", line!(), result);
-    assert_eq!(buf.start_parsing_position, 117);
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(header_end, Some(2));
+    state = state.consume(12, &mut buf);
+    /*println!("result({}): {:?}", line!(), result);
+    assert_eq!(buf.start_parsing_position, 117);*/
     assert_eq!(
-        result,
-        (
-            ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 200,
-                    reason: String::from("OK")
-                },
-                Connection::new(),
-                Chunk::Ended
-            ),
-            Some(74)
-        )
+        state,
+        ResponseState::ResponseWithBodyChunks {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 200,
+                reason: String::from("OK")
+            },
+            connection: Connection::keep_alive(),
+            chunk: Chunk::Ended,
+        }
     );
 }
 
@@ -1093,146 +1293,145 @@ fn parse_incomplete_chunk_header_test() {
           in\r\n\r\nchunks.\r\n\
           0\r\n\
           \r\n";
-    let initial = ResponseState::HasLength(
-        RStatusLine {
-            version: Version::V11,
-            status: 200,
-            reason: String::from("OK"),
-        },
-        Connection::keep_alive(),
-        LengthInformation::Chunked,
-    );
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let initial = ResponseState::Initial; /*ResponseState::HasLength{
+                                            status: RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
+                                            connection: Connection::keep_alive(),
+                                            length: LengthInformation::Chunked,
+                                          };*/
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
 
     buf.write(&input[..74]).unwrap();
-    buf.consume_parsed_data(72);
-    //println!("parsing\n{}", buf.buffer.data().to_hex(16));
-    let result = parse_response_until_stop(
+    //buf.consume_parsed_data(72);
+    println!("parsing\n{}", buf.unparsed_data().to_hex(16));
+    let (mut state, header_end) = parse_response_until_stop(
         initial,
         None,
         &mut buf,
         false,
-        "",
+        None,
         "SOZUBALANCEID",
         None,
         None,
     );
-    println!("result: {:?}", result);
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(header_end, Some(74));
+    state = state.consume(header_end.unwrap(), &mut buf);
+
+    /*println!("result: {:?}", result);
     println!("input length: {}", input.len());
     println!("initial input:\n{}", &input[..72].to_hex(8));
     println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 74);*/
     assert_eq!(
-        buf.output_queue,
-        vec!(OutputElement::Insert(vec!()), OutputElement::Slice(2))
-    );
-    assert_eq!(buf.start_parsing_position, 74);
-    assert_eq!(
-        result,
-        (
-            ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 200,
-                    reason: String::from("OK")
-                },
-                Connection::keep_alive(),
-                Chunk::Initial
-            ),
-            Some(74)
-        )
+        state,
+        ResponseState::ResponseWithBodyChunks {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 200,
+                reason: String::from("OK")
+            },
+            connection: Connection::keep_alive(),
+            chunk: Chunk::Initial,
+        },
     );
 
     // we got the chunk header, but not the chunk content
     buf.write(&input[74..77]).unwrap();
-    println!("parsing\n{}", buf.buffer.data().to_hex(16));
-    let result = parse_response_until_stop(
-        result.0,
-        result.1,
+    println!("parsing\n{}", buf.unparsed_data().to_hex(16));
+    let (mut state, advance) = parse_response_until_stop(
+        state,
+        header_end,
         &mut buf,
         false,
-        "",
+        None,
         "SOZUBALANCEID",
         None,
         None,
     );
-    println!("result: {:?}", result);
-    assert_eq!(buf.start_parsing_position, 81);
-    assert_eq!(
-        result,
-        (
-            ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 200,
-                    reason: String::from("OK")
-                },
-                Connection::keep_alive(),
-                Chunk::Copying
-            ),
-            Some(74)
-        )
-    );
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(advance, Some(7));
 
-    //buf.consume(5);
+    /*println!("result: {:?}", result);
+    assert_eq!(buf.start_parsing_position, 81);*/
+    assert_eq!(
+        state,
+        ResponseState::ResponseWithBodyChunks {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 200,
+                reason: String::from("OK")
+            },
+            connection: Connection::keep_alive(),
+            chunk: Chunk::Copying(7),
+        }
+    );
+    buf.write(&input[77..81]).unwrap();
+    state = state.consume(advance.unwrap(), &mut buf);
+
+    println!("STATE IS NOW: {:?}", state);
 
     // the external code copied the chunk content directly, starting at next chunk end
     buf.write(&input[81..115]).unwrap();
-    println!("parsing\n{}", buf.buffer.data().to_hex(16));
-    let result = parse_response_until_stop(
-        result.0,
-        result.1,
+    println!("parsing\n{}", buf.unparsed_data().to_hex(16));
+    let (mut state, header_end) = parse_response_until_stop(
+        state,
+        header_end,
         &mut buf,
         false,
-        "",
+        None,
         "SOZUBALANCEID",
         None,
         None,
     );
-    println!("result({}): {:?}", line!(), result);
-    assert_eq!(buf.start_parsing_position, 115);
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(header_end, Some(34));
+
+    /*println!("result({}): {:?}", line!(), result);
+    assert_eq!(buf.start_parsing_position, 115);*/
     assert_eq!(
-        result,
-        (
-            ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 200,
-                    reason: String::from("OK")
-                },
-                Connection::keep_alive(),
-                Chunk::CopyingLastHeader
-            ),
-            Some(74)
-        )
+        state,
+        ResponseState::ResponseWithBodyChunks {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 200,
+                reason: String::from("OK")
+            },
+            connection: Connection::keep_alive(),
+            chunk: Chunk::CopyingLastHeader(34, false),
+        }
     );
+
+    state = state.consume(header_end.unwrap(), &mut buf);
+
     buf.write(&input[115..]).unwrap();
-    println!("parsing\n{}", &input[115..].to_hex(16));
-    let result = parse_response_until_stop(
-        result.0,
-        result.1,
+    println!("parsing\n{}", buf.unparsed_data().to_hex(16));
+    let (mut state, header_end) = parse_response_until_stop(
+        state,
+        header_end,
         &mut buf,
         false,
-        "",
+        None,
         "SOZUBALANCEID",
         None,
         None,
     );
-    println!("result({}): {:?}", line!(), result);
-    assert_eq!(buf.start_parsing_position, 117);
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(header_end, Some(2));
+    state = state.consume(header_end.unwrap(), &mut buf);
+    /*println!("result({}): {:?}", line!(), result);
+    assert_eq!(buf.start_parsing_position, 117);*/
     assert_eq!(
-        result,
-        (
-            ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 200,
-                    reason: String::from("OK")
-                },
-                Connection::keep_alive(),
-                Chunk::Ended
-            ),
-            Some(74)
-        )
+        state,
+        ResponseState::ResponseWithBodyChunks {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 200,
+                reason: String::from("OK")
+            },
+            connection: Connection::keep_alive(),
+            chunk: Chunk::Ended,
+        }
     );
 }
 
@@ -1245,52 +1444,64 @@ fn parse_response_302() {
         Connection: close\r\n\
         \r\n";
     let initial = ResponseState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
-    let new_header = b"Sozu-Id: 123456789\r\n";
-    let result = parse_response_until_stop(
+    let added = Some(AddedHeader {
+        request_id: rusty_ulid::Ulid::from(0),
+        public_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+        peer_address: Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 0, 2)),
+            1234,
+        )),
+        protocol: crate::Protocol::HTTP,
+        closing: false,
+    });
+    let (mut state, header_end) = parse_response_until_stop(
         initial,
         None,
         &mut buf,
         false,
-        "Sozu-Id: 123456789\r\n",
+        added.as_ref(),
         "SOZUBALANCEID",
         None,
         None,
     );
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(header_end, Some(125));
+    assert_eq!(header_end.unwrap(), 125);
+    // we add some request headers; so we must consume more
+    let to_consume = 125 + 37;
+    state = state.consume(to_consume, &mut buf);
+    /*let (mut state, header_end) = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+      println!("result({}): {:?}", line!(), state);
+      state = state.consume(header_end.unwrap(), &mut buf);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
-    println!("initial input:\n{}", &input[..72].to_hex(8));
-    println!("buffer output: {:?}", buf.output_queue);
+    println!("initial input:\n{}", &input[..72].to_hex(8));*/
+    //println!("buffer output: {:?}", buf.output_queue);
+    /*assert_eq!(buf.output_queue, vec!(
+        OutputElement::Slice(20),
+        OutputElement::Slice(25),
+        OutputElement::Slice(19),
+        OutputElement::Slice(40),
+        OutputElement::Delete(19),
+        OutputElement::Insert(Vec::from(&new_header[..])),
+        OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 125);*/
+
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(20),
-            OutputElement::Slice(25),
-            OutputElement::Slice(19),
-            OutputElement::Slice(40),
-            OutputElement::Delete(19),
-            OutputElement::Insert(Vec::from(&new_header[..])),
-            OutputElement::Slice(2)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 125);
-    assert_eq!(
-        result,
-        (
-            ResponseState::ResponseWithBody(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 302,
-                    reason: String::from("Found")
-                },
-                Connection::close(),
-                0
-            ),
-            Some(125)
-        )
+        state,
+        ResponseState::ResponseWithBody {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 302,
+                reason: String::from("Found")
+            },
+            connection: Connection::close(),
+            length: 0,
+        },
     );
 }
 
@@ -1303,51 +1514,55 @@ fn parse_response_303() {
         Connection: close\r\n\
         \r\n";
     let initial = ResponseState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
-    let new_header = b"Sozu-Id: 123456789\r\n";
-    let result = parse_response_until_stop(
+    let added = Some(AddedHeader {
+        request_id: rusty_ulid::Ulid::from(0),
+        public_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+        peer_address: Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 0, 2)),
+            1234,
+        )),
+        protocol: crate::Protocol::HTTP,
+        closing: false,
+    });
+    let (mut state, header_end) = parse_response_until_stop(
         initial,
         None,
         &mut buf,
         false,
-        "Sozu-Id: 123456789\r\n",
+        added.as_ref(),
         "SOZUBALANCEID",
         None,
         None,
     );
-    println!("result: {:?}", result);
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(header_end.unwrap(), 129);
+    // we add some request headers; so we must consume more
+    let to_consume = 129 + 37;
+    state = state.consume(to_consume, &mut buf);
+    /*println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
     println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(24), OutputElement::Slice(25),
+      OutputElement::Slice(19), OutputElement::Slice(40),
+      OutputElement::Delete(19), OutputElement::Insert(Vec::from(&new_header[..])),
+      OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 129);*/
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(24),
-            OutputElement::Slice(25),
-            OutputElement::Slice(19),
-            OutputElement::Slice(40),
-            OutputElement::Delete(19),
-            OutputElement::Insert(Vec::from(&new_header[..])),
-            OutputElement::Slice(2)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 129);
-    assert_eq!(
-        result,
-        (
-            ResponseState::ResponseWithBody(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 303,
-                    reason: String::from("See Other")
-                },
-                Connection::close(),
-                0
-            ),
-            Some(129)
-        )
+        state,
+        ResponseState::ResponseWithBody {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 303,
+                reason: String::from("See Other")
+            },
+            connection: Connection::close(),
+            length: 0,
+        }
     );
 }
 
@@ -1359,57 +1574,50 @@ fn parse_response_304() {
           \r\n";
     let initial = ResponseState::Initial;
     let is_head = true;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
-    println!("buffer input: {:?}", buf.input_queue);
+    //println!("buffer input: {:?}", buf.input_queue);
 
     //let result = parse_request(initial, input);
-    let result = parse_response_until_stop(
+    let (mut state, header_end) = parse_response_until_stop(
         initial,
         None,
         &mut buf,
         is_head,
-        "",
+        None,
         "SOZUBALANCEID",
         None,
         None,
     );
-    println!("result: {:?}", result);
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(header_end, Some(66));
+    state = state.consume(header_end.unwrap(), &mut buf);
+    /*println!("result: {:?}", result);
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
     println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(27), OutputElement::Delete(24), OutputElement::Slice(13),
+      OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 66);*/
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(27),
-            OutputElement::Delete(24),
-            OutputElement::Slice(13),
-            OutputElement::Insert(vec!()),
-            OutputElement::Slice(2)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 66);
-    assert_eq!(
-        result,
-        (
-            ResponseState::Response(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 304,
-                    reason: String::from("Not Modified")
-                },
-                Connection {
-                    keep_alive: Some(true),
-                    has_upgrade: false,
-                    upgrade: None,
-                    continues: Continue::None,
-                    to_delete: None,
-                    sticky_session: None,
-                    forwarded: ForwardedHeaders::default(),
-                },
-            ),
-            Some(66)
-        )
+        state,
+        ResponseState::Response {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 304,
+                reason: String::from("Not Modified")
+            },
+            connection: Connection {
+                keep_alive: Some(true),
+                has_upgrade: false,
+                upgrade: None,
+                continues: Continue::None,
+                to_delete: None,
+                sticky_session: None,
+                forwarded: ForwardedHeaders::default(),
+            },
+        }
     );
 }
 
@@ -1459,48 +1667,42 @@ fn parse_state_head_with_content_length_test() {
           \r\n";
     let initial = ResponseState::Initial;
     let is_head = true;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
-    println!("buffer input: {:?}", buf.input_queue);
+    //println!("buffer input: {:?}", buf.input_queue);
 
     //let result = parse_request(initial, input);
-    let result = parse_response_until_stop(
+    let (mut state, header_end) = parse_response_until_stop(
         initial,
         None,
         &mut buf,
         is_head,
-        "",
+        None,
         "SOZUBALANCEID",
         None,
         None,
     );
-    println!("result: {:?}", result);
+    println!("result({}): {:?}", line!(), state);
+    assert_eq!(header_end, Some(40));
+    state = state.consume(header_end.unwrap(), &mut buf);
+    /*println!("result: {:?}", result);
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
     println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(17), OutputElement::Slice(21),
+      OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 40);*/
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(17),
-            OutputElement::Slice(21),
-            OutputElement::Insert(vec!()),
-            OutputElement::Slice(2)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 40);
-    assert_eq!(
-        result,
-        (
-            ResponseState::Response(
-                RStatusLine {
-                    version: Version::V11,
-                    status: 200,
-                    reason: String::from("Ok")
-                },
-                Connection::new()
-            ),
-            Some(40)
-        )
+        state,
+        ResponseState::Response {
+            status: RStatusLine {
+                version: Version::V11,
+                status: 200,
+                reason: String::from("Ok")
+            },
+            connection: Connection::keep_alive(),
+        }
     );
 }
 
@@ -1514,39 +1716,26 @@ fn parse_connection_upgrade_test() {
           Connection: keep-alive, Upgrade\r\n\
           \r\n";
     let initial = RequestState::Initial;
-    let (_pool, mut buf) = buf_with_capacity(2048);
+    let (_pool, mut buf) = http_buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
-    println!("buffer input: {:?}", buf.input_queue);
+    //println!("buffer input: {:?}", buf.input_queue);
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    let (mut state, header_end) =
+        parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    println!("result: {:?}", state);
     println!("input length: {}", input.len());
-    println!("buffer input: {:?}", buf.input_queue);
-    println!("buffer output: {:?}", buf.output_queue);
+    state = state.consume(header_end.unwrap(), &mut buf);
     assert_eq!(
-        buf.output_queue,
-        vec!(
-            OutputElement::Slice(26),
-            OutputElement::Slice(22),
-            OutputElement::Slice(25),
-            OutputElement::Slice(13),
-            OutputElement::Slice(20),
-            OutputElement::Slice(33),
-            OutputElement::Slice(2)
-        )
-    );
-    assert_eq!(buf.start_parsing_position, 141);
-    assert_eq!(
-        result,
+        (state, header_end),
         (
-            RequestState::Request(
-                RRequestLine {
+            RequestState::Request {
+                request: RRequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
                 },
-                Connection {
+                connection: Connection {
                     keep_alive: Some(true),
                     has_upgrade: true,
                     upgrade: Some("WebSocket".to_string()),
@@ -1555,11 +1744,20 @@ fn parse_connection_upgrade_test() {
                     sticky_session: None,
                     forwarded: ForwardedHeaders::default(),
                 },
-                String::from("localhost:8888"),
-            ),
+                host: String::from("localhost:8888"),
+            },
             Some(141)
         )
     );
+    /*
+    println!("buffer input: {:?}", buf.input_queue);
+    println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(26), OutputElement::Slice(22), OutputElement::Slice(25),
+      OutputElement::Slice(13), OutputElement::Slice(20), OutputElement::Slice(33),
+      OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 141);
+    */
 }
 
 #[test]

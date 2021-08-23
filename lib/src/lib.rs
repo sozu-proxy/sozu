@@ -94,7 +94,6 @@
 //! ```ignore
 //! use std::thread;
 //! use std::sync::mpsc;
-//! use log::info;
 //! use sozu_command::messages;
 //! use sozu_command::channel::Channel;
 //! use sozu::network;
@@ -179,6 +178,8 @@ extern crate quickcheck;
 extern crate foreign_types_shared;
 #[cfg(feature = "use-openssl")]
 extern crate openssl_sys;
+#[cfg(test)]
+extern crate pretty_assertions;
 
 #[macro_use]
 pub mod util;

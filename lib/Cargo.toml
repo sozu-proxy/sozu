@@ -51,6 +51,7 @@ cookie-factory = "^0.3"
 hpack = "^0.3"
 x509-parser = "^0.10.0"
 thiserror = "^1.0.26"
+pretty_assertions = "0.7"
 
 [dev-dependencies]
 tiny_http = "^0.8"

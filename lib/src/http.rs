@@ -21,7 +21,7 @@ use crate::sozu_command::scm_socket::{Listeners, ScmSocket};
 
 use super::backends::BackendMap;
 use super::pool::Pool;
-use super::protocol::http::parser::{hostname_and_port, Method, RequestState};
+use super::protocol::http::parser::{hostname_and_port, request2::RequestState, Method};
 use super::protocol::http::{answers::HttpAnswers, DefaultAnswerStatus};
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use super::protocol::{Http, Pipe, ProtocolResult, StickySession};
@@ -155,7 +155,7 @@ impl Session {
             let ws_context = http.websocket_context();
 
             let front_buf = match http.front_buf {
-                Some(buf) => buf.buffer,
+                Some(buf) => buf.into_inner(),
                 None => {
                     if let Some(p) = self.pool.upgrade() {
                         if let Some(buf) = p.borrow_mut().checkout() {
@@ -170,7 +170,7 @@ impl Session {
             };
 
             let back_buf = match http.back_buf {
-                Some(buf) => buf.buffer,
+                Some(buf) => buf.into_inner(),
                 None => {
                     if let Some(p) = self.pool.upgrade() {
                         if let Some(buf) = p.borrow_mut().checkout() {
@@ -2057,6 +2057,7 @@ mod tests {
             load_metric: None,
             answer_503: None,
         };
+
         command.write_message(&ProxyRequest {
             id: String::from("ID_ABCD"),
             order: ProxyRequestData::AddCluster(cluster),

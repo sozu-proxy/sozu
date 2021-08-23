@@ -163,6 +163,11 @@ impl Checkout {
         &self.inner.extra()[self.inner.position..self.inner.end]
     }
 
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        let range = self.inner.position..self.inner.end;
+        &mut self.inner.extra_mut()[range]
+    }
+
     pub fn space(&mut self) -> &mut [u8] {
         let range = self.inner.end..self.capacity();
         &mut self.inner.extra_mut()[range]

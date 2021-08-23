@@ -27,12 +27,12 @@ use time::{Duration, Instant};
 
 use crate::sozu_command::logging;
 use crate::sozu_command::proxy::{
-    CertificateFingerprint, Cluster, HttpFrontend, HttpsListener, ProxyEvent, ProxyRequest,
-    ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
-    QueryAnswerCertificate, QueryCertificateType, Route, TlsVersion,
+    CertificateFingerprint, Cluster, HttpFrontend, HttpsListener, ProxyEvent,
+    ProxyRequest, ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query,
+    QueryAnswer, QueryAnswerCertificate, QueryCertificateType, Route, TlsVersion,
 };
-use crate::sozu_command::ready::Ready;
-use crate::sozu_command::scm_socket::ScmSocket;
+use sozu_command::ready::Ready;
+use sozu_command::scm_socket::ScmSocket;
 
 use crate::backends::BackendMap;
 use crate::pool::Pool;
@@ -40,7 +40,7 @@ use crate::protocol::h2::Http2;
 use crate::protocol::http::DefaultAnswerStatus;
 use crate::protocol::http::{
     answers::HttpAnswers,
-    parser::{hostname_and_port, Method, RRequestLine, RequestState},
+    parser::{hostname_and_port, request2::RequestState, Method, RRequestLine},
 };
 use crate::protocol::openssl::TlsHandshake;
 use crate::protocol::proxy_protocol::expect::ExpectProxyProtocol;
@@ -330,7 +330,7 @@ impl Session {
             let ws_context = http.websocket_context();
 
             let front_buf = match http.front_buf {
-                Some(buf) => buf.buffer,
+                Some(buf) => buf.into_inner(),
                 None => {
                     if let Some(p) = self.pool.upgrade() {
                         if let Some(buf) = p.borrow_mut().checkout() {
@@ -344,7 +344,7 @@ impl Session {
                 }
             };
             let back_buf = match http.back_buf {
-                Some(buf) => buf.buffer,
+                Some(buf) => buf.into_inner(),
                 None => {
                     if let Some(p) = self.pool.upgrade() {
                         if let Some(buf) = p.borrow_mut().checkout() {
@@ -2485,9 +2485,9 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
 mod tests {
     extern crate tiny_http;
     use super::*;
-    use crate::router::{trie::TrieNode, MethodRule, PathRule, Router};
-    use crate::sozu_command::proxy::Route;
     use openssl::ssl::{SslContext, SslMethod};
+    use crate::router::{trie::TrieNode, MethodRule, PathRule, Router};
+    use sozu_command::proxy::Route;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::rc::Rc;
