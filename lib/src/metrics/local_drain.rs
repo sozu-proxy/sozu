@@ -967,62 +967,38 @@ impl LocalDrain {
                 };
 
                 if let Some(old_v) = tree.get(&p50_key) {
-                    let new_percentile = calculate_percentile(
-                        *old_v as usize,
-                        t,
-                        standard_dev,
-                        0.50f64,
-                        );
+                    let new_percentile =
+                        calculate_percentile(*old_v as usize, t, standard_dev, 0.50f64);
                     tree.insert(p50_key, new_percentile as u64);
                 }
 
                 if let Some(old_v) = tree.get(&p90_key) {
-                    let new_percentile = calculate_percentile(
-                        *old_v as usize,
-                        t,
-                        standard_dev,
-                        0.90f64,
-                        );
+                    let new_percentile =
+                        calculate_percentile(*old_v as usize, t, standard_dev, 0.90f64);
                     tree.insert(p90_key, new_percentile as u64);
                 }
 
                 if let Some(old_v) = tree.get(&p99_key) {
-                    let new_percentile = calculate_percentile(
-                        *old_v as usize,
-                        t,
-                        standard_dev,
-                        0.99f64,
-                        );
+                    let new_percentile =
+                        calculate_percentile(*old_v as usize, t, standard_dev, 0.99f64);
                     tree.insert(p99_key, new_percentile as u64);
                 }
 
                 if let Some(old_v) = tree.get(&p99_9_key) {
-                    let new_percentile = calculate_percentile(
-                        *old_v as usize,
-                        t,
-                        standard_dev,
-                        0.999f64,
-                        );
+                    let new_percentile =
+                        calculate_percentile(*old_v as usize, t, standard_dev, 0.999f64);
                     tree.insert(p99_9_key, new_percentile as u64);
                 }
 
                 if let Some(old_v) = tree.get(&p99_99_key) {
-                    let new_percentile = calculate_percentile(
-                        *old_v as usize,
-                        t,
-                        standard_dev,
-                        0.9999f64,
-                        );
+                    let new_percentile =
+                        calculate_percentile(*old_v as usize, t, standard_dev, 0.9999f64);
                     tree.insert(p99_99_key, new_percentile as u64);
                 }
 
                 if let Some(old_v) = tree.get(&p99_999_key) {
-                    let new_percentile = calculate_percentile(
-                        *old_v as usize,
-                        t,
-                        standard_dev,
-                        0.99999f64,
-                        );
+                    let new_percentile =
+                        calculate_percentile(*old_v as usize, t, standard_dev, 0.99999f64);
                     tree.insert(p99_999_key, new_percentile as u64);
                 }
 

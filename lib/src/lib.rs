@@ -153,136 +153,140 @@
 #[cfg(all(feature = "unstable", test))]
 extern crate test;
 
-#[macro_use] extern crate nom;
-extern crate mio;
-extern crate url;
+#[macro_use]
+extern crate nom;
+extern crate hdrhistogram;
+extern crate libc;
 extern crate log;
-extern crate time;
-extern crate rand;
+extern crate mio;
+extern crate net2;
 #[cfg(feature = "use-openssl")]
 extern crate openssl;
-extern crate rustls;
 extern crate pool as pool_crate;
+extern crate rand;
+extern crate rustls;
 extern crate rusty_ulid;
-extern crate net2;
-extern crate libc;
 extern crate slab;
-extern crate hdrhistogram;
-#[macro_use] extern crate sozu_command_lib as sozu_command;
-extern crate idna;
-extern crate webpki;
-extern crate poule;
-extern crate lazycell;
-extern crate hashbrown;
-extern crate regex;
-extern crate hpack;
+extern crate time;
+extern crate url;
+#[macro_use]
+extern crate sozu_command_lib as sozu_command;
 extern crate cookie_factory;
+extern crate hashbrown;
+extern crate hpack;
+extern crate idna;
+extern crate lazycell;
+extern crate poule;
+extern crate regex;
+extern crate webpki;
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
+extern crate foreign_types_shared;
 #[cfg(feature = "use-openssl")]
 extern crate openssl_sys;
-extern crate foreign_types_shared;
 
-#[macro_use] pub mod util;
-#[macro_use] pub mod metrics;
+#[macro_use]
+pub mod util;
+#[macro_use]
+pub mod metrics;
 
-pub mod pool;
-pub mod buffer_queue;
-pub mod socket;
-pub mod router;
-pub mod protocol;
-pub mod http;
 pub mod backends;
-pub mod retry;
-pub mod load_balancing;
+pub mod buffer_queue;
 pub mod features;
+pub mod http;
+pub mod load_balancing;
+pub mod pool;
+pub mod protocol;
+pub mod retry;
+pub mod router;
+pub mod socket;
 pub mod timer;
 
 #[cfg(feature = "splice")]
 mod splice;
 
-pub mod tcp;
 pub mod server;
+pub mod tcp;
 
 #[cfg(feature = "use-openssl")]
 pub mod https_openssl;
 
 pub mod https_rustls;
 
-use mio::{Poll, Token};
 use mio::net::TcpStream;
+use mio::{Poll, Token};
+use std::cell::RefCell;
 use std::fmt;
-use std::str;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::cell::RefCell;
-use time::{Instant,Duration};
+use std::str;
+use time::{Duration, Instant};
 
-use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams,ProxyEvent};
+use sozu_command::proxy::{LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse};
 use sozu_command::ready::Ready;
 
 use self::retry::RetryPolicy;
 
 pub type ClusterId = String;
 
-#[derive(Debug,Clone,Copy,PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Protocol {
-  HTTP,
-  HTTPS,
-  TCP,
-  HTTPListen,
-  HTTPSListen,
-  TCPListen,
-  Channel,
-  Metrics,
-  Timer,
+    HTTP,
+    HTTPS,
+    TCP,
+    HTTPListen,
+    HTTPSListen,
+    TCPListen,
+    Channel,
+    Metrics,
+    Timer,
 }
 
-#[derive(Debug,Clone,Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CloseResult {
-  pub tokens:   Vec<Token>,
+    pub tokens: Vec<Token>,
 }
 
 /// trait that must be implemented by listeners and client sessions
 pub trait ProxySession {
-  /// indicates the protocol associated with the session
-  ///
-  /// this is used to distinguish sessions from listenrs, channels, metrics
-  /// and timers
-  fn protocol(&self)  -> Protocol;
-  /// if a session received an event or can still execute, the event loop will
-  /// call this method. Its result indicates if it can still execute, needs to
-  /// connect to a backend server, close the session
-  fn ready(&mut self) -> SessionResult;
-  /// if the event loop got an event for a token associated with the session,
-  /// it will call this method on the session
-  fn process_events(&mut self, token: Token, events: Ready);
-  /// closes a session
-  fn close(&mut self, poll: &mut Poll) -> CloseResult;
-  /// closes the backend socket of a session
-  fn close_backend(&mut self, token: Token, poll: &mut Poll);
-  /// if a timeout associated with the session triggers, the event loop will
-  /// call this method with the timeout's token
-  fn timeout(&mut self, t: Token) -> SessionResult;
-  /// last time the session got an event
-  fn last_event(&self) -> Instant;
-  /// displays the session's internal state (for debugging purpose)
-  fn print_state(&self);
-  /// list the tokens associated with the session
-  fn tokens(&self) -> Vec<Token>;
-  /// tells the session to shut down if possible
-  ///
-  /// if the session handles HTTP requests, it will not close until the response
-  /// is completely sent back to the client
-  fn shutting_down(&mut self) -> SessionResult;
+    /// indicates the protocol associated with the session
+    ///
+    /// this is used to distinguish sessions from listenrs, channels, metrics
+    /// and timers
+    fn protocol(&self) -> Protocol;
+    /// if a session received an event or can still execute, the event loop will
+    /// call this method. Its result indicates if it can still execute, needs to
+    /// connect to a backend server, close the session
+    fn ready(&mut self) -> SessionResult;
+    /// if the event loop got an event for a token associated with the session,
+    /// it will call this method on the session
+    fn process_events(&mut self, token: Token, events: Ready);
+    /// closes a session
+    fn close(&mut self, poll: &mut Poll) -> CloseResult;
+    /// closes the backend socket of a session
+    fn close_backend(&mut self, token: Token, poll: &mut Poll);
+    /// if a timeout associated with the session triggers, the event loop will
+    /// call this method with the timeout's token
+    fn timeout(&mut self, t: Token) -> SessionResult;
+    /// last time the session got an event
+    fn last_event(&self) -> Instant;
+    /// displays the session's internal state (for debugging purpose)
+    fn print_state(&self);
+    /// list the tokens associated with the session
+    fn tokens(&self) -> Vec<Token>;
+    /// tells the session to shut down if possible
+    ///
+    /// if the session handles HTTP requests, it will not close until the response
+    /// is completely sent back to the client
+    fn shutting_down(&mut self) -> SessionResult;
 }
 
-#[derive(Clone,Copy,Debug,PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BackendConnectionStatus {
-  NotConnected,
-  Connecting(Instant),
-  Connected,
+    NotConnected,
+    Connecting(Instant),
+    Connected,
 }
 
 impl BackendConnectionStatus {
@@ -294,250 +298,265 @@ impl BackendConnectionStatus {
     }
 }
 
-#[derive(Debug,PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum BackendConnectAction {
-  New,
-  Reuse,
-  Replace,
+    New,
+    Reuse,
+    Replace,
 }
 
-#[derive(Debug,PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum AcceptError {
-  IoError,
-  TooManySessions,
-  WouldBlock,
+    IoError,
+    TooManySessions,
+    WouldBlock,
 }
 
 use self::server::ListenToken;
 pub trait ProxyConfiguration<Session> {
-  fn connect_to_backend(&mut self, event_loop: &mut Poll, session: &mut Session,
-    back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
-  fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse;
-  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
-  fn create_session(&mut self, socket: TcpStream, token: ListenToken,
-                    event_loop: &mut Poll, session_token: Token, wait_time: Duration)
-    -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
+    fn connect_to_backend(
+        &mut self,
+        event_loop: &mut Poll,
+        session: &mut Session,
+        back_token: Token,
+    ) -> Result<BackendConnectAction, ConnectionError>;
+    fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse;
+    fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
+    fn create_session(
+        &mut self,
+        socket: TcpStream,
+        token: ListenToken,
+        event_loop: &mut Poll,
+        session_token: Token,
+        wait_time: Duration,
+    ) -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum RequiredEvents {
-  FrontReadBackNone,
-  FrontWriteBackNone,
-  FrontReadWriteBackNone,
-  FrontNoneBackNone,
-  FrontReadBackRead,
-  FrontWriteBackRead,
-  FrontReadWriteBackRead,
-  FrontNoneBackRead,
-  FrontReadBackWrite,
-  FrontWriteBackWrite,
-  FrontReadWriteBackWrite,
-  FrontNoneBackWrite,
-  FrontReadBackReadWrite,
-  FrontWriteBackReadWrite,
-  FrontReadWriteBackReadWrite,
-  FrontNoneBackReadWrite,
+    FrontReadBackNone,
+    FrontWriteBackNone,
+    FrontReadWriteBackNone,
+    FrontNoneBackNone,
+    FrontReadBackRead,
+    FrontWriteBackRead,
+    FrontReadWriteBackRead,
+    FrontNoneBackRead,
+    FrontReadBackWrite,
+    FrontWriteBackWrite,
+    FrontReadWriteBackWrite,
+    FrontNoneBackWrite,
+    FrontReadBackReadWrite,
+    FrontWriteBackReadWrite,
+    FrontReadWriteBackReadWrite,
+    FrontNoneBackReadWrite,
 }
 
 impl RequiredEvents {
-
-  pub fn front_readable(&self) -> bool {
-    match *self {
-      RequiredEvents::FrontReadBackNone
-      | RequiredEvents:: FrontReadWriteBackNone
-      | RequiredEvents:: FrontReadBackRead
-      | RequiredEvents:: FrontReadWriteBackRead
-      | RequiredEvents:: FrontReadBackWrite
-      | RequiredEvents:: FrontReadWriteBackWrite
-      | RequiredEvents:: FrontReadBackReadWrite
-      | RequiredEvents:: FrontReadWriteBackReadWrite => true,
-      _ => false
+    pub fn front_readable(&self) -> bool {
+        match *self {
+            RequiredEvents::FrontReadBackNone
+            | RequiredEvents::FrontReadWriteBackNone
+            | RequiredEvents::FrontReadBackRead
+            | RequiredEvents::FrontReadWriteBackRead
+            | RequiredEvents::FrontReadBackWrite
+            | RequiredEvents::FrontReadWriteBackWrite
+            | RequiredEvents::FrontReadBackReadWrite
+            | RequiredEvents::FrontReadWriteBackReadWrite => true,
+            _ => false,
+        }
     }
-  }
 
-  pub fn front_writable(&self) -> bool {
-    match *self {
-        RequiredEvents::FrontWriteBackNone
-        | RequiredEvents::FrontReadWriteBackNone
-        | RequiredEvents::FrontWriteBackRead
-        | RequiredEvents::FrontReadWriteBackRead
-        | RequiredEvents::FrontWriteBackWrite
-        | RequiredEvents::FrontReadWriteBackWrite
-        | RequiredEvents::FrontWriteBackReadWrite
-        | RequiredEvents::FrontReadWriteBackReadWrite => true,
-        _ => false
+    pub fn front_writable(&self) -> bool {
+        match *self {
+            RequiredEvents::FrontWriteBackNone
+            | RequiredEvents::FrontReadWriteBackNone
+            | RequiredEvents::FrontWriteBackRead
+            | RequiredEvents::FrontReadWriteBackRead
+            | RequiredEvents::FrontWriteBackWrite
+            | RequiredEvents::FrontReadWriteBackWrite
+            | RequiredEvents::FrontWriteBackReadWrite
+            | RequiredEvents::FrontReadWriteBackReadWrite => true,
+            _ => false,
+        }
     }
-  }
 
-  pub fn back_readable(&self) -> bool {
-    match *self {
-        RequiredEvents::FrontReadBackRead
-        | RequiredEvents::FrontWriteBackRead
-        | RequiredEvents::FrontReadWriteBackRead
-        | RequiredEvents::FrontNoneBackRead
-        | RequiredEvents::FrontReadBackReadWrite
-        | RequiredEvents::FrontWriteBackReadWrite
-        | RequiredEvents::FrontReadWriteBackReadWrite
-        | RequiredEvents::FrontNoneBackReadWrite => true,
-        _ => false
+    pub fn back_readable(&self) -> bool {
+        match *self {
+            RequiredEvents::FrontReadBackRead
+            | RequiredEvents::FrontWriteBackRead
+            | RequiredEvents::FrontReadWriteBackRead
+            | RequiredEvents::FrontNoneBackRead
+            | RequiredEvents::FrontReadBackReadWrite
+            | RequiredEvents::FrontWriteBackReadWrite
+            | RequiredEvents::FrontReadWriteBackReadWrite
+            | RequiredEvents::FrontNoneBackReadWrite => true,
+            _ => false,
+        }
     }
-  }
 
-  pub fn back_writable(&self) -> bool {
-    match *self {
-        RequiredEvents::FrontReadBackWrite
-        | RequiredEvents::FrontWriteBackWrite
-        | RequiredEvents::FrontReadWriteBackWrite
-        | RequiredEvents::FrontNoneBackWrite
-        | RequiredEvents::FrontReadBackReadWrite
-        | RequiredEvents::FrontWriteBackReadWrite
-        | RequiredEvents::FrontReadWriteBackReadWrite
-        | RequiredEvents::FrontNoneBackReadWrite => true,
-        _ => false
+    pub fn back_writable(&self) -> bool {
+        match *self {
+            RequiredEvents::FrontReadBackWrite
+            | RequiredEvents::FrontWriteBackWrite
+            | RequiredEvents::FrontReadWriteBackWrite
+            | RequiredEvents::FrontNoneBackWrite
+            | RequiredEvents::FrontReadBackReadWrite
+            | RequiredEvents::FrontWriteBackReadWrite
+            | RequiredEvents::FrontReadWriteBackReadWrite
+            | RequiredEvents::FrontNoneBackReadWrite => true,
+            _ => false,
+        }
     }
-  }
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SessionResult {
-  CloseSession,
-  CloseBackend(Option<Token>),
-  ReconnectBackend(Option<Token>, Option<Token>),
-  Continue,
-  ConnectBackend
+    CloseSession,
+    CloseBackend(Option<Token>),
+    ReconnectBackend(Option<Token>, Option<Token>),
+    Continue,
+    ConnectBackend,
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ConnectionError {
-  NoHostGiven,
-  NoRequestLineGiven,
-  InvalidHost,
-  HostNotFound,
-  NoBackendAvailable,
-  ToBeDefined,
-  HttpsRedirect,
-  Unauthorized,
+    NoHostGiven,
+    NoRequestLineGiven,
+    InvalidHost,
+    HostNotFound,
+    NoBackendAvailable,
+    ToBeDefined,
+    HttpsRedirect,
+    Unauthorized,
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum SocketType {
-  Listener,
-  FrontClient
+    Listener,
+    FrontClient,
 }
 
-#[derive(Debug,PartialEq,Eq,Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum BackendStatus {
-  Normal,
-  Closing,
-  Closed,
+    Normal,
+    Closing,
+    Closed,
 }
 
-#[derive(Debug,PartialEq,Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Backend {
-  pub sticky_id:                 Option<String>,
-  pub backend_id:                String,
-  pub address:                   SocketAddr,
-  pub status:                    BackendStatus,
-  pub retry_policy:              retry::RetryPolicyWrapper,
-  pub active_connections:        usize,
-  pub active_requests:           usize,
-  pub failures:                  usize,
-  pub load_balancing_parameters: Option<LoadBalancingParams>,
-  pub backup:                    bool,
-  pub connection_time: PeakEWMA,
+    pub sticky_id: Option<String>,
+    pub backend_id: String,
+    pub address: SocketAddr,
+    pub status: BackendStatus,
+    pub retry_policy: retry::RetryPolicyWrapper,
+    pub active_connections: usize,
+    pub active_requests: usize,
+    pub failures: usize,
+    pub load_balancing_parameters: Option<LoadBalancingParams>,
+    pub backup: bool,
+    pub connection_time: PeakEWMA,
 }
 
 impl Backend {
-  pub fn new(backend_id: &str, address: SocketAddr, sticky_id: Option<String>, load_balancing_parameters: Option<LoadBalancingParams>, backup: Option<bool>) -> Backend {
-    let desired_policy = retry::ExponentialBackoffPolicy::new(6);
-    Backend {
-      sticky_id,
-      backend_id:         backend_id.to_string(),
-      address,
-      status:             BackendStatus::Normal,
-      retry_policy:       desired_policy.into(),
-      active_connections: 0,
-      active_requests:    0,
-      failures:           0,
-      load_balancing_parameters,
-      backup: backup.unwrap_or(false),
-      connection_time: PeakEWMA::new(),
-    }
-  }
-
-  pub fn set_closing(&mut self) {
-    self.status = BackendStatus::Closing;
-  }
-
-  pub fn retry_policy(&mut self) -> &mut retry::RetryPolicyWrapper {
-    &mut self.retry_policy
-  }
-
-  pub fn can_open(&self) -> bool {
-    if let Some(action) = self.retry_policy.can_try() {
-      self.status == BackendStatus::Normal && action == retry::RetryAction::OKAY
-    } else {
-      false
-    }
-  }
-
-  pub fn inc_connections(&mut self) -> Option<usize> {
-    if self.status == BackendStatus::Normal {
-      self.active_connections += 1;
-      Some(self.active_connections)
-    } else {
-      None
-    }
-  }
-
-  pub fn dec_connections(&mut self) -> Option<usize> {
-    match self.status {
-      BackendStatus::Normal => {
-        if self.active_connections > 0 {
-          self.active_connections -= 1;
+    pub fn new(
+        backend_id: &str,
+        address: SocketAddr,
+        sticky_id: Option<String>,
+        load_balancing_parameters: Option<LoadBalancingParams>,
+        backup: Option<bool>,
+    ) -> Backend {
+        let desired_policy = retry::ExponentialBackoffPolicy::new(6);
+        Backend {
+            sticky_id,
+            backend_id: backend_id.to_string(),
+            address,
+            status: BackendStatus::Normal,
+            retry_policy: desired_policy.into(),
+            active_connections: 0,
+            active_requests: 0,
+            failures: 0,
+            load_balancing_parameters,
+            backup: backup.unwrap_or(false),
+            connection_time: PeakEWMA::new(),
         }
-        Some(self.active_connections)
-      }
-      BackendStatus::Closed  => None,
-      BackendStatus::Closing => {
-        if self.active_connections > 0 {
-          self.active_connections -= 1;
-        }
-        if self.active_connections == 0 {
-          self.status = BackendStatus::Closed;
-          None
+    }
+
+    pub fn set_closing(&mut self) {
+        self.status = BackendStatus::Closing;
+    }
+
+    pub fn retry_policy(&mut self) -> &mut retry::RetryPolicyWrapper {
+        &mut self.retry_policy
+    }
+
+    pub fn can_open(&self) -> bool {
+        if let Some(action) = self.retry_policy.can_try() {
+            self.status == BackendStatus::Normal && action == retry::RetryAction::OKAY
         } else {
-          Some(self.active_connections)
+            false
         }
-      },
-    }
-  }
-
-  pub fn set_connection_time(&mut self, dur: Duration) {
-      self.connection_time.observe(dur.whole_nanoseconds() as f64);
-  }
-
-  pub fn peak_ewma_connection(&mut self) -> f64 {
-      self.connection_time.get(self.active_connections)
-  }
-
-  pub fn try_connect(&mut self) -> Result<mio::net::TcpStream, ConnectionError> {
-    if self.status != BackendStatus::Normal {
-      return Err(ConnectionError::NoBackendAvailable);
     }
 
-    //FIXME: what happens if the connect() call fails with EINPROGRESS?
-    let conn = mio::net::TcpStream::connect(self.address).map_err(|_| ConnectionError::NoBackendAvailable);
-    if conn.is_ok() {
-      //self.retry_policy.succeed();
-      self.inc_connections();
-    } else {
-      self.retry_policy.fail();
-      self.failures += 1;
+    pub fn inc_connections(&mut self) -> Option<usize> {
+        if self.status == BackendStatus::Normal {
+            self.active_connections += 1;
+            Some(self.active_connections)
+        } else {
+            None
+        }
     }
 
-    conn
-  }
+    pub fn dec_connections(&mut self) -> Option<usize> {
+        match self.status {
+            BackendStatus::Normal => {
+                if self.active_connections > 0 {
+                    self.active_connections -= 1;
+                }
+                Some(self.active_connections)
+            }
+            BackendStatus::Closed => None,
+            BackendStatus::Closing => {
+                if self.active_connections > 0 {
+                    self.active_connections -= 1;
+                }
+                if self.active_connections == 0 {
+                    self.status = BackendStatus::Closed;
+                    None
+                } else {
+                    Some(self.active_connections)
+                }
+            }
+        }
+    }
+
+    pub fn set_connection_time(&mut self, dur: Duration) {
+        self.connection_time.observe(dur.whole_nanoseconds() as f64);
+    }
+
+    pub fn peak_ewma_connection(&mut self) -> f64 {
+        self.connection_time.get(self.active_connections)
+    }
+
+    pub fn try_connect(&mut self) -> Result<mio::net::TcpStream, ConnectionError> {
+        if self.status != BackendStatus::Normal {
+            return Err(ConnectionError::NoBackendAvailable);
+        }
+
+        //FIXME: what happens if the connect() call fails with EINPROGRESS?
+        let conn = mio::net::TcpStream::connect(self.address)
+            .map_err(|_| ConnectionError::NoBackendAvailable);
+        if conn.is_ok() {
+            //self.retry_policy.succeed();
+            self.inc_connections();
+        } else {
+            self.retry_policy.fail();
+            self.failures += 1;
+        }
+
+        conn
+    }
 }
 
 // when a backend has been removed from configuration and the last connection to
@@ -545,228 +564,229 @@ impl Backend {
 // can be safely stopped
 impl std::ops::Drop for Backend {
     fn drop(&mut self) {
-        server::push_event(ProxyEvent::RemovedBackendHasNoConnections(self.backend_id.clone(), self.address));
+        server::push_event(ProxyEvent::RemovedBackendHasNoConnections(
+            self.backend_id.clone(),
+            self.address,
+        ));
     }
 }
 
 #[derive(Clone)]
 pub struct Readiness {
-  pub event:    Ready,
-  pub interest: Ready,
+    pub event: Ready,
+    pub interest: Ready,
 }
 
 impl Readiness {
-  pub fn new() -> Readiness {
-    Readiness {
-      event:    Ready::empty(),
-      interest: Ready::empty(),
+    pub fn new() -> Readiness {
+        Readiness {
+            event: Ready::empty(),
+            interest: Ready::empty(),
+        }
     }
-  }
 
-  pub fn reset(&mut self) {
-    self.event = Ready::empty();
-    self.interest = Ready::empty();
-  }
+    pub fn reset(&mut self) {
+        self.event = Ready::empty();
+        self.interest = Ready::empty();
+    }
 }
 
 pub fn display_ready(s: &mut [u8], readiness: Ready) {
-  if readiness.is_readable() {
-    s[0] = b'R';
-  }
-  if readiness.is_writable() {
-    s[1] = b'W';
-  }
-  if readiness.is_error() {
-    s[2] = b'E';
-  }
-  if readiness.is_hup() {
-    s[3] = b'H';
-  }
+    if readiness.is_readable() {
+        s[0] = b'R';
+    }
+    if readiness.is_writable() {
+        s[1] = b'W';
+    }
+    if readiness.is_error() {
+        s[2] = b'E';
+    }
+    if readiness.is_hup() {
+        s[3] = b'H';
+    }
 }
 
 pub fn ready_to_string(readiness: Ready) -> String {
-  let s = &mut [b'-'; 4];
-  display_ready(s, readiness);
-  String::from_utf8(s.to_vec()).unwrap()
+    let s = &mut [b'-'; 4];
+    display_ready(s, readiness);
+    String::from_utf8(s.to_vec()).unwrap()
 }
 
 impl fmt::Debug for Readiness {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let i = &mut [b'-'; 4];
+        let r = &mut [b'-'; 4];
+        let mixed = &mut [b'-'; 4];
 
-    let i = &mut [b'-'; 4];
-    let r = &mut [b'-'; 4];
-    let mixed = &mut [b'-'; 4];
+        display_ready(i, self.interest);
+        display_ready(r, self.event);
+        display_ready(mixed, self.interest & self.event);
 
-    display_ready(i, self.interest);
-    display_ready(r, self.event);
-    display_ready(mixed, self.interest & self.event);
-
-    write!(f, "Readiness {{ interest: {}, readiness: {}, mixed: {} }}",
-      str::from_utf8(i).unwrap(),
-      str::from_utf8(r).unwrap(),
-      str::from_utf8(mixed).unwrap())
-  }
+        write!(
+            f,
+            "Readiness {{ interest: {}, readiness: {}, mixed: {} }}",
+            str::from_utf8(i).unwrap(),
+            str::from_utf8(r).unwrap(),
+            str::from_utf8(mixed).unwrap()
+        )
+    }
 }
 
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 pub struct SessionMetrics {
-  /// date at which we started handling that request
-  pub start:        Option<Instant>,
-  /// time actually spent handling the request
-  pub service_time: Duration,
-  /// time spent waiting for its turn
-  pub wait_time:    Duration,
-  /// bytes received by the frontend
-  pub bin:          usize,
-  /// bytes sent by the frontend
-  pub bout:         usize,
+    /// date at which we started handling that request
+    pub start: Option<Instant>,
+    /// time actually spent handling the request
+    pub service_time: Duration,
+    /// time spent waiting for its turn
+    pub wait_time: Duration,
+    /// bytes received by the frontend
+    pub bin: usize,
+    /// bytes sent by the frontend
+    pub bout: usize,
 
-  /// date at which we started working on the request
-  pub service_start: Option<Instant>,
-  pub wait_start:    Instant,
+    /// date at which we started working on the request
+    pub service_start: Option<Instant>,
+    pub wait_start: Instant,
 
-  pub backend_id:    Option<String>,
-  pub backend_start: Option<Instant>,
-  pub backend_connected: Option<Instant>,
-  pub backend_stop:  Option<Instant>,
-  pub backend_bin:   usize,
-  pub backend_bout:  usize,
+    pub backend_id: Option<String>,
+    pub backend_start: Option<Instant>,
+    pub backend_connected: Option<Instant>,
+    pub backend_stop: Option<Instant>,
+    pub backend_bin: usize,
+    pub backend_bout: usize,
 }
 
 impl SessionMetrics {
-  pub fn new(wait_time: Option<Duration>) -> SessionMetrics {
-    SessionMetrics {
-      start:         Some(Instant::now()),
-      service_time:  Duration::seconds(0),
-      wait_time:     wait_time.unwrap_or_else(|| Duration::seconds(0)),
-      bin:           0,
-      bout:          0,
-      service_start: None,
-      wait_start:    Instant::now(),
-      backend_id:    None,
-      backend_start: None,
-      backend_connected: None,
-      backend_stop:  None,
-      backend_bin:   0,
-      backend_bout:  0,
-    }
-  }
-
-  pub fn reset(&mut self) {
-    self.start         = None;
-    self.service_time  = Duration::seconds(0);
-    self.wait_time     = Duration::seconds(0);
-    self.bin           = 0;
-    self.bout          = 0;
-    self.service_start = None;
-    self.backend_start = None;
-    self.backend_connected = None;
-    self.backend_stop  = None;
-    self.backend_bin   = 0;
-    self.backend_bout  = 0;
-  }
-
-  pub fn service_start(&mut self) {
-    let now = Instant::now();
-
-    if self.start.is_none() {
-      self.start = Some(now);
+    pub fn new(wait_time: Option<Duration>) -> SessionMetrics {
+        SessionMetrics {
+            start: Some(Instant::now()),
+            service_time: Duration::seconds(0),
+            wait_time: wait_time.unwrap_or_else(|| Duration::seconds(0)),
+            bin: 0,
+            bout: 0,
+            service_start: None,
+            wait_start: Instant::now(),
+            backend_id: None,
+            backend_start: None,
+            backend_connected: None,
+            backend_stop: None,
+            backend_bin: 0,
+            backend_bout: 0,
+        }
     }
 
-    self.service_start = Some(now);
-    self.wait_time = self.wait_time + (now - self.wait_start);
-  }
-
-  pub fn service_stop(&mut self) {
-    if self.service_start.is_some() {
-      let start = self.service_start.take().unwrap();
-      let duration = Instant::now() - start;
-      self.service_time = self.service_time + duration;
+    pub fn reset(&mut self) {
+        self.start = None;
+        self.service_time = Duration::seconds(0);
+        self.wait_time = Duration::seconds(0);
+        self.bin = 0;
+        self.bout = 0;
+        self.service_start = None;
+        self.backend_start = None;
+        self.backend_connected = None;
+        self.backend_stop = None;
+        self.backend_bin = 0;
+        self.backend_bout = 0;
     }
-  }
 
-  pub fn wait_start(&mut self) {
-    self.wait_start = Instant::now();
-  }
+    pub fn service_start(&mut self) {
+        let now = Instant::now();
 
-  pub fn service_time(&self) -> Duration {
-    match self.service_start {
-      Some(start) => {
-        let last_duration = Instant::now() - start;
-        self.service_time + last_duration
-      },
-      None        => self.service_time,
+        if self.start.is_none() {
+            self.start = Some(now);
+        }
+
+        self.service_start = Some(now);
+        self.wait_time = self.wait_time + (now - self.wait_start);
     }
-  }
 
-  pub fn response_time(&self) -> Duration {
-    match self.start {
-      Some(start) => Instant::now() - start,
-      None        => Duration::seconds(0),
+    pub fn service_stop(&mut self) {
+        if self.service_start.is_some() {
+            let start = self.service_start.take().unwrap();
+            let duration = Instant::now() - start;
+            self.service_time = self.service_time + duration;
+        }
     }
-  }
 
-  pub fn backend_start(&mut self) {
-    self.backend_start = Some(Instant::now());
-  }
-
-  pub fn backend_connected(&mut self) {
-    self.backend_connected = Some(Instant::now());
-  }
-
-  pub fn backend_stop(&mut self) {
-    self.backend_stop = Some(Instant::now());
-  }
-
-  pub fn backend_response_time(&self) -> Option<Duration> {
-    match (self.backend_connected, self.backend_stop) {
-      (Some(start), Some(end)) => {
-        Some(end - start)
-      },
-      (Some(start), None) => Some(Instant::now() - start),
-      _ => None
+    pub fn wait_start(&mut self) {
+        self.wait_start = Instant::now();
     }
-  }
 
-  pub fn backend_connection_time(&self) -> Option<Duration> {
-    match (self.backend_start, self.backend_connected) {
-      (Some(start), Some(end)) => {
-        Some(end - start)
-      },
-      _ => None
+    pub fn service_time(&self) -> Duration {
+        match self.service_start {
+            Some(start) => {
+                let last_duration = Instant::now() - start;
+                self.service_time + last_duration
+            }
+            None => self.service_time,
+        }
     }
-  }
+
+    pub fn response_time(&self) -> Duration {
+        match self.start {
+            Some(start) => Instant::now() - start,
+            None => Duration::seconds(0),
+        }
+    }
+
+    pub fn backend_start(&mut self) {
+        self.backend_start = Some(Instant::now());
+    }
+
+    pub fn backend_connected(&mut self) {
+        self.backend_connected = Some(Instant::now());
+    }
+
+    pub fn backend_stop(&mut self) {
+        self.backend_stop = Some(Instant::now());
+    }
+
+    pub fn backend_response_time(&self) -> Option<Duration> {
+        match (self.backend_connected, self.backend_stop) {
+            (Some(start), Some(end)) => Some(end - start),
+            (Some(start), None) => Some(Instant::now() - start),
+            _ => None,
+        }
+    }
+
+    pub fn backend_connection_time(&self) -> Option<Duration> {
+        match (self.backend_start, self.backend_connected) {
+            (Some(start), Some(end)) => Some(end - start),
+            _ => None,
+        }
+    }
 }
 
 pub struct LogDuration(Duration);
 
 impl fmt::Display for LogDuration {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    let secs = self.0.whole_seconds();
-    if secs >= 10 {
-      return write!(f, "{}s", secs);
-    }
-
-    let ms = self.0.whole_milliseconds();
-
-    if ms < 10 {
-        let us = self.0.whole_microseconds();
-        if us >= 10 {
-            return write!(f, "{}μs", us);
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let secs = self.0.whole_seconds();
+        if secs >= 10 {
+            return write!(f, "{}s", secs);
         }
 
-        let ns = self.0.whole_nanoseconds();
-        return write!(f, "{}ns", ns);
-    }
+        let ms = self.0.whole_milliseconds();
 
-    write!(f, "{}ms", ms)
-  }
+        if ms < 10 {
+            let us = self.0.whole_microseconds();
+            if us >= 10 {
+                return write!(f, "{}μs", us);
+            }
+
+            let ns = self.0.whole_nanoseconds();
+            return write!(f, "{}ns", ns);
+        }
+
+        write!(f, "{}ms", ms)
+    }
 }
 
 /// exponentially weighted moving average with high sensibility to latency bursts
 ///
 /// cf Finagle for the original implementation: <https://github.com/twitter/finagle/blob/9cc08d15216497bb03a1cafda96b7266cfbbcff1/finagle-core/src/main/scala/com/twitter/finagle/loadbalancer/PeakEwma.scala>
-#[derive(Debug,PartialEq,Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct PeakEWMA {
     /// decay in nanoseconds
     ///

@@ -19,9 +19,9 @@ use sozu_command::command::{
 };
 use sozu_command::logging;
 use sozu_command::proxy::{
-    AggregatedMetricsData, HttpFrontend, MetricsData, ProxyRequestData, ProxyResponseData,
-    ProxyResponseStatus, Query, QueryAnswer, QueryApplicationType, Route, TcpFrontend,
-    ProxyRequest, MetricsConfiguration,
+    AggregatedMetricsData, HttpFrontend, MetricsConfiguration, MetricsData, ProxyRequest,
+    ProxyRequestData, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
+    QueryApplicationType, Route, TcpFrontend,
 };
 use sozu_command::scm_socket::Listeners;
 use sozu_command::state::get_application_ids_by_domain;
@@ -61,7 +61,9 @@ impl CommandServer {
             }
 
             CommandRequestData::Proxy(proxy_request) => match proxy_request {
-                ProxyRequestData::Metrics(config) => self.metrics(client_id, request.id, config).await,
+                ProxyRequestData::Metrics(config) => {
+                    self.metrics(client_id, request.id, config).await
+                }
                 ProxyRequestData::Query(query) => self.query(client_id, request.id, query).await,
                 order => {
                     self.worker_order(client_id, request.id, order, request.worker_id)
@@ -71,9 +73,10 @@ impl CommandServer {
             CommandRequestData::SubscribeEvents => {
                 self.event_subscribers.insert(client_id);
             }
-            CommandRequestData::ReloadConfiguration { path }=> {
-                self.reload_configuration(Some(client_id), request.id, path).await;
-            },
+            CommandRequestData::ReloadConfiguration { path } => {
+                self.reload_configuration(Some(client_id), request.id, path)
+                    .await;
+            }
         }
     }
 
@@ -298,20 +301,22 @@ impl CommandServer {
                                 format!("ok: {} messages, error: 0", ok),
                                 None,
                             ))
-                            .await {
-                                error!("could not send message to client {:?}: {:?}", client_id, e);
-                            }
+                            .await
+                        {
+                            error!("could not send message to client {:?}: {:?}", client_id, e);
+                        }
                     } else {
-                        if let Err(e) =  sender
+                        if let Err(e) = sender
                             .send(CommandResponse::new(
                                 message_id.to_string(),
                                 CommandStatus::Error,
                                 format!("ok: {} messages, error: {}", ok, error),
                                 None,
                             ))
-                            .await {
-                                error!("could not send message to client {:?}: {:?}", client_id, e);
-                            }
+                            .await
+                        {
+                            error!("could not send message to client {:?}: {:?}", client_id, e);
+                        }
                     }
                 } else {
                     if error == 0 {
@@ -372,9 +377,10 @@ impl CommandServer {
                         "sending configuration orders".to_string(),
                         None,
                     ))
-                    .await{
-                        error!("could not send message to client {:?}: {:?}", client_id, e);
-                    }
+                    .await
+                {
+                    error!("could not send message to client {:?}: {:?}", client_id, e);
+                }
             }
 
             info!("created new worker: {}", worker.id);
@@ -449,9 +455,10 @@ impl CommandServer {
                     "".to_string(),
                     None,
                 ))
-                .await {
-                    error!("could not send message to client {:?}: {:?}", client_id, e);
-                }
+                .await
+            {
+                error!("could not send message to client {:?}: {:?}", client_id, e);
+            }
         }
 
         let (pid, mut channel) =
@@ -477,9 +484,10 @@ impl CommandServer {
                         ),
                         None,
                     ))
-                    .await{
-                        error!("could not send message to client {:?}: {:?}", client_id, e);
-                    }
+                    .await
+                {
+                    error!("could not send message to client {:?}: {:?}", client_id, e);
+                }
             }
 
             info!("wrote final message, closing");
@@ -521,9 +529,10 @@ impl CommandServer {
                         "sending configuration orders".to_string(),
                         None,
                     ))
-                    .await {
-                        error!("could not send message to client {:?}: {:?}", client_id, e);
-                    }
+                    .await
+                {
+                    error!("could not send message to client {:?}: {:?}", client_id, e);
+                }
             }
             info!("created new worker: {}", next_id);
 
@@ -551,7 +560,6 @@ impl CommandServer {
             return;
         }
 
-
         let sock = worker.channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
         worker.sender = Some(worker_tx);
@@ -564,10 +572,13 @@ impl CommandServer {
                 id: format!("UPGRADE-{}-STATUS", id),
                 order: ProxyRequestData::Status,
             })
-        .await {
-            error!("could not send status message to worker {:?}: {:?}", worker.id, e);
+            .await
+        {
+            error!(
+                "could not send status message to worker {:?}: {:?}",
+                worker.id, e
+            );
         }
-
 
         let mut listeners = None;
         {
@@ -646,10 +657,16 @@ impl CommandServer {
                         ProxyResponseStatus::Ok => {
                             info!("softstop OK"); // this doesn't display :-(
                             if let Err(e) = command_tx
-                                .send(CommandMessage::WorkerClose { id: worker_id.clone() })
-                                .await {
-                                    error!("could not send worker close message to {}: {:?}", worker_id, e);
-                                }
+                                .send(CommandMessage::WorkerClose {
+                                    id: worker_id.clone(),
+                                })
+                                .await
+                            {
+                                error!(
+                                    "could not send worker close message to {}: {:?}",
+                                    worker_id, e
+                                );
+                            }
                             break;
                         }
                         ProxyResponseStatus::Processing => {
@@ -675,7 +692,6 @@ impl CommandServer {
             }
             None => error!("could not get the list of listeners from the previous worker"),
         };
-
 
         let stream = Async::new(unsafe {
             let fd = sock.into_raw_fd();
@@ -708,16 +724,30 @@ impl CommandServer {
         info!("finished upgrade");
     }
 
-    pub async fn reload_configuration(&mut self, client_id: Option<String>, message_id: String, config_path: Option<String>) {
-        let new_config = match Config::load_from_path(config_path.as_deref().unwrap_or(&self.config.config_path)) {
+    pub async fn reload_configuration(
+        &mut self,
+        client_id: Option<String>,
+        message_id: String,
+        config_path: Option<String>,
+    ) {
+        let new_config = match Config::load_from_path(
+            config_path.as_deref().unwrap_or(&self.config.config_path),
+        ) {
             Err(e) => {
-                    if let Some(id) = client_id {
-                        self.answer_error(id, message_id,
-                            format!("cannot load configuration from '{}': {:?}", self.config.config_path, e),
-                            None).await;
-                    }
-                return
-            },
+                if let Some(id) = client_id {
+                    self.answer_error(
+                        id,
+                        message_id,
+                        format!(
+                            "cannot load configuration from '{}': {:?}",
+                            self.config.config_path, e
+                        ),
+                        None,
+                    )
+                    .await;
+                }
+                return;
+            }
             Ok(c) => c,
         };
 
@@ -753,7 +783,6 @@ impl CommandServer {
             }
         }
 
-
         let client_tx = if let Some(id) = client_id.as_ref() {
             self.clients.get(id).cloned()
         } else {
@@ -761,7 +790,10 @@ impl CommandServer {
         };
 
         if diff_counter > 0 {
-            info!("state loaded from {}, will start sending {} messages to workers", new_config.config_path, diff_counter);
+            info!(
+                "state loaded from {}, will start sending {} messages to workers",
+                new_config.config_path, diff_counter
+            );
             smol::spawn(async move {
                 let mut ok = 0usize;
                 let mut error = 0usize;
@@ -787,9 +819,11 @@ impl CommandServer {
                                 CommandStatus::Ok,
                                 format!("ok: {} messages, error: 0", ok),
                                 None,
-                            )).await {
-                                error!("could not send message to client {:?}: {:?}", client_id, e);
-                            }
+                            ))
+                            .await
+                        {
+                            error!("could not send message to client {:?}: {:?}", client_id, e);
+                        }
                     } else {
                         if let Err(e) = sender
                             .send(CommandResponse::new(
@@ -797,9 +831,11 @@ impl CommandServer {
                                 CommandStatus::Error,
                                 format!("ok: {} messages, error: {}", ok, error),
                                 None,
-                            )).await{
-                                error!("could not send message to client {:?}: {:?}", client_id, e);
-                            }
+                            ))
+                            .await
+                        {
+                            error!("could not send message to client {:?}: {:?}", client_id, e);
+                        }
                     }
                 } else {
                     if error == 0 {
@@ -827,7 +863,12 @@ impl CommandServer {
         self.config = new_config;
     }
 
-    pub async fn metrics(&mut self, client_id: String, request_id: String, config: MetricsConfiguration) {
+    pub async fn metrics(
+        &mut self,
+        client_id: String,
+        request_id: String,
+        config: MetricsConfiguration,
+    ) {
         let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
@@ -836,7 +877,9 @@ impl CommandServer {
             .filter(|worker| worker.run_state != RunState::Stopped)
         {
             let req_id = format!("{}-metrics-{}", request_id, worker.id);
-            worker.send(req_id.clone(), ProxyRequestData::Metrics(config.clone())).await;
+            worker
+                .send(req_id.clone(), ProxyRequestData::Metrics(config.clone()))
+                .await;
             count += 1;
             self.in_flight.insert(req_id, (tx.clone(), 1));
         }
@@ -899,8 +942,7 @@ impl CommandServer {
         let mut main_query_answer = None;
         match &query {
             &Query::ApplicationsHashes => {
-                main_query_answer =
-                    Some(QueryAnswer::ApplicationsHashes(self.state.hash_state()));
+                main_query_answer = Some(QueryAnswer::ApplicationsHashes(self.state.hash_state()));
             }
             &Query::Applications(ref query_type) => {
                 main_query_answer = Some(QueryAnswer::Applications(match query_type {
@@ -908,8 +950,15 @@ impl CommandServer {
                         vec![self.state.application_state(cluster_id)]
                     }
                     QueryApplicationType::Domain(ref domain) => {
-                        let cluster_ids = get_application_ids_by_domain(&self.state, domain.hostname.clone(), domain.path.clone());
-                        cluster_ids.iter().map(|ref cluster_id| self.state.application_state(cluster_id)).collect()
+                        let cluster_ids = get_application_ids_by_domain(
+                            &self.state,
+                            domain.hostname.clone(),
+                            domain.path.clone(),
+                        );
+                        cluster_ids
+                            .iter()
+                            .map(|ref cluster_id| self.state.application_state(cluster_id))
+                            .collect()
                     }
                 }));
             }
@@ -967,9 +1016,10 @@ impl CommandServer {
                             "".to_string(),
                             Some(CommandResponseData::Query(data)),
                         ))
-                        .await{
-                            error!("could not send message to client {:?}: {:?}", client_id, e);
-                        }
+                        .await
+                    {
+                        error!("could not send message to client {:?}: {:?}", client_id, e);
+                    }
                 }
                 &Query::Applications(_) => {
                     let main = main_query_answer.unwrap();
@@ -982,9 +1032,10 @@ impl CommandServer {
                             "".to_string(),
                             Some(CommandResponseData::Query(data)),
                         ))
-                        .await{
-                            error!("could not send message to client {:?}: {:?}", client_id, e);
-                        }
+                        .await
+                    {
+                        error!("could not send message to client {:?}: {:?}", client_id, e);
+                    }
                 }
                 &Query::Certificates(_) => {
                     info!("certificates query received: {:?}", data);
@@ -995,9 +1046,10 @@ impl CommandServer {
                             "".to_string(),
                             Some(CommandResponseData::Query(data)),
                         ))
-                        .await{
-                            error!("could not send message to client {:?}: {:?}", client_id, e);
-                        }
+                        .await
+                    {
+                        error!("could not send message to client {:?}: {:?}", client_id, e);
+                    }
                 }
                 &Query::Metrics(_) => {
                     debug!("metrics query received: {:?}", data);
@@ -1052,10 +1104,13 @@ impl CommandServer {
                         self.answer_error(client_id, request_id, msg, None).await;
                         return;
                     }
-                    ProxyRequestData::RemoveHttpFrontend(h) | ProxyRequestData::RemoveHttpsFrontend(h) => {
+                    ProxyRequestData::RemoveHttpFrontend(h)
+                    | ProxyRequestData::RemoveHttpsFrontend(h) => {
                         let msg = match h.route {
-                            Route::ClusterId(cluster_id) =>
-                                format!("No such frontend at {} for the cluster {}", h.address, cluster_id),
+                            Route::ClusterId(cluster_id) => format!(
+                                "No such frontend at {} for the cluster {}",
+                                h.address, cluster_id
+                            ),
                             Route::Deny => format!("No such frontend at {}", h.address),
                         };
                         error!("{}", msg);
@@ -1138,7 +1193,10 @@ impl CommandServer {
 
                         let id: u32 = tag.parse().unwrap();
                         if stopping_workers.contains(&id) {
-                            if let Err(e) = command_tx.send(CommandMessage::WorkerClose { id: id.clone() }).await {
+                            if let Err(e) = command_tx
+                                .send(CommandMessage::WorkerClose { id: id.clone() })
+                                .await
+                            {
                                 error!("could not send worker close message to {}: {:?}", id, e);
                             }
                         }
@@ -1183,9 +1241,11 @@ impl CommandServer {
                         CommandStatus::Error,
                         messages.join(", "),
                         None,
-                    )).await{
-                        error!("could not send message to client {:?}: {:?}", client_id, e);
-                    }
+                    ))
+                    .await
+                {
+                    error!("could not send message to client {:?}: {:?}", client_id, e);
+                }
             } else {
                 if let Err(e) = client_tx
                     .send(CommandResponse::new(
@@ -1193,9 +1253,11 @@ impl CommandServer {
                         CommandStatus::Ok,
                         "".to_string(),
                         None,
-                    )).await {
-                        error!("could not send message to client {:?}: {:?}", client_id, e);
-                    }
+                    ))
+                    .await
+                {
+                    error!("could not send message to client {:?}: {:?}", client_id, e);
+                }
             }
         })
         .detach();
@@ -1227,18 +1289,16 @@ impl CommandServer {
 }
 
 use nom::{
-    multi::many0,
-    combinator::{complete, map_res},
-    sequence::terminated,
     bytes::streaming::is_not,
     character::streaming::char,
+    combinator::{complete, map_res},
+    multi::many0,
+    sequence::terminated,
 };
 pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<CommandRequest>> {
     use serde_json::from_slice;
-    many0(
-    complete(terminated(
-            map_res(is_not("\0"), from_slice),
-            char('\0')
-        ))
-    )(input)
+    many0(complete(terminated(
+        map_res(is_not("\0"), from_slice),
+        char('\0'),
+    )))(input)
 }

@@ -19,10 +19,10 @@ use sozu_command::command::{
     CommandRequestData, CommandResponse, CommandResponseData, CommandStatus, Event, RunState,
 };
 use sozu_command::config::Config;
+use sozu_command::proxy::Route;
 use sozu_command::proxy::{ProxyRequest, ProxyRequestData, ProxyResponseData, ProxyResponseStatus};
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::state::ConfigState;
-use sozu_command::proxy::Route;
 
 use crate::get_executable_path;
 use crate::upgrade::SerializedWorker;
@@ -338,7 +338,8 @@ impl CommandServer {
                     // FIXME: should send back error here
                     error!("no worker found");
                 } else {
-                    self.in_flight.insert(message.id.clone(), (tx.clone(), count));
+                    self.in_flight
+                        .insert(message.id.clone(), (tx.clone(), count));
                     total_message_count += count;
                 }
             }
@@ -365,7 +366,10 @@ impl CommandServer {
                         continue;
                     }
                     ProxyResponseStatus::Error(e) => {
-                        error!("error handling configuration message {}: {}", proxy_response.id, e);
+                        error!(
+                            "error handling configuration message {}: {}",
+                            proxy_response.id, e
+                        );
                         error += 1;
                     }
                 };
@@ -398,7 +402,7 @@ impl CommandServer {
                     "worker process {} (PID = {}) is alive but the worker must have crashed. Killing and replacing",
                     worker.id, worker.pid
                 );
-            },
+            }
             Err(_) => {
                 error!(
                     "worker process {} (PID = {}) not answering, killing and replacing",
@@ -462,9 +466,13 @@ impl CommandServer {
                         id: format!("RESTART-{}-ACTIVATE-{}", id, count),
                         order,
                     })
-                    .await {
-                        error!("could not send activate order to worker {:?}: {:?}", worker.id, e);
-                    }
+                    .await
+                {
+                    error!(
+                        "could not send activate order to worker {:?}: {:?}",
+                        worker.id, e
+                    );
+                }
                 count += 1;
             }
 
@@ -476,8 +484,12 @@ impl CommandServer {
                     id: format!("RESTART-{}-STATUS", id),
                     order: ProxyRequestData::Status,
                 })
-            .await{
-                error!("could not send status message to worker {:?}: {:?}", worker.id, e);
+                .await
+            {
+                error!(
+                    "could not send status message to worker {:?}: {:?}",
+                    worker.id, e
+                );
             }
 
             self.workers.push(worker);
@@ -636,7 +648,8 @@ impl CommandServer {
                     info!("removing worker {}", id);
                     if let Some(w) = self.workers.iter_mut().filter(|w| w.id == id).next() {
                         // In case a worker crashes and should be restarted
-                        if self.config.worker_automatic_restart && w.run_state == RunState::Running {
+                        if self.config.worker_automatic_restart && w.run_state == RunState::Running
+                        {
                             self.restart_worker(id).await;
                             return;
                         }
@@ -680,7 +693,7 @@ impl CommandServer {
                                 // messages receive responses from each of the HTTP, HTTPS and TCP
                                 // proxys. The clusters list should be merged
                                 debug!("unknown message id: {}", message.id);
-                            },
+                            }
                             Some((mut tx, mut nb)) => {
                                 let message_id = message.id.clone();
 
@@ -735,9 +748,10 @@ impl CommandServer {
                     message.into(),
                     data,
                 ))
-                .await {
-                    error!("could not send message to client {:?}: {:?}", client_id, e);
-                }
+                .await
+            {
+                error!("could not send message to client {:?}: {:?}", client_id, e);
+            }
         }
     }
 
@@ -766,9 +780,10 @@ impl CommandServer {
                     message.into(),
                     data,
                 ))
-                .await{
-                    error!("could not send message to client {:?}: {:?}", client_id, e);
-                }
+                .await
+            {
+                error!("could not send message to client {:?}: {:?}", client_id, e);
+            }
         }
     }
 }
@@ -813,8 +828,7 @@ async fn client(
             Ok(message) => {
                 debug!("got message: {:?}", message);
                 let id = id.clone();
-                if let Err(e) = tx.send(CommandMessage::ClientRequest { id, message })
-                    .await {
+                if let Err(e) = tx.send(CommandMessage::ClientRequest { id, message }).await {
                     error!("error writing to client: {:?}", e);
                 }
             }
