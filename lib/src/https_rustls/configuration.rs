@@ -12,29 +12,29 @@ use std::str::from_utf8_unchecked;
 use std::sync::Arc;
 use time::{Duration, Instant};
 
-use sozu_command::logging;
-use sozu_command::proxy::{
+use crate::sozu_command::logging;
+use crate::sozu_command::proxy::{
     AddCertificate, Cluster, HttpFrontend, HttpsListener, ProxyRequest, ProxyRequestData,
     ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
-    QueryAnswerCertificate, QueryCertificateType, RemoveCertificate, RemoveListener,
-    ReplaceCertificate, Route, TlsVersion,
+    QueryAnswerCertificate, QueryCertificateType, RemoveCertificate, ReplaceCertificate, Route,
+    TlsVersion,
 };
-use sozu_command::ready::Ready;
-use sozu_command::scm_socket::ScmSocket;
+use crate::sozu_command::ready::Ready;
+use crate::sozu_command::scm_socket::ScmSocket;
 
-use backends::BackendMap;
-use pool::Pool;
-use protocol::http::DefaultAnswerStatus;
-use protocol::http::{
+use crate::backends::BackendMap;
+use crate::pool::Pool;
+use crate::protocol::http::DefaultAnswerStatus;
+use crate::protocol::http::{
     answers::HttpAnswers,
     parser::{hostname_and_port, Method, RRequestLine},
 };
-use protocol::StickySession;
-use router::Router;
-use server::{ListenSession, ListenToken, ProxyChannel, Server, SessionToken, CONN_RETRIES};
-use socket::server_bind;
-use util::UnwrapLog;
-use {
+use crate::protocol::StickySession;
+use crate::router::Router;
+use crate::server::{ListenSession, ListenToken, ProxyChannel, Server, SessionToken, CONN_RETRIES};
+use crate::socket::server_bind;
+use crate::util::UnwrapLog;
+use crate::{
     AcceptError, BackendConnectAction, BackendConnectionStatus, ClusterId, ConnectionError,
     Protocol, ProxyConfiguration, ProxySession,
 };
@@ -903,9 +903,9 @@ impl ProxyConfiguration<Session> for Proxy {
     }
 }
 
-use server::HttpsProvider;
+use crate::server::HttpsProvider;
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-    use server::{self, ProxySessionCast};
+    use crate::server::{self, ProxySessionCast};
 
     let mut event_loop = Poll::new().expect("could not create event loop");
 

@@ -848,7 +848,7 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::RemoveCluster { ref cluster_id } => [
+            ProxyRequestData::RemoveCluster { cluster_id: _ } => [
                 Topic::HttpProxyConfig,
                 Topic::HttpsProxyConfig,
                 Topic::TcpProxyConfig,

@@ -2,8 +2,8 @@
 //!
 //! code imported from mio-extras
 //! License: MIT or Apache 2.0
+use crate::server::TIMER;
 use mio::Token;
-use server::TIMER;
 use slab::Slab;
 use std::{cmp, iter, u64, usize};
 use time::{Duration, Instant};

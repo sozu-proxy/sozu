@@ -9,6 +9,7 @@ version = "0.13.6"
 license = "AGPL-3.0"
 authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
+edition = "2018"
 
 include = [
   "./README.md",

@@ -1,5 +1,5 @@
-use buffer_queue::BufferQueue;
-use protocol::http::StickySession;
+use crate::buffer_queue::BufferQueue;
+use crate::protocol::http::StickySession;
 
 use nom::{Err, HexDisplay, IResult, Offset};
 

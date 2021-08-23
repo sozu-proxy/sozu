@@ -705,7 +705,6 @@ macro_rules! fixme {
     };
 }
 
-use crate::log;
 pub struct CompatLogger;
 
 impl From<log::Level> for LogLevel {

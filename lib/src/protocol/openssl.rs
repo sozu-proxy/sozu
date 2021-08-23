@@ -1,12 +1,12 @@
+use crate::protocol::ProtocolResult;
+use crate::sozu_command::ready::Ready;
+use crate::LogDuration;
+use crate::SessionMetrics;
+use crate::{Readiness, SessionResult};
 use mio::net::*;
 use openssl::ssl::{HandshakeError, MidHandshakeSslStream, NameType, Ssl, SslStream, SslVersion};
-use protocol::ProtocolResult;
 use rusty_ulid::Ulid;
-use sozu_command::ready::Ready;
 use std::net::SocketAddr;
-use LogDuration;
-use SessionMetrics;
-use {Readiness, SessionResult};
 
 pub enum TlsState {
     Initial,

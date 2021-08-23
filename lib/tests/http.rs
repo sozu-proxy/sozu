@@ -6,10 +6,10 @@ extern crate time;
 extern crate tiny_http;
 extern crate ureq;
 
-use sozu_command::channel::Channel;
-use sozu_command::logging::{Logger, LoggerBackend};
-use sozu_command::proxy;
-use sozu_command::proxy::{LoadBalancingParams, PathRule, Route, RulePosition};
+use crate::sozu_command::channel::Channel;
+use crate::sozu_command::logging::{Logger, LoggerBackend};
+use crate::sozu_command::proxy;
+use crate::sozu_command::proxy::{LoadBalancingParams, PathRule, Route, RulePosition};
 use std::thread;
 use std::{
     io::{stdout, Read, Write},

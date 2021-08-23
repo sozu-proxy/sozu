@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use sozu_command::proxy::{self, LoadBalancingAlgorithms};
+use crate::sozu_command::proxy::{self, LoadBalancingAlgorithms};
 
 use super::{load_balancing::*, Backend, ClusterId, ConnectionError};
-use server::push_event;
+use crate::server::push_event;
 
 #[derive(Debug)]
 pub struct BackendMap {

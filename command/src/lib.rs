@@ -1,21 +1,5 @@
-extern crate log;
 #[macro_use]
 extern crate serde_derive;
-
-extern crate hex;
-extern crate mio;
-extern crate pem;
-#[macro_use]
-extern crate nix;
-extern crate libc;
-extern crate pool;
-extern crate poule;
-extern crate regex;
-extern crate serde;
-extern crate serde_json;
-extern crate sha2;
-extern crate time;
-extern crate toml;
 
 #[macro_use]
 pub mod logging;

@@ -11,12 +11,12 @@ use std::rc::{Rc, Weak};
 use std::str::from_utf8_unchecked;
 use time::{Duration, Instant};
 
-use sozu_command::logging;
-use sozu_command::proxy::{
+use crate::sozu_command::logging;
+use crate::sozu_command::proxy::{
     Cluster, HttpFrontend, HttpListener, ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse,
-    ProxyResponseStatus, RemoveListener, Route,
+    ProxyResponseStatus, Route,
 };
-use sozu_command::scm_socket::{Listeners, ScmSocket};
+use crate::sozu_command::scm_socket::{Listeners, ScmSocket};
 
 use super::backends::BackendMap;
 use super::pool::Pool;
@@ -32,10 +32,10 @@ use super::{
     ConnectionError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
     SessionResult,
 };
-use router::Router;
-use sozu_command::ready::Ready;
-use timer::TimeoutContainer;
-use util::UnwrapLog;
+use crate::router::Router;
+use crate::sozu_command::ready::Ready;
+use crate::timer::TimeoutContainer;
+use crate::util::UnwrapLog;
 
 #[derive(PartialEq)]
 pub enum SessionStatus {
@@ -1717,8 +1717,8 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
 mod tests {
     extern crate tiny_http;
     use super::*;
-    use sozu_command::channel::Channel;
-    use sozu_command::proxy::{
+    use crate::sozu_command::channel::Channel;
+    use crate::sozu_command::proxy::{
         Backend, HttpFrontend, HttpListener, LoadBalancingAlgorithms, LoadBalancingParams,
         PathRule, ProxyRequest, ProxyRequestData, Route, RulePosition,
     };

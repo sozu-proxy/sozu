@@ -92,15 +92,9 @@
 //! Here is the complete example for reference:
 //!
 //! ```ignore
-//! #[macro_use] extern crate log;
-//! extern crate env_logger;
-//! extern crate sozu_lib as sozu;
-//! extern crate sozu_command_lib as sozu_command;
-//! extern crate openssl;
-//! extern crate mio;
-//!
 //! use std::thread;
 //! use std::sync::mpsc;
+//! use log::info;
 //! use sozu_command::messages;
 //! use sozu_command::channel::Channel;
 //! use sozu::network;
@@ -223,8 +217,8 @@ use std::rc::Rc;
 use std::str;
 use time::{Duration, Instant};
 
-use sozu_command::proxy::{LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse};
-use sozu_command::ready::Ready;
+use crate::sozu_command::proxy::{LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse};
+use crate::sozu_command::ready::Ready;
 
 use self::retry::RetryPolicy;
 

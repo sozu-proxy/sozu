@@ -884,7 +884,7 @@ impl ConfigState {
             http_frontends: self
                 .http_fronts
                 .iter()
-                .filter_map(|(k, v)| match &v.route {
+                .filter_map(|(_k, v)| match &v.route {
                     Route::Deny => None,
                     Route::ClusterId(id) => {
                         if id == cluster_id {
@@ -899,7 +899,7 @@ impl ConfigState {
             https_frontends: self
                 .https_fronts
                 .iter()
-                .filter_map(|(k, v)| match &v.route {
+                .filter_map(|(_k, v)| match &v.route {
                     Route::Deny => None,
                     Route::ClusterId(id) => {
                         if id == cluster_id {

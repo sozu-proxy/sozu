@@ -1,30 +1,30 @@
+use crate::sozu_command::proxy::ProxyEvent;
 use mio::net::*;
 use mio::*;
 use rustls::{
     CipherSuite, ProtocolVersion, ServerSession, Session as ClientSession, SupportedCipherSuite,
 };
 use rusty_ulid::Ulid;
-use sozu_command::proxy::ProxyEvent;
 use std::cell::RefCell;
 use std::io::{ErrorKind, Read};
 use std::net::{Shutdown, SocketAddr};
 use std::rc::{Rc, Weak};
 use time::{Duration, Instant};
 
-use buffer_queue::BufferQueue;
-use pool::Pool;
-use protocol::http::parser::RequestState;
-use protocol::http::{answers::HttpAnswers, DefaultAnswerStatus};
-use protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use protocol::rustls::TlsHandshake;
-use protocol::{Http, Pipe, ProtocolResult};
-use retry::RetryPolicy;
-use server::push_event;
-use socket::FrontRustls;
-use sozu_command::ready::Ready;
-use timer::TimeoutContainer;
-use util::UnwrapLog;
-use {
+use crate::buffer_queue::BufferQueue;
+use crate::pool::Pool;
+use crate::protocol::http::parser::RequestState;
+use crate::protocol::http::{answers::HttpAnswers, DefaultAnswerStatus};
+use crate::protocol::proxy_protocol::expect::ExpectProxyProtocol;
+use crate::protocol::rustls::TlsHandshake;
+use crate::protocol::{Http, Pipe, ProtocolResult};
+use crate::retry::RetryPolicy;
+use crate::server::push_event;
+use crate::socket::FrontRustls;
+use crate::sozu_command::ready::Ready;
+use crate::timer::TimeoutContainer;
+use crate::util::UnwrapLog;
+use crate::{
     Backend, BackendConnectionStatus, CloseResult, Protocol, ProxySession, Readiness,
     SessionMetrics, SessionResult,
 };

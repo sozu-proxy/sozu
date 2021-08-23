@@ -4,9 +4,9 @@ use rand::{
     thread_rng, Rng,
 };
 
-use Backend;
+use crate::Backend;
 
-use sozu_command::proxy::LoadMetric;
+use crate::sozu_command::proxy::LoadMetric;
 use std::fmt::Debug;
 use std::{cell::RefCell, rc::Rc};
 
@@ -174,10 +174,10 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
 #[cfg(test)]
 mod test {
     use super::*;
-    use retry::{ExponentialBackoffPolicy, RetryPolicyWrapper};
-    use sozu_command::proxy::LoadMetric;
+    use crate::retry::{ExponentialBackoffPolicy, RetryPolicyWrapper};
+    use crate::sozu_command::proxy::LoadMetric;
+    use crate::{BackendStatus, PeakEWMA};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use {BackendStatus, PeakEWMA};
 
     fn create_backend(id: String, connections: Option<usize>) -> Backend {
         Backend {

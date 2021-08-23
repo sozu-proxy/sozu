@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-use hdrhistogram::Histogram;
-use sozu_command::proxy::{
+use crate::sozu_command::proxy::{
     AppMetricsData, FilteredData, MetricsConfiguration, MetricsData, Percentiles,
     QueryAnswerMetrics, QueryMetricsType,
 };
+use hdrhistogram::Histogram;
 use std::collections::BTreeMap;
 use std::str;
 use std::time::Instant;
@@ -397,7 +397,7 @@ impl LocalDrain {
     }
 
     pub fn dump_cluster_data(&mut self) -> BTreeMap<String, AppMetricsData> {
-        let mut apps = BTreeMap::new();
+        let apps = BTreeMap::new();
 
         /*
         for (key, (meta, kind)) in self.metrics.iter() {
@@ -532,7 +532,7 @@ impl LocalDrain {
     fn store_metric(
         &mut self,
         key_prefix: &str,
-        id: &str,
+        _id: &str,
         backend_id: Option<&str>,
         metric: &MetricData,
     ) {

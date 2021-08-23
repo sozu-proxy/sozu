@@ -5,10 +5,10 @@ extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 extern crate time;
 
-use sozu_command::channel::Channel;
-use sozu_command::logging::{Logger, LoggerBackend};
-use sozu_command::proxy;
-use sozu_command::proxy::{LoadBalancingParams, PathRule, Route, RulePosition};
+use crate::sozu_command::channel::Channel;
+use crate::sozu_command::logging::{Logger, LoggerBackend};
+use crate::sozu_command::proxy;
+use crate::sozu_command::proxy::{LoadBalancingParams, PathRule, Route, RulePosition};
 use std::env;
 use std::io::stdout;
 use std::thread;
