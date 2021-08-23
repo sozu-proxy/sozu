@@ -1708,7 +1708,7 @@ pub fn query_metrics(
     refresh: Option<u32>,
     names: Vec<String>,
     clusters: Vec<String>,
-    mut backends: Vec<(String, String)>,
+    backends: Vec<(String, String)>,
 ) -> Result<(), anyhow::Error> {
     let query = if list {
         QueryMetricsType::List

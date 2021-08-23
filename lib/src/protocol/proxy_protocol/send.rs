@@ -1,17 +1,17 @@
 use std::io::Read;
 use std::io::{ErrorKind, Write};
 
-use mio::net::TcpStream;
-use mio::*;
-use rusty_ulid::Ulid;
-use sozu_command::ready::Ready;
-use Protocol;
-use {
+use crate::sozu_command::ready::Ready;
+use crate::Protocol;
+use crate::{
     pool::Checkout,
     protocol::{pipe::Pipe, ProtocolResult},
     socket::SocketHandler,
     BackendConnectionStatus, Readiness, SessionMetrics, SessionResult,
 };
+use mio::net::TcpStream;
+use mio::*;
+use rusty_ulid::Ulid;
 
 use super::header::*;
 

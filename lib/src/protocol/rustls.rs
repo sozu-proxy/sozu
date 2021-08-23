@@ -1,10 +1,10 @@
+use crate::protocol::ProtocolResult;
+use crate::Ready;
+use crate::{Readiness, SessionResult};
 use mio::net::*;
-use protocol::ProtocolResult;
 use rustls::{ServerSession, Session};
 use rusty_ulid::Ulid;
 use std::io::ErrorKind;
-use Ready;
-use {Readiness, SessionResult};
 
 pub enum TlsState {
     Initial,

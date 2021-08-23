@@ -19,7 +19,7 @@ use sozu_command::command::{
     CommandRequestData, CommandResponse, CommandResponseData, CommandStatus, Event, RunState,
 };
 use sozu_command::config::Config;
-use sozu_command::proxy::Route;
+
 use sozu_command::proxy::{ProxyRequest, ProxyRequestData, ProxyResponseData, ProxyResponseStatus};
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::state::ConfigState;

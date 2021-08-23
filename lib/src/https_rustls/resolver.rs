@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 
-use sozu_command::certificate::calculate_fingerprint_from_der;
-use sozu_command::proxy::{
+use crate::sozu_command::certificate::calculate_fingerprint_from_der;
+use crate::sozu_command::proxy::{
     AddCertificate, CertificateAndKey, CertificateFingerprint, RemoveCertificate,
 };
 
-use router::trie::TrieNode;
+use crate::router::trie::TrieNode;
 
 struct TlsData {
     pub cert: CertifiedKey,

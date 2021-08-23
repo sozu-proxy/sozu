@@ -1,6 +1,6 @@
-use protocol::http::parser::Method;
+use crate::protocol::http::parser::Method;
+use crate::sozu_command::proxy::{HttpFrontend, Route, RulePosition};
 use regex::bytes::Regex;
-use sozu_command::proxy::{HttpFrontend, Route, RulePosition};
 use std::str::from_utf8;
 
 pub mod pattern_trie;
@@ -544,7 +544,7 @@ impl MethodRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sozu_command::proxy::Route;
+    use crate::sozu_command::proxy::Route;
 
     #[test]
     fn convert_regex() {

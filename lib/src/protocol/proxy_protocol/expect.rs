@@ -2,19 +2,19 @@ use std::io::Read;
 
 use super::header::ProxyAddr;
 use super::parser::parse_v2_header;
+use crate::pool::Checkout;
+use crate::protocol::pipe::Pipe;
+use crate::protocol::ProtocolResult;
+use crate::socket::{SocketHandler, SocketResult};
+use crate::sozu_command::ready::Ready;
+use crate::Protocol;
+use crate::Readiness;
+use crate::SessionMetrics;
+use crate::SessionResult;
 use mio::net::TcpStream;
 use mio::*;
 use nom::{Err, HexDisplay};
-use pool::Checkout;
-use protocol::pipe::Pipe;
-use protocol::ProtocolResult;
 use rusty_ulid::Ulid;
-use socket::{SocketHandler, SocketResult};
-use sozu_command::ready::Ready;
-use Protocol;
-use Readiness;
-use SessionMetrics;
-use SessionResult;
 
 #[derive(Clone, Copy)]
 pub enum HeaderLen {
@@ -201,7 +201,7 @@ mod expect_test {
         thread::{self, JoinHandle},
     };
 
-    use protocol::proxy_protocol::header::*;
+    use crate::protocol::proxy_protocol::header::*;
 
     // Flow diagram of the test below
     //                [connect]   [send proxy protocol]

@@ -1,20 +1,20 @@
 use super::super::{LogDuration, Protocol, Readiness, SessionMetrics, SessionResult};
+use crate::buffer_queue::BufferQueue;
+use crate::pool::Pool;
+use crate::protocol::ProtocolResult;
+use crate::socket::{SocketHandler, SocketResult, TransportProtocol};
+use crate::sozu_command::ready::Ready;
+use crate::timer::TimeoutContainer;
+use crate::util::UnwrapLog;
 use crate::Backend;
-use buffer_queue::BufferQueue;
 use mio::net::TcpStream;
 use mio::*;
-use pool::Pool;
-use protocol::ProtocolResult;
 use rusty_ulid::Ulid;
-use socket::{SocketHandler, SocketResult, TransportProtocol};
-use sozu_command::ready::Ready;
 use std::cell::RefCell;
 use std::cmp::min;
 use std::net::{IpAddr, SocketAddr};
 use std::rc::{Rc, Weak};
 use time::{Duration, Instant};
-use timer::TimeoutContainer;
-use util::UnwrapLog;
 
 pub mod answers;
 pub mod cookies;

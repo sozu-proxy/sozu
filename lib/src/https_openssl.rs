@@ -24,35 +24,35 @@ use std::str::from_utf8_unchecked;
 use std::sync::{Arc, Mutex};
 use time::{Duration, Instant};
 
-use sozu_command::logging;
-use sozu_command::proxy::{
+use crate::sozu_command::logging;
+use crate::sozu_command::proxy::{
     CertificateAndKey, CertificateFingerprint, Cluster, HttpFrontend, HttpsListener, ProxyEvent,
     ProxyRequest, ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query,
-    QueryAnswer, QueryAnswerCertificate, QueryCertificateType, RemoveListener, Route, TlsVersion,
+    QueryAnswer, QueryAnswerCertificate, QueryCertificateType, Route, TlsVersion,
 };
-use sozu_command::ready::Ready;
-use sozu_command::scm_socket::ScmSocket;
+use crate::sozu_command::ready::Ready;
+use crate::sozu_command::scm_socket::ScmSocket;
 
-use backends::BackendMap;
-use pool::Pool;
-use protocol::h2::Http2;
-use protocol::http::DefaultAnswerStatus;
-use protocol::http::{
+use crate::backends::BackendMap;
+use crate::pool::Pool;
+use crate::protocol::h2::Http2;
+use crate::protocol::http::DefaultAnswerStatus;
+use crate::protocol::http::{
     answers::HttpAnswers,
     parser::{hostname_and_port, Method, RRequestLine, RequestState},
 };
-use protocol::openssl::TlsHandshake;
-use protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use protocol::{Http, Pipe, ProtocolResult, StickySession};
-use retry::RetryPolicy;
-use router::{trie::*, Router};
-use server::{
+use crate::protocol::openssl::TlsHandshake;
+use crate::protocol::proxy_protocol::expect::ExpectProxyProtocol;
+use crate::protocol::{Http, Pipe, ProtocolResult, StickySession};
+use crate::retry::RetryPolicy;
+use crate::router::{trie::*, Router};
+use crate::server::{
     push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionToken, CONN_RETRIES,
 };
-use socket::server_bind;
-use timer::TimeoutContainer;
-use util::UnwrapLog;
-use {
+use crate::socket::server_bind;
+use crate::timer::TimeoutContainer;
+use crate::util::UnwrapLog;
+use crate::{
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, CloseResult, ClusterId,
     ConnectionError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
     SessionResult,
@@ -2325,9 +2325,9 @@ yD0TrUjkXyjV/zczIYiYSROg9OE5UgYqswIBAg==
     ctx.set_tmp_dh(&dh)
 }
 
-use server::HttpsProvider;
+use crate::server::HttpsProvider;
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-    use server::{self, ProxySessionCast};
+    use crate::server::{self, ProxySessionCast};
 
     let mut event_loop = Poll::new().expect("could not create event loop");
 
@@ -2406,9 +2406,9 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
 mod tests {
     extern crate tiny_http;
     use super::*;
+    use crate::router::{trie::TrieNode, MethodRule, PathRule, Router};
+    use crate::sozu_command::proxy::Route;
     use openssl::ssl::{SslContext, SslMethod};
-    use router::{trie::TrieNode, MethodRule, PathRule, Router};
-    use sozu_command::proxy::Route;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::rc::Rc;

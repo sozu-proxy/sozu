@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use async_io::Async;
 
-use sozu::metrics::METRICS;
 use sozu_command::buffer::fixed::Buffer;
 use sozu_command::command::{
     CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
@@ -19,9 +18,8 @@ use sozu_command::command::{
 };
 use sozu_command::logging;
 use sozu_command::proxy::{
-    AggregatedMetricsData, HttpFrontend, MetricsConfiguration, MetricsData, ProxyRequest,
-    ProxyRequestData, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
-    QueryApplicationType, Route, TcpFrontend,
+    MetricsConfiguration, ProxyRequest, ProxyRequestData, ProxyResponseData, ProxyResponseStatus,
+    Query, QueryAnswer, QueryApplicationType, Route, TcpFrontend,
 };
 use sozu_command::scm_socket::Listeners;
 use sozu_command::state::get_application_ids_by_domain;
@@ -1053,7 +1051,7 @@ impl CommandServer {
                 }
                 &Query::Metrics(_) => {
                     debug!("metrics query received: {:?}", data);
-                    let res = client_tx
+                    let _res = client_tx
                         .send(CommandResponse::new(
                             request_id.clone(),
                             CommandStatus::Ok,

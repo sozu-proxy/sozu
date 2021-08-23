@@ -10,24 +10,24 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::rc::Rc;
 use time::{Duration, Instant};
 
-use sozu_command::channel::Channel;
-use sozu_command::config::Config;
-use sozu_command::proxy::{
+use crate::sozu_command::channel::Channel;
+use crate::sozu_command::config::Config;
+use crate::sozu_command::proxy::{
     HttpsListener, ListenerType, MessageId, ProxyEvent, ProxyRequest, ProxyRequestData,
     ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
     QueryAnswerCertificate, QueryApplicationType, QueryCertificateType, TlsProvider, Topic,
 };
-use sozu_command::ready::Ready;
-use sozu_command::scm_socket::{Listeners, ScmSocket};
-use sozu_command::state::{get_application_ids_by_domain, get_certificate, ConfigState};
+use crate::sozu_command::ready::Ready;
+use crate::sozu_command::scm_socket::{Listeners, ScmSocket};
+use crate::sozu_command::state::{get_application_ids_by_domain, get_certificate, ConfigState};
 
-use backends::BackendMap;
-use features::FEATURES;
-use metrics::METRICS;
-use pool::Pool;
-use timer::Timer;
-use {http, tcp};
-use {
+use crate::backends::BackendMap;
+use crate::features::FEATURES;
+use crate::metrics::METRICS;
+use crate::pool::Pool;
+use crate::timer::Timer;
+use crate::{http, tcp};
+use crate::{
     AcceptError, Backend, BackendConnectAction, CloseResult, ConnectionError, Protocol,
     ProxyConfiguration, ProxySession, SessionResult,
 };
@@ -1914,9 +1914,9 @@ impl ProxySession for ListenSession {
 }
 
 #[cfg(feature = "use-openssl")]
-use https_openssl;
+use crate::https_openssl;
 
-use https_rustls;
+use crate::https_rustls;
 
 #[cfg(feature = "use-openssl")]
 pub enum HttpsProvider {
@@ -2034,7 +2034,7 @@ impl HttpsProvider {
 }
 
 #[cfg(not(feature = "use-openssl"))]
-use https_rustls::session::Session;
+use crate::https_rustls::session::Session;
 
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {

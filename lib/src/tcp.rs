@@ -10,28 +10,30 @@ use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
 use time::{Duration, Instant};
 
-use sozu_command::config::ProxyProtocolConfig;
-use sozu_command::logging;
-use sozu_command::proxy::TcpListener as TcpListenerConfig;
-use sozu_command::proxy::{
+use crate::sozu_command::config::ProxyProtocolConfig;
+use crate::sozu_command::logging;
+use crate::sozu_command::proxy::TcpListener as TcpListenerConfig;
+use crate::sozu_command::proxy::{
     LoadBalancingAlgorithms, ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse,
     ProxyResponseStatus,
 };
-use sozu_command::ready::Ready;
-use sozu_command::scm_socket::ScmSocket;
+use crate::sozu_command::ready::Ready;
+use crate::sozu_command::scm_socket::ScmSocket;
 
-use backends::BackendMap;
-use pool::{Checkout, Pool};
-use protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use protocol::proxy_protocol::relay::RelayProxyProtocol;
-use protocol::proxy_protocol::send::SendProxyProtocol;
-use protocol::{Pipe, ProtocolResult};
-use retry::RetryPolicy;
-use server::{push_event, ListenSession, ListenToken, ProxyChannel, Server, CONN_RETRIES, TIMER};
-use socket::server_bind;
-use timer::TimeoutContainer;
-use util::UnwrapLog;
-use {
+use crate::backends::BackendMap;
+use crate::pool::{Checkout, Pool};
+use crate::protocol::proxy_protocol::expect::ExpectProxyProtocol;
+use crate::protocol::proxy_protocol::relay::RelayProxyProtocol;
+use crate::protocol::proxy_protocol::send::SendProxyProtocol;
+use crate::protocol::{Pipe, ProtocolResult};
+use crate::retry::RetryPolicy;
+use crate::server::{
+    push_event, ListenSession, ListenToken, ProxyChannel, Server, CONN_RETRIES, TIMER,
+};
+use crate::socket::server_bind;
+use crate::timer::TimeoutContainer;
+use crate::util::UnwrapLog;
+use crate::{
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, CloseResult, ClusterId,
     ConnectionError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
     SessionResult,
@@ -1348,7 +1350,7 @@ pub fn start(
     buffer_size: usize,
     channel: ProxyChannel,
 ) {
-    use server::{self, ProxySessionCast};
+    use crate::server::{self, ProxySessionCast};
 
     let mut poll = Poll::new().expect("could not create event loop");
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
@@ -1421,9 +1423,9 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sozu_command::channel::Channel;
-    use sozu_command::proxy::{self, LoadBalancingParams, TcpFrontend};
-    use sozu_command::scm_socket::Listeners;
+    use crate::sozu_command::channel::Channel;
+    use crate::sozu_command::proxy::{self, LoadBalancingParams, TcpFrontend};
+    use crate::sozu_command::scm_socket::Listeners;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::os::unix::io::IntoRawFd;
@@ -1547,7 +1549,7 @@ mod tests {
     }
 
     pub fn start_proxy() -> Channel<ProxyRequest, ProxyResponse> {
-        use server::{self, ProxySessionCast};
+        use crate::server::{self, ProxySessionCast};
 
         info!("listen for connections");
         let (mut command, channel) =

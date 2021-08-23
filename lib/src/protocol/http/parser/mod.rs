@@ -6,7 +6,7 @@ use nom::{
     bytes::{
         self,
         complete::take_while1 as take_while1_complete,
-        streaming::{is_not, tag, tag_no_case, take, take_while, take_while1},
+        streaming::{is_not, tag, tag_no_case, take, take_while},
     },
     character::{
         complete::digit1 as digit_complete,
@@ -14,7 +14,7 @@ use nom::{
         streaming::{char, one_of},
     },
     combinator::{complete, map_res, opt, recognize},
-    error::{Error, ErrorKind, ParseError},
+    error::{Error, ErrorKind},
     multi::many0,
     sequence::{delimited, preceded, terminated, tuple},
     Err, IResult, Needed, Offset,

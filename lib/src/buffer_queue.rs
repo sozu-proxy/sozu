@@ -1,5 +1,5 @@
-use pool::{Checkout, Pool};
-use pool_crate::Reset;
+use crate::pool::{Checkout, Pool};
+use crate::pool_crate::Reset;
 use std::cmp::{max, min};
 use std::io::{self, Write};
 use std::{fmt, str};
@@ -506,8 +506,8 @@ pub fn buf_with_capacity(capacity: usize) -> (Pool, BufferQueue) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sozu_command::buffer::fixed::Buffer;
     use nom::HexDisplay;
-    use sozu_command::buffer::fixed::Buffer;
     use std::io::Write;
 
     #[test]

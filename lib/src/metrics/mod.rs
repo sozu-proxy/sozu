@@ -1,7 +1,7 @@
-use mio::net::UdpSocket;
-use sozu_command::proxy::{
+use crate::sozu_command::proxy::{
     FilteredData, MetricsConfiguration, MetricsData, QueryAnswerMetrics, QueryMetricsType,
 };
+use mio::net::UdpSocket;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
