@@ -196,6 +196,7 @@ fn test() {
     assert_eq!(res.status(), 200);
     assert_eq!(res.status_text(), "Ok");
     assert_eq!(res.header("Content-Length"), Some("5"));
+    assert_eq!(res.header("Connection"), None);
     assert_eq!(res.into_string().unwrap(), "Hello");
 
     let barrier2 = barrier.clone();
