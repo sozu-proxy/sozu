@@ -88,7 +88,7 @@ impl SozuCommandClient {
                     if msg.id != id {
                         return Err(Error::new(
                             ErrorKind::ConnectionAborted,
-                            format!("could not send message"),
+                            "could not send message".to_string(),
                         ));
                     }
 

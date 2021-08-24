@@ -1023,7 +1023,8 @@ pub fn add_certificate(
             ProxyRequestData::AddCertificate(AddCertificate {
                 address,
                 certificate: new_certificate,
-                names: Vec::new(),
+                names: vec![],
+                expired_at: None,
             }),
         )?;
     }
@@ -1064,7 +1065,6 @@ pub fn remove_certificate(
             ProxyRequestData::RemoveCertificate(RemoveCertificate {
                 address,
                 fingerprint,
-                names: Vec::new(),
             }),
         )?
     }
@@ -1109,8 +1109,8 @@ pub fn replace_certificate(
         address,
         new_certificate,
         old_fingerprint,
-        new_names: Vec::new(),
-        old_names: Vec::new()
+        new_names: vec![],
+        new_expired_at: None,
       }))?;
     }
     }

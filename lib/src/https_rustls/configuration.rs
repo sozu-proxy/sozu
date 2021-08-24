@@ -14,10 +14,9 @@ use time::Duration;
 
 use crate::sozu_command::logging;
 use crate::sozu_command::proxy::{
-    AddCertificate, Cluster, HttpFrontend, HttpsListener, ProxyRequest, ProxyRequestData,
-    ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
-    QueryAnswerCertificate, QueryCertificateType, RemoveCertificate, ReplaceCertificate, Route,
-    TlsVersion,
+    AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListener, ProxyRequest,
+    ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
+    QueryAnswerCertificate, QueryCertificateType, RemoveCertificate, Route, TlsVersion,
 };
 use crate::sozu_command::scm_socket::ScmSocket;
 
@@ -32,10 +31,13 @@ use crate::server::{
     ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken,
 };
 use crate::socket::server_bind;
+use crate::tls::{
+    CertificateResolver, GenericCertificateResolverError, MutexWrappedCertificateResolver,
+    ParsedCertificateAndKey,
+};
 use crate::util::UnwrapLog;
 use crate::{AcceptError, ClusterId, Protocol, ProxyConfiguration, ProxySession};
 
-use super::resolver::CertificateResolverWrapper;
 use super::session::Session;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,14 @@ pub struct TlsApp {
 pub type HostName = String;
 pub type PathBegin = String;
 
+#[derive(thiserror::Error, Debug)]
+pub enum ListenerError {
+    #[error("failed to acquired the lock, {0}")]
+    LockError(String),
+    #[error("failed to handle certificate operation, got resolver error, {0}")]
+    ResolverError(GenericCertificateResolverError),
+}
+
 pub struct Listener {
     listener: Option<TcpListener>,
     address: SocketAddr,
@@ -55,9 +65,54 @@ pub struct Listener {
     answers: Rc<RefCell<HttpAnswers>>,
     pub config: HttpsListener,
     ssl_config: Arc<ServerConfig>,
-    resolver: Arc<CertificateResolverWrapper>,
+    resolver: Arc<MutexWrappedCertificateResolver>,
     pub token: Token,
     active: bool,
+}
+
+impl CertificateResolver for Listener {
+    type Error = ListenerError;
+
+    fn get_certificate(
+        &self,
+        fingerprint: &CertificateFingerprint,
+    ) -> Option<ParsedCertificateAndKey> {
+        let resolver = self
+            .resolver
+            .0
+            .lock()
+            .map_err(|err| ListenerError::LockError(err.to_string()))
+            .ok()?;
+
+        resolver.get_certificate(fingerprint)
+    }
+
+    fn add_certificate(
+        &mut self,
+        opts: &AddCertificate,
+    ) -> Result<CertificateFingerprint, Self::Error> {
+        let mut resolver = self
+            .resolver
+            .0
+            .lock()
+            .map_err(|err| ListenerError::LockError(err.to_string()))?;
+
+        resolver
+            .add_certificate(opts)
+            .map_err(|err| ListenerError::ResolverError(err))
+    }
+
+    fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error> {
+        let mut resolver = self
+            .resolver
+            .0
+            .lock()
+            .map_err(|err| ListenerError::LockError(err.to_string()))?;
+
+        resolver
+            .remove_certificate(opts)
+            .map_err(ListenerError::ResolverError)
+    }
 }
 
 impl Listener {
@@ -76,8 +131,8 @@ impl Listener {
             })
             .collect();
 
-        let resolver = Arc::new(CertificateResolverWrapper::new());
-        server_config.cert_resolver = resolver.clone();
+        let resolver = Arc::new(MutexWrappedCertificateResolver::new());
+        server_config.cert_resolver = resolver.to_owned();
 
         //FIXME: we should have another way than indexes in ALL_CIPHERSUITES,
         //but rustls does not export the static SupportedCipherSuite instances yet
@@ -160,41 +215,6 @@ impl Listener {
     pub fn remove_https_front(&mut self, tls_front: HttpFrontend) -> bool {
         debug!("removing tls_front {:?}", tls_front);
         self.fronts.remove_http_front(tls_front)
-    }
-
-    pub fn add_certificate(&mut self, add_certificate: AddCertificate) -> bool {
-        (*self.resolver).add_certificate(add_certificate).is_some()
-    }
-
-    // FIXME: return an error if the cert is still in use
-    pub fn remove_certificate(&mut self, remove_certificate: RemoveCertificate) {
-        debug!("removing certificate {:?}", remove_certificate);
-        (*self.resolver).remove_certificate(remove_certificate)
-    }
-
-    pub fn replace_certificate(&mut self, replace_certificate: ReplaceCertificate) {
-        debug!("replacing certificate {:?}", replace_certificate);
-        let ReplaceCertificate {
-            address,
-            new_certificate,
-            old_fingerprint,
-            old_names,
-            new_names,
-        } = replace_certificate;
-        let remove = RemoveCertificate {
-            address,
-            fingerprint: old_fingerprint,
-            names: old_names,
-        };
-        let add = AddCertificate {
-            address,
-            certificate: new_certificate,
-            names: new_names,
-        };
-
-        //FIXME: handle results
-        (*self.resolver).remove_certificate(remove);
-        (*self.resolver).add_certificate(add);
     }
 
     fn accept(&mut self) -> Result<TcpStream, AcceptError> {
@@ -455,14 +475,25 @@ impl ProxyConfiguration<Session> for Proxy {
                     .values_mut()
                     .find(|l| l.address == add_certificate.address)
                 {
-                    listener.add_certificate(add_certificate);
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Ok,
-                        data: None,
+                    match listener.add_certificate(&add_certificate) {
+                        Ok(_) => ProxyResponse {
+                            id: message.id,
+                            status: ProxyResponseStatus::Ok,
+                            data: None,
+                        },
+                        Err(err) => ProxyResponse {
+                            id: message.id,
+                            status: ProxyResponseStatus::Error(err.to_string()),
+                            data: None,
+                        },
                     }
                 } else {
-                    panic!()
+                    error!("replacing certificate to unknown listener");
+                    ProxyResponse {
+                        id: message.id,
+                        status: ProxyResponseStatus::Error(String::from("unsupported message")),
+                        data: None,
+                    }
                 }
             }
             ProxyRequestData::RemoveCertificate(remove_certificate) => {
@@ -472,14 +503,25 @@ impl ProxyConfiguration<Session> for Proxy {
                     .values_mut()
                     .find(|l| l.address == remove_certificate.address)
                 {
-                    listener.remove_certificate(remove_certificate);
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Ok,
-                        data: None,
+                    match listener.remove_certificate(&remove_certificate) {
+                        Ok(_) => ProxyResponse {
+                            id: message.id,
+                            status: ProxyResponseStatus::Ok,
+                            data: None,
+                        },
+                        Err(err) => ProxyResponse {
+                            id: message.id,
+                            status: ProxyResponseStatus::Error(err.to_string()),
+                            data: None,
+                        },
                     }
                 } else {
-                    panic!()
+                    error!("replacing certificate to unknown listener");
+                    ProxyResponse {
+                        id: message.id,
+                        status: ProxyResponseStatus::Error(String::from("unsupported message")),
+                        data: None,
+                    }
                 }
             }
             ProxyRequestData::ReplaceCertificate(replace_certificate) => {
@@ -489,14 +531,25 @@ impl ProxyConfiguration<Session> for Proxy {
                     .values_mut()
                     .find(|l| l.address == replace_certificate.address)
                 {
-                    listener.replace_certificate(replace_certificate);
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Ok,
-                        data: None,
+                    match listener.replace_certificate(&replace_certificate) {
+                        Ok(_) => ProxyResponse {
+                            id: message.id,
+                            status: ProxyResponseStatus::Ok,
+                            data: None,
+                        },
+                        Err(err) => ProxyResponse {
+                            id: message.id,
+                            status: ProxyResponseStatus::Error(err.to_string()),
+                            data: None,
+                        },
                     }
                 } else {
-                    panic!()
+                    error!("replacing certificate to unknown listener");
+                    ProxyResponse {
+                        id: message.id,
+                        status: ProxyResponseStatus::Error(String::from("unsupported message")),
+                        data: None,
+                    }
                 }
             }
             ProxyRequestData::RemoveListener(remove) => {
@@ -602,10 +655,10 @@ impl ProxyConfiguration<Session> for Proxy {
                     .listeners
                     .iter()
                     .map(|(_addr, listener)| {
-                        let domains = &unwrap_msg!(listener.resolver.0.lock()).domains;
+                        let resolver = &unwrap_msg!(listener.resolver.0.lock());
                         (
                             listener.address,
-                            domains.domain_lookup(d.as_bytes(), true).map(|(k, v)| {
+                            resolver.domain_lookup(d.as_bytes(), true).map(|(k, v)| {
                                 (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
                             }),
                         )
