@@ -32,6 +32,7 @@ time = "^0.3"
 mio = { version = "^0.7", features = [ "os-poll", "os-ext", "tcp", "udp" ] }
 libc = "^0.2"
 slab = "^0.4.0"
+sha2 = "^0.9"
 pool = "^0.1"
 openssl = {version="^0.10.26", optional = true}
 openssl-sys = {version="^0.9", optional = true}
@@ -48,11 +49,14 @@ hashbrown = "0.11"
 regex = "1.1"
 cookie-factory = "^0.3"
 hpack = "^0.3"
+x509-parser = "^0.10.0"
+thiserror = "^1.0.26"
 
 [dev-dependencies]
 tiny_http = "^0.8"
 quickcheck = "^1.0"
 ureq = "2.1"
+rand = "^0.8.4"
 
 [dependencies.nom]
 version = "^7.0.0"

@@ -319,7 +319,8 @@ mod tests {
                     key: String::from(KEY),
                     versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
                 },
-                names: Vec::new()
+                names: vec![],
+                expired_at: None,
             })),
             worker_id: None
         }
@@ -340,7 +341,6 @@ mod tests {
                         )
                         .unwrap()
                     ),
-                    names: Vec::new(),
                 }
             )),
             worker_id: None

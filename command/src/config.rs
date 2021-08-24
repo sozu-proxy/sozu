@@ -589,6 +589,7 @@ impl HttpFrontendConfig {
                     versions: self.tls_versions.clone(),
                 },
                 names: vec![self.hostname.clone()],
+                expired_at: None,
             }));
 
             v.push(ProxyRequestData::AddHttpsFrontend(HttpFrontend {

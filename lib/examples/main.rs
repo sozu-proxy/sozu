@@ -120,7 +120,8 @@ fn main() {
         order: proxy::ProxyRequestData::AddCertificate(proxy::AddCertificate {
             address: "127.0.0.1:8443".parse().unwrap(),
             certificate: certificate_and_key,
-            names: Vec::new(),
+            names: vec![],
+            expired_at: None,
         }),
     });
 
@@ -166,7 +167,8 @@ fn main() {
         order: proxy::ProxyRequestData::AddCertificate(proxy::AddCertificate {
             address: "127.0.0.1:8443".parse().unwrap(),
             certificate: certificate_and_key2,
-            names: Vec::new(),
+            names: vec![],
+            expired_at: None,
         }),
     });
 
