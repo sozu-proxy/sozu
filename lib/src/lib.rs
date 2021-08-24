@@ -196,6 +196,7 @@ pub mod retry;
 pub mod router;
 pub mod socket;
 pub mod timer;
+pub mod tls;
 
 #[cfg(feature = "splice")]
 mod splice;

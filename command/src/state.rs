@@ -246,6 +246,7 @@ impl ConfigState {
                             (replace.new_certificate.clone(), replace.new_names.clone()),
                         )
                     });
+
                     true
                 } else {
                     changed
@@ -389,6 +390,7 @@ impl ConfigState {
                     address: **front,
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
+                    expired_at: None,
                 }));
             }
         }
@@ -807,7 +809,6 @@ impl ConfigState {
             v.push(ProxyRequestData::RemoveCertificate(RemoveCertificate {
                 address,
                 fingerprint: fingerprint.clone(),
-                names: Vec::new(),
             }));
         }
 
@@ -821,6 +822,7 @@ impl ConfigState {
                     address,
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
+                    expired_at: None,
                 }));
             }
         }
