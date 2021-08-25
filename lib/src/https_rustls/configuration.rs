@@ -126,7 +126,7 @@ impl Listener {
 
     pub fn activate(
         &mut self,
-        event_loop: &mut Poll,
+        registry: &mut Registry,
         tcp_listener: Option<TcpListener>,
     ) -> Option<Token> {
         if self.active {
@@ -145,10 +145,7 @@ impl Listener {
         });
 
         if let Some(ref mut sock) = listener {
-            if let Err(e) = event_loop
-                .registry()
-                .register(sock, self.token, Interest::READABLE)
-            {
+            if let Err(e) = registry.register(sock, self.token, Interest::READABLE) {
                 error!("error registering listen socket: {:?}", e);
             }
         } else {
@@ -247,15 +244,21 @@ pub struct Proxy {
     clusters: HashMap<ClusterId, Cluster>,
     backends: Rc<RefCell<BackendMap>>,
     pool: Rc<RefCell<Pool>>,
+    registry: Registry,
 }
 
 impl Proxy {
-    pub fn new(pool: Rc<RefCell<Pool>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
+    pub fn new(
+        registry: Registry,
+        pool: Rc<RefCell<Pool>>,
+        backends: Rc<RefCell<BackendMap>>,
+    ) -> Proxy {
         Proxy {
             listeners: HashMap::new(),
             clusters: HashMap::new(),
             backends,
             pool,
+            registry,
         }
     }
 
@@ -278,13 +281,12 @@ impl Proxy {
 
     pub fn activate_listener(
         &mut self,
-        event_loop: &mut Poll,
         addr: &SocketAddr,
         tcp_listener: Option<TcpListener>,
     ) -> Option<Token> {
         for listener in self.listeners.values_mut() {
             if &listener.address == addr {
-                return listener.activate(event_loop, tcp_listener);
+                return listener.activate(&mut self.registry, tcp_listener);
             }
         }
         None
@@ -907,7 +909,7 @@ use crate::server::HttpsProvider;
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
     use crate::server::{self, ProxySessionCast};
 
-    let mut event_loop = Poll::new().expect("could not create event loop");
+    let event_loop = Poll::new().expect("could not create event loop");
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
         1,
@@ -949,11 +951,10 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
     };
 
     let address = config.address.clone();
-    let mut configuration = Proxy::new(pool.clone(), backends.clone());
+    let registry = event_loop.registry().try_clone().unwrap();
+    let mut configuration = Proxy::new(registry, pool.clone(), backends.clone());
     if configuration.add_listener(config, token).is_some()
-        && configuration
-            .activate_listener(&mut event_loop, &address, None)
-            .is_some()
+        && configuration.activate_listener(&address, None).is_some()
     {
         let (scm_server, _scm_client) = UnixStream::pair().unwrap();
         let mut server_config: server::ServerConfig = Default::default();

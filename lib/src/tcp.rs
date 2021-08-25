@@ -933,7 +933,7 @@ impl Listener {
 
     pub fn activate(
         &mut self,
-        event_loop: &mut Poll,
+        registry: &mut Registry,
         tcp_listener: Option<TcpListener>,
     ) -> Option<Token> {
         if self.active {
@@ -952,10 +952,7 @@ impl Listener {
         });
 
         if let Some(ref mut sock) = listener {
-            if let Err(e) = event_loop
-                .registry()
-                .register(sock, self.token, Interest::READABLE)
-            {
+            if let Err(e) = registry.register(sock, self.token, Interest::READABLE) {
                 error!("error registering socket({:?}): {:?}", sock, e);
             }
         } else {
@@ -979,15 +976,17 @@ pub struct Proxy {
     backends: Rc<RefCell<BackendMap>>,
     listeners: HashMap<Token, Listener>,
     configs: HashMap<ClusterId, ClusterConfiguration>,
+    registry: Registry,
 }
 
 impl Proxy {
-    pub fn new(backends: Rc<RefCell<BackendMap>>) -> Proxy {
+    pub fn new(registry: Registry, backends: Rc<RefCell<BackendMap>>) -> Proxy {
         Proxy {
             backends,
             listeners: HashMap::new(),
             configs: HashMap::new(),
             fronts: HashMap::new(),
+            registry,
         }
     }
 
@@ -1015,13 +1014,12 @@ impl Proxy {
 
     pub fn activate_listener(
         &mut self,
-        event_loop: &mut Poll,
         addr: &SocketAddr,
         tcp_listener: Option<TcpListener>,
     ) -> Option<Token> {
         for listener in self.listeners.values_mut() {
             if &listener.address == addr {
-                return listener.activate(event_loop, tcp_listener);
+                return listener.activate(&mut self.registry, tcp_listener);
             }
         }
         None
@@ -1352,7 +1350,7 @@ pub fn start(
 ) {
     use crate::server::{self, ProxySessionCast};
 
-    let mut poll = Poll::new().expect("could not create event loop");
+    let poll = Poll::new().expect("could not create event loop");
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
         1,
         max_buffers,
@@ -1393,9 +1391,10 @@ pub fn start(
     };
 
     let address = config.address;
-    let mut configuration = Proxy::new(backends.clone());
+    let registry = poll.registry().try_clone().unwrap();
+    let mut configuration = Proxy::new(registry, backends.clone());
     let _ = configuration.add_listener(config, pool.clone(), token);
-    let _ = configuration.activate_listener(&mut poll, &address, None);
+    let _ = configuration.activate_listener(&address, None);
     let (scm_server, _scm_client) = UnixStream::pair().unwrap();
 
     let mut server_config: server::ServerConfig = Default::default();
@@ -1556,7 +1555,7 @@ mod tests {
             Channel::generate(1000, 10000).expect("should create a channel");
         thread::spawn(move || {
             info!("starting event loop");
-            let mut poll = Poll::new().expect("could not create event loop");
+            let poll = Poll::new().expect("could not create event loop");
             let max_buffers = 100;
             let buffer_size = 16384;
             let pool = Rc::new(RefCell::new(Pool::with_capacity(
@@ -1590,7 +1589,8 @@ mod tests {
                 })));
             }
 
-            let mut configuration = Proxy::new(backends.clone());
+            let registry = poll.registry().try_clone().unwrap();
+            let mut configuration = Proxy::new(registry, backends.clone());
             let listener_config = TcpListenerConfig {
                 address: "127.0.0.1:1234".parse().unwrap(),
                 public_address: None,
@@ -1605,7 +1605,7 @@ mod tests {
                 let entry = sessions.vacant_entry();
                 let _ =
                     configuration.add_listener(listener_config, pool.clone(), Token(entry.key()));
-                let _ = configuration.activate_listener(&mut poll, &address, None);
+                let _ = configuration.activate_listener(&address, None);
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::TCPListen,
                 })));
