@@ -941,15 +941,21 @@ pub struct Proxy {
     backends: Rc<RefCell<BackendMap>>,
     clusters: HashMap<ClusterId, Cluster>,
     pool: Rc<RefCell<Pool>>,
+    registry: Registry,
 }
 
 impl Proxy {
-    pub fn new(pool: Rc<RefCell<Pool>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
+    pub fn new(
+        registry: Registry,
+        pool: Rc<RefCell<Pool>>,
+        backends: Rc<RefCell<BackendMap>>,
+    ) -> Proxy {
         Proxy {
             listeners: HashMap::new(),
             clusters: HashMap::new(),
             backends,
             pool,
+            registry,
         }
     }
 
@@ -972,13 +978,12 @@ impl Proxy {
 
     pub fn activate_listener(
         &mut self,
-        event_loop: &mut Poll,
         addr: &SocketAddr,
         tcp_listener: Option<TcpListener>,
     ) -> Option<Token> {
         for listener in self.listeners.values_mut() {
             if &listener.address == addr {
-                return listener.activate(event_loop, tcp_listener);
+                return listener.activate(&mut self.registry, tcp_listener);
             }
         }
         None
@@ -1191,7 +1196,7 @@ impl Listener {
 
     pub fn activate(
         &mut self,
-        event_loop: &mut Poll,
+        registry: &mut Registry,
         tcp_listener: Option<TcpListener>,
     ) -> Option<Token> {
         if self.active {
@@ -1210,10 +1215,7 @@ impl Listener {
         });
 
         if let Some(ref mut sock) = listener {
-            if let Err(e) = event_loop
-                .registry()
-                .register(sock, self.token, Interest::READABLE)
-            {
+            if let Err(e) = registry.register(sock, self.token, Interest::READABLE) {
                 error!("error registering listener socket({:?}): {:?}", sock, e);
             }
         } else {
@@ -1637,7 +1639,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
 pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
     use super::server::{self, ProxySessionCast};
-    let mut event_loop = Poll::new().expect("could not create event loop");
+    let event_loop = Poll::new().expect("could not create event loop");
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
         1,
@@ -1678,9 +1680,10 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
     };
 
     let address = config.address;
-    let mut proxy = Proxy::new(pool.clone(), backends.clone());
+    let registry = event_loop.registry().try_clone().unwrap();
+    let mut proxy = Proxy::new(registry, pool.clone(), backends.clone());
     let _ = proxy.add_listener(config, token);
-    let _ = proxy.activate_listener(&mut event_loop, &address, None);
+    let _ = proxy.activate_listener(&address, None);
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let scm = ScmSocket::new(scm_client.into_raw_fd());
     if let Err(e) = scm.send_listeners(&Listeners {

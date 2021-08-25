@@ -212,7 +212,11 @@ impl Server {
         }
 
         let use_openssl = config.tls_provider == TlsProvider::Openssl;
-        let https = HttpsProvider::new(use_openssl, pool.clone(), backends.clone());
+        let registry = event_loop
+            .registry()
+            .try_clone()
+            .expect("could not clone the mio Registry");
+        let https = HttpsProvider::new(use_openssl, registry, pool.clone(), backends.clone());
 
         Server::new(
             event_loop,
@@ -266,16 +270,37 @@ impl Server {
 
         let base_sessions_count = sessions.len();
 
+        let http = http.unwrap_or_else(|| {
+            let registry = poll
+                .registry()
+                .try_clone()
+                .expect("could not clone the mio Registry");
+            http::Proxy::new(registry, pool.clone(), backends.clone())
+        });
+        let https = https.unwrap_or_else(|| {
+            let registry = poll
+                .registry()
+                .try_clone()
+                .expect("could not clone the mio Registry");
+            HttpsProvider::new(false, registry, pool.clone(), backends.clone())
+        });
+        let tcp = tcp.unwrap_or_else(|| {
+            let registry = poll
+                .registry()
+                .try_clone()
+                .expect("could not clone the mio Registry");
+            tcp::Proxy::new(registry, backends.clone())
+        });
+
         let mut server = Server {
             poll,
             shutting_down: None,
             accept_ready: HashSet::new(),
             can_accept: true,
             channel,
-            http: http.unwrap_or_else(|| http::Proxy::new(pool.clone(), backends.clone())),
-            https: https
-                .unwrap_or_else(|| HttpsProvider::new(false, pool.clone(), backends.clone())),
-            tcp: tcp.unwrap_or_else(|| tcp::Proxy::new(backends.clone())),
+            http,
+            https,
+            tcp,
             config_state: ConfigState::new(),
             scm,
             sessions,
@@ -894,11 +919,8 @@ impl Server {
                             .as_mut()
                             .and_then(|s| s.get_http(&activate.address))
                             .map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
-                        let status = match self.http.activate_listener(
-                            &mut self.poll,
-                            &activate.address,
-                            listener,
-                        ) {
+                        let status = match self.http.activate_listener(&activate.address, listener)
+                        {
                             Some(token) => {
                                 self.accept(ListenToken(token.0), Protocol::HTTPListen);
                                 ProxyResponseStatus::Ok
@@ -1045,11 +1067,8 @@ impl Server {
                             .as_mut()
                             .and_then(|s| s.get_https(&activate.address))
                             .map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
-                        let status = match self.https.activate_listener(
-                            &mut self.poll,
-                            &activate.address,
-                            listener,
-                        ) {
+                        let status = match self.https.activate_listener(&activate.address, listener)
+                        {
                             Some(token) => {
                                 self.accept(ListenToken(token.0), Protocol::HTTPSListen);
                                 ProxyResponseStatus::Ok
@@ -1199,11 +1218,7 @@ impl Server {
                             .as_mut()
                             .and_then(|s| s.get_tcp(&activate.address))
                             .map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
-                        let status = match self.tcp.activate_listener(
-                            &mut self.poll,
-                            &activate.address,
-                            listener,
-                        ) {
+                        let status = match self.tcp.activate_listener(&activate.address, listener) {
                             Some(token) => {
                                 self.accept(ListenToken(token.0), Protocol::TCPListen);
                                 ProxyResponseStatus::Ok
@@ -1933,13 +1948,16 @@ pub enum HttpsProvider {
 impl HttpsProvider {
     pub fn new(
         use_openssl: bool,
+        registry: Registry,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> HttpsProvider {
         if use_openssl {
-            HttpsProvider::Openssl(https_openssl::Proxy::new(pool, backends))
+            HttpsProvider::Openssl(https_openssl::Proxy::new(registry, pool, backends))
         } else {
-            HttpsProvider::Rustls(https_rustls::configuration::Proxy::new(pool, backends))
+            HttpsProvider::Rustls(https_rustls::configuration::Proxy::new(
+                registry, pool, backends,
+            ))
         }
     }
 
@@ -1959,16 +1977,15 @@ impl HttpsProvider {
 
     pub fn activate_listener(
         &mut self,
-        event_loop: &mut Poll,
         addr: &SocketAddr,
         tcp_listener: Option<TcpListener>,
     ) -> Option<Token> {
         match self {
             &mut HttpsProvider::Rustls(ref mut rustls) => {
-                rustls.activate_listener(event_loop, addr, tcp_listener)
+                rustls.activate_listener(addr, tcp_listener)
             }
             &mut HttpsProvider::Openssl(ref mut openssl) => {
-                openssl.activate_listener(event_loop, addr, tcp_listener)
+                openssl.activate_listener(addr, tcp_listener)
             }
         }
     }
@@ -2040,6 +2057,7 @@ use crate::https_rustls::session::Session;
 impl HttpsProvider {
     pub fn new(
         use_openssl: bool,
+        registry: Registry,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> HttpsProvider {
@@ -2047,7 +2065,7 @@ impl HttpsProvider {
             error!("the openssl provider is not compiled, continuing with the rustls provider");
         }
 
-        let configuration = https_rustls::configuration::Proxy::new(pool, backends);
+        let configuration = https_rustls::configuration::Proxy::new(registry, pool, backends);
         HttpsProvider::Rustls(configuration)
     }
 
@@ -2063,13 +2081,12 @@ impl HttpsProvider {
 
     pub fn activate_listener(
         &mut self,
-        event_loop: &mut Poll,
         addr: &SocketAddr,
         tcp_listener: Option<TcpListener>,
     ) -> Option<Token> {
         let &mut HttpsProvider::Rustls(ref mut rustls) = self;
 
-        rustls.activate_listener(event_loop, addr, tcp_listener)
+        rustls.activate_listener(addr, tcp_listener)
     }
 
     pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
