@@ -1073,9 +1073,11 @@ impl Proxy {
 impl ProxyConfiguration<Session> for Proxy {
     fn connect_to_backend(
         &mut self,
-        session: &mut Session,
-        back_token: Token,
+        session_rc: Rc<RefCell<dyn ProxySessionCast>>,
     ) -> Result<BackendConnectAction, ConnectionError> {
+        let mut b = session_rc.borrow_mut();
+        let session = b.as_tcp();
+
         if self.listeners[&session.accept_token].cluster_id.is_none() {
             error!("no TCP application corresponds to that front address");
             return Err(ConnectionError::HostNotFound);
@@ -1103,6 +1105,14 @@ impl ProxyConfiguration<Session> for Proxy {
                     );
                 }
                 session.back_connected = BackendConnectionStatus::Connecting(Instant::now());
+
+                let back_token = {
+                    let mut s = self.sessions.borrow_mut();
+                    let entry = s.vacant_entry();
+                    let back_token = Token(entry.key());
+                    let _entry = entry.insert(session_rc.clone());
+                    back_token
+                };
 
                 if let Err(e) = self.registry.register(
                     &mut stream,
