@@ -210,11 +210,14 @@ pub mod https_rustls;
 
 use mio::net::TcpStream;
 use mio::{Registry, Token};
+use std::cell::RefCell;
 use std::fmt;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::str;
 use time::{Duration, Instant};
 
+use crate::server::ProxySessionCast;
 use crate::sozu_command::proxy::{LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse};
 use crate::sozu_command::ready::Ready;
 
@@ -308,8 +311,7 @@ use self::server::ListenToken;
 pub trait ProxyConfiguration<Session> {
     fn connect_to_backend(
         &mut self,
-        session: &mut Session,
-        back_token: Token,
+        session: Rc<RefCell<dyn ProxySessionCast>>,
     ) -> Result<BackendConnectAction, ConnectionError>;
     fn notify(&mut self, message: ProxyRequest) -> ProxyResponse;
     fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;

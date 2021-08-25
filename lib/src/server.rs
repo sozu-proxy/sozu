@@ -1677,39 +1677,19 @@ impl Server {
                 return;
             }
 
-            // isolate the sessions borrow in that block
-            let back_token = {
-                let mut s = self.sessions.borrow_mut();
-                let entry = s.vacant_entry();
-                let back_token = Token(entry.key());
-                let _entry = entry.insert(cl);
-                back_token
-            };
-
             let (protocol, res) = match protocol {
                 Protocol::TCP => {
-                    let mut b = cl2.borrow_mut();
-                    let session: &mut tcp::Session = b.as_tcp();
-                    let r = self.tcp.connect_to_backend(session, back_token);
+                    let r = self.tcp.connect_to_backend(cl2);
 
                     (Protocol::TCP, r)
                 }
-                Protocol::HTTP => (Protocol::HTTP, {
-                    let mut b = cl2.borrow_mut();
-                    let session: &mut http::Session = b.as_http();
-                    self.http.connect_to_backend(session, back_token)
-                }),
-                Protocol::HTTPS => (Protocol::HTTPS, {
-                    self.https.connect_to_backend(cl2, back_token)
-                }),
+                Protocol::HTTP => (Protocol::HTTP, { self.http.connect_to_backend(cl2) }),
+                Protocol::HTTPS => (Protocol::HTTPS, { self.https.connect_to_backend(cl2) }),
                 _ => {
                     panic!("should not call connect_to_backend on listeners");
                 }
             };
 
-            if res != Ok(BackendConnectAction::New) {
-                self.sessions.borrow_mut().remove(back_token.0);
-            }
             (protocol, res)
         };
 
@@ -2037,20 +2017,11 @@ impl HttpsProvider {
 
     pub fn connect_to_backend(
         &mut self,
-        proxy_session: Rc<RefCell<dyn ProxySessionCast>>,
-        back_token: Token,
+        session: Rc<RefCell<dyn ProxySessionCast>>,
     ) -> Result<BackendConnectAction, ConnectionError> {
         match self {
-            &mut HttpsProvider::Rustls(ref mut rustls) => {
-                let mut b = proxy_session.borrow_mut();
-                let session: &mut https_rustls::session::Session = b.as_https_rustls();
-                rustls.connect_to_backend(session, back_token)
-            }
-            &mut HttpsProvider::Openssl(ref mut openssl) => {
-                let mut b = proxy_session.borrow_mut();
-                let session: &mut https_openssl::Session = b.as_https_openssl();
-                openssl.connect_to_backend(session, back_token)
-            }
+            &mut HttpsProvider::Rustls(ref mut rustls) => rustls.connect_to_backend(session),
+            &mut HttpsProvider::Openssl(ref mut openssl) => openssl.connect_to_backend(session),
         }
     }
 }
@@ -2123,14 +2094,10 @@ impl HttpsProvider {
 
     pub fn connect_to_backend(
         &mut self,
-        proxy_session: Rc<RefCell<dyn ProxySessionCast>>,
-        back_token: Token,
+        session: Rc<RefCell<dyn ProxySessionCast>>,
     ) -> Result<BackendConnectAction, ConnectionError> {
         let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-
-        let mut b = proxy_session.borrow_mut();
-        let session: &mut https_rustls::session::Session = b.as_https_rustls();
-        rustls.connect_to_backend(session, back_token)
+        rustls.connect_to_backend(session)
     }
 }
 
