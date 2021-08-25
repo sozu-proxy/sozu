@@ -28,7 +28,8 @@ use crate::protocol::proxy_protocol::send::SendProxyProtocol;
 use crate::protocol::{Pipe, ProtocolResult};
 use crate::retry::RetryPolicy;
 use crate::server::{
-    push_event, ListenSession, ListenToken, ProxyChannel, Server, CONN_RETRIES, TIMER,
+    push_event, ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, CONN_RETRIES,
+    TIMER,
 };
 use crate::socket::server_bind;
 use crate::timer::TimeoutContainer;
@@ -977,16 +978,22 @@ pub struct Proxy {
     listeners: HashMap<Token, Listener>,
     configs: HashMap<ClusterId, ClusterConfiguration>,
     registry: Registry,
+    sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
 }
 
 impl Proxy {
-    pub fn new(registry: Registry, backends: Rc<RefCell<BackendMap>>) -> Proxy {
+    pub fn new(
+        registry: Registry,
+        sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
+        backends: Rc<RefCell<BackendMap>>,
+    ) -> Proxy {
         Proxy {
             backends,
             listeners: HashMap::new(),
             configs: HashMap::new(),
             fronts: HashMap::new(),
             registry,
+            sessions,
         }
     }
 
@@ -1348,7 +1355,7 @@ pub fn start(
     buffer_size: usize,
     channel: ProxyChannel,
 ) {
-    use crate::server::{self, ProxySessionCast};
+    use crate::server;
 
     let poll = Poll::new().expect("could not create event loop");
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
@@ -1390,9 +1397,10 @@ pub fn start(
         Token(key)
     };
 
+    let sessions = Rc::new(RefCell::new(sessions));
     let address = config.address;
     let registry = poll.registry().try_clone().unwrap();
-    let mut configuration = Proxy::new(registry, backends.clone());
+    let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
     let _ = configuration.add_listener(config, pool.clone(), token);
     let _ = configuration.activate_listener(&address, None);
     let (scm_server, _scm_client) = UnixStream::pair().unwrap();
@@ -1403,7 +1411,7 @@ pub fn start(
         poll,
         channel,
         ScmSocket::new(scm_server.as_raw_fd()),
-        Rc::new(RefCell::new(sessions)),
+        sessions,
         pool,
         backends,
         None,
@@ -1548,7 +1556,7 @@ mod tests {
     }
 
     pub fn start_proxy() -> Channel<ProxyRequest, ProxyResponse> {
-        use crate::server::{self, ProxySessionCast};
+        use crate::server;
 
         info!("listen for connections");
         let (mut command, channel) =
@@ -1589,8 +1597,9 @@ mod tests {
                 })));
             }
 
+            let sessions = Rc::new(RefCell::new(sessions));
             let registry = poll.registry().try_clone().unwrap();
-            let mut configuration = Proxy::new(registry, backends.clone());
+            let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
             let listener_config = TcpListenerConfig {
                 address: "127.0.0.1:1234".parse().unwrap(),
                 public_address: None,
@@ -1602,7 +1611,8 @@ mod tests {
 
             {
                 let address = listener_config.address.clone();
-                let entry = sessions.vacant_entry();
+                let mut s = sessions.borrow_mut();
+                let entry = s.vacant_entry();
                 let _ =
                     configuration.add_listener(listener_config, pool.clone(), Token(entry.key()));
                 let _ = configuration.activate_listener(&address, None);
@@ -1627,7 +1637,7 @@ mod tests {
                 poll,
                 channel,
                 ScmSocket::new(scm_server.into_raw_fd()),
-                Rc::new(RefCell::new(sessions)),
+                sessions,
                 pool,
                 backends,
                 None,

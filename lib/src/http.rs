@@ -25,7 +25,9 @@ use super::protocol::http::{answers::HttpAnswers, DefaultAnswerStatus};
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use super::protocol::{Http, Pipe, ProtocolResult, StickySession};
 use super::retry::RetryPolicy;
-use super::server::{push_event, ListenSession, ListenToken, ProxyChannel, Server, CONN_RETRIES};
+use super::server::{
+    push_event, ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, CONN_RETRIES,
+};
 use super::socket::server_bind;
 use super::{
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, CloseResult, ClusterId,
@@ -942,11 +944,13 @@ pub struct Proxy {
     clusters: HashMap<ClusterId, Cluster>,
     pool: Rc<RefCell<Pool>>,
     registry: Registry,
+    sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
 }
 
 impl Proxy {
     pub fn new(
         registry: Registry,
+        sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> Proxy {
@@ -956,6 +960,7 @@ impl Proxy {
             backends,
             pool,
             registry,
+            sessions,
         }
     }
 
@@ -1638,7 +1643,7 @@ impl ProxyConfiguration<Session> for Proxy {
 }
 
 pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-    use super::server::{self, ProxySessionCast};
+    use crate::server;
     let event_loop = Poll::new().expect("could not create event loop");
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
@@ -1680,8 +1685,9 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
     };
 
     let address = config.address;
+    let sessions = Rc::new(RefCell::new(sessions));
     let registry = event_loop.registry().try_clone().unwrap();
-    let mut proxy = Proxy::new(registry, pool.clone(), backends.clone());
+    let mut proxy = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     let _ = proxy.add_listener(config, token);
     let _ = proxy.activate_listener(&address, None);
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
@@ -1700,7 +1706,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
         event_loop,
         channel,
         ScmSocket::new(scm_server.into_raw_fd()),
-        Rc::new(RefCell::new(sessions)),
+        sessions,
         pool,
         backends,
         Some(proxy),
