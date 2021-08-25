@@ -209,7 +209,7 @@ pub mod https_openssl;
 pub mod https_rustls;
 
 use mio::net::TcpStream;
-use mio::{Poll, Token};
+use mio::{Registry, Token};
 use std::cell::RefCell;
 use std::fmt;
 use std::net::SocketAddr;
@@ -257,9 +257,9 @@ pub trait ProxySession {
     /// it will call this method on the session
     fn process_events(&mut self, token: Token, events: Ready);
     /// closes a session
-    fn close(&mut self, poll: &mut Poll) -> CloseResult;
+    fn close(&mut self, registry: &Registry) -> CloseResult;
     /// closes the backend socket of a session
-    fn close_backend(&mut self, token: Token, poll: &mut Poll);
+    fn close_backend(&mut self, token: Token, registry: &Registry);
     /// if a timeout associated with the session triggers, the event loop will
     /// call this method with the timeout's token
     fn timeout(&mut self, t: Token) -> SessionResult;
@@ -310,17 +310,15 @@ use self::server::ListenToken;
 pub trait ProxyConfiguration<Session> {
     fn connect_to_backend(
         &mut self,
-        event_loop: &mut Poll,
         session: &mut Session,
         back_token: Token,
     ) -> Result<BackendConnectAction, ConnectionError>;
-    fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse;
+    fn notify(&mut self, message: ProxyRequest) -> ProxyResponse;
     fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
     fn create_session(
         &mut self,
         socket: TcpStream,
         token: ListenToken,
-        event_loop: &mut Poll,
         session_token: Token,
         wait_time: Duration,
     ) -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
