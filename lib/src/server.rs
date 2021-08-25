@@ -1429,22 +1429,14 @@ impl Server {
 
         //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
         let index = {
-            let mut s = self.sessions.borrow_mut();
-            let entry = s.vacant_entry();
-            let session_token = Token(entry.key());
-            let index = entry.key();
-            match self
-                .tcp
-                .create_session(socket, token, session_token, wait_time)
-            {
-                Ok((session, should_connect)) => {
-                    entry.insert(session);
+            match self.tcp.create_session(socket, token, wait_time) {
+                Ok((session_token, should_connect)) => {
                     self.nb_connections += 1;
                     assert!(self.nb_connections <= self.max_connections);
                     gauge!("client.connections", self.nb_connections);
 
                     if should_connect {
-                        index
+                        session_token.0
                     } else {
                         return true;
                     }
@@ -1495,15 +1487,8 @@ impl Server {
             return false;
         }
 
-        let mut s = self.sessions.borrow_mut();
-        let entry = s.vacant_entry();
-        let session_token = Token(entry.key());
-        match self
-            .http
-            .create_session(socket, token, session_token, wait_time)
-        {
-            Ok((session, _)) => {
-                entry.insert(session);
+        match self.http.create_session(socket, token, wait_time) {
+            Ok(_) => {
                 self.nb_connections += 1;
                 assert!(self.nb_connections <= self.max_connections);
                 gauge!("client.connections", self.nb_connections);
@@ -1551,15 +1536,8 @@ impl Server {
             return false;
         }
 
-        let mut s = self.sessions.borrow_mut();
-        let entry = s.vacant_entry();
-        let session_token = Token(entry.key());
-        match self
-            .https
-            .create_session(socket, token, session_token, wait_time)
-        {
-            Ok((session, _)) => {
-                entry.insert(session);
+        match self.https.create_session(socket, token, wait_time) {
+            Ok(_) => {
                 self.nb_connections += 1;
                 assert!(self.nb_connections <= self.max_connections);
                 gauge!("client.connections", self.nb_connections);
@@ -2045,16 +2023,15 @@ impl HttpsProvider {
         &mut self,
         frontend_sock: TcpStream,
         token: ListenToken,
-        session_token: Token,
         wait_time: Duration,
-    ) -> Result<(Rc<RefCell<dyn ProxySessionCast>>, bool), AcceptError> {
+    ) -> Result<(Token, bool), AcceptError> {
         match self {
-            &mut HttpsProvider::Rustls(ref mut rustls) => rustls
-                .create_session(frontend_sock, token, session_token, wait_time)
-                .map(|(r, b)| (r as Rc<RefCell<dyn ProxySessionCast>>, b)),
-            &mut HttpsProvider::Openssl(ref mut openssl) => openssl
-                .create_session(frontend_sock, token, session_token, wait_time)
-                .map(|(r, b)| (r as Rc<RefCell<dyn ProxySessionCast>>, b)),
+            &mut HttpsProvider::Rustls(ref mut rustls) => {
+                rustls.create_session(frontend_sock, token, wait_time)
+            }
+            &mut HttpsProvider::Openssl(ref mut openssl) => {
+                openssl.create_session(frontend_sock, token, wait_time)
+            }
         }
     }
 
@@ -2138,11 +2115,10 @@ impl HttpsProvider {
         &mut self,
         frontend_sock: TcpStream,
         token: ListenToken,
-        session_token: Token,
         wait_time: Duration,
-    ) -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
+    ) -> Result<(Token, bool), AcceptError> {
         let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-        rustls.create_session(frontend_sock, token, session_token, wait_time)
+        rustls.create_session(frontend_sock, token, wait_time)
     }
 
     pub fn connect_to_backend(

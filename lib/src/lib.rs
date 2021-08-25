@@ -210,10 +210,8 @@ pub mod https_rustls;
 
 use mio::net::TcpStream;
 use mio::{Registry, Token};
-use std::cell::RefCell;
 use std::fmt;
 use std::net::SocketAddr;
-use std::rc::Rc;
 use std::str;
 use time::{Duration, Instant};
 
@@ -319,9 +317,8 @@ pub trait ProxyConfiguration<Session> {
         &mut self,
         socket: TcpStream,
         token: ListenToken,
-        session_token: Token,
         wait_time: Duration,
-    ) -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
+    ) -> Result<(Token, bool), AcceptError>;
 }
 
 #[derive(Debug, PartialEq, Eq)]
