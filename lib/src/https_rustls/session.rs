@@ -806,7 +806,7 @@ impl Session {
 }
 
 impl ProxySession for Session {
-    fn close(&mut self, poll: &mut Poll) -> CloseResult {
+    fn close(&mut self, registry: &Registry) -> CloseResult {
         //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
         self.http_mut().map(|http| http.close());
         self.metrics.service_stop();
@@ -817,7 +817,7 @@ impl ProxySession for Session {
             }
         }
 
-        if let Err(e) = poll.registry().deregister(self.front_socket_mut()) {
+        if let Err(e) = registry.deregister(self.front_socket_mut()) {
             error!("error deregistering front socket: {:?}", e);
         }
 
@@ -828,7 +828,7 @@ impl ProxySession for Session {
         }
 
         //FIXME: should we really pass a token here?
-        self.close_backend(Token(0), poll);
+        self.close_backend(Token(0), registry);
 
         if let Some(State::Http(ref mut http)) = self.protocol {
             //if the state was initial, the connection was already reset
@@ -875,7 +875,7 @@ impl ProxySession for Session {
         }
     }
 
-    fn close_backend(&mut self, _: Token, poll: &mut Poll) {
+    fn close_backend(&mut self, _: Token, registry: &Registry) {
         self.remove_backend();
 
         let back_connected = self.back_connected();
@@ -888,7 +888,7 @@ impl ProxySession for Session {
                     }
                 }
 
-                if let Err(e) = poll.registry().deregister(sock) {
+                if let Err(e) = registry.deregister(sock) {
                     error!("error deregistering backend socket: {:?}", e);
                 }
             }

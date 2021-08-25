@@ -742,7 +742,7 @@ impl Session {
 }
 
 impl ProxySession for Session {
-    fn close(&mut self, poll: &mut Poll) -> CloseResult {
+    fn close(&mut self, registry: &Registry) -> CloseResult {
         self.metrics.service_stop();
         self.cancel_timeouts();
         if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
@@ -755,7 +755,7 @@ impl ProxySession for Session {
             }
         }
 
-        if let Err(e) = poll.registry().deregister(self.front_socket_mut()) {
+        if let Err(e) = registry.deregister(self.front_socket_mut()) {
             error!(
                 "error deregistering front socket({:?}): {:?}",
                 self.front_socket(),
@@ -770,7 +770,7 @@ impl ProxySession for Session {
         }
 
         //FIXME: should we really pass a token here?
-        self.close_backend(Token(0), poll);
+        self.close_backend(Token(0), registry);
 
         if let Some(State::Http(ref mut http)) = self.protocol {
             //if the state was initial, the connection was already reset
@@ -817,7 +817,7 @@ impl ProxySession for Session {
     }
 
     //FIXME: check the token passed as argument
-    fn close_backend(&mut self, _: Token, poll: &mut Poll) {
+    fn close_backend(&mut self, _: Token, registry: &Registry) {
         self.remove_backend();
 
         let back_connected = self.back_connected();
@@ -829,7 +829,7 @@ impl ProxySession for Session {
                         error!("error shutting down back socket({:?}): {:?}", sock, e);
                     }
                 }
-                if let Err(e) = poll.registry().deregister(sock) {
+                if let Err(e) = registry.deregister(sock) {
                     error!("error shutting down back socket({:?}): {:?}", sock, e);
                 }
             }
@@ -983,7 +983,7 @@ impl Proxy {
     ) -> Option<Token> {
         for listener in self.listeners.values_mut() {
             if &listener.address == addr {
-                return listener.activate(&mut self.registry, tcp_listener);
+                return listener.activate(&self.registry, tcp_listener);
             }
         }
         None
@@ -1196,7 +1196,7 @@ impl Listener {
 
     pub fn activate(
         &mut self,
-        registry: &mut Registry,
+        registry: &Registry,
         tcp_listener: Option<TcpListener>,
     ) -> Option<Token> {
         if self.active {
@@ -1295,7 +1295,6 @@ impl Listener {
 impl ProxyConfiguration<Session> for Proxy {
     fn connect_to_backend(
         &mut self,
-        poll: &mut Poll,
         session: &mut Session,
         back_token: Token,
     ) -> Result<BackendConnectAction, ConnectionError> {
@@ -1338,7 +1337,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 });
                 return Ok(BackendConnectAction::Reuse);
             } else if let Some(token) = session.back_token() {
-                session.close_backend(token, poll);
+                session.close_backend(token, &self.registry);
 
                 //reset the back token here so we can remove it
                 //from the slab after backend_from* fails
@@ -1349,7 +1348,7 @@ impl ProxyConfiguration<Session> for Proxy {
         //replacing with a connection to another cluster
         if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
             if let Some(token) = session.back_token() {
-                session.close_backend(token, poll);
+                session.close_backend(token, &self.registry);
 
                 //reset the back token here so we can remove it
                 //from the slab after backend_from* fails
@@ -1391,7 +1390,7 @@ impl ProxyConfiguration<Session> for Proxy {
         session.back_connected = BackendConnectionStatus::Connecting(Instant::now());
         if let Some(back_token) = old_back_token {
             session.set_back_token(back_token);
-            if let Err(e) = poll.registry().register(
+            if let Err(e) = self.registry.register(
                 &mut socket,
                 back_token,
                 Interest::READABLE | Interest::WRITABLE,
@@ -1404,7 +1403,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 .map(|h| h.set_back_timeout(connect_timeout));
             Ok(BackendConnectAction::Replace)
         } else {
-            if let Err(e) = poll.registry().register(
+            if let Err(e) = self.registry.register(
                 &mut socket,
                 back_token,
                 Interest::READABLE | Interest::WRITABLE,
@@ -1421,7 +1420,7 @@ impl ProxyConfiguration<Session> for Proxy {
         }
     }
 
-    fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
+    fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
         // ToDo temporary
         //trace!("{} notified", message);
         match message.order {
@@ -1513,9 +1512,10 @@ impl ProxyConfiguration<Session> for Proxy {
             }
             ProxyRequestData::SoftStop => {
                 info!("{} processing soft shutdown", message.id);
-                for (_, l) in self.listeners.iter_mut() {
+                let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
+                for (_, l) in listeners.iter_mut() {
                     l.listener.take().map(|mut sock| {
-                        if let Err(e) = event_loop.registry().deregister(&mut sock) {
+                        if let Err(e) = self.registry.deregister(&mut sock) {
                             error!("error deregistering listen socket({:?}): {:?}", sock, e);
                         }
                     });
@@ -1528,9 +1528,10 @@ impl ProxyConfiguration<Session> for Proxy {
             }
             ProxyRequestData::HardStop => {
                 info!("{} hard shutdown", message.id);
-                for (_, mut l) in self.listeners.drain() {
+                let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
+                for (_, mut l) in listeners.drain() {
                     l.listener.take().map(|mut sock| {
-                        if let Err(e) = event_loop.registry().deregister(&mut sock) {
+                        if let Err(e) = self.registry.deregister(&mut sock) {
                             error!("error deregistering listen socket({:?}): {:?}", sock, e);
                         }
                     });
@@ -1586,7 +1587,6 @@ impl ProxyConfiguration<Session> for Proxy {
         &mut self,
         frontend_sock: TcpStream,
         listen_token: ListenToken,
-        poll: &mut Poll,
         session_token: Token,
         wait_time: Duration,
     ) -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
@@ -1614,7 +1614,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 Duration::seconds(listener.config.back_timeout as i64),
                 Duration::seconds(listener.config.request_timeout as i64),
             ) {
-                if let Err(e) = poll.registry().register(
+                if let Err(e) = self.registry.register(
                     c.front_socket_mut(),
                     session_token,
                     Interest::READABLE | Interest::WRITABLE,
