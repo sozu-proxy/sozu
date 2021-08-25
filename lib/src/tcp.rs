@@ -979,12 +979,14 @@ pub struct Proxy {
     configs: HashMap<ClusterId, ClusterConfiguration>,
     registry: Registry,
     sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
+    max_connections: usize,
 }
 
 impl Proxy {
     pub fn new(
         registry: Registry,
         sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
+        max_connections: usize,
         backends: Rc<RefCell<BackendMap>>,
     ) -> Proxy {
         Proxy {
@@ -994,6 +996,7 @@ impl Proxy {
             fronts: HashMap::new(),
             registry,
             sessions,
+            max_connections,
         }
     }
 
@@ -1068,6 +1071,10 @@ impl Proxy {
             false
         }
     }
+
+    fn slab_capacity(&self) -> usize {
+        10 + 2 * self.max_connections
+    }
 }
 
 impl ProxyConfiguration<Session> for Proxy {
@@ -1090,6 +1097,11 @@ impl ProxyConfiguration<Session> for Proxy {
         if session.connection_attempt == CONN_RETRIES {
             error!("{} max connection attempt reached", session.log_context());
             return Err(ConnectionError::NoBackendAvailable);
+        }
+
+        if self.sessions.borrow().len() >= self.slab_capacity() {
+            error!("not enough memory, cannot connect to backend");
+            return Err(ConnectionError::TooManyConnections);
         }
 
         let conn = self
@@ -1416,7 +1428,7 @@ pub fn start(
     let sessions = Rc::new(RefCell::new(sessions));
     let address = config.address;
     let registry = poll.registry().try_clone().unwrap();
-    let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
+    let mut configuration = Proxy::new(registry, sessions.clone(), max_buffers, backends.clone());
     let _ = configuration.add_listener(config, pool.clone(), token);
     let _ = configuration.activate_listener(&address, None);
     let (scm_server, _scm_client) = UnixStream::pair().unwrap();
@@ -1615,7 +1627,8 @@ mod tests {
 
             let sessions = Rc::new(RefCell::new(sessions));
             let registry = poll.registry().try_clone().unwrap();
-            let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
+            let mut configuration =
+                Proxy::new(registry, sessions.clone(), max_buffers, backends.clone());
             let listener_config = TcpListenerConfig {
                 address: "127.0.0.1:1234".parse().unwrap(),
                 public_address: None,

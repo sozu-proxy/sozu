@@ -420,6 +420,7 @@ pub enum ConnectionError {
     ToBeDefined,
     HttpsRedirect,
     Unauthorized,
+    TooManyConnections,
 }
 
 #[derive(Debug, PartialEq, Eq)]
