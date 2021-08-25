@@ -1592,9 +1592,8 @@ impl ProxyConfiguration<Session> for Proxy {
         &mut self,
         frontend_sock: TcpStream,
         listen_token: ListenToken,
-        session_token: Token,
         wait_time: Duration,
-    ) -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
+    ) -> Result<(Token, bool), AcceptError> {
         if let Some(ref listener) = self.listeners.get(&Token(listen_token.0)) {
             if let Err(e) = frontend_sock.set_nodelay(true) {
                 error!(
@@ -1602,6 +1601,10 @@ impl ProxyConfiguration<Session> for Proxy {
                     frontend_sock, e
                 );
             }
+            let mut s = self.sessions.borrow_mut();
+            let entry = s.vacant_entry();
+            let session_token = Token(entry.key());
+
             if let Some(mut c) = Session::new(
                 frontend_sock,
                 session_token,
@@ -1631,7 +1634,9 @@ impl ProxyConfiguration<Session> for Proxy {
                     );
                 }
 
-                Ok((Rc::new(RefCell::new(c)), false))
+                let s = Rc::new(RefCell::new(c));
+                entry.insert(s);
+                Ok((session_token, false))
             } else {
                 Err(AcceptError::TooManySessions)
             }
