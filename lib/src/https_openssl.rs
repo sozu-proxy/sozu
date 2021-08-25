@@ -2384,7 +2384,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
                 event_loop,
                 channel,
                 ScmSocket::new(scm_server.as_raw_fd()),
-                sessions,
+                Rc::new(RefCell::new(sessions)),
                 pool,
                 backends,
                 None,

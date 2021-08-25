@@ -1700,7 +1700,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
         event_loop,
         channel,
         ScmSocket::new(scm_server.into_raw_fd()),
-        sessions,
+        Rc::new(RefCell::new(sessions)),
         pool,
         backends,
         Some(proxy),
