@@ -224,6 +224,7 @@ impl Server {
             use_openssl,
             registry,
             sessions.clone(),
+            server_config.max_connections,
             pool.clone(),
             backends.clone(),
         );
@@ -285,7 +286,13 @@ impl Server {
                 .registry()
                 .try_clone()
                 .expect("could not clone the mio Registry");
-            http::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
+            http::Proxy::new(
+                registry,
+                sessions.clone(),
+                server_config.max_connections,
+                pool.clone(),
+                backends.clone(),
+            )
         });
         let https = https.unwrap_or_else(|| {
             let registry = poll
@@ -296,6 +303,7 @@ impl Server {
                 false,
                 registry,
                 sessions.clone(),
+                server_config.max_connections,
                 pool.clone(),
                 backends.clone(),
             )
@@ -305,7 +313,12 @@ impl Server {
                 .registry()
                 .try_clone()
                 .expect("could not clone the mio Registry");
-            tcp::Proxy::new(registry, sessions.clone(), backends.clone())
+            tcp::Proxy::new(
+                registry,
+                sessions.clone(),
+                server_config.max_connections,
+                backends.clone(),
+            )
         });
 
         let mut server = Server {
@@ -1668,23 +1681,17 @@ impl Server {
         }
 
         let (protocol, res) = {
-            let cl = self.sessions.borrow()[token.0].clone();
-            let cl2: Rc<RefCell<dyn ProxySessionCast>> = cl.clone();
-            let protocol = { cl.borrow().protocol() };
-
-            if self.sessions.borrow().len() >= self.slab_capacity() {
-                error!("not enough memory, cannot connect to backend");
-                return;
-            }
+            let session = self.sessions.borrow()[token.0].clone();
+            let protocol = { session.borrow().protocol() };
 
             let (protocol, res) = match protocol {
                 Protocol::TCP => {
-                    let r = self.tcp.connect_to_backend(cl2);
+                    let r = self.tcp.connect_to_backend(session);
 
                     (Protocol::TCP, r)
                 }
-                Protocol::HTTP => (Protocol::HTTP, { self.http.connect_to_backend(cl2) }),
-                Protocol::HTTPS => (Protocol::HTTPS, { self.https.connect_to_backend(cl2) }),
+                Protocol::HTTP => (Protocol::HTTP, { self.http.connect_to_backend(session) }),
+                Protocol::HTTPS => (Protocol::HTTPS, { self.https.connect_to_backend(session) }),
                 _ => {
                     panic!("should not call connect_to_backend on listeners");
                 }
@@ -1935,16 +1942,25 @@ impl HttpsProvider {
         use_openssl: bool,
         registry: Registry,
         sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
+        max_connections: usize,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> HttpsProvider {
         if use_openssl {
             HttpsProvider::Openssl(https_openssl::Proxy::new(
-                registry, sessions, pool, backends,
+                registry,
+                sessions,
+                max_connections,
+                pool,
+                backends,
             ))
         } else {
             HttpsProvider::Rustls(https_rustls::configuration::Proxy::new(
-                registry, sessions, pool, backends,
+                registry,
+                sessions,
+                max_connections,
+                pool,
+                backends,
             ))
         }
     }
@@ -2035,6 +2051,7 @@ impl HttpsProvider {
         use_openssl: bool,
         registry: Registry,
         sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
+        max_connections: usize,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> HttpsProvider {
@@ -2042,8 +2059,13 @@ impl HttpsProvider {
             error!("the openssl provider is not compiled, continuing with the rustls provider");
         }
 
-        let configuration =
-            https_rustls::configuration::Proxy::new(registry, sessions, pool, backends);
+        let configuration = https_rustls::configuration::Proxy::new(
+            registry,
+            sessions,
+            max_connections,
+            pool,
+            backends,
+        );
         HttpsProvider::Rustls(configuration)
     }
 
