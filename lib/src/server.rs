@@ -220,7 +220,13 @@ impl Server {
             .registry()
             .try_clone()
             .expect("could not clone the mio Registry");
-        let https = HttpsProvider::new(use_openssl, registry, pool.clone(), backends.clone());
+        let https = HttpsProvider::new(
+            use_openssl,
+            registry,
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
 
         Server::new(
             event_loop,
@@ -279,21 +285,27 @@ impl Server {
                 .registry()
                 .try_clone()
                 .expect("could not clone the mio Registry");
-            http::Proxy::new(registry, pool.clone(), backends.clone())
+            http::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
         });
         let https = https.unwrap_or_else(|| {
             let registry = poll
                 .registry()
                 .try_clone()
                 .expect("could not clone the mio Registry");
-            HttpsProvider::new(false, registry, pool.clone(), backends.clone())
+            HttpsProvider::new(
+                false,
+                registry,
+                sessions.clone(),
+                pool.clone(),
+                backends.clone(),
+            )
         });
         let tcp = tcp.unwrap_or_else(|| {
             let registry = poll
                 .registry()
                 .try_clone()
                 .expect("could not clone the mio Registry");
-            tcp::Proxy::new(registry, backends.clone())
+            tcp::Proxy::new(registry, sessions.clone(), backends.clone())
         });
 
         let mut server = Server {
@@ -1964,14 +1976,17 @@ impl HttpsProvider {
     pub fn new(
         use_openssl: bool,
         registry: Registry,
+        sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> HttpsProvider {
         if use_openssl {
-            HttpsProvider::Openssl(https_openssl::Proxy::new(registry, pool, backends))
+            HttpsProvider::Openssl(https_openssl::Proxy::new(
+                registry, sessions, pool, backends,
+            ))
         } else {
             HttpsProvider::Rustls(https_rustls::configuration::Proxy::new(
-                registry, pool, backends,
+                registry, sessions, pool, backends,
             ))
         }
     }
@@ -2071,6 +2086,7 @@ impl HttpsProvider {
     pub fn new(
         use_openssl: bool,
         registry: Registry,
+        sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> HttpsProvider {
@@ -2078,7 +2094,8 @@ impl HttpsProvider {
             error!("the openssl provider is not compiled, continuing with the rustls provider");
         }
 
-        let configuration = https_rustls::configuration::Proxy::new(registry, pool, backends);
+        let configuration =
+            https_rustls::configuration::Proxy::new(registry, sessions, pool, backends);
         HttpsProvider::Rustls(configuration)
     }
 
