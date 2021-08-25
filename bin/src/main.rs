@@ -24,7 +24,7 @@ mod upgrade;
 mod cli;
 mod util;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use std::panic;
 use sozu_command::config::Config;
 use clap::ArgMatches;
@@ -35,20 +35,6 @@ use libc::{cpu_set_t,pid_t};
 use crate::command::Worker;
 use crate::worker::{start_workers,get_executable_path};
 use sozu::metrics::METRICS;
-
-#[derive(Debug)]
-pub enum StartupError {
-  ConfigurationFileNotSpecified,
-  ConfigurationFileLoadError(std::io::Error),
-  #[allow(dead_code)]
-  TooManyAllowedConnections(String),
-  #[allow(dead_code)]
-  TooManyAllowedConnectionsForWorker(String),
-  WorkersSpawnFail(anyhow::Error),
-  SozuMainStartFail(anyhow::Error),
-  PIDFileNotWritable(String),
-  UnknownSubcommand,
-}
 
 fn main() -> Result<(), anyhow::Error> {
   register_panic_hook();
@@ -65,45 +51,15 @@ fn main() -> Result<(), anyhow::Error> {
   if let Some(upgrade_matches) = matches.subcommand_matches("upgrade") {
     return upgrade_main(&upgrade_matches);
   }
-
             
   // If we are not, then we want to start sozu
-  match start(&matches) {
-    Ok(_) => {info!("main process stopped"); }, // Ok() is only called when the proxy exits
-    Err(StartupError::ConfigurationFileNotSpecified) => {
-      error!("Configuration file hasn't been specified. Either use -c with the start command \
-              or use the SOZU_CONFIG environment variable when building sozu.");
-      bail!("exit");
-    },
-    Err(StartupError::ConfigurationFileLoadError(err)) => {
-      error!("Invalid configuration file. Error: {:?}", err);
-      bail!("exit");
-    },
-    Err(StartupError::TooManyAllowedConnections(err)) | Err(StartupError::TooManyAllowedConnectionsForWorker(err)) => {
-      error!("{}", err);
-      bail!("exit");
-    },
-    Err(StartupError::WorkersSpawnFail(err)) => {
-      error!("At least one worker failed to spawn. Error: {:?}", err);
-      bail!("exit");
-    },
-    Err(StartupError::PIDFileNotWritable(err)) => {
-      error!("{}", err);
-      bail!("exit");
-    },
-    Err(StartupError::SozuMainStartFail(err)) => {
-      error!("Failed to start Sōzu: {}", err);
-      bail!("exit");
-    }
-    Err(StartupError::UnknownSubcommand) => {
-      error!("Unknown subcommand");
-      bail!("exit");
-    }
-  }
+  start(&matches)?;
+
+  info!("main process stopped");
   Ok(())
 }
 
-fn start(matches: &ArgMatches) -> Result<(), StartupError> {
+fn start(matches: &ArgMatches) -> Result<(), anyhow::Error> {
 
   let config = load_configuration(get_config_file_path(&matches)?)?;
 
@@ -111,7 +67,7 @@ fn start(matches: &ArgMatches) -> Result<(), StartupError> {
   info!("Starting up");
   util::setup_metrics(&config);
   util::write_pid_file(&config)
-    .or_else(|e| Err(StartupError::PIDFileNotWritable(e.to_string())))?;
+    .with_context(|| "The PID file is not writeable")?;
 
   update_process_limits(&config)?;
 
@@ -124,39 +80,39 @@ fn start(matches: &ArgMatches) -> Result<(), StartupError> {
   let command_socket_path = config.command_socket_path();
 
   command::start(config, command_socket_path, workers)
-    .map_err(|e| StartupError::SozuMainStartFail(e))?;
-
-  Ok(())
+    .with_context(|| "Sozu main start failed")
 }
 
-fn init_workers(config: &Config) -> Result<Vec<Worker>, StartupError> {
+fn init_workers(config: &Config) -> Result<Vec<Worker>, anyhow::Error> {
   let path = unsafe {
-    get_executable_path()
-      .map_err(|e| StartupError::WorkersSpawnFail(e))?
+    get_executable_path().with_context(|| "Failed to get the executable path for the worker")?
   };
 
   let workers = start_workers(path, &config)
-    .map_err(|e| StartupError::WorkersSpawnFail(e))?;
+    .with_context(|| "At least one worker failed to spawn")?;
   
   info!("created workers: {:?}", workers);
   Ok(workers)
 }
 
-fn get_config_file_path<'a>(matches: &'a ArgMatches<'a>) -> Result<&'a str, StartupError> {
-  if let Some(start_matches) = matches.subcommand_matches("start") { //(|e| StartupError::UnknownedSubcommand(e));
-    match start_matches.value_of("config") {
-      Some(config_file) => Ok(config_file),
-      None => option_env!("SOZU_CONFIG").ok_or(StartupError::ConfigurationFileNotSpecified)
+fn get_config_file_path<'a>(matches: &'a ArgMatches<'a>) -> Result<&'a str, anyhow::Error> {
+  let start_matches = matches.subcommand_matches("start").with_context(|| "unknown subcommand")?;
+  match start_matches.value_of("config") {
+    Some(config_file) => Ok(config_file),
+    None => {
+      option_env!("SOZU_CONFIG")
+        .ok_or(
+          anyhow::Error::msg(
+            "Configuration file hasn't been specified. Either use -c with the start command \
+            or use the SOZU_CONFIG environment variable when building sozu."
+          )
+        )
     }
-  } else {
-    Err(StartupError::UnknownSubcommand)
   }
 }
 
-fn load_configuration(config_file: &str) -> Result<Config, StartupError> {
-  Config::load_from_path(config_file).map_err(
-    |e| StartupError::ConfigurationFileLoadError(e)
-  )
+fn load_configuration(config_file: &str) -> Result<Config, anyhow::Error> {
+  Config::load_from_path(config_file).with_context(|| "Invalid configuration file.")
 }
 
 /// Set workers process affinity, see man sched_setaffinity
@@ -216,20 +172,23 @@ fn set_process_affinity(pid: pid_t, cpu: usize) {
 #[cfg(target_os="linux")]
 // We check the hard_limit. The soft_limit can be changed at runtime
 // by the process or any user. hard_limit can only be changed by root
-fn update_process_limits(config: &Config) -> Result<(), StartupError> {
+fn update_process_limits(config: &Config) -> Result<(), anyhow::Error> {
   let wanted_opened_files = (config.max_connections as u64) * 2;
 
   // Ensure we don't exceed the system maximum capacity
   let f = sozu_command::config::Config::load_file("/proc/sys/fs/file-max")
-    .expect("Couldn't read /proc/sys/fs/file-max");
+    .with_context(|| "Couldn't read /proc/sys/fs/file-max")?;
   let re_max = Regex::new(r"(\d*)").unwrap();
   let system_max_fd = re_max.captures(&f).and_then(|c| c.get(1))
     .and_then(|m| m.as_str().parse::<usize>().ok())
     .expect("Couldn't parse /proc/sys/fs/file-max");
   if config.max_connections > system_max_fd {
-    let error = format!("Proxies total max_connections can't be higher than system's file-max limit. \
-            Current limit: {}, current value: {}", system_max_fd, config.max_connections);
-    return Err(StartupError::TooManyAllowedConnections(error))
+    bail!(
+      format!(
+        "Proxies total max_connections can't be higher than system's file-max limit.\nCurrent limit: {}, current value: {}",
+        system_max_fd,
+        config.max_connections)
+      );
   }
 
   // Get the soft and hard limits for the current process
@@ -241,11 +200,16 @@ fn update_process_limits(config: &Config) -> Result<(), StartupError> {
 
   // Ensure we don't exceed the hard limit
   if limits.rlim_max < wanted_opened_files {
-      let error = format!("at least one worker can't have that many connections. \
-              current max file descriptor hard limit is: {}, \
-              configured max_connections is {} (the worker needs two file descriptors \
-              per client connection)", limits.rlim_max, config.max_connections);
-      return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
+      bail!(
+        format!(
+          "at least one worker can't have that many connections. \
+          current max file descriptor hard limit is: {}, \
+          configured max_connections is {} (the worker needs two file descriptors \
+          per client connection)",
+          limits.rlim_max,
+          config.max_connections
+        )
+      )
   }
 
   if limits.rlim_cur < wanted_opened_files && limits.rlim_cur != limits.rlim_max {
@@ -261,11 +225,16 @@ fn update_process_limits(config: &Config) -> Result<(), StartupError> {
 
   // Ensure we don't exceed the new soft limit
   if limits.rlim_cur < wanted_opened_files {
-      let error = format!("at least one worker can't have that many connections. \
-              current max file descriptor soft limit is: {}, \
-              configured max_connections is {} (the worker needs two file descriptors \
-              per client connection)", limits.rlim_cur, config.max_connections);
-      return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
+      bail!(
+        format!(
+          "at least one worker can't have that many connections. \
+          current max file descriptor soft limit is: {}, \
+          configured max_connections is {} (the worker needs two file descriptors \
+          per client connection)",
+          limits.rlim_cur,
+          config.max_connections
+        )
+      )
   }
 
   Ok(())
