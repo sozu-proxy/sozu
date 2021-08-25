@@ -1300,9 +1300,11 @@ impl Listener {
 impl ProxyConfiguration<Session> for Proxy {
     fn connect_to_backend(
         &mut self,
-        session: &mut Session,
-        back_token: Token,
+        session_rc: Rc<RefCell<dyn ProxySessionCast>>,
     ) -> Result<BackendConnectAction, ConnectionError> {
+        let mut b = session_rc.borrow_mut();
+        let session = b.as_http();
+
         let old_cluster_id = session.http().and_then(|ref http| http.cluster_id.clone());
         let old_back_token = session.back_token();
 
@@ -1393,6 +1395,7 @@ impl ProxyConfiguration<Session> for Proxy {
         ));
 
         session.back_connected = BackendConnectionStatus::Connecting(Instant::now());
+
         if let Some(back_token) = old_back_token {
             session.set_back_token(back_token);
             if let Err(e) = self.registry.register(
@@ -1408,6 +1411,14 @@ impl ProxyConfiguration<Session> for Proxy {
                 .map(|h| h.set_back_timeout(connect_timeout));
             Ok(BackendConnectAction::Replace)
         } else {
+            let back_token = {
+                let mut s = self.sessions.borrow_mut();
+                let entry = s.vacant_entry();
+                let back_token = Token(entry.key());
+                let _entry = entry.insert(session_rc.clone());
+                back_token
+            };
+
             if let Err(e) = self.registry.register(
                 &mut socket,
                 back_token,
