@@ -1724,7 +1724,11 @@ fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: 
 }
 
 fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), anyhow::Error> {
-  println!("{}", serde_json::to_string_pretty(&input).context("Error while parsing response to JSON")?);
+  println!(
+    "{}",
+    serde_json::to_string_pretty(&input)
+      .with_context(|| "Error while parsing response to JSON")?
+  );
   Ok(())
 }
 
