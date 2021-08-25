@@ -156,7 +156,7 @@ pub struct Server {
     tcp: tcp::Proxy,
     config_state: ConfigState,
     scm: ScmSocket,
-    sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>>,
+    sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
     max_connections: usize,
     nb_connections: usize,
     pool: Rc<RefCell<Pool>>,
@@ -187,24 +187,28 @@ impl Server {
 
         //FIXME: we will use a few entries for the channel, metrics socket and the listeners
         //FIXME: for HTTP/2, we will have more than 2 entries per session
-        let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>> =
-            Slab::with_capacity(server_config.slab_capacity());
+        let sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>> = Rc::new(RefCell::new(
+            Slab::with_capacity(server_config.slab_capacity()),
+        ));
         {
-            let entry = sessions.vacant_entry();
+            let mut s = sessions.borrow_mut();
+            let entry = s.vacant_entry();
             trace!("taking token {:?} for channel", SessionToken(entry.key()));
             entry.insert(Rc::new(RefCell::new(ListenSession {
                 protocol: Protocol::Channel,
             })));
         }
         {
-            let entry = sessions.vacant_entry();
+            let mut s = sessions.borrow_mut();
+            let entry = s.vacant_entry();
             trace!("taking token {:?} for metrics", SessionToken(entry.key()));
             entry.insert(Rc::new(RefCell::new(ListenSession {
                 protocol: Protocol::Timer,
             })));
         }
         {
-            let entry = sessions.vacant_entry();
+            let mut s = sessions.borrow_mut();
+            let entry = s.vacant_entry();
             trace!("taking token {:?} for metrics", SessionToken(entry.key()));
             entry.insert(Rc::new(RefCell::new(ListenSession {
                 protocol: Protocol::Metrics,
@@ -238,7 +242,7 @@ impl Server {
         poll: Poll,
         mut channel: ProxyChannel,
         scm: ScmSocket,
-        sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>>,
+        sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
         http: Option<http::Proxy>,
@@ -268,7 +272,7 @@ impl Server {
             }
         });
 
-        let base_sessions_count = sessions.len();
+        let base_sessions_count = sessions.borrow().len();
 
         let http = http.unwrap_or_else(|| {
             let registry = poll
@@ -373,7 +377,7 @@ impl Server {
         let max_poll_errors = 10000;
         let mut current_poll_errors = 0;
         let mut last_zombie_check = Instant::now();
-        let mut last_sessions_len = self.sessions.len();
+        let mut last_sessions_len = self.sessions.borrow().len();
         let mut should_poll_at: Option<Instant> = None;
         let mut last_shutting_down_message = None;
 
@@ -493,7 +497,7 @@ impl Server {
                                     return;
                                 } else if let ProxyRequestData::SoftStop = msg.order {
                                     self.shutting_down = Some(msg.id.clone());
-                                    last_sessions_len = self.sessions.len();
+                                    last_sessions_len = self.sessions.borrow().len();
                                     self.notify(msg);
                                 } else if let ProxyRequestData::ReturnListenSockets = msg.order {
                                     info!("received ReturnListenSockets order");
@@ -552,6 +556,7 @@ impl Server {
                 let duration = self.zombie_check_interval;
                 for (_index, session) in self
                     .sessions
+                    .borrow_mut()
                     .iter_mut()
                     .filter(|(_, c)| now - c.borrow().last_event() > duration)
                 {
@@ -579,8 +584,9 @@ impl Server {
                     let mut remaining = 0;
                     for tk in tokens.into_iter() {
                         let cl = self.to_session(tk);
-                        if self.sessions.contains(cl.0) {
-                            self.sessions.remove(cl.0);
+                        let mut sessions = self.sessions.borrow_mut();
+                        if sessions.contains(cl.0) {
+                            sessions.remove(cl.0);
                             remaining += 1;
                         }
                     }
@@ -601,14 +607,14 @@ impl Server {
             }
 
             gauge!("client.connections", self.nb_connections);
-            gauge!("slab.count", self.sessions.len());
+            gauge!("slab.count", self.sessions.borrow().len());
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).send_data();
             });
 
             if self.shutting_down.is_some() {
                 let mut closing_tokens = HashSet::new();
-                for session in self.sessions.iter_mut() {
+                for session in self.sessions.borrow_mut().iter_mut() {
                     let res = session.1.borrow_mut().shutting_down();
                     if let SessionResult::CloseSession = res {
                         let t = session.1.borrow().tokens();
@@ -628,7 +634,7 @@ impl Server {
                             info!(
                                 "closed {} sessions, {} sessions left, base_sessions_count = {}",
                                 closing_tokens.len(),
-                                self.sessions.len(),
+                                self.sessions.borrow().len(),
                                 self.base_sessions_count
                             );
                             last_shutting_down_message = Some(now);
@@ -638,7 +644,7 @@ impl Server {
                     }
                 }
 
-                let count = self.sessions.len();
+                let count = self.sessions.borrow().len();
                 if count <= self.base_sessions_count {
                     info!("last session stopped, shutting down!");
                     self.channel.run();
@@ -860,7 +866,7 @@ impl Server {
                 } => {
                     debug!("{} add http listener {:?}", id, listener);
 
-                    if self.sessions.len() >= self.slab_capacity() {
+                    if self.sessions.borrow().len() >= self.slab_capacity() {
                         push_queue(ProxyResponse {
                             id: id.to_string(),
                             status: ProxyResponseStatus::Error(String::from(
@@ -871,7 +877,8 @@ impl Server {
                         return;
                     }
 
-                    let entry = self.sessions.vacant_entry();
+                    let mut s = self.sessions.borrow_mut();
+                    let entry = s.vacant_entry();
                     let token = Token(entry.key());
 
                     let status = if self.http.add_listener(listener.clone(), token).is_some() {
@@ -952,8 +959,9 @@ impl Server {
                                         deactivate, e
                                     );
                                 }
-                                if self.sessions.contains(token.0) {
-                                    self.sessions.remove(token.0);
+                                let mut sessions = self.sessions.borrow_mut();
+                                if sessions.contains(token.0) {
+                                    sessions.remove(token.0);
                                     info!("removed listen token {:?}", token);
                                 }
 
@@ -1005,7 +1013,7 @@ impl Server {
                 } => {
                     debug!("{} add https listener {:?}", id, listener);
 
-                    if self.sessions.len() >= self.slab_capacity() {
+                    if self.sessions.borrow().len() >= self.slab_capacity() {
                         push_queue(ProxyResponse {
                             id: id.to_string(),
                             status: ProxyResponseStatus::Error(String::from(
@@ -1016,7 +1024,8 @@ impl Server {
                         return;
                     }
 
-                    let entry = self.sessions.vacant_entry();
+                    let mut s = self.sessions.borrow_mut();
+                    let entry = s.vacant_entry();
                     let token = Token(entry.key());
 
                     let status = if self.https.add_listener(listener.clone(), token).is_some() {
@@ -1097,8 +1106,8 @@ impl Server {
                                         deactivate, e
                                     );
                                 }
-                                if self.sessions.contains(token.0) {
-                                    self.sessions.remove(token.0);
+                                if self.sessions.borrow_mut().contains(token.0) {
+                                    self.sessions.borrow_mut().remove(token.0);
                                     info!("removed listen token {:?}", token);
                                 }
 
@@ -1150,7 +1159,7 @@ impl Server {
                 } => {
                     debug!("{} add tcp listener {:?}", id, listener);
 
-                    if self.sessions.len() >= self.slab_capacity() {
+                    if self.sessions.borrow().len() >= self.slab_capacity() {
                         push_queue(ProxyResponse {
                             id,
                             status: ProxyResponseStatus::Error(String::from(
@@ -1161,7 +1170,8 @@ impl Server {
                         return;
                     }
 
-                    let entry = self.sessions.vacant_entry();
+                    let mut s = self.sessions.borrow_mut();
+                    let entry = s.vacant_entry();
                     let token = Token(entry.key());
 
                     let status = if self
@@ -1244,8 +1254,8 @@ impl Server {
                                         deactivate, e
                                     );
                                 }
-                                if self.sessions.contains(token.0) {
-                                    self.sessions.remove(token.0);
+                                if self.sessions.borrow_mut().contains(token.0) {
+                                    self.sessions.borrow_mut().remove(token.0);
                                     info!("removed listen token {:?}", token);
                                 }
 
@@ -1352,14 +1362,15 @@ impl Server {
     }
 
     pub fn close_session(&mut self, token: SessionToken) {
-        if self.sessions.contains(token.0) {
-            let session = self.sessions.remove(token.0);
+        let mut sessions = self.sessions.borrow_mut();
+        if sessions.contains(token.0) {
+            let session = sessions.remove(token.0);
             let CloseResult { tokens } = session.borrow_mut().close(self.poll.registry());
 
             for tk in tokens.into_iter() {
                 let cl = self.to_session(tk);
-                if self.sessions.contains(cl.0) {
-                    self.sessions.remove(cl.0);
+                if sessions.contains(cl.0) {
+                    sessions.remove(cl.0);
                 }
             }
 
@@ -1392,7 +1403,7 @@ impl Server {
             return false;
         }
 
-        if self.sessions.len() >= self.slab_capacity() {
+        if self.sessions.borrow().len() >= self.slab_capacity() {
             error!("not enough memory to accept another session, flushing the accept queue");
             error!(
                 "nb_connections: {}, max_connections: {}",
@@ -1406,7 +1417,8 @@ impl Server {
 
         //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
         let index = {
-            let entry = self.sessions.vacant_entry();
+            let mut s = self.sessions.borrow_mut();
+            let entry = s.vacant_entry();
             let session_token = Token(entry.key());
             let index = entry.key();
             match self
@@ -1460,7 +1472,7 @@ impl Server {
         }
 
         //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
-        if self.sessions.len() >= self.slab_capacity() {
+        if self.sessions.borrow().len() >= self.slab_capacity() {
             error!("not enough memory to accept another session, flushing the accept queue");
             error!(
                 "nb_connections: {}, max_connections: {}",
@@ -1471,7 +1483,8 @@ impl Server {
             return false;
         }
 
-        let entry = self.sessions.vacant_entry();
+        let mut s = self.sessions.borrow_mut();
+        let entry = s.vacant_entry();
         let session_token = Token(entry.key());
         match self
             .http
@@ -1515,7 +1528,7 @@ impl Server {
         }
 
         //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
-        if self.sessions.len() >= self.slab_capacity() {
+        if self.sessions.borrow().len() >= self.slab_capacity() {
             error!("not enough memory to accept another session, flushing the accept queue");
             error!(
                 "nb_connections: {}, max_connections: {}",
@@ -1526,7 +1539,8 @@ impl Server {
             return false;
         }
 
-        let entry = self.sessions.vacant_entry();
+        let mut s = self.sessions.borrow_mut();
+        let entry = s.vacant_entry();
         let session_token = Token(entry.key());
         match self
             .https
@@ -1658,23 +1672,29 @@ impl Server {
     }
 
     pub fn connect_to_backend(&mut self, token: SessionToken) {
-        if !self.sessions.contains(token.0) {
+        if !self.sessions.borrow().contains(token.0) {
             error!("invalid token in connect_to_backend");
             return;
         }
 
         let (protocol, res) = {
-            let cl = self.sessions[token.0].clone();
-            let cl2: Rc<RefCell<dyn ProxySessionCast>> = self.sessions[token.0].clone();
+            let cl = self.sessions.borrow()[token.0].clone();
+            let cl2: Rc<RefCell<dyn ProxySessionCast>> = cl.clone();
             let protocol = { cl.borrow().protocol() };
 
-            if self.sessions.len() >= self.slab_capacity() {
+            if self.sessions.borrow().len() >= self.slab_capacity() {
                 error!("not enough memory, cannot connect to backend");
                 return;
             }
-            let entry = self.sessions.vacant_entry();
-            let back_token = Token(entry.key());
-            let _entry = entry.insert(cl);
+
+            // isolate the sessions borrow in that block
+            let back_token = {
+                let mut s = self.sessions.borrow_mut();
+                let entry = s.vacant_entry();
+                let back_token = Token(entry.key());
+                let _entry = entry.insert(cl);
+                back_token
+            };
 
             let (protocol, res) = match protocol {
                 Protocol::TCP => {
@@ -1698,7 +1718,7 @@ impl Server {
             };
 
             if res != Ok(BackendConnectAction::New) {
-                self.sessions.remove(back_token.0);
+                self.sessions.borrow_mut().remove(back_token.0);
             }
             (protocol, res)
         };
@@ -1729,8 +1749,9 @@ impl Server {
             SessionResult::CloseBackend(opt) => {
                 if let Some(token) = opt {
                     let cl = self.to_session(token);
-                    if self.sessions.contains(cl.0) {
-                        let session = self.sessions.remove(cl.0);
+                    let mut sessions = self.sessions.borrow_mut();
+                    if sessions.contains(cl.0) {
+                        let session = sessions.remove(cl.0);
                         session
                             .borrow_mut()
                             .close_backend(token, self.poll.registry());
@@ -1740,8 +1761,9 @@ impl Server {
             SessionResult::ReconnectBackend(main_token, backend_token) => {
                 if let Some(t) = backend_token {
                     let cl = self.to_session(t);
-                    if self.sessions.contains(cl.0) {
-                        let session = self.sessions.remove(cl.0);
+                    let mut sessions = self.sessions.borrow_mut();
+                    if sessions.contains(cl.0) {
+                        let session = sessions.remove(cl.0);
                         session.borrow_mut().close_backend(t, self.poll.registry());
                     }
                 }
@@ -1760,9 +1782,9 @@ impl Server {
         trace!("PROXY\t{:?} got events: {:?}", token, events);
 
         let mut session_token = token.0;
-        if self.sessions.contains(session_token) {
+        if self.sessions.borrow().contains(session_token) {
             //info!("sessions contains {:?}", session_token);
-            let protocol = self.sessions[session_token].borrow().protocol();
+            let protocol = self.sessions.borrow()[session_token].borrow().protocol();
             //info!("protocol: {:?}", protocol);
             match protocol {
                 Protocol::HTTPListen | Protocol::HTTPSListen | Protocol::TCPListen => {
@@ -1793,17 +1815,19 @@ impl Server {
                 _ => {}
             }
 
-            self.sessions[session_token]
+            self.sessions.borrow_mut()[session_token]
                 .borrow_mut()
                 .process_events(token, events);
 
             loop {
                 //self.session_ready(poll, session_token, events);
-                if !self.sessions.contains(session_token) {
+                if !self.sessions.borrow().contains(session_token) {
                     break;
                 }
 
-                let order = self.sessions[session_token].borrow_mut().ready();
+                let order = self.sessions.borrow_mut()[session_token]
+                    .borrow_mut()
+                    .ready();
                 trace!(
                     "session[{:?} -> {:?}] got events {:?} and returned order {:?}",
                     session_token,
@@ -1842,8 +1866,10 @@ impl Server {
         trace!("PROXY\t{:?} got timeout", token);
 
         let session_token = token.0;
-        if self.sessions.contains(session_token) {
-            let order = self.sessions[session_token].borrow_mut().timeout(token);
+        if self.sessions.borrow().contains(session_token) {
+            let order = self.sessions.borrow_mut()[session_token]
+                .borrow_mut()
+                .timeout(token);
             self.interpret_session_order(SessionToken(session_token), order);
         }
     }
@@ -1859,7 +1885,7 @@ impl Server {
                     .next()
                     .map(|token| ListenToken(token.0))
                 {
-                    let protocol = self.sessions[token.0].borrow().protocol();
+                    let protocol = self.sessions.borrow()[token.0].borrow().protocol();
                     self.accept(token, protocol);
                     if !self.can_accept || self.accept_ready.is_empty() {
                         break;
