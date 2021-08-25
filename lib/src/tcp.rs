@@ -1282,9 +1282,12 @@ impl ProxyConfiguration<Session> for Proxy {
         &mut self,
         frontend_sock: TcpStream,
         token: ListenToken,
-        session_token: Token,
         wait_time: Duration,
-    ) -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
+    ) -> Result<(Token, bool), AcceptError> {
+        let mut s = self.sessions.borrow_mut();
+        let entry = s.vacant_entry();
+        let session_token = Token(entry.key());
+
         let internal_token = Token(token.0);
         if let Some(listener) = self.listeners.get_mut(&internal_token) {
             let mut p = (*listener.pool).borrow_mut();
@@ -1338,7 +1341,10 @@ impl ProxyConfiguration<Session> for Proxy {
 
                 let should_connect_backend =
                     proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
-                Ok((Rc::new(RefCell::new(c)), should_connect_backend))
+
+                let s = Rc::new(RefCell::new(c));
+                entry.insert(s);
+                Ok((session_token, should_connect_backend))
             } else {
                 error!("could not get buffers from pool");
                 Err(AcceptError::TooManySessions)
