@@ -7,6 +7,7 @@ extern crate nom;
 
 #[cfg(target_os = "linux")]
 extern crate num_cpus;
+use cli::{upgrade_main, upgrade_worker};
 #[cfg(target_os="linux")]
 use regex::Regex;
 
@@ -54,47 +55,49 @@ fn main() -> Result<(), anyhow::Error> {
 
   // Init parsing of arguments
   let matches = cli::init();
+
   // Check if we are upgrading workers
-  let mut upgrade = cli::upgrade_worker(&matches)?;
+  if let Some(worker_matches) = matches.subcommand_matches("worker") {
+    return upgrade_worker(&worker_matches);
+  }
 
   // check if we are upgrading main (overrides worker upgrading)
-  if let Some(upgrade_main) = cli::upgrade_main(&matches)? {
-    upgrade = Some(upgrade_main);
+  if let Some(upgrade_matches) = matches.subcommand_matches("upgrade") {
+    return upgrade_main(&upgrade_matches);
   }
+
             
   // If we are not, then we want to start sozu
-  if upgrade == None {
-    match start(&matches) {
-      Ok(_) => {info!("main process stopped"); }, // Ok() is only called when the proxy exits
-      Err(StartupError::ConfigurationFileNotSpecified) => {
-        error!("Configuration file hasn't been specified. Either use -c with the start command \
-               or use the SOZU_CONFIG environment variable when building sozu.");
-        bail!("exit");
-      },
-      Err(StartupError::ConfigurationFileLoadError(err)) => {
-        error!("Invalid configuration file. Error: {:?}", err);
-        bail!("exit");
-      },
-      Err(StartupError::TooManyAllowedConnections(err)) | Err(StartupError::TooManyAllowedConnectionsForWorker(err)) => {
-        error!("{}", err);
-        bail!("exit");
-      },
-      Err(StartupError::WorkersSpawnFail(err)) => {
-        error!("At least one worker failed to spawn. Error: {:?}", err);
-        bail!("exit");
-      },
-      Err(StartupError::PIDFileNotWritable(err)) => {
-        error!("{}", err);
-        bail!("exit");
-      },
-      Err(StartupError::SozuMainStartFail(err)) => {
-        error!("Failed to start Sōzu: {}", err);
-        bail!("exit");
-      }
-      Err(StartupError::UnknownSubcommand) => {
-        error!("Unknown subcommand");
-        bail!("exit");
-      }
+  match start(&matches) {
+    Ok(_) => {info!("main process stopped"); }, // Ok() is only called when the proxy exits
+    Err(StartupError::ConfigurationFileNotSpecified) => {
+      error!("Configuration file hasn't been specified. Either use -c with the start command \
+              or use the SOZU_CONFIG environment variable when building sozu.");
+      bail!("exit");
+    },
+    Err(StartupError::ConfigurationFileLoadError(err)) => {
+      error!("Invalid configuration file. Error: {:?}", err);
+      bail!("exit");
+    },
+    Err(StartupError::TooManyAllowedConnections(err)) | Err(StartupError::TooManyAllowedConnectionsForWorker(err)) => {
+      error!("{}", err);
+      bail!("exit");
+    },
+    Err(StartupError::WorkersSpawnFail(err)) => {
+      error!("At least one worker failed to spawn. Error: {:?}", err);
+      bail!("exit");
+    },
+    Err(StartupError::PIDFileNotWritable(err)) => {
+      error!("{}", err);
+      bail!("exit");
+    },
+    Err(StartupError::SozuMainStartFail(err)) => {
+      error!("Failed to start Sōzu: {}", err);
+      bail!("exit");
+    }
+    Err(StartupError::UnknownSubcommand) => {
+      error!("Unknown subcommand");
+      bail!("exit");
     }
   }
   Ok(())
