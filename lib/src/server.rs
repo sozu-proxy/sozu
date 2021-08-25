@@ -899,13 +899,10 @@ impl Server {
                     if remove.proxy == ListenerType::HTTP {
                         debug!("{} remove http listener {:?}", id, remove);
                         self.base_sessions_count -= 1;
-                        push_queue(self.http.notify(
-                            &mut self.poll,
-                            ProxyRequest {
-                                id: id.to_string(),
-                                order: ProxyRequestData::RemoveListener(remove.clone()),
-                            },
-                        ));
+                        push_queue(self.http.notify(ProxyRequest {
+                            id: id.to_string(),
+                            order: ProxyRequestData::RemoveListener(remove.clone()),
+                        }));
                     }
                 }
                 ProxyRequest {
@@ -996,7 +993,7 @@ impl Server {
                         push_queue(answer);
                     }
                 }
-                ref m => push_queue(self.http.notify(&mut self.poll, m.clone())),
+                ref m => push_queue(self.http.notify(m.clone())),
             }
         }
         if topics.contains(&Topic::HttpsProxyConfig) {
@@ -1047,13 +1044,10 @@ impl Server {
                     if remove.proxy == ListenerType::HTTPS {
                         debug!("{} remove https listener {:?}", id, remove);
                         self.base_sessions_count -= 1;
-                        push_queue(self.https.notify(
-                            &mut self.poll,
-                            ProxyRequest {
-                                id: id.to_string(),
-                                order: ProxyRequestData::RemoveListener(remove.clone()),
-                            },
-                        ));
+                        push_queue(self.https.notify(ProxyRequest {
+                            id: id.to_string(),
+                            order: ProxyRequestData::RemoveListener(remove.clone()),
+                        }));
                     }
                 }
                 ProxyRequest {
@@ -1144,7 +1138,7 @@ impl Server {
                         push_queue(answer);
                     }
                 }
-                ref m => push_queue(self.https.notify(&mut self.poll, m.clone())),
+                ref m => push_queue(self.https.notify(m.clone())),
             }
         }
         if topics.contains(&Topic::TcpProxyConfig) {
@@ -1198,13 +1192,10 @@ impl Server {
                     if remove.proxy == ListenerType::TCP {
                         debug!("{} remove tcp listener {:?}", id, remove);
                         self.base_sessions_count -= 1;
-                        push_queue(self.tcp.notify(
-                            &mut self.poll,
-                            ProxyRequest {
-                                id: id.to_string(),
-                                order: ProxyRequestData::RemoveListener(remove.clone()),
-                            },
-                        ));
+                        push_queue(self.tcp.notify(ProxyRequest {
+                            id: id.to_string(),
+                            order: ProxyRequestData::RemoveListener(remove.clone()),
+                        }));
                     }
                 }
                 ProxyRequest {
@@ -1294,7 +1285,7 @@ impl Server {
                         push_queue(answer);
                     }
                 }
-                m => push_queue(self.tcp.notify(&mut self.poll, m)),
+                m => push_queue(self.tcp.notify(m)),
             }
         }
     }
@@ -1363,7 +1354,7 @@ impl Server {
     pub fn close_session(&mut self, token: SessionToken) {
         if self.sessions.contains(token.0) {
             let session = self.sessions.remove(token.0);
-            let CloseResult { tokens } = session.borrow_mut().close(&mut self.poll);
+            let CloseResult { tokens } = session.borrow_mut().close(self.poll.registry());
 
             for tk in tokens.into_iter() {
                 let cl = self.to_session(tk);
@@ -1420,7 +1411,7 @@ impl Server {
             let index = entry.key();
             match self
                 .tcp
-                .create_session(socket, token, &mut self.poll, session_token, wait_time)
+                .create_session(socket, token, session_token, wait_time)
             {
                 Ok((session, should_connect)) => {
                     entry.insert(session);
@@ -1484,7 +1475,7 @@ impl Server {
         let session_token = Token(entry.key());
         match self
             .http
-            .create_session(socket, token, &mut self.poll, session_token, wait_time)
+            .create_session(socket, token, session_token, wait_time)
         {
             Ok((session, _)) => {
                 entry.insert(session);
@@ -1539,7 +1530,7 @@ impl Server {
         let session_token = Token(entry.key());
         match self
             .https
-            .create_session(socket, token, &mut self.poll, session_token, wait_time)
+            .create_session(socket, token, session_token, wait_time)
         {
             Ok((session, _)) => {
                 entry.insert(session);
@@ -1689,21 +1680,17 @@ impl Server {
                 Protocol::TCP => {
                     let mut b = cl2.borrow_mut();
                     let session: &mut tcp::Session = b.as_tcp();
-                    let r = self
-                        .tcp
-                        .connect_to_backend(&mut self.poll, session, back_token);
+                    let r = self.tcp.connect_to_backend(session, back_token);
 
                     (Protocol::TCP, r)
                 }
                 Protocol::HTTP => (Protocol::HTTP, {
                     let mut b = cl2.borrow_mut();
                     let session: &mut http::Session = b.as_http();
-                    self.http
-                        .connect_to_backend(&mut self.poll, session, back_token)
+                    self.http.connect_to_backend(session, back_token)
                 }),
                 Protocol::HTTPS => (Protocol::HTTPS, {
-                    self.https
-                        .connect_to_backend(&mut self.poll, cl2, back_token)
+                    self.https.connect_to_backend(cl2, back_token)
                 }),
                 _ => {
                     panic!("should not call connect_to_backend on listeners");
@@ -1744,7 +1731,9 @@ impl Server {
                     let cl = self.to_session(token);
                     if self.sessions.contains(cl.0) {
                         let session = self.sessions.remove(cl.0);
-                        session.borrow_mut().close_backend(token, &mut self.poll);
+                        session
+                            .borrow_mut()
+                            .close_backend(token, self.poll.registry());
                     }
                 }
             }
@@ -1753,7 +1742,7 @@ impl Server {
                     let cl = self.to_session(t);
                     if self.sessions.contains(cl.0) {
                         let session = self.sessions.remove(cl.0);
-                        session.borrow_mut().close_backend(t, &mut self.poll);
+                        session.borrow_mut().close_backend(t, self.poll.registry());
                     }
                 }
 
@@ -1913,11 +1902,11 @@ impl ProxySession for ListenSession {
 
     fn process_events(&mut self, _token: Token, _events: Ready) {}
 
-    fn close(&mut self, _poll: &mut Poll) -> CloseResult {
+    fn close(&mut self, _registry: &Registry) -> CloseResult {
         CloseResult::default()
     }
 
-    fn close_backend(&mut self, _token: Token, _poll: &mut Poll) {}
+    fn close_backend(&mut self, _token: Token, _registry: &Registry) {}
 
     fn timeout(&mut self, _token: Token) -> SessionResult {
         error!(
@@ -1961,10 +1950,10 @@ impl HttpsProvider {
         }
     }
 
-    pub fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
+    pub fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
         match self {
-            &mut HttpsProvider::Rustls(ref mut rustls) => rustls.notify(event_loop, message),
-            &mut HttpsProvider::Openssl(ref mut openssl) => openssl.notify(event_loop, message),
+            &mut HttpsProvider::Rustls(ref mut rustls) => rustls.notify(message),
+            &mut HttpsProvider::Openssl(ref mut openssl) => openssl.notify(message),
         }
     }
 
@@ -2015,23 +2004,21 @@ impl HttpsProvider {
         &mut self,
         frontend_sock: TcpStream,
         token: ListenToken,
-        poll: &mut Poll,
         session_token: Token,
         wait_time: Duration,
     ) -> Result<(Rc<RefCell<dyn ProxySessionCast>>, bool), AcceptError> {
         match self {
             &mut HttpsProvider::Rustls(ref mut rustls) => rustls
-                .create_session(frontend_sock, token, poll, session_token, wait_time)
+                .create_session(frontend_sock, token, session_token, wait_time)
                 .map(|(r, b)| (r as Rc<RefCell<dyn ProxySessionCast>>, b)),
             &mut HttpsProvider::Openssl(ref mut openssl) => openssl
-                .create_session(frontend_sock, token, poll, session_token, wait_time)
+                .create_session(frontend_sock, token, session_token, wait_time)
                 .map(|(r, b)| (r as Rc<RefCell<dyn ProxySessionCast>>, b)),
         }
     }
 
     pub fn connect_to_backend(
         &mut self,
-        poll: &mut Poll,
         proxy_session: Rc<RefCell<dyn ProxySessionCast>>,
         back_token: Token,
     ) -> Result<BackendConnectAction, ConnectionError> {
@@ -2039,12 +2026,12 @@ impl HttpsProvider {
             &mut HttpsProvider::Rustls(ref mut rustls) => {
                 let mut b = proxy_session.borrow_mut();
                 let session: &mut https_rustls::session::Session = b.as_https_rustls();
-                rustls.connect_to_backend(poll, session, back_token)
+                rustls.connect_to_backend(session, back_token)
             }
             &mut HttpsProvider::Openssl(ref mut openssl) => {
                 let mut b = proxy_session.borrow_mut();
                 let session: &mut https_openssl::Session = b.as_https_openssl();
-                openssl.connect_to_backend(poll, session, back_token)
+                openssl.connect_to_backend(session, back_token)
             }
         }
     }
@@ -2069,9 +2056,9 @@ impl HttpsProvider {
         HttpsProvider::Rustls(configuration)
     }
 
-    pub fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
+    pub fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
         let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-        rustls.notify(event_loop, message)
+        rustls.notify(message)
     }
 
     pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
@@ -2108,17 +2095,15 @@ impl HttpsProvider {
         &mut self,
         frontend_sock: TcpStream,
         token: ListenToken,
-        poll: &mut Poll,
         session_token: Token,
         wait_time: Duration,
     ) -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
         let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-        rustls.create_session(frontend_sock, token, poll, session_token, wait_time)
+        rustls.create_session(frontend_sock, token, session_token, wait_time)
     }
 
     pub fn connect_to_backend(
         &mut self,
-        poll: &mut Poll,
         proxy_session: Rc<RefCell<dyn ProxySessionCast>>,
         back_token: Token,
     ) -> Result<BackendConnectAction, ConnectionError> {
@@ -2126,7 +2111,7 @@ impl HttpsProvider {
 
         let mut b = proxy_session.borrow_mut();
         let session: &mut https_rustls::session::Session = b.as_https_rustls();
-        rustls.connect_to_backend(poll, session, back_token)
+        rustls.connect_to_backend(session, back_token)
     }
 }
 
