@@ -248,12 +248,14 @@ pub struct Proxy {
     pool: Rc<RefCell<Pool>>,
     registry: Registry,
     sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
+    max_connections: usize,
 }
 
 impl Proxy {
     pub fn new(
         registry: Registry,
         sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
+        max_connections: usize,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> Proxy {
@@ -264,6 +266,7 @@ impl Proxy {
             pool,
             registry,
             sessions,
+            max_connections,
         }
     }
 
@@ -484,6 +487,10 @@ impl Proxy {
             Ok(())
         }
     }
+
+    fn slab_capacity(&self) -> usize {
+        10 + 2 * self.max_connections
+    }
 }
 
 impl ProxyConfiguration<Session> for Proxy {
@@ -551,7 +558,6 @@ impl ProxyConfiguration<Session> for Proxy {
 
     fn connect_to_backend(
         &mut self,
-
         session_rc: Rc<RefCell<dyn ProxySessionCast>>,
     ) -> Result<BackendConnectAction, ConnectionError> {
         let mut b = session_rc.borrow_mut();
@@ -660,6 +666,11 @@ impl ProxyConfiguration<Session> for Proxy {
                 .map(|h| h.set_back_timeout(connect_timeout));
             Ok(BackendConnectAction::Replace)
         } else {
+            if self.sessions.borrow().len() >= self.slab_capacity() {
+                error!("not enough memory, cannot connect to backend");
+                return Err(ConnectionError::TooManyConnections);
+            }
+
             let back_token = {
                 let mut s = self.sessions.borrow_mut();
                 let entry = s.vacant_entry();
@@ -974,7 +985,13 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
     let address = config.address.clone();
     let sessions = Rc::new(RefCell::new(sessions));
     let registry = event_loop.registry().try_clone().unwrap();
-    let mut configuration = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+    let mut configuration = Proxy::new(
+        registry,
+        sessions.clone(),
+        max_buffers,
+        pool.clone(),
+        backends.clone(),
+    );
     if configuration.add_listener(config, token).is_some()
         && configuration.activate_listener(&address, None).is_some()
     {
