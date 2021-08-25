@@ -47,7 +47,8 @@ use crate::protocol::{Http, Pipe, ProtocolResult, StickySession};
 use crate::retry::RetryPolicy;
 use crate::router::{trie::*, Router};
 use crate::server::{
-    push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionToken, CONN_RETRIES,
+    push_event, ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, SessionToken,
+    CONN_RETRIES,
 };
 use crate::socket::server_bind;
 use crate::timer::TimeoutContainer;
@@ -1595,11 +1596,13 @@ pub struct Proxy {
     backends: Rc<RefCell<BackendMap>>,
     pool: Rc<RefCell<Pool>>,
     registry: Registry,
+    sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
 }
 
 impl Proxy {
     pub fn new(
         registry: Registry,
+        sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> Proxy {
@@ -1609,6 +1612,7 @@ impl Proxy {
             backends,
             pool,
             registry,
+            sessions,
         }
     }
 
@@ -2329,7 +2333,7 @@ yD0TrUjkXyjV/zczIYiYSROg9OE5UgYqswIBAg==
 
 use crate::server::HttpsProvider;
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-    use crate::server::{self, ProxySessionCast};
+    use crate::server;
 
     let event_loop = Poll::new().expect("could not create event loop");
 
@@ -2372,8 +2376,9 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
         Token(key)
     };
 
+    let sessions = Rc::new(RefCell::new(sessions));
     let registry = event_loop.registry().try_clone().unwrap();
-    let mut configuration = Proxy::new(registry, pool.clone(), backends.clone());
+    let mut configuration = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     let address = config.address.clone();
     if configuration.add_listener(config, token).is_some() {
         if configuration.activate_listener(&address, None).is_some() {
@@ -2384,7 +2389,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
                 event_loop,
                 channel,
                 ScmSocket::new(scm_server.as_raw_fd()),
-                Rc::new(RefCell::new(sessions)),
+                sessions,
                 pool,
                 backends,
                 None,

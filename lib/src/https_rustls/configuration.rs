@@ -31,7 +31,9 @@ use crate::protocol::http::{
 };
 use crate::protocol::StickySession;
 use crate::router::Router;
-use crate::server::{ListenSession, ListenToken, ProxyChannel, Server, SessionToken, CONN_RETRIES};
+use crate::server::{
+    ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, SessionToken, CONN_RETRIES,
+};
 use crate::socket::server_bind;
 use crate::util::UnwrapLog;
 use crate::{
@@ -245,11 +247,13 @@ pub struct Proxy {
     backends: Rc<RefCell<BackendMap>>,
     pool: Rc<RefCell<Pool>>,
     registry: Registry,
+    sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
 }
 
 impl Proxy {
     pub fn new(
         registry: Registry,
+        sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> Proxy {
@@ -259,6 +263,7 @@ impl Proxy {
             backends,
             pool,
             registry,
+            sessions,
         }
     }
 
@@ -907,7 +912,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
 use crate::server::HttpsProvider;
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-    use crate::server::{self, ProxySessionCast};
+    use crate::server;
 
     let event_loop = Poll::new().expect("could not create event loop");
 
@@ -951,8 +956,9 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
     };
 
     let address = config.address.clone();
+    let sessions = Rc::new(RefCell::new(sessions));
     let registry = event_loop.registry().try_clone().unwrap();
-    let mut configuration = Proxy::new(registry, pool.clone(), backends.clone());
+    let mut configuration = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     if configuration.add_listener(config, token).is_some()
         && configuration.activate_listener(&address, None).is_some()
     {
@@ -963,7 +969,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
             event_loop,
             channel,
             ScmSocket::new(scm_server.as_raw_fd()),
-            Rc::new(RefCell::new(sessions)),
+            sessions,
             pool,
             backends,
             None,
