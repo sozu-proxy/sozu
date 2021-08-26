@@ -26,7 +26,8 @@ use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use super::protocol::{Http, Pipe, ProtocolResult, StickySession};
 use super::retry::RetryPolicy;
 use super::server::{
-    push_event, ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, CONN_RETRIES,
+    push_event, ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, SessionManager,
+    CONN_RETRIES,
 };
 use super::socket::server_bind;
 use super::{
@@ -944,15 +945,13 @@ pub struct Proxy {
     clusters: HashMap<ClusterId, Cluster>,
     pool: Rc<RefCell<Pool>>,
     registry: Registry,
-    sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
-    max_connections: usize,
+    sessions: Rc<RefCell<SessionManager>>,
 }
 
 impl Proxy {
     pub fn new(
         registry: Registry,
-        sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
-        max_connections: usize,
+        sessions: Rc<RefCell<SessionManager>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> Proxy {
@@ -963,7 +962,6 @@ impl Proxy {
             pool,
             registry,
             sessions,
-            max_connections,
         }
     }
 
@@ -1183,10 +1181,6 @@ impl Proxy {
         } else {
             Ok(())
         }
-    }
-
-    fn slab_capacity(&self) -> usize {
-        10 + 2 * self.max_connections
     }
 }
 
@@ -1418,14 +1412,14 @@ impl ProxyConfiguration<Session> for Proxy {
                 .map(|h| h.set_back_timeout(connect_timeout));
             Ok(BackendConnectAction::Replace)
         } else {
-            if self.sessions.borrow().len() >= self.slab_capacity() {
+            if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
                 error!("not enough memory, cannot connect to backend");
                 return Err(ConnectionError::TooManyConnections);
             }
 
             let back_token = {
                 let mut s = self.sessions.borrow_mut();
-                let entry = s.vacant_entry();
+                let entry = s.slab.vacant_entry();
                 let back_token = Token(entry.key());
                 let _entry = entry.insert(session_rc.clone());
                 back_token
@@ -1625,7 +1619,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 );
             }
             let mut s = self.sessions.borrow_mut();
-            let entry = s.vacant_entry();
+            let entry = s.slab.vacant_entry();
             let session_token = Token(entry.key());
 
             if let Some(mut c) = Session::new(
@@ -1713,15 +1707,9 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
     };
 
     let address = config.address;
-    let sessions = Rc::new(RefCell::new(sessions));
+    let sessions = SessionManager::new(sessions, max_buffers);
     let registry = event_loop.registry().try_clone().unwrap();
-    let mut proxy = Proxy::new(
-        registry,
-        sessions.clone(),
-        max_buffers,
-        pool.clone(),
-        backends.clone(),
-    );
+    let mut proxy = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     let _ = proxy.add_listener(config, token);
     let _ = proxy.activate_listener(&address, None);
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
