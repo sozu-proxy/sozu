@@ -152,6 +152,39 @@ impl SessionManager {
     pub fn slab_capacity(&self) -> usize {
         10 + 2 * self.max_connections
     }
+
+    pub fn check_limits(&mut self) -> bool {
+        if self.nb_connections == self.max_connections {
+            error!("max number of session connection reached, flushing the accept queue");
+            gauge!("accept_queue.backpressure", 1);
+            self.can_accept = false;
+            return false;
+        }
+
+        if self.slab.len() >= self.slab_capacity() {
+            error!("not enough memory to accept another session, flushing the accept queue");
+            error!(
+                "nb_connections: {}, max_connections: {}",
+                self.nb_connections,
+                self.max_connections
+            );
+            gauge!("accept_queue.backpressure", 1);
+            self.can_accept = false;
+
+            return false;
+        }
+
+        true
+    }
+
+    pub fn incr(&mut self) {
+        self.nb_connections += 1;
+        assert!(
+            self.nb_connections
+            <= self.max_connections
+            );
+        gauge!("client.connections", self.nb_connections);
+    }
 }
 
 /// `Server` handles the event loop, the listeners, the sessions and
@@ -1425,23 +1458,7 @@ impl Server {
         socket: TcpStream,
         wait_time: Duration,
     ) -> bool {
-        if self.sessions.borrow().nb_connections == self.sessions.borrow().max_connections {
-            error!("max number of session connection reached, flushing the accept queue");
-            gauge!("accept_queue.backpressure", 1);
-            self.sessions.borrow_mut().can_accept = false;
-            return false;
-        }
-
-        if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-            error!("not enough memory to accept another session, flushing the accept queue");
-            error!(
-                "nb_connections: {}, max_connections: {}",
-                self.sessions.borrow().nb_connections,
-                self.sessions.borrow().max_connections
-            );
-            gauge!("accept_queue.backpressure", 1);
-            self.sessions.borrow_mut().can_accept = false;
-
+        if !self.sessions.borrow_mut().check_limits() {
             return false;
         }
 
@@ -1449,13 +1466,6 @@ impl Server {
         let index = {
             match self.tcp.create_session(socket, token, wait_time) {
                 Ok((session_token, should_connect)) => {
-                    self.sessions.borrow_mut().nb_connections += 1;
-                    assert!(
-                        self.sessions.borrow().nb_connections
-                            <= self.sessions.borrow().max_connections
-                    );
-                    gauge!("client.connections", self.sessions.borrow().nb_connections);
-
                     if should_connect {
                         session_token.0
                     } else {
@@ -1489,33 +1499,12 @@ impl Server {
         socket: TcpStream,
         wait_time: Duration,
     ) -> bool {
-        if self.sessions.borrow().nb_connections == self.sessions.borrow().max_connections {
-            error!("max number of session connection reached, flushing the accept queue");
-            gauge!("accept_queue.backpressure", 1);
-            self.sessions.borrow_mut().can_accept = false;
-            return false;
-        }
-
-        //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
-        if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-            error!("not enough memory to accept another session, flushing the accept queue");
-            error!(
-                "nb_connections: {}, max_connections: {}",
-                self.sessions.borrow().nb_connections,
-                self.sessions.borrow().max_connections
-            );
-            gauge!("accept_queue.backpressure", 1);
-            self.sessions.borrow_mut().can_accept = false;
+        if !self.sessions.borrow_mut().check_limits() {
             return false;
         }
 
         match self.http.create_session(socket, token, wait_time) {
             Ok(_) => {
-                self.sessions.borrow_mut().nb_connections += 1;
-                assert!(
-                    self.sessions.borrow().nb_connections <= self.sessions.borrow().max_connections
-                );
-                gauge!("client.connections", self.sessions.borrow().nb_connections);
                 true
             }
             Err(AcceptError::IoError) => {
@@ -1541,33 +1530,12 @@ impl Server {
         socket: TcpStream,
         wait_time: Duration,
     ) -> bool {
-        if self.sessions.borrow().nb_connections == self.sessions.borrow().max_connections {
-            error!("max number of session connection reached, flushing the accept queue");
-            gauge!("accept_queue.backpressure", 1);
-            self.sessions.borrow_mut().can_accept = false;
-            return false;
-        }
-
-        //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
-        if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-            error!("not enough memory to accept another session, flushing the accept queue");
-            error!(
-                "nb_connections: {}, max_connections: {}",
-                self.sessions.borrow().nb_connections,
-                self.sessions.borrow().max_connections
-            );
-            gauge!("accept_queue.backpressure", 1);
-            self.sessions.borrow_mut().can_accept = false;
+        if !self.sessions.borrow_mut().check_limits() {
             return false;
         }
 
         match self.https.create_session(socket, token, wait_time) {
             Ok(_) => {
-                self.sessions.borrow_mut().nb_connections += 1;
-                assert!(
-                    self.sessions.borrow().nb_connections <= self.sessions.borrow().max_connections
-                );
-                gauge!("client.connections", self.sessions.borrow().nb_connections);
                 true
             }
             Err(AcceptError::IoError) => {

@@ -1889,8 +1889,10 @@ impl ProxyConfiguration<Session> for Proxy {
                     Duration::seconds(listener.config.request_timeout as i64),
                 );
 
-                let s = Rc::new(RefCell::new(c));
-                entry.insert(s);
+                let session = Rc::new(RefCell::new(c));
+                entry.insert(session);
+
+                s.incr();
                 Ok((session_token, false))
             } else {
                 error!("could not create ssl context");
