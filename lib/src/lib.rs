@@ -320,6 +320,7 @@ pub trait ProxyConfiguration<Session> {
         socket: TcpStream,
         token: ListenToken,
         wait_time: Duration,
+        proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError>;
 }
 

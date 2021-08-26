@@ -1298,6 +1298,7 @@ impl ProxyConfiguration<Session> for Proxy {
         frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
+        proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
         let internal_token = Token(token.0);
 
@@ -1368,6 +1369,10 @@ impl ProxyConfiguration<Session> for Proxy {
                     (session, should_connect_backend)
                 } else {
                     error!("could not get buffers from pool");
+                    error!("max number of session connection reached, flushing the accept queue");
+                    gauge!("accept_queue.backpressure", 1);
+                    self.sessions.borrow_mut().can_accept = false;
+
                     return Err(AcceptError::TooManySessions);
                 }
             } else {

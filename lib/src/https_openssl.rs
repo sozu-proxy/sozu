@@ -1846,6 +1846,7 @@ impl ProxyConfiguration<Session> for Proxy {
         mut frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
+        proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
         if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
             if let Err(e) = frontend_sock.set_nodelay(true) {
@@ -2415,7 +2416,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
                 pool,
                 backends,
                 None,
-                Some(HttpsProvider::Openssl(configuration)),
+                Some(HttpsProvider::Openssl(Rc::new(RefCell::new(configuration)))),
                 None,
                 server_config,
                 None,
