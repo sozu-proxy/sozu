@@ -60,7 +60,7 @@ fn main() -> Result<(), anyhow::Error> {
       Ok(())
     },
     SubCmd::Status{ json } => status(channel, timeout, json),
-    SubCmd::Metrics{ json } => metrics(channel, json),
+    SubCmd::Metrics{ json } => metrics(channel, timeout, json),
     SubCmd::Logging{ level } => logging_filter(channel, timeout, &level),
     SubCmd::State{ cmd } => {
       match cmd {

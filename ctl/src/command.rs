@@ -574,8 +574,11 @@ pub fn status(
 
 }
 
-pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
-  -> Result<(), anyhow::Error> {
+pub fn metrics(
+  mut channel: Channel<CommandRequest,CommandResponse>,
+  timeout: u64,
+  json: bool
+)-> Result<(), anyhow::Error> {
   let id = generate_id();
   //println!("will send message for metrics with id {}", id);
   channel.write_message(&CommandRequest::new(
@@ -586,177 +589,59 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   //println!("message sent");
 
   // we should add a timeout somehow, otherwise it hangs
-  loop {
-    match channel.read_message() {
-      None          => {
-        bail!("the proxy didn't answer");
-      },
-      Some(message) => {
-        match message.status {
-          CommandStatus::Processing => {
-            println!("Proxy is processing: {}", message.message);
-          },
-          CommandStatus::Error => {
-            if json {
-              print_json_response(&message.message)?;
-            }
-            bail!("could not stop the proxy: {}", message.message);
-          },
-          CommandStatus::Ok => {
-            if &id == &message.id {
-              //println!("Sozu metrics:\n{}\n{:#?}", message.message, message.data);
 
-              if let Some(CommandResponseData::Metrics(data)) = message.data {
-                if json {
-                  print_json_response(&data)?;
-                  return Ok(());
-                }
+  // We do our own timeout so we can return the Channel object from the thread
+  // and avoid ownership issues
+  let (send, recv) = mpsc::channel();
 
-                let mut main_table = Table::new();
-                main_table.add_row(row![String::from("Main process")]);
-                main_table.add_row(row![String::from("key"), String::from("Count"), String::from("Gauge")]);
-
-                for (ref key, ref value) in data.main.iter() {
-                  match value {
-                    FilteredData::Count(c) => {main_table.add_row(row![key.to_string(), c, String::new()]);},
-                    FilteredData::Gauge(c) => { main_table.add_row(row![key.to_string(), String::new(), c]);},
-                    r => {
-                      println!("unexpected metric: {:?}", r);
-                      main_table.add_row(row![key.to_string(), String::new(), String::new()]);
-                    }
+  let timeout_thread = thread::spawn(move || {
+    loop {
+      match channel.read_message() {
+        None          => {
+          bail!("the proxy didn't answer");
+        },
+        Some(message) => {
+          match message.status {
+            CommandStatus::Processing => {
+              println!("Proxy is processing: {}", message.message);
+            },
+            CommandStatus::Error => {
+              if json {
+                print_json_response(&message.message)?;
+              }
+              bail!("could not stop the proxy: {}", message.message);
+            },
+            CommandStatus::Ok => {
+              if &id == &message.id {
+                //println!("Sozu metrics:\n{}\n{:#?}", message.message, message.data);
+  
+                if let Some(CommandResponseData::Metrics(data)) = message.data {
+                  if json {
+                    print_json_response(&data)?;
+                    return Ok(());
                   }
-                }
-
-                main_table.printstd();
-
-                println!("\nworker metrics:\n");
-
-                let mut proxy_table = Table::new();
-                let mut row = vec![cell!("Workers")];
-                for key in data.workers.keys() {
-                  row.push(cell!(key));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                }
-                proxy_table.add_row(Row::new(row));
-
-                let mut worker_keys = HashSet::new();
-                let mut header = Vec::new();
-                header.push(cell!("key"));
-                for key in data.workers.keys() {
-                  header.push(cell!("Count"));
-                  header.push(cell!("Gauge"));
-                  header.push(cell!("p50"));
-                  header.push(cell!("p90"));
-                  header.push(cell!("p99"));
-                  header.push(cell!("p99.9"));
-                  header.push(cell!("p99.99"));
-                  header.push(cell!("p99.999"));
-                  header.push(cell!("p100"));
-                  worker_keys.insert(key);
-                }
-                proxy_table.add_row(Row::new(header.clone()));
-
-                let mut proxy_metrics = HashSet::new();
-                for metrics in data.workers.values() {
-                  for key in metrics.proxy.keys() {
-                    proxy_metrics.insert(key);
-                  }
-                }
-
-                for key in proxy_metrics.iter() {
-                  let k: &str = key;
-                  let mut row = Vec::new();
-                  row.push(cell!(k.to_string()));
-                  for worker_key in worker_keys.iter() {
-                    let wk: &str = worker_key;
-
-                    match data.workers[wk].proxy.get(k) {
-                      None => {
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                      },
-                      Some(FilteredData::Count(c)) => {
-                        row.push(cell!(c));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                      },
-                      Some(FilteredData::Gauge(c)) => {
-                        row.push(cell!(""));
-                        row.push(cell!(c));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                      },
-                      Some(FilteredData::Percentiles(p)) => {
-                        row.push(cell!(p.samples));
-                        row.push(cell!(""));
-                        row.push(cell!(p.p_50));
-                        row.push(cell!(p.p_90));
-                        row.push(cell!(p.p_99));
-                        row.push(cell!(p.p_99_9));
-                        row.push(cell!(p.p_99_99));
-                        row.push(cell!(p.p_99_999));
-                        row.push(cell!(p.p_100));
-                      },
+  
+                  let mut main_table = Table::new();
+                  main_table.add_row(row![String::from("Main process")]);
+                  main_table.add_row(row![String::from("key"), String::from("Count"), String::from("Gauge")]);
+  
+                  for (ref key, ref value) in data.main.iter() {
+                    match value {
+                      FilteredData::Count(c) => {main_table.add_row(row![key.to_string(), c, String::new()]);},
+                      FilteredData::Gauge(c) => { main_table.add_row(row![key.to_string(), String::new(), c]);},
                       r => {
                         println!("unexpected metric: {:?}", r);
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
+                        main_table.add_row(row![key.to_string(), String::new(), String::new()]);
                       }
                     }
                   }
-
-                  proxy_table.add_row(Row::new(row));
-                }
-
-                proxy_table.printstd();
-
-                println!("\napplication metrics:\n");
-
-                let mut app_ids = HashSet::new();
-                for metrics in data.workers.values() {
-                  for key in metrics.applications.keys() {
-                    app_ids.insert(key);
-                  }
-                }
-
-                for app_id in app_ids.iter() {
-                  let id: &str = app_id;
-
-                  let mut application_table = Table::new();
-
-                  let mut row = vec![cell!(id)];
+  
+                  main_table.printstd();
+  
+                  println!("\nworker metrics:\n");
+  
+                  let mut proxy_table = Table::new();
+                  let mut row = vec![cell!("Workers")];
                   for key in data.workers.keys() {
                     row.push(cell!(key));
                     row.push(cell!(""));
@@ -768,31 +653,40 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                     row.push(cell!(""));
                     row.push(cell!(""));
                   }
-                  application_table.add_row(Row::new(row));
-                  application_table.add_row(Row::new(header.clone()));
-
-                  let mut app_metrics = HashSet::new();
-                  let mut backend_ids = HashSet::new();
-
-                  for worker in data.workers.values() {
-                    if let Some(app) = worker.applications.get(id) {
-                      for k in app.data.keys() {
-                        app_metrics.insert(k);
-                      }
-
-                      for k in app.backends.keys() {
-                        backend_ids.insert(k);
-                      }
+                  proxy_table.add_row(Row::new(row));
+  
+                  let mut worker_keys = HashSet::new();
+                  let mut header = Vec::new();
+                  header.push(cell!("key"));
+                  for key in data.workers.keys() {
+                    header.push(cell!("Count"));
+                    header.push(cell!("Gauge"));
+                    header.push(cell!("p50"));
+                    header.push(cell!("p90"));
+                    header.push(cell!("p99"));
+                    header.push(cell!("p99.9"));
+                    header.push(cell!("p99.99"));
+                    header.push(cell!("p99.999"));
+                    header.push(cell!("p100"));
+                    worker_keys.insert(key);
+                  }
+                  proxy_table.add_row(Row::new(header.clone()));
+  
+                  let mut proxy_metrics = HashSet::new();
+                  for metrics in data.workers.values() {
+                    for key in metrics.proxy.keys() {
+                      proxy_metrics.insert(key);
                     }
                   }
-
-                  for app_metric in app_metrics.iter() {
-                    let metric: &str = app_metric;
+  
+                  for key in proxy_metrics.iter() {
+                    let k: &str = key;
                     let mut row = Vec::new();
-                    row.push(cell!(metric.to_string()));
-
-                    for worker in data.workers.values() {
-                      match worker.applications.get(id).and_then(|app| app.data.get(metric)) {
+                    row.push(cell!(k.to_string()));
+                    for worker_key in worker_keys.iter() {
+                      let wk: &str = worker_key;
+  
+                      match data.workers[wk].proxy.get(k) {
                         None => {
                           row.push(cell!(""));
                           row.push(cell!(""));
@@ -825,7 +719,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                           row.push(cell!(""));
                           row.push(cell!(""));
                           row.push(cell!(""));
-                        }
+                        },
                         Some(FilteredData::Percentiles(p)) => {
                           row.push(cell!(p.samples));
                           row.push(cell!(""));
@@ -848,18 +742,30 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                           row.push(cell!(""));
                           row.push(cell!(""));
                           row.push(cell!(""));
-                        },
+                        }
                       }
                     }
-                    application_table.add_row(Row::new(row));
+  
+                    proxy_table.add_row(Row::new(row));
                   }
-                  application_table.printstd();
-
-                  for backend_id in backend_ids.iter() {
-                    let backend: &str = backend_id;
-                    let mut backend_table = Table::new();
-
-                    let mut row = vec![cell!(format!("{}: {}", id, backend))];
+  
+                  proxy_table.printstd();
+  
+                  println!("\napplication metrics:\n");
+  
+                  let mut app_ids = HashSet::new();
+                  for metrics in data.workers.values() {
+                    for key in metrics.applications.keys() {
+                      app_ids.insert(key);
+                    }
+                  }
+  
+                  for app_id in app_ids.iter() {
+                    let id: &str = app_id;
+  
+                    let mut application_table = Table::new();
+  
+                    let mut row = vec![cell!(id)];
                     for key in data.workers.keys() {
                       row.push(cell!(key));
                       row.push(cell!(""));
@@ -871,28 +777,31 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                       row.push(cell!(""));
                       row.push(cell!(""));
                     }
-                    backend_table.add_row(Row::new(row));
-                    backend_table.add_row(Row::new(header.clone()));
-
-                    let mut backend_metrics = HashSet::new();
+                    application_table.add_row(Row::new(row));
+                    application_table.add_row(Row::new(header.clone()));
+  
+                    let mut app_metrics = HashSet::new();
+                    let mut backend_ids = HashSet::new();
+  
                     for worker in data.workers.values() {
                       if let Some(app) = worker.applications.get(id) {
-                        for b in app.backends.values() {
-                          for k in b.keys() {
-                            backend_metrics.insert(k);
-                          }
+                        for k in app.data.keys() {
+                          app_metrics.insert(k);
+                        }
+  
+                        for k in app.backends.keys() {
+                          backend_ids.insert(k);
                         }
                       }
                     }
-
-                    for backend_metric in backend_metrics.iter() {
-                      let metric: &str = backend_metric;
+  
+                    for app_metric in app_metrics.iter() {
+                      let metric: &str = app_metric;
                       let mut row = Vec::new();
                       row.push(cell!(metric.to_string()));
-
+  
                       for worker in data.workers.values() {
-                        match worker.applications.get(id).and_then(|app| app.backends.get(backend))
-                          .and_then(|back| back.get(metric)) {
+                        match worker.applications.get(id).and_then(|app| app.data.get(metric)) {
                           None => {
                             row.push(cell!(""));
                             row.push(cell!(""));
@@ -951,21 +860,136 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                           },
                         }
                       }
-                      backend_table.add_row(Row::new(row));
+                      application_table.add_row(Row::new(row));
                     }
-
-                    backend_table.printstd();
+                    application_table.printstd();
+  
+                    for backend_id in backend_ids.iter() {
+                      let backend: &str = backend_id;
+                      let mut backend_table = Table::new();
+  
+                      let mut row = vec![cell!(format!("{}: {}", id, backend))];
+                      for key in data.workers.keys() {
+                        row.push(cell!(key));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                      }
+                      backend_table.add_row(Row::new(row));
+                      backend_table.add_row(Row::new(header.clone()));
+  
+                      let mut backend_metrics = HashSet::new();
+                      for worker in data.workers.values() {
+                        if let Some(app) = worker.applications.get(id) {
+                          for b in app.backends.values() {
+                            for k in b.keys() {
+                              backend_metrics.insert(k);
+                            }
+                          }
+                        }
+                      }
+  
+                      for backend_metric in backend_metrics.iter() {
+                        let metric: &str = backend_metric;
+                        let mut row = Vec::new();
+                        row.push(cell!(metric.to_string()));
+  
+                        for worker in data.workers.values() {
+                          match worker.applications.get(id).and_then(|app| app.backends.get(backend))
+                            .and_then(|back| back.get(metric)) {
+                            None => {
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                            },
+                            Some(FilteredData::Count(c)) => {
+                              row.push(cell!(c));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                            },
+                            Some(FilteredData::Gauge(c)) => {
+                              row.push(cell!(""));
+                              row.push(cell!(c));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                            }
+                            Some(FilteredData::Percentiles(p)) => {
+                              row.push(cell!(p.samples));
+                              row.push(cell!(""));
+                              row.push(cell!(p.p_50));
+                              row.push(cell!(p.p_90));
+                              row.push(cell!(p.p_99));
+                              row.push(cell!(p.p_99_9));
+                              row.push(cell!(p.p_99_99));
+                              row.push(cell!(p.p_99_999));
+                              row.push(cell!(p.p_100));
+                            },
+                            r => {
+                              println!("unexpected metric: {:?}", r);
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                              row.push(cell!(""));
+                            },
+                          }
+                        }
+                        backend_table.add_row(Row::new(row));
+                      }
+  
+                      backend_table.printstd();
+                    }
                   }
+  
+                  break;
                 }
-
-                break;
               }
             }
           }
         }
       }
     }
+
+    send.send(())?;
+    Ok(())
+  });
+
+
+  if timeout > 0 && recv.recv_timeout(Duration::from_millis(timeout)).is_err() {
+    bail!("Command timeout. The proxy didn't send answer");
   }
+
+  timeout_thread.join().map_err(|error| {
+    anyhow::Error::msg(
+      format!("upgrade worker: thread timeout exceeded on join, {:?}", error)
+    )
+  })??;
   Ok(())
 }
 
