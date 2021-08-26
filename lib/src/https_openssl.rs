@@ -1846,7 +1846,7 @@ impl ProxyConfiguration<Session> for Proxy {
         mut frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
-    ) -> Result<(Token, bool), AcceptError> {
+    ) -> Result<(), AcceptError> {
         if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
             if let Err(e) = frontend_sock.set_nodelay(true) {
                 error!(
@@ -1893,7 +1893,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 entry.insert(session);
 
                 s.incr();
-                Ok((session_token, false))
+                Ok(())
             } else {
                 error!("could not create ssl context");
                 Err(AcceptError::IoError)

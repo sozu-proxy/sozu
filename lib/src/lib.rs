@@ -320,7 +320,7 @@ pub trait ProxyConfiguration<Session> {
         socket: TcpStream,
         token: ListenToken,
         wait_time: Duration,
-    ) -> Result<(Token, bool), AcceptError>;
+    ) -> Result<(), AcceptError>;
 }
 
 #[derive(Debug, PartialEq, Eq)]

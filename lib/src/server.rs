@@ -165,8 +165,7 @@ impl SessionManager {
             error!("not enough memory to accept another session, flushing the accept queue");
             error!(
                 "nb_connections: {}, max_connections: {}",
-                self.nb_connections,
-                self.max_connections
+                self.nb_connections, self.max_connections
             );
             gauge!("accept_queue.backpressure", 1);
             self.can_accept = false;
@@ -179,10 +178,7 @@ impl SessionManager {
 
     pub fn incr(&mut self) {
         self.nb_connections += 1;
-        assert!(
-            self.nb_connections
-            <= self.max_connections
-            );
+        assert!(self.nb_connections <= self.max_connections);
         gauge!("client.connections", self.nb_connections);
     }
 }
@@ -1462,35 +1458,25 @@ impl Server {
             return false;
         }
 
-        //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
-        let index = {
-            match self.tcp.create_session(socket, token, wait_time) {
-                Ok((session_token, should_connect)) => {
-                    if should_connect {
-                        session_token.0
-                    } else {
-                        return true;
-                    }
-                }
-                Err(AcceptError::IoError) => {
-                    //FIXME: do we stop accepting?
-                    return false;
-                }
-                Err(AcceptError::WouldBlock) => {
-                    self.accept_ready.remove(&token);
-                    return false;
-                }
-                Err(AcceptError::TooManySessions) => {
-                    error!("max number of session connection reached, flushing the accept queue");
-                    gauge!("accept_queue.backpressure", 1);
-                    self.sessions.borrow_mut().can_accept = false;
-                    return false;
-                }
+        match self.tcp.create_session(socket, token, wait_time) {
+            Ok(()) => {
+                return true;
             }
-        };
-
-        self.connect_to_backend(SessionToken(index));
-        true
+            Err(AcceptError::IoError) => {
+                //FIXME: do we stop accepting?
+                return false;
+            }
+            Err(AcceptError::WouldBlock) => {
+                self.accept_ready.remove(&token);
+                return false;
+            }
+            Err(AcceptError::TooManySessions) => {
+                error!("max number of session connection reached, flushing the accept queue");
+                gauge!("accept_queue.backpressure", 1);
+                self.sessions.borrow_mut().can_accept = false;
+                return false;
+            }
+        }
     }
 
     pub fn create_session_http(
@@ -1504,9 +1490,7 @@ impl Server {
         }
 
         match self.http.create_session(socket, token, wait_time) {
-            Ok(_) => {
-                true
-            }
+            Ok(()) => true,
             Err(AcceptError::IoError) => {
                 //FIXME: do we stop accepting?
                 false
@@ -1535,9 +1519,7 @@ impl Server {
         }
 
         match self.https.create_session(socket, token, wait_time) {
-            Ok(_) => {
-                true
-            }
+            Ok(()) => true,
             Err(AcceptError::IoError) => {
                 //FIXME: do we stop accepting?
                 false
@@ -1995,7 +1977,7 @@ impl HttpsProvider {
         frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
-    ) -> Result<(Token, bool), AcceptError> {
+    ) -> Result<(), AcceptError> {
         match self {
             &mut HttpsProvider::Rustls(ref mut rustls) => {
                 rustls.create_session(frontend_sock, token, wait_time)
@@ -2078,7 +2060,7 @@ impl HttpsProvider {
         frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
-    ) -> Result<(Token, bool), AcceptError> {
+    ) -> Result<(), AcceptError> {
         let &mut HttpsProvider::Rustls(ref mut rustls) = self;
         rustls.create_session(frontend_sock, token, wait_time)
     }

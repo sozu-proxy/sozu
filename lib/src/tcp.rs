@@ -1298,77 +1298,88 @@ impl ProxyConfiguration<Session> for Proxy {
         frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
-    ) -> Result<(Token, bool), AcceptError> {
-        let mut s = self.sessions.borrow_mut();
-        let entry = s.slab.vacant_entry();
-        let session_token = Token(entry.key());
-
+    ) -> Result<(), AcceptError> {
         let internal_token = Token(token.0);
-        if let Some(listener) = self.listeners.get_mut(&internal_token) {
-            let mut p = (*listener.pool).borrow_mut();
 
-            if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-                if listener.cluster_id.is_none() {
-                    error!(
-                        "listener at address {:?} has no linked application",
-                        listener.address
+        let (session, should_connect_backend) =
+            if let Some(listener) = self.listeners.get_mut(&internal_token) {
+                let mut p = (*listener.pool).borrow_mut();
+
+                if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
+                    if listener.cluster_id.is_none() {
+                        error!(
+                            "listener at address {:?} has no linked application",
+                            listener.address
+                        );
+                        return Err(AcceptError::IoError);
+                    }
+
+                    let proxy_protocol = self
+                        .configs
+                        .get(listener.cluster_id.as_ref().unwrap())
+                        .and_then(|c| c.proxy_protocol.clone());
+
+                    if let Err(e) = frontend_sock.set_nodelay(true) {
+                        error!(
+                            "error setting nodelay on front socket({:?}): {:?}",
+                            frontend_sock, e
+                        );
+                    }
+
+                    let mut s = self.sessions.borrow_mut();
+                    let entry = s.slab.vacant_entry();
+                    let session_token = Token(entry.key());
+
+                    let mut c = Session::new(
+                        frontend_sock,
+                        session_token,
+                        internal_token,
+                        front_buf,
+                        back_buf,
+                        listener.cluster_id.clone(),
+                        None,
+                        proxy_protocol.clone(),
+                        wait_time,
+                        Duration::seconds(listener.config.front_timeout as i64),
+                        Duration::seconds(listener.config.back_timeout as i64),
                     );
-                    return Err(AcceptError::IoError);
+                    incr!("tcp.requests");
+
+                    if let Err(e) = self.registry.register(
+                        c.front_socket_mut(),
+                        session_token,
+                        Interest::READABLE | Interest::WRITABLE,
+                    ) {
+                        error!(
+                            "error registering front socket({:?}): {:?}",
+                            c.front_socket(),
+                            e
+                        );
+                    }
+
+                    let should_connect_backend =
+                        proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
+
+                    let session = Rc::new(RefCell::new(c));
+                    entry.insert(session.clone());
+
+                    s.incr();
+
+                    (session, should_connect_backend)
+                } else {
+                    error!("could not get buffers from pool");
+                    return Err(AcceptError::TooManySessions);
                 }
-
-                let proxy_protocol = self
-                    .configs
-                    .get(listener.cluster_id.as_ref().unwrap())
-                    .and_then(|c| c.proxy_protocol.clone());
-
-                if let Err(e) = frontend_sock.set_nodelay(true) {
-                    error!(
-                        "error setting nodelay on front socket({:?}): {:?}",
-                        frontend_sock, e
-                    );
-                }
-                let mut c = Session::new(
-                    frontend_sock,
-                    session_token,
-                    internal_token,
-                    front_buf,
-                    back_buf,
-                    listener.cluster_id.clone(),
-                    None,
-                    proxy_protocol.clone(),
-                    wait_time,
-                    Duration::seconds(listener.config.front_timeout as i64),
-                    Duration::seconds(listener.config.back_timeout as i64),
-                );
-                incr!("tcp.requests");
-
-                if let Err(e) = self.registry.register(
-                    c.front_socket_mut(),
-                    session_token,
-                    Interest::READABLE | Interest::WRITABLE,
-                ) {
-                    error!(
-                        "error registering front socket({:?}): {:?}",
-                        c.front_socket(),
-                        e
-                    );
-                }
-
-                let should_connect_backend =
-                    proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
-
-                let session = Rc::new(RefCell::new(c));
-                entry.insert(session);
-
-                s.incr();
-                Ok((session_token, should_connect_backend))
             } else {
-                error!("could not get buffers from pool");
-                Err(AcceptError::TooManySessions)
-            }
-        } else {
-            Err(AcceptError::IoError)
+                return Err(AcceptError::IoError);
+            };
+
+        if should_connect_backend {
+            // FIXME: handle errors here
+            self.connect_to_backend(session);
         }
+
+        Ok(())
     }
 }
 
