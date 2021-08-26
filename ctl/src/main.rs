@@ -59,7 +59,7 @@ fn main() -> Result<(), anyhow::Error> {
       upgrade_worker(channel, timeout, id)?;
       Ok(())
     },
-    SubCmd::Status{ json } => status(channel, json),
+    SubCmd::Status{ json } => status(channel, timeout, json),
     SubCmd::Metrics{ json } => metrics(channel, json),
     SubCmd::Logging{ level } => logging_filter(channel, timeout, &level),
     SubCmd::State{ cmd } => {

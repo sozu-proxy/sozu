@@ -399,8 +399,11 @@ pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, time
   })?
 }
 
-pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
-  -> Result<(), anyhow::Error> {
+pub fn status(
+  mut channel: Channel<CommandRequest,CommandResponse>,
+  timeout: u64,
+  json: bool
+) -> Result<(), anyhow::Error> {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
@@ -408,143 +411,167 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
     None,
   ));
 
-  match channel.read_message() {
-    None          => {
-      bail!("the proxy didn't answer");
-    },
-    Some(message) => {
-      if id != message.id {
-        bail!("received message with invalid id: {:?}", message);
-      }
-      match message.status {
-        CommandStatus::Processing => {
-          bail!("should have obtained an answer immediately");
+  // We do our own timeout so we can return the Channel object from the thread
+  // and avoid ownership issues
+  let (send, recv) = mpsc::channel();
+
+  let timeout_thread = thread::spawn(move || {
+    loop {
+      match channel.read_message() {
+        None          => {
+          bail!("the proxy didn't answer");
         },
-        CommandStatus::Error => {
-          if json {
-            print_json_response(&message.message)?;
+        Some(message) => {
+          if id != message.id {
+            bail!("received message with invalid id: {:?}", message);
           }
-          bail!("could not get the worker list: {}", message.message);
-        },
-        CommandStatus::Ok => {
-          //println!("Worker list:\n{:?}", message.data);
-          if let Some(CommandResponseData::Workers(ref workers)) = message.data {
-            let mut expecting: HashSet<String> = HashSet::new();
-
-            let mut h = HashMap::new();
-            for ref worker in workers.iter().filter(|worker| worker.run_state == RunState::Running) {
-              let id = generate_id();
-              let msg = CommandRequest::new(
-                id.clone(),
-                CommandRequestData::Proxy(ProxyRequestData::Status),
-                Some(worker.id),
-              );
-              //println!("sending message: {:?}", msg);
-              channel.write_message(&msg);
-              expecting.insert(id.clone());
-              h.insert(id, (worker.id, CommandStatus::Processing));
-            }
-
-            let state = Arc::new(Mutex::new(h));
-            let st = state.clone();
-            let (send, recv) = mpsc::channel();
-
-            thread::spawn(move || {
-              loop {
-                //println!("expecting: {:?}", expecting);
-                if expecting.is_empty() {
-                  break;
+          match message.status {
+            CommandStatus::Processing => {
+              bail!("should have obtained an answer immediately");
+            },
+            CommandStatus::Error => {
+              if json {
+                print_json_response(&message.message)?;
+              }
+              bail!("could not get the worker list: {}", message.message);
+            },
+            CommandStatus::Ok => {
+              //println!("Worker list:\n{:?}", message.data);
+              if let Some(CommandResponseData::Workers(ref workers)) = message.data {
+                let mut expecting: HashSet<String> = HashSet::new();
+    
+                let mut h = HashMap::new();
+                for ref worker in workers.iter().filter(|worker| worker.run_state == RunState::Running) {
+                  let id = generate_id();
+                  let msg = CommandRequest::new(
+                    id.clone(),
+                    CommandRequestData::Proxy(ProxyRequestData::Status),
+                    Some(worker.id),
+                  );
+                  //println!("sending message: {:?}", msg);
+                  channel.write_message(&msg);
+                  expecting.insert(id.clone());
+                  h.insert(id, (worker.id, CommandStatus::Processing));
                 }
-                match channel.read_message() {
-                  None          => {
-                    eprintln!("the proxy didn't answer");
-                    exit(1);
-                  },
-                  Some(message) => {
-                    //println!("received message: {:?}", message);
-                    match message.status {
-                      CommandStatus::Processing => {
-                      },
-                      CommandStatus::Error => {
-                        eprintln!("error for message[{}]: {}", message.id, message.message);
-                        if expecting.contains(&message.id) {
-                          expecting.remove(&message.id);
-                          //println!("status message with ID {} done", message.id);
-                          if let Ok(mut h) = state.try_lock() {
-                            if let Some(data) = h.get_mut(&message.id) {
-                              *data = ((*data).0, CommandStatus::Error);
-                            }
-                          }
-                        }
+    
+                let state = Arc::new(Mutex::new(h));
+                let st = state.clone();
+                let (send, recv) = mpsc::channel();
+    
+                thread::spawn(move || {
+                  loop {
+                    //println!("expecting: {:?}", expecting);
+                    if expecting.is_empty() {
+                      break;
+                    }
+                    match channel.read_message() {
+                      None          => {
+                        eprintln!("the proxy didn't answer");
                         exit(1);
                       },
-                      CommandStatus::Ok => {
-                        if expecting.contains(&message.id) {
-                          expecting.remove(&message.id);
-                          //println!("status message with ID {} done", message.id);
-                          if let Ok(mut h) = state.try_lock() {
-                            if let Some(data) = h.get_mut(&message.id) {
-                              *data = ((*data).0, CommandStatus::Ok);
+                      Some(message) => {
+                        //println!("received message: {:?}", message);
+                        match message.status {
+                          CommandStatus::Processing => {
+                          },
+                          CommandStatus::Error => {
+                            eprintln!("error for message[{}]: {}", message.id, message.message);
+                            if expecting.contains(&message.id) {
+                              expecting.remove(&message.id);
+                              //println!("status message with ID {} done", message.id);
+                              if let Ok(mut h) = state.try_lock() {
+                                if let Some(data) = h.get_mut(&message.id) {
+                                  *data = ((*data).0, CommandStatus::Error);
+                                }
+                              }
+                            }
+                            exit(1);
+                          },
+                          CommandStatus::Ok => {
+                            if expecting.contains(&message.id) {
+                              expecting.remove(&message.id);
+                              //println!("status message with ID {} done", message.id);
+                              if let Ok(mut h) = state.try_lock() {
+                                if let Some(data) = h.get_mut(&message.id) {
+                                  *data = ((*data).0, CommandStatus::Ok);
+                                }
+                              }
                             }
                           }
                         }
                       }
                     }
                   }
+    
+                  send.send(()).unwrap();
+                });
+    
+                let finished = recv.recv_timeout(Duration::from_millis(1000)).is_ok();
+                let placeholder = if finished {
+                  String::from("")
+                } else {
+                  String::from("timeout")
+                };
+    
+                let h2: HashMap<u32, String> = if let Ok(state) = st.try_lock() {
+                  state.values().map(|&(ref id, ref status)| {
+                    (*id, String::from(match *status {
+                      CommandStatus::Processing => if finished {
+                        "processing"
+                      } else {
+                        "timeout"
+                      },
+                      CommandStatus::Error      => "error",
+                      CommandStatus::Ok         => "ok",
+                    }))
+                  }).collect()
+                } else {
+                  HashMap::new()
+                };
+    
+                if json {
+                  let workers_status: Vec<WorkerStatus> = workers.iter().map(|ref worker| {
+                    WorkerStatus {
+                      worker: worker,
+                      status: h2.get(&worker.id).unwrap_or(&placeholder)
+                    }
+                  }).collect();
+                  print_json_response(&workers_status)?;
+                } else {
+                  let mut table = Table::new();
+    
+                  table.add_row(row!["Worker", "pid", "run state", "answer"]);
+                  for ref worker in workers.iter() {
+                    let run_state = format!("{:?}", worker.run_state);
+                    table.add_row(row![worker.id, worker.pid, run_state, h2.get(&worker.id).unwrap_or(&placeholder)]);
+                  }
+    
+                  table.printstd();
                 }
               }
-
-              send.send(()).unwrap();
-            });
-
-            let finished = recv.recv_timeout(Duration::from_millis(1000)).is_ok();
-            let placeholder = if finished {
-              String::from("")
-            } else {
-              String::from("timeout")
-            };
-
-            let h2: HashMap<u32, String> = if let Ok(state) = st.try_lock() {
-              state.values().map(|&(ref id, ref status)| {
-                (*id, String::from(match *status {
-                  CommandStatus::Processing => if finished {
-                    "processing"
-                  } else {
-                    "timeout"
-                  },
-                  CommandStatus::Error      => "error",
-                  CommandStatus::Ok         => "ok",
-                }))
-              }).collect()
-            } else {
-              HashMap::new()
-            };
-
-            if json {
-              let workers_status: Vec<WorkerStatus> = workers.iter().map(|ref worker| {
-                WorkerStatus {
-                  worker: worker,
-                  status: h2.get(&worker.id).unwrap_or(&placeholder)
-                }
-              }).collect();
-              print_json_response(&workers_status)?;
-            } else {
-              let mut table = Table::new();
-
-              table.add_row(row!["Worker", "pid", "run state", "answer"]);
-              for ref worker in workers.iter() {
-                let run_state = format!("{:?}", worker.run_state);
-                table.add_row(row![worker.id, worker.pid, run_state, h2.get(&worker.id).unwrap_or(&placeholder)]);
-              }
-
-              table.printstd();
+              break
             }
           }
-          Ok(())
         }
       }
+
     }
+
+    send.send(())?;
+    Ok(())
+  });
+
+  if timeout > 0 && recv.recv_timeout(Duration::from_millis(timeout)).is_err() {
+    bail!("Command timeout. The proxy didn't send answer");
   }
+
+  timeout_thread.join().map_err(|error| {
+    anyhow::Error::msg(
+      format!("upgrade worker: thread timeout exceeded on join, {:?}", error)
+    )
+  })??;
+  Ok(())
+
 }
 
 pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
