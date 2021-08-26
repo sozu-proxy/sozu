@@ -28,8 +28,8 @@ use crate::protocol::proxy_protocol::send::SendProxyProtocol;
 use crate::protocol::{Pipe, ProtocolResult};
 use crate::retry::RetryPolicy;
 use crate::server::{
-    push_event, ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, CONN_RETRIES,
-    TIMER,
+    push_event, ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, SessionManager,
+    CONN_RETRIES, TIMER,
 };
 use crate::socket::server_bind;
 use crate::timer::TimeoutContainer;
@@ -978,15 +978,13 @@ pub struct Proxy {
     listeners: HashMap<Token, Listener>,
     configs: HashMap<ClusterId, ClusterConfiguration>,
     registry: Registry,
-    sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
-    max_connections: usize,
+    sessions: Rc<RefCell<SessionManager>>,
 }
 
 impl Proxy {
     pub fn new(
         registry: Registry,
-        sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
-        max_connections: usize,
+        sessions: Rc<RefCell<SessionManager>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> Proxy {
         Proxy {
@@ -996,7 +994,6 @@ impl Proxy {
             fronts: HashMap::new(),
             registry,
             sessions,
-            max_connections,
         }
     }
 
@@ -1071,10 +1068,6 @@ impl Proxy {
             false
         }
     }
-
-    fn slab_capacity(&self) -> usize {
-        10 + 2 * self.max_connections
-    }
 }
 
 impl ProxyConfiguration<Session> for Proxy {
@@ -1099,7 +1092,7 @@ impl ProxyConfiguration<Session> for Proxy {
             return Err(ConnectionError::NoBackendAvailable);
         }
 
-        if self.sessions.borrow().len() >= self.slab_capacity() {
+        if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
             error!("not enough memory, cannot connect to backend");
             return Err(ConnectionError::TooManyConnections);
         }
@@ -1120,7 +1113,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
                 let back_token = {
                     let mut s = self.sessions.borrow_mut();
-                    let entry = s.vacant_entry();
+                    let entry = s.slab.vacant_entry();
                     let back_token = Token(entry.key());
                     let _entry = entry.insert(session_rc.clone());
                     back_token
@@ -1307,7 +1300,7 @@ impl ProxyConfiguration<Session> for Proxy {
         wait_time: Duration,
     ) -> Result<(Token, bool), AcceptError> {
         let mut s = self.sessions.borrow_mut();
-        let entry = s.vacant_entry();
+        let entry = s.slab.vacant_entry();
         let session_token = Token(entry.key());
 
         let internal_token = Token(token.0);
@@ -1425,10 +1418,10 @@ pub fn start(
         Token(key)
     };
 
-    let sessions = Rc::new(RefCell::new(sessions));
+    let sessions = SessionManager::new(sessions, max_buffers);
     let address = config.address;
     let registry = poll.registry().try_clone().unwrap();
-    let mut configuration = Proxy::new(registry, sessions.clone(), max_buffers, backends.clone());
+    let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
     let _ = configuration.add_listener(config, pool.clone(), token);
     let _ = configuration.activate_listener(&address, None);
     let (scm_server, _scm_client) = UnixStream::pair().unwrap();
@@ -1625,10 +1618,9 @@ mod tests {
                 })));
             }
 
-            let sessions = Rc::new(RefCell::new(sessions));
+            let sessions = SessionManager::new(sessions, max_buffers);
             let registry = poll.registry().try_clone().unwrap();
-            let mut configuration =
-                Proxy::new(registry, sessions.clone(), max_buffers, backends.clone());
+            let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
             let listener_config = TcpListenerConfig {
                 address: "127.0.0.1:1234".parse().unwrap(),
                 public_address: None,
@@ -1641,7 +1633,7 @@ mod tests {
             {
                 let address = listener_config.address.clone();
                 let mut s = sessions.borrow_mut();
-                let entry = s.vacant_entry();
+                let entry = s.slab.vacant_entry();
                 let _ =
                     configuration.add_listener(listener_config, pool.clone(), Token(entry.key()));
                 let _ = configuration.activate_listener(&address, None);
