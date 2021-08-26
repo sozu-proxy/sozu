@@ -47,8 +47,8 @@ use crate::protocol::{Http, Pipe, ProtocolResult, StickySession};
 use crate::retry::RetryPolicy;
 use crate::router::{trie::*, Router};
 use crate::server::{
-    push_event, ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, SessionToken,
-    CONN_RETRIES,
+    push_event, ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, SessionManager,
+    SessionToken, CONN_RETRIES,
 };
 use crate::socket::server_bind;
 use crate::timer::TimeoutContainer;
@@ -1596,15 +1596,13 @@ pub struct Proxy {
     backends: Rc<RefCell<BackendMap>>,
     pool: Rc<RefCell<Pool>>,
     registry: Registry,
-    sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
-    max_connections: usize,
+    sessions: Rc<RefCell<SessionManager>>,
 }
 
 impl Proxy {
     pub fn new(
         registry: Registry,
-        sessions: Rc<RefCell<Slab<Rc<RefCell<dyn ProxySessionCast>>>>>,
-        max_connections: usize,
+        sessions: Rc<RefCell<SessionManager>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> Proxy {
@@ -1615,7 +1613,6 @@ impl Proxy {
             pool,
             registry,
             sessions,
-            max_connections,
         }
     }
 
@@ -1837,10 +1834,6 @@ impl Proxy {
             Ok(())
         }
     }
-
-    fn slab_capacity(&self) -> usize {
-        10 + 2 * self.max_connections
-    }
 }
 
 impl ProxyConfiguration<Session> for Proxy {
@@ -1863,7 +1856,7 @@ impl ProxyConfiguration<Session> for Proxy {
             }
             if let Ok(ssl) = Ssl::new(&listener.default_context) {
                 let mut s = self.sessions.borrow_mut();
-                let entry = s.vacant_entry();
+                let entry = s.slab.vacant_entry();
                 let session_token = Token(entry.key());
 
                 if let Err(e) = self.registry.register(
@@ -2023,14 +2016,14 @@ impl ProxyConfiguration<Session> for Proxy {
                 .map(|h| h.set_back_timeout(connect_timeout));
             Ok(BackendConnectAction::Replace)
         } else {
-            if self.sessions.borrow().len() >= self.slab_capacity() {
+            if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
                 error!("not enough memory, cannot connect to backend");
                 return Err(ConnectionError::TooManyConnections);
             }
 
             let back_token = {
                 let mut s = self.sessions.borrow_mut();
-                let entry = s.vacant_entry();
+                let entry = s.slab.vacant_entry();
                 let back_token = Token(entry.key());
                 let _entry = entry.insert(session_rc.clone());
                 back_token
@@ -2403,15 +2396,9 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
         Token(key)
     };
 
-    let sessions = Rc::new(RefCell::new(sessions));
+    let sessions = SessionManager::new(sessions, max_buffers);
     let registry = event_loop.registry().try_clone().unwrap();
-    let mut configuration = Proxy::new(
-        registry,
-        sessions.clone(),
-        max_buffers,
-        pool.clone(),
-        backends.clone(),
-    );
+    let mut configuration = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     let address = config.address.clone();
     if configuration.add_listener(config, token).is_some() {
         if configuration.activate_listener(&address, None).is_some() {
