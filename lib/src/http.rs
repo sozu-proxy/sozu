@@ -1610,6 +1610,7 @@ impl ProxyConfiguration<Session> for Proxy {
         frontend_sock: TcpStream,
         listen_token: ListenToken,
         wait_time: Duration,
+        proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
         if let Some(ref listener) = self.listeners.get(&Token(listen_token.0)) {
             if let Err(e) = frontend_sock.set_nodelay(true) {
@@ -1657,6 +1658,10 @@ impl ProxyConfiguration<Session> for Proxy {
                 s.incr();
                 Ok(())
             } else {
+                error!("max number of session connection reached, flushing the accept queue");
+                gauge!("accept_queue.backpressure", 1);
+                self.sessions.borrow_mut().can_accept = false;
+
                 Err(AcceptError::TooManySessions)
             }
         } else {
