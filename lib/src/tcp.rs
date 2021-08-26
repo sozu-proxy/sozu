@@ -1357,8 +1357,10 @@ impl ProxyConfiguration<Session> for Proxy {
                 let should_connect_backend =
                     proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
 
-                let s = Rc::new(RefCell::new(c));
-                entry.insert(s);
+                let session = Rc::new(RefCell::new(c));
+                entry.insert(session);
+
+                s.incr();
                 Ok((session_token, should_connect_backend))
             } else {
                 error!("could not get buffers from pool");

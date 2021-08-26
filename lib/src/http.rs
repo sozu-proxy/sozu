@@ -1651,8 +1651,10 @@ impl ProxyConfiguration<Session> for Proxy {
                     );
                 }
 
-                let s = Rc::new(RefCell::new(c));
-                entry.insert(s);
+                let session = Rc::new(RefCell::new(c));
+                entry.insert(session);
+
+                s.incr();
                 Ok((session_token, false))
             } else {
                 Err(AcceptError::TooManySessions)
