@@ -253,7 +253,7 @@ pub trait ProxySession {
     /// if a session received an event or can still execute, the event loop will
     /// call this method. Its result indicates if it can still execute, needs to
     /// connect to a backend server, close the session
-    fn ready(&mut self) -> SessionResult;
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySessionCast>>) -> SessionResult;
     /// if the event loop got an event for a token associated with the session,
     /// it will call this method on the session
     fn process_events(&mut self, token: Token, events: Ready);
