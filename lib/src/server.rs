@@ -1759,7 +1759,8 @@ impl Server {
                 }
 
                 let session = self.sessions.borrow_mut().slab[session_token].clone();
-                let order = session.borrow_mut().ready();
+                let session2 = session.clone();
+                let order = session.borrow_mut().ready(session2);
                 trace!(
                     "session[{:?} -> {:?}] got events {:?} and returned order {:?}",
                     session_token,
@@ -1850,7 +1851,7 @@ impl ProxySession for ListenSession {
         self.protocol
     }
 
-    fn ready(&mut self) -> SessionResult {
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySessionCast>>) -> SessionResult {
         SessionResult::Continue
     }
 
