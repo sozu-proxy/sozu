@@ -1,6 +1,8 @@
 use anyhow::{bail, Context};
 use futures::channel::mpsc::*;
 use futures::{SinkExt, StreamExt};
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use nom::{Err, HexDisplay, IResult, Offset};
 use serde_json;
 use std::collections::{BTreeMap, HashSet};
