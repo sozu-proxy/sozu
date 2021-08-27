@@ -985,6 +985,21 @@ impl ProxySession for Session {
 
                 proxy.sessions.borrow_mut().slab.try_remove(token.0);
             }
+        } else if let SessionResult::CloseBackend(_opt_back_token) = res {
+            if let (Some(token), Some(fd)) = (
+                self.back_token(),
+                self.back_socket_mut().map(|s| s.as_raw_fd()),
+            ) {
+                let proxy = self.proxy.borrow_mut();
+                if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
+                    error!("error deregistering socket({:?}): {:?}", fd, e);
+                }
+
+                proxy.sessions.borrow_mut().slab.try_remove(token.0);
+            }
+
+            //FIXME: should we really pass a token here?
+            self.close_backend_inner(Token(0));
         }
         self.metrics().service_stop();
         res
