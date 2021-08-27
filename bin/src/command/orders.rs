@@ -1,3 +1,4 @@
+use anyhow::{bail, Context};
 use futures::channel::mpsc::*;
 use futures::{SinkExt, StreamExt};
 use nom::{Err, HexDisplay, IResult, Offset};
@@ -34,28 +35,22 @@ impl CommandServer {
         &mut self,
         client_id: String,
         request: sozu_command::command::CommandRequest,
-    ) {
+    ) -> anyhow::Result<()> {
         match request.data {
             CommandRequestData::SaveState { path } => {
-                self.save_state(client_id, &request.id, &path).await;
+                self.save_state(client_id, &request.id, &path).await
             }
-            CommandRequestData::DumpState => {
-                self.dump_state(client_id, &request.id).await;
-            }
-            CommandRequestData::ListWorkers => {
-                self.list_workers(client_id, request.id).await;
-            }
+            CommandRequestData::DumpState => self.dump_state(client_id, &request.id).await,
+            CommandRequestData::ListWorkers => self.list_workers(client_id, request.id).await,
             CommandRequestData::LoadState { path } => {
-                self.load_state(Some(client_id), request.id, &path).await;
+                self.load_state(Some(client_id), request.id, &path).await
             }
             CommandRequestData::LaunchWorker(tag) => {
-                self.launch_worker(client_id, request.id, &tag).await;
+                self.launch_worker(client_id, request.id, &tag).await
             }
-            CommandRequestData::UpgradeMain => {
-                self.upgrade_main(client_id, request.id).await;
-            }
+            CommandRequestData::UpgradeMain => self.upgrade_main(client_id, request.id).await,
             CommandRequestData::UpgradeWorker(worker_id) => {
-                self.upgrade_worker(client_id, request.id, worker_id).await;
+                self.upgrade_worker(client_id, request.id, worker_id).await
             }
 
             CommandRequestData::Proxy(proxy_request) => match proxy_request {
@@ -65,20 +60,26 @@ impl CommandServer {
                 ProxyRequestData::Query(query) => self.query(client_id, request.id, query).await,
                 order => {
                     self.worker_order(client_id, request.id, order, request.worker_id)
-                        .await;
+                        .await
                 }
             },
             CommandRequestData::SubscribeEvents => {
                 self.event_subscribers.insert(client_id);
+                Ok(())
             }
             CommandRequestData::ReloadConfiguration { path } => {
                 self.reload_configuration(Some(client_id), request.id, path)
-                    .await;
+                    .await
             }
         }
     }
 
-    pub async fn save_state(&mut self, client_id: String, message_id: &str, path: &str) {
+    pub async fn save_state(
+        &mut self,
+        client_id: String,
+        message_id: &str,
+        path: &str,
+    ) -> anyhow::Result<()> {
         if let Ok(mut f) = fs::File::create(&path) {
             let res = self.save_state_to_file(&mut f);
 
@@ -92,21 +93,24 @@ impl CommandServer {
                         None,
                     )
                     .await;
+                    Ok(())
                 }
                 Err(e) => {
                     error!("failed writing state to file: {:?}", e);
                     self.answer_error(client_id, message_id, "could not save state to file", None)
                         .await;
+                    Err(anyhow::Error::from(e))
                 }
             }
         } else {
             error!("could not open file: {}", &path);
             self.answer_error(client_id, message_id, "could not open file", None)
                 .await;
+            bail!(format!("could not open file: {}", &path));
         }
     }
 
-    pub fn save_state_to_file(&mut self, f: &mut fs::File) -> io::Result<usize> {
+    pub fn save_state_to_file(&mut self, f: &mut fs::File) -> anyhow::Result<usize> {
         let mut counter = 0usize;
         let orders = self.state.generate_orders();
 
@@ -136,10 +140,10 @@ impl CommandServer {
             Ok(counter)
         })();
 
-        res
+        Ok(res?)
     }
 
-    pub async fn dump_state(&mut self, client_id: String, message_id: &str) {
+    pub async fn dump_state(&mut self, client_id: String, message_id: &str) -> anyhow::Result<()> {
         let state = self.state.clone();
         self.answer_success(
             client_id,
@@ -148,9 +152,15 @@ impl CommandServer {
             Some(CommandResponseData::State(state)),
         )
         .await;
+        Ok(())
     }
 
-    pub async fn load_state(&mut self, client_id: Option<String>, message_id: String, path: &str) {
+    pub async fn load_state(
+        &mut self,
+        client_id: Option<String>,
+        message_id: String,
+        path: &str,
+    ) -> anyhow::Result<()> {
         let mut file = match fs::File::open(&path) {
             Err(e) => {
                 error!("cannot open file at path '{}': {:?}", path, e);
@@ -163,7 +173,7 @@ impl CommandServer {
                     )
                     .await;
                 }
-                return;
+                return Err(anyhow::Error::from(e));
             }
             Ok(file) => file,
         };
@@ -179,12 +189,10 @@ impl CommandServer {
         loop {
             let previous = buffer.available_data();
             //FIXME: we should read in streaming here
-            if let Ok(sz) = file.read(buffer.space()) {
-                buffer.fill(sz);
-            } else {
-                error!("error reading state file");
-                break;
-            }
+            let sz = file
+                .read(buffer.space())
+                .with_context(|| "error reading state file")?;
+            buffer.fill(sz);
 
             if buffer.available_data() == 0 {
                 break;
@@ -338,9 +346,14 @@ impl CommandServer {
         gauge!("configuration.clusters", self.state.clusters.len());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
+        Ok(())
     }
 
-    pub async fn list_workers(&mut self, client_id: String, request_id: String) {
+    pub async fn list_workers(
+        &mut self,
+        client_id: String,
+        request_id: String,
+    ) -> anyhow::Result<()> {
         let workers: Vec<WorkerInfo> = self
             .workers
             .iter()
@@ -357,9 +370,15 @@ impl CommandServer {
             Some(CommandResponseData::Workers(workers)),
         )
         .await;
+        Ok(())
     }
 
-    pub async fn launch_worker(&mut self, client_id: String, request_id: String, _tag: &str) {
+    pub async fn launch_worker(
+        &mut self,
+        client_id: String,
+        request_id: String,
+        _tag: &str,
+    ) -> anyhow::Result<()> {
         if let Ok(mut worker) = start_worker(
             self.next_id,
             &self.config,
@@ -378,6 +397,8 @@ impl CommandServer {
                     .await
                 {
                     error!("could not send message to client {:?}: {:?}", client_id, e);
+                    // should we have an early return here?
+                    // return Err(anyhow::Error::from(e));
                 }
             }
 
@@ -402,8 +423,7 @@ impl CommandServer {
             let stream = Async::new(unsafe {
                 let fd = sock.into_raw_fd();
                 UnixStream::from_raw_fd(fd)
-            })
-            .unwrap();
+            })?;
 
             let id = worker.id;
             let command_tx = self.command_tx.clone();
@@ -440,10 +460,15 @@ impl CommandServer {
             self.answer_error(client_id, request_id, "failed creating worker", None)
                 .await;
         }
+        Ok(())
     }
 
-    pub async fn upgrade_main(&mut self, client_id: String, request_id: String) {
-        self.disable_cloexec_before_upgrade();
+    pub async fn upgrade_main(
+        &mut self,
+        client_id: String,
+        request_id: String,
+    ) -> anyhow::Result<()> {
+        self.disable_cloexec_before_upgrade()?;
 
         if let Some(sender) = self.clients.get_mut(&client_id) {
             if let Err(e) = sender
@@ -460,7 +485,7 @@ impl CommandServer {
         }
 
         let (pid, mut channel) =
-            start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data());
+            start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data())?;
         channel.set_blocking(true);
         let res = channel.read_message();
         debug!("upgrade channel sent: {:?}", res);
@@ -501,10 +526,16 @@ impl CommandServer {
                 None,
             )
             .await;
+            Ok(())
         }
     }
 
-    pub async fn upgrade_worker(&mut self, client_id: String, request_id: String, id: u32) {
+    pub async fn upgrade_worker(
+        &mut self,
+        client_id: String,
+        request_id: String,
+        id: u32,
+    ) -> anyhow::Result<()> {
         info!(
             "client[{}] msg {} wants to upgrade worker {}",
             client_id, request_id, id
@@ -538,9 +569,9 @@ impl CommandServer {
 
             worker
         } else {
-            return self
+            return Ok(self
                 .answer_error(client_id, &request_id, "failed creating worker", None)
-                .await;
+                .await);
         };
 
         if self
@@ -555,7 +586,7 @@ impl CommandServer {
         {
             self.answer_error(client_id, &request_id, "worker not found", None)
                 .await;
-            return;
+            return Ok(());
         }
 
         let sock = worker.channel.take().unwrap().sock;
@@ -694,8 +725,7 @@ impl CommandServer {
         let stream = Async::new(unsafe {
             let fd = sock.into_raw_fd();
             UnixStream::from_raw_fd(fd)
-        })
-        .unwrap();
+        })?;
 
         let id = worker.id;
         let command_tx = self.command_tx.clone();
@@ -720,6 +750,7 @@ impl CommandServer {
 
         self.answer_success(client_id, request_id, "", None).await;
         info!("finished upgrade");
+        Ok(())
     }
 
     pub async fn reload_configuration(
@@ -727,7 +758,7 @@ impl CommandServer {
         client_id: Option<String>,
         message_id: String,
         config_path: Option<String>,
-    ) {
+    ) -> anyhow::Result<()> {
         let new_config = match Config::load_from_path(
             config_path.as_deref().unwrap_or(&self.config.config_path),
         ) {
@@ -744,7 +775,7 @@ impl CommandServer {
                     )
                     .await;
                 }
-                return;
+                return Err(anyhow::Error::from(e));
             }
             Ok(c) => c,
         };
@@ -859,6 +890,7 @@ impl CommandServer {
         gauge!("configuration.frontends", self.frontends_count);
 
         self.config = new_config;
+        Ok(())
     }
 
     pub async fn metrics(
@@ -866,7 +898,7 @@ impl CommandServer {
         client_id: String,
         request_id: String,
         config: MetricsConfiguration,
-    ) {
+    ) -> anyhow::Result<()> {
         let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
@@ -922,9 +954,15 @@ impl CommandServer {
             }
         })
         .detach();
+        Ok(())
     }
 
-    pub async fn query(&mut self, client_id: String, request_id: String, query: Query) {
+    pub async fn query(
+        &mut self,
+        client_id: String,
+        request_id: String,
+        query: Query,
+    ) -> anyhow::Result<()> {
         let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
@@ -1066,6 +1104,7 @@ impl CommandServer {
             };
         })
         .detach();
+        Ok(())
     }
 
     pub async fn worker_order(
@@ -1074,7 +1113,7 @@ impl CommandServer {
         request_id: String,
         order: ProxyRequestData,
         worker_id: Option<u32>,
-    ) {
+    ) -> anyhow::Result<()> {
         if let &ProxyRequestData::AddCertificate(_) = &order {
             debug!("workerconfig client order AddCertificate()");
         } else {
@@ -1103,7 +1142,7 @@ impl CommandServer {
                         );
                         error!("{}", msg);
                         self.answer_error(client_id, request_id, msg, None).await;
-                        return;
+                        return Ok(());
                     }
                     ProxyRequestData::RemoveHttpFrontend(h)
                     | ProxyRequestData::RemoveHttpsFrontend(h) => {
@@ -1116,7 +1155,7 @@ impl CommandServer {
                         };
                         error!("{}", msg);
                         self.answer_error(client_id, request_id, msg, None).await;
-                        return;
+                        return Ok(());
                     }
                     ProxyRequestData::RemoveTcpFrontend(TcpFrontend {
                         ref cluster_id,
@@ -1128,7 +1167,7 @@ impl CommandServer {
                         );
                         error!("{}", msg);
                         self.answer_error(client_id, request_id, msg, None).await;
-                        return;
+                        return Ok(());
                     }
                     _ => {}
                 };
@@ -1286,6 +1325,7 @@ impl CommandServer {
         gauge!("configuration.clusters", self.state.clusters.len());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
+        Ok(())
     }
 }
 

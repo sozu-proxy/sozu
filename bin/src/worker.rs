@@ -1,3 +1,4 @@
+use anyhow::{bail, Context};
 use libc::{self, pid_t};
 use mio::net::UnixStream;
 use nix;
@@ -42,7 +43,7 @@ use crate::command::Worker;
 use crate::logging;
 use crate::util;
 
-pub fn start_workers(executable_path: String, config: &Config) -> nix::Result<Vec<Worker>> {
+pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result<Vec<Worker>> {
     let state = ConfigState::new();
     let mut workers = Vec::new();
     for index in 0..config.worker_count {
@@ -51,28 +52,25 @@ pub fn start_workers(executable_path: String, config: &Config) -> nix::Result<Ve
             tls: Vec::new(),
             tcp: Vec::new(),
         });
-        match start_worker_process(
+
+        let (pid, command, scm) = start_worker_process(
             &index.to_string(),
             config,
             executable_path.clone(),
             &state,
             listeners,
-        ) {
-            Ok((pid, command, scm)) => {
-                let mut w = Worker::new(index as u32, pid, command, scm, config);
-                // the new worker expects a status message at startup
-                if let Some(channel) = w.channel.as_mut() {
-                    channel.set_blocking(true);
-                    channel.write_message(&ProxyRequest {
-                        id: format!("start-status-{}", index),
-                        order: ProxyRequestData::Status,
-                    });
-                    channel.set_nonblocking(true);
-                }
-                workers.push(w);
-            }
-            Err(e) => return Err(e),
-        };
+        )?;
+        let mut w = Worker::new(index as u32, pid, command, scm, config);
+        // the new worker expects a status message at startup
+        if let Some(channel) = w.channel.as_mut() {
+            channel.set_blocking(true);
+            channel.write_message(&ProxyRequest {
+                id: format!("start-status-{}", index),
+                order: ProxyRequestData::Status,
+            });
+            channel.set_nonblocking(true);
+        }
+        workers.push(w);
     }
     Ok(workers)
 }
@@ -83,14 +81,11 @@ pub fn start_worker(
     executable_path: String,
     state: &ConfigState,
     listeners: Option<Listeners>,
-) -> nix::Result<Worker> {
-    match start_worker_process(&id.to_string(), config, executable_path, state, listeners) {
-        Ok((pid, command, scm)) => {
-            let w = Worker::new(id, pid, command, scm, config);
-            Ok(w)
-        }
-        Err(e) => Err(e),
-    }
+) -> anyhow::Result<Worker> {
+    let (pid, command, scm) =
+        start_worker_process(&id.to_string(), config, executable_path, state, listeners)?;
+
+    Ok(Worker::new(id, pid, command, scm, config))
 }
 
 pub fn begin_worker_process(
@@ -100,7 +95,7 @@ pub fn begin_worker_process(
     id: i32,
     command_buffer_size: usize,
     max_command_buffer_size: usize,
-) {
+) -> Result<(), anyhow::Error> {
     let mut command: Channel<ProxyResponse, Config> = Channel::new(
         unsafe { UnixStream::from_raw_fd(fd) },
         command_buffer_size,
@@ -111,11 +106,11 @@ pub fn begin_worker_process(
 
     let configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
     let config_state: ConfigState = serde_json::from_reader(configuration_state_file)
-        .expect("could not parse configuration state data");
+        .with_context(|| "could not parse configuration state data")?;
 
     let worker_config = command
         .read_message()
-        .expect("worker could not read configuration from socket");
+        .with_context(|| "worker could not read configuration from socket")?;
     //println!("got message: {:?}", worker_config);
 
     let worker_id = format!("{}-{:02}", "WRK", id);
@@ -162,6 +157,7 @@ pub fn begin_worker_process(
     info!("starting event loop");
     server.run();
     info!("ending event loop");
+    Ok(())
 }
 
 pub fn start_worker_process(
@@ -170,26 +166,26 @@ pub fn start_worker_process(
     executable_path: String,
     state: &ConfigState,
     listeners: Option<Listeners>,
-) -> nix::Result<(pid_t, Channel<ProxyRequest, ProxyResponse>, ScmSocket)> {
+) -> anyhow::Result<(pid_t, Channel<ProxyRequest, ProxyResponse>, ScmSocket)> {
     trace!("parent({})", unsafe { libc::getpid() });
 
     let mut state_file =
         tempfile().expect("could not create temporary file for configuration state");
-    util::disable_close_on_exec(state_file.as_raw_fd());
+    util::disable_close_on_exec(state_file.as_raw_fd())?;
 
     serde_json::to_writer(&mut state_file, state)
-        .expect("could not write upgrade data to temporary file");
+        .with_context(|| "could not write upgrade data to temporary file")?;
     state_file
         .seek(SeekFrom::Start(0))
-        .expect("could not seek to beginning of file");
+        .with_context(|| "could not seek to beginning of file")?;
 
-    let (server, client) = UnixStream::pair().unwrap();
-    let (scm_server_fd, scm_client) = UnixStream::pair().unwrap();
+    let (server, client) = UnixStream::pair()?;
+    let (scm_server_fd, scm_client) = UnixStream::pair()?;
 
     let scm_server = ScmSocket::new(scm_server_fd.into_raw_fd());
 
-    util::disable_close_on_exec(client.as_raw_fd());
-    util::disable_close_on_exec(scm_client.as_raw_fd());
+    util::disable_close_on_exec(client.as_raw_fd())?;
+    util::disable_close_on_exec(scm_client.as_raw_fd())?;
 
     let mut command: Channel<Config, ProxyResponse> = Channel::new(
         server,
@@ -212,7 +208,7 @@ pub fn start_worker_process(
                 info!("sent listeners from main: {:?}", res);
                 l.close();
             };
-            util::disable_close_on_exec(scm_server.fd);
+            util::disable_close_on_exec(scm_server.fd)?;
 
             let command: Channel<ProxyRequest, ProxyResponse> = command.into();
             Ok((child.into(), command, scm_server))
@@ -239,20 +235,21 @@ pub fn start_worker_process(
         }
         Err(e) => {
             error!("Error during fork(): {}", e);
-            Err(e)
+            Err(anyhow::Error::from(e))
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-pub unsafe fn get_executable_path() -> String {
+pub unsafe fn get_executable_path() -> anyhow::Result<String> {
     use std::fs;
 
-    let path = fs::read_link("/proc/self/exe").expect("/proc/self/exe doesn't exist");
-    let mut path_str = path
-        .into_os_string()
-        .into_string()
-        .expect("Failed to convert PathBuf to String");
+    let path = fs::read_link("/proc/self/exe").with_context(|| "/proc/self/exe doesn't exist")?;
+
+    let mut path_str = match path.into_os_string().into_string() {
+        Ok(s) => s,
+        Err(_) => bail!("Failed to convert PathBuf to String"),
+    };
 
     if path_str.ends_with(" (deleted)") {
         // The kernel appends " (deleted)" to the symlink when the original executable has been replaced
@@ -260,7 +257,7 @@ pub unsafe fn get_executable_path() -> String {
         path_str.truncate(len - 10)
     }
 
-    path_str
+    Ok(path_str)
 }
 
 #[cfg(target_os = "macos")]
