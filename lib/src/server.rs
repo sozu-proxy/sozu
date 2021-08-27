@@ -176,7 +176,7 @@ impl SessionManager {
         true
     }
 
-    pub fn to_session(&self, token: Token) -> SessionToken {
+    pub fn to_session(token: Token) -> SessionToken {
         SessionToken(token.0)
     }
 
@@ -192,7 +192,7 @@ impl SessionManager {
             let CloseResult { tokens } = session.borrow_mut().close(registry);
 
             for tk in tokens.into_iter() {
-                let cl = self.to_session(tk);
+                let cl = Self::to_session(tk);
                 if self.slab.contains(cl.0) {
                     self.slab.remove(cl.0);
                 }
@@ -202,6 +202,31 @@ impl SessionManager {
             self.nb_connections -= 1;
             gauge!("client.connections", self.nb_connections);
         }
+
+        // do not be ready to accept right away, wait until we get back to 10% capacity
+        if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
+            debug!(
+                "nb_connections = {}, max_connections = {}, starting to accept again",
+                self.nb_connections, self.max_connections
+            );
+            gauge!("accept_queue.backpressure", 0);
+            self.can_accept = true;
+        }
+    }
+
+    pub fn close_session_tokens(&mut self, tokens: Vec<Token>) {
+        for tk in tokens.into_iter() {
+            let cl = Self::to_session(tk);
+            if self.slab.contains(cl.0) {
+                self.slab.remove(cl.0);
+            }
+        }
+    }
+
+    pub fn check_can_accept(&mut self) {
+        assert!(self.nb_connections != 0);
+        self.nb_connections -= 1;
+        gauge!("client.connections", self.nb_connections);
 
         // do not be ready to accept right away, wait until we get back to 10% capacity
         if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
@@ -1662,10 +1687,7 @@ impl Server {
     pub fn interpret_session_order(&mut self, token: SessionToken, order: SessionResult) {
         //trace!("INTERPRET ORDER: {:?}", order);
         match order {
-            SessionResult::CloseSession => self
-                .sessions
-                .borrow_mut()
-                .close_session(token, self.poll.registry()),
+            SessionResult::CloseSession => {}
             SessionResult::CloseBackend(opt) => {
                 if let Some(token) = opt {
                     let cl = self.to_session(token);
@@ -1747,9 +1769,8 @@ impl Server {
                     break;
                 }
 
-                let order = self.sessions.borrow_mut().slab[session_token]
-                    .borrow_mut()
-                    .ready();
+                let session = self.sessions.borrow_mut().slab[session_token].clone();
+                let order = session.borrow_mut().ready();
                 trace!(
                     "session[{:?} -> {:?}] got events {:?} and returned order {:?}",
                     session_token,
