@@ -908,6 +908,32 @@ impl Session {
 
         Ok((&host, &rl.uri, &rl.method))
     }
+
+    fn set_backend(
+        &mut self,
+        backend: Rc<RefCell<Backend>>,
+        front_should_stick: bool,
+        sticky_name: &str,
+    ) {
+        if front_should_stick {
+            self.http_mut().map(|http| {
+                http.sticky_session = Some(StickySession::new(
+                    backend
+                        .borrow()
+                        .sticky_id
+                        .clone()
+                        .unwrap_or_else(|| backend.borrow().backend_id.clone()),
+                ));
+                http.sticky_name = sticky_name.to_string();
+            });
+        }
+        self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        self.metrics.backend_start();
+        self.http_mut().map(|http| {
+            http.set_backend_id(backend.borrow().backend_id.clone());
+        });
+        self.backend = Some(backend);
+    }
 }
 
 impl ProxySession for Session {
@@ -1230,10 +1256,6 @@ impl Proxy {
         cluster_id: &str,
         front_should_stick: bool,
     ) -> Result<TcpStream, ConnectionError> {
-        session
-            .http_mut()
-            .map(|h| h.set_cluster_id(String::from(cluster_id)));
-
         let sticky_session = session
             .http()
             .and_then(|http| http.request.as_ref())
@@ -1263,28 +1285,8 @@ impl Proxy {
                 Err(e)
             }
             Ok((backend, conn)) => {
-                if front_should_stick {
-                    let sticky_name = self.listeners[&session.listen_token]
-                        .config
-                        .sticky_name
-                        .clone();
-                    session.http_mut().map(|http| {
-                        http.sticky_session = Some(StickySession::new(
-                            backend
-                                .borrow()
-                                .sticky_id
-                                .clone()
-                                .unwrap_or_else(|| backend.borrow().backend_id.clone()),
-                        ));
-                        http.sticky_name = sticky_name;
-                    });
-                }
-                session.metrics.backend_id = Some(backend.borrow().backend_id.clone());
-                session.metrics.backend_start();
-                session.http_mut().map(|http| {
-                    http.set_backend_id(backend.borrow().backend_id.clone());
-                });
-                session.backend = Some(backend);
+                let sticky_name = &self.listeners[&session.listen_token].config.sticky_name;
+                session.set_backend(backend, front_should_stick, &sticky_name);
 
                 Ok(conn)
             }
@@ -1509,6 +1511,9 @@ impl ProxyConfiguration<Session> for Proxy {
         }
 
         session.cluster_id = Some(cluster_id.clone());
+        session.http_mut().map(|http| {
+            http.cluster_id = Some(cluster_id.clone());
+        });
 
         let front_should_stick = self
             .clusters
@@ -1516,10 +1521,6 @@ impl ProxyConfiguration<Session> for Proxy {
             .map(|ref app| app.sticky_session)
             .unwrap_or(false);
         let mut socket = self.backend_from_request(session, &cluster_id, front_should_stick)?;
-
-        session.http_mut().map(|http| {
-            http.cluster_id = Some(cluster_id.clone());
-        });
 
         if let Err(e) = socket.set_nodelay(true) {
             error!(
