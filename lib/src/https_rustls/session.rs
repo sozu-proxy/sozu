@@ -22,14 +22,14 @@ use crate::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use crate::protocol::rustls::TlsHandshake;
 use crate::protocol::{Http, Pipe, ProtocolResult};
 use crate::retry::RetryPolicy;
-use crate::server::push_event;
+use crate::server::{push_event, CONN_RETRIES};
 use crate::socket::FrontRustls;
 use crate::sozu_command::ready::Ready;
 use crate::timer::TimeoutContainer;
 use crate::util::UnwrapLog;
 use crate::{
-    Backend, BackendConnectionStatus, CloseResult, Protocol, ProxySession, Readiness,
-    SessionMetrics, SessionResult,
+    Backend, BackendConnectionStatus, CloseResult, ConnectionError, Protocol, ProxySession,
+    Readiness, SessionMetrics, SessionResult,
 };
 
 pub enum State {
@@ -894,6 +894,16 @@ impl Session {
             h.clear_back_token();
             h.remove_backend();
         });
+    }
+
+    pub fn check_circuit_breaker(&mut self) -> Result<(), ConnectionError> {
+        if self.connection_attempt == CONN_RETRIES {
+            error!("{} max connection attempt reached", self.log_context());
+            self.set_answer(DefaultAnswerStatus::Answer503, None);
+            Err(ConnectionError::NoBackendAvailable)
+        } else {
+            Ok(())
+        }
     }
 }
 
