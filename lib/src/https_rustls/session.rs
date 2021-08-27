@@ -30,7 +30,7 @@ use crate::timer::TimeoutContainer;
 use crate::util::UnwrapLog;
 use crate::{
     Backend, BackendConnectionStatus, CloseResult, ConnectionError, Protocol, ProxySession,
-    Readiness, SessionMetrics, SessionResult,
+    ProxySessionCast, Readiness, SessionMetrics, SessionResult,
 };
 
 pub enum State {
@@ -1137,7 +1137,7 @@ impl ProxySession for Session {
         }
     }
 
-    fn ready(&mut self) -> SessionResult {
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySessionCast>>) -> SessionResult {
         self.metrics().service_start();
         let res = self.ready_inner();
         if res == SessionResult::CloseSession {

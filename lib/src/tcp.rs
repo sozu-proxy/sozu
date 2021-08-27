@@ -931,7 +931,7 @@ impl ProxySession for Session {
         }
     }
 
-    fn ready(&mut self) -> SessionResult {
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySessionCast>>) -> SessionResult {
         self.metrics().service_start();
         let res = self.ready_inner();
 
