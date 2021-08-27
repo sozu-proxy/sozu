@@ -11,12 +11,13 @@ use std::io::{ErrorKind, Read};
 use std::net::{Shutdown, SocketAddr};
 use std::os::unix::prelude::{AsRawFd, RawFd};
 use std::rc::{Rc, Weak};
+use std::str::from_utf8_unchecked;
 use time::{Duration, Instant};
 
 use super::configuration::Proxy;
 use crate::buffer_queue::BufferQueue;
 use crate::pool::Pool;
-use crate::protocol::http::parser::RequestState;
+use crate::protocol::http::parser::{hostname_and_port, Method, RRequestLine, RequestState};
 use crate::protocol::http::{answers::HttpAnswers, DefaultAnswerStatus};
 use crate::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use crate::protocol::rustls::TlsHandshake;
@@ -904,6 +905,80 @@ impl Session {
         } else {
             Ok(())
         }
+    }
+
+    pub fn check_backend_connection(&mut self) -> bool {
+        let is_valid_backend_socket = self
+            .http_mut()
+            .map(|h| h.is_valid_backend_socket())
+            .unwrap_or(false);
+
+        if is_valid_backend_socket {
+            //matched on keepalive
+            self.metrics.backend_id = self.backend.as_ref().map(|i| i.borrow().backend_id.clone());
+            self.metrics.backend_start();
+            self.http_mut().map(|h| {
+                h.backend_data
+                    .as_mut()
+                    .map(|b| b.borrow_mut().active_requests += 1)
+            });
+
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn extract_route(&self) -> Result<(&str, &str, &Method), ConnectionError> {
+        let h = self
+            .http()
+            .and_then(|h| h.request.as_ref())
+            .and_then(|r| r.get_host())
+            .ok_or(ConnectionError::NoHostGiven)?;
+
+        let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
+            if i != &b""[..] {
+                error!("invalid remaining chars after hostname");
+                return Err(ConnectionError::InvalidHost);
+            }
+
+            // it is alright to call from_utf8_unchecked,
+            // we already verified that there are only ascii
+            // chars in there
+            let hostname_str = unsafe { from_utf8_unchecked(hostname) };
+
+            //FIXME: what if we don't use SNI?
+            let servername: Option<String> = self
+                .http()
+                .and_then(|h| h.frontend.session.get_sni_hostname())
+                .map(|s| s.to_string());
+            if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
+                error!(
+                    "TLS SNI hostname '{:?}' and Host header '{}' don't match",
+                    servername, hostname_str
+                );
+                return Err(ConnectionError::HostNotFound);
+            }
+
+            //FIXME: we should check that the port is right too
+
+            if port == Some(&b"443"[..]) {
+                hostname_str
+            } else {
+                &h
+            }
+        } else {
+            error!("hostname parsing failed");
+            return Err(ConnectionError::InvalidHost);
+        };
+
+        let rl: &RRequestLine = self
+            .http()
+            .and_then(|h| h.request.as_ref())
+            .and_then(|r| r.get_request_line())
+            .ok_or(ConnectionError::NoRequestLineGiven)?;
+
+        Ok((&host, &rl.uri, &rl.method))
     }
 }
 
