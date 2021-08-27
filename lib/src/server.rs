@@ -1688,18 +1688,7 @@ impl Server {
         //trace!("INTERPRET ORDER: {:?}", order);
         match order {
             SessionResult::CloseSession => {}
-            SessionResult::CloseBackend(opt) => {
-                if let Some(token) = opt {
-                    let cl = self.to_session(token);
-                    let mut sessions = self.sessions.borrow_mut();
-                    if sessions.slab.contains(cl.0) {
-                        let session = sessions.slab.remove(cl.0);
-                        session
-                            .borrow_mut()
-                            .close_backend(token, self.poll.registry());
-                    }
-                }
-            }
+            SessionResult::CloseBackend(_opt) => {}
             SessionResult::ReconnectBackend(main_token, backend_token) => {
                 if let Some(t) = backend_token {
                     let cl = self.to_session(t);
