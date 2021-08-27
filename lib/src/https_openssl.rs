@@ -981,6 +981,87 @@ impl Session {
             Ok(())
         }
     }
+
+    fn check_backend_connection(&mut self) -> bool {
+        let is_valid_backend_socket = self
+            .http_mut()
+            .map(|h| h.is_valid_backend_socket())
+            .unwrap_or(false);
+
+        if is_valid_backend_socket {
+            //matched on keepalive
+            self.metrics.backend_id = self.backend.as_ref().map(|i| i.borrow().backend_id.clone());
+            self.metrics.backend_start();
+            self.http_mut().map(|h| {
+                h.backend_data
+                    .as_mut()
+                    .map(|b| b.borrow_mut().active_requests += 1)
+            });
+
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn extract_route(&self) -> Result<(&str, &str, &Method), ConnectionError> {
+        let h = self
+            .http()
+            .and_then(|h| h.request.as_ref())
+            .and_then(|s| s.get_host())
+            .ok_or(ConnectionError::NoHostGiven)?;
+
+        let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
+            if i != &b""[..] {
+                error!(
+                    "connect_to_backend: invalid remaining chars after hostname. Host: {}",
+                    h
+                );
+                return Err(ConnectionError::InvalidHost);
+            }
+
+            // it is alright to call from_utf8_unchecked,
+            // we already verified that there are only ascii
+            // chars in there
+            let hostname_str = unsafe { from_utf8_unchecked(hostname) };
+
+            //FIXME: what if we don't use SNI?
+            let servername: Option<String> = self
+                .http()
+                .and_then(|h| h.frontend.ssl().servername(NameType::HOST_NAME))
+                .map(|s| s.to_string());
+
+            if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
+                error!(
+                    "TLS SNI hostname '{:?}' and Host header '{}' don't match",
+                    servername, hostname_str
+                );
+                /*FIXME: deactivate this check for a temporary test
+                unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, None);
+                return Err(ConnectionError::HostNotFound);
+                */
+            }
+
+            //FIXME: we should check that the port is right too
+
+            if port == Some(&b"443"[..]) {
+                hostname_str
+            } else {
+                &h
+            }
+        } else {
+            error!("hostname parsing failed");
+            return Err(ConnectionError::InvalidHost);
+        };
+
+        let rl: &RRequestLine = self
+            .http()
+            .and_then(|h| h.request.as_ref())
+            .and_then(|r| r.get_request_line())
+            .ok_or(ConnectionError::NoRequestLineGiven)?;
+
+        Ok((&host, &rl.uri, &rl.method))
+    }
 }
 
 impl ProxySession for Session {
@@ -1886,67 +1967,19 @@ impl Proxy {
         &mut self,
         session: &mut Session,
     ) -> Result<String, ConnectionError> {
-        let h = session
-            .http()
-            .and_then(|h| h.request.as_ref())
-            .and_then(|s| s.get_host())
-            .ok_or(ConnectionError::NoHostGiven)?;
-
-        let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
-            if i != &b""[..] {
-                error!(
-                    "connect_to_backend: invalid remaining chars after hostname. Host: {}",
-                    h
-                );
+        let (host, uri, method) = match session.extract_route() {
+            Ok(t) => t,
+            Err(e) => {
                 session.set_answer(DefaultAnswerStatus::Answer400, None);
-                return Err(ConnectionError::InvalidHost);
+                return Err(e);
             }
-
-            // it is alright to call from_utf8_unchecked,
-            // we already verified that there are only ascii
-            // chars in there
-            let hostname_str = unsafe { from_utf8_unchecked(hostname) };
-
-            //FIXME: what if we don't use SNI?
-            let servername: Option<String> = session
-                .http()
-                .and_then(|h| h.frontend.ssl().servername(NameType::HOST_NAME))
-                .map(|s| s.to_string());
-
-            if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
-                error!(
-                    "TLS SNI hostname '{:?}' and Host header '{}' don't match",
-                    servername, hostname_str
-                );
-                /*FIXME: deactivate this check for a temporary test
-                unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, None);
-                return Err(ConnectionError::HostNotFound);
-                */
-            }
-
-            //FIXME: we should check that the port is right too
-
-            if port == Some(&b"443"[..]) {
-                hostname_str
-            } else {
-                &h
-            }
-        } else {
-            error!("hostname parsing failed");
-            session.set_answer(DefaultAnswerStatus::Answer400, None);
-            return Err(ConnectionError::InvalidHost);
         };
 
-        let rl: &RRequestLine = session
-            .http()
-            .and_then(|h| h.request.as_ref())
-            .and_then(|r| r.get_request_line())
-            .ok_or(ConnectionError::NoRequestLineGiven)?;
         match self
             .listeners
             .get(&session.listen_token)
             .as_ref()
-            .and_then(|l| l.frontend_from_request(&host, &rl.uri, &rl.method))
+            .and_then(|l| l.frontend_from_request(&host, &uri, &method))
         {
             Some(Route::ClusterId(cluster_id)) => Ok(cluster_id),
             Some(Route::Deny) => {
@@ -2062,24 +2095,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 })
                 .unwrap_or(false);
 
-            let is_valid_backend_socket = has_backend
-                && session
-                    .http_mut()
-                    .map(|h| h.is_valid_backend_socket())
-                    .unwrap_or(false);
-
-            if is_valid_backend_socket {
-                //matched on keepalive
-                session.metrics.backend_id = session
-                    .backend
-                    .as_ref()
-                    .map(|i| i.borrow().backend_id.clone());
-                session.metrics.backend_start();
-                session.http_mut().map(|h| {
-                    h.backend_data
-                        .as_mut()
-                        .map(|b| b.borrow_mut().active_requests += 1)
-                });
+            if has_backend && session.check_backend_connection() {
                 return Ok(BackendConnectAction::Reuse);
             } else {
                 if let Some(token) = session.back_token() {
