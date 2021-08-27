@@ -21,7 +21,7 @@ use crate::protocol::http::parser::{hostname_and_port, Method, RRequestLine, Req
 use crate::protocol::http::{answers::HttpAnswers, DefaultAnswerStatus};
 use crate::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use crate::protocol::rustls::TlsHandshake;
-use crate::protocol::{Http, Pipe, ProtocolResult};
+use crate::protocol::{Http, Pipe, ProtocolResult, StickySession};
 use crate::retry::RetryPolicy;
 use crate::server::{push_event, CONN_RETRIES};
 use crate::socket::FrontRustls;
@@ -979,6 +979,34 @@ impl Session {
             .ok_or(ConnectionError::NoRequestLineGiven)?;
 
         Ok((&host, &rl.uri, &rl.method))
+    }
+
+    pub fn set_backend(
+        &mut self,
+        backend: Rc<RefCell<Backend>>,
+        front_should_stick: bool,
+        sticky_name: &str,
+    ) {
+        if front_should_stick {
+            self.http_mut().map(|http| {
+                http.sticky_session = Some(StickySession::new(
+                    backend
+                        .borrow()
+                        .sticky_id
+                        .clone()
+                        .unwrap_or(backend.borrow().backend_id.clone()),
+                ));
+                http.sticky_name = sticky_name.to_string();
+            });
+        }
+        self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        self.metrics.backend_start();
+
+        self.http_mut().map(|http| {
+            http.set_backend_id(backend.borrow().backend_id.clone());
+        });
+
+        self.backend = Some(backend);
     }
 }
 
