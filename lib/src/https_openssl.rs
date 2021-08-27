@@ -1,4 +1,5 @@
 use mio::net::*;
+use mio::unix::SourceFd;
 use mio::*;
 use openssl::dh::Dh;
 use openssl::error::ErrorStack;
@@ -18,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::net::Shutdown;
 use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::{Rc, Weak};
 use std::str::from_utf8_unchecked;
 use std::sync::{Arc, Mutex};
@@ -90,6 +91,7 @@ pub struct Session {
     protocol: Option<State>,
     public_address: SocketAddr,
     pool: Weak<RefCell<Pool>>,
+    proxy: Rc<RefCell<Proxy>>,
     sticky_name: String,
     metrics: SessionMetrics,
     pub cluster_id: Option<String>,
@@ -109,6 +111,7 @@ impl Session {
         sock: TcpStream,
         token: Token,
         pool: Weak<RefCell<Pool>>,
+        proxy: Rc<RefCell<Proxy>>,
         public_address: SocketAddr,
         expect_proxy: bool,
         sticky_name: String,
@@ -155,6 +158,7 @@ impl Session {
             protocol,
             public_address,
             pool,
+            proxy,
             sticky_name,
             metrics,
             cluster_id: None,
@@ -874,6 +878,99 @@ impl Session {
 
         SessionResult::Continue
     }
+
+    fn close_inner(&mut self) -> Vec<(Token, RawFd)> {
+        //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.frontend_token, *self.temp.front_buf, *self.temp.back_buf);
+        self.http_mut().map(|http| http.close());
+        self.metrics.service_stop();
+        self.cancel_timeouts();
+        if let Some(front_socket) = self.front_socket_mut() {
+            if let Err(e) = front_socket.shutdown(Shutdown::Both) {
+                if e.kind() != ErrorKind::NotConnected {
+                    error!("error closing front socket({:?}): {:?}", front_socket, e);
+                }
+            }
+        }
+        let mut result = Vec::new();
+
+        if let (Some(tk), Some(fd)) = (
+            self.back_token(),
+            self.back_socket_mut().map(|s| s.as_raw_fd()),
+        ) {
+            result.push((tk, fd));
+        }
+
+        //FIXME: should we really pass a token here?
+        self.close_backend_inner(Token(0));
+
+        if let Some(State::Http(ref mut http)) = self.protocol {
+            //if the state was initial, the connection was already reset
+            if http.request != Some(RequestState::Initial) {
+                gauge_add!("http.active_requests", -1);
+
+                if let Some(b) = http.backend_data.as_mut() {
+                    let mut backend = b.borrow_mut();
+                    backend.active_requests = backend.active_requests.saturating_sub(1);
+                }
+            }
+        }
+
+        if let Some(State::WebSocket(_)) = self.protocol {
+            if let Some(b) = self.backend.as_mut() {
+                let mut backend = b.borrow_mut();
+                backend.active_requests = backend.active_requests.saturating_sub(1);
+            }
+        }
+
+        match self.protocol {
+            Some(State::Expect(_, _)) => gauge_add!("protocol.proxy.expect", -1),
+            Some(State::Handshake(_)) => gauge_add!("protocol.tls.handshake", -1),
+            Some(State::Http(_)) => gauge_add!("protocol.https", -1),
+            Some(State::Http2(_)) => gauge_add!("protocol.http2s", -1),
+            Some(State::WebSocket(_)) => gauge_add!("protocol.wss", -1),
+            None => {}
+        }
+
+        let token = self.frontend_token;
+        if let Some(sock) = self.front_socket_mut() {
+            result.push((token, sock.as_raw_fd()));
+        }
+
+        result
+    }
+
+    fn close_backend_inner(&mut self, _: Token) {
+        self.remove_backend();
+
+        let back_connected = self.back_connected();
+        if back_connected != BackendConnectionStatus::NotConnected {
+            self.back_readiness().map(|r| r.event = Ready::empty());
+            if let Some(sock) = self.back_socket_mut() {
+                if let Err(e) = sock.shutdown(Shutdown::Both) {
+                    if e.kind() != ErrorKind::NotConnected {
+                        error!("error closing back socket({:?}): {:?}", sock, e);
+                    }
+                }
+            }
+        }
+
+        if back_connected == BackendConnectionStatus::Connected {
+            gauge_add!("backend.connections", -1);
+            gauge_add!(
+                "connections_per_backend",
+                -1,
+                self.cluster_id.as_ref().map(|s| s.as_str()),
+                self.metrics.backend_id.as_ref().map(|s| s.as_str())
+            );
+        }
+
+        self.set_back_connected(BackendConnectionStatus::NotConnected);
+
+        self.http_mut().map(|h| {
+            h.clear_back_token();
+            h.remove_backend();
+        });
+    }
 }
 
 impl ProxySession for Session {
@@ -1020,6 +1117,20 @@ impl ProxySession for Session {
     fn ready(&mut self) -> SessionResult {
         self.metrics().service_start();
         let res = self.ready_inner();
+
+        if res == SessionResult::CloseSession {
+            let mut v = self.close_inner();
+
+            let proxy = self.proxy.borrow_mut();
+            for (token, fd) in v.drain(..) {
+                if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
+                    error!("error deregistering socket({:?}): {:?}", fd, e);
+                }
+
+                proxy.sessions.borrow_mut().slab.try_remove(token.0);
+            }
+        }
+
         self.metrics().service_stop();
         res
     }
@@ -1265,8 +1376,7 @@ impl Listener {
                 TlsVersion::TLSv1_1 => versions.remove(ssl::SslOptions::NO_TLSV1_1),
                 TlsVersion::TLSv1_2 => versions.remove(ssl::SslOptions::NO_TLSV1_2),
                 //TlsVersion::TLSv1_3 => versions.remove(ssl::SslOptions::NO_TLSV1_3),
-                TlsVersion::TLSv1_3 => {}
-                //s         => error!("unrecognized TLS version: {:?}", s)
+                TlsVersion::TLSv1_3 => {} //s         => error!("unrecognized TLS version: {:?}", s)
             };
         }
 
@@ -1834,6 +1944,12 @@ impl Proxy {
             Ok(())
         }
     }
+
+    pub fn close_session(&mut self, token: Token) {
+        self.sessions
+            .borrow_mut()
+            .close_session(SessionManager::to_session(token), &self.registry)
+    }
 }
 
 impl ProxyConfiguration<Session> for Proxy {
@@ -1876,6 +1992,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     frontend_sock,
                     session_token,
                     Rc::downgrade(&self.pool),
+                    proxy,
                     listener
                         .config
                         .public_address

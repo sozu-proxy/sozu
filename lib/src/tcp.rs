@@ -1,4 +1,5 @@
 use mio::net::*;
+use mio::unix::SourceFd;
 use mio::*;
 use rusty_ulid::Ulid;
 use slab::Slab;
@@ -6,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{Shutdown, SocketAddr};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
 use time::{Duration, Instant};
 
@@ -71,6 +72,7 @@ pub struct Session {
     frontend_address: Option<SocketAddr>,
     front_timeout: TimeoutContainer,
     back_timeout: TimeoutContainer,
+    proxy: Rc<RefCell<Proxy>>,
 }
 
 impl Session {
@@ -78,6 +80,7 @@ impl Session {
         sock: TcpStream,
         frontend_token: Token,
         accept_token: Token,
+        proxy: Rc<RefCell<Proxy>>,
         front_buf: Checkout,
         back_buf: Checkout,
         cluster_id: Option<String>,
@@ -157,6 +160,7 @@ impl Session {
             backend_token: None,
             back_connected: BackendConnectionStatus::NotConnected,
             accept_token,
+            proxy,
             request_id,
             cluster_id,
             backend_id,
@@ -583,131 +587,15 @@ impl Session {
         self.front_timeout.cancel();
         self.back_timeout.cancel();
     }
-}
 
-impl ProxySession for Session {
-    fn close(&mut self, registry: &Registry) -> CloseResult {
-        self.metrics.service_stop();
-        self.cancel_timeouts();
-        if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
-            if e.kind() != ErrorKind::NotConnected {
-                error!(
-                    "error shutting down front socket({:?}): {:?}",
-                    self.front_socket(),
-                    e
-                );
-            }
-        }
-        if let Err(e) = registry.deregister(self.front_socket_mut()) {
-            error!(
-                "error deregistering front socket({:?}): {:?}",
-                self.front_socket(),
-                e
-            );
-        }
-
-        let mut result = CloseResult::default();
-
-        if let Some(tk) = self.backend_token {
-            result.tokens.push(tk)
-        }
-
-        //FIXME: should we really pass a token here?
-        self.close_backend(Token(0), registry);
-
-        match self.protocol {
-            Some(State::Pipe(_)) => gauge_add!("protocol.tcp", -1),
-            Some(State::SendProxyProtocol(_)) => gauge_add!("protocol.proxy.send", -1),
-            Some(State::RelayProxyProtocol(_)) => gauge_add!("protocol.proxy.relay", -1),
-            Some(State::ExpectProxyProtocol(_)) => gauge_add!("protocol.proxy.expect", -1),
-            None => {}
-        }
-
-        result.tokens.push(self.frontend_token);
-
-        result
-    }
-
-    fn timeout(&mut self, token: Token) -> SessionResult {
-        if self.frontend_token == token {
-            let dur = Instant::now() - self.last_event;
-            let front_timeout = self.front_timeout.duration();
-            if dur < front_timeout {
-                TIMER.with(|timer| {
-                    timer.borrow_mut().set_timeout(front_timeout - dur, token);
-                });
-                SessionResult::Continue
-            } else {
-                SessionResult::CloseSession
-            }
-        } else {
-            // invalid token, obsolete timeout triggered
-            SessionResult::Continue
-        }
-    }
-
-    fn close_backend(&mut self, _: Token, registry: &Registry) {
-        self.remove_backend();
-
-        let back_connected = self.back_connected();
-        if back_connected != BackendConnectionStatus::NotConnected {
-            self.back_readiness().map(|r| r.event = Ready::empty());
-            if let Some(sock) = self.back_socket_mut() {
-                if let Err(e) = sock.shutdown(Shutdown::Both) {
-                    if e.kind() != ErrorKind::NotConnected {
-                        error!("error closing back socket({:?}): {:?}", sock, e);
-                    }
-                }
-                if let Err(e) = registry.deregister(sock) {
-                    error!("error deregistering back socket({:?}): {:?}", sock, e);
-                }
-            }
-        }
-
-        if back_connected == BackendConnectionStatus::Connected {
-            gauge_add!("backend.connections", -1);
-            gauge_add!(
-                "connections_per_backend",
-                -1,
-                self.cluster_id.as_ref().map(|s| s.as_str()),
-                self.metrics.backend_id.as_ref().map(|s| s.as_str())
-            );
-        }
-
-        self.set_back_connected(BackendConnectionStatus::NotConnected);
-    }
-
-    fn protocol(&self) -> Protocol {
-        Protocol::TCP
-    }
-
-    fn process_events(&mut self, token: Token, events: Ready) {
-        trace!(
-            "token {:?} got event {}",
-            token,
-            super::ready_to_string(events)
-        );
-        self.last_event = Instant::now();
-        self.metrics.wait_start();
-
-        if self.frontend_token == token {
-            self.front_readiness().event = self.front_readiness().event | events;
-        } else if self.backend_token == Some(token) {
-            self.back_readiness().map(|r| r.event = r.event | events);
-        }
-    }
-
-    fn ready(&mut self) -> SessionResult {
+    fn ready_inner(&mut self) -> SessionResult {
         let mut counter = 0;
         let max_loop_iterations = 100000;
-
-        self.metrics().service_start();
 
         if self.back_connected().is_connecting() {
             if self.back_readiness().unwrap().event.is_hup() && !self.test_back_socket() {
                 //retry connecting the backend
                 error!("error connecting to backend, trying again");
-                self.metrics().service_stop();
                 self.connection_attempt += 1;
                 self.fail_backend_connection();
 
@@ -862,6 +750,206 @@ impl ProxySession for Session {
         }
 
         SessionResult::Continue
+    }
+
+    fn close_inner(&mut self) -> Vec<(Token, RawFd)> {
+        self.metrics.service_stop();
+        self.cancel_timeouts();
+        if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
+            if e.kind() != ErrorKind::NotConnected {
+                error!(
+                    "error shutting down front socket({:?}): {:?}",
+                    self.front_socket(),
+                    e
+                );
+            }
+        }
+
+        let mut result = Vec::new();
+
+        if let (Some(tk), Some(fd)) = (
+            self.backend_token,
+            self.back_socket_mut().map(|s| s.as_raw_fd()),
+        ) {
+            result.push((tk, fd));
+        }
+
+        //FIXME: should we really pass a token here?
+        self.close_backend_inner(Token(0));
+
+        match self.protocol {
+            Some(State::Pipe(_)) => gauge_add!("protocol.tcp", -1),
+            Some(State::SendProxyProtocol(_)) => gauge_add!("protocol.proxy.send", -1),
+            Some(State::RelayProxyProtocol(_)) => gauge_add!("protocol.proxy.relay", -1),
+            Some(State::ExpectProxyProtocol(_)) => gauge_add!("protocol.proxy.expect", -1),
+            None => {}
+        }
+
+        result.push((self.frontend_token, self.front_socket().as_raw_fd()));
+
+        result
+    }
+
+    fn close_backend_inner(&mut self, _: Token) {
+        self.remove_backend();
+
+        let back_connected = self.back_connected();
+        if back_connected != BackendConnectionStatus::NotConnected {
+            self.back_readiness().map(|r| r.event = Ready::empty());
+            if let Some(sock) = self.back_socket_mut() {
+                if let Err(e) = sock.shutdown(Shutdown::Both) {
+                    if e.kind() != ErrorKind::NotConnected {
+                        error!("error closing back socket({:?}): {:?}", sock, e);
+                    }
+                }
+            }
+        }
+
+        if back_connected == BackendConnectionStatus::Connected {
+            gauge_add!("backend.connections", -1);
+            gauge_add!(
+                "connections_per_backend",
+                -1,
+                self.cluster_id.as_ref().map(|s| s.as_str()),
+                self.metrics.backend_id.as_ref().map(|s| s.as_str())
+            );
+        }
+
+        self.set_back_connected(BackendConnectionStatus::NotConnected);
+    }
+}
+
+impl ProxySession for Session {
+    fn close(&mut self, registry: &Registry) -> CloseResult {
+        self.metrics.service_stop();
+        self.cancel_timeouts();
+        if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
+            if e.kind() != ErrorKind::NotConnected {
+                error!(
+                    "error shutting down front socket({:?}): {:?}",
+                    self.front_socket(),
+                    e
+                );
+            }
+        }
+        if let Err(e) = registry.deregister(self.front_socket_mut()) {
+            error!(
+                "error deregistering front socket({:?}): {:?}",
+                self.front_socket(),
+                e
+            );
+        }
+
+        let mut result = CloseResult::default();
+
+        if let Some(tk) = self.backend_token {
+            result.tokens.push(tk)
+        }
+
+        //FIXME: should we really pass a token here?
+        self.close_backend(Token(0), registry);
+
+        match self.protocol {
+            Some(State::Pipe(_)) => gauge_add!("protocol.tcp", -1),
+            Some(State::SendProxyProtocol(_)) => gauge_add!("protocol.proxy.send", -1),
+            Some(State::RelayProxyProtocol(_)) => gauge_add!("protocol.proxy.relay", -1),
+            Some(State::ExpectProxyProtocol(_)) => gauge_add!("protocol.proxy.expect", -1),
+            None => {}
+        }
+
+        result.tokens.push(self.frontend_token);
+
+        result
+    }
+
+    fn timeout(&mut self, token: Token) -> SessionResult {
+        if self.frontend_token == token {
+            let dur = Instant::now() - self.last_event;
+            let front_timeout = self.front_timeout.duration();
+            if dur < front_timeout {
+                TIMER.with(|timer| {
+                    timer.borrow_mut().set_timeout(front_timeout - dur, token);
+                });
+                SessionResult::Continue
+            } else {
+                SessionResult::CloseSession
+            }
+        } else {
+            // invalid token, obsolete timeout triggered
+            SessionResult::Continue
+        }
+    }
+
+    fn close_backend(&mut self, _: Token, registry: &Registry) {
+        self.remove_backend();
+
+        let back_connected = self.back_connected();
+        if back_connected != BackendConnectionStatus::NotConnected {
+            self.back_readiness().map(|r| r.event = Ready::empty());
+            if let Some(sock) = self.back_socket_mut() {
+                if let Err(e) = sock.shutdown(Shutdown::Both) {
+                    if e.kind() != ErrorKind::NotConnected {
+                        error!("error closing back socket({:?}): {:?}", sock, e);
+                    }
+                }
+                if let Err(e) = registry.deregister(sock) {
+                    error!("error deregistering back socket({:?}): {:?}", sock, e);
+                }
+            }
+        }
+
+        if back_connected == BackendConnectionStatus::Connected {
+            gauge_add!("backend.connections", -1);
+            gauge_add!(
+                "connections_per_backend",
+                -1,
+                self.cluster_id.as_ref().map(|s| s.as_str()),
+                self.metrics.backend_id.as_ref().map(|s| s.as_str())
+            );
+        }
+
+        self.set_back_connected(BackendConnectionStatus::NotConnected);
+    }
+
+    fn protocol(&self) -> Protocol {
+        Protocol::TCP
+    }
+
+    fn process_events(&mut self, token: Token, events: Ready) {
+        trace!(
+            "token {:?} got event {}",
+            token,
+            super::ready_to_string(events)
+        );
+        self.last_event = Instant::now();
+        self.metrics.wait_start();
+
+        if self.frontend_token == token {
+            self.front_readiness().event = self.front_readiness().event | events;
+        } else if self.backend_token == Some(token) {
+            self.back_readiness().map(|r| r.event = r.event | events);
+        }
+    }
+
+    fn ready(&mut self) -> SessionResult {
+        self.metrics().service_start();
+        let res = self.ready_inner();
+
+        if res == SessionResult::CloseSession {
+            let mut v = self.close_inner();
+
+            let proxy = self.proxy.borrow_mut();
+            for (token, fd) in v.drain(..) {
+                if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
+                    error!("error deregistering socket({:?}): {:?}", fd, e);
+                }
+
+                proxy.sessions.borrow_mut().slab.try_remove(token.0);
+            }
+        }
+
+        self.metrics().service_stop();
+        res
     }
 
     fn shutting_down(&mut self) -> SessionResult {
@@ -1067,6 +1155,12 @@ impl Proxy {
         } else {
             false
         }
+    }
+
+    pub fn close_session(&mut self, token: Token) {
+        self.sessions
+            .borrow_mut()
+            .close_session(SessionManager::to_session(token), &self.registry);
     }
 }
 
@@ -1335,6 +1429,7 @@ impl ProxyConfiguration<Session> for Proxy {
                         frontend_sock,
                         session_token,
                         internal_token,
+                        proxy,
                         front_buf,
                         back_buf,
                         listener.cluster_id.clone(),
