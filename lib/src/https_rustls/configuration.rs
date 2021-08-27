@@ -247,8 +247,8 @@ pub struct Proxy {
     clusters: HashMap<ClusterId, Cluster>,
     backends: Rc<RefCell<BackendMap>>,
     pool: Rc<RefCell<Pool>>,
-    registry: Registry,
-    sessions: Rc<RefCell<SessionManager>>,
+    pub registry: Registry,
+    pub sessions: Rc<RefCell<SessionManager>>,
 }
 
 impl Proxy {
@@ -485,6 +485,12 @@ impl Proxy {
             Ok(())
         }
     }
+
+    pub fn close_session(&mut self, token: Token) {
+        self.sessions
+            .borrow_mut()
+            .close_session(SessionManager::to_session(token), &self.registry)
+    }
 }
 
 impl ProxyConfiguration<Session> for Proxy {
@@ -528,6 +534,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 frontend_sock,
                 session_token,
                 Rc::downgrade(&self.pool),
+                proxy,
                 listener
                     .config
                     .public_address
