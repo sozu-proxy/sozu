@@ -595,7 +595,8 @@ pub fn start(
         gauge!("configuration.frontends", server.frontends_count);
 
         info!("waiting for configuration client connections");
-        server.run().await
+        server.run().await;
+        Ok(())
     })
 }
 
@@ -622,7 +623,7 @@ enum CommandMessage {
 }
 
 impl CommandServer {
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(&mut self) {
         while let Some(msg) = self.command_rx.next().await {
             match msg {
                 CommandMessage::ClientNew { id, sender } => {
@@ -636,29 +637,38 @@ impl CommandServer {
                 }
                 CommandMessage::ClientRequest { id, message } => {
                     debug!("client {} sent {:?}", id, message);
-                    self.handle_client_message(id, message).await?;
+                    match self.handle_client_message(id, message).await {
+                        Ok(()) => {}
+                        Err(e) => error!("{}", e),
+                    }
                 }
                 CommandMessage::WorkerClose { id } => {
+                    // put all this in a method handle_worker_close
                     info!("removing worker {}", id);
                     if let Some(w) = self.workers.iter_mut().filter(|w| w.id == id).next() {
                         // In case a worker crashes and should be restarted
                         if self.config.worker_automatic_restart && w.run_state == RunState::Running
                         {
-                            self.restart_worker(id).await?;
-                            return Ok(());
+                            match self.restart_worker(id).await {
+                                Ok(()) => {}
+                                Err(e) => error!("Could not restart worker {}: {}", id, e),
+                            }
+                            
+                            // is this wise?
+                            return;
                         }
 
                         info!("Closing the worker {}.", w.id);
                         if !w.the_pid_is_alive() {
                             info!("Worker {} is dead, setting to Stopped.", w.id);
                             w.run_state = RunState::Stopped;
-                            return Ok(());
                         }
 
                         info!("Worker {} is not dead but should be. Let's kill it.", w.id);
-                        kill(Pid::from_raw(w.pid), Signal::SIGKILL)
-                            .with_context(|| "failed to kill the worker process")?;
 
+                        // unused Result - but why ? where ?
+                        kill(Pid::from_raw(w.pid), Signal::SIGKILL)
+                            .map_err(|e| error!("failed to kill the worker process: {}", e));
                         w.run_state = RunState::Stopped;
                     }
                 }
@@ -714,7 +724,6 @@ impl CommandServer {
                 }
             }
         }
-        Ok(())
     }
 
     async fn answer_success<T, U>(
