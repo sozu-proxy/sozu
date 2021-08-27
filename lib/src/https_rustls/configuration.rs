@@ -33,7 +33,7 @@ use crate::protocol::StickySession;
 use crate::router::Router;
 use crate::server::{
     ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, SessionManager,
-    SessionToken, CONN_RETRIES,
+    SessionToken,
 };
 use crate::socket::server_bind;
 use crate::util::UnwrapLog;
@@ -476,16 +476,6 @@ impl Proxy {
         }
     }
 
-    fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
-        if session.connection_attempt == CONN_RETRIES {
-            error!("{} max connection attempt reached", session.log_context());
-            session.set_answer(DefaultAnswerStatus::Answer503, None);
-            Err(ConnectionError::NoBackendAvailable)
-        } else {
-            Ok(())
-        }
-    }
-
     pub fn close_session(&mut self, token: Token) {
         self.sessions
             .borrow_mut()
@@ -570,7 +560,7 @@ impl ProxyConfiguration<Session> for Proxy {
         let old_cluster_id = session.http().and_then(|ref http| http.cluster_id.clone());
         let old_back_token = session.back_token();
 
-        self.check_circuit_breaker(session)?;
+        session.check_circuit_breaker()?;
 
         let cluster_id = self.cluster_id_from_request(session)?;
 
