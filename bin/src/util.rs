@@ -1,3 +1,4 @@
+use anyhow::Context;
 use libc;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use std::fs::File;
@@ -9,41 +10,31 @@ use anyhow;
 use sozu::metrics;
 use sozu_command::config::Config;
 
-pub fn enable_close_on_exec(fd: RawFd) -> Option<i32> {
-    fcntl(fd, FcntlArg::F_GETFD)
-        .map_err(|e| {
-            error!("could not get file descriptor flags: {:?}", e);
-        })
-        .ok()
-        .and_then(FdFlag::from_bits)
-        .and_then(|mut new_flags| {
-            new_flags.insert(FdFlag::FD_CLOEXEC);
-            fcntl(fd, FcntlArg::F_SETFD(new_flags))
-                .map_err(|e| {
-                    error!("could not set file descriptor flags: {:?}", e);
-                })
-                .ok()
-        })
+pub fn enable_close_on_exec(fd: RawFd) -> Result<i32, anyhow::Error> {
+    let file_descriptor =
+        fcntl(fd, FcntlArg::F_GETFD).with_context(|| "could not get file descriptor flags")?;
+
+    let mut new_flags = FdFlag::from_bits(file_descriptor)
+        .ok_or_else(|| anyhow::format_err!("could not convert flags for file descriptor"))?;
+
+    new_flags.insert(FdFlag::FD_CLOEXEC);
+
+    fcntl(fd, FcntlArg::F_SETFD(new_flags)).with_context(|| "could not set file descriptor flags")
 }
 
 // FD_CLOEXEC is set by default on every fd in Rust standard lib,
 // so we need to remove the flag on the client, otherwise
 // it won't be accessible
-pub fn disable_close_on_exec(fd: RawFd) -> Option<i32> {
-    fcntl(fd, FcntlArg::F_GETFD)
-        .map_err(|e| {
-            error!("could not get file descriptor flags: {:?}", e);
-        })
-        .ok()
-        .and_then(FdFlag::from_bits)
-        .and_then(|mut new_flags| {
-            new_flags.remove(FdFlag::FD_CLOEXEC);
-            fcntl(fd, FcntlArg::F_SETFD(new_flags))
-                .map_err(|e| {
-                    error!("could not set file descriptor flags: {:?}", e);
-                })
-                .ok()
-        })
+pub fn disable_close_on_exec(fd: RawFd) -> Result<i32, anyhow::Error> {
+    let old_flags =
+        fcntl(fd, FcntlArg::F_GETFD).with_context(|| "could not get file descriptor flags")?;
+
+    let mut new_flags = FdFlag::from_bits(old_flags)
+        .ok_or_else(|| anyhow::format_err!("could not convert flags for file descriptor"))?;
+
+    new_flags.remove(FdFlag::FD_CLOEXEC);
+
+    fcntl(fd, FcntlArg::F_SETFD(new_flags)).with_context(|| "could not set file descriptor flags")
 }
 
 pub fn setup_logging(config: &Config) {
@@ -80,9 +71,6 @@ pub fn write_pid_file(config: &Config) -> Result<(), anyhow::Error> {
 
         file.write_all(format!("{}", pid).as_bytes())?;
         file.sync_all()?;
-
-        Ok(())
-    } else {
-        Ok(())
     }
+    Ok(())
 }

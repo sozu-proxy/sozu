@@ -50,18 +50,21 @@ pub enum StartupError {
     TooManyAllowedConnections(String),
     #[allow(dead_code)]
     TooManyAllowedConnectionsForWorker(String),
-    WorkersSpawnFail(nix::Error),
+    WorkersSpawnFail(anyhow::Error),
     PIDFileNotWritable(String),
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     register_panic_hook();
 
     let matches = cli::Sozu::from_args();
 
     if let cli::SubCmd::Start = matches.cmd {
         match start(&matches) {
-            Ok(_) => info!("main process stopped"), // Ok() is only called when the proxy exits
+            Ok(_) => {
+                info!("main process stopped");
+                Ok(())
+            } // Ok() is only called when the proxy exits
             Err(StartupError::ConfigurationFileNotSpecified) => {
                 error!("Configuration file hasn't been specified. Either use -c with the start command \
                or use the SOZU_CONFIG environment variable when building sozu.");
@@ -102,7 +105,7 @@ fn main() {
             id,
             command_buffer_size,
             max_command_buffer_size,
-        );
+        )
     } else if let cli::SubCmd::Main {
         fd,
         upgrade_fd,
@@ -116,9 +119,9 @@ fn main() {
             upgrade_fd,
             command_buffer_size,
             max_command_buffer_size,
-        );
+        )
     } else {
-        ctl::ctl(matches).unwrap()
+        ctl::ctl(matches)
     }
 }
 
@@ -150,7 +153,7 @@ fn start(matches: &cli::Sozu) -> Result<(), StartupError> {
 }
 
 fn init_workers(config: &Config) -> Result<Vec<Worker>, StartupError> {
-    let path = unsafe { get_executable_path() };
+    let path = unsafe { get_executable_path().unwrap() };
     match start_workers(path, &config) {
         Ok(workers) => {
             info!("created workers: {:?}", workers);
