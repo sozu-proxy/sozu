@@ -592,7 +592,13 @@ impl Session {
         let mut counter = 0;
         let max_loop_iterations = 100000;
 
-        if self.back_connected().is_connecting() {
+        info!(
+            "tcp::ready(): back_connected  = {:?}",
+            self.back_connected()
+        );
+
+        let back_connected = self.back_connected();
+        if back_connected.is_connecting() {
             if self.back_readiness().unwrap().event.is_hup() && !self.test_back_socket() {
                 //retry connecting the backend
                 error!("error connecting to backend, trying again");
@@ -609,6 +615,8 @@ impl Session {
 
                 self.set_back_connected(BackendConnectionStatus::Connected);
             }
+        } else if back_connected == BackendConnectionStatus::NotConnected {
+            return SessionResult::ConnectBackend;
         }
 
         if self.front_readiness().event.is_hup() {
@@ -817,6 +825,93 @@ impl Session {
 
         self.set_back_connected(BackendConnectionStatus::NotConnected);
     }
+
+    fn connect_to_backend(
+        &mut self,
+        session_rc: Rc<RefCell<dyn ProxySessionCast>>,
+    ) -> Result<BackendConnectAction, ConnectionError> {
+        if self.proxy.borrow().listeners[&self.accept_token]
+            .cluster_id
+            .is_none()
+        {
+            error!("no TCP application corresponds to that front address");
+            return Err(ConnectionError::HostNotFound);
+        }
+
+        let cluster_id = self.proxy.borrow().listeners[&self.accept_token]
+            .cluster_id
+            .clone();
+        self.cluster_id = cluster_id.clone();
+        let cluster_id = cluster_id.unwrap();
+
+        if self.connection_attempt == CONN_RETRIES {
+            error!("{} max connection attempt reached", self.log_context());
+            return Err(ConnectionError::NoBackendAvailable);
+        }
+
+        if self.proxy.borrow().sessions.borrow().slab.len()
+            >= self.proxy.borrow().sessions.borrow().slab_capacity()
+        {
+            error!("not enough memory, cannot connect to backend");
+            return Err(ConnectionError::TooManyConnections);
+        }
+
+        let conn = self
+            .proxy
+            .borrow()
+            .backends
+            .borrow_mut()
+            .backend_from_cluster_id(&cluster_id);
+        match conn {
+            Ok((backend, mut stream)) => {
+                if let Err(e) = stream.set_nodelay(true) {
+                    error!(
+                        "error setting nodelay on back socket({:?}): {:?}",
+                        stream, e
+                    );
+                }
+                self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
+
+                let back_token = {
+                    let proxy = self.proxy.borrow();
+                    let mut s = proxy.sessions.borrow_mut();
+                    let entry = s.slab.vacant_entry();
+                    let back_token = Token(entry.key());
+                    let _entry = entry.insert(session_rc.clone());
+                    back_token
+                };
+
+                if let Err(e) = self.proxy.borrow().registry.register(
+                    &mut stream,
+                    back_token,
+                    Interest::READABLE | Interest::WRITABLE,
+                ) {
+                    error!("error registering back socket({:?}): {:?}", stream, e);
+                }
+
+                let connect_timeout_duration = Duration::seconds(
+                    self.proxy.borrow().listeners[&self.accept_token]
+                        .config
+                        .connect_timeout as i64,
+                );
+                self.back_timeout.set_duration(connect_timeout_duration);
+                self.back_timeout.set(back_token);
+
+                self.set_back_token(back_token);
+                self.set_back_socket(stream);
+
+                self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+                self.metrics.backend_start();
+                self.set_backend_id(backend.borrow().backend_id.clone());
+
+                Ok(BackendConnectAction::New)
+            }
+            Err(ConnectionError::NoBackendAvailable) => Err(ConnectionError::NoBackendAvailable),
+            Err(e) => {
+                panic!("tcp connect_to_backend: unexpected error: {:?}", e);
+            }
+        }
+    }
 }
 
 impl ProxySession for Session {
@@ -961,6 +1056,18 @@ impl ProxySession for Session {
 
             //FIXME: should we really pass a token here?
             self.close_backend_inner(Token(0));
+        } else if res == SessionResult::ConnectBackend {
+            let res = self.connect_to_backend(session);
+            info!("TCP::READY): connect_to_backend returned {:?}\n\n", res);
+
+            //FIXME: we might need to loop here betwen ready and connet_to_backend because a call to ready() might go through connect_to_backend again or it could return CloseBackend and other results. Ideally, connect_to_backend should be called from ready_inner instead
+            if res == Ok(BackendConnectAction::Reuse) || res.is_err() {
+                let res = self.ready_inner();
+                self.metrics().service_stop();
+                return res;
+            }
+            self.metrics().service_stop();
+            return SessionResult::Continue;
         }
 
         self.metrics().service_stop();
@@ -1489,10 +1596,16 @@ impl ProxyConfiguration<Session> for Proxy {
                 return Err(AcceptError::IoError);
             };
 
+        /*
         if should_connect_backend {
+            info!("will call connect_backend");
             // FIXME: handle errors here
-            self.connect_to_backend(session);
+            //self.connect_to_backend(session);
+            let s = session.clone();
+            let res = session.borrow_mut().connect_to_backend(s);
+            info!("tcp::create_session: connect_backend returned {:?}", res);
         }
+        */
 
         Ok(())
     }
@@ -1711,6 +1824,7 @@ mod tests {
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
         thread::spawn(move || {
+            setup_test_logger!();
             info!("starting event loop");
             let poll = Poll::new().expect("could not create event loop");
             let max_buffers = 100;
