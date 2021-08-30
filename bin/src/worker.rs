@@ -72,6 +72,7 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
         }
         workers.push(w);
     }
+    info!("Created workers");
     Ok(workers)
 }
 

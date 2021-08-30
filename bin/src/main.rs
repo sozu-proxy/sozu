@@ -31,6 +31,7 @@ mod upgrade;
 mod util;
 mod worker;
 
+use anyhow::{bail, Context};
 use sozu_command::config::Config;
 use std::panic;
 use structopt::StructOpt;
@@ -42,97 +43,62 @@ use crate::command::Worker;
 use crate::worker::{get_executable_path, start_workers};
 use sozu::metrics::METRICS;
 
-#[derive(Debug)]
-pub enum StartupError {
-    ConfigurationFileNotSpecified,
-    ConfigurationFileLoadError(std::io::Error),
-    #[allow(dead_code)]
-    TooManyAllowedConnections(String),
-    #[allow(dead_code)]
-    TooManyAllowedConnectionsForWorker(String),
-    WorkersSpawnFail(anyhow::Error),
-    PIDFileNotWritable(String),
-}
-
 fn main() -> anyhow::Result<()> {
     register_panic_hook();
 
     let matches = cli::Sozu::from_args();
 
-    if let cli::SubCmd::Start = matches.cmd {
-        match start(&matches) {
-            Ok(_) => {
-                info!("main process stopped");
-                Ok(())
-            } // Ok() is only called when the proxy exits
-            Err(StartupError::ConfigurationFileNotSpecified) => {
-                error!("Configuration file hasn't been specified. Either use -c with the start command \
-               or use the SOZU_CONFIG environment variable when building sozu.");
-                std::process::exit(1);
-            }
-            Err(StartupError::ConfigurationFileLoadError(err)) => {
-                error!("Invalid configuration file. Error: {:?}", err);
-                std::process::exit(1);
-            }
-            Err(StartupError::TooManyAllowedConnections(err))
-            | Err(StartupError::TooManyAllowedConnectionsForWorker(err)) => {
-                error!("{}", err);
-                std::process::exit(1);
-            }
-            Err(StartupError::WorkersSpawnFail(err)) => {
-                error!("At least one worker failed to spawn. Error: {:?}", err);
-                std::process::exit(1);
-            }
-            Err(StartupError::PIDFileNotWritable(err)) => {
-                error!("{}", err);
-                std::process::exit(1);
-            }
+    match matches.cmd {
+        cli::SubCmd::Start => {
+            start(&matches)?;
+            info!("main process stopped");
+            Ok(())
         }
-    } else if let cli::SubCmd::Worker {
-        fd,
-        scm,
-        configuration_state_fd,
-        id,
-        command_buffer_size,
-        max_command_buffer_size,
-    } = matches.cmd
-    {
-        let max_command_buffer_size = max_command_buffer_size.unwrap_or(command_buffer_size * 2);
-        worker::begin_worker_process(
+        cli::SubCmd::Worker {
             fd,
             scm,
             configuration_state_fd,
             id,
             command_buffer_size,
             max_command_buffer_size,
-        )
-    } else if let cli::SubCmd::Main {
-        fd,
-        upgrade_fd,
-        command_buffer_size,
-        max_command_buffer_size,
-    } = matches.cmd
-    {
-        let max_command_buffer_size = max_command_buffer_size.unwrap_or(command_buffer_size * 2);
-        upgrade::begin_new_main_process(
+        } => {
+            let max_command_buffer_size =
+                max_command_buffer_size.unwrap_or(command_buffer_size * 2);
+            worker::begin_worker_process(
+                fd,
+                scm,
+                configuration_state_fd,
+                id,
+                command_buffer_size,
+                max_command_buffer_size,
+            )
+        }
+        cli::SubCmd::Main {
             fd,
             upgrade_fd,
             command_buffer_size,
             max_command_buffer_size,
-        )
-    } else {
-        ctl::ctl(matches)
+        } => {
+            let max_command_buffer_size =
+                max_command_buffer_size.unwrap_or(command_buffer_size * 2);
+            upgrade::begin_new_main_process(
+                fd,
+                upgrade_fd,
+                command_buffer_size,
+                max_command_buffer_size,
+            )
+        }
+        _ => ctl::ctl(matches),
     }
 }
 
-fn start(matches: &cli::Sozu) -> Result<(), StartupError> {
+fn start(matches: &cli::Sozu) -> Result<(), anyhow::Error> {
     let config = load_configuration(get_config_file_path(&matches)?)?;
 
     util::setup_logging(&config);
     info!("Starting up");
     util::setup_metrics(&config);
-    util::write_pid_file(&config)
-        .or_else(|e| Err(StartupError::PIDFileNotWritable(e.to_string())))?;
+    util::write_pid_file(&config).with_context(|| "PID file is not writeable")?;
 
     update_process_limits(&config)?;
 
@@ -144,37 +110,29 @@ fn start(matches: &cli::Sozu) -> Result<(), StartupError> {
 
     let command_socket_path = config.command_socket_path();
 
-    // this could be transformed into a new StartupError that contains std::io::Error
-    if let Err(e) = command::start(config, command_socket_path, workers) {
-        error!("could not start worker: {:?}", e);
-    }
+    command::start(config, command_socket_path, workers)
+        .with_context(|| "could not start Sozu")?;
 
     Ok(())
 }
 
-fn init_workers(config: &Config) -> Result<Vec<Worker>, StartupError> {
-    let path = unsafe { get_executable_path().unwrap() };
-    match start_workers(path, &config) {
-        Ok(workers) => {
-            info!("created workers: {:?}", workers);
-            Ok(workers)
-        }
-        Err(e) => Err(StartupError::WorkersSpawnFail(e)),
-    }
+fn init_workers(config: &Config) -> Result<Vec<Worker>, anyhow::Error> {
+    let path = unsafe { get_executable_path().with_context(|| "Could not get executable path")? };
+    start_workers(path, &config).with_context(|| "Failed at spawning workers")
 }
 
-fn get_config_file_path(matches: &cli::Sozu) -> Result<&str, StartupError> {
+fn get_config_file_path(matches: &cli::Sozu) -> Result<&str, anyhow::Error> {
     match matches.config.as_ref() {
         Some(config_file) => Ok(config_file.as_str()),
-        None => option_env!("SOZU_CONFIG").ok_or(StartupError::ConfigurationFileNotSpecified),
+        None => option_env!("SOZU_CONFIG").ok_or(anyhow::Error::msg(
+            "Configuration file hasn't been specified. Either use -c with the start command \
+            or use the SOZU_CONFIG environment variable when building sozu.",
+        )),
     }
 }
 
-fn load_configuration(config_file: &str) -> Result<Config, StartupError> {
-    match Config::load_from_path(config_file) {
-        Ok(config) => Ok(config),
-        Err(e) => Err(StartupError::ConfigurationFileLoadError(e)),
-    }
+fn load_configuration(config_file: &str) -> Result<Config, anyhow::Error> {
+    Config::load_from_path(config_file).with_context(|| "Invalid configuration file.")
 }
 
 /// Set workers process affinity, see man sched_setaffinity
@@ -235,25 +193,25 @@ fn set_process_affinity(pid: pid_t, cpu: usize) {
 #[cfg(target_os = "linux")]
 // We check the hard_limit. The soft_limit can be changed at runtime
 // by the process or any user. hard_limit can only be changed by root
-fn update_process_limits(config: &Config) -> Result<(), StartupError> {
+fn update_process_limits(config: &Config) -> Result<(), anyhow::Error> {
     let wanted_opened_files = (config.max_connections as u64) * 2;
 
     // Ensure we don't exceed the system maximum capacity
     let f = sozu_command::config::Config::load_file("/proc/sys/fs/file-max")
-        .expect("Couldn't read /proc/sys/fs/file-max");
-    let re_max = Regex::new(r"(\d*)").unwrap();
+        .with_context(|| "Couldn't read /proc/sys/fs/file-max")?;
+    let re_max = Regex::new(r"(\d*)")?;
     let system_max_fd = re_max
         .captures(&f)
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse::<usize>().ok())
         .expect("Couldn't parse /proc/sys/fs/file-max");
     if config.max_connections > system_max_fd {
-        let error = format!(
+        error!(
             "Proxies total max_connections can't be higher than system's file-max limit. \
             Current limit: {}, current value: {}",
             system_max_fd, config.max_connections
         );
-        return Err(StartupError::TooManyAllowedConnections(error));
+        bail!("Too many allowed connections");
     }
 
     // Get the soft and hard limits for the current process
@@ -265,14 +223,14 @@ fn update_process_limits(config: &Config) -> Result<(), StartupError> {
 
     // Ensure we don't exceed the hard limit
     if limits.rlim_max < wanted_opened_files {
-        let error = format!(
+        error!(
             "at least one worker can't have that many connections. \
               current max file descriptor hard limit is: {}, \
               configured max_connections is {} (the worker needs two file descriptors \
               per client connection)",
             limits.rlim_max, config.max_connections
         );
-        return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
+        bail!("Too many allowed connection for a worker");
     }
 
     if limits.rlim_cur < wanted_opened_files && limits.rlim_cur != limits.rlim_max {
@@ -288,14 +246,14 @@ fn update_process_limits(config: &Config) -> Result<(), StartupError> {
 
     // Ensure we don't exceed the new soft limit
     if limits.rlim_cur < wanted_opened_files {
-        let error = format!(
+        error!(
             "at least one worker can't have that many connections. \
               current max file descriptor soft limit is: {}, \
               configured max_connections is {} (the worker needs two file descriptors \
               per client connection)",
             limits.rlim_cur, config.max_connections
         );
-        return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
+        bail!("Too many allowed connection for a worker");
     }
 
     Ok(())
