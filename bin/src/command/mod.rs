@@ -653,22 +653,23 @@ impl CommandServer {
                                 Ok(()) => {}
                                 Err(e) => error!("Could not restart worker {}: {}", id, e),
                             }
-                            
+
                             // is this wise?
                             return;
                         }
 
                         info!("Closing the worker {}.", w.id);
-                        if !w.the_pid_is_alive() {
+
+                        if w.the_pid_is_alive() {
+                            info!("Worker {} is not dead but should be. Let's kill it.", w.id);
+
+                            match kill(Pid::from_raw(w.pid), Signal::SIGKILL) {
+                                Ok(()) => info!("Successfully killed the worker process {}", w.id),
+                                Err(e) => error!("failed to kill the worker process: {}", e),
+                            }
+                        } else {
                             info!("Worker {} is dead, setting to Stopped.", w.id);
-                            w.run_state = RunState::Stopped;
                         }
-
-                        info!("Worker {} is not dead but should be. Let's kill it.", w.id);
-
-                        // unused Result - but why ? where ?
-                        kill(Pid::from_raw(w.pid), Signal::SIGKILL)
-                            .map_err(|e| error!("failed to kill the worker process: {}", e));
                         w.run_state = RunState::Stopped;
                     }
                 }
