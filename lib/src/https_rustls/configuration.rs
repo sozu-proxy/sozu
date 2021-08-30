@@ -59,7 +59,7 @@ pub struct Listener {
     address: SocketAddr,
     fronts: Router,
     answers: Rc<RefCell<HttpAnswers>>,
-    config: HttpsListener,
+    pub config: HttpsListener,
     ssl_config: Arc<ServerConfig>,
     resolver: Arc<CertificateResolverWrapper>,
     pub token: Token,
@@ -242,9 +242,9 @@ impl Listener {
 }
 
 pub struct Proxy {
-    listeners: HashMap<Token, Listener>,
-    clusters: HashMap<ClusterId, Cluster>,
-    backends: Rc<RefCell<BackendMap>>,
+    pub listeners: HashMap<Token, Listener>,
+    pub clusters: HashMap<ClusterId, Cluster>,
+    pub backends: Rc<RefCell<BackendMap>>,
     pool: Rc<RefCell<Pool>>,
     pub registry: Registry,
     pub sessions: Rc<RefCell<SessionManager>>,
