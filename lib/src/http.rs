@@ -31,7 +31,7 @@ use super::server::{
 };
 use super::socket::server_bind;
 use super::{
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, CloseResult, ClusterId,
+    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
     ConnectionError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
     SessionResult,
 };
@@ -746,61 +746,6 @@ impl Session {
         SessionResult::Continue
     }
 
-    fn close_inner(&mut self) {
-        self.metrics.service_stop();
-        self.cancel_timeouts();
-        if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
-            if e.kind() != ErrorKind::NotConnected {
-                error!(
-                    "error shutting down front socket({:?}): {:?}",
-                    self.front_socket(),
-                    e
-                );
-            }
-        }
-
-        //FIXME: should we really pass a token here?
-        self.close_backend_inner(Token(0));
-
-        if let Some(State::Http(ref mut http)) = self.protocol {
-            //if the state was initial, the connection was already reset
-            if http.request != Some(RequestState::Initial) {
-                gauge_add!("http.active_requests", -1);
-
-                if let Some(b) = http.backend_data.as_mut() {
-                    let mut backend = b.borrow_mut();
-                    backend.active_requests = backend.active_requests.saturating_sub(1);
-                }
-            }
-        }
-
-        if let Some(State::WebSocket(_)) = self.protocol {
-            if let Some(b) = self.backend.as_mut() {
-                let mut backend = b.borrow_mut();
-                backend.active_requests = backend.active_requests.saturating_sub(1);
-            }
-        }
-
-        match self.protocol {
-            Some(State::Expect(_)) => gauge_add!("protocol.proxy.expect", -1),
-            Some(State::Http(_)) => gauge_add!("protocol.http", -1),
-            Some(State::WebSocket(_)) => gauge_add!("protocol.ws", -1),
-            None => {}
-        }
-
-        let fd = self.front_socket().as_raw_fd();
-        let proxy = self.proxy.borrow_mut();
-        if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-            error!("1error deregistering socket({:?}): {:?}", fd, e);
-        }
-
-        proxy
-            .sessions
-            .borrow_mut()
-            .slab
-            .try_remove(self.frontend_token.0);
-    }
-
     //FIXME: check the token passed as argument
     fn close_backend_inner(&mut self, _: Token) {
         if let Some(token) = self.back_token() {
@@ -1190,7 +1135,7 @@ impl Session {
 }
 
 impl ProxySession for Session {
-    fn close(&mut self, registry: &Registry) -> CloseResult {
+    fn close(&mut self) {
         self.metrics.service_stop();
         self.cancel_timeouts();
         if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
@@ -1203,22 +1148,8 @@ impl ProxySession for Session {
             }
         }
 
-        if let Err(e) = registry.deregister(self.front_socket_mut()) {
-            error!(
-                "3error deregistering front socket({:?}): {:?}",
-                self.front_socket(),
-                e
-            );
-        }
-
-        let mut result = CloseResult::default();
-
-        if let Some(tk) = self.back_token() {
-            result.tokens.push(tk)
-        }
-
         //FIXME: should we really pass a token here?
-        self.close_backend(Token(0), registry);
+        self.close_backend_inner(Token(0));
 
         if let Some(State::Http(ref mut http)) = self.protocol {
             //if the state was initial, the connection was already reset
@@ -1246,9 +1177,17 @@ impl ProxySession for Session {
             None => {}
         }
 
-        result.tokens.push(self.frontend_token);
+        let fd = self.front_socket().as_raw_fd();
+        let proxy = self.proxy.borrow_mut();
+        if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
+            error!("1error deregistering socket({:?}): {:?}", fd, e);
+        }
 
-        result
+        proxy
+            .sessions
+            .borrow_mut()
+            .slab
+            .try_remove(self.frontend_token.0);
     }
 
     fn timeout(&mut self, token: Token) -> SessionResult {
@@ -1326,7 +1265,7 @@ impl ProxySession for Session {
         let res = self.ready_inner();
 
         if res == SessionResult::CloseSession {
-            let mut v = self.close_inner();
+            self.close();
         } else if let SessionResult::CloseBackend(_opt_back_token) = res {
             //FIXME: should we really pass a token here?
             self.close_backend_inner(Token(0));
@@ -1507,12 +1446,6 @@ impl Proxy {
         for l in self.listeners.values_mut() {
             l.answers.borrow_mut().remove_custom_answer(cluster_id);
         }
-    }
-
-    pub fn close_session(&mut self, token: Token) {
-        self.sessions
-            .borrow_mut()
-            .close_session(SessionManager::to_session(token), &self.registry)
     }
 }
 

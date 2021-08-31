@@ -330,12 +330,6 @@ impl Proxy {
             l.answers.borrow_mut().remove_custom_answer(cluster_id);
         }
     }
-
-    pub fn close_session(&mut self, token: Token) {
-        self.sessions
-            .borrow_mut()
-            .close_session(SessionManager::to_session(token), &self.registry)
-    }
 }
 
 impl ProxyConfiguration<Session> for Proxy {
