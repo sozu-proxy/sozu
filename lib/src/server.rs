@@ -718,28 +718,21 @@ impl Server {
             });
 
             if self.shutting_down.is_some() {
-                let mut closing_tokens = HashSet::new();
+                let sessions_count = self.sessions.borrow().slab.len();
                 for session in self.sessions.borrow_mut().slab.iter_mut() {
-                    let res = session.1.borrow_mut().shutting_down();
-                    if let SessionResult::CloseSession = res {
-                        let t = session.1.borrow().tokens();
-                        closing_tokens.insert(t[0]);
-                    }
+                    session.1.borrow_mut().shutting_down();
                 }
 
-                for tk in closing_tokens.iter() {
-                    let cl = self.to_session(*tk);
-                    self.sessions.borrow_mut().close_session(cl);
-                }
+                let new_sessions_count = self.sessions.borrow().slab.len();
 
-                if !closing_tokens.is_empty() {
+                if new_sessions_count < sessions_count {
                     let now = Instant::now();
                     if let Some(last) = last_shutting_down_message {
                         if (now - last) > Duration::seconds(5) {
                             info!(
                                 "closed {} sessions, {} sessions left, base_sessions_count = {}",
-                                closing_tokens.len(),
-                                self.sessions.borrow().slab.len(),
+                                sessions_count - new_sessions_count,
+                                new_sessions_count,
                                 self.base_sessions_count
                             );
                             last_shutting_down_message = Some(now);
@@ -749,8 +742,7 @@ impl Server {
                     }
                 }
 
-                let count = self.sessions.borrow().slab.len();
-                if count <= self.base_sessions_count {
+                if new_sessions_count <= self.base_sessions_count {
                     info!("last session stopped, shutting down!");
                     self.channel.run();
                     self.channel.set_blocking(true);
@@ -763,13 +755,13 @@ impl Server {
                         data: None,
                     });
                     return;
-                } else if count < last_sessions_len {
+                } else if new_sessions_count < last_sessions_len {
                     info!(
                         "shutting down, {} slab elements remaining (base: {})",
-                        count - self.base_sessions_count,
+                        new_sessions_count - self.base_sessions_count,
                         self.base_sessions_count
                     );
-                    last_sessions_len = count;
+                    last_sessions_len = new_sessions_count;
                 }
             }
         }
@@ -1661,37 +1653,9 @@ impl Server {
                 .borrow_mut()
                 .process_events(token, events);
 
-            loop {
-                //self.session_ready(poll, session_token, events);
-                if !self.sessions.borrow().slab.contains(session_token) {
-                    break;
-                }
-
-                let session = self.sessions.borrow_mut().slab[session_token].clone();
-                let session2 = session.clone();
-                let order = session.borrow_mut().ready(session2);
-                trace!(
-                    "session[{:?} -> {:?}] got events {:?} and returned order {:?}",
-                    session_token,
-                    self.from_session(SessionToken(session_token)),
-                    events,
-                    order
-                );
-                //FIXME: the CloseBackend message might not mean we have nothing else to do
-                //with that session
-                let is_connect = match order {
-                    SessionResult::ConnectBackend | SessionResult::ReconnectBackend(_, _) => true,
-                    _ => false,
-                };
-
-                // if we had to connect to a backend server, go back to the loop
-                // I'm not sure we would have anything to do right away, though,
-                // so maybe we can just stop there for that session?
-                // also the events would change?
-                if !is_connect {
-                    break;
-                }
-            }
+            let session = self.sessions.borrow_mut().slab[session_token].clone();
+            let session2 = session.clone();
+            session.borrow_mut().ready(session2);
         }
     }
 
@@ -1750,13 +1714,9 @@ impl ProxySession for ListenSession {
         self.protocol
     }
 
-    fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
-        SessionResult::Continue
-    }
+    fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) {}
 
-    fn shutting_down(&mut self) -> SessionResult {
-        SessionResult::Continue
-    }
+    fn shutting_down(&mut self) {}
 
     fn process_events(&mut self, _token: Token, _events: Ready) {}
 
