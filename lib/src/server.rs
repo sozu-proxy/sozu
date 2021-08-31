@@ -1618,21 +1618,10 @@ impl Server {
         gauge!("accept_queue.count", self.accept_queue.len());
     }
 
-    fn interpret_session_order(&mut self, token: SessionToken, order: SessionResult) {
-        //trace!("INTERPRET ORDER: {:?}", order);
-        match order {
-            SessionResult::CloseSession => {}
-            SessionResult::CloseBackend(_opt) => {}
-            SessionResult::ReconnectBackend(_main_token, _backend_token) => {}
-            SessionResult::ConnectBackend => {}
-            SessionResult::Continue => {}
-        }
-    }
-
     pub fn ready(&mut self, token: Token, events: Ready) {
         trace!("PROXY\t{:?} got events: {:?}", token, events);
 
-        let mut session_token = token.0;
+        let session_token = token.0;
         if self.sessions.borrow().slab.contains(session_token) {
             //info!("sessions contains {:?}", session_token);
             let protocol = self.sessions.borrow().slab[session_token]
@@ -1694,15 +1683,6 @@ impl Server {
                     SessionResult::ConnectBackend | SessionResult::ReconnectBackend(_, _) => true,
                     _ => false,
                 };
-
-                // if we got ReconnectBackend, that means the current session_token
-                // corresponds to an entry that will be removed in interpret_session_order
-                // so we ask for the "main" token, ie the one for the front socket
-                if let SessionResult::ReconnectBackend(Some(t), _) = order {
-                    session_token = self.to_session(t).0;
-                }
-
-                self.interpret_session_order(SessionToken(session_token), order);
 
                 // if we had to connect to a backend server, go back to the loop
                 // I'm not sure we would have anything to do right away, though,
@@ -1770,7 +1750,7 @@ impl ProxySession for ListenSession {
         self.protocol
     }
 
-    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
+    fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
         SessionResult::Continue
     }
 
@@ -1891,7 +1871,7 @@ impl HttpsProvider {
         frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
-        proxy: Rc<RefCell<Self>>,
+        _proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
         match self {
             &mut HttpsProvider::Rustls(ref mut rustls) => {
