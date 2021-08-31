@@ -824,13 +824,6 @@ impl Session {
 
         let mut result = Vec::new();
 
-        if let (Some(tk), Some(fd)) = (
-            self.back_token(),
-            self.back_socket_mut().map(|s| s.as_raw_fd()),
-        ) {
-            result.push((tk, fd));
-        }
-
         //FIXME: should we really pass a token here?
         self.close_backend_inner(Token(0));
 
@@ -866,35 +859,46 @@ impl Session {
     }
 
     fn close_backend_inner(&mut self, _: Token) {
-        self.remove_backend();
+        if let Some(token) = self.back_token() {
+            if let Some(fd) = self.back_socket_mut().map(|s| s.as_raw_fd()) {
+                let proxy = self.proxy.borrow_mut();
+                if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
+                    error!("1error deregistering socket({:?}): {:?}", fd, e);
+                }
 
-        let back_connected = self.back_connected();
-        if back_connected != BackendConnectionStatus::NotConnected {
-            self.back_readiness().map(|r| r.event = Ready::empty());
-            if let Some(sock) = self.back_socket_mut() {
-                if let Err(e) = sock.shutdown(Shutdown::Both) {
-                    if e.kind() != ErrorKind::NotConnected {
-                        error!("error shutting down backend socket: {:?}", e);
+                proxy.sessions.borrow_mut().slab.try_remove(token.0);
+            }
+
+            self.remove_backend();
+
+            let back_connected = self.back_connected();
+            if back_connected != BackendConnectionStatus::NotConnected {
+                self.back_readiness().map(|r| r.event = Ready::empty());
+                if let Some(sock) = self.back_socket_mut() {
+                    if let Err(e) = sock.shutdown(Shutdown::Both) {
+                        if e.kind() != ErrorKind::NotConnected {
+                            error!("error shutting down backend socket: {:?}", e);
+                        }
                     }
                 }
             }
-        }
 
-        if back_connected == BackendConnectionStatus::Connected {
-            gauge_add!("backend.connections", -1);
-            gauge_add!(
-                "connections_per_backend",
-                -1,
-                self.cluster_id.as_ref().map(|s| s.as_str()),
-                self.metrics.backend_id.as_ref().map(|s| s.as_str())
-            );
-        }
+            if back_connected == BackendConnectionStatus::Connected {
+                gauge_add!("backend.connections", -1);
+                gauge_add!(
+                    "connections_per_backend",
+                    -1,
+                    self.cluster_id.as_ref().map(|s| s.as_str()),
+                    self.metrics.backend_id.as_ref().map(|s| s.as_str())
+                );
+            }
 
-        self.set_back_connected(BackendConnectionStatus::NotConnected);
-        self.http_mut().map(|h| {
-            h.clear_back_token();
-            h.remove_backend();
-        });
+            self.set_back_connected(BackendConnectionStatus::NotConnected);
+            self.http_mut().map(|h| {
+                h.clear_back_token();
+                h.remove_backend();
+            });
+        }
     }
 
     pub fn check_circuit_breaker(&mut self) -> Result<(), ConnectionError> {
@@ -1135,14 +1139,6 @@ impl Session {
             if has_backend && self.check_backend_connection() {
                 return Ok(BackendConnectAction::Reuse);
             } else if let Some(token) = self.back_token() {
-                if let Some(fd) = self.back_socket_mut().map(|s| s.as_raw_fd()) {
-                    let proxy = self.proxy.borrow_mut();
-                    if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                        error!("1error deregistering socket({:?}): {:?}", fd, e);
-                    }
-
-                    proxy.sessions.borrow_mut().slab.try_remove(token.0);
-                }
                 self.close_backend_inner(token);
 
                 //reset the back token here so we can remove it
@@ -1153,14 +1149,6 @@ impl Session {
 
         if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
             if let Some(token) = self.back_token() {
-                if let Some(fd) = self.back_socket_mut().map(|s| s.as_raw_fd()) {
-                    let proxy = self.proxy.borrow_mut();
-                    if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                        error!("1error deregistering socket({:?}): {:?}", fd, e);
-                    }
-
-                    proxy.sessions.borrow_mut().slab.try_remove(token.0);
-                }
                 self.close_backend_inner(token);
 
                 //reset the back token here so we can remove it
@@ -1390,18 +1378,6 @@ impl ProxySession for Session {
                 proxy.sessions.borrow_mut().slab.try_remove(token.0);
             }
         } else if let SessionResult::CloseBackend(_opt_back_token) = res {
-            if let (Some(token), Some(fd)) = (
-                self.back_token(),
-                self.back_socket_mut().map(|s| s.as_raw_fd()),
-            ) {
-                let proxy = self.proxy.borrow_mut();
-                if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                    error!("error deregistering socket({:?}): {:?}", fd, e);
-                }
-
-                proxy.sessions.borrow_mut().slab.try_remove(token.0);
-            }
-
             //FIXME: should we really pass a token here?
             self.close_backend_inner(Token(0));
         } else if res == SessionResult::ConnectBackend {
@@ -1420,18 +1396,6 @@ impl ProxySession for Session {
             self.metrics().service_stop();
             return SessionResult::Continue;
         } else if let SessionResult::ReconnectBackend(_, opt_back_token) = res {
-            if let (Some(token), Some(fd)) = (
-                opt_back_token,
-                self.back_socket_mut().map(|s| s.as_raw_fd()),
-            ) {
-                let proxy = self.proxy.borrow_mut();
-                if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                    error!("error deregistering socket({:?}): {:?}", fd, e);
-                }
-
-                proxy.sessions.borrow_mut().slab.try_remove(token.0);
-            }
-
             //FIXME: should we really pass a token here?
             self.close_backend_inner(Token(0));
 
