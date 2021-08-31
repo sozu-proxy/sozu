@@ -47,13 +47,10 @@ fn main() -> anyhow::Result<()> {
     register_panic_hook();
 
     let matches = cli::Sozu::from_args();
-    let config = load_configuration(get_config_file_path(&matches)?)?;
-
-    util::setup_logging(&config);
 
     match matches.cmd {
         cli::SubCmd::Start => {
-            start(config)?;
+            start(&matches)?;
             info!("main process stopped");
             Ok(())
         }
@@ -91,11 +88,15 @@ fn main() -> anyhow::Result<()> {
                 max_command_buffer_size,
             )
         }
-        _ => ctl::ctl(config, matches.cmd, matches.timeout),
+        _ => ctl::ctl(matches),
     }
 }
 
-fn start(config: Config) -> Result<(), anyhow::Error> {
+fn start(matches: &cli::Sozu) -> Result<(), anyhow::Error> {
+    let config_file_path = get_config_file_path(matches)?;
+    let config = load_configuration(config_file_path)?;
+
+    util::setup_logging(&config);
     info!("Starting up");
     util::setup_metrics(&config);
     util::write_pid_file(&config).with_context(|| "PID file is not writeable")?;
@@ -120,7 +121,7 @@ fn init_workers(config: &Config) -> Result<Vec<Worker>, anyhow::Error> {
     start_workers(path, &config).with_context(|| "Failed at spawning workers")
 }
 
-fn get_config_file_path(matches: &cli::Sozu) -> Result<&str, anyhow::Error> {
+pub fn get_config_file_path(matches: &cli::Sozu) -> Result<&str, anyhow::Error> {
     match matches.config.as_ref() {
         Some(config_file) => Ok(config_file.as_str()),
         None => option_env!("SOZU_CONFIG").ok_or(anyhow::Error::msg(
@@ -130,7 +131,7 @@ fn get_config_file_path(matches: &cli::Sozu) -> Result<&str, anyhow::Error> {
     }
 }
 
-fn load_configuration(config_file: &str) -> Result<Config, anyhow::Error> {
+pub fn load_configuration(config_file: &str) -> Result<Config, anyhow::Error> {
     Config::load_from_path(config_file).with_context(|| "Invalid configuration file.")
 }
 

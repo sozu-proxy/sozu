@@ -1,11 +1,13 @@
 mod command;
 
-use std::io;
-
+use crate::cli;
+use crate::util;
+use crate::{get_config_file_path, load_configuration};
 use sozu_command::channel::Channel;
 use sozu_command::command::{CommandRequest, CommandResponse};
 use sozu_command::config::Config;
 use sozu_command::proxy::ListenerType;
+use std::io;
 
 use self::command::{
     activate_listener, add_application, add_backend, add_certificate, add_http_frontend,
@@ -17,20 +19,25 @@ use self::command::{
 };
 use crate::cli::*;
 
-pub fn ctl(config: Config, cmd: SubCmd, timeout: Option<u64>) -> Result<(), anyhow::Error> {
+pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
+    let config_file_path = get_config_file_path(&matches)?;
+    let config = load_configuration(config_file_path)?;
+
+    util::setup_logging(&config);
+
     // If the command is `config check` then exit because if we are here, the configuration is valid
     if let SubCmd::Config {
         cmd: ConfigCmd::Check {},
-    } = cmd
+    } = matches.cmd
     {
         println!("Configuration file is valid");
         std::process::exit(0);
     }
 
     let channel = create_channel(&config).expect("could not connect to the command unix socket");
-    let timeout: u64 = timeout.unwrap_or(config.ctl_command_timeout);
+    let timeout: u64 = matches.timeout.unwrap_or(config.ctl_command_timeout);
 
-    match cmd {
+    match matches.cmd {
         SubCmd::Shutdown { hard, worker } => {
             if hard {
                 hard_stop(channel, worker, timeout)
