@@ -760,7 +760,7 @@ impl Session {
         SessionResult::Continue
     }
 
-    fn close_backend_inner(&mut self, _: Token) {
+    fn close_backend(&mut self, _: Token) {
         if let (Some(token), Some(fd)) = (
             self.back_token(),
             self.back_socket_mut().map(|s| s.as_raw_fd()),
@@ -902,7 +902,7 @@ impl ProxySession for Session {
         }
 
         //FIXME: should we really pass a token here?
-        self.close_backend_inner(Token(0));
+        self.close_backend(Token(0));
 
         match self.protocol {
             Some(State::Pipe(_)) => gauge_add!("protocol.tcp", -1),
@@ -937,37 +937,6 @@ impl ProxySession for Session {
         }
     }
 
-    fn close_backend(&mut self, _: Token, registry: &Registry) {
-        self.remove_backend();
-
-        let back_connected = self.back_connected();
-        if back_connected != BackendConnectionStatus::NotConnected {
-            self.back_readiness().map(|r| r.event = Ready::empty());
-            if let Some(sock) = self.back_socket_mut() {
-                if let Err(e) = sock.shutdown(Shutdown::Both) {
-                    if e.kind() != ErrorKind::NotConnected {
-                        error!("error closing back socket({:?}): {:?}", sock, e);
-                    }
-                }
-                if let Err(e) = registry.deregister(sock) {
-                    error!("error deregistering back socket({:?}): {:?}", sock, e);
-                }
-            }
-        }
-
-        if back_connected == BackendConnectionStatus::Connected {
-            gauge_add!("backend.connections", -1);
-            gauge_add!(
-                "connections_per_backend",
-                -1,
-                self.cluster_id.as_ref().map(|s| s.as_str()),
-                self.metrics.backend_id.as_ref().map(|s| s.as_str())
-            );
-        }
-
-        self.set_back_connected(BackendConnectionStatus::NotConnected);
-    }
-
     fn protocol(&self) -> Protocol {
         Protocol::TCP
     }
@@ -996,7 +965,7 @@ impl ProxySession for Session {
             self.close();
         } else if let SessionResult::CloseBackend(_opt_back_token) = res {
             //FIXME: should we really pass a token here?
-            self.close_backend_inner(Token(0));
+            self.close_backend(Token(0));
         } else if res == SessionResult::ConnectBackend {
             let res = self.connect_to_backend(session);
             info!("TCP::READY): connect_to_backend returned {:?}\n\n", res);
@@ -1011,7 +980,7 @@ impl ProxySession for Session {
             return SessionResult::Continue;
         } else if let SessionResult::ReconnectBackend(_, opt_back_token) = res {
             //FIXME: should we really pass a token here?
-            self.close_backend_inner(Token(0));
+            self.close_backend(Token(0));
 
             let res = self.connect_to_backend(session);
             info!("TCP::READY): (re)connect_to_backend returned {:?}\n\n", res);

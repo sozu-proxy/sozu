@@ -1783,8 +1783,6 @@ impl ProxySession for ListenSession {
 
     fn close(&mut self) {}
 
-    fn close_backend(&mut self, _token: Token, _registry: &Registry) {}
-
     fn timeout(&mut self, _token: Token) -> SessionResult {
         error!(
             "called ProxySession::timeout(token={:?}, time) on ListenSession {{ protocol: {:?} }}",
