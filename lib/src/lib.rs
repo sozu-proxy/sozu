@@ -209,7 +209,7 @@ pub mod https_openssl;
 pub mod https_rustls;
 
 use mio::net::TcpStream;
-use mio::{Registry, Token};
+use mio::Token;
 use std::cell::RefCell;
 use std::fmt;
 use std::net::SocketAddr;
@@ -393,8 +393,8 @@ impl RequiredEvents {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SessionResult {
     CloseSession,
-    CloseBackend(Option<Token>),
-    ReconnectBackend(Option<Token>, Option<Token>),
+    CloseBackend,
+    ReconnectBackend,
     Continue,
     ConnectBackend,
 }

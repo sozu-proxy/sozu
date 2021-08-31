@@ -489,7 +489,7 @@ impl<Front: SocketHandler> Http<Front> {
                     // we're not expecting any more data from the backend
                     self.back_readiness.interest = Ready::empty();
                 }
-                SessionResult::CloseBackend(self.backend_token.clone())
+                SessionResult::CloseBackend
             }
         }
     }
@@ -1256,7 +1256,7 @@ impl<Front: SocketHandler> Http<Front> {
                     self.front_readiness.interest =
                         Ready::readable() | Ready::hup() | Ready::error();
                     self.back_readiness.interest = Ready::hup() | Ready::error();
-                    SessionResult::CloseBackend(self.backend_token.take())
+                    SessionResult::CloseBackend
                 } else {
                     debug!("{} no keep alive", self.log_context());
                     self.front_readiness.reset();

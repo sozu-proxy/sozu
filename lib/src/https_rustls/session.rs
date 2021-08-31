@@ -9,7 +9,7 @@ use rusty_ulid::Ulid;
 use std::cell::RefCell;
 use std::io::{ErrorKind, Read};
 use std::net::{Shutdown, SocketAddr};
-use std::os::unix::prelude::{AsRawFd, RawFd};
+use std::os::unix::prelude::AsRawFd;
 use std::rc::{Rc, Weak};
 use std::str::from_utf8_unchecked;
 use time::{Duration, Instant};
@@ -663,9 +663,8 @@ impl Session {
                 self.connection_attempt += 1;
                 self.fail_backend_connection();
 
-                let backend_token = self.back_token();
                 self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
-                return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
+                return SessionResult::ReconnectBackend;
             } else {
                 self.metrics().backend_connected();
                 self.reset_connection_attempt();
@@ -750,7 +749,7 @@ impl Session {
             if back_interest.is_hup() {
                 let order = self.back_hup();
                 match order {
-                    SessionResult::CloseSession | SessionResult::CloseBackend(_) => {
+                    SessionResult::CloseSession | SessionResult::CloseBackend => {
                         return order;
                     }
                     SessionResult::Continue => {}
@@ -811,7 +810,7 @@ impl Session {
         SessionResult::Continue
     }
 
-    fn close_backend(&mut self, _: Token) {
+    fn close_backend(&mut self) {
         if let Some(token) = self.back_token() {
             if let Some(fd) = self.back_socket_mut().map(|s| s.as_raw_fd()) {
                 let proxy = self.proxy.borrow_mut();
@@ -1092,7 +1091,7 @@ impl Session {
             if has_backend && self.check_backend_connection() {
                 return Ok(BackendConnectAction::Reuse);
             } else if let Some(token) = self.back_token() {
-                self.close_backend(token);
+                self.close_backend();
 
                 //reset the back token here so we can remove it
                 //from the slab after backend_from* fails
@@ -1102,7 +1101,7 @@ impl Session {
 
         if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
             if let Some(token) = self.back_token() {
-                self.close_backend(token);
+                self.close_backend();
 
                 //reset the back token here so we can remove it
                 //from the slab after backend_from* fails
@@ -1201,8 +1200,7 @@ impl ProxySession for Session {
             }
         }
 
-        //FIXME: should we really pass a token here?
-        self.close_backend(Token(0));
+        self.close_backend();
 
         if let Some(State::Http(ref mut http)) = self.protocol {
             //if the state was initial, the connection was already reset
@@ -1281,15 +1279,10 @@ impl ProxySession for Session {
         let res = self.ready_inner();
         if res == SessionResult::CloseSession {
             self.close();
-        } else if let SessionResult::CloseBackend(_opt_back_token) = res {
-            //FIXME: should we really pass a token here?
-            self.close_backend(Token(0));
+        } else if let SessionResult::CloseBackend = res {
+            self.close_backend();
         } else if res == SessionResult::ConnectBackend {
             let res = self.connect_to_backend(session);
-            info!(
-                "HTTPS_RUSTLS::READY): connect_to_backend returned {:?}\n\n",
-                res
-            );
 
             //FIXME: we might need to loop here betwen ready and connet_to_backend because a call to ready() might go through connect_to_backend again or it could return CloseBackend and other results. Ideally, connect_to_backend should be called from ready_inner instead
             if res == Ok(BackendConnectAction::Reuse) || res.is_err() {
@@ -1297,12 +1290,11 @@ impl ProxySession for Session {
                 self.metrics().service_stop();
             }
             self.metrics().service_stop();
-        } else if let SessionResult::ReconnectBackend(_, opt_back_token) = res {
+        } else if let SessionResult::ReconnectBackend = res {
             //FIXME: should we really pass a token here?
-            self.close_backend(Token(0));
+            self.close_backend();
 
             let res = self.connect_to_backend(session);
-            info!("TCP::READY): (re)connect_to_backend returned {:?}\n\n", res);
 
             //FIXME: we might need to loop here betwen ready and connet_to_backend because a call to ready() might go through connect_to_backend again or it could return CloseBackend and other results. Ideally, connect_to_backend should be called from ready_inner instead
             if res == Ok(BackendConnectAction::Reuse) || res.is_err() {

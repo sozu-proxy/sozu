@@ -10,7 +10,7 @@ use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
 use std::str::from_utf8_unchecked;
 use std::sync::Arc;
-use time::{Duration, Instant};
+use time::Duration;
 
 use crate::sozu_command::logging;
 use crate::sozu_command::proxy::{
@@ -19,12 +19,10 @@ use crate::sozu_command::proxy::{
     QueryAnswerCertificate, QueryCertificateType, RemoveCertificate, ReplaceCertificate, Route,
     TlsVersion,
 };
-use crate::sozu_command::ready::Ready;
 use crate::sozu_command::scm_socket::ScmSocket;
 
 use crate::backends::BackendMap;
 use crate::pool::Pool;
-use crate::protocol::http::DefaultAnswerStatus;
 use crate::protocol::http::{
     answers::HttpAnswers,
     parser::{hostname_and_port, Method},
@@ -35,10 +33,7 @@ use crate::server::{
 };
 use crate::socket::server_bind;
 use crate::util::UnwrapLog;
-use crate::{
-    AcceptError, BackendConnectAction, BackendConnectionStatus, ClusterId, ConnectionError,
-    Protocol, ProxyConfiguration, ProxySession,
-};
+use crate::{AcceptError, ClusterId, Protocol, ProxyConfiguration, ProxySession};
 
 use super::resolver::CertificateResolverWrapper;
 use super::session::Session;
