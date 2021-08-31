@@ -30,7 +30,7 @@ use crate::timer::TimeoutContainer;
 use crate::util::UnwrapLog;
 use crate::{
     Backend, BackendConnectAction, BackendConnectionStatus, CloseResult, ConnectionError, Protocol,
-    ProxySession, ProxySessionCast, Readiness, SessionMetrics, SessionResult,
+    ProxySession, Readiness, SessionMetrics, SessionResult,
 };
 
 pub enum State {
@@ -1107,7 +1107,7 @@ impl Session {
 
     fn connect_to_backend(
         &mut self,
-        session_rc: Rc<RefCell<dyn ProxySessionCast>>,
+        session_rc: Rc<RefCell<dyn ProxySession>>,
     ) -> Result<BackendConnectAction, ConnectionError> {
         let old_cluster_id = self.http().and_then(|ref http| http.cluster_id.clone());
         let old_back_token = self.back_token();
@@ -1375,7 +1375,7 @@ impl ProxySession for Session {
         }
     }
 
-    fn ready(&mut self, session: Rc<RefCell<dyn ProxySessionCast>>) -> SessionResult {
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
         self.metrics().service_start();
         let res = self.ready_inner();
         if res == SessionResult::CloseSession {
