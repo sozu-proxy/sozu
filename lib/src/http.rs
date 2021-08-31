@@ -746,7 +746,7 @@ impl Session {
         SessionResult::Continue
     }
 
-    fn close_inner(&mut self) -> Vec<(Token, RawFd)> {
+    fn close_inner(&mut self) {
         self.metrics.service_stop();
         self.cancel_timeouts();
         if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
@@ -758,8 +758,6 @@ impl Session {
                 );
             }
         }
-
-        let mut result = Vec::new();
 
         //FIXME: should we really pass a token here?
         self.close_backend_inner(Token(0));
@@ -801,8 +799,6 @@ impl Session {
             .borrow_mut()
             .slab
             .try_remove(self.frontend_token.0);
-
-        result
     }
 
     //FIXME: check the token passed as argument
