@@ -17,28 +17,20 @@ use self::command::{
 };
 use crate::cli::*;
 
-pub fn ctl(matches: Sozu) -> Result<(), anyhow::Error> {
-    let config_file = matches
-        .config
-        .or(option_env!("SOZU_CONFIG").map(|s| s.to_string()))
-        .expect("missing --config <configuration file> option");
-
-    let config =
-        Config::load_from_path(config_file.as_str()).expect("could not parse configuration file");
-
+pub fn ctl(config: Config, cmd: SubCmd, timeout: Option<u64>) -> Result<(), anyhow::Error> {
     // If the command is `config check` then exit because if we are here, the configuration is valid
     if let SubCmd::Config {
         cmd: ConfigCmd::Check {},
-    } = matches.cmd
+    } = cmd
     {
         println!("Configuration file is valid");
         std::process::exit(0);
     }
 
     let channel = create_channel(&config).expect("could not connect to the command unix socket");
-    let timeout: u64 = matches.timeout.unwrap_or(config.ctl_command_timeout);
+    let timeout: u64 = timeout.unwrap_or(config.ctl_command_timeout);
 
-    match matches.cmd {
+    match cmd {
         SubCmd::Shutdown { hard, worker } => {
             if hard {
                 hard_stop(channel, worker, timeout)
