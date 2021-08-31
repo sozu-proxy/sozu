@@ -47,10 +47,13 @@ fn main() -> anyhow::Result<()> {
     register_panic_hook();
 
     let matches = cli::Sozu::from_args();
+    let config = load_configuration(get_config_file_path(&matches)?)?;
+
+    util::setup_logging(&config);
 
     match matches.cmd {
         cli::SubCmd::Start => {
-            start(&matches)?;
+            start(config)?;
             info!("main process stopped");
             Ok(())
         }
@@ -88,14 +91,11 @@ fn main() -> anyhow::Result<()> {
                 max_command_buffer_size,
             )
         }
-        _ => ctl::ctl(matches),
+        _ => ctl::ctl(config, matches.cmd, matches.timeout),
     }
 }
 
-fn start(matches: &cli::Sozu) -> Result<(), anyhow::Error> {
-    let config = load_configuration(get_config_file_path(&matches)?)?;
-
-    util::setup_logging(&config);
+fn start(config: Config) -> Result<(), anyhow::Error> {
     info!("Starting up");
     util::setup_metrics(&config);
     util::write_pid_file(&config).with_context(|| "PID file is not writeable")?;
@@ -110,8 +110,7 @@ fn start(matches: &cli::Sozu) -> Result<(), anyhow::Error> {
 
     let command_socket_path = config.command_socket_path();
 
-    command::start(config, command_socket_path, workers)
-        .with_context(|| "could not start Sozu")?;
+    command::start(config, command_socket_path, workers).with_context(|| "could not start Sozu")?;
 
     Ok(())
 }
