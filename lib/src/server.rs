@@ -27,7 +27,7 @@ use crate::metrics::METRICS;
 use crate::pool::Pool;
 use crate::timer::Timer;
 use crate::{http, tcp};
-use crate::{AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession, SessionResult};
+use crate::{AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession};
 
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;

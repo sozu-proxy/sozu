@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{Shutdown, SocketAddr};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
 use time::{Duration, Instant};
 
@@ -605,8 +605,7 @@ impl Session {
                 self.connection_attempt += 1;
                 self.fail_backend_connection();
 
-                let backend_token = self.backend_token;
-                return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
+                return SessionResult::ReconnectBackend;
             } else if self.back_readiness().unwrap().event != Ready::empty() {
                 self.reset_connection_attempt();
                 let back_token = self.backend_token.unwrap();
@@ -760,7 +759,7 @@ impl Session {
         SessionResult::Continue
     }
 
-    fn close_backend(&mut self, _: Token) {
+    fn close_backend(&mut self) {
         if let (Some(token), Some(fd)) = (
             self.back_token(),
             self.back_socket_mut().map(|s| s.as_raw_fd()),
@@ -901,8 +900,7 @@ impl ProxySession for Session {
             }
         }
 
-        //FIXME: should we really pass a token here?
-        self.close_backend(Token(0));
+        self.close_backend();
 
         match self.protocol {
             Some(State::Pipe(_)) => gauge_add!("protocol.tcp", -1),
@@ -961,12 +959,10 @@ impl ProxySession for Session {
 
         if res == SessionResult::CloseSession {
             self.close();
-        } else if let SessionResult::CloseBackend(_opt_back_token) = res {
-            //FIXME: should we really pass a token here?
-            self.close_backend(Token(0));
+        } else if let SessionResult::CloseBackend = res {
+            self.close_backend();
         } else if res == SessionResult::ConnectBackend {
             let res = self.connect_to_backend(session);
-            info!("TCP::READY): connect_to_backend returned {:?}\n\n", res);
 
             //FIXME: we might need to loop here betwen ready and connet_to_backend because a call to ready() might go through connect_to_backend again or it could return CloseBackend and other results. Ideally, connect_to_backend should be called from ready_inner instead
             if res == Ok(BackendConnectAction::Reuse) || res.is_err() {
@@ -974,12 +970,10 @@ impl ProxySession for Session {
                 self.metrics().service_stop();
             }
             self.metrics().service_stop();
-        } else if let SessionResult::ReconnectBackend(_, opt_back_token) = res {
-            //FIXME: should we really pass a token here?
-            self.close_backend(Token(0));
+        } else if let SessionResult::ReconnectBackend = res {
+            self.close_backend();
 
             let res = self.connect_to_backend(session);
-            info!("TCP::READY): (re)connect_to_backend returned {:?}\n\n", res);
 
             //FIXME: we might need to loop here betwen ready and connet_to_backend because a call to ready() might go through connect_to_backend again or it could return CloseBackend and other results. Ideally, connect_to_backend should be called from ready_inner instead
             if res == Ok(BackendConnectAction::Reuse) || res.is_err() {

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::net::Shutdown;
 use std::net::SocketAddr;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::rc::{Rc, Weak};
 use std::str::from_utf8_unchecked;
 use std::sync::{Arc, Mutex};
@@ -725,9 +725,8 @@ impl Session {
                 self.connection_attempt += 1;
                 self.fail_backend_connection();
 
-                let backend_token = self.back_token();
                 self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
-                return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
+                return SessionResult::ReconnectBackend;
             } else {
                 self.metrics().backend_connected();
                 self.reset_connection_attempt();
@@ -812,7 +811,7 @@ impl Session {
             if back_interest.is_hup() {
                 let order = self.back_hup();
                 match order {
-                    SessionResult::CloseSession | SessionResult::CloseBackend(_) => {
+                    SessionResult::CloseSession | SessionResult::CloseBackend => {
                         return order;
                     }
                     SessionResult::Continue => {
@@ -879,7 +878,7 @@ impl Session {
         SessionResult::Continue
     }
 
-    fn close_backend(&mut self, _: Token) {
+    fn close_backend(&mut self) {
         if let Some(token) = self.back_token() {
             if let Some(fd) = self.back_socket_mut().map(|s| s.as_raw_fd()) {
                 let proxy = self.proxy.borrow_mut();
@@ -1014,32 +1013,6 @@ impl Session {
         Ok((&host, &rl.uri, &rl.method))
     }
 
-    fn set_backend(
-        &mut self,
-        backend: Rc<RefCell<Backend>>,
-        front_should_stick: bool,
-        sticky_name: &str,
-    ) {
-        if front_should_stick {
-            self.http_mut().map(|http| {
-                http.sticky_session = Some(StickySession::new(
-                    backend
-                        .borrow()
-                        .sticky_id
-                        .clone()
-                        .unwrap_or(backend.borrow().backend_id.clone()),
-                ));
-                http.sticky_name = sticky_name.to_string();
-            });
-        }
-        self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
-        self.metrics.backend_start();
-        self.http_mut().map(|http| {
-            http.set_backend_id(backend.borrow().backend_id.clone());
-        });
-        self.backend = Some(backend);
-    }
-
     pub fn backend_from_request(
         &mut self,
         cluster_id: &str,
@@ -1165,7 +1138,7 @@ impl Session {
             if has_backend && self.check_backend_connection() {
                 return Ok(BackendConnectAction::Reuse);
             } else if let Some(token) = self.back_token() {
-                self.close_backend(token);
+                self.close_backend();
 
                 //reset the back token here so we can remove it
                 //from the slab after backend_from* fails
@@ -1176,7 +1149,7 @@ impl Session {
         //replacing with a connection to another application
         if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
             if let Some(token) = self.back_token() {
-                self.close_backend(token);
+                self.close_backend();
 
                 //reset the back token here so we can remove it
                 //from the slab after backend_from* fails
@@ -1279,8 +1252,7 @@ impl ProxySession for Session {
             }
         }
 
-        //FIXME: should we really pass a token here?
-        self.close_backend(Token(0));
+        self.close_backend();
 
         if let Some(State::Http(ref mut http)) = self.protocol {
             //if the state was initial, the connection was already reset
@@ -1371,15 +1343,10 @@ impl ProxySession for Session {
 
         if res == SessionResult::CloseSession {
             self.close();
-        } else if let SessionResult::CloseBackend(_opt_back_token) = res {
-            //FIXME: should we really pass a token here?
-            self.close_backend(Token(0));
+        } else if let SessionResult::CloseBackend = res {
+            self.close_backend();
         } else if res == SessionResult::ConnectBackend {
             let res = self.connect_to_backend(session);
-            info!(
-                "HTTPS_OPENSSL::READY): connect_to_backend returned {:?}\n\n",
-                res
-            );
 
             //FIXME: we might need to loop here betwen ready and connet_to_backend because a call to ready() might go through connect_to_backend again or it could return CloseBackend and other results. Ideally, connect_to_backend should be called from ready_inner instead
             if res == Ok(BackendConnectAction::Reuse) || res.is_err() {
@@ -1387,12 +1354,10 @@ impl ProxySession for Session {
                 self.metrics().service_stop();
             }
             self.metrics().service_stop();
-        } else if let SessionResult::ReconnectBackend(_, opt_back_token) = res {
-            //FIXME: should we really pass a token here?
-            self.close_backend(Token(0));
+        } else if let SessionResult::ReconnectBackend = res {
+            self.close_backend();
 
             let res = self.connect_to_backend(session);
-            info!("TCP::READY): (re)connect_to_backend returned {:?}\n\n", res);
 
             //FIXME: we might need to loop here betwen ready and connet_to_backend because a call to ready() might go through connect_to_backend again or it could return CloseBackend and other results. Ideally, connect_to_backend should be called from ready_inner instead
             if res == Ok(BackendConnectAction::Reuse) || res.is_err() {
