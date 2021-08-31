@@ -811,7 +811,7 @@ impl Session {
         SessionResult::Continue
     }
 
-    fn close_backend_inner(&mut self, _: Token) {
+    fn close_backend(&mut self, _: Token) {
         if let Some(token) = self.back_token() {
             if let Some(fd) = self.back_socket_mut().map(|s| s.as_raw_fd()) {
                 let proxy = self.proxy.borrow_mut();
@@ -1092,7 +1092,7 @@ impl Session {
             if has_backend && self.check_backend_connection() {
                 return Ok(BackendConnectAction::Reuse);
             } else if let Some(token) = self.back_token() {
-                self.close_backend_inner(token);
+                self.close_backend(token);
 
                 //reset the back token here so we can remove it
                 //from the slab after backend_from* fails
@@ -1102,7 +1102,7 @@ impl Session {
 
         if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
             if let Some(token) = self.back_token() {
-                self.close_backend_inner(token);
+                self.close_backend(token);
 
                 //reset the back token here so we can remove it
                 //from the slab after backend_from* fails
@@ -1202,7 +1202,7 @@ impl ProxySession for Session {
         }
 
         //FIXME: should we really pass a token here?
-        self.close_backend_inner(Token(0));
+        self.close_backend(Token(0));
 
         if let Some(State::Http(ref mut http)) = self.protocol {
             //if the state was initial, the connection was already reset
@@ -1251,42 +1251,6 @@ impl ProxySession for Session {
         }
     }
 
-    fn close_backend(&mut self, _: Token, registry: &Registry) {
-        self.remove_backend();
-
-        let back_connected = self.back_connected();
-        if back_connected != BackendConnectionStatus::NotConnected {
-            self.back_readiness().map(|r| r.event = Ready::empty());
-            if let Some(sock) = self.back_socket_mut() {
-                if let Err(e) = sock.shutdown(Shutdown::Both) {
-                    if e.kind() != ErrorKind::NotConnected {
-                        error!("error shutting down backend socket: {:?}", e);
-                    }
-                }
-
-                if let Err(e) = registry.deregister(sock) {
-                    error!("error deregistering backend socket: {:?}", e);
-                }
-            }
-        }
-
-        if back_connected == BackendConnectionStatus::Connected {
-            gauge_add!("backend.connections", -1);
-            gauge_add!(
-                "connections_per_backend",
-                -1,
-                self.cluster_id.as_ref().map(|s| s.as_str()),
-                self.metrics.backend_id.as_ref().map(|s| s.as_str())
-            );
-        }
-
-        self.set_back_connected(BackendConnectionStatus::NotConnected);
-        self.http_mut().map(|h| {
-            h.clear_back_token();
-            h.remove_backend();
-        });
-    }
-
     fn protocol(&self) -> Protocol {
         Protocol::HTTPS
     }
@@ -1315,7 +1279,7 @@ impl ProxySession for Session {
             self.close();
         } else if let SessionResult::CloseBackend(_opt_back_token) = res {
             //FIXME: should we really pass a token here?
-            self.close_backend_inner(Token(0));
+            self.close_backend(Token(0));
         } else if res == SessionResult::ConnectBackend {
             let res = self.connect_to_backend(session);
             info!(
@@ -1333,7 +1297,7 @@ impl ProxySession for Session {
             return SessionResult::Continue;
         } else if let SessionResult::ReconnectBackend(_, opt_back_token) = res {
             //FIXME: should we really pass a token here?
-            self.close_backend_inner(Token(0));
+            self.close_backend(Token(0));
 
             let res = self.connect_to_backend(session);
             info!("TCP::READY): (re)connect_to_backend returned {:?}\n\n", res);

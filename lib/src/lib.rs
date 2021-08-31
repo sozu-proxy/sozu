@@ -253,8 +253,6 @@ pub trait ProxySession {
     fn process_events(&mut self, token: Token, events: Ready);
     /// closes a session
     fn close(&mut self);
-    /// closes the backend socket of a session
-    fn close_backend(&mut self, token: Token, registry: &Registry);
     /// if a timeout associated with the session triggers, the event loop will
     /// call this method with the timeout's token
     fn timeout(&mut self, t: Token) -> SessionResult;
