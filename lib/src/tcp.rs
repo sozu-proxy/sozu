@@ -955,7 +955,7 @@ impl ProxySession for Session {
         }
     }
 
-    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) {
         self.metrics().service_start();
         let res = self.ready_inner();
 
@@ -972,10 +972,8 @@ impl ProxySession for Session {
             if res == Ok(BackendConnectAction::Reuse) || res.is_err() {
                 let res = self.ready_inner();
                 self.metrics().service_stop();
-                return res;
             }
             self.metrics().service_stop();
-            return SessionResult::Continue;
         } else if let SessionResult::ReconnectBackend(_, opt_back_token) = res {
             //FIXME: should we really pass a token here?
             self.close_backend(Token(0));
@@ -987,18 +985,15 @@ impl ProxySession for Session {
             if res == Ok(BackendConnectAction::Reuse) || res.is_err() {
                 let res = self.ready_inner();
                 self.metrics().service_stop();
-                return res;
             }
             self.metrics().service_stop();
-            return SessionResult::Continue;
         }
 
         self.metrics().service_stop();
-        res
     }
 
-    fn shutting_down(&mut self) -> SessionResult {
-        SessionResult::CloseSession
+    fn shutting_down(&mut self) {
+        self.close()
     }
 
     fn last_event(&self) -> Instant {
