@@ -237,11 +237,6 @@ pub enum Protocol {
     Timer,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct CloseResult {
-    pub tokens: Vec<Token>,
-}
-
 /// trait that must be implemented by listeners and client sessions
 pub trait ProxySession {
     /// indicates the protocol associated with the session
@@ -257,7 +252,7 @@ pub trait ProxySession {
     /// it will call this method on the session
     fn process_events(&mut self, token: Token, events: Ready);
     /// closes a session
-    fn close(&mut self, registry: &Registry) -> CloseResult;
+    fn close(&mut self);
     /// closes the backend socket of a session
     fn close_backend(&mut self, token: Token, registry: &Registry);
     /// if a timeout associated with the session triggers, the event loop will

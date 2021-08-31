@@ -36,7 +36,7 @@ use crate::socket::server_bind;
 use crate::timer::TimeoutContainer;
 use crate::util::UnwrapLog;
 use crate::{
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, CloseResult, ClusterId,
+    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
     ConnectionError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
     SessionResult,
 };
@@ -760,37 +760,6 @@ impl Session {
         SessionResult::Continue
     }
 
-    fn close_inner(&mut self) {
-        self.metrics.service_stop();
-        self.cancel_timeouts();
-        if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
-            if e.kind() != ErrorKind::NotConnected {
-                error!(
-                    "error shutting down front socket({:?}): {:?}",
-                    self.front_socket(),
-                    e
-                );
-            }
-        }
-
-        //FIXME: should we really pass a token here?
-        self.close_backend_inner(Token(0));
-
-        match self.protocol {
-            Some(State::Pipe(_)) => gauge_add!("protocol.tcp", -1),
-            Some(State::SendProxyProtocol(_)) => gauge_add!("protocol.proxy.send", -1),
-            Some(State::RelayProxyProtocol(_)) => gauge_add!("protocol.proxy.relay", -1),
-            Some(State::ExpectProxyProtocol(_)) => gauge_add!("protocol.proxy.expect", -1),
-            None => {}
-        }
-
-        let fd = self.front_socket().as_raw_fd();
-        let proxy = self.proxy.borrow_mut();
-        if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-            error!("1error deregistering socket({:?}): {:?}", fd, e);
-        }
-    }
-
     fn close_backend_inner(&mut self, _: Token) {
         if let (Some(token), Some(fd)) = (
             self.back_token(),
@@ -919,7 +888,7 @@ impl Session {
 }
 
 impl ProxySession for Session {
-    fn close(&mut self, registry: &Registry) -> CloseResult {
+    fn close(&mut self) {
         self.metrics.service_stop();
         self.cancel_timeouts();
         if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
@@ -931,22 +900,9 @@ impl ProxySession for Session {
                 );
             }
         }
-        if let Err(e) = registry.deregister(self.front_socket_mut()) {
-            error!(
-                "error deregistering front socket({:?}): {:?}",
-                self.front_socket(),
-                e
-            );
-        }
-
-        let mut result = CloseResult::default();
-
-        if let Some(tk) = self.backend_token {
-            result.tokens.push(tk)
-        }
 
         //FIXME: should we really pass a token here?
-        self.close_backend(Token(0), registry);
+        self.close_backend_inner(Token(0));
 
         match self.protocol {
             Some(State::Pipe(_)) => gauge_add!("protocol.tcp", -1),
@@ -956,9 +912,11 @@ impl ProxySession for Session {
             None => {}
         }
 
-        result.tokens.push(self.frontend_token);
-
-        result
+        let fd = self.front_socket().as_raw_fd();
+        let proxy = self.proxy.borrow_mut();
+        if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
+            error!("1error deregistering socket({:?}): {:?}", fd, e);
+        }
     }
 
     fn timeout(&mut self, token: Token) -> SessionResult {
@@ -1035,7 +993,7 @@ impl ProxySession for Session {
         let res = self.ready_inner();
 
         if res == SessionResult::CloseSession {
-            let mut v = self.close_inner();
+            self.close();
         } else if let SessionResult::CloseBackend(_opt_back_token) = res {
             //FIXME: should we really pass a token here?
             self.close_backend_inner(Token(0));
@@ -1275,12 +1233,6 @@ impl Proxy {
         } else {
             false
         }
-    }
-
-    pub fn close_session(&mut self, token: Token) {
-        self.sessions
-            .borrow_mut()
-            .close_session(SessionManager::to_session(token), &self.registry);
     }
 }
 
