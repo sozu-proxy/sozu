@@ -1720,10 +1720,9 @@ impl Server {
 
         let session_token = token.0;
         if self.sessions.borrow().slab.contains(session_token) {
-            let order = self.sessions.borrow_mut().slab[session_token]
+            self.sessions.borrow_mut().slab[session_token]
                 .borrow_mut()
                 .timeout(token);
-            self.interpret_session_order(SessionToken(session_token), order);
         }
     }
 
@@ -1783,12 +1782,11 @@ impl ProxySession for ListenSession {
 
     fn close(&mut self) {}
 
-    fn timeout(&mut self, _token: Token) -> SessionResult {
+    fn timeout(&mut self, _token: Token) {
         error!(
             "called ProxySession::timeout(token={:?}, time) on ListenSession {{ protocol: {:?} }}",
             _token, self.protocol
         );
-        SessionResult::CloseSession
     }
 }
 

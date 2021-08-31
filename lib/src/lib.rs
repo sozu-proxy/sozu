@@ -255,7 +255,7 @@ pub trait ProxySession {
     fn close(&mut self);
     /// if a timeout associated with the session triggers, the event loop will
     /// call this method with the timeout's token
-    fn timeout(&mut self, t: Token) -> SessionResult;
+    fn timeout(&mut self, t: Token);
     /// last time the session got an event
     fn last_event(&self) -> Instant;
     /// displays the session's internal state (for debugging purpose)
