@@ -1318,8 +1318,8 @@ impl ProxySession for Session {
         }
     }
 
-    fn timeout(&mut self, token: Token) -> SessionResult {
-        match *unwrap_msg!(self.protocol.as_mut()) {
+    fn timeout(&mut self, token: Token) {
+        let res = match *unwrap_msg!(self.protocol.as_mut()) {
             State::Expect(_, _) => {
                 if token == self.frontend_token {
                     self.front_timeout.triggered();
@@ -1338,6 +1338,10 @@ impl ProxySession for Session {
             //FIXME: not implemented yet
             State::Http2(_) => SessionResult::CloseSession,
             State::Http(ref mut http) => http.timeout(token, &mut self.metrics),
+        };
+
+        if res == SessionResult::CloseSession {
+            self.close();
         }
     }
 

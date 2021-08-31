@@ -919,7 +919,7 @@ impl ProxySession for Session {
         }
     }
 
-    fn timeout(&mut self, token: Token) -> SessionResult {
+    fn timeout(&mut self, token: Token) {
         if self.frontend_token == token {
             let dur = Instant::now() - self.last_event;
             let front_timeout = self.front_timeout.duration();
@@ -927,13 +927,11 @@ impl ProxySession for Session {
                 TIMER.with(|timer| {
                     timer.borrow_mut().set_timeout(front_timeout - dur, token);
                 });
-                SessionResult::Continue
             } else {
-                SessionResult::CloseSession
+                self.close();
             }
         } else {
             // invalid token, obsolete timeout triggered
-            SessionResult::Continue
         }
     }
 

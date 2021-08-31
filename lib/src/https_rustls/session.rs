@@ -1237,8 +1237,8 @@ impl ProxySession for Session {
         }
     }
 
-    fn timeout(&mut self, token: Token) -> SessionResult {
-        match *unwrap_msg!(self.protocol.as_mut()) {
+    fn timeout(&mut self, token: Token) {
+        let res = match *unwrap_msg!(self.protocol.as_mut()) {
             State::Http(ref mut http) => http.timeout(token, &mut self.metrics),
             State::WebSocket(ref mut pipe) => pipe.timeout(token, &mut self.metrics),
             _ => {
@@ -1248,6 +1248,10 @@ impl ProxySession for Session {
 
                 SessionResult::CloseSession
             }
+        };
+
+        if res == SessionResult::CloseSession {
+            self.close();
         }
     }
 
