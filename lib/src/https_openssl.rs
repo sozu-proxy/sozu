@@ -1516,6 +1516,33 @@ impl ProxySession for Session {
             }
             self.metrics().service_stop();
             return SessionResult::Continue;
+        } else if let SessionResult::ReconnectBackend(_, opt_back_token) = res {
+            if let (Some(token), Some(fd)) = (
+                opt_back_token,
+                self.back_socket_mut().map(|s| s.as_raw_fd()),
+            ) {
+                let proxy = self.proxy.borrow_mut();
+                if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
+                    error!("error deregistering socket({:?}): {:?}", fd, e);
+                }
+
+                proxy.sessions.borrow_mut().slab.try_remove(token.0);
+            }
+
+            //FIXME: should we really pass a token here?
+            self.close_backend_inner(Token(0));
+
+            let res = self.connect_to_backend(session);
+            info!("TCP::READY): (re)connect_to_backend returned {:?}\n\n", res);
+
+            //FIXME: we might need to loop here betwen ready and connet_to_backend because a call to ready() might go through connect_to_backend again or it could return CloseBackend and other results. Ideally, connect_to_backend should be called from ready_inner instead
+            if res == Ok(BackendConnectAction::Reuse) || res.is_err() {
+                let res = self.ready_inner();
+                self.metrics().service_stop();
+                return res;
+            }
+            self.metrics().service_stop();
+            return SessionResult::Continue;
         }
 
         self.metrics().service_stop();
