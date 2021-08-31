@@ -496,6 +496,40 @@ impl CommandServer {
         }
         Ok(())
     }
+
+    async fn handle_worker_close(&mut self, id: u32) {
+        // put all this in a method handle_worker_close
+        info!("removing worker {}", id);
+
+        if let Some(w) = self.workers.iter_mut().filter(|w| w.id == id).next() {
+            // In case a worker crashes and should be restarted
+            if self.config.worker_automatic_restart && w.run_state == RunState::Running {
+                info!("Automatically restarting worker {}", id);
+                match self.restart_worker(id).await {
+                    Ok(()) => info!("Worker {} has automatically restarted!", id),
+                    Err(e) => error!("Could not restart worker {}: {}", id, e),
+                }
+                return;
+            }
+
+            info!("Closing the worker {}.", w.id);
+            if !w.the_pid_is_alive() {
+                info!("Worker {} is dead, setting to Stopped.", w.id);
+                w.run_state = RunState::Stopped;
+                return;
+            }
+
+            info!("Worker {} is not dead but should be. Let's kill it.", w.id);
+
+            match kill(Pid::from_raw(w.pid), Signal::SIGKILL) {
+                Ok(()) => {
+                    info!("Worker {} was successfuly killed", id);
+                    w.run_state = RunState::Stopped;
+                }
+                Err(e) => error!("failed to kill the worker process: {:?}", e),
+            }
+        }
+    }
 }
 
 pub fn start(
@@ -643,35 +677,7 @@ impl CommandServer {
                     }
                 }
                 CommandMessage::WorkerClose { id } => {
-                    // put all this in a method handle_worker_close
-                    info!("removing worker {}", id);
-                    if let Some(w) = self.workers.iter_mut().filter(|w| w.id == id).next() {
-                        // In case a worker crashes and should be restarted
-                        if self.config.worker_automatic_restart && w.run_state == RunState::Running
-                        {
-                            match self.restart_worker(id).await {
-                                Ok(()) => {}
-                                Err(e) => error!("Could not restart worker {}: {}", id, e),
-                            }
-
-                            // is this wise?
-                            return;
-                        }
-
-                        info!("Closing the worker {}.", w.id);
-
-                        if w.the_pid_is_alive() {
-                            info!("Worker {} is not dead but should be. Let's kill it.", w.id);
-
-                            match kill(Pid::from_raw(w.pid), Signal::SIGKILL) {
-                                Ok(()) => info!("Successfully killed the worker process {}", w.id),
-                                Err(e) => error!("failed to kill the worker process: {}", e),
-                            }
-                        } else {
-                            info!("Worker {} is dead, setting to Stopped.", w.id);
-                        }
-                        w.run_state = RunState::Stopped;
-                    }
+                    self.handle_worker_close(id).await;
                 }
                 CommandMessage::WorkerResponse { id, message } => {
                     debug!("worker {} sent back {:?}", id, message);
