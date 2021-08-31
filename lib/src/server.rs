@@ -27,10 +27,7 @@ use crate::metrics::METRICS;
 use crate::pool::Pool;
 use crate::timer::Timer;
 use crate::{http, tcp};
-use crate::{
-    AcceptError, Backend, BackendConnectAction, CloseResult, ConnectionError, Protocol,
-    ProxyConfiguration, ProxySession, SessionResult,
-};
+use crate::{AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession, SessionResult};
 
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;
@@ -186,17 +183,10 @@ impl SessionManager {
         gauge!("client.connections", self.nb_connections);
     }
 
-    pub fn close_session(&mut self, token: SessionToken, registry: &Registry) {
+    pub fn close_session(&mut self, token: SessionToken) {
         if self.slab.contains(token.0) {
             let session = self.slab.remove(token.0);
-            let CloseResult { tokens } = session.borrow_mut().close(registry);
-
-            for tk in tokens.into_iter() {
-                let cl = Self::to_session(tk);
-                if self.slab.contains(cl.0) {
-                    self.slab.remove(cl.0);
-                }
-            }
+            session.borrow_mut().close();
 
             assert!(self.nb_connections != 0);
             self.nb_connections -= 1;
@@ -690,9 +680,7 @@ impl Server {
 
                 for tk in frontend_tokens.iter() {
                     let cl = self.to_session(*tk);
-                    self.sessions
-                        .borrow_mut()
-                        .close_session(cl, self.poll.registry());
+                    self.sessions.borrow_mut().close_session(cl);
                 }
 
                 if count > 0 {
@@ -741,9 +729,7 @@ impl Server {
 
                 for tk in closing_tokens.iter() {
                     let cl = self.to_session(*tk);
-                    self.sessions
-                        .borrow_mut()
-                        .close_session(cl, self.poll.registry());
+                    self.sessions.borrow_mut().close_session(cl);
                 }
 
                 if !closing_tokens.is_empty() {
@@ -1795,9 +1781,7 @@ impl ProxySession for ListenSession {
 
     fn process_events(&mut self, _token: Token, _events: Ready) {}
 
-    fn close(&mut self, _registry: &Registry) -> CloseResult {
-        CloseResult::default()
-    }
+    fn close(&mut self) {}
 
     fn close_backend(&mut self, _token: Token, _registry: &Registry) {}
 
