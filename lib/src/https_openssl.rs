@@ -879,7 +879,7 @@ impl Session {
         SessionResult::Continue
     }
 
-    fn close_inner(&mut self) -> Vec<(Token, RawFd)> {
+    fn close_inner(&mut self) {
         //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.frontend_token, *self.temp.front_buf, *self.temp.back_buf);
         self.http_mut().map(|http| http.close());
         self.metrics.service_stop();
@@ -891,7 +891,6 @@ impl Session {
                 }
             }
         }
-        let mut result = Vec::new();
 
         //FIXME: should we really pass a token here?
         self.close_backend_inner(Token(0));
@@ -924,12 +923,12 @@ impl Session {
             None => {}
         }
 
-        let token = self.frontend_token;
-        if let Some(sock) = self.front_socket_mut() {
-            result.push((token, sock.as_raw_fd()));
+        if let Some(fd) = self.front_socket_mut().map(|s| s.as_raw_fd()) {
+            let proxy = self.proxy.borrow_mut();
+            if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
+                error!("1error deregistering socket({:?}): {:?}", fd, e);
+            }
         }
-
-        result
     }
 
     fn close_backend_inner(&mut self, _: Token) {
@@ -1465,15 +1464,6 @@ impl ProxySession for Session {
 
         if res == SessionResult::CloseSession {
             let mut v = self.close_inner();
-
-            let proxy = self.proxy.borrow_mut();
-            for (token, fd) in v.drain(..) {
-                if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                    error!("error deregistering socket({:?}): {:?}", fd, e);
-                }
-
-                proxy.sessions.borrow_mut().slab.try_remove(token.0);
-            }
         } else if let SessionResult::CloseBackend(_opt_back_token) = res {
             //FIXME: should we really pass a token here?
             self.close_backend_inner(Token(0));
