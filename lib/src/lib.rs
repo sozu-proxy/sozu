@@ -309,10 +309,6 @@ pub enum AcceptError {
 
 use self::server::ListenToken;
 pub trait ProxyConfiguration<Session> {
-    fn connect_to_backend(
-        &mut self,
-        session: Rc<RefCell<dyn ProxySessionCast>>,
-    ) -> Result<BackendConnectAction, ConnectionError>;
     fn notify(&mut self, message: ProxyRequest) -> ProxyResponse;
     fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
     fn create_session(

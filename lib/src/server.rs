@@ -1632,79 +1632,13 @@ impl Server {
         gauge!("accept_queue.count", self.accept_queue.len());
     }
 
-    pub fn connect_to_backend(&mut self, token: SessionToken) {
-        if !self.sessions.borrow().slab.contains(token.0) {
-            error!("invalid token in connect_to_backend");
-            return;
-        }
-
-        let (protocol, res) = {
-            let session = self.sessions.borrow().slab[token.0].clone();
-            let protocol = { session.borrow().protocol() };
-
-            let (protocol, res) = match protocol {
-                Protocol::TCP => (
-                    Protocol::TCP,
-                    self.tcp.borrow_mut().connect_to_backend(session),
-                ),
-                Protocol::HTTP => (
-                    Protocol::HTTP,
-                    self.http.borrow_mut().connect_to_backend(session),
-                ),
-                Protocol::HTTPS => (Protocol::HTTPS, self.https.connect_to_backend(session)),
-                _ => {
-                    panic!("should not call connect_to_backend on listeners");
-                }
-            };
-
-            (protocol, res)
-        };
-
-        match res {
-            Ok(BackendConnectAction::Reuse) => {
-                debug!("keepalive, reusing backend connection");
-            }
-            Ok(BackendConnectAction::Replace) => {}
-            Ok(BackendConnectAction::New) => {}
-            Err(ConnectionError::HostNotFound)
-            | Err(ConnectionError::NoBackendAvailable)
-            | Err(ConnectionError::HttpsRedirect)
-            | Err(ConnectionError::InvalidHost)
-            | Err(ConnectionError::Unauthorized) => {
-                if protocol == Protocol::TCP {
-                    self.sessions
-                        .borrow_mut()
-                        .close_session(token, self.poll.registry());
-                }
-            }
-            _ => self
-                .sessions
-                .borrow_mut()
-                .close_session(token, self.poll.registry()),
-        }
-    }
-
-    pub fn interpret_session_order(&mut self, token: SessionToken, order: SessionResult) {
+    fn interpret_session_order(&mut self, token: SessionToken, order: SessionResult) {
         //trace!("INTERPRET ORDER: {:?}", order);
         match order {
             SessionResult::CloseSession => {}
             SessionResult::CloseBackend(_opt) => {}
-            SessionResult::ReconnectBackend(main_token, backend_token) => {
-                if let Some(t) = backend_token {
-                    let cl = self.to_session(t);
-                    let mut sessions = self.sessions.borrow_mut();
-                    if sessions.slab.contains(cl.0) {
-                        let session = sessions.slab.remove(cl.0);
-                        session.borrow_mut().close_backend(t, self.poll.registry());
-                    }
-                }
-
-                if let Some(t) = main_token {
-                    let tok = self.to_session(t);
-                    self.connect_to_backend(tok)
-                }
-            }
-            SessionResult::ConnectBackend => self.connect_to_backend(token),
+            SessionResult::ReconnectBackend(_main_token, _backend_token) => {}
+            SessionResult::ConnectBackend => {}
             SessionResult::Continue => {}
         }
     }
@@ -1994,20 +1928,6 @@ impl HttpsProvider {
             }
         }
     }
-
-    pub fn connect_to_backend(
-        &mut self,
-        session: Rc<RefCell<dyn ProxySessionCast>>,
-    ) -> Result<BackendConnectAction, ConnectionError> {
-        match self {
-            &mut HttpsProvider::Rustls(ref mut rustls) => {
-                rustls.borrow_mut().connect_to_backend(session)
-            }
-            &mut HttpsProvider::Openssl(ref mut openssl) => {
-                openssl.borrow_mut().connect_to_backend(session)
-            }
-        }
-    }
 }
 
 #[cfg(not(feature = "use-openssl"))]
@@ -2078,14 +1998,6 @@ impl HttpsProvider {
         rustls
             .borrow_mut()
             .create_session(frontend_sock, token, wait_time, r)
-    }
-
-    pub fn connect_to_backend(
-        &mut self,
-        session: Rc<RefCell<dyn ProxySessionCast>>,
-    ) -> Result<BackendConnectAction, ConnectionError> {
-        let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-        rustls.borrow_mut().connect_to_backend(session)
     }
 }
 
