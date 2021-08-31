@@ -60,12 +60,12 @@
 //! command.write_message(&proxy::ProxyRequest {
 //!   id:    String::from("ID_ABCD"),
 //!   order: proxy::ProxyRequestData::AddHttpFront(http_front)
-//! ));
+//! });
 //!
 //! command.write_message(&proxy::ProxyRequest {
 //!   id:    String::from("ID_EFGH"),
 //!   order: proxy::ProxyRequestData::AddBackend(http_backend)
-//! ));
+//! });
 //!
 //! println!("HTTP -> {:?}", command.read_message());
 //! println!("HTTP -> {:?}", command.read_message());
@@ -128,12 +128,12 @@
 //!   command.write_message(&proxy::ProxyRequest {
 //!     id:    String::from("ID_ABCD"),
 //!     order: proxy::ProxyRequestData::AddHttpFront(http_front)
-//!   ));
+//!   });
 //!
 //!   command.write_message(&proxy::ProxyRequest {
 //!     id:    String::from("ID_EFGH"),
 //!     order: proxy::ProxyRequestData::AddBackend(http_backend)
-//!   ));
+//!   });
 //!
 //!   println!("HTTP -> {:?}", command.read_message());
 //!   println!("HTTP -> {:?}", command.write_message());
