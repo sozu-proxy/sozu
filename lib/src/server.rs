@@ -133,12 +133,12 @@ pub struct SessionManager {
     pub max_connections: usize,
     pub nb_connections: usize,
     pub can_accept: bool,
-    pub slab: Slab<Rc<RefCell<dyn ProxySessionCast>>>,
+    pub slab: Slab<Rc<RefCell<dyn ProxySession>>>,
 }
 
 impl SessionManager {
     pub fn new(
-        slab: Slab<Rc<RefCell<dyn ProxySessionCast>>>,
+        slab: Slab<Rc<RefCell<dyn ProxySession>>>,
         max_connections: usize,
     ) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(SessionManager {
@@ -1785,7 +1785,7 @@ impl ProxySession for ListenSession {
         self.protocol
     }
 
-    fn ready(&mut self, session: Rc<RefCell<dyn ProxySessionCast>>) -> SessionResult {
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
         SessionResult::Continue
     }
 
@@ -1998,161 +1998,6 @@ impl HttpsProvider {
         rustls
             .borrow_mut()
             .create_session(frontend_sock, token, wait_time, r)
-    }
-}
-
-#[cfg(not(feature = "use-openssl"))]
-/// this trait is used to work around the fact that we need to transform
-/// the sessions (that are all stored as a ProxySession in the slab) back
-/// to their original type to call the `connect_to_backend` method of
-/// their corresponding `Proxy`.
-/// If we find a way to make `connect_to_backend` work wothout transforming
-/// back to the type (example: storing a reference to the configuration
-/// in the session and making `connect_to_backend` a method of `ProxySession`?),
-/// we'll be able to remove all those ugly casts and panics
-pub trait ProxySessionCast: ProxySession {
-    fn as_tcp(&mut self) -> &mut tcp::Session;
-    fn as_http(&mut self) -> &mut http::Session;
-    fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session;
-}
-
-#[cfg(feature = "use-openssl")]
-pub trait ProxySessionCast: ProxySession {
-    fn as_tcp(&mut self) -> &mut tcp::Session;
-    fn as_http(&mut self) -> &mut http::Session;
-    fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session;
-    fn as_https_openssl(&mut self) -> &mut https_openssl::Session;
-}
-
-#[cfg(not(feature = "use-openssl"))]
-impl ProxySessionCast for ListenSession {
-    fn as_http(&mut self) -> &mut http::Session {
-        panic!()
-    }
-    fn as_tcp(&mut self) -> &mut tcp::Session {
-        panic!()
-    }
-    fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session {
-        panic!()
-    }
-}
-
-#[cfg(feature = "use-openssl")]
-impl ProxySessionCast for ListenSession {
-    fn as_http(&mut self) -> &mut http::Session {
-        panic!()
-    }
-    fn as_tcp(&mut self) -> &mut tcp::Session {
-        panic!()
-    }
-    fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session {
-        panic!()
-    }
-    fn as_https_openssl(&mut self) -> &mut https_openssl::Session {
-        panic!()
-    }
-}
-
-#[cfg(not(feature = "use-openssl"))]
-impl ProxySessionCast for http::Session {
-    fn as_http(&mut self) -> &mut http::Session {
-        self
-    }
-    fn as_tcp(&mut self) -> &mut tcp::Session {
-        panic!()
-    }
-    fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session {
-        panic!()
-    }
-}
-
-#[cfg(feature = "use-openssl")]
-impl ProxySessionCast for http::Session {
-    fn as_http(&mut self) -> &mut http::Session {
-        self
-    }
-    fn as_tcp(&mut self) -> &mut tcp::Session {
-        panic!()
-    }
-    fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session {
-        panic!()
-    }
-    fn as_https_openssl(&mut self) -> &mut https_openssl::Session {
-        panic!()
-    }
-}
-
-#[cfg(not(feature = "use-openssl"))]
-impl ProxySessionCast for tcp::Session {
-    fn as_http(&mut self) -> &mut http::Session {
-        panic!()
-    }
-    fn as_tcp(&mut self) -> &mut tcp::Session {
-        self
-    }
-    fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session {
-        panic!()
-    }
-}
-
-#[cfg(feature = "use-openssl")]
-impl ProxySessionCast for tcp::Session {
-    fn as_http(&mut self) -> &mut http::Session {
-        panic!()
-    }
-    fn as_tcp(&mut self) -> &mut tcp::Session {
-        self
-    }
-    fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session {
-        panic!()
-    }
-    fn as_https_openssl(&mut self) -> &mut https_openssl::Session {
-        panic!()
-    }
-}
-
-#[cfg(not(feature = "use-openssl"))]
-impl ProxySessionCast for https_rustls::session::Session {
-    fn as_http(&mut self) -> &mut http::Session {
-        panic!()
-    }
-    fn as_tcp(&mut self) -> &mut tcp::Session {
-        panic!()
-    }
-    fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session {
-        self
-    }
-}
-
-#[cfg(feature = "use-openssl")]
-impl ProxySessionCast for https_rustls::session::Session {
-    fn as_http(&mut self) -> &mut http::Session {
-        panic!()
-    }
-    fn as_tcp(&mut self) -> &mut tcp::Session {
-        panic!()
-    }
-    fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session {
-        self
-    }
-    fn as_https_openssl(&mut self) -> &mut https_openssl::Session {
-        panic!()
-    }
-}
-
-#[cfg(feature = "use-openssl")]
-impl ProxySessionCast for https_openssl::Session {
-    fn as_http(&mut self) -> &mut http::Session {
-        panic!()
-    }
-    fn as_tcp(&mut self) -> &mut tcp::Session {
-        panic!()
-    }
-    fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session {
-        panic!()
-    }
-    fn as_https_openssl(&mut self) -> &mut https_openssl::Session {
-        self
     }
 }
 
