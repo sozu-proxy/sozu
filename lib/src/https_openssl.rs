@@ -48,8 +48,8 @@ use crate::protocol::{Http, Pipe, ProtocolResult, StickySession};
 use crate::retry::RetryPolicy;
 use crate::router::{trie::*, Router};
 use crate::server::{
-    push_event, ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, SessionManager,
-    SessionToken, CONN_RETRIES,
+    push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken,
+    CONN_RETRIES,
 };
 use crate::socket::server_bind;
 use crate::timer::TimeoutContainer;
@@ -1186,7 +1186,7 @@ impl Session {
 
     fn connect_to_backend(
         &mut self,
-        session_rc: Rc<RefCell<dyn ProxySessionCast>>,
+        session_rc: Rc<RefCell<dyn ProxySession>>,
     ) -> Result<BackendConnectAction, ConnectionError> {
         let old_cluster_id = self.http().and_then(|ref http| http.cluster_id.clone());
         let old_back_token = self.back_token();
@@ -1471,7 +1471,7 @@ impl ProxySession for Session {
         }
     }
 
-    fn ready(&mut self, session: Rc<RefCell<dyn ProxySessionCast>>) -> SessionResult {
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
         self.metrics().service_start();
         let res = self.ready_inner();
 
@@ -2598,7 +2598,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
     )));
     let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-    let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>> = Slab::with_capacity(max_buffers);
+    let mut sessions: Slab<Rc<RefCell<dyn ProxySession>>> = Slab::with_capacity(max_buffers);
     {
         let entry = sessions.vacant_entry();
         info!("taking token {:?} for channel", SessionToken(entry.key()));

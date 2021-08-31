@@ -31,8 +31,7 @@ use crate::protocol::http::{
 };
 use crate::router::Router;
 use crate::server::{
-    ListenSession, ListenToken, ProxyChannel, ProxySessionCast, Server, SessionManager,
-    SessionToken,
+    ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken,
 };
 use crate::socket::server_bind;
 use crate::util::UnwrapLog;
@@ -660,7 +659,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
     )));
     let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-    let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>> = Slab::with_capacity(max_buffers);
+    let mut sessions: Slab<Rc<RefCell<dyn ProxySession>>> = Slab::with_capacity(max_buffers);
     {
         let entry = sessions.vacant_entry();
         info!("taking token {:?} for channel", SessionToken(entry.key()));
