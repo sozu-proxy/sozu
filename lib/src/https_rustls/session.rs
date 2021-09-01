@@ -1177,6 +1177,7 @@ impl Session {
                 >= self.proxy.borrow().sessions.borrow().slab_capacity()
             {
                 error!("not enough memory, cannot connect to backend");
+                self.set_answer(DefaultAnswerStatus::Answer503, None);
                 return Err(ConnectionError::TooManyConnections);
             }
 
