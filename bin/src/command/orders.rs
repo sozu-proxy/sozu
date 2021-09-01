@@ -407,8 +407,6 @@ impl CommandServer {
                 .await
             {
                 error!("could not send message to client {:?}: {:?}", client_id, e);
-                // should we have an early return here?
-                // return Err(anyhow::Error::from(e));
             }
         }
 
