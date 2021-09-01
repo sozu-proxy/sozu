@@ -727,22 +727,17 @@ impl Session {
                 let order = self.readable();
                 trace!("front readable\tinterpreting session order {:?}", order);
 
-                if front_interest.is_readable() {
-                    let order = self.readable();
-                    trace!("front readable\tinterpreting session order {:?}", order);
-
-                    match order {
-                        SessionResult::ConnectBackend => {
-                            match self.connect_to_backend(session.clone()) {
-                                // reuse connection or send a default answer, we can continue
-                                Ok(BackendConnectAction::Reuse) | Err(_) => {}
-                                // New or Replace: stop here, we must wait for an event
-                                _ => return SessionResult::Continue,
-                            }
+                match order {
+                    SessionResult::ConnectBackend => {
+                        match self.connect_to_backend(session.clone()) {
+                            // reuse connection or send a default answer, we can continue
+                            Ok(BackendConnectAction::Reuse) | Err(_) => {}
+                            // New or Replace: stop here, we must wait for an event
+                            _ => return SessionResult::Continue,
                         }
-                        SessionResult::Continue => {}
-                        order => return order,
                     }
+                    SessionResult::Continue => {}
+                    order => return order,
                 }
             }
 
