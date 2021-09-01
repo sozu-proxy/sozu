@@ -294,7 +294,7 @@ impl CommandServer {
     pub fn disable_cloexec_before_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                util::disable_close_on_exec(worker.fd).map_err(|e| {
+                let _ =util::disable_close_on_exec(worker.fd).map_err(|e| {
                     error!(
                         "could not disable close on exec for worker {}: {}",
                         worker.id, e
@@ -310,7 +310,7 @@ impl CommandServer {
     pub fn enable_cloexec_after_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                util::enable_close_on_exec(worker.fd).map_err(|e| {
+                let _ = util::enable_close_on_exec(worker.fd).map_err(|e| {
                     error!(
                         "could not enable close on exec for worker {}: {}",
                         worker.id, e
