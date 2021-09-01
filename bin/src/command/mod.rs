@@ -294,7 +294,12 @@ impl CommandServer {
     pub fn disable_cloexec_before_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                util::disable_close_on_exec(worker.fd)?;
+                util::disable_close_on_exec(worker.fd).map_err(|e| {
+                    error!(
+                        "could not disable close on exec for worker {}: {}",
+                        worker.id, e
+                    );
+                });
             }
         }
         trace!("disabling cloexec on listener: {}", self.fd);
@@ -305,7 +310,12 @@ impl CommandServer {
     pub fn enable_cloexec_after_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                util::enable_close_on_exec(worker.fd)?;
+                util::enable_close_on_exec(worker.fd).map_err(|e| {
+                    error!(
+                        "could not enable close on exec for worker {}: {}",
+                        worker.id, e
+                    );
+                });
             }
         }
         util::enable_close_on_exec(self.fd)?;
@@ -498,7 +508,6 @@ impl CommandServer {
     }
 
     async fn handle_worker_close(&mut self, id: u32) {
-        // put all this in a method handle_worker_close
         info!("removing worker {}", id);
 
         if let Some(w) = self.workers.iter_mut().filter(|w| w.id == id).next() {

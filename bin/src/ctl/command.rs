@@ -422,7 +422,6 @@ pub fn upgrade_worker(
     let timeout_thread = thread::spawn(move || {
         loop {
             let message = channel.read_message();
-            debug!("message received: {:?}", message);
             match message {
                 None => bail!("the proxy didn't answer"),
                 Some(message) => match message.status {
