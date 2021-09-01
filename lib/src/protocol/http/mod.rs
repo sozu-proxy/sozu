@@ -1247,9 +1247,6 @@ impl<Front: SocketHandler> Http<Front> {
                     self.back_readiness.interest = Ready::hup() | Ready::error();
 
                     SessionResult::Continue
-                    //FIXME: issues reusing the backend socket
-                    //self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
-                    //SessionResult::CloseBackend
                 } else if front_keep_alive && !back_keep_alive {
                     debug!("{} keep alive front", self.log_context());
                     self.reset();

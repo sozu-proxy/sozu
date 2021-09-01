@@ -696,7 +696,7 @@ impl Session {
         }
     }
 
-    fn ready_inner(&mut self) -> SessionResult {
+    fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
         let mut counter = 0;
         let max_loop_iterations = 100000;
 
@@ -726,7 +726,15 @@ impl Session {
                 self.fail_backend_connection();
 
                 self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
-                return SessionResult::ReconnectBackend;
+
+                // trigger a backend reconnection
+                self.close_backend();
+                match self.connect_to_backend(session.clone()) {
+                    // reuse connection or send a default answer, we can continue
+                    Ok(BackendConnectAction::Reuse) | Err(_) => {}
+                    // New or Replace: stop here, we must wait for an event
+                    _ => return SessionResult::Continue,
+                }
             } else {
                 self.metrics().backend_connected();
                 self.reset_connection_attempt();
@@ -781,8 +789,17 @@ impl Session {
                 let order = self.readable();
                 trace!("front readable\tinterpreting session order {:?}", order);
 
-                if order != SessionResult::Continue {
-                    return order;
+                match order {
+                    SessionResult::ConnectBackend => {
+                        match self.connect_to_backend(session.clone()) {
+                            // reuse connection or send a default answer, we can continue
+                            Ok(BackendConnectAction::Reuse) | Err(_) => {}
+                            // New or Replace: stop here, we must wait for an event
+                            _ => return SessionResult::Continue,
+                        }
+                    }
+                    SessionResult::Continue => {}
+                    order => return order,
                 }
             }
 
@@ -1339,32 +1356,12 @@ impl ProxySession for Session {
 
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) {
         self.metrics().service_start();
-        let res = self.ready_inner();
+        let res = self.ready_inner(session);
 
         if res == SessionResult::CloseSession {
             self.close();
         } else if let SessionResult::CloseBackend = res {
             self.close_backend();
-        } else if res == SessionResult::ConnectBackend {
-            let res = self.connect_to_backend(session);
-
-            //FIXME: we might need to loop here betwen ready and connet_to_backend because a call to ready() might go through connect_to_backend again or it could return CloseBackend and other results. Ideally, connect_to_backend should be called from ready_inner instead
-            if res == Ok(BackendConnectAction::Reuse) || res.is_err() {
-                let res = self.ready_inner();
-                self.metrics().service_stop();
-            }
-            self.metrics().service_stop();
-        } else if let SessionResult::ReconnectBackend = res {
-            self.close_backend();
-
-            let res = self.connect_to_backend(session);
-
-            //FIXME: we might need to loop here betwen ready and connet_to_backend because a call to ready() might go through connect_to_backend again or it could return CloseBackend and other results. Ideally, connect_to_backend should be called from ready_inner instead
-            if res == Ok(BackendConnectAction::Reuse) || res.is_err() {
-                let res = self.ready_inner();
-                self.metrics().service_stop();
-            }
-            self.metrics().service_stop();
         }
 
         self.metrics().service_stop();
