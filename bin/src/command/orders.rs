@@ -15,7 +15,7 @@ use async_io::Async;
 use sozu_command::buffer::fixed::Buffer;
 use sozu_command::command::{
     CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
-    RunState, WorkerInfo,
+    FrontendFilters, RunState, WorkerInfo,
 };
 use sozu_command::logging;
 use sozu_command::proxy::{
@@ -42,6 +42,9 @@ impl CommandServer {
             }
             CommandRequestData::DumpState => self.dump_state(client_id, &request.id).await,
             CommandRequestData::ListWorkers => self.list_workers(client_id, request.id).await,
+            CommandRequestData::ListFrontends(filters) => {
+                self.list_frontends(client_id, &request.id, filters).await
+            }
             CommandRequestData::LoadState { path } => {
                 self.load_state(Some(client_id), request.id, &path).await
             }
@@ -347,6 +350,28 @@ impl CommandServer {
         gauge!("configuration.clusters", self.state.clusters.len());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
+        Ok(())
+    }
+
+    pub async fn list_frontends(
+        &mut self,
+        client_id: String,
+        message_id: &str,
+        filters: FrontendFilters,
+    ) -> anyhow::Result<()> {
+        info!("Received a request to list frontends, along these filters: {:#?}", filters);
+
+        info!("Here is the config: {:#?}", self.config);
+
+        self.answer_success(
+            client_id,
+            message_id,
+            String::from("This message comes with answer_success()"),
+            Some(CommandResponseData::FrontendList(String::from(
+                "Hello world!",
+            ))),
+        )
+        .await;
         Ok(())
     }
 

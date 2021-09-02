@@ -3,7 +3,7 @@ use sozu_command::certificate::{calculate_fingerprint, split_certificate_chain};
 use sozu_command::channel::Channel;
 use sozu_command::command::{
     CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
-    RunState, WorkerInfo,
+    FrontendFilters, RunState, WorkerInfo,
 };
 use sozu_command::config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig};
 use sozu_command::proxy::{
@@ -1147,6 +1147,40 @@ pub fn remove_tcp_frontend(
             address,
         }),
     )
+}
+
+pub fn list_frontends(
+    mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: u64,
+    http: bool,
+    https: bool,
+    tcp: bool,
+) -> Result<(), anyhow::Error> {
+    let command = CommandRequestData::ListFrontends(FrontendFilters { http, https, tcp });
+
+    let id = generate_id();
+    channel.write_message(&CommandRequest::new(id.clone(), command, None));
+
+    match channel.read_message() {
+        None => bail!("the proxy didn't answer"),
+        Some(message) => {
+            if id != message.id {
+                bail!("received message with invalid id: {:?}", message);
+            }
+            match message.status {
+                CommandStatus::Processing => {}
+                CommandStatus::Error => {
+                    println!("could not query proxy state: {}", message.message)
+                }
+                CommandStatus::Ok => {
+                    println!("We received this response: {:?}", message.data);
+                    
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn add_http_listener(

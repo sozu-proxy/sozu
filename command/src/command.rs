@@ -14,11 +14,19 @@ pub enum CommandRequestData {
     LoadState { path: String },
     DumpState,
     ListWorkers,
+    ListFrontends(FrontendFilters),
     LaunchWorker(String),
     UpgradeMain,
     UpgradeWorker(u32),
     SubscribeEvents,
     ReloadConfiguration { path: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FrontendFilters {
+    pub http: bool,
+    pub https: bool,
+    pub tcp: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -58,6 +66,7 @@ pub enum CommandResponseData {
     Query(BTreeMap<String, QueryAnswer>),
     State(ConfigState),
     Event(Event),
+    FrontendList(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
