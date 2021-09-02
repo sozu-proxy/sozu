@@ -304,6 +304,15 @@ pub enum FrontendCmd {
         #[structopt(subcommand)]
         cmd: TcpFrontendCmd,
     },
+    #[structopt(name = "list", about = "list frontends using filters")]
+    List {
+        #[structopt(long = "http", help = "filter for http frontends")]
+        http: bool,
+        #[structopt(long = "https", help = "filter for https frontends")]
+        https: bool,
+        #[structopt(long = "tcp", help = "filter for tcp frontends")]
+        tcp: bool,
+    },
 }
 
 #[derive(StructOpt, PartialEq, Debug)]
