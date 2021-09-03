@@ -1,4 +1,4 @@
-use crate::cli::MetricsCmd;
+use crate::cli::{LoggingLevel, MetricsCmd};
 use sozu_command::certificate::{calculate_fingerprint, split_certificate_chain};
 use sozu_command::channel::Channel;
 use sozu_command::command::{
@@ -1859,12 +1859,12 @@ pub fn query_metrics(
 pub fn logging_filter(
     channel: Channel<CommandRequest, CommandResponse>,
     timeout: u64,
-    filter: &str,
+    filter: &LoggingLevel,
 ) -> Result<(), anyhow::Error> {
     order_command(
         channel,
         timeout,
-        ProxyRequestData::Logging(String::from(filter)),
+        ProxyRequestData::Logging(filter.to_string().to_lowercase()),
     )
 }
 
