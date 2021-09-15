@@ -15,7 +15,7 @@ use async_io::Async;
 use sozu_command::buffer::fixed::Buffer;
 use sozu_command::command::{
     CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
-    FrontendFilters, RunState, WorkerInfo,
+    FrontendFilters, ListedFrontends, RunState, WorkerInfo,
 };
 use sozu_command::logging;
 use sozu_command::proxy::{
@@ -359,17 +359,57 @@ impl CommandServer {
         message_id: &str,
         filters: FrontendFilters,
     ) -> anyhow::Result<()> {
-        info!("Received a request to list frontends, along these filters: {:#?}", filters);
+        info!(
+            "Received a request to list frontends, along these filters: {:#?}",
+            filters
+        );
 
-        info!("Here is the config: {:#?}", self.config);
+        info!("Here are the filters: {:#?}", filters);
+
+        // if no http / https / tcp filter is provided, list all of them
+        let list_all = !filters.http && !filters.https && !filters.tcp;
+
+        let mut listed_frontends = ListedFrontends::default();
+
+        if filters.http || list_all {
+            for http_frontend in self.state.http_fronts.iter().filter(|f| {
+                if let Some(domain) = &filters.domain {
+                    f.1.hostname.contains(domain)
+                } else {
+                    true
+                }
+            }) {
+                listed_frontends
+                    .http_frontends
+                    .push(http_frontend.1.to_owned());
+            }
+        }
+
+        if filters.https || list_all {
+            for https_frontend in self.state.https_fronts.iter().filter(|f| {
+                if let Some(domain) = &filters.domain {
+                    f.1.hostname.contains(domain)
+                } else {
+                    true
+                }
+            }) {
+                listed_frontends
+                    .https_frontends
+                    .push(https_frontend.1.to_owned());
+            }
+        }
+
+        if (filters.tcp || list_all) && !filters.domain.is_some() {
+            for tcp_frontend in self.state.tcp_fronts.values().map(|v| v.iter()).flatten() {
+                listed_frontends.tcp_frontends.push(tcp_frontend.to_owned());
+            }
+        }
 
         self.answer_success(
             client_id,
             message_id,
             String::from("This message comes with answer_success()"),
-            Some(CommandResponseData::FrontendList(String::from(
-                "Hello world!",
-            ))),
+            Some(CommandResponseData::FrontendList(listed_frontends)),
         )
         .await;
         Ok(())

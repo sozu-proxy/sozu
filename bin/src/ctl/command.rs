@@ -1155,8 +1155,9 @@ pub fn list_frontends(
     http: bool,
     https: bool,
     tcp: bool,
+    domain: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    let command = CommandRequestData::ListFrontends(FrontendFilters { http, https, tcp });
+    let command = CommandRequestData::ListFrontends(FrontendFilters { http, https, tcp, domain });
 
     let id = generate_id();
     channel.write_message(&CommandRequest::new(id.clone(), command, None));
@@ -1173,8 +1174,61 @@ pub fn list_frontends(
                     println!("could not query proxy state: {}", message.message)
                 }
                 CommandStatus::Ok => {
-                    println!("We received this response: {:?}", message.data);
-                    
+                    debug!("We received this response: {:?}", message.data);
+
+                    if let Some(CommandResponseData::FrontendList(data)) = message.data {
+                        trace!(" We received this data to display {:#?}", data);
+                        // HTTP frontends
+                        if !data.http_frontends.is_empty() {
+                            let mut table = Table::new();
+                            table.add_row(row!["HTTP frontends"]);
+                            table.add_row(row![
+                                "route", "address", "hostname", "path", "method", "position"
+                            ]);
+                            for http_frontend in data.http_frontends.iter() {
+                                table.add_row(row!(
+                                    http_frontend.route,
+                                    http_frontend.address.to_string(),
+                                    http_frontend.hostname.to_string(),
+                                    format!("{:?}", http_frontend.path),
+                                    format!("{:?}", http_frontend.method),
+                                    format!("{:?}", http_frontend.position),
+                                ));
+                            }
+                            table.printstd();
+                        }
+
+                        // HTTPS frontends
+                        if !data.https_frontends.is_empty() {
+                            let mut table = Table::new();
+                            table.add_row(row!["HTTPS frontends"]);
+                            table.add_row(row![
+                                "route", "address", "hostname", "path", "method", "position"
+                            ]);
+                            for https_frontend in data.https_frontends.iter() {
+                                table.add_row(row!(
+                                    https_frontend.route,
+                                    https_frontend.address.to_string(),
+                                    https_frontend.hostname.to_string(),
+                                    format!("{:?}", https_frontend.path),
+                                    format!("{:?}", https_frontend.method),
+                                    format!("{:?}", https_frontend.position),
+                                ));
+                            }
+                            table.printstd();
+                        }
+
+                        // TCP frontends
+                        if !data.tcp_frontends.is_empty() {
+                            let mut table = Table::new();
+                            table.add_row(row!["TCP frontends"]);
+                            table.add_row(row!["Cluster ID", "address"]);
+                            for tcp_frontend in data.tcp_frontends.iter() {
+                                table.add_row(row!(tcp_frontend.cluster_id, tcp_frontend.address,));
+                            }
+                            table.printstd();
+                        }
+                    }
                 }
             }
         }
