@@ -26,7 +26,7 @@ log_level = "info"
 # to a unix socket
 # log_target = "unix:///var/sozu/logs
 # to a file
-# log_target = "file:///var/logs/sozu.log"
+# log_target = "file:///var/log/sozu.log"
 # to_stdout
 log_target = "stdout"
 
@@ -36,7 +36,7 @@ log_target = "stdout"
 
 # path to the unix socket file used to send commands to sozu
 # default value points to "sozu.sock" file in the current directory
-command_socket = "./command_folder/sock"
+command_socket = "./sozu.sock"
 
 # size in bytes of the buffer used by the command socket protocol. If the message
 # sent to sozu is too large, or the data that sozu must return is too large, the
