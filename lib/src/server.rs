@@ -1664,9 +1664,8 @@ impl Server {
 
         let session_token = token.0;
         if self.sessions.borrow().slab.contains(session_token) {
-            self.sessions.borrow_mut().slab[session_token]
-                .borrow_mut()
-                .timeout(token);
+            let session = self.sessions.borrow_mut().slab[session_token].clone();
+            session.borrow_mut().timeout(token);
         }
     }
 
