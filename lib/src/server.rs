@@ -152,14 +152,14 @@ impl SessionManager {
 
     pub fn check_limits(&mut self) -> bool {
         if self.nb_connections == self.max_connections {
-            error!("max number of session connection reached, flushing the accept queue");
+            error!("max number of session connection reached, will stop accept new connections");
             gauge!("accept_queue.backpressure", 1);
             self.can_accept = false;
             return false;
         }
 
         if self.slab.len() >= self.slab_capacity() {
-            error!("not enough memory to accept another session, flushing the accept queue");
+            error!("not enough memory to accept another session, will stop accept new connections");
             error!(
                 "nb_connections: {}, max_connections: {}",
                 self.nb_connections, self.max_connections
@@ -210,22 +210,6 @@ impl SessionManager {
             if self.slab.contains(cl.0) {
                 self.slab.remove(cl.0);
             }
-        }
-    }
-
-    pub fn check_can_accept(&mut self) {
-        assert!(self.nb_connections != 0);
-        self.nb_connections -= 1;
-        gauge!("client.connections", self.nb_connections);
-
-        // do not be ready to accept right away, wait until we get back to 10% capacity
-        if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
-            debug!(
-                "nb_connections = {}, max_connections = {}, starting to accept again",
-                self.nb_connections, self.max_connections
-            );
-            gauge!("accept_queue.backpressure", 0);
-            self.can_accept = true;
         }
     }
 }

@@ -1298,6 +1298,7 @@ pub struct Proxy {
     sessions: Rc<RefCell<SessionManager>>,
 }
 
+
 impl Proxy {
     pub fn new(
         registry: Registry,
