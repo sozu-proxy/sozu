@@ -106,8 +106,9 @@ pub enum SubCmd {
     },
     #[structopt(name = "logging", about = "change logging level")]
     Logging {
-        #[structopt(short = "l", long = "level", help = "change logging level")]
-        level: String,
+        // #[structopt(short = "l", long = "level", help = "change logging level")]
+        #[structopt(subcommand)]
+        level: LoggingLevel,
     },
     #[structopt(name = "state", about = "state management")]
     State {
@@ -191,6 +192,28 @@ pub enum MetricsCmd {
     },
     #[structopt(name = "clear", about = "Deletes local metrics data")]
     Clear,
+}
+
+#[derive(StructOpt, PartialEq, Debug)]
+pub enum LoggingLevel {
+    #[structopt(name = "trace", about = "Displays a LOT of logs")]
+    Trace,
+    #[structopt(
+        name = "debug",
+        about = "Displays more logs about the inner workings of Sōzu"
+    )]
+    Debug,
+    #[structopt(name = "error", about = "Displays occurring errors")]
+    Error,
+    #[structopt(name = "warn", about = "Displays warnings about non-critical errors")]
+    Warn,
+    #[structopt(name = "info", about = "Displays logs about normal behaviour of Sōzu")]
+    Info,
+}
+impl std::fmt::Display for LoggingLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 #[derive(StructOpt, PartialEq, Debug)]
