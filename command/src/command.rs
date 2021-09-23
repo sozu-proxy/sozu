@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use crate::proxy::{AggregatedMetricsData, ProxyEvent, ProxyRequestData, QueryAnswer};
+use crate::proxy::{
+    AggregatedMetricsData, HttpFrontend, ProxyEvent, ProxyRequestData, QueryAnswer, TcpFrontend,
+};
 use crate::state::ConfigState;
 
 pub const PROTOCOL_VERSION: u8 = 0;
@@ -14,11 +16,20 @@ pub enum CommandRequestData {
     LoadState { path: String },
     DumpState,
     ListWorkers,
+    ListFrontends(FrontendFilters),
     LaunchWorker(String),
     UpgradeMain,
     UpgradeWorker(u32),
     SubscribeEvents,
     ReloadConfiguration { path: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FrontendFilters {
+    pub http: bool,
+    pub https: bool,
+    pub tcp: bool,
+    pub domain: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -58,6 +69,14 @@ pub enum CommandResponseData {
     Query(BTreeMap<String, QueryAnswer>),
     State(ConfigState),
     Event(Event),
+    FrontendList(ListedFrontends),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ListedFrontends {
+    pub http_frontends: Vec<HttpFrontend>,
+    pub https_frontends: Vec<HttpFrontend>,
+    pub tcp_frontends: Vec<TcpFrontend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

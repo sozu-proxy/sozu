@@ -989,6 +989,15 @@ fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     t == &T::default()
 }
 
+impl std::fmt::Display for Route {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Route::Deny => write!(f, "deny"),
+            Route::ClusterId(string) => write!(f, "{}", string),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

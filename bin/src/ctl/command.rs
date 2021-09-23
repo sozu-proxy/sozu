@@ -3,7 +3,7 @@ use sozu_command::certificate::{calculate_fingerprint, split_certificate_chain};
 use sozu_command::channel::Channel;
 use sozu_command::command::{
     CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
-    RunState, WorkerInfo,
+    FrontendFilters, RunState, WorkerInfo,
 };
 use sozu_command::config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig};
 use sozu_command::proxy::{
@@ -1147,6 +1147,94 @@ pub fn remove_tcp_frontend(
             address,
         }),
     )
+}
+
+pub fn list_frontends(
+    mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: u64,
+    http: bool,
+    https: bool,
+    tcp: bool,
+    domain: Option<String>,
+) -> Result<(), anyhow::Error> {
+    let command = CommandRequestData::ListFrontends(FrontendFilters { http, https, tcp, domain });
+
+    let id = generate_id();
+    channel.write_message(&CommandRequest::new(id.clone(), command, None));
+
+    match channel.read_message() {
+        None => bail!("the proxy didn't answer"),
+        Some(message) => {
+            if id != message.id {
+                bail!("received message with invalid id: {:?}", message);
+            }
+            match message.status {
+                CommandStatus::Processing => {}
+                CommandStatus::Error => {
+                    println!("could not query proxy state: {}", message.message)
+                }
+                CommandStatus::Ok => {
+                    debug!("We received this response: {:?}", message.data);
+
+                    if let Some(CommandResponseData::FrontendList(data)) = message.data {
+                        trace!(" We received this data to display {:#?}", data);
+                        // HTTP frontends
+                        if !data.http_frontends.is_empty() {
+                            let mut table = Table::new();
+                            table.add_row(row!["HTTP frontends"]);
+                            table.add_row(row![
+                                "route", "address", "hostname", "path", "method", "position"
+                            ]);
+                            for http_frontend in data.http_frontends.iter() {
+                                table.add_row(row!(
+                                    http_frontend.route,
+                                    http_frontend.address.to_string(),
+                                    http_frontend.hostname.to_string(),
+                                    format!("{:?}", http_frontend.path),
+                                    format!("{:?}", http_frontend.method),
+                                    format!("{:?}", http_frontend.position),
+                                ));
+                            }
+                            table.printstd();
+                        }
+
+                        // HTTPS frontends
+                        if !data.https_frontends.is_empty() {
+                            let mut table = Table::new();
+                            table.add_row(row!["HTTPS frontends"]);
+                            table.add_row(row![
+                                "route", "address", "hostname", "path", "method", "position"
+                            ]);
+                            for https_frontend in data.https_frontends.iter() {
+                                table.add_row(row!(
+                                    https_frontend.route,
+                                    https_frontend.address.to_string(),
+                                    https_frontend.hostname.to_string(),
+                                    format!("{:?}", https_frontend.path),
+                                    format!("{:?}", https_frontend.method),
+                                    format!("{:?}", https_frontend.position),
+                                ));
+                            }
+                            table.printstd();
+                        }
+
+                        // TCP frontends
+                        if !data.tcp_frontends.is_empty() {
+                            let mut table = Table::new();
+                            table.add_row(row!["TCP frontends"]);
+                            table.add_row(row!["Cluster ID", "address"]);
+                            for tcp_frontend in data.tcp_frontends.iter() {
+                                table.add_row(row!(tcp_frontend.cluster_id, tcp_frontend.address,));
+                            }
+                            table.printstd();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn add_http_listener(

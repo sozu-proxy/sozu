@@ -12,9 +12,9 @@ use std::io;
 use self::command::{
     activate_listener, add_application, add_backend, add_certificate, add_http_frontend,
     add_http_listener, add_https_listener, add_tcp_frontend, add_tcp_listener, deactivate_listener,
-    dump_state, events, hard_stop, load_state, logging_filter, metrics, query_application,
-    query_certificate, query_metrics, reload_configuration, remove_application, remove_backend,
-    remove_certificate, remove_http_frontend, remove_listener, remove_tcp_frontend,
+    dump_state, events, hard_stop, list_frontends, load_state, logging_filter, metrics,
+    query_application, query_certificate, query_metrics, reload_configuration, remove_application,
+    remove_backend, remove_certificate, remove_http_frontend, remove_listener, remove_tcp_frontend,
     replace_certificate, save_state, soft_stop, status, upgrade_main, upgrade_worker,
 };
 use crate::cli::*;
@@ -178,6 +178,9 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
                     remove_tcp_frontend(channel, timeout, &id, address)
                 }
             },
+            FrontendCmd::List { http, https, tcp, domain } => {
+                list_frontends(channel, timeout, http, https, tcp, domain)
+            }
         },
         SubCmd::Listener { cmd } => match cmd {
             ListenerCmd::Http { cmd } => match cmd {
