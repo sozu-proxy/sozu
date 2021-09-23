@@ -26,7 +26,7 @@ log_level = "info"
 # to a unix socket
 # log_target = "unix:///var/sozu/logs
 # to a file
-# log_target = "file:///var/logs/sozu.log"
+# log_target = "file:///var/log/sozu.log"
 # to_stdout
 log_target = "stdout"
 
@@ -36,7 +36,7 @@ log_target = "stdout"
 
 # path to the unix socket file used to send commands to sozu
 # default value points to "sozu.sock" file in the current directory
-command_socket = "./command_folder/sock"
+command_socket = "./sozu.sock"
 
 # size in bytes of the buffer used by the command socket protocol. If the message
 # sent to sozu is too large, or the data that sozu must return is too large, the
@@ -127,7 +127,7 @@ tls_provider = "rustls"
 
 # by default, all listeners start a TCP listen socket o startup
 # if set to false, this option will prevent them from listening. You can then add
-# the complete co,figuration, and send an ActivateListener message afterwards
+# the complete configuration, and send an ActivateListener message afterwards
 activate_listeners= true
 
 # various statistics can be sent to a server that supports the statsd protocol
