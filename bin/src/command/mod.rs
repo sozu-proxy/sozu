@@ -294,7 +294,7 @@ impl CommandServer {
     pub fn disable_cloexec_before_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                let _ =util::disable_close_on_exec(worker.fd).map_err(|e| {
+                let _ = util::disable_close_on_exec(worker.fd).map_err(|e| {
                     error!(
                         "could not disable close on exec for worker {}: {}",
                         worker.id, e
@@ -548,8 +548,11 @@ pub fn start(
 ) -> anyhow::Result<()> {
     let addr = PathBuf::from(&command_socket_path);
 
-    fs::remove_file(&addr)
-        .with_context(|| format!("could not delete previous socket at {:?}", addr))?;
+    if fs::metadata(&addr).is_ok() {
+        info!("A socket is already present. Deleting...");
+        fs::remove_file(&addr)
+            .with_context(|| format!("could not delete previous socket at {:?}", addr))?;
+    }
 
     let srv = match UnixListener::bind(&addr) {
         Err(e) => {
