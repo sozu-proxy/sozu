@@ -178,9 +178,12 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
                     remove_tcp_frontend(channel, timeout, &id, address)
                 }
             },
-            FrontendCmd::List { http, https, tcp, domain } => {
-                list_frontends(channel, timeout, http, https, tcp, domain)
-            }
+            FrontendCmd::List {
+                http,
+                https,
+                tcp,
+                domain,
+            } => list_frontends(channel, timeout, http, https, tcp, domain),
         },
         SubCmd::Listener { cmd } => match cmd {
             ListenerCmd::Http { cmd } => match cmd {
@@ -310,7 +313,9 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
             ),
         },
         SubCmd::Query { cmd, json } => match cmd {
-            QueryCmd::Applications { id, domain } => query_application(channel, json, id, domain),
+            QueryCmd::Applications { id, domain } => {
+                query_application(channel, json, id, domain, timeout)
+            }
             QueryCmd::Certificates {
                 fingerprint,
                 domain,
