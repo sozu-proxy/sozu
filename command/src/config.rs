@@ -1,4 +1,5 @@
 //! parsing data from the configuration file
+use anyhow::{bail, Context};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
@@ -1251,27 +1252,26 @@ impl Config {
         v
     }
 
-    pub fn command_socket_path(&self) -> String {
+    pub fn command_socket_path(&self) -> anyhow::Result<String> {
         let config_path_buf = PathBuf::from(self.config_path.clone());
-        let mut config_folder = config_path_buf
-            .parent()
-            .expect("could not get parent folder of configuration file")
-            .to_path_buf();
+        let mut config_folder = match config_path_buf.parent() {
+            Some(path) => path.to_path_buf(),
+            None => bail!("could not get parent folder of configuration file"),
+        };
 
         let socket_path = PathBuf::from(self.command_socket.clone());
         let mut parent = match socket_path.parent() {
             None => config_folder,
             Some(path) => {
                 config_folder.push(path);
-                match config_folder.canonicalize() {
-                    Ok(path) => path,
-                    Err(e) => panic!("could not get command socket folder path: {}", e),
-                }
+                config_folder.canonicalize().with_context(|| {
+                    format!("could not get command socket folder path: {:?}", path)
+                })?
             }
         };
 
         let path = match socket_path.file_name() {
-            None => panic!("could not get command socket file name"),
+            None => bail!("could not get command socket file name"),
             Some(f) => {
                 parent.push(f);
                 parent
@@ -1280,7 +1280,7 @@ impl Config {
 
         path.to_str()
             .map(|s| s.to_string())
-            .expect("could not parse command socket path")
+            .with_context(|| "could not parse command socket path")
     }
 
     pub fn saved_state_path(&self) -> Option<String> {
