@@ -109,7 +109,7 @@ fn start(matches: &cli::Sozu) -> Result<(), anyhow::Error> {
         set_workers_affinity(&workers);
     }
 
-    let command_socket_path = config.command_socket_path();
+    let command_socket_path = config.command_socket_path()?;
 
     command::start(config, command_socket_path, workers).with_context(|| "could not start Sozu")?;
 

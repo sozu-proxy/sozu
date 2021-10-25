@@ -3,6 +3,7 @@ mod command;
 use crate::cli;
 use crate::util;
 use crate::{get_config_file_path, load_configuration};
+use anyhow::Context;
 use sozu_command::channel::Channel;
 use sozu_command::command::{CommandRequest, CommandResponse};
 use sozu_command::config::Config;
@@ -34,7 +35,8 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
         std::process::exit(0);
     }
 
-    let channel = create_channel(&config).expect("could not connect to the command unix socket");
+    let channel =
+        create_channel(&config).with_context(|| "could not connect to the command unix socket")?;
     let timeout: u64 = matches.timeout.unwrap_or(config.ctl_command_timeout);
 
     match matches.cmd {
@@ -178,9 +180,12 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
                     remove_tcp_frontend(channel, timeout, &id, address)
                 }
             },
-            FrontendCmd::List { http, https, tcp, domain } => {
-                list_frontends(channel, timeout, http, https, tcp, domain)
-            }
+            FrontendCmd::List {
+                http,
+                https,
+                tcp,
+                domain,
+            } => list_frontends(channel, timeout, http, https, tcp, domain),
         },
         SubCmd::Listener { cmd } => match cmd {
             ListenerCmd::Http { cmd } => match cmd {
@@ -331,16 +336,14 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
     }
 }
 
-pub fn create_channel(
-    config: &Config,
-) -> Result<Channel<CommandRequest, CommandResponse>, io::Error> {
-    Channel::from_path(
-        &config.command_socket_path(),
+pub fn create_channel(config: &Config) -> anyhow::Result<Channel<CommandRequest, CommandResponse>> {
+    let mut channel = Channel::from_path(
+        &config.command_socket_path()?,
         config.command_buffer_size,
         config.max_command_buffer_size,
     )
-    .and_then(|mut channel| {
-        channel.set_nonblocking(false);
-        Ok(channel)
-    })
+    .with_context(|| "Could not create Channel from the given path")?;
+
+    channel.set_nonblocking(false);
+    Ok(channel)
 }
