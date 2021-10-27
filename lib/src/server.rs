@@ -454,11 +454,16 @@ impl Server {
             server.channel.set_nonblocking(false);
             let msg = server.channel.read_message();
             debug!("got message: {:?}", msg);
-            server.channel.write_message(&ProxyResponse {
-                id: msg.unwrap().id,
-                status: ProxyResponseStatus::Ok,
-                data: None,
-            });
+
+            // it so happens that trying to upgrade a dead worker will bring no message
+            // which brings the whole main processe to crash because it unwraps a None
+            if msg.is_some() {
+                server.channel.write_message(&ProxyResponse {
+                    id: msg.unwrap().id,
+                    status: ProxyResponseStatus::Ok,
+                    data: None,
+                });
+            }
             server.channel.set_nonblocking(true);
         }
 
