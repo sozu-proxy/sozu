@@ -58,29 +58,49 @@ fn generate_tagged_id(tag: &str) -> String {
 // The calling code waits for this message with a timeout.
 // Note: This macro is used only for simple command which has any/simple computing
 // to do with the message received.
-macro_rules! command_timeout {
-  ($duration: expr, $block: expr) => (
-    if $duration == 0 {
-      $block
-    } else {
-      let (send, recv) = mpsc::channel();
+// macro_rules! command_timeout {
+//   ($duration: expr, $block: expr) => (
+//     if $duration == 0 {
+//       $block
+//     } else {
+//       let (send, recv) = mpsc::channel();
 
-      thread::spawn(move || {
-        $block
-        serde::__private::Ok::<(), anyhow::Error>(send.send(())?)
+//       thread::spawn(move || {
+//         $block
+//         serde::__private::Ok::<(), anyhow::Error>(send.send(())?)
 
-      });
+//       });
 
-      if recv.recv_timeout(Duration::from_millis($duration)).is_err() {
-        eprintln!("Command timeout. The proxy didn't send an answer");
-      }
+//       if recv.recv_timeout(Duration::from_millis($duration)).is_err() {
+//         eprintln!("Command timeout. The proxy didn't send an answer");
+//       }
+//     }
+//   )
+// }
+
+fn read_channel_message_with_timeout(
+    mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: Duration,
+) -> anyhow::Result<CommandResponse> {
+    let (send, recv) = mpsc::channel();
+
+    thread::spawn(move || {
+        let message = channel.read_message();
+        send.send(message)
+    });
+
+    match recv.recv_timeout(timeout) {
+        Err(_) => bail!("Command timeout. The proxy did not answer in time."),
+        Ok(message) => match message {
+            None => bail!("The proxy didn't answer"),
+            Some(payload) => Ok(payload),
+        },
     }
-  )
 }
 
 pub fn save_state(
     mut channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     path: String,
 ) -> Result<(), anyhow::Error> {
     let id = generate_id();
@@ -90,37 +110,31 @@ pub fn save_state(
         None,
     ));
 
-    command_timeout!(timeout, {
-        match channel.read_message() {
-            None => {
-                bail!("the proxy didn't answer");
-            }
-            Some(message) => {
-                if id != message.id {
-                    bail!("received message with invalid id: {:?}", message);
-                }
-                match message.status {
-                    CommandStatus::Processing => {
-                        // do nothing here
-                        // for other messages, we would loop over read_message
-                        // until an error or ok message was sent
-                    }
-                    CommandStatus::Error => {
-                        bail!("could not save proxy state: {}", message.message)
-                    }
-                    CommandStatus::Ok => {
-                        println!("{}", message.message);
-                    }
-                }
-            }
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    if id != message.id {
+        bail!("received message with invalid id: {:?}", message);
+    }
+    match message.status {
+        CommandStatus::Processing => {
+            // do nothing here
+            // for other messages, we would loop over read_message
+            // until an error or ok message was sent
         }
-    });
+        CommandStatus::Error => {
+            bail!("could not save proxy state: {}", message.message)
+        }
+        CommandStatus::Ok => {
+            println!("{}", message.message);
+        }
+    }
+
     Ok(())
 }
 
 pub fn load_state(
     mut channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     path: String,
 ) -> Result<(), anyhow::Error> {
     let id = generate_id();
@@ -130,37 +144,31 @@ pub fn load_state(
         None,
     ));
 
-    command_timeout!(timeout, {
-        match channel.read_message() {
-            None => {
-                bail!("the proxy didn't answer")
-            }
-            Some(message) => {
-                if id != message.id {
-                    bail!("received message with invalid id: {:?}", message);
-                }
-                match message.status {
-                    CommandStatus::Processing => {
-                        // do nothing here
-                        // for other messages, we would loop over read_message
-                        // until an error or ok message was sent
-                    }
-                    CommandStatus::Error => {
-                        bail!("could not load proxy state: {}", message.message)
-                    }
-                    CommandStatus::Ok => {
-                        println!("Proxy state loaded successfully from {}", path);
-                    }
-                }
-            }
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    if id != message.id {
+        bail!("received message with invalid id: {:?}", message);
+    }
+    match message.status {
+        CommandStatus::Processing => {
+            // do nothing here
+            // for other messages, we would loop over read_message
+            // until an error or ok message was sent
         }
-    });
+        CommandStatus::Error => {
+            bail!("could not load proxy state: {}", message.message)
+        }
+        CommandStatus::Ok => {
+            println!("Proxy state loaded successfully from {}", path);
+        }
+    }
+
     Ok(())
 }
 
 pub fn dump_state(
     mut channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     json: bool,
 ) -> Result<(), anyhow::Error> {
     let id = generate_id();
@@ -170,47 +178,41 @@ pub fn dump_state(
         None,
     ));
 
-    command_timeout!(timeout, {
-        match channel.read_message() {
-            None => {
-                bail!("the proxy didn't answer");
-            }
-            Some(message) => {
-                if id != message.id {
-                    bail!("received message with invalid id: {:?}", message);
-                }
-                match message.status {
-                    CommandStatus::Processing => {
-                        // do nothing here
-                        // for other messages, we would loop over read_message
-                        // until an error or ok message was sent
-                    }
-                    CommandStatus::Error => {
-                        if json {
-                            print_json_response(&message.message)?;
-                        }
-                        bail!("could not dump proxy state: {}", message.message);
-                    }
-                    CommandStatus::Ok => {
-                        if let Some(CommandResponseData::State(state)) = message.data {
-                            if json {
-                                print_json_response(&state)?;
-                            } else {
-                                println!("{:#?}", state);
-                            }
-                            return Ok(());
-                        }
-                        bail!("state dump was empty");
-                    }
-                }
-            }
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    if id != message.id {
+        bail!("received message with invalid id: {:?}", message);
+    }
+    match message.status {
+        CommandStatus::Processing => {
+            // do nothing here
+            // for other messages, we would loop over read_message
+            // until an error or ok message was sent
         }
-    });
+        CommandStatus::Error => {
+            if json {
+                print_json_response(&message.message)?;
+            }
+            bail!("could not dump proxy state: {}", message.message);
+        }
+        CommandStatus::Ok => {
+            if let Some(CommandResponseData::State(state)) = message.data {
+                if json {
+                    print_json_response(&state)?;
+                } else {
+                    println!("{:#?}", state);
+                }
+                return Ok(());
+            }
+            bail!("state dump was empty");
+        }
+    }
     Ok(())
 }
 
 pub fn soft_stop(
     mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: Duration,
     proxy_id: Option<u32>,
 ) -> Result<(), anyhow::Error> {
     println!("shutting down proxy");
@@ -221,37 +223,30 @@ pub fn soft_stop(
         proxy_id,
     ));
 
-    loop {
-        match channel.read_message() {
-            None => {
-                bail!("the proxy didn't answer");
-            }
-            Some(message) => {
-                if &id != &message.id {
-                    bail!("received message with invalid id: {:?}", message);
-                }
-                match message.status {
-                    CommandStatus::Processing => {
-                        println!("Proxy is processing: {}", message.message);
-                    }
-                    CommandStatus::Error => {
-                        bail!("could not stop the proxy: {}", message.message);
-                    }
-                    CommandStatus::Ok => {
-                        println!("Proxy shut down with message: \"{}\"", message.message);
-                        break;
-                    }
-                }
-            }
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    if &id != &message.id {
+        bail!("received message with invalid id: {:?}", message);
+    }
+    match message.status {
+        CommandStatus::Processing => {
+            println!("Proxy is processing: {}", message.message);
+        }
+        CommandStatus::Error => {
+            bail!("could not stop the proxy: {}", message.message);
+        }
+        CommandStatus::Ok => {
+            println!("Proxy shut down with message: \"{}\"", message.message);
         }
     }
+
     Ok(())
 }
 
 pub fn hard_stop(
     mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: Duration,
     proxy_id: Option<u32>,
-    timeout: u64,
 ) -> Result<(), anyhow::Error> {
     println!("shutting down proxy");
     let id = generate_id();
@@ -261,35 +256,27 @@ pub fn hard_stop(
         proxy_id,
     ));
 
-    command_timeout!(
-        timeout,
-        loop {
-            match channel.read_message() {
-                None => {
-                    bail!("the proxy didn't answer");
-                }
-                Some(message) => match message.status {
-                    CommandStatus::Processing => {
-                        println!("Proxy is processing: {}", message.message);
-                    }
-                    CommandStatus::Error => {
-                        bail!("could not stop the proxy: {}", message.message);
-                    }
-                    CommandStatus::Ok => {
-                        if &id == &message.id {
-                            println!("Proxy shut down: {}", message.message);
-                            break;
-                        }
-                    }
-                },
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    match message.status {
+        CommandStatus::Processing => {
+            println!("Proxy is processing: {}", message.message);
+        }
+        CommandStatus::Error => {
+            bail!("could not stop the proxy: {}", message.message);
+        }
+        CommandStatus::Ok => {
+            if &id == &message.id {
+                println!("Proxy shut down: {}", message.message);
             }
         }
-    );
+    }
     Ok(())
 }
 
 pub fn upgrade_main(
     mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: Duration,
     config: &Config,
 ) -> Result<(), anyhow::Error> {
     println!("Preparing to upgrade proxy...");
@@ -301,109 +288,92 @@ pub fn upgrade_main(
         None,
     ));
 
-    loop {
-        match channel.read_message() {
-            None => {
-                bail!("Error: the proxy didn't list workers");
-            }
-            Some(message) => {
-                if id != message.id {
-                    bail!("Error: received unexpected message: {:?}", message);
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    if id != message.id {
+        bail!("Error: received unexpected message: {:?}", message);
+    }
+    match message.status {
+        CommandStatus::Processing => {
+            error!("Error: the proxy didn't return list of workers immediately");
+        }
+        CommandStatus::Error => {
+            bail!(
+                "Error: failed to get the list of worker: {}",
+                message.message
+            );
+        }
+        CommandStatus::Ok => {
+            if let Some(CommandResponseData::Workers(ref workers)) = message.data {
+                let mut table = Table::new();
+                table.add_row(row!["Worker", "pid", "run state"]);
+                for ref worker in workers.iter() {
+                    let run_state = format!("{:?}", worker.run_state);
+                    table.add_row(row![worker.id, worker.pid, run_state]);
                 }
-                match message.status {
-                    CommandStatus::Processing => {
-                        error!("Error: the proxy didn't return list of workers immediately");
-                    }
-                    CommandStatus::Error => {
-                        bail!(
-                            "Error: failed to get the list of worker: {}",
-                            message.message
-                        );
-                    }
-                    CommandStatus::Ok => {
-                        if let Some(CommandResponseData::Workers(ref workers)) = message.data {
-                            let mut table = Table::new();
-                            table.add_row(row!["Worker", "pid", "run state"]);
-                            for ref worker in workers.iter() {
-                                let run_state = format!("{:?}", worker.run_state);
-                                table.add_row(row![worker.id, worker.pid, run_state]);
+                println!("");
+                table.printstd();
+                println!("");
+
+                let id = generate_tagged_id("UPGRADE-MAIN");
+                channel.write_message(&CommandRequest::new(
+                    id.clone(),
+                    CommandRequestData::UpgradeMain,
+                    None,
+                ));
+                println!("Upgrading main process");
+
+                loop {
+                    match channel.read_message() {
+                        None => {
+                            bail!("Error: the proxy didn't start main upgrade");
+                        }
+                        Some(message) => {
+                            if &id != &message.id {
+                                bail!("Error: received unexpected message: {:?}", message);
                             }
-                            println!("");
-                            table.printstd();
-                            println!("");
-
-                            let id = generate_tagged_id("UPGRADE-MAIN");
-                            channel.write_message(&CommandRequest::new(
-                                id.clone(),
-                                CommandRequestData::UpgradeMain,
-                                None,
-                            ));
-                            println!("Upgrading main process");
-
-                            loop {
-                                match channel.read_message() {
-                                    None => {
-                                        bail!("Error: the proxy didn't start main upgrade");
-                                    }
-                                    Some(message) => {
-                                        if &id != &message.id {
-                                            bail!(
-                                                "Error: received unexpected message: {:?}",
-                                                message
-                                            );
-                                        }
-                                        match message.status {
-                                            CommandStatus::Processing => {}
-                                            CommandStatus::Error => {
-                                                bail!(
-                                                    "Error: failed to upgrade the main: {}",
-                                                    message.message
-                                                );
-                                            }
-                                            CommandStatus::Ok => {
-                                                println!(
-                                                    "Main process upgrade succeeded: {}",
-                                                    message.message
-                                                );
-                                                break;
-                                            }
-                                        }
-                                    }
+                            match message.status {
+                                CommandStatus::Processing => {}
+                                CommandStatus::Error => {
+                                    bail!("Error: failed to upgrade the main: {}", message.message);
+                                }
+                                CommandStatus::Ok => {
+                                    println!("Main process upgrade succeeded: {}", message.message);
+                                    break;
                                 }
                             }
-
-                            // Reconnect to the new main
-                            println!("Reconnecting to new main process...");
-                            let mut channel = create_channel(&config).with_context(|| {
-                                "could not reconnect to the command unix socket"
-                            })?;
-
-                            // Do a rolling restart of the workers
-                            let running_workers = workers
-                                .iter()
-                                .filter(|worker| worker.run_state == RunState::Running)
-                                .collect::<Vec<_>>();
-                            let running_count = running_workers.len();
-                            for (i, ref worker) in running_workers.iter().enumerate() {
-                                println!("Upgrading worker {} (of {})", i + 1, running_count);
-
-                                channel = upgrade_worker(channel, 0, worker.id)?;
-                                //thread::sleep(Duration::from_millis(1000));
-                            }
-
-                            println!("Proxy successfully upgraded!");
                         }
-                        break Ok(());
                     }
                 }
+
+                // Reconnect to the new main
+                println!("Reconnecting to new main process...");
+                let mut channel = create_channel(&config)
+                    .with_context(|| "could not reconnect to the command unix socket")?;
+
+                // Do a rolling restart of the workers
+                let running_workers = workers
+                    .iter()
+                    .filter(|worker| worker.run_state == RunState::Running)
+                    .collect::<Vec<_>>();
+                let running_count = running_workers.len();
+                for (i, ref worker) in running_workers.iter().enumerate() {
+                    println!("Upgrading worker {} (of {})", i + 1, running_count);
+
+                    channel = upgrade_worker(channel, Duration::ZERO, worker.id)?;
+                    //thread::sleep(Duration::from_millis(1000));
+                }
+
+                println!("Proxy successfully upgraded!");
             }
         }
     }
+    Ok(())
 }
 
 pub fn upgrade_worker(
     mut channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     worker_id: u32,
 ) -> Result<Channel<CommandRequest, CommandResponse>, anyhow::Error> {
     println!("upgrading worker {}", worker_id);
@@ -415,7 +385,7 @@ pub fn upgrade_worker(
         None,
     ));
 
-    // We do our own timeout so we can return the Channel object from the thread
+    // The timeout logic is rewritten here so we can return the Channel object from the thread
     // and avoid ownership issues
     let (send, recv) = mpsc::channel();
 
@@ -446,7 +416,7 @@ pub fn upgrade_worker(
         Ok(channel)
     });
 
-    if timeout > 0 && recv.recv_timeout(Duration::from_millis(timeout)).is_err() {
+    if timeout > Duration::ZERO && recv.recv_timeout(timeout).is_err() {
         bail!("Command timeout. The proxy didn't send answer");
     }
 
@@ -460,6 +430,7 @@ pub fn upgrade_worker(
 
 pub fn status(
     mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: Duration,
     json: bool,
 ) -> Result<(), anyhow::Error> {
     let id = generate_id();
@@ -469,167 +440,162 @@ pub fn status(
         None,
     ));
 
-    match channel.read_message() {
-        None => {
-            bail!("the proxy didn't answer");
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    if id != message.id {
+        bail!("received message with invalid id: {:?}", message);
+    }
+    match message.status {
+        CommandStatus::Processing => {
+            bail!("should have obtained an answer immediately");
         }
-        Some(message) => {
-            if id != message.id {
-                bail!("received message with invalid id: {:?}", message);
+        CommandStatus::Error => {
+            if json {
+                print_json_response(&message.message)?;
             }
-            match message.status {
-                CommandStatus::Processing => {
-                    bail!("should have obtained an answer immediately");
-                }
-                CommandStatus::Error => {
-                    if json {
-                        print_json_response(&message.message)?;
-                    }
-                    bail!("could not get the worker list: {}", message.message);
-                }
-                CommandStatus::Ok => {
-                    //println!("Worker list:\n{:?}", message.data);
-                    if let Some(CommandResponseData::Workers(ref workers)) = message.data {
-                        let mut expecting: HashSet<String> = HashSet::new();
+            bail!("could not get the worker list: {}", message.message);
+        }
+        CommandStatus::Ok => {
+            //println!("Worker list:\n{:?}", message.data);
+            if let Some(CommandResponseData::Workers(ref workers)) = message.data {
+                let mut expecting: HashSet<String> = HashSet::new();
 
-                        let mut h = HashMap::new();
-                        for ref worker in workers
-                            .iter()
-                            .filter(|worker| worker.run_state == RunState::Running)
-                        {
-                            let id = generate_id();
-                            let msg = CommandRequest::new(
-                                id.clone(),
-                                CommandRequestData::Proxy(ProxyRequestData::Status),
-                                Some(worker.id),
-                            );
-                            //println!("sending message: {:?}", msg);
-                            channel.write_message(&msg);
-                            expecting.insert(id.clone());
-                            h.insert(id, (worker.id, CommandStatus::Processing));
+                let mut h = HashMap::new();
+                for ref worker in workers
+                    .iter()
+                    .filter(|worker| worker.run_state == RunState::Running)
+                {
+                    let id = generate_id();
+                    let msg = CommandRequest::new(
+                        id.clone(),
+                        CommandRequestData::Proxy(ProxyRequestData::Status),
+                        Some(worker.id),
+                    );
+                    //println!("sending message: {:?}", msg);
+                    channel.write_message(&msg);
+                    expecting.insert(id.clone());
+                    h.insert(id, (worker.id, CommandStatus::Processing));
+                }
+
+                let state = Arc::new(Mutex::new(h));
+                let st = state.clone();
+                let (send, recv) = mpsc::channel();
+
+                thread::spawn(move || {
+                    loop {
+                        //println!("expecting: {:?}", expecting);
+                        if expecting.is_empty() {
+                            break;
                         }
-
-                        let state = Arc::new(Mutex::new(h));
-                        let st = state.clone();
-                        let (send, recv) = mpsc::channel();
-
-                        thread::spawn(move || {
-                            loop {
-                                //println!("expecting: {:?}", expecting);
-                                if expecting.is_empty() {
-                                    break;
-                                }
-                                match channel.read_message() {
-                                    None => {
-                                        eprintln!("the proxy didn't answer");
+                        match channel.read_message() {
+                            None => {
+                                eprintln!("the proxy didn't answer");
+                                exit(1);
+                            }
+                            Some(message) => {
+                                //println!("received message: {:?}", message);
+                                match message.status {
+                                    CommandStatus::Processing => {}
+                                    CommandStatus::Error => {
+                                        eprintln!(
+                                            "error for message[{}]: {}",
+                                            message.id, message.message
+                                        );
+                                        if expecting.contains(&message.id) {
+                                            expecting.remove(&message.id);
+                                            //println!("status message with ID {} done", message.id);
+                                            if let Ok(mut h) = state.try_lock() {
+                                                if let Some(data) = h.get_mut(&message.id) {
+                                                    *data = ((*data).0, CommandStatus::Error);
+                                                }
+                                            }
+                                        }
                                         exit(1);
                                     }
-                                    Some(message) => {
-                                        //println!("received message: {:?}", message);
-                                        match message.status {
-                                            CommandStatus::Processing => {}
-                                            CommandStatus::Error => {
-                                                eprintln!(
-                                                    "error for message[{}]: {}",
-                                                    message.id, message.message
-                                                );
-                                                if expecting.contains(&message.id) {
-                                                    expecting.remove(&message.id);
-                                                    //println!("status message with ID {} done", message.id);
-                                                    if let Ok(mut h) = state.try_lock() {
-                                                        if let Some(data) = h.get_mut(&message.id) {
-                                                            *data =
-                                                                ((*data).0, CommandStatus::Error);
-                                                        }
-                                                    }
-                                                }
-                                                exit(1);
-                                            }
-                                            CommandStatus::Ok => {
-                                                if expecting.contains(&message.id) {
-                                                    expecting.remove(&message.id);
-                                                    //println!("status message with ID {} done", message.id);
-                                                    if let Ok(mut h) = state.try_lock() {
-                                                        if let Some(data) = h.get_mut(&message.id) {
-                                                            *data = ((*data).0, CommandStatus::Ok);
-                                                        }
-                                                    }
+                                    CommandStatus::Ok => {
+                                        if expecting.contains(&message.id) {
+                                            expecting.remove(&message.id);
+                                            //println!("status message with ID {} done", message.id);
+                                            if let Ok(mut h) = state.try_lock() {
+                                                if let Some(data) = h.get_mut(&message.id) {
+                                                    *data = ((*data).0, CommandStatus::Ok);
                                                 }
                                             }
                                         }
                                     }
                                 }
                             }
-
-                            send.send(()).unwrap();
-                        });
-
-                        let finished = recv.recv_timeout(Duration::from_millis(1000)).is_ok();
-                        let placeholder = if finished {
-                            String::from("")
-                        } else {
-                            String::from("timeout")
-                        };
-
-                        let h2: HashMap<u32, String> = if let Ok(state) = st.try_lock() {
-                            state
-                                .values()
-                                .map(|&(ref id, ref status)| {
-                                    (
-                                        *id,
-                                        String::from(match *status {
-                                            CommandStatus::Processing => {
-                                                if finished {
-                                                    "processing"
-                                                } else {
-                                                    "timeout"
-                                                }
-                                            }
-                                            CommandStatus::Error => "error",
-                                            CommandStatus::Ok => "ok",
-                                        }),
-                                    )
-                                })
-                                .collect()
-                        } else {
-                            HashMap::new()
-                        };
-
-                        if json {
-                            let workers_status: Vec<WorkerStatus> = workers
-                                .iter()
-                                .map(|ref worker| WorkerStatus {
-                                    worker: worker,
-                                    status: h2.get(&worker.id).unwrap_or(&placeholder),
-                                })
-                                .collect();
-                            print_json_response(&workers_status)?;
-                        } else {
-                            let mut table = Table::new();
-
-                            table.add_row(row!["Worker", "pid", "run state", "answer"]);
-                            for ref worker in workers.iter() {
-                                let run_state = format!("{:?}", worker.run_state);
-                                table.add_row(row![
-                                    worker.id,
-                                    worker.pid,
-                                    run_state,
-                                    h2.get(&worker.id).unwrap_or(&placeholder)
-                                ]);
-                            }
-
-                            table.printstd();
                         }
                     }
-                    Ok(())
+
+                    send.send(()).unwrap();
+                });
+
+                let finished = recv.recv_timeout(Duration::from_millis(1000)).is_ok();
+                let placeholder = if finished {
+                    String::from("")
+                } else {
+                    String::from("timeout")
+                };
+
+                let h2: HashMap<u32, String> = if let Ok(state) = st.try_lock() {
+                    state
+                        .values()
+                        .map(|&(ref id, ref status)| {
+                            (
+                                *id,
+                                String::from(match *status {
+                                    CommandStatus::Processing => {
+                                        if finished {
+                                            "processing"
+                                        } else {
+                                            "timeout"
+                                        }
+                                    }
+                                    CommandStatus::Error => "error",
+                                    CommandStatus::Ok => "ok",
+                                }),
+                            )
+                        })
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
+
+                if json {
+                    let workers_status: Vec<WorkerStatus> = workers
+                        .iter()
+                        .map(|ref worker| WorkerStatus {
+                            worker: worker,
+                            status: h2.get(&worker.id).unwrap_or(&placeholder),
+                        })
+                        .collect();
+                    print_json_response(&workers_status)?;
+                } else {
+                    let mut table = Table::new();
+
+                    table.add_row(row!["Worker", "pid", "run state", "answer"]);
+                    for ref worker in workers.iter() {
+                        let run_state = format!("{:?}", worker.run_state);
+                        table.add_row(row![
+                            worker.id,
+                            worker.pid,
+                            run_state,
+                            h2.get(&worker.id).unwrap_or(&placeholder)
+                        ]);
+                    }
+
+                    table.printstd();
                 }
             }
         }
     }
+    Ok(())
 }
 
 pub fn metrics(
     mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: Duration,
     cmd: MetricsCmd,
 ) -> Result<(), anyhow::Error> {
     let id = generate_id();
@@ -659,27 +625,22 @@ pub fn metrics(
         None,
     ));
 
-    // we should add a timeout somehow, otherwise it hangs
-    loop {
-        match channel.read_message() {
-            None => {
-                bail!("the proxy didn't answer");
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    match message.status {
+        CommandStatus::Processing => {
+            println!("Proxy is processing: {}", message.message);
+        }
+        CommandStatus::Error => {
+            bail!("could not stop the proxy: {}", message.message);
+        }
+        CommandStatus::Ok => {
+            if &id == &message.id {
+                println!("Successfully stopped the proxy");
             }
-            Some(message) => match message.status {
-                CommandStatus::Processing => {
-                    println!("Proxy is processing: {}", message.message);
-                }
-                CommandStatus::Error => {
-                    bail!("could not stop the proxy: {}", message.message);
-                }
-                CommandStatus::Ok => {
-                    if &id == &message.id {
-                        break Ok(());
-                    }
-                }
-            },
         }
     }
+    Ok(())
 }
 
 // input: map worker_id -> (map key -> value)
@@ -799,6 +760,7 @@ fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, Filt
 
 pub fn reload_configuration(
     mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: Duration,
     path: Option<String>,
     json: bool,
 ) -> Result<(), anyhow::Error> {
@@ -809,40 +771,36 @@ pub fn reload_configuration(
         None,
     ));
 
-    match channel.read_message() {
-        None => {
-            bail!("the proxy didn't answer");
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    if id != message.id {
+        bail!("received message with invalid id: {:?}", message);
+    }
+    match message.status {
+        CommandStatus::Processing => {
+            bail!("should have obtained an answer immediately");
         }
-        Some(message) => {
-            if id != message.id {
-                bail!("received message with invalid id: {:?}", message);
+        CommandStatus::Error => {
+            if json {
+                print_json_response(&message.message)?;
             }
-            match message.status {
-                CommandStatus::Processing => {
-                    bail!("should have obtained an answer immediately");
-                }
-                CommandStatus::Error => {
-                    if json {
-                        print_json_response(&message.message)?;
-                    }
-                    bail!("could not get the worker list: {}", message.message);
-                }
-                CommandStatus::Ok => {
-                    if json {
-                        print_json_response(&message.message)?;
-                    } else {
-                        println!("Reloaded configuration: {}", message.message);
-                    }
-                    Ok(())
-                }
+            bail!("could not get the worker list: {}", message.message);
+        }
+        CommandStatus::Ok => {
+            if json {
+                print_json_response(&message.message)?;
+            } else {
+                println!("Reloaded configuration: {}", message.message);
             }
         }
     }
+
+    Ok(())
 }
 
 pub fn add_application(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     cluster_id: &str,
     sticky_session: bool,
     https_redirect: bool,
@@ -874,7 +832,7 @@ pub fn add_application(
 
 pub fn remove_application(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     cluster_id: &str,
 ) -> Result<(), anyhow::Error> {
     order_command(
@@ -888,7 +846,7 @@ pub fn remove_application(
 
 pub fn add_http_frontend(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     route: Route,
     address: SocketAddr,
     hostname: &str,
@@ -927,7 +885,7 @@ pub fn add_http_frontend(
 
 pub fn remove_http_frontend(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     route: Route,
     address: SocketAddr,
     hostname: &str,
@@ -966,7 +924,7 @@ pub fn remove_http_frontend(
 
 pub fn add_backend(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     cluster_id: &str,
     backend_id: &str,
     address: SocketAddr,
@@ -989,7 +947,7 @@ pub fn add_backend(
 
 pub fn remove_backend(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     cluster_id: &str,
     backend_id: &str,
     address: SocketAddr,
@@ -1007,7 +965,7 @@ pub fn remove_backend(
 
 pub fn add_certificate(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     address: SocketAddr,
     certificate_path: &str,
     certificate_chain_path: &str,
@@ -1033,7 +991,7 @@ pub fn add_certificate(
 
 pub fn remove_certificate(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     address: SocketAddr,
     certificate_path: Option<&str>,
     fingerprint: Option<&str>,
@@ -1073,7 +1031,7 @@ pub fn remove_certificate(
 
 pub fn replace_certificate(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     address: SocketAddr,
     new_certificate_path: &str,
     new_certificate_chain_path: &str,
@@ -1119,7 +1077,7 @@ pub fn replace_certificate(
 
 pub fn add_tcp_frontend(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     cluster_id: &str,
     address: SocketAddr,
 ) -> Result<(), anyhow::Error> {
@@ -1135,7 +1093,7 @@ pub fn add_tcp_frontend(
 
 pub fn remove_tcp_frontend(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     cluster_id: &str,
     address: SocketAddr,
 ) -> Result<(), anyhow::Error> {
@@ -1151,84 +1109,86 @@ pub fn remove_tcp_frontend(
 
 pub fn list_frontends(
     mut channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     http: bool,
     https: bool,
     tcp: bool,
     domain: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    let command = CommandRequestData::ListFrontends(FrontendFilters { http, https, tcp, domain });
+    let command = CommandRequestData::ListFrontends(FrontendFilters {
+        http,
+        https,
+        tcp,
+        domain,
+    });
 
     let id = generate_id();
     channel.write_message(&CommandRequest::new(id.clone(), command, None));
 
-    match channel.read_message() {
-        None => bail!("the proxy didn't answer"),
-        Some(message) => {
-            if id != message.id {
-                bail!("received message with invalid id: {:?}", message);
-            }
-            match message.status {
-                CommandStatus::Processing => {}
-                CommandStatus::Error => {
-                    println!("could not query proxy state: {}", message.message)
-                }
-                CommandStatus::Ok => {
-                    debug!("We received this response: {:?}", message.data);
+    let message = read_channel_message_with_timeout(channel, timeout)?;
 
-                    if let Some(CommandResponseData::FrontendList(data)) = message.data {
-                        trace!(" We received this data to display {:#?}", data);
-                        // HTTP frontends
-                        if !data.http_frontends.is_empty() {
-                            let mut table = Table::new();
-                            table.add_row(row!["HTTP frontends"]);
-                            table.add_row(row![
-                                "route", "address", "hostname", "path", "method", "position"
-                            ]);
-                            for http_frontend in data.http_frontends.iter() {
-                                table.add_row(row!(
-                                    http_frontend.route,
-                                    http_frontend.address.to_string(),
-                                    http_frontend.hostname.to_string(),
-                                    format!("{:?}", http_frontend.path),
-                                    format!("{:?}", http_frontend.method),
-                                    format!("{:?}", http_frontend.position),
-                                ));
-                            }
-                            table.printstd();
-                        }
+    if id != message.id {
+        bail!("received message with invalid id: {:?}", message);
+    }
+    match message.status {
+        CommandStatus::Processing => {}
+        CommandStatus::Error => {
+            println!("could not query proxy state: {}", message.message)
+        }
+        CommandStatus::Ok => {
+            debug!("We received this response: {:?}", message.data);
 
-                        // HTTPS frontends
-                        if !data.https_frontends.is_empty() {
-                            let mut table = Table::new();
-                            table.add_row(row!["HTTPS frontends"]);
-                            table.add_row(row![
-                                "route", "address", "hostname", "path", "method", "position"
-                            ]);
-                            for https_frontend in data.https_frontends.iter() {
-                                table.add_row(row!(
-                                    https_frontend.route,
-                                    https_frontend.address.to_string(),
-                                    https_frontend.hostname.to_string(),
-                                    format!("{:?}", https_frontend.path),
-                                    format!("{:?}", https_frontend.method),
-                                    format!("{:?}", https_frontend.position),
-                                ));
-                            }
-                            table.printstd();
-                        }
-
-                        // TCP frontends
-                        if !data.tcp_frontends.is_empty() {
-                            let mut table = Table::new();
-                            table.add_row(row!["TCP frontends"]);
-                            table.add_row(row!["Cluster ID", "address"]);
-                            for tcp_frontend in data.tcp_frontends.iter() {
-                                table.add_row(row!(tcp_frontend.cluster_id, tcp_frontend.address,));
-                            }
-                            table.printstd();
-                        }
+            if let Some(CommandResponseData::FrontendList(data)) = message.data {
+                trace!(" We received this data to display {:#?}", data);
+                // HTTP frontends
+                if !data.http_frontends.is_empty() {
+                    let mut table = Table::new();
+                    table.add_row(row!["HTTP frontends"]);
+                    table.add_row(row![
+                        "route", "address", "hostname", "path", "method", "position"
+                    ]);
+                    for http_frontend in data.http_frontends.iter() {
+                        table.add_row(row!(
+                            http_frontend.route,
+                            http_frontend.address.to_string(),
+                            http_frontend.hostname.to_string(),
+                            format!("{:?}", http_frontend.path),
+                            format!("{:?}", http_frontend.method),
+                            format!("{:?}", http_frontend.position),
+                        ));
                     }
+                    table.printstd();
+                }
+
+                // HTTPS frontends
+                if !data.https_frontends.is_empty() {
+                    let mut table = Table::new();
+                    table.add_row(row!["HTTPS frontends"]);
+                    table.add_row(row![
+                        "route", "address", "hostname", "path", "method", "position"
+                    ]);
+                    for https_frontend in data.https_frontends.iter() {
+                        table.add_row(row!(
+                            https_frontend.route,
+                            https_frontend.address.to_string(),
+                            https_frontend.hostname.to_string(),
+                            format!("{:?}", https_frontend.path),
+                            format!("{:?}", https_frontend.method),
+                            format!("{:?}", https_frontend.position),
+                        ));
+                    }
+                    table.printstd();
+                }
+
+                // TCP frontends
+                if !data.tcp_frontends.is_empty() {
+                    let mut table = Table::new();
+                    table.add_row(row!["TCP frontends"]);
+                    table.add_row(row!["Cluster ID", "address"]);
+                    for tcp_frontend in data.tcp_frontends.iter() {
+                        table.add_row(row!(tcp_frontend.cluster_id, tcp_frontend.address,));
+                    }
+                    table.printstd();
                 }
             }
         }
@@ -1239,7 +1199,7 @@ pub fn list_frontends(
 
 pub fn add_http_listener(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     address: SocketAddr,
     public_address: Option<SocketAddr>,
     answer_404: Option<String>,
@@ -1264,7 +1224,7 @@ pub fn add_http_listener(
 
 pub fn add_https_listener(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     address: SocketAddr,
     public_address: Option<SocketAddr>,
     answer_404: Option<String>,
@@ -1303,7 +1263,7 @@ pub fn add_https_listener(
 
 pub fn add_tcp_listener(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     address: SocketAddr,
     public_address: Option<SocketAddr>,
     expect_proxy: bool,
@@ -1324,7 +1284,7 @@ pub fn add_tcp_listener(
 
 pub fn remove_listener(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     address: SocketAddr,
     proxy: ListenerType,
 ) -> Result<(), anyhow::Error> {
@@ -1337,7 +1297,7 @@ pub fn remove_listener(
 
 pub fn activate_listener(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     address: SocketAddr,
     proxy: ListenerType,
 ) -> Result<(), anyhow::Error> {
@@ -1354,7 +1314,7 @@ pub fn activate_listener(
 
 pub fn deactivate_listener(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     address: SocketAddr,
     proxy: ListenerType,
 ) -> Result<(), anyhow::Error> {
@@ -1371,6 +1331,7 @@ pub fn deactivate_listener(
 
 pub fn query_application(
     mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: Duration,
     json: bool,
     application_id: Option<String>,
     domain: Option<String>,
@@ -1408,281 +1369,269 @@ pub fn query_application(
     let id = generate_id();
     channel.write_message(&CommandRequest::new(id.clone(), command, None));
 
-    match channel.read_message() {
-        None => {
-            bail!("the proxy didn't answer");
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    if id != message.id {
+        bail!("received message with invalid id: {:?}", message);
+    }
+    match message.status {
+        CommandStatus::Processing => {
+            // do nothing here
+            // for other messages, we would loop over read_message
+            // until an error or ok message was sent
         }
-        Some(message) => {
-            if id != message.id {
-                bail!("received message with invalid id: {:?}", message);
+        CommandStatus::Error => {
+            if json {
+                print_json_response(&message.message)?;
             }
-            match message.status {
-                CommandStatus::Processing => {
-                    // do nothing here
-                    // for other messages, we would loop over read_message
-                    // until an error or ok message was sent
-                    Ok(())
-                }
-                CommandStatus::Error => {
+            bail!("could not query proxy state: {}", message.message);
+        }
+        CommandStatus::Ok => {
+            if let Some(needle) = application_id.or(domain) {
+                if let Some(CommandResponseData::Query(data)) = message.data {
                     if json {
-                        print_json_response(&message.message)?;
+                        return Ok(print_json_response(&data)?);
                     }
-                    bail!("could not query proxy state: {}", message.message);
+
+                    let application_headers = vec!["id", "sticky_session", "https_redirect"];
+                    let mut application_table =
+                        create_queried_application_table(application_headers, &data);
+
+                    let http_headers = vec!["id", "hostname", "path"];
+                    let mut frontend_table = create_queried_application_table(http_headers, &data);
+
+                    let https_headers = vec!["id", "hostname", "path"];
+                    let mut https_frontend_table =
+                        create_queried_application_table(https_headers, &data);
+
+                    let tcp_headers = vec!["id", "address"];
+                    let mut tcp_frontend_table =
+                        create_queried_application_table(tcp_headers, &data);
+
+                    let backend_headers = vec!["backend id", "IP address", "Backup"];
+                    let mut backend_table =
+                        create_queried_application_table(backend_headers, &data);
+
+                    let keys: HashSet<&String> = data.keys().collect();
+
+                    let mut application_data = HashMap::new();
+                    let mut frontend_data = HashMap::new();
+                    let mut https_frontend_data = HashMap::new();
+                    let mut tcp_frontend_data = HashMap::new();
+                    let mut backend_data = HashMap::new();
+
+                    for (ref key, ref metrics) in data.iter() {
+                        //let m: u8 = metrics;
+                        if let &QueryAnswer::Applications(ref apps) = *metrics {
+                            for app in apps.iter() {
+                                let entry = application_data.entry(app).or_insert(Vec::new());
+                                entry.push((*key).clone());
+
+                                for frontend in app.http_frontends.iter() {
+                                    let entry = frontend_data.entry(frontend).or_insert(Vec::new());
+                                    entry.push((*key).clone());
+                                }
+
+                                for frontend in app.https_frontends.iter() {
+                                    let entry =
+                                        https_frontend_data.entry(frontend).or_insert(Vec::new());
+                                    entry.push((*key).clone());
+                                }
+
+                                for frontend in app.tcp_frontends.iter() {
+                                    let entry =
+                                        tcp_frontend_data.entry(frontend).or_insert(Vec::new());
+                                    entry.push((*key).clone());
+                                }
+
+                                for backend in app.backends.iter() {
+                                    let entry = backend_data.entry(backend).or_insert(Vec::new());
+                                    entry.push((*key).clone());
+                                }
+                            }
+                        }
+                    }
+
+                    println!("Cluster level configuration for {}:\n", needle);
+
+                    for (ref key, ref values) in application_data.iter() {
+                        let mut row = Vec::new();
+                        row.push(cell!(key
+                            .configuration
+                            .clone()
+                            .map(|conf| conf.cluster_id)
+                            .unwrap_or(String::from(""))));
+                        row.push(cell!(key
+                            .configuration
+                            .clone()
+                            .map(|conf| conf.sticky_session)
+                            .unwrap_or(false)));
+                        row.push(cell!(key
+                            .configuration
+                            .clone()
+                            .map(|conf| conf.https_redirect)
+                            .unwrap_or(false)));
+
+                        for val in values.iter() {
+                            if keys.contains(val) {
+                                row.push(cell!(String::from("X")));
+                            } else {
+                                row.push(cell!(String::from("")));
+                            }
+                        }
+
+                        application_table.add_row(Row::new(row));
+                    }
+
+                    application_table.printstd();
+
+                    println!("\nHTTP frontends configuration for {}:\n", needle);
+
+                    for (ref key, ref values) in frontend_data.iter() {
+                        let mut row = Vec::new();
+                        match &key.route {
+                            Route::ClusterId(cluster_id) => row.push(cell!(cluster_id)),
+                            Route::Deny => row.push(cell!("-")),
+                        }
+                        row.push(cell!(key.hostname));
+                        row.push(cell!(key.path));
+
+                        for val in values.iter() {
+                            if keys.contains(val) {
+                                row.push(cell!(String::from("X")));
+                            } else {
+                                row.push(cell!(String::from("")));
+                            }
+                        }
+
+                        frontend_table.add_row(Row::new(row));
+                    }
+
+                    frontend_table.printstd();
+
+                    println!("\nHTTPS frontends configuration for {}:\n", needle);
+
+                    for (ref key, ref values) in https_frontend_data.iter() {
+                        let mut row = Vec::new();
+                        match &key.route {
+                            Route::ClusterId(cluster_id) => row.push(cell!(cluster_id)),
+                            Route::Deny => row.push(cell!("-")),
+                        }
+                        row.push(cell!(key.hostname));
+                        row.push(cell!(key.path));
+
+                        for val in values.iter() {
+                            if keys.contains(val) {
+                                row.push(cell!(String::from("X")));
+                            } else {
+                                row.push(cell!(String::from("")));
+                            }
+                        }
+
+                        https_frontend_table.add_row(Row::new(row));
+                    }
+
+                    https_frontend_table.printstd();
+
+                    println!("\nTCP frontends configuration for {}:\n", needle);
+
+                    for (ref key, ref values) in tcp_frontend_data.iter() {
+                        let mut row = Vec::new();
+                        row.push(cell!(key.cluster_id));
+                        row.push(cell!(format!("{}", key.address)));
+
+                        for val in values.iter() {
+                            if keys.contains(val) {
+                                row.push(cell!(String::from("X")));
+                            } else {
+                                row.push(cell!(String::from("")));
+                            }
+                        }
+
+                        tcp_frontend_table.add_row(Row::new(row));
+                    }
+
+                    tcp_frontend_table.printstd();
+
+                    println!("\nbackends configuration for {}:\n", needle);
+
+                    for (ref key, ref values) in backend_data.iter() {
+                        let mut row = Vec::new();
+                        let backend_backup =
+                            key.backup.map(|b| if b { "X" } else { "" }).unwrap_or("");
+                        row.push(cell!(key.backend_id));
+                        row.push(cell!(format!("{}", key.address)));
+                        row.push(cell!(backend_backup));
+
+                        for val in values.iter() {
+                            if keys.contains(val) {
+                                row.push(cell!(String::from("X")));
+                            } else {
+                                row.push(cell!(String::from("")));
+                            }
+                        }
+
+                        backend_table.add_row(Row::new(row));
+                    }
+
+                    backend_table.printstd();
                 }
-                CommandStatus::Ok => {
-                    if let Some(needle) = application_id.or(domain) {
-                        if let Some(CommandResponseData::Query(data)) = message.data {
-                            if json {
-                                return Ok(print_json_response(&data)?);
-                            }
-
-                            let application_headers =
-                                vec!["id", "sticky_session", "https_redirect"];
-                            let mut application_table =
-                                create_queried_application_table(application_headers, &data);
-
-                            let http_headers = vec!["id", "hostname", "path"];
-                            let mut frontend_table =
-                                create_queried_application_table(http_headers, &data);
-
-                            let https_headers = vec!["id", "hostname", "path"];
-                            let mut https_frontend_table =
-                                create_queried_application_table(https_headers, &data);
-
-                            let tcp_headers = vec!["id", "address"];
-                            let mut tcp_frontend_table =
-                                create_queried_application_table(tcp_headers, &data);
-
-                            let backend_headers = vec!["backend id", "IP address", "Backup"];
-                            let mut backend_table =
-                                create_queried_application_table(backend_headers, &data);
-
-                            let keys: HashSet<&String> = data.keys().collect();
-
-                            let mut application_data = HashMap::new();
-                            let mut frontend_data = HashMap::new();
-                            let mut https_frontend_data = HashMap::new();
-                            let mut tcp_frontend_data = HashMap::new();
-                            let mut backend_data = HashMap::new();
-
-                            for (ref key, ref metrics) in data.iter() {
-                                //let m: u8 = metrics;
-                                if let &QueryAnswer::Applications(ref apps) = *metrics {
-                                    for app in apps.iter() {
-                                        let entry =
-                                            application_data.entry(app).or_insert(Vec::new());
-                                        entry.push((*key).clone());
-
-                                        for frontend in app.http_frontends.iter() {
-                                            let entry =
-                                                frontend_data.entry(frontend).or_insert(Vec::new());
-                                            entry.push((*key).clone());
-                                        }
-
-                                        for frontend in app.https_frontends.iter() {
-                                            let entry = https_frontend_data
-                                                .entry(frontend)
-                                                .or_insert(Vec::new());
-                                            entry.push((*key).clone());
-                                        }
-
-                                        for frontend in app.tcp_frontends.iter() {
-                                            let entry = tcp_frontend_data
-                                                .entry(frontend)
-                                                .or_insert(Vec::new());
-                                            entry.push((*key).clone());
-                                        }
-
-                                        for backend in app.backends.iter() {
-                                            let entry =
-                                                backend_data.entry(backend).or_insert(Vec::new());
-                                            entry.push((*key).clone());
-                                        }
-                                    }
-                                }
-                            }
-
-                            println!("Cluster level configuration for {}:\n", needle);
-
-                            for (ref key, ref values) in application_data.iter() {
-                                let mut row = Vec::new();
-                                row.push(cell!(key
-                                    .configuration
-                                    .clone()
-                                    .map(|conf| conf.cluster_id)
-                                    .unwrap_or(String::from(""))));
-                                row.push(cell!(key
-                                    .configuration
-                                    .clone()
-                                    .map(|conf| conf.sticky_session)
-                                    .unwrap_or(false)));
-                                row.push(cell!(key
-                                    .configuration
-                                    .clone()
-                                    .map(|conf| conf.https_redirect)
-                                    .unwrap_or(false)));
-
-                                for val in values.iter() {
-                                    if keys.contains(val) {
-                                        row.push(cell!(String::from("X")));
-                                    } else {
-                                        row.push(cell!(String::from("")));
-                                    }
-                                }
-
-                                application_table.add_row(Row::new(row));
-                            }
-
-                            application_table.printstd();
-
-                            println!("\nHTTP frontends configuration for {}:\n", needle);
-
-                            for (ref key, ref values) in frontend_data.iter() {
-                                let mut row = Vec::new();
-                                match &key.route {
-                                    Route::ClusterId(cluster_id) => row.push(cell!(cluster_id)),
-                                    Route::Deny => row.push(cell!("-")),
-                                }
-                                row.push(cell!(key.hostname));
-                                row.push(cell!(key.path));
-
-                                for val in values.iter() {
-                                    if keys.contains(val) {
-                                        row.push(cell!(String::from("X")));
-                                    } else {
-                                        row.push(cell!(String::from("")));
-                                    }
-                                }
-
-                                frontend_table.add_row(Row::new(row));
-                            }
-
-                            frontend_table.printstd();
-
-                            println!("\nHTTPS frontends configuration for {}:\n", needle);
-
-                            for (ref key, ref values) in https_frontend_data.iter() {
-                                let mut row = Vec::new();
-                                match &key.route {
-                                    Route::ClusterId(cluster_id) => row.push(cell!(cluster_id)),
-                                    Route::Deny => row.push(cell!("-")),
-                                }
-                                row.push(cell!(key.hostname));
-                                row.push(cell!(key.path));
-
-                                for val in values.iter() {
-                                    if keys.contains(val) {
-                                        row.push(cell!(String::from("X")));
-                                    } else {
-                                        row.push(cell!(String::from("")));
-                                    }
-                                }
-
-                                https_frontend_table.add_row(Row::new(row));
-                            }
-
-                            https_frontend_table.printstd();
-
-                            println!("\nTCP frontends configuration for {}:\n", needle);
-
-                            for (ref key, ref values) in tcp_frontend_data.iter() {
-                                let mut row = Vec::new();
-                                row.push(cell!(key.cluster_id));
-                                row.push(cell!(format!("{}", key.address)));
-
-                                for val in values.iter() {
-                                    if keys.contains(val) {
-                                        row.push(cell!(String::from("X")));
-                                    } else {
-                                        row.push(cell!(String::from("")));
-                                    }
-                                }
-
-                                tcp_frontend_table.add_row(Row::new(row));
-                            }
-
-                            tcp_frontend_table.printstd();
-
-                            println!("\nbackends configuration for {}:\n", needle);
-
-                            for (ref key, ref values) in backend_data.iter() {
-                                let mut row = Vec::new();
-                                let backend_backup =
-                                    key.backup.map(|b| if b { "X" } else { "" }).unwrap_or("");
-                                row.push(cell!(key.backend_id));
-                                row.push(cell!(format!("{}", key.address)));
-                                row.push(cell!(backend_backup));
-
-                                for val in values.iter() {
-                                    if keys.contains(val) {
-                                        row.push(cell!(String::from("X")));
-                                    } else {
-                                        row.push(cell!(String::from("")));
-                                    }
-                                }
-
-                                backend_table.add_row(Row::new(row));
-                            }
-
-                            backend_table.printstd();
-                        }
-                        Ok(())
-                    } else {
-                        if let Some(CommandResponseData::Query(data)) = message.data {
-                            let mut table = Table::new();
-                            let mut header = Vec::new();
-                            header.push(cell!("key"));
-                            for ref key in data.keys() {
-                                header.push(cell!(&key));
-                            }
-                            header.push(cell!("desynchronized"));
-                            table.add_row(Row::new(header));
-
-                            let mut query_data = HashMap::new();
-
-                            for ref metrics in data.values() {
-                                //let m: u8 = metrics;
-                                if let &QueryAnswer::ApplicationsHashes(ref apps) = *metrics {
-                                    for (ref key, ref value) in apps.iter() {
-                                        (*(query_data.entry((*key).clone()).or_insert(Vec::new())))
-                                            .push(*value);
-                                    }
-                                }
-                            }
-
-                            for (ref key, ref values) in query_data.iter() {
-                                let mut row = Vec::new();
-                                row.push(cell!(key));
-
-                                for val in values.iter() {
-                                    row.push(cell!(format!("{}", val)));
-                                }
-
-                                let hs: HashSet<&u64> = values.iter().cloned().collect();
-
-                                let diff = hs.len() > 1;
-
-                                if diff {
-                                    row.push(cell!(String::from("X")));
-                                } else {
-                                    row.push(cell!(String::from("")));
-                                }
-
-                                table.add_row(Row::new(row));
-                            }
-
-                            table.printstd();
-                        }
-                        Ok(())
+            } else {
+                if let Some(CommandResponseData::Query(data)) = message.data {
+                    let mut table = Table::new();
+                    let mut header = Vec::new();
+                    header.push(cell!("key"));
+                    for ref key in data.keys() {
+                        header.push(cell!(&key));
                     }
+                    header.push(cell!("desynchronized"));
+                    table.add_row(Row::new(header));
+
+                    let mut query_data = HashMap::new();
+
+                    for ref metrics in data.values() {
+                        //let m: u8 = metrics;
+                        if let &QueryAnswer::ApplicationsHashes(ref apps) = *metrics {
+                            for (ref key, ref value) in apps.iter() {
+                                (*(query_data.entry((*key).clone()).or_insert(Vec::new())))
+                                    .push(*value);
+                            }
+                        }
+                    }
+
+                    for (ref key, ref values) in query_data.iter() {
+                        let mut row = Vec::new();
+                        row.push(cell!(key));
+
+                        for val in values.iter() {
+                            row.push(cell!(format!("{}", val)));
+                        }
+
+                        let hs: HashSet<&u64> = values.iter().cloned().collect();
+
+                        let diff = hs.len() > 1;
+
+                        if diff {
+                            row.push(cell!(String::from("X")));
+                        } else {
+                            row.push(cell!(String::from("")));
+                        }
+
+                        table.add_row(Row::new(row));
+                    }
+
+                    table.printstd();
                 }
             }
         }
     }
+
+    Ok(())
 }
 
 pub fn query_certificate(
     mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: Duration,
     json: bool,
     fingerprint: Option<String>,
     domain: Option<String>,
@@ -1706,98 +1655,89 @@ pub fn query_certificate(
     let id = generate_id();
     channel.write_message(&CommandRequest::new(id.clone(), command, None));
 
-    match channel.read_message() {
-        None => {
-            bail!("the proxy didn't answer");
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    if id != message.id {
+        bail!("received message with invalid id: {:?}", message);
+    }
+    match message.status {
+        CommandStatus::Processing => {
+            // do nothing here
+            // for other messages, we would loop over read_message
+            // until an error or ok message was sent
         }
-        Some(message) => {
-            if id != message.id {
-                bail!("received message with invalid id: {:?}", message);
+        CommandStatus::Error => {
+            if json {
+                print_json_response(&message.message)?;
+                bail!("We received an error message");
+            } else {
+                bail!("could not query proxy state: {}", message.message);
             }
-            match message.status {
-                CommandStatus::Processing => {
-                    // do nothing here
-                    // for other messages, we would loop over read_message
-                    // until an error or ok message was sent
-                    Ok(())
+        }
+        CommandStatus::Ok => {
+            if let Some(CommandResponseData::Query(data)) = message.data {
+                if json {
+                    print_json_response(&data)?;
+                    return Ok(());
                 }
-                CommandStatus::Error => {
-                    if json {
-                        print_json_response(&message.message)?;
-                        bail!("We received an error message");
-                    } else {
-                        bail!("could not query proxy state: {}", message.message);
+
+                //println!("received: {:?}", data);
+                let it = data.iter().map(|(k, v)| match v {
+                    QueryAnswer::Certificates(c) => (k, c),
+                    v => {
+                        eprintln!("unexpected certificates query answer: {:?}", v);
+                        exit(1);
                     }
-                }
-                CommandStatus::Ok => {
-                    if let Some(CommandResponseData::Query(data)) = message.data {
-                        if json {
-                            print_json_response(&data)?;
-                            return Ok(());
-                        }
+                });
 
-                        //println!("received: {:?}", data);
-                        let it = data.iter().map(|(k, v)| match v {
-                            QueryAnswer::Certificates(c) => (k, c),
-                            v => {
-                                eprintln!("unexpected certificates query answer: {:?}", v);
-                                exit(1);
+                for (k, v) in it {
+                    println!("process '{}':", k);
+
+                    match v {
+                        QueryAnswerCertificate::All(h) => {
+                            for (addr, h2) in h.iter() {
+                                println!("\t{}:", addr);
+
+                                for (domain, fingerprint) in h2.iter() {
+                                    println!("\t\t{}:\t{}", domain, hex::encode(fingerprint));
+                                }
+
+                                println!("");
                             }
-                        });
-
-                        for (k, v) in it {
-                            println!("process '{}':", k);
-
-                            match v {
-                                QueryAnswerCertificate::All(h) => {
-                                    for (addr, h2) in h.iter() {
-                                        println!("\t{}:", addr);
-
-                                        for (domain, fingerprint) in h2.iter() {
-                                            println!(
-                                                "\t\t{}:\t{}",
-                                                domain,
-                                                hex::encode(fingerprint)
-                                            );
-                                        }
-
-                                        println!("");
-                                    }
-                                }
-                                QueryAnswerCertificate::Domain(h) => {
-                                    for (addr, opt) in h.iter() {
-                                        println!("\t{}:", addr);
-                                        if let Some((key, fingerprint)) = opt {
-                                            println!("\t\t{}:\t{}", key, hex::encode(fingerprint));
-                                        } else {
-                                            println!("\t\tnot found");
-                                        }
-
-                                        println!("");
-                                    }
-                                }
-                                QueryAnswerCertificate::Fingerprint(opt) => {
-                                    if let Some((s, v)) = opt {
-                                        println!("\tfrontends: {:?}\ncertificate:\n{}", v, s);
-                                    } else {
-                                        println!("\tnot found");
-                                    }
-                                }
-                            }
-                            println!("");
                         }
-                        Ok(())
-                    } else {
-                        bail!("unexpected response: {:?}", message.data);
+                        QueryAnswerCertificate::Domain(h) => {
+                            for (addr, opt) in h.iter() {
+                                println!("\t{}:", addr);
+                                if let Some((key, fingerprint)) = opt {
+                                    println!("\t\t{}:\t{}", key, hex::encode(fingerprint));
+                                } else {
+                                    println!("\t\tnot found");
+                                }
+
+                                println!("");
+                            }
+                        }
+                        QueryAnswerCertificate::Fingerprint(opt) => {
+                            if let Some((s, v)) = opt {
+                                println!("\tfrontends: {:?}\ncertificate:\n{}", v, s);
+                            } else {
+                                println!("\tnot found");
+                            }
+                        }
                     }
+                    println!("");
                 }
+            } else {
+                bail!("unexpected response: {:?}", message.data);
             }
         }
     }
+    Ok(())
 }
 
 pub fn query_metrics(
     mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: Duration,
     json: bool,
     list: bool,
     refresh: Option<u32>,
@@ -1827,104 +1767,97 @@ pub fn query_metrics(
 
     let command = CommandRequestData::Proxy(ProxyRequestData::Query(Query::Metrics(query)));
 
+    // a loop to reperform the query every refresh time
     loop {
         let id = generate_id();
         channel.write_message(&CommandRequest::new(id.clone(), command.clone(), None));
         print!("{}", termion::cursor::Save);
 
-        match channel.read_message() {
-            None => {
-                bail!("the proxy didn't answer");
+        // this functions may bail and escape the loop, should we avoid that?
+        let message = read_channel_message_with_timeout(channel, timeout)?;
+
+        //println!("received message: {:?}", message);
+        if id != message.id {
+            bail!("received message with invalid id: {:?}", message);
+        }
+        match message.status {
+            CommandStatus::Processing => {
+                // do nothing here
+                // for other messages, we would loop over read_message
+                // until an error or ok message was sent
             }
-            Some(message) => {
-                //println!("received message: {:?}", message);
-                if id != message.id {
-                    bail!("received message with invalid id: {:?}", message);
+            CommandStatus::Error => {
+                if json {
+                    return print_json_response(&message.message);
+                } else {
+                    bail!("could not query proxy state: {}", message.message);
                 }
-                match message.status {
-                    CommandStatus::Processing => {
-                        // do nothing here
-                        // for other messages, we would loop over read_message
-                        // until an error or ok message was sent
+            }
+            CommandStatus::Ok => {
+                if let Some(CommandResponseData::Query(data)) = message.data {
+                    if json {
+                        return print_json_response(&data);
                     }
-                    CommandStatus::Error => {
-                        if json {
-                            return print_json_response(&message.message);
-                        } else {
-                            bail!("could not query proxy state: {}", message.message);
-                        }
-                    }
-                    CommandStatus::Ok => {
-                        if let Some(CommandResponseData::Query(data)) = message.data {
-                            if json {
-                                return print_json_response(&data);
-                            }
 
-                            //println!("got data: {:#?}", data);
-                            if list {
-                                let metrics: HashSet<_> = data
-                                    .values()
-                                    .filter_map(|value| match value {
-                                        QueryAnswer::Metrics(QueryAnswerMetrics::List(v)) => {
-                                            Some(v.iter())
-                                        }
-                                        _ => None,
-                                    })
-                                    .flatten()
-                                    .map(|s| s.replace("\t", "."))
-                                    .collect();
-                                let mut metrics: Vec<_> = metrics.iter().collect();
-                                metrics.sort();
-                                println!("available metrics: {:?}", metrics);
-                                return Ok(());
-                            }
-
-                            let data = data
-                                .iter()
-                                .filter_map(|(key, value)| match value {
-                                    QueryAnswer::Metrics(QueryAnswerMetrics::Cluster(d)) => {
-                                        let mut metrics = BTreeMap::new();
-                                        for (cluster_id, cluster_metrics) in d.iter() {
-                                            for (metric_key, value) in cluster_metrics.iter() {
-                                                metrics.insert(
-                                                    format!(
-                                                        "{} {}",
-                                                        cluster_id,
-                                                        metric_key.replace("\t", ".")
-                                                    ),
-                                                    value.clone(),
-                                                );
-                                            }
-                                        }
-                                        Some((key.clone(), metrics))
-                                    }
-                                    QueryAnswer::Metrics(QueryAnswerMetrics::Backend(d)) => {
-                                        let mut metrics = BTreeMap::new();
-                                        for (cluster_id, cluster_metrics) in d.iter() {
-                                            for (backend_id, backend_metrics) in
-                                                cluster_metrics.iter()
-                                            {
-                                                for (metric_key, value) in backend_metrics.iter() {
-                                                    metrics.insert(
-                                                        format!(
-                                                            "{}/{} {}",
-                                                            cluster_id,
-                                                            backend_id,
-                                                            metric_key.replace("\t", ".")
-                                                        ),
-                                                        value.clone(),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Some((key.clone(), metrics))
-                                    }
-                                    _ => None,
-                                })
-                                .collect::<BTreeMap<_, _>>();
-                            print_metrics("Result", &data);
-                        }
+                    //println!("got data: {:#?}", data);
+                    if list {
+                        let metrics: HashSet<_> = data
+                            .values()
+                            .filter_map(|value| match value {
+                                QueryAnswer::Metrics(QueryAnswerMetrics::List(v)) => Some(v.iter()),
+                                _ => None,
+                            })
+                            .flatten()
+                            .map(|s| s.replace("\t", "."))
+                            .collect();
+                        let mut metrics: Vec<_> = metrics.iter().collect();
+                        metrics.sort();
+                        println!("available metrics: {:?}", metrics);
+                        return Ok(());
                     }
+
+                    let data = data
+                        .iter()
+                        .filter_map(|(key, value)| match value {
+                            QueryAnswer::Metrics(QueryAnswerMetrics::Cluster(d)) => {
+                                let mut metrics = BTreeMap::new();
+                                for (cluster_id, cluster_metrics) in d.iter() {
+                                    for (metric_key, value) in cluster_metrics.iter() {
+                                        metrics.insert(
+                                            format!(
+                                                "{} {}",
+                                                cluster_id,
+                                                metric_key.replace("\t", ".")
+                                            ),
+                                            value.clone(),
+                                        );
+                                    }
+                                }
+                                Some((key.clone(), metrics))
+                            }
+                            QueryAnswer::Metrics(QueryAnswerMetrics::Backend(d)) => {
+                                let mut metrics = BTreeMap::new();
+                                for (cluster_id, cluster_metrics) in d.iter() {
+                                    for (backend_id, backend_metrics) in cluster_metrics.iter() {
+                                        for (metric_key, value) in backend_metrics.iter() {
+                                            metrics.insert(
+                                                format!(
+                                                    "{}/{} {}",
+                                                    cluster_id,
+                                                    backend_id,
+                                                    metric_key.replace("\t", ".")
+                                                ),
+                                                value.clone(),
+                                            );
+                                        }
+                                    }
+                                }
+                                Some((key.clone(), metrics))
+                            }
+                            _ => None,
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    print_metrics("Result", &data);
                 }
             }
         }
@@ -1946,7 +1879,7 @@ pub fn query_metrics(
 
 pub fn logging_filter(
     channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     filter: &LoggingLevel,
 ) -> Result<(), anyhow::Error> {
     order_command(
@@ -1956,7 +1889,10 @@ pub fn logging_filter(
     )
 }
 
-pub fn events(mut channel: Channel<CommandRequest, CommandResponse>) -> Result<(), anyhow::Error> {
+pub fn events(
+    mut channel: Channel<CommandRequest, CommandResponse>,
+    timeout: Duration,
+) -> Result<(), anyhow::Error> {
     let id = generate_id();
     channel.write_message(&CommandRequest::new(
         id.clone(),
@@ -1964,32 +1900,26 @@ pub fn events(mut channel: Channel<CommandRequest, CommandResponse>) -> Result<(
         None,
     ));
 
-    loop {
-        match channel.read_message() {
-            None => {
-                bail!("the proxy didn't answer");
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+    match message.status {
+        CommandStatus::Processing => {
+            if let Some(CommandResponseData::Event(event)) = message.data {
+                println!("got event from worker({}): {:?}", message.message, event);
             }
-            Some(message) => match message.status {
-                CommandStatus::Processing => {
-                    if let Some(CommandResponseData::Event(event)) = message.data {
-                        println!("got event from worker({}): {:?}", message.message, event);
-                    }
-                }
-                CommandStatus::Error => {
-                    bail!("could not get proxy events: {}", message.message);
-                }
-                CommandStatus::Ok => {
-                    println!("{}", message.message);
-                    return Ok(());
-                }
-            },
+        }
+        CommandStatus::Error => {
+            bail!("could not get proxy events: {}", message.message);
+        }
+        CommandStatus::Ok => {
+            println!("{}", message.message);
         }
     }
+    Ok(())
 }
 
 fn order_command(
     mut channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    timeout: Duration,
     order: ProxyRequestData,
 ) -> Result<(), anyhow::Error> {
     let id = generate_id();
@@ -1999,44 +1929,37 @@ fn order_command(
         None,
     ));
 
-    command_timeout!(timeout, {
-        match channel.read_message() {
-            None => {
-                bail!("the proxy didn't answer");
-            }
-            Some(message) => {
-                if id != message.id {
-                    bail!("received message with invalid id: {:?}", message);
-                }
-                match message.status {
-                    CommandStatus::Processing => {
-                        // do nothing here
-                        // for other messages, we would loop over read_message
-                        // until an error or ok message was sent
-                    }
-                    CommandStatus::Error => bail!("could not execute order: {}", message.message),
-                    CommandStatus::Ok => {
-                        //deactivate success messages for now
-                        /*
-                        match order {
-                          ProxyRequestData::AddCluster(_) => println!("application added : {}", message.message),
-                          ProxyRequestData::RemoveCluster(_) => println!("application removed : {} ", message.message),
-                          ProxyRequestData::AddBackend(_) => println!("backend added : {}", message.message),
-                          ProxyRequestData::RemoveBackend(_) => println!("backend removed : {} ", message.message),
-                          ProxyRequestData::AddCertificate(_) => println!("certificate added: {}", message.message),
-                          ProxyRequestData::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
-                          ProxyRequestData::AddHttpFrontend(_) => println!("front added: {}", message.message),
-                          ProxyRequestData::RemoveHttpFrontend(_) => println!("front removed: {}", message.message),
-                          _ => {
-                            // do nothing for now
-                          }
-                        }
-                        */
-                    }
-                };
-            }
+    let message = read_channel_message_with_timeout(channel, timeout)?;
+
+    if id != message.id {
+        bail!("received message with invalid id: {:?}", message);
+    }
+    match message.status {
+        CommandStatus::Processing => {
+            // do nothing here
+            // for other messages, we would loop over read_message
+            // until an error or ok message was sent
         }
-    });
+        CommandStatus::Error => bail!("could not execute order: {}", message.message),
+        CommandStatus::Ok => {
+            //deactivate success messages for now
+            /*
+            match order {
+              ProxyRequestData::AddCluster(_) => println!("application added : {}", message.message),
+              ProxyRequestData::RemoveCluster(_) => println!("application removed : {} ", message.message),
+              ProxyRequestData::AddBackend(_) => println!("backend added : {}", message.message),
+              ProxyRequestData::RemoveBackend(_) => println!("backend removed : {} ", message.message),
+              ProxyRequestData::AddCertificate(_) => println!("certificate added: {}", message.message),
+              ProxyRequestData::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
+              ProxyRequestData::AddHttpFrontend(_) => println!("front added: {}", message.message),
+              ProxyRequestData::RemoveHttpFrontend(_) => println!("front removed: {}", message.message),
+              _ => {
+                // do nothing for now
+              }
+            }
+            */
+        }
+    }
     Ok(())
 }
 

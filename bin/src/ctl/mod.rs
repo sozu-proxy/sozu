@@ -8,7 +8,7 @@ use sozu_command::channel::Channel;
 use sozu_command::command::{CommandRequest, CommandResponse};
 use sozu_command::config::Config;
 use sozu_command::proxy::ListenerType;
-use std::io;
+use std::time::Duration;
 
 use self::command::{
     activate_listener, add_application, add_backend, add_certificate, add_http_frontend,
@@ -37,30 +37,30 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
 
     let channel =
         create_channel(&config).with_context(|| "could not connect to the command unix socket")?;
-    let timeout: u64 = matches.timeout.unwrap_or(config.ctl_command_timeout);
+    let timeout = Duration::from_millis(matches.timeout.unwrap_or(config.ctl_command_timeout));
 
     match matches.cmd {
         SubCmd::Shutdown { hard, worker } => {
             if hard {
-                hard_stop(channel, worker, timeout)
+                hard_stop(channel, timeout, worker)
             } else {
-                soft_stop(channel, worker)
+                soft_stop(channel, timeout, worker)
             }
         }
-        SubCmd::Upgrade { worker: None } => upgrade_main(channel, &config),
+        SubCmd::Upgrade { worker: None } => upgrade_main(channel, timeout, &config),
         SubCmd::Upgrade { worker: Some(id) } => {
             upgrade_worker(channel, timeout, id)?;
             Ok(())
         }
-        SubCmd::Status { json } => status(channel, json),
-        SubCmd::Metrics { cmd } => metrics(channel, cmd),
+        SubCmd::Status { json } => status(channel, timeout, json),
+        SubCmd::Metrics { cmd } => metrics(channel, timeout, cmd),
         SubCmd::Logging { level } => logging_filter(channel, timeout, &level),
         SubCmd::State { cmd } => match cmd {
             StateCmd::Save { file } => save_state(channel, timeout, file),
             StateCmd::Load { file } => load_state(channel, timeout, file),
             StateCmd::Dump { json } => dump_state(channel, timeout, json),
         },
-        SubCmd::Reload { file, json } => reload_configuration(channel, file, json),
+        SubCmd::Reload { file, json } => reload_configuration(channel, timeout, file, json),
         SubCmd::Application { cmd } => match cmd {
             ApplicationCmd::Add {
                 id,
@@ -315,21 +315,25 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
             ),
         },
         SubCmd::Query { cmd, json } => match cmd {
-            QueryCmd::Applications { id, domain } => query_application(channel, json, id, domain),
+            QueryCmd::Applications { id, domain } => {
+                query_application(channel, timeout, json, id, domain)
+            }
             QueryCmd::Certificates {
                 fingerprint,
                 domain,
-            } => query_certificate(channel, json, fingerprint, domain),
+            } => query_certificate(channel, timeout, json, fingerprint, domain),
             QueryCmd::Metrics {
                 list,
                 refresh,
                 names,
                 clusters,
                 backends,
-            } => query_metrics(channel, json, list, refresh, names, clusters, backends),
+            } => query_metrics(
+                channel, timeout, json, list, refresh, names, clusters, backends,
+            ),
         },
         SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
-        SubCmd::Events => events(channel),
+        SubCmd::Events => events(channel, timeout),
         rest => {
             panic!("that command should have been handled earlier: {:x?}", rest)
         }
