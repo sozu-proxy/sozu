@@ -545,7 +545,7 @@ impl CommandServer {
                 .send(CommandResponse::new(
                     request_id.clone(),
                     CommandStatus::Processing,
-                    "".to_string(),
+                    "The proxy is processing the upgrade command".to_string(),
                     None,
                 ))
                 .await

@@ -242,7 +242,22 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     }
 
     pub fn read_message_blocking(&mut self) -> Option<Rx> {
+        self.read_message_blocking_timeout(None)
+    }
+
+    pub fn read_message_blocking_timeout(
+        &mut self,
+        timeout: Option<std::time::Duration>,
+    ) -> Option<Rx> {
+        let now = std::time::Instant::now();
+
         loop {
+            if timeout.is_some() {
+                if now.elapsed() >= timeout.unwrap() {
+                    return None;
+                }
+            }
+
             if let Some(pos) = self.front_buf.data().iter().position(|&x| x == 0) {
                 let mut res = None;
 
