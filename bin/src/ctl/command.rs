@@ -321,9 +321,15 @@ pub fn upgrade_main(
                     .collect::<Vec<_>>();
                 let running_count = running_workers.len();
                 for (i, ref worker) in running_workers.iter().enumerate() {
-                    println!("Upgrading worker {} (of {})", i + 1, running_count);
+                    println!(
+                        "Upgrading worker {} (#{} out of {})",
+                        worker.id,
+                        i + 1,
+                        running_count
+                    );
 
-                    upgrade_worker(&mut channel, Duration::ZERO, worker.id)?;
+                    upgrade_worker(&mut channel, Duration::ZERO, worker.id)
+                        .with_context(|| "Upgrading the worker failed")?;
                     //thread::sleep(Duration::from_millis(1000));
                 }
 
