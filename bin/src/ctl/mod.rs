@@ -35,8 +35,9 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
         std::process::exit(0);
     }
 
-    let mut channel =
-        create_channel(&config).with_context(|| "could not connect to the command unix socket")?;
+    let mut channel = create_channel(&config).with_context(|| {
+        "could not connect to the command unix socket. Are you sure the proxy is up?"
+    })?;
     let timeout = Duration::from_millis(matches.timeout.unwrap_or(config.ctl_command_timeout));
 
     match matches.cmd {
