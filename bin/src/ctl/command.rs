@@ -54,47 +54,13 @@ fn generate_tagged_id(tag: &str) -> String {
     format!("{}-{}", tag, s)
 }
 
-// Run the code waiting for messages in a separate thread. Just before finishing the thread sends a message.
-// The calling code waits for this message with a timeout.
-// Note: This macro is used only for simple command which has any/simple computing
-// to do with the message received.
-// macro_rules! command_timeout {
-//   ($duration: expr, $block: expr) => (
-//     if $duration == 0 {
-//       $block
-//     } else {
-//       let (send, recv) = mpsc::channel();
-
-//       thread::spawn(move || {
-//         $block
-//         serde::__private::Ok::<(), anyhow::Error>(send.send(())?)
-
-//       });
-
-//       if recv.recv_timeout(Duration::from_millis($duration)).is_err() {
-//         eprintln!("Command timeout. The proxy didn't send an answer");
-//       }
-//     }
-//   )
-// }
-
 fn read_channel_message_with_timeout(
-    mut channel: Channel<CommandRequest, CommandResponse>,
+    channel: &mut Channel<CommandRequest, CommandResponse>,
     timeout: Duration,
 ) -> anyhow::Result<CommandResponse> {
-    let (send, recv) = mpsc::channel();
-
-    thread::spawn(move || {
-        let message = channel.read_message();
-        send.send(message)
-    });
-
-    match recv.recv_timeout(timeout) {
-        Err(_) => bail!("Command timeout. The proxy did not answer in time."),
-        Ok(message) => match message {
-            None => bail!("The proxy didn't answer"),
-            Some(payload) => Ok(payload),
-        },
+    match channel.read_message_blocking_timeout(Some(timeout)) {
+        None => bail!("The proxy didn't answer"),
+        Some(payload) => Ok(payload),
     }
 }
 
@@ -110,7 +76,7 @@ pub fn save_state(
         None,
     ));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     if id != message.id {
         bail!("received message with invalid id: {:?}", message);
@@ -144,7 +110,7 @@ pub fn load_state(
         None,
     ));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     if id != message.id {
         bail!("received message with invalid id: {:?}", message);
@@ -178,7 +144,7 @@ pub fn dump_state(
         None,
     ));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     if id != message.id {
         bail!("received message with invalid id: {:?}", message);
@@ -223,7 +189,7 @@ pub fn soft_stop(
         proxy_id,
     ));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     if &id != &message.id {
         bail!("received message with invalid id: {:?}", message);
@@ -256,7 +222,7 @@ pub fn hard_stop(
         proxy_id,
     ));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     match message.status {
         CommandStatus::Processing => {
@@ -288,7 +254,7 @@ pub fn upgrade_main(
         None,
     ));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     if id != message.id {
         bail!("Error: received unexpected message: {:?}", message);
@@ -324,24 +290,21 @@ pub fn upgrade_main(
                 println!("Upgrading main process");
 
                 loop {
-                    match channel.read_message() {
-                        None => {
-                            bail!("Error: the proxy didn't start main upgrade");
+                    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
+
+                    if &id != &message.id {
+                        bail!("Error: received unexpected message: {:?}", message);
+                    }
+                    match message.status {
+                        CommandStatus::Processing => {
+                            println!("Main process is upgrading");
                         }
-                        Some(message) => {
-                            if &id != &message.id {
-                                bail!("Error: received unexpected message: {:?}", message);
-                            }
-                            match message.status {
-                                CommandStatus::Processing => {}
-                                CommandStatus::Error => {
-                                    bail!("Error: failed to upgrade the main: {}", message.message);
-                                }
-                                CommandStatus::Ok => {
-                                    println!("Main process upgrade succeeded: {}", message.message);
-                                    break;
-                                }
-                            }
+                        CommandStatus::Error => {
+                            bail!("Error: failed to upgrade the main: {}", message.message);
+                        }
+                        CommandStatus::Ok => {
+                            println!("Main process upgrade succeeded: {}", message.message);
+                            break;
                         }
                     }
                 }
@@ -360,7 +323,7 @@ pub fn upgrade_main(
                 for (i, ref worker) in running_workers.iter().enumerate() {
                     println!("Upgrading worker {} (of {})", i + 1, running_count);
 
-                    channel = upgrade_worker(channel, Duration::ZERO, worker.id)?;
+                    upgrade_worker(&mut channel, Duration::ZERO, worker.id)?;
                     //thread::sleep(Duration::from_millis(1000));
                 }
 
@@ -372,10 +335,10 @@ pub fn upgrade_main(
 }
 
 pub fn upgrade_worker(
-    mut channel: Channel<CommandRequest, CommandResponse>,
+    channel: &mut Channel<CommandRequest, CommandResponse>,
     timeout: Duration,
     worker_id: u32,
-) -> Result<Channel<CommandRequest, CommandResponse>, anyhow::Error> {
+) -> Result<(), anyhow::Error> {
     println!("upgrading worker {}", worker_id);
     let id = generate_id();
     channel.write_message(&CommandRequest::new(
@@ -385,47 +348,29 @@ pub fn upgrade_worker(
         None,
     ));
 
-    // The timeout logic is rewritten here so we can return the Channel object from the thread
-    // and avoid ownership issues
-    let (send, recv) = mpsc::channel();
-
-    let timeout_thread = thread::spawn(move || {
-        loop {
-            let message = channel.read_message();
-            match message {
-                None => bail!("the proxy didn't answer"),
-                Some(message) => match message.status {
-                    CommandStatus::Processing => {
-                        info!("Worker {} is processing: {}", worker_id, message.message);
-                    }
-                    CommandStatus::Error => bail!(
-                        "could not stop the worker {}: {}",
-                        worker_id,
-                        message.message
-                    ),
-                    CommandStatus::Ok => {
-                        if &id == &message.id {
-                            info!("Worker {} shut down: {}", worker_id, message.message);
-                            break;
-                        }
-                    }
-                },
+    let message = channel.read_message_blocking_timeout(Some(timeout));
+    match message {
+        None => bail!(format!(
+            "No response from the proxy about worker {}",
+            worker_id
+        )),
+        Some(message) => match message.status {
+            CommandStatus::Processing => {
+                info!("Worker {} is processing: {}", worker_id, message.message);
             }
-        }
-        send.send(())?;
-        Ok(channel)
-    });
-
-    if timeout > Duration::ZERO && recv.recv_timeout(timeout).is_err() {
-        bail!("Command timeout. The proxy didn't send answer");
+            CommandStatus::Error => bail!(
+                "could not stop the worker {}: {}",
+                worker_id,
+                message.message
+            ),
+            CommandStatus::Ok => {
+                if &id == &message.id {
+                    info!("Worker {} shut down: {}", worker_id, message.message);
+                }
+            }
+        },
     }
-
-    timeout_thread.join().map_err(|error| {
-        anyhow::Error::msg(format!(
-            "upgrade worker: thread timeout exceeded on join, {:?}",
-            error
-        ))
-    })?
+    Ok(())
 }
 
 pub fn status(
@@ -440,7 +385,7 @@ pub fn status(
         None,
     ));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     if id != message.id {
         bail!("received message with invalid id: {:?}", message);
@@ -625,7 +570,7 @@ pub fn metrics(
         None,
     ));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     match message.status {
         CommandStatus::Processing => {
@@ -771,7 +716,7 @@ pub fn reload_configuration(
         None,
     ));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     if id != message.id {
         bail!("received message with invalid id: {:?}", message);
@@ -1125,7 +1070,7 @@ pub fn list_frontends(
     let id = generate_id();
     channel.write_message(&CommandRequest::new(id.clone(), command, None));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     if id != message.id {
         bail!("received message with invalid id: {:?}", message);
@@ -1369,7 +1314,7 @@ pub fn query_application(
     let id = generate_id();
     channel.write_message(&CommandRequest::new(id.clone(), command, None));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     if id != message.id {
         bail!("received message with invalid id: {:?}", message);
@@ -1655,7 +1600,7 @@ pub fn query_certificate(
     let id = generate_id();
     channel.write_message(&CommandRequest::new(id.clone(), command, None));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     if id != message.id {
         bail!("received message with invalid id: {:?}", message);
@@ -1774,7 +1719,7 @@ pub fn query_metrics(
         print!("{}", termion::cursor::Save);
 
         // this functions may bail and escape the loop, should we avoid that?
-        let message = read_channel_message_with_timeout(channel, timeout)?;
+        let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
         //println!("received message: {:?}", message);
         if id != message.id {
@@ -1900,7 +1845,7 @@ pub fn events(
         None,
     ));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
     match message.status {
         CommandStatus::Processing => {
             if let Some(CommandResponseData::Event(event)) = message.data {
@@ -1929,7 +1874,7 @@ fn order_command(
         None,
     ));
 
-    let message = read_channel_message_with_timeout(channel, timeout)?;
+    let message = read_channel_message_with_timeout(&mut channel, timeout)?;
 
     if id != message.id {
         bail!("received message with invalid id: {:?}", message);

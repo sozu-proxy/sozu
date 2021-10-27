@@ -35,7 +35,7 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
         std::process::exit(0);
     }
 
-    let channel =
+    let mut channel =
         create_channel(&config).with_context(|| "could not connect to the command unix socket")?;
     let timeout = Duration::from_millis(matches.timeout.unwrap_or(config.ctl_command_timeout));
 
@@ -49,7 +49,7 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
         }
         SubCmd::Upgrade { worker: None } => upgrade_main(channel, timeout, &config),
         SubCmd::Upgrade { worker: Some(id) } => {
-            upgrade_worker(channel, timeout, id)?;
+            upgrade_worker(&mut channel, timeout, id)?;
             Ok(())
         }
         SubCmd::Status { json } => status(channel, timeout, json),
