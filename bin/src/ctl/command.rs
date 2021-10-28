@@ -59,7 +59,7 @@ fn read_channel_message_with_timeout(
     timeout: Duration,
 ) -> anyhow::Result<CommandResponse> {
     match channel.read_message_blocking_timeout(Some(timeout)) {
-        None => bail!("The proxy didn't answer"),
+        None => bail!("Command timeout. The proxy didn't send an answer"),
         Some(payload) => Ok(payload),
     }
 }
@@ -328,7 +328,7 @@ pub fn upgrade_main(
                         running_count
                     );
 
-                    upgrade_worker(&mut channel, Duration::ZERO, worker.id)
+                    upgrade_worker(&mut channel, timeout, worker.id)
                         .with_context(|| "Upgrading the worker failed")?;
                     //thread::sleep(Duration::from_millis(1000));
                 }
