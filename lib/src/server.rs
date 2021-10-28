@@ -456,10 +456,10 @@ impl Server {
             debug!("got message: {:?}", msg);
 
             // it so happens that trying to upgrade a dead worker will bring no message
-            // which brings the whole main processe to crash because it unwraps a None
-            if msg.is_some() {
+            // which brings the whole main process to crash because it unwraps a None
+            if let Some(msg) = msg {
                 server.channel.write_message(&ProxyResponse {
-                    id: msg.unwrap().id,
+                    id: msg.id,
                     status: ProxyResponseStatus::Ok,
                     data: None,
                 });
