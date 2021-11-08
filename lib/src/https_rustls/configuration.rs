@@ -116,7 +116,7 @@ impl CertificateResolver for Listener {
 }
 
 impl Listener {
-    pub fn new(config: HttpsListener, token: Token) -> Listener {
+    pub fn new(config: HttpsListener, token: Token) -> Result<Listener, rustls::Error> {
         let server_config = ServerConfig::builder();
         let server_config = if !config.rustls_cipher_list.is_empty() {
             let mut ciphers = Vec::new();
@@ -152,13 +152,12 @@ impl Listener {
                 s => error!("unsupported TLS version: {:?}", s),
             }
         }
-        // FIXME: don't panic
-        let server_config = server_config.with_protocol_versions(&versions[..]).expect("No configured ciphers matches configured protocols");
+        let server_config = server_config.with_protocol_versions(&versions[..])?;
         let server_config = server_config.with_no_client_auth();
         let resolver = Arc::new(MutexWrappedCertificateResolver::new());
         let server_config = server_config.with_cert_resolver(resolver.clone());
 
-        Listener {
+        Ok(Listener {
             address: config.address.clone(),
             fronts: Router::new(),
             answers: Rc::new(RefCell::new(HttpAnswers::new(
@@ -171,7 +170,7 @@ impl Listener {
             resolver,
             token,
             active: false,
-        }
+        })
     }
 
     pub fn activate(
@@ -280,14 +279,14 @@ impl Proxy {
         }
     }
 
-    pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
-        if self.listeners.contains_key(&token) {
+    pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Result<Option<Token>, rustls::Error> {
+        Ok(if self.listeners.contains_key(&token) {
             None
         } else {
-            let listener = Listener::new(config, token);
+            let listener = Listener::new(config, token)?;
             self.listeners.insert(listener.token, listener);
             Some(token)
-        }
+        })
     }
 
     pub fn remove_listener(&mut self, address: SocketAddr) -> bool {
@@ -742,7 +741,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
     let sessions = SessionManager::new(sessions, max_buffers);
     let registry = event_loop.registry().try_clone().unwrap();
     let mut configuration = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
-    if configuration.add_listener(config, token).is_some()
+    if configuration.add_listener(config, token).expect("failed to create listener").is_some()
         && configuration.activate_listener(&address, None).is_some()
     {
         let (scm_server, _scm_client) = UnixStream::pair().unwrap();
