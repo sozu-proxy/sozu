@@ -193,12 +193,16 @@ impl CommandServer {
         loop {
             let previous = buffer.available_data();
             //FIXME: we should read in streaming here
-            let sz = file
-                .read(buffer.space())
-                .with_context(|| "error reading state file")?;
-            buffer.fill(sz);
+            match file.read(buffer.space()) {
+                Ok(sz) => buffer.fill(sz),
+                Err(e) => {
+                    error!("error reading state file: {}", e);
+                    break;
+                }
+            };
 
             if buffer.available_data() == 0 {
+                debug!("Empty buffer");
                 break;
             }
 
@@ -206,7 +210,7 @@ impl CommandServer {
             match parse(buffer.data()) {
                 Ok((i, orders)) => {
                     if i.len() > 0 {
-                        //info!("could not parse {} bytes", i.len());
+                        debug!("could not parse {} bytes", i.len());
                         if previous == buffer.available_data() {
                             error!("error consuming load state message");
                             break;
