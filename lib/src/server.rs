@@ -1780,7 +1780,7 @@ impl HttpsProvider {
     pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
         match self {
             &mut HttpsProvider::Rustls(ref mut rustls) => {
-                rustls.borrow_mut().add_listener(config, token)
+                rustls.borrow_mut().add_listener(config, token).ok().flatten()
             }
             &mut HttpsProvider::Openssl(ref mut openssl) => {
                 openssl.borrow_mut().add_listener(config, token)
@@ -1878,7 +1878,7 @@ impl HttpsProvider {
 
     pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
         let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-        rustls.borrow_mut().add_listener(config, token)
+        rustls.borrow_mut().add_listener(config, token).ok().flatten()
     }
 
     pub fn activate_listener(
