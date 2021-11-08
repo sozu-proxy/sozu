@@ -22,7 +22,7 @@ name = "sozu"
 
 [dependencies]
 anyhow = "1.0.42"
-mio = { version = "^0.7", features = [ "os-poll", "uds" ] }
+mio = { version = "^0.7", features = [ "os-poll", "net" ] }
 serde = "~1.0.2"
 serde_json = "~1.0.1"
 serde_derive = "~1.0.2"
