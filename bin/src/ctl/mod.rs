@@ -8,7 +8,6 @@ use sozu_command::channel::Channel;
 use sozu_command::command::{CommandRequest, CommandResponse};
 use sozu_command::config::Config;
 use sozu_command::proxy::ListenerType;
-use std::io;
 
 use self::command::{
     activate_listener, add_application, add_backend, add_certificate, add_http_frontend,

@@ -1835,7 +1835,6 @@ impl HttpsProvider {
         frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
-        _proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
         match self {
             &mut HttpsProvider::Rustls(ref mut rustls) => {
@@ -1853,9 +1852,6 @@ impl HttpsProvider {
         }
     }
 }
-
-#[cfg(not(feature = "use-openssl"))]
-use crate::https_rustls::session::Session;
 
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
@@ -1915,7 +1911,6 @@ impl HttpsProvider {
         frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
-        proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
         let &mut HttpsProvider::Rustls(ref mut rustls) = self;
         let r = rustls.clone();

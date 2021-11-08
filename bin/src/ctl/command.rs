@@ -1151,7 +1151,7 @@ pub fn remove_tcp_frontend(
 
 pub fn list_frontends(
     mut channel: Channel<CommandRequest, CommandResponse>,
-    timeout: u64,
+    _timeout: u64,
     http: bool,
     https: bool,
     tcp: bool,
