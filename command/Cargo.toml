@@ -25,9 +25,9 @@ include = [
 anyhow = "^1.0.42"
 hex = "^0.4"
 log = "^0.4"
-pem = "^0.8"
-nix = "^0.22"
-mio = { version = "^0.7", features = [ "os-poll", "tcp", "uds" ] }
+pem = "^1.0"
+nix = "^0.23"
+mio = { version = "^0.7", features = [ "os-poll", "net" ] }
 libc = "^0.2"
 pool = "^0.1"
 time = "^0.3"

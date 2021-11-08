@@ -153,7 +153,6 @@ extern crate hdrhistogram;
 extern crate libc;
 extern crate log;
 extern crate mio;
-extern crate net2;
 #[cfg(feature = "use-openssl")]
 extern crate openssl;
 extern crate pool as pool_crate;
@@ -161,6 +160,7 @@ extern crate rand;
 extern crate rustls;
 extern crate rusty_ulid;
 extern crate slab;
+extern crate socket2;
 extern crate time;
 extern crate url;
 #[macro_use]

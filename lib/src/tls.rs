@@ -17,9 +17,9 @@ use crate::sozu_command::proxy::{
 };
 
 use rustls::{
-    internal::pemfile,
-    sign::{CertifiedKey, RSASigningKey},
-    ClientHello, ResolvesServerCert,
+    Certificate, PrivateKey,
+    server::{ClientHello, ResolvesServerCert},
+    sign::{CertifiedKey, RsaSigningKey},
 };
 use sha2::{Digest, Sha256};
 use sozu_command::proxy::TlsVersion;
@@ -358,10 +358,11 @@ impl CertificateResolverHelper for GenericCertificateResolver {
 
         // try to parse key as rsa private key
         let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
-        let parsed_keys = pemfile::rsa_private_keys(&mut key_reader);
-        if let Ok(keys) = parsed_keys {
+        let parsed_keys = rustls_pemfile::rsa_private_keys(&mut key_reader);
+        if let Ok(mut keys) = parsed_keys {
             if !keys.is_empty() {
-                if RSASigningKey::new(&keys[0]).is_ok() {
+                let key = PrivateKey(keys.swap_remove(0));
+                if RsaSigningKey::new(&key).is_ok() {
                     return Ok(ParsedCertificateAndKey {
                         certificate,
                         chain: chains,
@@ -374,11 +375,12 @@ impl CertificateResolverHelper for GenericCertificateResolver {
 
         // try to parse key as pkcs8-encoded private
         let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
-        let parsed_keys = pemfile::pkcs8_private_keys(&mut key_reader);
-        if let Ok(keys) = parsed_keys {
+        let parsed_keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader);
+        if let Ok(mut keys) = parsed_keys {
             if !keys.is_empty() {
+                let key = PrivateKey(keys.swap_remove(0));
                 // try to read as rsa private key
-                if RSASigningKey::new(&keys[0]).is_ok() {
+                if RsaSigningKey::new(&key).is_ok() {
                     return Ok(ParsedCertificateAndKey {
                         certificate,
                         chain: chains,
@@ -388,7 +390,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
                 }
 
                 // try to read as ecdsa private key
-                if rustls::sign::any_ecdsa_type(&keys[0]).is_ok() {
+                if rustls::sign::any_ecdsa_type(&key).is_ok() {
                     return Ok(ParsedCertificateAndKey {
                         certificate,
                         chain: chains,
@@ -546,9 +548,9 @@ impl GenericCertificateResolver {
 pub struct MutexWrappedCertificateResolver(pub Mutex<GenericCertificateResolver>);
 
 impl ResolvesServerCert for MutexWrappedCertificateResolver {
-    fn resolve(&self, client_hello: ClientHello) -> Option<CertifiedKey> {
+    fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
         let server_name = client_hello.server_name();
-        let sigschemes = client_hello.sigschemes();
+        let sigschemes = client_hello.signature_schemes();
 
         if server_name.is_none() {
             error!("cannot look up certificate: no SNI from session");
@@ -572,8 +574,8 @@ impl ResolvesServerCert for MutexWrappedCertificateResolver {
                 return resolver
                     .certificates
                     .get(fingerprint)
-                    .map(Self::generate_certified_key)
-                    .flatten();
+                    .and_then(Self::generate_certified_key)
+                    .map(Arc::new);
             }
         }
 
@@ -599,11 +601,11 @@ impl MutexWrappedCertificateResolver {
         let mut chains = Vec::new();
 
         let mut cert_reader = BufReader::new(&*certificate_and_key.certificate.contents);
-        let parsed_certs = pemfile::certs(&mut cert_reader);
+        let parsed_certs = rustls_pemfile::certs(&mut cert_reader);
 
         if let Ok(certs) = parsed_certs {
             for cert in certs {
-                chains.push(cert);
+                chains.push(Certificate(cert));
             }
         } else {
             return None;
@@ -611,34 +613,37 @@ impl MutexWrappedCertificateResolver {
 
         for chain in certificate_and_key.chain.iter() {
             let mut chain_cert_reader = BufReader::new(&*chain.contents);
-            if let Ok(parsed_chain_certs) = pemfile::certs(&mut chain_cert_reader) {
+            if let Ok(parsed_chain_certs) = rustls_pemfile::certs(&mut chain_cert_reader) {
                 for cert in parsed_chain_certs {
-                    chains.push(cert);
+                    chains.push(Certificate(cert));
                 }
             }
         }
 
         let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
-        let parsed_key = pemfile::rsa_private_keys(&mut key_reader);
+        let parsed_key = rustls_pemfile::rsa_private_keys(&mut key_reader);
 
-        if let Ok(keys) = parsed_key {
+        if let Ok(mut keys) = parsed_key {
             if !keys.is_empty() {
-                if let Ok(signing_key) = RSASigningKey::new(&keys[0]) {
-                    let certified = CertifiedKey::new(chains, Arc::new(Box::new(signing_key)));
+                let key = PrivateKey(keys.swap_remove(0));
+
+                if let Ok(signing_key) = RsaSigningKey::new(&key) {
+                    let certified = CertifiedKey::new(chains, Arc::new(signing_key));
                     return Some(certified);
                 }
             } else {
                 let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
-                let parsed_key = pemfile::pkcs8_private_keys(&mut key_reader);
-                if let Ok(keys) = parsed_key {
+                let parsed_key = rustls_pemfile::pkcs8_private_keys(&mut key_reader);
+                if let Ok(mut keys) = parsed_key {
                     if !keys.is_empty() {
-                        if let Ok(signing_key) = RSASigningKey::new(&keys[0]) {
+                        let key = PrivateKey(keys.swap_remove(0));
+                        if let Ok(signing_key) = RsaSigningKey::new(&key) {
                             let certified =
-                                CertifiedKey::new(chains, Arc::new(Box::new(signing_key)));
+                                CertifiedKey::new(chains, Arc::new(signing_key));
                             return Some(certified);
                         } else {
-                            if let Ok(k) = rustls::sign::any_ecdsa_type(&keys[0]) {
-                                let certified = CertifiedKey::new(chains, Arc::new(k));
+                            if let Ok(k) = rustls::sign::any_ecdsa_type(&key) {
+                                let certified = CertifiedKey::new(chains, k);
                                 return Some(certified);
                             } else {
                                 error!("could not decode signing key (tried RSA and ECDSA)");

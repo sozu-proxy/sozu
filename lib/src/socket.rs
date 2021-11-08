@@ -1,9 +1,8 @@
 use mio::net::{TcpListener, TcpStream};
-use net2::unix::UnixTcpBuilderExt;
-use net2::TcpBuilder;
 #[cfg(feature = "use-openssl")]
 use openssl::ssl::{ErrorCode, SslStream, SslVersion};
-use rustls::{ProtocolVersion, ServerSession, Session};
+use rustls::{ProtocolVersion, ServerConnection};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::SocketAddr;
 
@@ -247,7 +246,7 @@ impl SocketHandler for SslStream<TcpStream> {
 
 pub struct FrontRustls {
     pub stream: TcpStream,
-    pub session: ServerSession,
+    pub session: ServerConnection,
 }
 
 impl SocketHandler for FrontRustls {
@@ -296,7 +295,7 @@ impl SocketHandler for FrontRustls {
             }
 
             while !self.session.wants_read() {
-                match self.session.read(&mut buf[size..]) {
+                match self.session.reader().read(&mut buf[size..]) {
                     Ok(0) => break,
                     Ok(sz) => size += sz,
                     Err(e) => match e.kind() {
@@ -345,7 +344,7 @@ impl SocketHandler for FrontRustls {
                 break;
             }
 
-            match self.session.write(&buf[buffered_size..]) {
+            match self.session.writer().write(&buf[buffered_size..]) {
                 Ok(0) => {
                     break;
                 }
@@ -422,7 +421,7 @@ impl SocketHandler for FrontRustls {
 
     fn protocol(&self) -> TransportProtocol {
         self.session
-            .get_protocol_version()
+            .protocol_version()
             .map(|version| match version {
                 ProtocolVersion::SSLv2 => TransportProtocol::Ssl2,
                 ProtocolVersion::SSLv3 => TransportProtocol::Ssl3,
@@ -444,27 +443,25 @@ impl SocketHandler for FrontRustls {
     }
 }
 
-pub fn server_bind(addr: &SocketAddr) -> io::Result<TcpListener> {
-    let sock = match *addr {
-        SocketAddr::V4(..) => TcpBuilder::new_v4()?,
-        SocketAddr::V6(..) => TcpBuilder::new_v6()?,
-    };
+pub fn server_bind(addr: SocketAddr) -> io::Result<TcpListener> {
+    let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
 
     // set so_reuseaddr, but only on unix (mirrors what libstd does)
     if cfg!(unix) {
-        sock.reuse_address(true)?;
+        sock.set_reuse_address(true)?;
     }
 
-    sock.reuse_port(true)?;
+    sock.set_reuse_port(true)?;
 
     // bind the socket
-    sock.bind(addr)?;
+    let addr = addr.into();
+    sock.bind(&addr)?;
+
+    sock.set_nonblocking(true)?;
 
     // listen
     // FIXME: make the backlog configurable?
-    let listener = sock.listen(1024)?;
+    sock.listen(1024)?;
 
-    listener.set_nonblocking(true)?;
-
-    Ok(TcpListener::from_std(listener))
+    Ok(TcpListener::from_std(sock.into()))
 }

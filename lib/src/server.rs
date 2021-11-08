@@ -454,11 +454,16 @@ impl Server {
             server.channel.set_nonblocking(false);
             let msg = server.channel.read_message();
             debug!("got message: {:?}", msg);
-            server.channel.write_message(&ProxyResponse {
-                id: msg.unwrap().id,
-                status: ProxyResponseStatus::Ok,
-                data: None,
-            });
+
+            // it so happens that trying to upgrade a dead worker will bring no message
+            // which brings the whole main process to crash because it unwraps a None
+            if let Some(msg) = msg {
+                server.channel.write_message(&ProxyResponse {
+                    id: msg.id,
+                    status: ProxyResponseStatus::Ok,
+                    data: None,
+                });
+            }
             server.channel.set_nonblocking(true);
         }
 
@@ -1775,7 +1780,7 @@ impl HttpsProvider {
     pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
         match self {
             &mut HttpsProvider::Rustls(ref mut rustls) => {
-                rustls.borrow_mut().add_listener(config, token)
+                rustls.borrow_mut().add_listener(config, token).ok().flatten()
             }
             &mut HttpsProvider::Openssl(ref mut openssl) => {
                 openssl.borrow_mut().add_listener(config, token)
@@ -1830,7 +1835,6 @@ impl HttpsProvider {
         frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
-        _proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
         match self {
             &mut HttpsProvider::Rustls(ref mut rustls) => {
@@ -1848,9 +1852,6 @@ impl HttpsProvider {
         }
     }
 }
-
-#[cfg(not(feature = "use-openssl"))]
-use crate::https_rustls::session::Session;
 
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
@@ -1877,7 +1878,7 @@ impl HttpsProvider {
 
     pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
         let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-        rustls.borrow_mut().add_listener(config, token)
+        rustls.borrow_mut().add_listener(config, token).ok().flatten()
     }
 
     pub fn activate_listener(
@@ -1910,7 +1911,6 @@ impl HttpsProvider {
         frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
-        proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
         let &mut HttpsProvider::Rustls(ref mut rustls) = self;
         let r = rustls.clone();

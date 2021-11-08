@@ -27,16 +27,17 @@ include = [
 rand = "^0.8"
 url = "^2.1"
 log = "^0.4"
-net2 = "^0.2"
+socket2 ={ version =  "^0.4", features = [ "all" ] }
 time = "^0.3"
-mio = { version = "^0.7", features = [ "os-poll", "os-ext", "tcp", "udp" ] }
+mio = { version = "^0.7", features = [ "os-poll", "os-ext", "net" ] }
 libc = "^0.2"
 slab = "^0.4.0"
 sha2 = "^0.9"
 pool = "^0.1"
 openssl = {version="^0.10.26", optional = true}
 openssl-sys = {version="^0.9", optional = true}
-rustls = "^0.19"
+rustls = "^0.20"
+rustls-pemfile = "^0.2"
 webpki = "^0.22"
 hdrhistogram = "^7.0"
 sozu-command-lib = { version = "^0.13.0", path = "../command" }
@@ -49,11 +50,11 @@ hashbrown = "0.11"
 regex = "1.1"
 cookie-factory = "^0.3"
 hpack = "^0.3"
-x509-parser = "^0.10.0"
+x509-parser = "^0.12.0"
 thiserror = "^1.0.26"
 
 [dev-dependencies]
-tiny_http = "^0.8"
+tiny_http = "^0.9"
 quickcheck = "^1.0"
 ureq = "2.1"
 rand = "^0.8.4"
