@@ -3,7 +3,7 @@ use mio::net::*;
 use mio::unix::SourceFd;
 use mio::*;
 use rustls::{
-    CipherSuite, ProtocolVersion, ServerSession, Session as ClientSession, SupportedCipherSuite,
+    CipherSuite, ProtocolVersion, ServerConnection, SupportedCipherSuite,
 };
 use rusty_ulid::Ulid;
 use std::cell::RefCell;
@@ -34,7 +34,7 @@ use crate::{
 };
 
 pub enum State {
-    Expect(ExpectProxyProtocol<TcpStream>, ServerSession),
+    Expect(ExpectProxyProtocol<TcpStream>, ServerConnection),
     Handshake(TlsHandshake),
     Http(Http<FrontRustls>),
     WebSocket(Pipe<FrontRustls>),
@@ -63,7 +63,7 @@ pub struct Session {
 
 impl Session {
     pub fn new(
-        ssl: ServerSession,
+        ssl: ServerConnection,
         sock: TcpStream,
         token: Token,
         pool: Weak<RefCell<Pool>>,
@@ -197,12 +197,12 @@ impl Session {
 
             let mut front_buf = front_buf.unwrap();
 
-            handshake.session.get_protocol_version().map(|version| {
+            handshake.session.protocol_version().map(|version| {
                 incr!(version_str(version));
             });
             handshake
                 .session
-                .get_negotiated_ciphersuite()
+                .negotiated_cipher_suite()
                 .map(|cipher| {
                     incr!(ciphersuite_str(cipher));
                 });
@@ -228,7 +228,7 @@ impl Session {
                 self.backend_timeout_duration,
             );
 
-            let res = http.frontend.session.read(front_buf.space());
+            let res = http.frontend.session.reader().read(front_buf.space());
             match res {
                 Ok(sz) => {
                     //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
@@ -923,7 +923,7 @@ impl Session {
             //FIXME: what if we don't use SNI?
             let servername: Option<String> = self
                 .http()
-                .and_then(|h| h.frontend.session.get_sni_hostname())
+                .and_then(|h| h.frontend.session.sni_hostname())
                 .map(|s| s.to_string());
             if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
                 error!(
@@ -1362,8 +1362,8 @@ fn version_str(version: ProtocolVersion) -> &'static str {
     }
 }
 
-fn ciphersuite_str(cipher: &'static SupportedCipherSuite) -> &'static str {
-    match cipher.suite {
+fn ciphersuite_str(cipher: SupportedCipherSuite) -> &'static str {
+    match cipher.suite() {
         CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
             "tls.cipher.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
         }
@@ -1406,7 +1406,7 @@ mod tests {
     assert_size!(State, 2464);
 
     assert_size!(FrontRustls, 1456);
-    assert_size!(ServerSession, 1440);
+    assert_size!(ServerConnection, 1440);
   }
 }
 */
