@@ -2,7 +2,7 @@ use crate::protocol::ProtocolResult;
 use crate::Ready;
 use crate::{Readiness, SessionResult};
 use mio::net::*;
-use rustls::{ServerSession, Session};
+use rustls::ServerConnection;
 use rusty_ulid::Ulid;
 use std::io::ErrorKind;
 
@@ -15,13 +15,13 @@ pub enum TlsState {
 
 pub struct TlsHandshake {
     pub stream: TcpStream,
-    pub session: ServerSession,
+    pub session: ServerConnection,
     pub readiness: Readiness,
     pub request_id: Ulid,
 }
 
 impl TlsHandshake {
-    pub fn new(session: ServerSession, stream: TcpStream, request_id: Ulid) -> TlsHandshake {
+    pub fn new(session: ServerConnection, stream: TcpStream, request_id: Ulid) -> TlsHandshake {
         TlsHandshake {
             stream,
             session,
