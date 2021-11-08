@@ -611,6 +611,29 @@ impl CommandServer {
             client_id, request_id, id
         );
 
+        if self
+            .workers
+            .iter()
+            .find(|worker| {
+                worker.id == id
+                    && worker.run_state != RunState::Stopping
+                    && worker.run_state != RunState::Stopped
+            })
+            .is_none()
+        {
+            self.answer_error(
+                client_id,
+                &request_id,
+                format!(
+                    "The worker {} does not exist, or is stopped / stopping.",
+                    &id
+                ),
+                None,
+            )
+            .await;
+            return Ok(());
+        }
+
         // same as launch_worker
         let next_id = self.next_id;
         let mut worker = if let Ok(worker) = start_worker(
@@ -643,21 +666,6 @@ impl CommandServer {
                 .answer_error(client_id, &request_id, "failed creating worker", None)
                 .await);
         };
-
-        if self
-            .workers
-            .iter()
-            .find(|worker| {
-                worker.id == id
-                    && worker.run_state != RunState::Stopping
-                    && worker.run_state != RunState::Stopped
-            })
-            .is_none()
-        {
-            self.answer_error(client_id, &request_id, "worker not found", None)
-                .await;
-            return Ok(());
-        }
 
         let sock = worker.channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
