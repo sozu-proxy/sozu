@@ -1060,7 +1060,7 @@ impl Listener {
         }
 
         let mut listener = tcp_listener.or_else(|| {
-            server_bind(&self.config.address)
+            server_bind(self.config.address)
                 .map_err(|e| {
                     error!(
                         "could not create listener {:?}: {:?}",

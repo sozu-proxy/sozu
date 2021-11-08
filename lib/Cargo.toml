@@ -27,7 +27,7 @@ include = [
 rand = "^0.8"
 url = "^2.1"
 log = "^0.4"
-net2 = "^0.2"
+socket2 ={ version =  "^0.4", features = [ "all" ] }
 time = "^0.3"
 mio = { version = "^0.7", features = [ "os-poll", "os-ext", "tcp", "udp" ] }
 libc = "^0.2"
