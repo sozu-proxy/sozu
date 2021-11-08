@@ -1,6 +1,6 @@
 use mio::net::*;
 use mio::*;
-use rustls::{NoClientAuth, ProtocolVersion, ServerConfig, ServerSession, ALL_CIPHERSUITES};
+use rustls::{cipher_suite::*, ServerConfig, ServerConnection};
 use slab::Slab;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -117,47 +117,46 @@ impl CertificateResolver for Listener {
 
 impl Listener {
     pub fn new(config: HttpsListener, token: Token) -> Listener {
-        let mut server_config = ServerConfig::new(NoClientAuth::new());
-        server_config.versions = config
-            .versions
-            .iter()
-            .map(|version| match version {
-                TlsVersion::SSLv2 => ProtocolVersion::SSLv2,
-                TlsVersion::SSLv3 => ProtocolVersion::SSLv3,
-                TlsVersion::TLSv1_0 => ProtocolVersion::TLSv1_0,
-                TlsVersion::TLSv1_1 => ProtocolVersion::TLSv1_1,
-                TlsVersion::TLSv1_2 => ProtocolVersion::TLSv1_2,
-                TlsVersion::TLSv1_3 => ProtocolVersion::TLSv1_3,
-            })
-            .collect();
-
-        let resolver = Arc::new(MutexWrappedCertificateResolver::new());
-        server_config.cert_resolver = resolver.to_owned();
-
-        //FIXME: we should have another way than indexes in ALL_CIPHERSUITES,
-        //but rustls does not export the static SupportedCipherSuite instances yet
-        if !config.rustls_cipher_list.is_empty() {
+        let server_config = ServerConfig::builder();
+        let server_config = if !config.rustls_cipher_list.is_empty() {
             let mut ciphers = Vec::new();
             for cipher in config.rustls_cipher_list.iter() {
                 match cipher.as_str() {
-                    "TLS13_CHACHA20_POLY1305_SHA256" => ciphers.push(ALL_CIPHERSUITES[0]),
-                    "TLS13_AES_256_GCM_SHA384" => ciphers.push(ALL_CIPHERSUITES[1]),
-                    "TLS13_AES_128_GCM_SHA256" => ciphers.push(ALL_CIPHERSUITES[2]),
+                    "TLS13_CHACHA20_POLY1305_SHA256" => ciphers.push(TLS13_CHACHA20_POLY1305_SHA256),
+                    "TLS13_AES_256_GCM_SHA384" => ciphers.push(TLS13_AES_256_GCM_SHA384),
+                    "TLS13_AES_128_GCM_SHA256" => ciphers.push(TLS13_AES_128_GCM_SHA256),
                     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
-                        ciphers.push(ALL_CIPHERSUITES[3])
+                        ciphers.push(TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
                     }
                     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
-                        ciphers.push(ALL_CIPHERSUITES[4])
+                        ciphers.push(TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256)
                     }
-                    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => ciphers.push(ALL_CIPHERSUITES[5]),
-                    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => ciphers.push(ALL_CIPHERSUITES[6]),
-                    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => ciphers.push(ALL_CIPHERSUITES[7]),
-                    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => ciphers.push(ALL_CIPHERSUITES[8]),
+                    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => ciphers.push(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384),
+                    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => ciphers.push(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
+                    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => ciphers.push(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
+                    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => ciphers.push(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
                     s => error!("unknown cipher: {:?}", s),
                 }
             }
-            server_config.ciphersuites = ciphers;
+            server_config.with_cipher_suites(&ciphers[..])
+        } else {
+            server_config.with_safe_default_cipher_suites()
+        };
+
+        let server_config = server_config.with_safe_default_kx_groups();
+        let mut versions = Vec::new();
+        for version in config.versions.iter() {
+            match version {
+                TlsVersion::TLSv1_2 => versions.push(&rustls::version::TLS12),
+                TlsVersion::TLSv1_3 => versions.push(&rustls::version::TLS13),
+                s => error!("unsupported TLS version: {:?}", s),
+            }
         }
+        // FIXME: don't panic
+        let server_config = server_config.with_protocol_versions(&versions[..]).expect("No configured ciphers matches configured protocols");
+        let server_config = server_config.with_no_client_auth();
+        let resolver = Arc::new(MutexWrappedCertificateResolver::new());
+        let server_config = server_config.with_cert_resolver(resolver.clone());
 
         Listener {
             address: config.address.clone(),
@@ -382,7 +381,13 @@ impl ProxyConfiguration<Session> for Proxy {
                 );
             }
 
-            let session = ServerSession::new(&listener.ssl_config);
+            let session = match ServerConnection::new(listener.ssl_config.clone()) {
+                Ok(session) => session,
+                Err(e) => {
+                    error!("failed to create server session: {:?}", e);
+                    return Err(AcceptError::IoError);
+                }
+            };
             let c = Session::new(
                 session,
                 frontend_sock,

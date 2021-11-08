@@ -36,7 +36,8 @@ sha2 = "^0.9"
 pool = "^0.1"
 openssl = {version="^0.10.26", optional = true}
 openssl-sys = {version="^0.9", optional = true}
-rustls = "^0.19"
+rustls = "^0.20"
+rustls-pemfile = "^0.2"
 webpki = "^0.22"
 hdrhistogram = "^7.0"
 sozu-command-lib = { version = "^0.13.0", path = "../command" }
