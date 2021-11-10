@@ -3,6 +3,8 @@ use mio::unix::SourceFd;
 use mio::*;
 use openssl::dh::Dh;
 use openssl::error::ErrorStack;
+#[cfg(feature = "use-openssl")]
+use nom::HexDisplay;
 
 use openssl::nid;
 use openssl::pkey::{PKey, Private};
@@ -1808,7 +1810,6 @@ impl Listener {
            + Sync
            + Send {
         move |ssl: &mut SslRef, alert: &mut SslAlert| {
-            use nom::HexDisplay;
             debug!(
                 "client hello callback: TLS version = {:?}",
                 ssl.version_str()

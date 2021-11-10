@@ -108,21 +108,21 @@ pub enum Method {
 
 impl Method {
     pub fn new(s: &[u8]) -> Method {
-        if compare_no_case(&s, b"GET") {
+        if compare_no_case(s, b"GET") {
             Method::Get
-        } else if compare_no_case(&s, b"POST") {
+        } else if compare_no_case(s, b"POST") {
             Method::Post
-        } else if compare_no_case(&s, b"HEAD") {
+        } else if compare_no_case(s, b"HEAD") {
             Method::Head
-        } else if compare_no_case(&s, b"OPTIONS") {
+        } else if compare_no_case(s, b"OPTIONS") {
             Method::Options
-        } else if compare_no_case(&s, b"PUT") {
+        } else if compare_no_case(s, b"PUT") {
             Method::Put
-        } else if compare_no_case(&s, b"DELETE") {
+        } else if compare_no_case(s, b"DELETE") {
             Method::Delete
-        } else if compare_no_case(&s, b"TRACE") {
+        } else if compare_no_case(s, b"TRACE") {
             Method::Trace
-        } else if compare_no_case(&s, b"CONNECT") {
+        } else if compare_no_case(s, b"CONNECT") {
             Method::Connect
         } else {
             Method::Custom(String::from(unsafe { str::from_utf8_unchecked(s) }))
@@ -241,9 +241,9 @@ fn request_line(i: &[u8]) -> IResult<&[u8], RequestLine> {
     Ok((
         i,
         RequestLine {
-            method: method,
-            uri: uri,
-            version: version,
+            method,
+            uri,
+            version,
         },
     ))
 }
@@ -255,9 +255,9 @@ fn status_line(i: &[u8]) -> IResult<&[u8], StatusLine> {
     Ok((
         i,
         StatusLine {
-            version: version,
-            status: status,
-            reason: reason,
+            version,
+            status,
+            reason,
         },
     ))
 }
@@ -278,13 +278,7 @@ fn message_header(i: &[u8]) -> IResult<&[u8], Header> {
         crlf,
     ))(i)?;
 
-    Ok((
-        i,
-        Header {
-            name: name,
-            value: value,
-        },
-    ))
+    Ok((i, Header { name, value }))
 }
 
 //not a space nor a comma
@@ -487,10 +481,10 @@ impl Chunk {
     }
 
     pub fn should_parse(&self) -> bool {
-        match *self {
-            Chunk::Initial | Chunk::Copying | Chunk::CopyingLastHeader => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            Chunk::Initial | Chunk::Copying | Chunk::CopyingLastHeader
+        )
     }
 
     pub fn has_ended(&self) -> bool {
@@ -525,8 +519,7 @@ impl Chunk {
             // we parse a crlf then a header, and advance the position to the end of chunk
             Chunk::Copying => {
                 match end_of_chunk_and_header(buf) {
-                    Ok((i, sz_str)) => {
-                        let sz = usize::from(sz_str);
+                    Ok((i, sz)) => {
                         if sz == 0 {
                             // data to copy + size of header + 0 data
                             (buf.offset(i), Chunk::CopyingLastHeader)
@@ -610,28 +603,28 @@ impl<'a> Header<'a> {
     pub fn value(&self) -> HeaderValue {
         if compare_no_case(self.name, b"host") {
             //FIXME: UTF8 conversion should be unchecked here, since we already checked the tokens?
-            if let Some(s) = str::from_utf8(self.value).map(String::from).ok() {
+            if let Ok(s) = str::from_utf8(self.value).map(String::from) {
                 HeaderValue::Host(s)
             } else {
                 HeaderValue::Error
             }
         } else if compare_no_case(self.name, b"content-length") {
             if let Ok(l) = str::from_utf8(self.value) {
-                if let Some(length) = l.parse().ok() {
+                if let Ok(length) = l.parse() {
                     return HeaderValue::ContentLength(length);
                 }
             }
             HeaderValue::Error
         } else if compare_no_case(self.name, b"transfer-encoding") {
-            if compare_no_case(&self.value, b"chunked") {
+            if compare_no_case(self.value, b"chunked") {
                 HeaderValue::Encoding(TransferEncodingValue::Chunked)
-            } else if compare_no_case(&self.value, b"compress") {
+            } else if compare_no_case(self.value, b"compress") {
                 HeaderValue::Encoding(TransferEncodingValue::Compress)
-            } else if compare_no_case(&self.value, b"deflate") {
+            } else if compare_no_case(self.value, b"deflate") {
                 HeaderValue::Encoding(TransferEncodingValue::Deflate)
-            } else if compare_no_case(&self.value, b"gzip") {
+            } else if compare_no_case(self.value, b"gzip") {
                 HeaderValue::Encoding(TransferEncodingValue::Gzip)
-            } else if compare_no_case(&self.value, b"identity") {
+            } else if compare_no_case(self.value, b"identity") {
                 HeaderValue::Encoding(TransferEncodingValue::Identity)
             } else {
                 HeaderValue::Encoding(TransferEncodingValue::Unknown)
@@ -658,7 +651,7 @@ impl<'a> Header<'a> {
                         to_delete.as_mut().map(|h| h.insert(Vec::from(first)));
                     }
 
-                    while input.len() != 0 {
+                    while !input.is_empty() {
                         match preceded(
                             tuple((opt(complete(sp)), complete(char(',')), opt(sp))),
                             single_header_value,
@@ -727,13 +720,13 @@ impl<'a> Header<'a> {
 
     pub fn should_delete(&self, conn: &Connection, sticky_name: &str) -> bool {
         //FIXME: we should delete this header anyway, and add a Connection: Upgrade if we detected an upgrade
-        if compare_no_case(&self.name, b"connection") {
+        if compare_no_case(self.name, b"connection") {
             match single_header_value(self.value) {
                 Ok((mut input, first)) => {
                     if compare_no_case(first, b"upgrade") {
                         false
                     } else {
-                        while input.len() != 0 {
+                        while !input.is_empty() {
                             match preceded(
                                 tuple((opt(complete(sp)), complete(char(',')), opt(sp))),
                                 single_header_value,
@@ -755,17 +748,17 @@ impl<'a> Header<'a> {
                 }
                 Err(_) => true,
             }
-        } else if compare_no_case(&self.name, b"set-cookie") {
+        } else if compare_no_case(self.name, b"set-cookie") {
             self.value.starts_with(sticky_name.as_bytes())
         } else {
-            let b = (compare_no_case(&self.name, b"connection")
-                && !compare_no_case(&self.value, b"upgrade"))
-                || compare_no_case(&self.name, b"sozu-id")
+            let b = (compare_no_case(self.name, b"connection")
+                && !compare_no_case(self.value, b"upgrade"))
+                || compare_no_case(self.name, b"sozu-id")
                 || {
                     let mut res = false;
-                    if let Some(ref to_delete) = conn.to_delete {
-                        for ref header_value in to_delete {
-                            if compare_no_case(&self.value, &header_value) {
+                    if let Some(to_delete) = &conn.to_delete {
+                        for header_value in to_delete {
+                            if compare_no_case(self.value, header_value) {
                                 res = true;
                                 break;
                             }
@@ -775,15 +768,15 @@ impl<'a> Header<'a> {
                     res
                 };
 
-            if compare_no_case(&self.name, b"x-forwarded-proto")
-                || compare_no_case(&self.name, b"x-forwarded-host")
-                || compare_no_case(&self.name, b"x-forwarded-port")
+            if compare_no_case(self.name, b"x-forwarded-proto")
+                || compare_no_case(self.name, b"x-forwarded-host")
+                || compare_no_case(self.name, b"x-forwarded-port")
             {
                 return false;
             }
 
-            if compare_no_case(&self.name, b"x-forwarded-for")
-                || compare_no_case(&self.name, b"forwarded")
+            if compare_no_case(self.name, b"x-forwarded-for")
+                || compare_no_case(self.name, b"forwarded")
             {
                 return true;
             }
@@ -793,11 +786,11 @@ impl<'a> Header<'a> {
     }
 
     pub fn must_mutate(&self) -> bool {
-        compare_no_case(&self.name, b"cookie")
+        compare_no_case(self.name, b"cookie")
     }
 
     pub fn mutate_header(&self, buf: &[u8], offset: usize, sticky_name: &str) -> Vec<BufferMove> {
-        if compare_no_case(&self.name, b"cookie") {
+        if compare_no_case(self.name, b"cookie") {
             self.remove_sticky_cookie_in_request(buf, offset, sticky_name)
         } else {
             vec![BufferMove::Advance(offset)]
@@ -814,7 +807,7 @@ impl<'a> Header<'a> {
             // if we don't find the cookie, don't go further
             if let Some(sozu_balance_position) = cookies
                 .iter()
-                .position(|cookie| &cookie.name[..] == sticky_name.as_bytes())
+                .position(|cookie| cookie.name == sticky_name.as_bytes())
             {
                 // If we have only one cookie and that's the one, then we drop the whole header
                 if cookies.len() == 1 {
@@ -962,6 +955,12 @@ pub struct Connection {
     pub continues: Continue,
     pub sticky_session: Option<String>,
     pub forwarded: ForwardedHeaders,
+}
+
+impl Default for Connection {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Connection {

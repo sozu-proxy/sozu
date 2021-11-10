@@ -165,8 +165,8 @@ impl MetricsWriter {
                         }*/
 
                         let mut currently_written = 0;
-                        for i in 0..(sent as usize) {
-                            currently_written += messages[i].msg_len as usize;
+                        for message in messages.iter().take(sent as usize) {
+                            currently_written += message.msg_len as usize;
                         }
                         written += currently_written;
                         //println!("written (packet indexes: {:?}): {}, total {}", self.packet_indexes,

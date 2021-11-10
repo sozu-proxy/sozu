@@ -62,8 +62,8 @@ impl<Front: SocketHandler> Pipe<Front> {
         let log_ctx = format!(
             "{} {} {}\t",
             &request_id,
-            cluster_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
-            backend_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-")
+            cluster_id.as_deref().unwrap_or("-"),
+            backend_id.as_deref().unwrap_or("-")
         );
         let frontend_status = ConnectionStatus::Normal;
         let backend_status = if backend.is_none() {
@@ -195,8 +195,8 @@ impl<Front: SocketHandler> Pipe<Front> {
         self.log_ctx = format!(
             "{} {} {}\t",
             self.request_id,
-            self.cluster_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
-            self.backend_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-")
+            self.cluster_id.as_deref().unwrap_or("-"),
+            self.backend_id.as_deref().unwrap_or("-")
         );
     }
 
@@ -288,10 +288,7 @@ impl<Front: SocketHandler> Pipe<Front> {
             metrics.bin,
             metrics.bout,
             proto,
-            self.websocket_context
-                .as_ref()
-                .map(|s| s.as_str())
-                .unwrap_or("-")
+            self.websocket_context.as_deref().unwrap_or("-")
         );
     }
 
@@ -343,16 +340,13 @@ impl<Front: SocketHandler> Pipe<Front> {
             metrics.bin,
             metrics.bout,
             proto,
-            self.websocket_context
-                .as_ref()
-                .map(|s| s.as_str())
-                .unwrap_or("-"),
+            self.websocket_context.as_deref().unwrap_or("-"),
             message
         );
     }
 
     pub fn check_connections(&self) -> bool {
-        let res = match (self.frontend_status, self.backend_status) {
+        match (self.frontend_status, self.backend_status) {
             //(ConnectionStatus::Normal, ConnectionStatus::Normal) => true,
             //(ConnectionStatus::Normal, ConnectionStatus::ReadOpen) => true,
             (ConnectionStatus::Normal, ConnectionStatus::WriteOpen) => {
@@ -398,10 +392,7 @@ impl<Front: SocketHandler> Pipe<Front> {
             (ConnectionStatus::Closed, ConnectionStatus::Closed) => false,
 
             _ => true,
-        };
-
-        //info!("check_connections: front = {:?}, back = {:?} => {}", self.frontend_status, self.backend_status, res);
-        res
+        }
     }
 
     pub fn front_hup(&mut self, metrics: &mut SessionMetrics) -> SessionResult {

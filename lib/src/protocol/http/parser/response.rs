@@ -71,21 +71,17 @@ impl ResponseState {
     }
 
     pub fn is_proxying(&self) -> bool {
-        match *self {
+        matches!(
+            self,
             ResponseState::Response(_, _)
-            | ResponseState::ResponseWithBody(_, _, _)
-            | ResponseState::ResponseWithBodyChunks(_, _, _)
-            | ResponseState::ResponseWithBodyCloseDelimited(_, _, _) => true,
-            _ => false,
-        }
+                | ResponseState::ResponseWithBody(_, _, _)
+                | ResponseState::ResponseWithBodyChunks(_, _, _)
+                | ResponseState::ResponseWithBodyCloseDelimited(_, _, _)
+        )
     }
 
     pub fn is_back_error(&self) -> bool {
-        if let ResponseState::Error(_, _, _, _, _) = self {
-            true
-        } else {
-            false
-        }
+        matches!(self, ResponseState::Error(_, _, _, _, _))
     }
 
     pub fn get_status_line(&self) -> Option<&RStatusLine> {
@@ -156,11 +152,7 @@ impl ResponseState {
     }
 
     pub fn should_chunk(&self) -> bool {
-        if let ResponseState::ResponseWithBodyChunks(_, _, _) = *self {
-            true
-        } else {
-            false
-        }
+        matches!(self, ResponseState::ResponseWithBodyChunks(_, _, _))
     }
 }
 
@@ -589,7 +581,7 @@ fn add_sticky_session_to_response(
     sticky_name: &str,
     sticky_session: Option<&StickySession>,
 ) {
-    if let Some(ref sticky_backend) = sticky_session {
+    if let Some(sticky_backend) = sticky_session {
         let sticky_cookie = format!(
             "Set-Cookie: {}={}; Path=/\r\n",
             sticky_name, sticky_backend.sticky_id

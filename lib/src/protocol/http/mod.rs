@@ -296,10 +296,7 @@ impl<Front: SocketHandler> Http<Front> {
                     // if the socket is half open, it will report 0 bytes read (EOF)
                     Ok(0) => false,
                     Ok(_) => true,
-                    Err(e) => match e.kind() {
-                        std::io::ErrorKind::WouldBlock => true,
-                        _ => false,
-                    },
+                    Err(e) => matches!(e.kind(), std::io::ErrorKind::WouldBlock),
                 }
             }
             None => false,
@@ -322,7 +319,7 @@ impl<Front: SocketHandler> Http<Front> {
             return self.test_back_socket();
         }
 
-        return true;
+        true
     }
 
     pub fn close(&mut self) {}
@@ -368,15 +365,12 @@ impl<Front: SocketHandler> Http<Front> {
     }
 
     fn must_continue_request(&self) -> bool {
-        if let Some(Continue::Expects(_sz)) = self
-            .request
-            .as_ref()
-            .and_then(|r| r.get_keep_alive().as_ref().map(|conn| conn.continues))
-        {
-            true
-        } else {
-            false
-        }
+        matches!(
+            self.request
+                .as_ref()
+                .and_then(|r| r.get_keep_alive().as_ref().map(|conn| conn.continues)),
+            Some(Continue::Expects(_))
+        )
     }
 
     fn must_continue_response(&self) -> Option<usize> {
@@ -447,21 +441,20 @@ impl<Front: SocketHandler> Http<Front> {
                 } else {
                     if self.response == Some(ResponseState::Initial) {
                         self.set_answer(DefaultAnswerStatus::Answer503, None);
+                    } else if let Some(ResponseState::ResponseWithBodyCloseDelimited(
+                        _,
+                        _,
+                        ref mut back_closed,
+                    )) = self.response.as_mut()
+                    {
+                        *back_closed = true;
+                        // trick the protocol into calling readable() again
+                        self.back_readiness.event.insert(Ready::readable());
+                        return SessionResult::Continue;
                     } else {
-                        if let Some(ResponseState::ResponseWithBodyCloseDelimited(
-                            _,
-                            _,
-                            ref mut back_closed,
-                        )) = self.response.as_mut()
-                        {
-                            *back_closed = true;
-                            // trick the protocol into calling readable() again
-                            self.back_readiness.event.insert(Ready::readable());
-                            return SessionResult::Continue;
-                        } else {
-                            self.set_answer(DefaultAnswerStatus::Answer502, None);
-                        }
+                        self.set_answer(DefaultAnswerStatus::Answer502, None);
                     }
+
                     // we're not expecting any more data from the backend
                     self.back_readiness.interest = Ready::empty();
                     SessionResult::Continue
@@ -473,24 +466,23 @@ impl<Front: SocketHandler> Http<Front> {
                 }
                 SessionResult::Continue
             }
+        } else if self.back_readiness.event.is_readable()
+            && self.back_readiness.interest.is_readable()
+        {
+            SessionResult::Continue
         } else {
-            if self.back_readiness.event.is_readable() && self.back_readiness.interest.is_readable()
+            if self
+                .request
+                .as_ref()
+                .map(|r| r.is_proxying())
+                .unwrap_or(false)
+                && self.response == Some(ResponseState::Initial)
             {
-                SessionResult::Continue
-            } else {
-                if self
-                    .request
-                    .as_ref()
-                    .map(|r| r.is_proxying())
-                    .unwrap_or(false)
-                    && self.response == Some(ResponseState::Initial)
-                {
-                    self.set_answer(DefaultAnswerStatus::Answer503, None);
-                    // we're not expecting any more data from the backend
-                    self.back_readiness.interest = Ready::empty();
-                }
-                SessionResult::CloseBackend
+                self.set_answer(DefaultAnswerStatus::Answer503, None);
+                // we're not expecting any more data from the backend
+                self.back_readiness.interest = Ready::empty();
             }
+            SessionResult::CloseBackend
         }
     }
 
@@ -590,7 +582,7 @@ impl<Front: SocketHandler> Http<Front> {
         let service_time = metrics.service_time();
         let _wait_time = metrics.wait_time;
 
-        let cluster_id = OptionalString::new(self.cluster_id.as_ref().map(|s| s.as_str()));
+        let cluster_id = OptionalString::new(self.cluster_id.as_deref());
         time!(
             "response_time",
             cluster_id.as_str(),
@@ -673,15 +665,15 @@ impl<Front: SocketHandler> Http<Front> {
         let response_time = metrics.response_time();
         let service_time = metrics.service_time();
 
-        if let Some(ref cluster_id) = self.cluster_id {
+        if let Some(cluster_id) = &self.cluster_id {
             time!(
                 "response_time",
-                &cluster_id,
+                cluster_id,
                 response_time.whole_milliseconds()
             );
             time!(
                 "service_time",
-                &cluster_id,
+                cluster_id,
                 service_time.whole_milliseconds()
             );
         }
@@ -729,15 +721,15 @@ impl<Front: SocketHandler> Http<Front> {
         let response_time = metrics.response_time();
         let service_time = metrics.service_time();
 
-        if let Some(ref cluster_id) = self.cluster_id {
+        if let Some(cluster_id) = &self.cluster_id {
             time!(
                 "response_time",
-                &cluster_id,
+                cluster_id,
                 response_time.whole_milliseconds()
             );
             time!(
                 "service_time",
-                &cluster_id,
+                cluster_id,
                 service_time.whole_milliseconds()
             );
         }
@@ -820,7 +812,7 @@ impl<Front: SocketHandler> Http<Front> {
             count!("bytes_in", sz as i64);
             metrics.bin += sz;
 
-            self.front_buf.as_mut().map(|front_buf| {
+            if let Some(front_buf) = self.front_buf.as_mut() {
                 front_buf.buffer.fill(sz);
                 front_buf.sliced_input(sz);
                 if front_buf.start_parsing_position > front_buf.parsed_position {
@@ -830,7 +822,7 @@ impl<Front: SocketHandler> Http<Front> {
                     );
                     front_buf.consume_parsed_data(to_consume);
                 }
-            });
+            }
 
             if self.front_buf.as_ref().unwrap().buffer.available_space() == 0 {
                 self.front_readiness.interest.remove(Ready::readable());
@@ -1056,7 +1048,7 @@ impl<Front: SocketHandler> Http<Front> {
 
             if index == len {
                 metrics.service_stop();
-                self.log_default_answer_success(&metrics);
+                self.log_default_answer_success(metrics);
                 self.front_readiness.reset();
                 self.back_readiness.reset();
                 return SessionResult::CloseSession;
@@ -1192,10 +1184,10 @@ impl<Front: SocketHandler> Http<Front> {
 
             // we must now copy the body from front to back
             trace!("100-Continue => copying {} of body from front to back", sz);
-            self.front_buf.as_mut().map(|buf| {
+            if let Some(buf) = self.front_buf.as_mut() {
                 buf.slice_output(sz);
                 buf.consume_parsed_data(sz);
-            });
+            }
 
             self.response = Some(ResponseState::Initial);
             self.res_header_end = None;
@@ -1225,7 +1217,7 @@ impl<Front: SocketHandler> Http<Front> {
 
                 save_http_status_metric(self.get_response_status());
 
-                self.log_request_success(&metrics);
+                self.log_request_success(metrics);
                 metrics.reset();
 
                 if self.closing {
@@ -1265,7 +1257,7 @@ impl<Front: SocketHandler> Http<Front> {
                 self.back_readiness.interest.insert(Ready::readable());
                 if back_closed {
                     save_http_status_metric(self.get_response_status());
-                    self.log_request_success(&metrics);
+                    self.log_request_success(metrics);
 
                     SessionResult::CloseSession
                 } else {
@@ -1507,10 +1499,10 @@ impl<Front: SocketHandler> Http<Front> {
             sock.socket_read(&mut self.back_buf.as_mut().unwrap().buffer.space())
         };
 
-        self.back_buf.as_mut().map(|back_buf| {
+        if let Some(back_buf) = self.back_buf.as_mut() {
             back_buf.buffer.fill(sz);
             back_buf.sliced_input(sz);
-        });
+        };
 
         metrics.backend_bin += sz;
 
@@ -1637,10 +1629,10 @@ impl<Front: SocketHandler> Http<Front> {
             Some(ResponseState::ResponseWithBodyCloseDelimited(_, _, _)) => {
                 self.front_readiness.interest.insert(Ready::writable());
                 if sz > 0 {
-                    self.back_buf.as_mut().map(|buf| {
+                    if let Some(buf) = self.back_buf.as_mut() {
                         buf.slice_output(sz);
                         buf.consume_parsed_data(sz);
-                    });
+                    }
                 }
 
                 if let ResponseState::ResponseWithBodyCloseDelimited(rl, conn, back_closed) =
@@ -1661,7 +1653,7 @@ impl<Front: SocketHandler> Http<Front> {
                             .unwrap()
                         {
                             save_http_status_metric(self.get_response_status());
-                            self.log_request_success(&metrics);
+                            self.log_request_success(metrics);
                             return (ProtocolResult::Continue, SessionResult::CloseSession);
                         }
                     } else {
@@ -1850,8 +1842,8 @@ impl<'a> std::fmt::Display for LogContext<'a> {
             f,
             "{} {} {}\t",
             self.request_id,
-            self.cluster_id.unwrap_or(&"-"),
-            self.backend_id.unwrap_or(&"-")
+            self.cluster_id.unwrap_or("-"),
+            self.backend_id.unwrap_or("-")
         )
     }
 }

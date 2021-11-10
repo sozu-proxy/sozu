@@ -38,10 +38,10 @@ pub fn single_request_cookie(i: &[u8]) -> IResult<&[u8], RequestCookie> {
     Ok((
         i,
         RequestCookie {
-            name: name,
-            value: value,
-            semicolon: semicolon,
-            spaces: spaces,
+            name,
+            value,
+            semicolon,
+            spaces,
         },
     ))
 }

@@ -30,10 +30,7 @@ pub enum MetricData {
 
 impl MetricData {
     fn is_time(&self) -> bool {
-        match self {
-            &MetricData::Time(_) => true,
-            _ => false,
-        }
+        matches!(self, &MetricData::Time(_))
     }
 
     fn update(&mut self, key: &'static str, m: MetricData) -> bool {
@@ -127,7 +124,7 @@ pub fn setup<O: Into<String>>(
         if let Some(p) = prefix {
             (*metrics.borrow_mut()).set_up_prefix(p);
         }
-        (*metrics.borrow_mut()).set_up_remote(metrics_socket, metrics_host.clone());
+        (*metrics.borrow_mut()).set_up_remote(metrics_socket, *metrics_host);
         (*metrics.borrow_mut()).set_up_origin(origin.into());
         (*metrics.borrow_mut()).set_up_tagged_metrics(use_tagged_metrics);
     });
@@ -167,11 +164,15 @@ impl Aggregator {
     }
 
     pub fn set_up_origin(&mut self, origin: String) {
-        self.network.as_mut().map(|n| n.origin = origin);
+        if let Some(n) = self.network.as_mut() {
+            n.origin = origin;
+        }
     }
 
     pub fn set_up_tagged_metrics(&mut self, tagged: bool) {
-        self.network.as_mut().map(|n| n.use_tagged_metrics = tagged);
+        if let Some(n) = self.network.as_mut() {
+            n.use_tagged_metrics = tagged;
+        }
     }
 
     pub fn socket(&self) -> Option<&UdpSocket> {
@@ -238,10 +239,10 @@ impl Subscriber for Aggregator {
         metric: MetricData,
     ) {
         if let Some(ref mut net) = self.network.as_mut() {
-            net.receive_metric(label, cluster_id, backend_id, metric.clone());
+            net.receive_metric(label, cluster_id, backend_id, metric.to_owned());
         }
         self.local
-            .receive_metric(label, cluster_id, backend_id, metric.clone());
+            .receive_metric(label, cluster_id, backend_id, metric);
     }
 }
 
@@ -334,7 +335,7 @@ macro_rules! time (
     use $crate::metrics::{MetricData,Subscriber};
     let v = $value;
     $crate::metrics::METRICS.with(|metrics| {
-      let ref mut m = *metrics.borrow_mut();
+      let m = &mut *metrics.borrow_mut();
 
       m.receive_metric($key, None, None, MetricData::Time(v as usize));
     });
@@ -343,7 +344,7 @@ macro_rules! time (
     use $crate::metrics::{MetricData,Subscriber};
     let v = $value;
     $crate::metrics::METRICS.with(|metrics| {
-      let ref mut m = *metrics.borrow_mut();
+      let m = &mut *metrics.borrow_mut();
       let cluster: &str = $cluster_id;
 
       m.receive_metric($key, Some(cluster), None, MetricData::Time(v as usize));
@@ -356,7 +357,7 @@ macro_rules! record_backend_metrics (
   ($cluster_id:expr, $backend_id:expr, $response_time: expr, $backend_connection_time: expr, $bin: expr, $bout: expr) => {
     use $crate::metrics::{MetricData,Subscriber};
     $crate::metrics::METRICS.with(|metrics| {
-      let ref mut m = *metrics.borrow_mut();
+      let m = &mut *metrics.borrow_mut();
       let cluster_id: &str = $cluster_id.as_str();
       let backend_id: &str = $backend_id;
 
