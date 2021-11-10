@@ -249,8 +249,8 @@ impl Session {
         format!(
             "{} {} {}\t",
             self.request_id,
-            self.cluster_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
-            self.backend_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-")
+            self.cluster_id.as_deref().unwrap_or("-"),
+            self.backend_id.as_deref().unwrap_or("-")
         )
     }
 
@@ -459,10 +459,8 @@ impl Session {
 
     fn set_backend_id(&mut self, id: String) {
         self.backend_id = Some(id.clone());
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.set_backend_id(Some(id)),
-            //FIXME: do other cases
-            _ => {}
+        if let Some(State::Pipe(ref mut pipe)) = self.protocol {
+            pipe.set_backend_id(Some(id));
         }
     }
 
@@ -471,7 +469,7 @@ impl Session {
     }
 
     fn set_back_connected(&mut self, status: BackendConnectionStatus) {
-        let last = self.back_connected.clone();
+        let last = self.back_connected;
         self.back_connected = status;
 
         if status == BackendConnectionStatus::Connected {
@@ -479,21 +477,21 @@ impl Session {
             gauge_add!(
                 "connections_per_backend",
                 1,
-                self.cluster_id.as_ref().map(|s| s.as_str()),
-                self.metrics.backend_id.as_ref().map(|s| s.as_str())
+                self.cluster_id.as_deref(),
+                self.metrics.backend_id.as_deref()
             );
             if let Some(State::SendProxyProtocol(ref mut pp)) = self.protocol {
                 pp.set_back_connected(BackendConnectionStatus::Connected);
             }
 
-            self.backend.as_ref().map(|backend| {
-                let ref mut backend = *backend.borrow_mut();
+            if let Some(backend) = self.backend.as_ref() {
+                let backend = &mut *backend.borrow_mut();
 
                 if backend.retry_policy.is_down() {
                     incr!(
                         "up",
-                        self.cluster_id.as_ref().map(|s| s.as_str()),
-                        self.metrics.backend_id.as_ref().map(|s| s.as_str())
+                        self.cluster_id.as_deref(),
+                        self.metrics.backend_id.as_deref()
                     );
                     info!(
                         "backend server {} at {} is up",
@@ -512,7 +510,7 @@ impl Session {
                 //successful connection, rest failure counter
                 backend.failures = 0;
                 backend.retry_policy.succeed();
-            });
+            }
         }
     }
 
@@ -529,16 +527,16 @@ impl Session {
     }
 
     fn fail_backend_connection(&mut self) {
-        self.backend.as_ref().map(|backend| {
-            let ref mut backend = *backend.borrow_mut();
+        if let Some(backend) = self.backend.as_ref() {
+            let backend = &mut *backend.borrow_mut();
             backend.failures += 1;
 
             let already_unavailable = backend.retry_policy.is_down();
             backend.retry_policy.fail();
             incr!(
                 "connections.error",
-                self.cluster_id.as_ref().map(|s| s.as_str()),
-                self.metrics.backend_id.as_ref().map(|s| s.as_str())
+                self.cluster_id.as_deref(),
+                self.metrics.backend_id.as_deref()
             );
             if !already_unavailable && backend.retry_policy.is_down() {
                 error!(
@@ -547,8 +545,8 @@ impl Session {
                 );
                 incr!(
                     "down",
-                    self.cluster_id.as_ref().map(|s| s.as_str()),
-                    self.metrics.backend_id.as_ref().map(|s| s.as_str())
+                    self.cluster_id.as_deref(),
+                    self.metrics.backend_id.as_deref()
                 );
 
                 push_event(ProxyEvent::BackendDown(
@@ -556,7 +554,7 @@ impl Session {
                     backend.address,
                 ));
             }
-        });
+        }
     }
 
     fn reset_connection_attempt(&mut self) {
@@ -573,10 +571,7 @@ impl Session {
                     // if the socket is half open, it will report 0 bytes read (EOF)
                     Ok(0) => false,
                     Ok(_) => true,
-                    Err(e) => match e.kind() {
-                        std::io::ErrorKind::WouldBlock => true,
-                        _ => false,
-                    },
+                    Err(e) => matches!(e.kind(), std::io::ErrorKind::WouldBlock),
                 }
             }
             None => false,
@@ -644,7 +639,7 @@ impl Session {
             let back_interest = self
                 .back_readiness()
                 .map(|r| r.interest & r.event)
-                .unwrap_or(Ready::empty());
+                .unwrap_or_else(Ready::empty);
 
             trace!(
                 "PROXY\t{} {:?} {:?} -> {:?}",
@@ -716,7 +711,10 @@ impl Session {
                     }
                     SessionResult::Continue => {}
                     _ => {
-                        self.back_readiness().map(|r| r.event.remove(Ready::hup()));
+                        if let Some(r) = self.back_readiness() {
+                            r.event.remove(Ready::hup());
+                        }
+
                         return order;
                     }
                 };
@@ -728,20 +726,24 @@ impl Session {
                     self.frontend_token
                 );
                 self.front_readiness().interest = Ready::empty();
-                self.back_readiness().map(|r| r.interest = Ready::empty());
+                if let Some(r) = self.back_readiness() {
+                    r.interest = Ready::empty();
+                }
+
                 return SessionResult::CloseSession;
             }
 
-            if back_interest.is_error() {
-                if self.back_hup() == SessionResult::CloseSession {
-                    self.front_readiness().interest = Ready::empty();
-                    self.back_readiness().map(|r| r.interest = Ready::empty());
-                    error!(
-                        "PROXY session {:?} back error, disconnecting",
-                        self.frontend_token
-                    );
-                    return SessionResult::CloseSession;
+            if back_interest.is_error() && self.back_hup() == SessionResult::CloseSession {
+                self.front_readiness().interest = Ready::empty();
+                if let Some(r) = self.back_readiness() {
+                    r.interest = Ready::empty();
                 }
+
+                error!(
+                    "PROXY session {:?} back error, disconnecting",
+                    self.frontend_token
+                );
+                return SessionResult::CloseSession;
             }
 
             counter += 1;
@@ -755,7 +757,7 @@ impl Session {
             let back_interest = self
                 .back_readiness()
                 .map(|r| r.interest & r.event)
-                .unwrap_or(Ready::empty());
+                .unwrap_or_else(Ready::empty);
 
             let front_token = self.frontend_token;
             let back = self.back_readiness().cloned();
@@ -791,7 +793,10 @@ impl Session {
 
         let back_connected = self.back_connected();
         if back_connected != BackendConnectionStatus::NotConnected {
-            self.back_readiness().map(|r| r.event = Ready::empty());
+            if let Some(r) = self.back_readiness() {
+                r.event = Ready::empty();
+            }
+
             if let Some(sock) = self.back_socket_mut() {
                 if let Err(e) = sock.shutdown(Shutdown::Both) {
                     if e.kind() != ErrorKind::NotConnected {
@@ -806,8 +811,8 @@ impl Session {
             gauge_add!(
                 "connections_per_backend",
                 -1,
-                self.cluster_id.as_ref().map(|s| s.as_str()),
-                self.metrics.backend_id.as_ref().map(|s| s.as_str())
+                self.cluster_id.as_deref(),
+                self.metrics.backend_id.as_deref()
             );
         }
 
@@ -965,7 +970,9 @@ impl ProxySession for Session {
         if self.frontend_token == token {
             self.front_readiness().event = self.front_readiness().event | events;
         } else if self.backend_token == Some(token) {
-            self.back_readiness().map(|r| r.event = r.event | events);
+            if let Some(r) = self.back_readiness() {
+                r.event |= events;
+            }
         }
     }
 
@@ -1144,7 +1151,7 @@ impl Proxy {
     ) -> Option<Token> {
         for listener in self.listeners.values_mut() {
             if &listener.address == addr {
-                return listener.activate(&mut self.registry, tcp_listener);
+                return listener.activate(&self.registry, tcp_listener);
             }
         }
         None
@@ -1263,7 +1270,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     proxy_protocol: cluster.proxy_protocol,
                     load_balancing: cluster.load_balancing,
                 };
-                self.configs.insert(cluster.cluster_id.clone(), config);
+                self.configs.insert(cluster.cluster_id, config);
 
                 ProxyResponse {
                     id: message.id,
@@ -1314,7 +1321,7 @@ impl ProxyConfiguration<Session> for Proxy {
     fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
         let internal_token = Token(token.0);
         if let Some(listener) = self.listeners.get_mut(&internal_token) {
-            if let Some(ref tcp_listener) = listener.listener.as_ref() {
+            if let Some(tcp_listener) = listener.listener.as_ref() {
                 tcp_listener
                     .accept()
                     .map(|(frontend_sock, _)| frontend_sock)
@@ -1379,7 +1386,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     back_buf,
                     listener.cluster_id.clone(),
                     None,
-                    proxy_protocol.clone(),
+                    proxy_protocol,
                     wait_time,
                     Duration::seconds(listener.config.front_timeout as i64),
                     Duration::seconds(listener.config.back_timeout as i64),
@@ -1474,8 +1481,11 @@ pub fn start(
     let _ = configuration.activate_listener(&address, None);
     let (scm_server, _scm_client) = UnixStream::pair().unwrap();
 
-    let mut server_config: server::ServerConfig = Default::default();
-    server_config.max_connections = max_buffers;
+    let server_config = server::ServerConfig {
+        max_connections: max_buffers,
+        ..Default::default()
+    };
+
     let mut server = Server::new(
         poll,
         channel,

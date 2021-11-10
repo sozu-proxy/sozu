@@ -99,7 +99,7 @@ impl CertificateResolver for Listener {
 
         resolver
             .add_certificate(opts)
-            .map_err(|err| ListenerError::ResolverError(err))
+            .map_err(ListenerError::ResolverError)
     }
 
     fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error> {
@@ -122,7 +122,9 @@ impl Listener {
             let mut ciphers = Vec::new();
             for cipher in config.rustls_cipher_list.iter() {
                 match cipher.as_str() {
-                    "TLS13_CHACHA20_POLY1305_SHA256" => ciphers.push(TLS13_CHACHA20_POLY1305_SHA256),
+                    "TLS13_CHACHA20_POLY1305_SHA256" => {
+                        ciphers.push(TLS13_CHACHA20_POLY1305_SHA256)
+                    }
                     "TLS13_AES_256_GCM_SHA384" => ciphers.push(TLS13_AES_256_GCM_SHA384),
                     "TLS13_AES_128_GCM_SHA256" => ciphers.push(TLS13_AES_128_GCM_SHA256),
                     "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
@@ -131,10 +133,18 @@ impl Listener {
                     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
                         ciphers.push(TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256)
                     }
-                    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => ciphers.push(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384),
-                    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => ciphers.push(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
-                    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => ciphers.push(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
-                    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => ciphers.push(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
+                    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => {
+                        ciphers.push(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)
+                    }
+                    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => {
+                        ciphers.push(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
+                    }
+                    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => {
+                        ciphers.push(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384)
+                    }
+                    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => {
+                        ciphers.push(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
+                    }
                     s => error!("unknown cipher: {:?}", s),
                 }
             }
@@ -158,7 +168,7 @@ impl Listener {
         let server_config = server_config.with_cert_resolver(resolver.clone());
 
         Ok(Listener {
-            address: config.address.clone(),
+            address: config.address,
             fronts: Router::new(),
             answers: Rc::new(RefCell::new(HttpAnswers::new(
                 &config.answer_404,
@@ -216,7 +226,7 @@ impl Listener {
     }
 
     fn accept(&mut self) -> Result<TcpStream, AcceptError> {
-        if let Some(ref listener) = self.listener.as_ref() {
+        if let Some(listener) = self.listener.as_ref() {
             listener
                 .accept()
                 .map_err(|e| match e.kind() {
@@ -279,7 +289,11 @@ impl Proxy {
         }
     }
 
-    pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Result<Option<Token>, rustls::Error> {
+    pub fn add_listener(
+        &mut self,
+        config: HttpsListener,
+        token: Token,
+    ) -> Result<Option<Token>, rustls::Error> {
         Ok(if self.listeners.contains_key(&token) {
             None
         } else {
@@ -357,7 +371,7 @@ impl ProxyConfiguration<Session> for Proxy {
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
-        if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
+        if let Some(listener) = self.listeners.get(&Token(token.0)) {
             if let Err(e) = frontend_sock.set_nodelay(true) {
                 error!(
                     "error setting nodelay on front socket({:?}): {:?}",
@@ -579,11 +593,11 @@ impl ProxyConfiguration<Session> for Proxy {
                 info!("{} processing soft shutdown", message.id);
                 let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.iter_mut() {
-                    l.listener.take().map(|mut sock| {
+                    if let Some(mut sock) = l.listener.take() {
                         if let Err(e) = self.registry.deregister(&mut sock) {
                             error!("error deregistering listen socket: {:?}", e);
                         }
-                    });
+                    };
                 }
                 ProxyResponse {
                     id: message.id,
@@ -595,11 +609,11 @@ impl ProxyConfiguration<Session> for Proxy {
                 info!("{} hard shutdown", message.id);
                 let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, mut l) in listeners.drain() {
-                    l.listener.take().map(|mut sock| {
+                    if let Some(mut sock) = l.listener.take() {
                         if let Err(e) = self.registry.deregister(&mut sock) {
                             error!("error deregistering listen socket: {:?}", e);
                         }
-                    });
+                    };
                 }
                 ProxyResponse {
                     id: message.id,
@@ -737,16 +751,22 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
         Token(key)
     };
 
-    let address = config.address.clone();
+    let address = config.address;
     let sessions = SessionManager::new(sessions, max_buffers);
     let registry = event_loop.registry().try_clone().unwrap();
     let mut configuration = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
-    if configuration.add_listener(config, token).expect("failed to create listener").is_some()
+    if configuration
+        .add_listener(config, token)
+        .expect("failed to create listener")
+        .is_some()
         && configuration.activate_listener(&address, None).is_some()
     {
         let (scm_server, _scm_client) = UnixStream::pair().unwrap();
-        let mut server_config: server::ServerConfig = Default::default();
-        server_config.max_connections = max_buffers;
+        let server_config = server::ServerConfig {
+            max_connections: max_buffers,
+            ..Default::default()
+        };
+
         let mut server = Server::new(
             event_loop,
             channel,

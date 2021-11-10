@@ -16,6 +16,12 @@ pub struct BackendMap {
     pub available: bool,
 }
 
+impl Default for BackendMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BackendMap {
     pub fn new() -> BackendMap {
         BackendMap {
@@ -30,7 +36,7 @@ impl BackendMap {
         backends: &HashMap<ClusterId, Vec<proxy::Backend>>,
     ) {
         self.backends
-            .extend(backends.iter().map(|(ref cluster_id, ref backend_vec)| {
+            .extend(backends.iter().map(|(cluster_id, backend_vec)| {
                 (
                     cluster_id.to_string(),
                     BackendList::import_configuration_state(backend_vec),
@@ -82,7 +88,7 @@ impl BackendMap {
             }
 
             if let Some(ref mut b) = app_backends.next_available_backend() {
-                let ref mut backend = *b.borrow_mut();
+                let backend = &mut (*b.borrow_mut());
 
                 debug!(
                     "Connecting {} -> {:?}",
@@ -107,7 +113,7 @@ impl BackendMap {
                     self.available = true;
                 }
 
-                return res;
+                res
             } else {
                 if self.available {
                     error!("no more available backends for app {}", cluster_id);
@@ -117,7 +123,7 @@ impl BackendMap {
                         cluster_id.to_string(),
                     ));
                 }
-                return Err(ConnectionError::NoBackendAvailable);
+                Err(ConnectionError::NoBackendAvailable)
             }
         } else {
             Err(ConnectionError::NoBackendAvailable)
@@ -134,7 +140,7 @@ impl BackendMap {
             .get_mut(cluster_id)
             .and_then(|app_backends| app_backends.find_sticky(sticky_session))
             .map(|b| {
-                let ref mut backend = *b.borrow_mut();
+                let backend = &mut *b.borrow_mut();
                 let conn = backend.try_connect();
 
                 conn.map(|c| (b.clone(), c)).map_err(|e| {
@@ -147,13 +153,13 @@ impl BackendMap {
             });
 
         if let Some(res) = sticky_conn {
-            return res;
+            res
         } else {
             debug!(
                 "Couldn't find a backend corresponding to sticky_session {} for app {}",
                 sticky_session, cluster_id
             );
-            return self.backend_from_cluster_id(cluster_id);
+            self.backend_from_cluster_id(cluster_id)
         }
     }
 
@@ -183,6 +189,12 @@ pub struct BackendList {
     pub load_balancing: Box<dyn LoadBalancingAlgorithm>,
 }
 
+impl Default for BackendList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BackendList {
     pub fn new() -> BackendList {
         BackendList {
@@ -192,9 +204,9 @@ impl BackendList {
         }
     }
 
-    pub fn import_configuration_state(backend_vec: &Vec<proxy::Backend>) -> BackendList {
+    pub fn import_configuration_state(backend_vec: &[proxy::Backend]) -> BackendList {
         let mut list = BackendList::new();
-        for ref backend in backend_vec {
+        for backend in backend_vec {
             let backend = Backend::new(
                 &backend.backend_id,
                 backend.address,
@@ -252,7 +264,7 @@ impl BackendList {
     pub fn find_sticky(&mut self, sticky_session: &str) -> Option<&mut Rc<RefCell<Backend>>> {
         self.backends
             .iter_mut()
-            .find(|b| b.borrow().sticky_id.as_ref().map(|s| s.as_str()) == Some(sticky_session))
+            .find(|b| b.borrow().sticky_id.as_deref() == Some(sticky_session))
             .and_then(|b| if b.borrow().can_open() { Some(b) } else { None })
     }
 
@@ -292,12 +304,12 @@ impl BackendList {
             LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(Random {}),
             LoadBalancingAlgorithms::LeastLoaded => {
                 self.load_balancing = Box::new(LeastLoaded {
-                    metric: metric.clone().unwrap_or(proxy::LoadMetric::Connections),
+                    metric: metric.unwrap_or(proxy::LoadMetric::Connections),
                 })
             }
             LoadBalancingAlgorithms::PowerOfTwo => {
                 self.load_balancing = Box::new(PowerOfTwo {
-                    metric: metric.clone().unwrap_or(proxy::LoadMetric::Connections),
+                    metric: metric.unwrap_or(proxy::LoadMetric::Connections),
                 })
             }
         }

@@ -36,6 +36,12 @@ impl LoadBalancingAlgorithm for RoundRobin {
     }
 }
 
+impl Default for RoundRobin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RoundRobin {
     pub fn new() -> Self {
         Self { next_backend: 0 }
@@ -143,15 +149,12 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
                     second = first.take();
                     first = Some((measure, backend));
                 }
+            } else if first.as_ref().unwrap().0 <= measure && measure < second.as_ref().unwrap().0 {
+                second = Some((measure, backend));
+                // other case: we don't change anything
             } else {
-                if first.as_ref().unwrap().0 <= measure {
-                    if measure < second.as_ref().unwrap().0 {
-                        second = Some((measure, backend));
-                    } // other case: we don't change anything
-                } else {
-                    second = first.take();
-                    first = Some((measure, backend));
-                }
+                second = first.take();
+                first = Some((measure, backend));
             }
         }
 

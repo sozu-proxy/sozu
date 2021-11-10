@@ -279,10 +279,7 @@ pub enum BackendConnectionStatus {
 
 impl BackendConnectionStatus {
     pub fn is_connecting(&self) -> bool {
-        match self {
-            BackendConnectionStatus::Connecting(_) => true,
-            _ => false,
-        }
+        matches!(self, BackendConnectionStatus::Connecting(_))
     }
 }
 
@@ -335,59 +332,59 @@ pub enum RequiredEvents {
 
 impl RequiredEvents {
     pub fn front_readable(&self) -> bool {
-        match *self {
+        matches!(
+            *self,
             RequiredEvents::FrontReadBackNone
-            | RequiredEvents::FrontReadWriteBackNone
-            | RequiredEvents::FrontReadBackRead
-            | RequiredEvents::FrontReadWriteBackRead
-            | RequiredEvents::FrontReadBackWrite
-            | RequiredEvents::FrontReadWriteBackWrite
-            | RequiredEvents::FrontReadBackReadWrite
-            | RequiredEvents::FrontReadWriteBackReadWrite => true,
-            _ => false,
-        }
+                | RequiredEvents::FrontReadWriteBackNone
+                | RequiredEvents::FrontReadBackRead
+                | RequiredEvents::FrontReadWriteBackRead
+                | RequiredEvents::FrontReadBackWrite
+                | RequiredEvents::FrontReadWriteBackWrite
+                | RequiredEvents::FrontReadBackReadWrite
+                | RequiredEvents::FrontReadWriteBackReadWrite
+        )
     }
 
     pub fn front_writable(&self) -> bool {
-        match *self {
+        matches!(
+            *self,
             RequiredEvents::FrontWriteBackNone
-            | RequiredEvents::FrontReadWriteBackNone
-            | RequiredEvents::FrontWriteBackRead
-            | RequiredEvents::FrontReadWriteBackRead
-            | RequiredEvents::FrontWriteBackWrite
-            | RequiredEvents::FrontReadWriteBackWrite
-            | RequiredEvents::FrontWriteBackReadWrite
-            | RequiredEvents::FrontReadWriteBackReadWrite => true,
-            _ => false,
-        }
+                | RequiredEvents::FrontReadWriteBackNone
+                | RequiredEvents::FrontWriteBackRead
+                | RequiredEvents::FrontReadWriteBackRead
+                | RequiredEvents::FrontWriteBackWrite
+                | RequiredEvents::FrontReadWriteBackWrite
+                | RequiredEvents::FrontWriteBackReadWrite
+                | RequiredEvents::FrontReadWriteBackReadWrite
+        )
     }
 
     pub fn back_readable(&self) -> bool {
-        match *self {
+        matches!(
+            *self,
             RequiredEvents::FrontReadBackRead
-            | RequiredEvents::FrontWriteBackRead
-            | RequiredEvents::FrontReadWriteBackRead
-            | RequiredEvents::FrontNoneBackRead
-            | RequiredEvents::FrontReadBackReadWrite
-            | RequiredEvents::FrontWriteBackReadWrite
-            | RequiredEvents::FrontReadWriteBackReadWrite
-            | RequiredEvents::FrontNoneBackReadWrite => true,
-            _ => false,
-        }
+                | RequiredEvents::FrontWriteBackRead
+                | RequiredEvents::FrontReadWriteBackRead
+                | RequiredEvents::FrontNoneBackRead
+                | RequiredEvents::FrontReadBackReadWrite
+                | RequiredEvents::FrontWriteBackReadWrite
+                | RequiredEvents::FrontReadWriteBackReadWrite
+                | RequiredEvents::FrontNoneBackReadWrite
+        )
     }
 
     pub fn back_writable(&self) -> bool {
-        match *self {
+        matches!(
+            *self,
             RequiredEvents::FrontReadBackWrite
-            | RequiredEvents::FrontWriteBackWrite
-            | RequiredEvents::FrontReadWriteBackWrite
-            | RequiredEvents::FrontNoneBackWrite
-            | RequiredEvents::FrontReadBackReadWrite
-            | RequiredEvents::FrontWriteBackReadWrite
-            | RequiredEvents::FrontReadWriteBackReadWrite
-            | RequiredEvents::FrontNoneBackReadWrite => true,
-            _ => false,
-        }
+                | RequiredEvents::FrontWriteBackWrite
+                | RequiredEvents::FrontReadWriteBackWrite
+                | RequiredEvents::FrontNoneBackWrite
+                | RequiredEvents::FrontReadBackReadWrite
+                | RequiredEvents::FrontWriteBackReadWrite
+                | RequiredEvents::FrontReadWriteBackReadWrite
+                | RequiredEvents::FrontNoneBackReadWrite
+        )
     }
 }
 
@@ -559,6 +556,12 @@ pub struct Readiness {
     pub interest: Ready,
 }
 
+impl Default for Readiness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Readiness {
     pub fn new() -> Readiness {
         Readiness {
@@ -680,14 +683,14 @@ impl SessionMetrics {
         }
 
         self.service_start = Some(now);
-        self.wait_time = self.wait_time + (now - self.wait_start);
+        self.wait_time += now - self.wait_start;
     }
 
     pub fn service_stop(&mut self) {
         if self.service_start.is_some() {
             let start = self.service_start.take().unwrap();
             let duration = Instant::now() - start;
-            self.service_time = self.service_time + duration;
+            self.service_time += duration;
         }
     }
 
@@ -781,6 +784,12 @@ pub struct PeakEWMA {
     pub rtt: f64,
     /// last modification
     pub last_event: Instant,
+}
+
+impl Default for PeakEWMA {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PeakEWMA {

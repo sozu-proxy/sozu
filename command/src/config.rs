@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::io::{self, Error, ErrorKind, Read};
-use std::iter::repeat;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -198,7 +198,7 @@ impl Listener {
         };
 
         let key = self.key.as_ref().and_then(|path| {
-            Config::load_file(&path)
+            Config::load_file(path)
                 .map_err(|e| {
                     error!("cannot load key at path '{}': {:?}", path, e);
                     e
@@ -206,7 +206,7 @@ impl Listener {
                 .ok()
         });
         let certificate = self.certificate.as_ref().and_then(|path| {
-            Config::load_file(&path)
+            Config::load_file(path)
                 .map_err(|e| {
                     error!("cannot load certificate at path '{}': {:?}", path, e);
                     e
@@ -217,7 +217,7 @@ impl Listener {
             .certificate_chain
             .as_ref()
             .and_then(|path| {
-                Config::load_file(&path)
+                Config::load_file(path)
                     .map_err(|e| {
                         error!("cannot load certificate chain at path '{}': {:?}", path, e);
                         e
@@ -387,7 +387,7 @@ impl FileAppFrontendConfig {
         }
 
         let key_opt = self.key.as_ref().and_then(|path| {
-            Config::load_file(&path)
+            Config::load_file(path)
                 .map_err(|e| {
                     error!("cannot load key at path '{}': {:?}", path, e);
                     e
@@ -395,7 +395,7 @@ impl FileAppFrontendConfig {
                 .ok()
         });
         let certificate_opt = self.certificate.as_ref().and_then(|path| {
-            Config::load_file(&path)
+            Config::load_file(path)
                 .map_err(|e| {
                     error!("cannot load certificate at path '{}': {:?}", path, e);
                     e
@@ -406,7 +406,7 @@ impl FileAppFrontendConfig {
             .certificate_chain
             .as_ref()
             .and_then(|path| {
-                Config::load_file(&path)
+                Config::load_file(path)
                     .map_err(|e| {
                         error!("cannot load certificate chain at path '{}': {:?}", path, e);
                         e
@@ -537,7 +537,7 @@ impl FileAppConfig {
                 }
 
                 let answer_503 = self.answer_503.as_ref().and_then(|path| {
-                    Config::load_file(&path)
+                    Config::load_file(path)
                         .map_err(|e| {
                             error!("cannot load 503 error page at path '{}': {:?}", path, e);
                             e
@@ -599,7 +599,7 @@ impl HttpFrontendConfig {
                 hostname: self.hostname.clone(),
                 path: self.path.clone(),
                 method: self.method.clone(),
-                position: self.position.clone(),
+                position: self.position,
             }));
         } else {
             //create the front both for HTTP and HTTPS if possible
@@ -609,7 +609,7 @@ impl HttpFrontendConfig {
                 hostname: self.hostname.clone(),
                 path: self.path.clone(),
                 method: self.method.clone(),
-                position: self.position.clone(),
+                position: self.position,
             }));
         }
 
@@ -632,25 +632,22 @@ pub struct HttpAppConfig {
 
 impl HttpAppConfig {
     pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
-        let mut v = Vec::new();
-
-        v.push(ProxyRequestData::AddCluster(Cluster {
+        let mut v = vec![ProxyRequestData::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: self.sticky_session,
             https_redirect: self.https_redirect,
             proxy_protocol: None,
             load_balancing: self.load_balancing,
             answer_503: self.answer_503.clone(),
-            load_metric: self.load_metric.clone(),
-        }));
+            load_metric: self.load_metric,
+        })];
 
         for frontend in &self.frontends {
             let mut orders = frontend.generate_orders(&self.cluster_id);
-            v.extend(orders.drain(..));
+            v.append(&mut orders);
         }
 
-        let mut backend_count = 0usize;
-        for backend in &self.backends {
+        for (backend_count, backend) in self.backends.iter().enumerate() {
             let load_balancing_parameters = Some(LoadBalancingParams {
                 weight: backend.weight.unwrap_or(100),
             });
@@ -665,8 +662,6 @@ impl HttpAppConfig {
                 sticky_id: backend.sticky_id.clone(),
                 backup: backend.backup,
             }));
-
-            backend_count += 1;
         }
 
         v
@@ -691,17 +686,15 @@ pub struct TcpAppConfig {
 
 impl TcpAppConfig {
     pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
-        let mut v = Vec::new();
-
-        v.push(ProxyRequestData::AddCluster(Cluster {
+        let mut v = vec![ProxyRequestData::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: false,
             https_redirect: false,
             proxy_protocol: self.proxy_protocol.clone(),
             load_balancing: self.load_balancing,
-            load_metric: self.load_metric.clone(),
+            load_metric: self.load_metric,
             answer_503: None,
-        }));
+        })];
 
         for frontend in &self.frontends {
             v.push(ProxyRequestData::AddTcpFrontend(TcpFrontend {
@@ -710,8 +703,7 @@ impl TcpAppConfig {
             }));
         }
 
-        let mut backend_count = 0usize;
-        for backend in &self.backends {
+        for (backend_count, backend) in self.backends.iter().enumerate() {
             let load_balancing_parameters = Some(LoadBalancingParams {
                 weight: backend.weight.unwrap_or(100),
             });
@@ -726,8 +718,6 @@ impl TcpAppConfig {
                 sticky_id: backend.sticky_id.clone(),
                 backup: backend.backup,
             }));
-
-            backend_count += 1;
         }
 
         v
@@ -878,9 +868,9 @@ impl FileConfig {
                 match listener.protocol {
                     FileListenerProtocolConfig::Https => {
                         if let Some(l) = listener.to_tls(
-                            self.front_timeout.clone(),
-                            self.back_timeout.clone(),
-                            self.connect_timeout.clone(),
+                            self.front_timeout,
+                            self.back_timeout,
+                            self.connect_timeout,
                         ) {
                             https_listeners.push(l);
                         } else {
@@ -889,9 +879,9 @@ impl FileConfig {
                     }
                     FileListenerProtocolConfig::Http => {
                         if let Some(l) = listener.to_http(
-                            self.front_timeout.clone(),
-                            self.back_timeout.clone(),
-                            self.connect_timeout.clone(),
+                            self.front_timeout,
+                            self.back_timeout,
+                            self.connect_timeout,
                         ) {
                             http_listeners.push(l);
                         } else {
@@ -900,9 +890,9 @@ impl FileConfig {
                     }
                     FileListenerProtocolConfig::Tcp => {
                         if let Some(l) = listener.to_tcp(
-                            self.front_timeout.clone(),
-                            self.back_timeout.clone(),
-                            self.connect_timeout.clone(),
+                            self.front_timeout,
+                            self.back_timeout,
+                            self.connect_timeout,
                         ) {
                             tcp_listeners.push(l);
                         } else {
@@ -946,9 +936,9 @@ impl FileConfig {
                                                 https_listeners.push(
                                                     listener
                                                         .to_tls(
-                                                            self.front_timeout.clone(),
-                                                            self.back_timeout.clone(),
-                                                            self.connect_timeout.clone(),
+                                                            self.front_timeout,
+                                                            self.back_timeout,
+                                                            self.connect_timeout,
                                                         )
                                                         .unwrap(),
                                                 );
@@ -962,9 +952,9 @@ impl FileConfig {
                                                 http_listeners.push(
                                                     listener
                                                         .to_http(
-                                                            self.front_timeout.clone(),
-                                                            self.back_timeout.clone(),
-                                                            self.connect_timeout.clone(),
+                                                            self.front_timeout,
+                                                            self.back_timeout,
+                                                            self.connect_timeout,
                                                         )
                                                         .unwrap(),
                                                 );
@@ -996,9 +986,9 @@ impl FileConfig {
                                             tcp_listeners.push(
                                                 listener
                                                     .to_tcp(
-                                                        self.front_timeout.clone(),
-                                                        self.back_timeout.clone(),
-                                                        self.connect_timeout.clone(),
+                                                        self.front_timeout,
+                                                        self.back_timeout,
+                                                        self.connect_timeout,
                                                     )
                                                     .unwrap(),
                                             );
@@ -1033,11 +1023,8 @@ impl FileConfig {
             path.to_str().map(|s| s.to_string()).unwrap()
         });
 
-        match (&self.saved_state, &self.automatic_state_save) {
-            (None, Some(true)) => panic!(
-                "cannot activate automatic state save if the 'saved_state` option is not set"
-            ),
-            _ => {}
+        if let (None, Some(true)) = (&self.saved_state, &self.automatic_state_save) {
+            panic!("cannot activate automatic state save if the 'saved_state` option is not set");
         }
 
         Config {
@@ -1315,10 +1302,7 @@ pub fn display_toml_error(file: &str, error: &toml::de::Error) {
     if let Some((line, column)) = error.line_col() {
         let l_span = line.to_string().len();
         println!("{}| {}", line + 1, file.lines().nth(line).unwrap());
-        println!(
-            "{}^",
-            repeat(' ').take(l_span + 2 + column).collect::<String>()
-        );
+        println!("{}^", " ".repeat(l_span + 2 + column));
     }
 }
 

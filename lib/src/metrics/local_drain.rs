@@ -73,11 +73,11 @@ pub fn histogram_to_percentiles(hist: &Histogram<u32>) -> Percentiles {
 }
 
 pub fn aggregated_to_filtered(value: &AggregatedMetric) -> FilteredData {
-    match value {
-        &AggregatedMetric::Gauge(i) => FilteredData::Gauge(i),
-        &AggregatedMetric::Count(i) => FilteredData::Count(i),
-        &AggregatedMetric::Time(ref hist) => {
-            FilteredData::Percentiles(histogram_to_percentiles(&hist))
+    match *value {
+        AggregatedMetric::Gauge(i) => FilteredData::Gauge(i),
+        AggregatedMetric::Count(i) => FilteredData::Count(i),
+        AggregatedMetric::Time(ref hist) => {
+            FilteredData::Percentiles(histogram_to_percentiles(hist))
         }
     }
 }
@@ -172,7 +172,7 @@ impl LocalDrain {
         let data: BTreeMap<String, FilteredData> = self
             .data
             .iter()
-            .map(|(ref key, ref value)| (key.to_string(), aggregated_to_filtered(value)))
+            .map(|(key, value)| (key.to_string(), aggregated_to_filtered(value)))
             .collect();
 
         data
@@ -188,12 +188,12 @@ impl LocalDrain {
                 metrics,
                 clusters,
                 date,
-            } => self.query_cluster(metrics, clusters, date.clone()),
+            } => self.query_cluster(metrics, clusters, *date),
             QueryMetricsType::Backend {
                 metrics,
                 backends,
                 date,
-            } => self.query_backend(metrics, backends, date.clone()),
+            } => self.query_backend(metrics, backends, *date),
         }
     }
 
@@ -258,8 +258,8 @@ impl LocalDrain {
 
     fn query_cluster(
         &mut self,
-        metrics: &Vec<String>,
-        clusters: &Vec<String>,
+        metrics: &[String],
+        clusters: &[String],
         date: Option<i64>,
     ) -> QueryAnswerMetrics {
         let mut apps: BTreeMap<String, BTreeMap<String, FilteredData>> = BTreeMap::new();
@@ -305,8 +305,8 @@ impl LocalDrain {
 
     fn query_backend(
         &mut self,
-        metrics: &Vec<String>,
-        backends: &Vec<(String, String)>,
+        metrics: &[String],
+        backends: &[(String, String)],
         date: Option<i64>,
     ) -> QueryAnswerMetrics {
         let mut backend_data: BTreeMap<String, BTreeMap<String, BTreeMap<String, FilteredData>>> =
@@ -397,7 +397,7 @@ impl LocalDrain {
     }
 
     pub fn dump_cluster_data(&mut self) -> BTreeMap<String, AppMetricsData> {
-        let apps = BTreeMap::new();
+        //let apps = BTreeMap::new();
 
         /*
         for (key, (meta, kind)) in self.metrics.iter() {
@@ -483,7 +483,9 @@ impl LocalDrain {
         // still clear the DB for now
         //self.db.clear();
 
-        apps
+        //apps
+
+        BTreeMap::new()
     }
 
     fn receive_cluster_metric(
@@ -554,13 +556,13 @@ impl LocalDrain {
 
         match metric {
             MetricData::Gauge(i) => {
-                self.store_gauge(&key_prefix, *i, backend_id.is_some());
+                self.store_gauge(key_prefix, *i, backend_id.is_some());
             }
             MetricData::GaugeAdd(i) => {
-                self.add_gauge(&key_prefix, *i, backend_id.is_some());
+                self.add_gauge(key_prefix, *i, backend_id.is_some());
             }
             MetricData::Count(i) => {
-                self.store_count(&key_prefix, *i, backend_id.is_some());
+                self.store_count(key_prefix, *i, backend_id.is_some());
             }
             MetricData::Time(_) => {}
         }
@@ -594,19 +596,18 @@ impl LocalDrain {
 
             let complete_key = format!("{}\t{}", key, timestamp);
 
-            if !self.tree(is_backend).contains_key(&complete_key) {
-                self.tree(is_backend).insert(complete_key, i as u64);
-            }
-
+            self.tree(is_backend)
+                .entry(complete_key)
+                .or_insert(i as u64);
             let minute = previous_minute.minute();
             if minute != 0 {
                 let previous_hour = now - time::Duration::minutes(minute as i64);
                 let timestamp = previous_hour.unix_timestamp();
 
                 let complete_key = format!("{}\t{}", key, timestamp);
-                if !self.tree(is_backend).contains_key(&complete_key) {
-                    self.tree(is_backend).insert(complete_key, i as u64);
-                }
+                self.tree(is_backend)
+                    .entry(complete_key)
+                    .or_insert(i as u64);
             }
         }
     }
@@ -689,9 +690,7 @@ impl LocalDrain {
             None => {
                 self.tree(is_backend).insert(complete_key, i as u64);
             }
-            Some(v) => {
-                *v = *v + i as u64;
-            }
+            Some(v) => *v += i as u64,
         };
 
         // aggregate at the last hour
@@ -705,9 +704,7 @@ impl LocalDrain {
                 None => {
                     self.tree(is_backend).insert(complete_key, i as u64);
                 }
-                Some(v) => {
-                    *v = *v + i as u64;
-                }
+                Some(v) => *v += i as u64,
             };
 
             let minute = previous_minute.minute();
@@ -720,9 +717,7 @@ impl LocalDrain {
                     None => {
                         self.tree(is_backend).insert(complete_key, i as u64);
                     }
-                    Some(v) => {
-                        *v = *v + i as u64;
-                    }
+                    Some(v) => *v += i as u64,
                 };
             }
         }
@@ -1098,10 +1093,8 @@ impl Subscriber for LocalDrain {
         } else if !self.data.contains_key(key) {
             self.data
                 .insert(String::from(key), AggregatedMetric::new(metric));
-        } else {
-            self.data.get_mut(key).map(|stored_metric| {
-                stored_metric.update(key, metric);
-            });
+        } else if let Some(stored_metric) = self.data.get_mut(key) {
+            stored_metric.update(key, metric);
         }
     }
 }

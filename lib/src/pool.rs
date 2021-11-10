@@ -73,19 +73,18 @@ pub struct BufferMetadata {
     end: usize,
 }
 
+impl Default for BufferMetadata {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BufferMetadata {
     pub fn new() -> BufferMetadata {
         BufferMetadata {
             position: 0,
             end: 0,
         }
-    }
-}
-
-impl poule::Reset for BufferMetadata {
-    fn reset(&mut self) {
-        self.position = 0;
-        self.end = 0;
     }
 }
 

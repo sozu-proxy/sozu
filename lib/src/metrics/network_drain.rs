@@ -1,5 +1,6 @@
 use super::writer::{MetricSocket, MetricsWriter};
 use mio::net::UdpSocket;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Write};
@@ -155,7 +156,7 @@ impl NetworkDrain {
         }*/
 
         if self.is_writable {
-            for (ref key, ref mut stored_metric) in
+            for (key, mut stored_metric) in
                 self.cluster_data.iter_mut().filter(|&(_, ref value)| {
                     value.updated && now.duration_since(value.last_sent) > secs
                 })
@@ -239,10 +240,10 @@ impl NetworkDrain {
         }*/
 
         if self.is_writable {
-            for (ref key, ref mut stored_metric) in
-                self.backend_data.iter_mut().filter(|&(_, ref value)| {
-                    value.updated && now.duration_since(value.last_sent) > secs
-                })
+            for (key, mut stored_metric) in self
+                .backend_data
+                .iter_mut()
+                .filter(|(_, value)| value.updated && now.duration_since(value.last_sent) > secs)
             {
                 //info!("will write {:?} -> {:#?}", key, stored_metric);
                 let res = match stored_metric.data {
@@ -426,23 +427,17 @@ impl Subscriber for NetworkDrain {
         } else if let Some(id) = cluster_id {
             if let Some(bid) = backend_id {
                 let k = (String::from(id), String::from(bid), String::from(key));
-                if !self.backend_data.contains_key(&k) {
-                    self.backend_data
-                        .insert(k, StoredMetricData::new(self.created, metric));
-                } else {
-                    self.backend_data.get_mut(&k).map(|stored_metric| {
-                        stored_metric.update(key, metric);
-                    });
+                if let Entry::Vacant(e) = self.backend_data.entry(k.to_owned()) {
+                    e.insert(StoredMetricData::new(self.created, metric));
+                } else if let Some(stored_metric) = self.backend_data.get_mut(&k) {
+                    stored_metric.update(key, metric);
                 }
             } else {
                 let k = (String::from(id), String::from(key));
-                if !self.cluster_data.contains_key(&k) {
-                    self.cluster_data
-                        .insert(k, StoredMetricData::new(self.created, metric));
-                } else {
-                    self.cluster_data.get_mut(&k).map(|stored_metric| {
-                        stored_metric.update(key, metric);
-                    });
+                if let Entry::Vacant(e) = self.cluster_data.entry(k.to_owned()) {
+                    e.insert(StoredMetricData::new(self.created, metric));
+                } else if let Some(stored_metric) = self.cluster_data.get_mut(&k) {
+                    stored_metric.update(key, metric);
                 }
             }
         } else if !self.data.contains_key(key) {
@@ -450,10 +445,8 @@ impl Subscriber for NetworkDrain {
                 String::from(key),
                 StoredMetricData::new(self.created, metric),
             );
-        } else {
-            self.data.get_mut(key).map(|stored_metric| {
-                stored_metric.update(key, metric);
-            });
+        } else if let Some(stored_metric) = self.data.get_mut(key) {
+            stored_metric.update(key, metric);
         }
     }
 }

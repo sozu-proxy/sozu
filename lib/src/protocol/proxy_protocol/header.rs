@@ -207,16 +207,16 @@ impl ProxyAddr {
 
     pub fn source(&self) -> Option<SocketAddr> {
         match self {
-            &ProxyAddr::Ipv4Addr { src_addr: src, .. } => Some(SocketAddr::V4(src)),
-            &ProxyAddr::Ipv6Addr { src_addr: src, .. } => Some(SocketAddr::V6(src)),
+            ProxyAddr::Ipv4Addr { src_addr: src, .. } => Some(SocketAddr::V4(*src)),
+            ProxyAddr::Ipv6Addr { src_addr: src, .. } => Some(SocketAddr::V6(*src)),
             _ => None,
         }
     }
 
     pub fn destination(&self) -> Option<SocketAddr> {
         match self {
-            &ProxyAddr::Ipv4Addr { dst_addr: dst, .. } => Some(SocketAddr::V4(dst)),
-            &ProxyAddr::Ipv6Addr { dst_addr: dst, .. } => Some(SocketAddr::V6(dst)),
+            ProxyAddr::Ipv4Addr { dst_addr: dst, .. } => Some(SocketAddr::V4(*dst)),
+            ProxyAddr::Ipv6Addr { dst_addr: dst, .. } => Some(SocketAddr::V6(*dst)),
             _ => None,
         }
     }

@@ -4,7 +4,6 @@ use nix::sys::socket;
 use nix::sys::uio;
 use nix::Result as NixResult;
 use serde_json;
-use std::iter::repeat;
 use std::net::SocketAddr;
 use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net;
@@ -67,8 +66,7 @@ impl ScmSocket {
     }
 
     pub fn receive_listeners(&self) -> Option<Listeners> {
-        let mut buf = Vec::with_capacity(MAX_BYTES_OUT);
-        buf.extend(repeat(0).take(MAX_BYTES_OUT));
+        let mut buf = vec![0; MAX_BYTES_OUT];
 
         let mut received_fds: [RawFd; MAX_FDS_OUT] = [0; MAX_FDS_OUT];
 

@@ -431,17 +431,17 @@ impl Server {
 
         // initialize the worker with the state we got from a file
         if let Some(state) = config_state {
-            let mut counter = 0usize;
-
-            for order in state.generate_orders() {
+            for (counter, order) in state.generate_orders().iter().enumerate() {
                 let id = format!("INIT-{}", counter);
-                let message = ProxyRequest { id, order };
+                let message = ProxyRequest {
+                    id,
+                    order: order.to_owned(),
+                };
 
                 trace!("generating initial config order: {:#?}", message);
                 server.notify_proxys(message);
-
-                counter += 1;
             }
+
             // do not send back answers to the initialization messages
             QUEUE.with(|queue| {
                 (*queue.borrow_mut()).clear();
@@ -649,7 +649,7 @@ impl Server {
             self.handle_remaining_readiness();
             self.create_sessions();
 
-            should_poll_at = TIMER.with(|timer| timer.borrow().next_poll_date().map(|i| i.into()));
+            should_poll_at = TIMER.with(|timer| timer.borrow().next_poll_date());
 
             let now = Instant::now();
             if now - last_zombie_check > self.zombie_check_interval {
@@ -802,7 +802,7 @@ impl Server {
     }
 
     fn notify(&mut self, message: ProxyRequest) {
-        if let ProxyRequestData::Metrics(ref configuration) = message.order {
+        if let ProxyRequestData::Metrics(configuration) = &message.order {
             //let id = message.id.clone();
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).configure(configuration);
@@ -818,7 +818,7 @@ impl Server {
 
         if let ProxyRequestData::Query(ref query) = message.order {
             match query {
-                &Query::ApplicationsHashes => {
+                Query::ApplicationsHashes => {
                     push_queue(ProxyResponse {
                         id: message.id.clone(),
                         status: ProxyResponseStatus::Ok,
@@ -828,14 +828,14 @@ impl Server {
                     });
                     return;
                 }
-                &Query::Applications(ref query_type) => {
+                Query::Applications(query_type) => {
                     let answer = match query_type {
-                        &QueryApplicationType::ClusterId(ref cluster_id) => {
+                        QueryApplicationType::ClusterId(cluster_id) => {
                             QueryAnswer::Applications(vec![self
                                 .config_state
                                 .application_state(cluster_id)])
                         }
-                        &QueryApplicationType::Domain(ref domain) => {
+                        QueryApplicationType::Domain(domain) => {
                             let cluster_ids = get_application_ids_by_domain(
                                 &self.config_state,
                                 domain.hostname.clone(),
@@ -843,9 +843,7 @@ impl Server {
                             );
                             let answer = cluster_ids
                                 .iter()
-                                .map(|ref cluster_id| {
-                                    self.config_state.application_state(cluster_id)
-                                })
+                                .map(|cluster_id| self.config_state.application_state(cluster_id))
                                 .collect();
 
                             QueryAnswer::Applications(answer)
@@ -859,7 +857,7 @@ impl Server {
                     });
                     return;
                 }
-                &Query::Certificates(ref q) => {
+                Query::Certificates(q) => {
                     match q {
                         // forward the query to the TLS implementation
                         QueryCertificateType::Domain(_) => {}
@@ -872,7 +870,7 @@ impl Server {
                                 data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(
                                     QueryAnswerCertificate::Fingerprint(get_certificate(
                                         &self.config_state,
-                                        &f,
+                                        f,
                                     )),
                                 ))),
                             });
@@ -880,7 +878,7 @@ impl Server {
                         }
                     }
                 }
-                &Query::Metrics(ref q) => {
+                Query::Metrics(q) => {
                     METRICS.with(|metrics| {
                         let data = (*metrics.borrow_mut()).query(q);
 
@@ -911,7 +909,7 @@ impl Server {
                     .set_load_balancing_policy_for_app(
                         &cluster.cluster_id,
                         cluster.load_balancing,
-                        cluster.load_metric.clone(),
+                        cluster.load_metric,
                     );
                 //not returning because the message must still be handled by each proxy
             }
@@ -1291,7 +1289,7 @@ impl Server {
                     let status = if self
                         .tcp
                         .borrow_mut()
-                        .add_listener(listener.clone(), self.pool.clone(), token)
+                        .add_listener(listener, self.pool.clone(), token)
                         .is_some()
                     {
                         entry.insert(Rc::new(RefCell::new(ListenSession {
@@ -1547,68 +1545,64 @@ impl Server {
     }
 
     pub fn create_sessions(&mut self) {
-        loop {
-            if let Some((sock, token, protocol, timestamp)) = self.accept_queue.pop_back() {
-                let wait_time = Instant::now() - timestamp;
-                time!("accept_queue.wait_time", wait_time.whole_milliseconds());
-                if wait_time > self.accept_queue_timeout {
-                    incr!("accept_queue.timeout");
-                    continue;
-                }
+        while let Some((sock, token, protocol, timestamp)) = self.accept_queue.pop_back() {
+            let wait_time = Instant::now() - timestamp;
+            time!("accept_queue.wait_time", wait_time.whole_milliseconds());
+            if wait_time > self.accept_queue_timeout {
+                incr!("accept_queue.timeout");
+                continue;
+            }
 
-                if !self.sessions.borrow_mut().check_limits() {
-                    break;
-                }
-
-                //FIXME: check the timestamp
-                match protocol {
-                    Protocol::TCPListen => {
-                        let proxy = self.tcp.clone();
-                        if !self
-                            .tcp
-                            .borrow_mut()
-                            .create_session(sock, token, wait_time, proxy)
-                            .is_ok()
-                        {
-                            break;
-                        }
-                    }
-                    Protocol::HTTPListen => {
-                        let proxy = self.http.clone();
-                        if !self
-                            .http
-                            .borrow_mut()
-                            .create_session(sock, token, wait_time, proxy)
-                            .is_ok()
-                        {
-                            break;
-                        }
-                    }
-                    Protocol::HTTPSListen => {
-                        let res = match self.https {
-                            #[cfg(feature = "use-openssl")]
-                            HttpsProvider::Openssl(ref mut openssl) => {
-                                let o = openssl.clone();
-                                openssl
-                                    .borrow_mut()
-                                    .create_session(sock, token, wait_time, o)
-                            }
-                            HttpsProvider::Rustls(ref mut rustls) => {
-                                let r = rustls.clone();
-                                rustls
-                                    .borrow_mut()
-                                    .create_session(sock, token, wait_time, r)
-                            }
-                        };
-
-                        if !res.is_ok() {
-                            break;
-                        }
-                    }
-                    _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
-                }
-            } else {
+            if !self.sessions.borrow_mut().check_limits() {
                 break;
+            }
+
+            //FIXME: check the timestamp
+            match protocol {
+                Protocol::TCPListen => {
+                    let proxy = self.tcp.clone();
+                    if self
+                        .tcp
+                        .borrow_mut()
+                        .create_session(sock, token, wait_time, proxy)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Protocol::HTTPListen => {
+                    let proxy = self.http.clone();
+                    if self
+                        .http
+                        .borrow_mut()
+                        .create_session(sock, token, wait_time, proxy)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Protocol::HTTPSListen => {
+                    let res = match self.https {
+                        #[cfg(feature = "use-openssl")]
+                        HttpsProvider::Openssl(ref mut openssl) => {
+                            let o = openssl.clone();
+                            openssl
+                                .borrow_mut()
+                                .create_session(sock, token, wait_time, o)
+                        }
+                        HttpsProvider::Rustls(ref mut rustls) => {
+                            let r = rustls.clone();
+                            rustls
+                                .borrow_mut()
+                                .create_session(sock, token, wait_time, r)
+                        }
+                    };
+
+                    if res.is_err() {
+                        break;
+                    }
+                }
+                _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
             }
         }
 
@@ -1678,20 +1672,15 @@ impl Server {
         // try to accept again after handling all session events,
         // since we might have released a few session slots
         if self.sessions.borrow().can_accept && !self.accept_ready.is_empty() {
-            loop {
-                if let Some(token) = self
-                    .accept_ready
-                    .iter()
-                    .next()
-                    .map(|token| ListenToken(token.0))
-                {
-                    let protocol = self.sessions.borrow().slab[token.0].borrow().protocol();
-                    self.accept(token, protocol);
-                    if !self.sessions.borrow().can_accept || self.accept_ready.is_empty() {
-                        break;
-                    }
-                } else {
-                    // we don't have any more elements to loop over
+            while let Some(token) = self
+                .accept_ready
+                .iter()
+                .next()
+                .map(|token| ListenToken(token.0))
+            {
+                let protocol = self.sessions.borrow().slab[token.0].borrow().protocol();
+                self.accept(token, protocol);
+                if !self.sessions.borrow().can_accept || self.accept_ready.is_empty() {
                     break;
                 }
             }
@@ -1779,9 +1768,11 @@ impl HttpsProvider {
 
     pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
         match self {
-            &mut HttpsProvider::Rustls(ref mut rustls) => {
-                rustls.borrow_mut().add_listener(config, token).ok().flatten()
-            }
+            &mut HttpsProvider::Rustls(ref mut rustls) => rustls
+                .borrow_mut()
+                .add_listener(config, token)
+                .ok()
+                .flatten(),
             &mut HttpsProvider::Openssl(ref mut openssl) => {
                 openssl.borrow_mut().add_listener(config, token)
             }
@@ -1878,7 +1869,11 @@ impl HttpsProvider {
 
     pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
         let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-        rustls.borrow_mut().add_listener(config, token).ok().flatten()
+        rustls
+            .borrow_mut()
+            .add_listener(config, token)
+            .ok()
+            .flatten()
     }
 
     pub fn activate_listener(

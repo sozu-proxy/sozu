@@ -320,9 +320,9 @@ mod tests {
         }
     );
 
-    const KEY: &'static str = include_str!("../../lib/assets/key.pem");
-    const CERTIFICATE: &'static str = include_str!("../../lib/assets/certificate.pem");
-    const CHAIN: &'static str = include_str!("../../lib/assets/certificate_chain.pem");
+    const KEY: &str = include_str!("../../lib/assets/key.pem");
+    const CERTIFICATE: &str = include_str!("../../lib/assets/certificate.pem");
+    const CHAIN: &str = include_str!("../../lib/assets/certificate_chain.pem");
 
     test_message!(
         add_certificate,

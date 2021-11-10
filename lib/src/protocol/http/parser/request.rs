@@ -63,11 +63,7 @@ impl RequestState {
     }
 
     pub fn is_front_error(&self) -> bool {
-        if let RequestState::Error(_, _, _, _, _) = self {
-            true
-        } else {
-            false
-        }
+        matches!(self, RequestState::Error(_, _, _, _, _))
     }
 
     pub fn get_sticky_session(&self) -> Option<&str> {
@@ -77,23 +73,23 @@ impl RequestState {
     }
 
     pub fn has_host(&self) -> bool {
-        match *self {
+        matches!(
+            self,
             RequestState::HasHost(_, _, _)
-            | RequestState::HasHostAndLength(_, _, _, _)
-            | RequestState::Request(_, _, _)
-            | RequestState::RequestWithBody(_, _, _, _)
-            | RequestState::RequestWithBodyChunks(_, _, _, _) => true,
-            _ => false,
-        }
+                | RequestState::HasHostAndLength(_, _, _, _)
+                | RequestState::Request(_, _, _)
+                | RequestState::RequestWithBody(_, _, _, _)
+                | RequestState::RequestWithBodyChunks(_, _, _, _)
+        )
     }
 
     pub fn is_proxying(&self) -> bool {
-        match *self {
+        matches!(
+            self,
             RequestState::Request(_, _, _)
-            | RequestState::RequestWithBody(_, _, _, _)
-            | RequestState::RequestWithBodyChunks(_, _, _, _) => true,
-            _ => false,
-        }
+                | RequestState::RequestWithBody(_, _, _, _)
+                | RequestState::RequestWithBodyChunks(_, _, _, _)
+        )
     }
 
     pub fn is_head(&self) -> bool {
@@ -193,11 +189,7 @@ impl RequestState {
     }
 
     pub fn should_chunk(&self) -> bool {
-        if let RequestState::RequestWithBodyChunks(_, _, _, _) = *self {
-            true
-        } else {
-            false
-        }
+        matches!(self, RequestState::RequestWithBodyChunks(_, _, _, _))
     }
 }
 
@@ -289,50 +281,50 @@ pub fn validate_request_header(
         HeaderValue::Encoding(_) => state,
         HeaderValue::Forwarded(value) => {
             //FIXME: it should handle duplicate headers
-            state.get_mut_connection().map(|conn| {
+            if let Some(conn) = state.get_mut_connection() {
                 conn.forwarded.forwarded = String::from_utf8(value.to_vec()).ok();
-            });
+            }
             state
         }
         HeaderValue::XForwardedFor(value) => {
             //FIXME: it should handle duplicate headers
-            state.get_mut_connection().map(|conn| {
+            if let Some(conn) = state.get_mut_connection() {
                 conn.forwarded.x_for = String::from_utf8(value.to_vec()).ok();
-            });
+            }
             state
         }
         HeaderValue::XForwardedPort => {
-            state.get_mut_connection().map(|conn| {
+            if let Some(conn) = state.get_mut_connection() {
                 conn.forwarded.x_port = true;
-            });
+            }
             state
         }
         HeaderValue::XForwardedProto => {
-            state.get_mut_connection().map(|conn| {
+            if let Some(conn) = state.get_mut_connection() {
                 conn.forwarded.x_proto = true;
-            });
+            }
             state
         }
         HeaderValue::Other(_, _) => state,
         //FIXME: for now, we don't look at what is asked in upgrade since the backend is the one deciding
         HeaderValue::Upgrade(s) => {
             let mut st = state;
-            st.get_mut_connection().map(|conn| {
+            if let Some(conn) = st.get_mut_connection() {
                 conn.upgrade = Some(str::from_utf8(s).expect("should be ascii").to_string())
-            });
+            }
             st
         }
         HeaderValue::Cookie(cookies) => {
             let sticky_session_header = cookies
                 .into_iter()
-                .find(|ref cookie| &cookie.name[..] == sticky_name.as_bytes());
+                .find(|cookie| cookie.name == sticky_name.as_bytes());
             if let Some(sticky_session) = sticky_session_header {
                 let mut st = state;
-                st.get_mut_connection().map(|conn| {
+                if let Some(conn) = st.get_mut_connection() {
                     conn.sticky_session = str::from_utf8(sticky_session.value)
                         .map(|s| s.to_string())
                         .ok()
-                });
+                }
 
                 return st;
             }
@@ -366,7 +358,7 @@ pub fn parse_request(
                     if let Some(rl) = RRequestLine::from_request_line(r) {
                         let conn = Connection::new();
                         //FIXME: what if it's not absolute path or complete URL, but an authority with CONNECT?
-                        if rl.uri.len() > 0 && rl.uri.as_bytes()[0] != b'/' {
+                        if !rl.uri.is_empty() && rl.uri.as_bytes()[0] != b'/' {
                             if let Some(host) = Url::parse(&rl.uri)
                                 .ok()
                                 .and_then(|u| u.host_str().map(|s| s.to_string()))

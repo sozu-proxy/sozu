@@ -11,11 +11,17 @@ pub struct FeatureFlags {
     features: HashMap<String, Feature>,
 }
 
+impl Default for FeatureFlags {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FeatureFlags {
     pub fn new() -> FeatureFlags {
         let mut features = HashMap::new();
         if let Ok(val) = std::env::var("FEATURES") {
-            for feature_val in val.split(",") {
+            for feature_val in val.split(',') {
                 if let Some((key, f)) = parse_feature(feature_val) {
                     info!("adding feature flag ({}, {:?})", key, f);
                     features.insert(key, f);
@@ -53,13 +59,13 @@ impl Feature {
 }
 
 fn parse_feature(s: &str) -> Option<(String, Feature)> {
-    let v = s.split(";").collect::<Vec<_>>();
+    let v = s.split(';').collect::<Vec<_>>();
     if v.len() != 3 {
         return None;
     }
 
     let f = if v[1] == "b" {
-        if let Some(b) = v[2].parse().ok() {
+        if let Ok(b) = v[2].parse() {
             Feature::Boolean(b)
         } else {
             return None;
@@ -67,7 +73,7 @@ fn parse_feature(s: &str) -> Option<(String, Feature)> {
     } else if v[1] == "s" {
         Feature::String(v[2].to_string())
     } else if v[1] == "i" {
-        if let Some(i) = v[2].parse().ok() {
+        if let Ok(i) = v[2].parse() {
             Feature::Number(i)
         } else {
             return None;
@@ -76,5 +82,5 @@ fn parse_feature(s: &str) -> Option<(String, Feature)> {
         return None;
     };
 
-    return Some((v[0].to_string(), f));
+    Some((v[0].to_string(), f))
 }

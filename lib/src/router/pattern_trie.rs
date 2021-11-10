@@ -103,7 +103,7 @@ impl<V: Debug + Clone> TrieNode<V> {
         if key.is_empty() {
             return InsertResult::Failed;
         }
-        if &key[..] == &b"."[..] {
+        if key[..] == b"."[..] {
             return InsertResult::Failed;
         }
 
@@ -160,19 +160,17 @@ impl<V: Debug + Clone> TrieNode<V> {
             None => {
                 if self.children.contains_key(partial_key) {
                     InsertResult::Existing
-                } else {
-                    if partial_key == &b"*"[..] {
-                        if self.wildcard.is_some() {
-                            InsertResult::Existing
-                        } else {
-                            self.wildcard = Some((key.to_vec(), value));
-                            InsertResult::Ok
-                        }
+                } else if partial_key == &b"*"[..] {
+                    if self.wildcard.is_some() {
+                        InsertResult::Existing
                     } else {
-                        let node = TrieNode::new(key.to_vec(), value);
-                        self.children.insert(partial_key.to_vec(), node);
+                        self.wildcard = Some((key.to_vec(), value));
                         InsertResult::Ok
                     }
+                } else {
+                    let node = TrieNode::new(key.to_vec(), value);
+                    self.children.insert(partial_key.to_vec(), node);
+                    InsertResult::Ok
                 }
             }
             Some(pos) => {
@@ -199,7 +197,7 @@ impl<V: Debug + Clone> TrieNode<V> {
     pub fn remove_recursive(&mut self, partial_key: &[u8]) -> RemoveResult {
         //println!("remove: key == {}", std::str::from_utf8(partial_key).unwrap());
 
-        if partial_key.len() == 0 {
+        if partial_key.is_empty() {
             if self.key_value.is_some() {
                 self.key_value = None;
                 return RemoveResult::Ok;
@@ -262,7 +260,7 @@ impl<V: Debug + Clone> TrieNode<V> {
     pub fn lookup(&self, partial_key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key, V>> {
         //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
 
-        if partial_key.len() == 0 {
+        if partial_key.is_empty() {
             return self.key_value.as_ref();
         }
 
@@ -312,7 +310,7 @@ impl<V: Debug + Clone> TrieNode<V> {
     ) -> Option<&mut KeyValue<Key, V>> {
         //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
 
-        if partial_key.len() == 0 {
+        if partial_key.is_empty() {
             return self.key_value.as_mut();
         }
 
@@ -359,27 +357,27 @@ impl<V: Debug + Clone> TrieNode<V> {
     }
 
     pub fn print_recursive(&self, partial_key: &[u8], indent: u8) {
-        let raw_prefix: Vec<u8> = iter::repeat(' ' as u8).take(2 * indent as usize).collect();
+        let raw_prefix: Vec<u8> = iter::repeat(b' ').take(2 * indent as usize).collect();
         let prefix = str::from_utf8(&raw_prefix).unwrap();
 
         print!("{}{}: ", prefix, str::from_utf8(partial_key).unwrap());
         if let Some((ref key, ref value)) = self.key_value {
-            print!("({}, {:?}) | ", str::from_utf8(&key).unwrap(), value);
+            print!("({}, {:?}) | ", str::from_utf8(key).unwrap(), value);
         } else {
             print!("None | ");
         }
 
-        if let Some((ref key, ref value)) = self.wildcard {
-            println!("({}, {:?})", str::from_utf8(&key).unwrap(), value);
+        if let Some((key, value)) = &self.wildcard {
+            println!("({}, {:?})", str::from_utf8(key).unwrap(), value);
         } else {
             println!("None");
         }
 
-        for (ref child_key, ref child) in self.children.iter() {
+        for (child_key, child) in self.children.iter() {
             child.print_recursive(child_key, indent + 1);
         }
 
-        for (ref regexp, ref child) in self.regexps.iter() {
+        for (regexp, child) in self.regexps.iter() {
             //print!("{}{}:", prefix, regexp.as_str());
             child.print_recursive(regexp.as_str().as_bytes(), indent + 1);
         }
@@ -423,15 +421,15 @@ impl<V: Debug + Clone> TrieNode<V> {
     }
 
     pub fn to_hashmap_recursive(&self, h: &mut HashMap<Key, V>) {
-        if let Some((ref key, ref value)) = self.key_value {
+        if let Some((key, value)) = &self.key_value {
             h.insert(key.clone(), value.clone());
         }
 
-        if let Some((ref key, ref value)) = self.wildcard {
+        if let Some((key, value)) = &self.wildcard {
             h.insert(key.clone(), value.clone());
         }
 
-        for ref child in self.children.values() {
+        for child in self.children.values() {
             child.to_hashmap_recursive(h);
         }
     }
