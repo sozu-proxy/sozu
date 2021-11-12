@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{Context, bail};
 use futures::channel::mpsc::*;
 use futures::{SinkExt, StreamExt};
 use nom::{Err, HexDisplay, IResult, Offset};
@@ -212,7 +212,7 @@ impl CommandServer {
                     if i.len() > 0 {
                         debug!("could not parse {} bytes", i.len());
                         if previous == buffer.available_data() {
-                            error!("error consuming load state message");
+                            bail!("error consuming load state message");
                             break;
                         }
                     }

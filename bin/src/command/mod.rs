@@ -634,7 +634,8 @@ pub fn start(
         if let Some(path) = saved_state {
             server
                 .load_state(None, "INITIALIZATION".to_string(), &path)
-                .await?;
+                .await
+                .with_context(|| format!("Loading {:?} failed", &path))?;
         }
         gauge!("configuration.clusters", server.state.clusters.len());
         gauge!("configuration.backends", server.backends_count);
