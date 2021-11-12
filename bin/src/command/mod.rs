@@ -118,14 +118,17 @@ impl CommandServer {
                 let fd = sock.into_raw_fd();
                 UnixStream::from_raw_fd(fd)
             })
-            .unwrap();
+            .with_context(|| "Could not get a unix stream from the file descriptor")?;
 
             let id = worker.id;
             let command_tx = command_tx.clone();
             smol::spawn(async move {
-                worker_loop(id, stream, command_tx, worker_rx)
+                if worker_loop(id, stream, command_tx, worker_rx)
                     .await
-                    .unwrap();
+                    .is_err()
+                {
+                    error!("The worker loop of worker {} crashed", id);
+                }
             })
             .detach();
         }
@@ -729,7 +732,9 @@ impl CommandServer {
                                     _ => {}
                                 };
 
-                                tx.send(message).await.unwrap();
+                                if tx.send(message.clone()).await.is_err() {
+                                    error!("Failed to send message: {}", message);
+                                };
 
                                 if nb > 0 {
                                     self.in_flight.insert(message_id, (tx, nb));
@@ -869,7 +874,7 @@ async fn worker_loop(
     stream: Async<UnixStream>,
     mut tx: Sender<CommandMessage>,
     mut rx: Receiver<sozu_command::proxy::ProxyRequest>,
-) -> std::io::Result<()> {
+) -> anyhow::Result<()> {
     let stream = Arc::new(stream);
     let mut s = stream.clone();
 
@@ -907,12 +912,14 @@ async fn worker_loop(
                 let id = id.clone();
                 tx.send(CommandMessage::WorkerResponse { id, message })
                     .await
-                    .unwrap();
+                    .with_context(|| format!("Could not send message to worker"))?;
             }
         }
     }
 
-    tx.send(CommandMessage::WorkerClose { id }).await.unwrap();
+    tx.send(CommandMessage::WorkerClose { id })
+        .await
+        .with_context(|| format!("Could not send close message to worker {}", id))?;
 
     Ok(())
 }

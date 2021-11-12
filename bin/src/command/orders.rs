@@ -194,7 +194,7 @@ impl CommandServer {
             let previous = buffer.available_data();
             //FIXME: we should read in streaming here
             match file.read(buffer.space()) {
-                Ok(sz) => buffer.fill(sz),
+                Ok(size) => buffer.fill(size),
                 Err(e) => {
                     error!("error reading state file: {}", e);
                     break;
@@ -213,7 +213,6 @@ impl CommandServer {
                         debug!("could not parse {} bytes", i.len());
                         if previous == buffer.available_data() {
                             bail!("error consuming load state message");
-                            break;
                         }
                     }
                     offset = buffer.data().offset(i);
@@ -506,9 +505,11 @@ impl CommandServer {
         let command_tx = self.command_tx.clone();
         //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
         smol::spawn(async move {
-            super::worker_loop(id, stream, command_tx, worker_rx)
+            if super::worker_loop(id, stream, command_tx, worker_rx)
                 .await
-                .unwrap();
+                .is_err() {
+                    error!("The worker loop of worker {} crashed", id);
+                }
         })
         .detach();
 
