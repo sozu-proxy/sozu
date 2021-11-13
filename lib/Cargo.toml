@@ -29,7 +29,7 @@ url = "^2.1"
 log = "^0.4"
 socket2 ={ version =  "^0.4", features = [ "all" ] }
 time = "^0.3"
-mio = { version = "^0.7", features = [ "os-poll", "os-ext", "net" ] }
+mio = { version = "^0.8", features = [ "os-poll", "os-ext", "net" ] }
 libc = "^0.2"
 slab = "^0.4.0"
 sha2 = "^0.9"
