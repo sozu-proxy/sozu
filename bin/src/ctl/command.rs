@@ -58,7 +58,7 @@ fn read_channel_message_with_timeout(
     channel: &mut Channel<CommandRequest, CommandResponse>,
     timeout: Duration,
 ) -> anyhow::Result<CommandResponse> {
-    match channel.read_message_blocking_timeout(Some(timeout)) {
+    match channel.read_message_blocking_timeout(Some(timeout))? {
         None => bail!("Command timeout. The proxy didn't send an answer"),
         Some(payload) => Ok(payload),
     }
@@ -354,7 +354,7 @@ pub fn upgrade_worker(
         None,
     ));
 
-    let message = channel.read_message_blocking_timeout(Some(timeout));
+    let message = channel.read_message_blocking_timeout(Some(timeout))?;
     match message {
         None => bail!(format!(
             "No response from the proxy about worker {}",
@@ -438,7 +438,10 @@ pub fn status(
                         if expecting.is_empty() {
                             break;
                         }
-                        match channel.read_message() {
+                        match channel
+                            .read_message()
+                            .expect("Error when reading message from the channel")
+                        {
                             None => {
                                 eprintln!("the proxy didn't answer");
                                 exit(1);

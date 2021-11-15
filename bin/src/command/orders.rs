@@ -1,4 +1,4 @@
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use futures::channel::mpsc::*;
 use futures::{SinkExt, StreamExt};
 use nom::{Err, HexDisplay, IResult, Offset};
@@ -507,9 +507,10 @@ impl CommandServer {
         smol::spawn(async move {
             if super::worker_loop(id, stream, command_tx, worker_rx)
                 .await
-                .is_err() {
-                    error!("The worker loop of worker {} crashed", id);
-                }
+                .is_err()
+            {
+                error!("The worker loop of worker {} crashed", id);
+            }
         })
         .detach();
 
@@ -562,7 +563,13 @@ impl CommandServer {
         let (pid, mut channel) =
             start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data())?;
         channel.set_blocking(true);
-        let res = channel.read_message();
+        let res = match channel.read_message() {
+            Ok(res) => res,
+            Err(e) => {
+                error!("Error when reading message from channel: {}", e);
+                None
+            }
+        };
         debug!("upgrade channel sent: {:?}", res);
 
         // signaling the accept loop that it should stop

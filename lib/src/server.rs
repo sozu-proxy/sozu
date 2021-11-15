@@ -452,7 +452,13 @@ impl Server {
             // the main process sends a Status message, so we can notify it
             // when the initial state is loaded
             server.channel.set_nonblocking(false);
-            let msg = server.channel.read_message();
+            let msg = match server.channel.read_message() {
+                Ok(msg) => msg,
+                Err(e) => {
+                    error!("Error when reading message from the channel: {}", e);
+                    None
+                }
+            };
             debug!("got message: {:?}", msg);
 
             // it so happens that trying to upgrade a dead worker will bring no message
@@ -577,7 +583,13 @@ impl Server {
                             }
 
                             loop {
-                                let msg = self.channel.read_message();
+                                let msg = match self.channel.read_message() {
+                                    Ok(msg) => msg,
+                                    Err(e) => {
+                                        error!("Error when reading message on the channel: {}", e);
+                                        None
+                                    }
+                                };
 
                                 // if the message was too large, we grow the buffer and retry to read if possible
                                 if msg.is_none() {

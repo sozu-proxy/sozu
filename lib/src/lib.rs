@@ -67,8 +67,8 @@
 //!   order: proxy::ProxyRequestData::AddBackend(http_backend)
 //! });
 //!
-//! println!("HTTP -> {:?}", command.read_message());
-//! println!("HTTP -> {:?}", command.read_message());
+//! println!("HTTP -> {:?}", command.read_message().expect("No message received"));
+//! println!("HTTP -> {:?}", command.read_message().expect("No message received"));
 //! ```
 //!
 //! An application is identified by its `cluster_id`, a string that will be shared
@@ -135,8 +135,8 @@
 //!     order: proxy::ProxyRequestData::AddBackend(http_backend)
 //!   });
 //!
-//!   println!("HTTP -> {:?}", command.read_message());
-//!   println!("HTTP -> {:?}", command.write_message());
+//!   println!("HTTP -> {:?}", command.read_message().expect("No message received"));
+//!   println!("HTTP -> {:?}", command.write_message().expect("No message received"));
 //!
 //!   let _ = jg.join();
 //!   info!("good bye");

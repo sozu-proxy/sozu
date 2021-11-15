@@ -1,3 +1,4 @@
+use anyhow::{bail, Context};
 use mio::event::Source;
 use mio::net::UnixStream;
 use serde::de::DeserializeOwned;
@@ -204,7 +205,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         Ok(count)
     }
 
-    pub fn read_message(&mut self) -> Option<Rx> {
+    pub fn read_message(&mut self) -> anyhow::Result<Option<Rx>> {
         if self.blocking {
             self.read_message_blocking()
         } else {
@@ -212,92 +213,72 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         }
     }
 
-    pub fn read_message_nonblocking(&mut self) -> Option<Rx> {
+    pub fn read_message_nonblocking(&mut self) -> anyhow::Result<Option<Rx>> {
         if let Some(pos) = self.front_buf.data().iter().position(|&x| x == 0) {
-            let mut res = None;
+            let string = from_utf8(&self.front_buf.data()[..pos])
+                .with_context(|| "invalid utf-8 encoding in command message")?;
 
-            if let Ok(s) = from_utf8(&self.front_buf.data()[..pos]) {
-                match serde_json::from_str(s) {
-                    Ok(message) => res = Some(message),
-                    Err(e) => error!("could not parse message (error={:?}), ignoring:\n{}", e, s),
-                }
-            } else {
-                error!("invalid utf-8 encoding in command message, ignoring");
-            }
+            let message = serde_json::from_str(string)
+                .with_context(|| format!("could not parse message :\n{}", string))?;
 
             self.front_buf.consume(pos + 1);
-            res
-        } else {
-            if self.front_buf.available_space() == 0 {
-                if self.front_buf.capacity() == self.max_buffer_size {
-                    error!("command buffer full, cannot grow more, ignoring");
-                } else {
-                    let new_size = min(self.front_buf.capacity() + 5000, self.max_buffer_size);
-                    self.front_buf.grow(new_size);
-                }
-            }
-
-            self.interest.insert(Ready::readable());
-            None
+            return Ok(Some(message));
         }
+        if self.front_buf.available_space() == 0 {
+            if self.front_buf.capacity() == self.max_buffer_size {
+                error!("command buffer full, cannot grow more, ignoring");
+                bail!("Command buffer is full, cannot grow more");
+            }
+            let new_size = min(self.front_buf.capacity() + 5000, self.max_buffer_size);
+            self.front_buf.grow(new_size);
+        }
+
+        self.interest.insert(Ready::readable());
+        Ok(None)
     }
 
-    pub fn read_message_blocking(&mut self) -> Option<Rx> {
+    pub fn read_message_blocking(&mut self) -> anyhow::Result<Option<Rx>> {
         self.read_message_blocking_timeout(None)
     }
 
     pub fn read_message_blocking_timeout(
         &mut self,
         timeout: Option<Duration>,
-    ) -> Option<Rx> {
+    ) -> anyhow::Result<Option<Rx>> {
         let now = std::time::Instant::now();
 
         loop {
+            println!("waiting for response");
             if timeout.is_some() {
                 if now.elapsed() >= timeout.unwrap() {
-                    return None;
+                    return Ok(None);
                 }
             }
 
             if let Some(pos) = self.front_buf.data().iter().position(|&x| x == 0) {
-                let mut res = None;
+                let string = from_utf8(&self.front_buf.data()[..pos])
+                    .with_context(|| "invalid utf-8 encoding in command message")?;
 
-                if let Ok(s) = from_utf8(&self.front_buf.data()[..pos]) {
-                    match serde_json::from_str(s) {
-                        Ok(message) => res = Some(message),
-                        Err(e) => {
-                            error!("could not parse message (error={:?}), ignoring:\n{}", e, s)
-                        }
-                    }
-                } else {
-                    error!("invalid utf-8 encoding in command message, ignoring");
-                }
+                let message = serde_json::from_str(string)
+                    .with_context(|| format!("could not parse message :\n{}", string))?;
 
                 self.front_buf.consume(pos + 1);
-                return res;
-            } else {
-                if self.front_buf.available_space() == 0 {
-                    if self.front_buf.capacity() == self.max_buffer_size {
-                        error!("command buffer full, cannot grow more, ignoring");
-                        return None;
-                    } else {
-                        let new_size = min(self.front_buf.capacity() + 5000, self.max_buffer_size);
-                        self.front_buf.grow(new_size);
-                    }
-                }
-
-                match self.sock.read(self.front_buf.space()) {
-                    Ok(0) => {
-                        return None;
-                    }
-                    Err(_) => {
-                        return None;
-                    }
-                    Ok(r) => {
-                        self.front_buf.fill(r);
-                    }
-                };
+                return Ok(Some(message));
             }
+
+            if self.front_buf.available_space() == 0 {
+                if self.front_buf.capacity() == self.max_buffer_size {
+                    error!("command buffer full, cannot grow more, ignoring");
+                    bail!("Command buffer is full, cannot grow more");
+                }
+                let new_size = min(self.front_buf.capacity() + 5000, self.max_buffer_size);
+                self.front_buf.grow(new_size);
+            }
+
+            match self.sock.read(self.front_buf.space())? {
+                0 => return Ok(None),
+                r => self.front_buf.fill(r),
+            };
         }
     }
 
@@ -428,7 +409,7 @@ impl<Tx: Debug + DeserializeOwned + Serialize, Rx: Debug + DeserializeOwned + Se
 impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Iterator for Channel<Tx, Rx> {
     type Item = Rx;
     fn next(&mut self) -> Option<Self::Item> {
-        self.read_message()
+        self.read_message().ok().flatten()
     }
 }
 

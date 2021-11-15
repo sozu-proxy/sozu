@@ -109,10 +109,16 @@ pub fn begin_worker_process(
     let config_state: ConfigState = serde_json::from_reader(configuration_state_file)
         .with_context(|| "could not parse configuration state data")?;
 
-    let worker_config = command
+    let msg = command
         .read_message()
         .with_context(|| "worker could not read configuration from socket")?;
-    //println!("got message: {:?}", worker_config);
+
+    let worker_config = match msg {
+        Some(config) => config,
+        None => bail!("No configuration received from the channel"),
+    };
+
+    debug!("got message: {:?}", worker_config);
 
     let worker_id = format!("{}-{:02}", "WRK", id);
     logging::setup(

@@ -56,7 +56,7 @@ fn test() {
     });
 
     // wait for sozu to start and answer
-    info!("Status -> {:?}", command.read_message());
+    info!("Status -> {:?}", command.read_message().expect("No message received"));
 
     let agent = ureq::AgentBuilder::new()
         .resolver(|addr: &str| match addr {
@@ -86,7 +86,7 @@ fn test() {
         id: String::from("ID_ABCD"),
         order: proxy::ProxyRequestData::AddHttpFrontend(http_frontend),
     });
-    println!("HTTP -> {:?}", command.read_message());
+    println!("HTTP -> {:?}", command.read_message().expect("No message received"));
 
     info!("expecting 503");
     match agent.get("http://example.com:8080/").call().unwrap_err() {
@@ -110,7 +110,7 @@ fn test() {
         order: proxy::ProxyRequestData::AddBackend(http_backend),
     });
 
-    println!("HTTP -> {:?}", command.read_message());
+    println!("HTTP -> {:?}", command.read_message().expect("No message received"));
 
     info!("sending invalid request, expecting 400");
     let mut client = TcpStream::connect(("127.0.0.1", 8080)).expect("could not parse address");

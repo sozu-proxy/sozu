@@ -1769,10 +1769,10 @@ mod tests {
             });
         }
 
-        println!("read_message: {:?}", command.read_message().unwrap());
-        println!("read_message: {:?}", command.read_message().unwrap());
-        println!("read_message: {:?}", command.read_message().unwrap());
-        println!("read_message: {:?}", command.read_message().unwrap());
+        println!("read_message: {:?}", command.read_message().expect("No message received").unwrap());
+        println!("read_message: {:?}", command.read_message().expect("No message received").unwrap());
+        println!("read_message: {:?}", command.read_message().expect("No message received").unwrap());
+        println!("read_message: {:?}", command.read_message().expect("No message received").unwrap());
 
         command
     }
