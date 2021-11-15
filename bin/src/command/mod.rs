@@ -20,7 +20,9 @@ use sozu_command::command::{
 };
 use sozu_command::config::Config;
 
-use sozu_command::proxy::{ProxyRequest, ProxyRequestData, ProxyResponseData, ProxyResponseStatus};
+use sozu_command::proxy::{
+    ProxyRequest, ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus,
+};
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::state::ConfigState;
 
@@ -297,31 +299,27 @@ impl CommandServer {
     pub fn disable_cloexec_before_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                let _ = util::disable_close_on_exec(worker.fd).map_err(|e| {
-                    error!(
-                        "could not disable close on exec for worker {}: {}",
-                        worker.id, e
-                    );
-                });
+                util::disable_close_on_exec(worker.fd).with_context(|| {
+                    format!("could not disable close on exec for worker {}", worker.id,)
+                })?;
             }
         }
         trace!("disabling cloexec on listener: {}", self.fd);
-        util::disable_close_on_exec(self.fd)?;
+        util::disable_close_on_exec(self.fd)
+            .with_context(|| format!("Cannot disable cloexec on listener: {}", self.fd))?;
         Ok(())
     }
 
     pub fn enable_cloexec_after_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                let _ = util::enable_close_on_exec(worker.fd).map_err(|e| {
-                    error!(
-                        "could not enable close on exec for worker {}: {}",
-                        worker.id, e
-                    );
-                });
+                util::enable_close_on_exec(worker.fd).with_context(|| {
+                    format!("could not enable close on exec for worker {}", worker.id,)
+                })?;
             }
         }
-        util::enable_close_on_exec(self.fd)?;
+        util::enable_close_on_exec(self.fd)
+            .with_context(|| format!("Cannot enable cloexec on listener: {}", self.fd))?;
         Ok(())
     }
 
@@ -510,7 +508,7 @@ impl CommandServer {
         Ok(())
     }
 
-    async fn handle_worker_close(&mut self, id: u32) {
+    async fn handle_worker_close(&mut self, id: u32) -> anyhow::Result<()> {
         info!("removing worker {}", id);
 
         if let Some(w) = self.workers.iter_mut().filter(|w| w.id == id).next() {
@@ -521,14 +519,14 @@ impl CommandServer {
                     Ok(()) => info!("Worker {} has automatically restarted!", id),
                     Err(e) => error!("Could not restart worker {}: {}", id, e),
                 }
-                return;
+                return Ok(());
             }
 
             info!("Closing the worker {}.", w.id);
             if !w.the_pid_is_alive() {
                 info!("Worker {} is dead, setting to Stopped.", w.id);
                 w.run_state = RunState::Stopped;
-                return;
+                return Ok(());
             }
 
             info!("Worker {} is not dead but should be. Let's kill it.", w.id);
@@ -537,10 +535,69 @@ impl CommandServer {
                 Ok(()) => {
                     info!("Worker {} was successfuly killed", id);
                     w.run_state = RunState::Stopped;
+                    return Ok(());
                 }
-                Err(e) => error!("failed to kill the worker process: {:?}", e),
+                Err(e) => {
+                    return Err(e).with_context(|| "failed to kill the worker process");
+                }
             }
         }
+        Ok(())
+    }
+
+    async fn handle_worker_response(
+        &mut self,
+        id: u32,
+        message: ProxyResponse,
+    ) -> anyhow::Result<()> {
+        debug!("worker {} sent back {:?}", id, message);
+        if let Some(ProxyResponseData::Event(data)) = message.data {
+            let event: Event = data.into();
+            for client_id in self.event_subscribers.iter() {
+                if let Some(tx) = self.clients.get_mut(client_id) {
+                    let event = CommandResponse::new(
+                        message.id.to_string(),
+                        CommandStatus::Processing,
+                        format!("{}", id),
+                        Some(CommandResponseData::Event(event.clone())),
+                    );
+                    return tx
+                        .send(event)
+                        .await
+                        .with_context(|| "could not send message to client");
+                }
+            }
+            return Ok(());
+        }
+        match self.in_flight.remove(&message.id) {
+            None => {
+                // FIXME: this messsage happens a lot at startup because AddCluster
+                // messages receive responses from each of the HTTP, HTTPS and TCP
+                // proxys. The clusters list should be merged
+                debug!("unknown message id: {}", message.id);
+            }
+            Some((mut tx, mut nb)) => {
+                let message_id = message.id.clone();
+
+                // if a worker returned Ok or Error, we're not expecting any more
+                // messages with this id from it
+                match message.status {
+                    ProxyResponseStatus::Ok | ProxyResponseStatus::Error(_) => {
+                        nb -= 1;
+                    }
+                    _ => {}
+                };
+
+                if tx.send(message.clone()).await.is_err() {
+                    error!("Failed to send message: {}", message);
+                };
+
+                if nb > 0 {
+                    self.in_flight.insert(message_id, (tx, nb));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -664,7 +721,7 @@ enum CommandMessage {
     },
     WorkerResponse {
         id: u32,
-        message: sozu_command::proxy::ProxyResponse,
+        message: ProxyResponse,
     },
     WorkerClose {
         id: u32,
@@ -675,78 +732,42 @@ enum CommandMessage {
 impl CommandServer {
     pub async fn run(&mut self) {
         while let Some(msg) = self.command_rx.next().await {
-            match msg {
+            let result: anyhow::Result<()> = match msg {
                 CommandMessage::ClientNew { id, sender } => {
                     debug!("adding new client {}", id);
                     self.clients.insert(id, sender);
+                    Ok(())
                 }
                 CommandMessage::ClientClose { id } => {
                     debug!("removing client {}", id);
                     self.clients.remove(&id);
                     self.event_subscribers.remove(&id);
+                    Ok(())
                 }
                 CommandMessage::ClientRequest { id, message } => {
                     debug!("client {} sent {:?}", id, message);
-                    match self.handle_client_message(id, message).await {
-                        Ok(()) => {}
-                        Err(e) => error!("{}", e),
-                    }
+                    self.handle_client_message(id, message).await
                 }
-                CommandMessage::WorkerClose { id } => {
-                    self.handle_worker_close(id).await;
-                }
-                CommandMessage::WorkerResponse { id, message } => {
-                    debug!("worker {} sent back {:?}", id, message);
-                    if let Some(ProxyResponseData::Event(data)) = message.data {
-                        let event: Event = data.into();
-                        for client_id in self.event_subscribers.iter() {
-                            if let Some(tx) = self.clients.get_mut(client_id) {
-                                let event = CommandResponse::new(
-                                    message.id.to_string(),
-                                    CommandStatus::Processing,
-                                    format!("{}", id),
-                                    Some(CommandResponseData::Event(event.clone())),
-                                );
-                                if let Err(e) = tx.send(event).await {
-                                    error!("could not send message to client: {:?}", e);
-                                }
-                            }
-                        }
-                    } else {
-                        match self.in_flight.remove(&message.id) {
-                            None => {
-                                // FIXME: this messsage happens a lot at startup because AddCluster
-                                // messages receive responses from each of the HTTP, HTTPS and TCP
-                                // proxys. The clusters list should be merged
-                                debug!("unknown message id: {}", message.id);
-                            }
-                            Some((mut tx, mut nb)) => {
-                                let message_id = message.id.clone();
-
-                                // if a worker returned Ok or Error, we're not expecting any more
-                                // messages with this id from it
-                                match message.status {
-                                    ProxyResponseStatus::Ok | ProxyResponseStatus::Error(_) => {
-                                        nb -= 1;
-                                    }
-                                    _ => {}
-                                };
-
-                                if tx.send(message.clone()).await.is_err() {
-                                    error!("Failed to send message: {}", message);
-                                };
-
-                                if nb > 0 {
-                                    self.in_flight.insert(message_id, (tx, nb));
-                                }
-                            }
-                        }
-                    }
-                }
+                CommandMessage::WorkerClose { id } => self
+                    .handle_worker_close(id)
+                    .await
+                    .with_context(|| "Could not close worker"),
+                CommandMessage::WorkerResponse { id, message } => self
+                    .handle_worker_response(id, message)
+                    .await
+                    .with_context(|| "Could not handle worker response"),
                 CommandMessage::MasterStop => {
                     info!("stopping main process");
+                    // We should do something here
                     break;
                 }
+            };
+            if let Err(e) = result {
+                // log the error on the main process
+                error!("{:#?}", e);
+                //  and and answer_error() to the client
+                // self.answer_error(client_id, msg.id, e.to_string(), None)
+                //     .await;
             }
         }
     }

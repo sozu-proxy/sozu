@@ -46,7 +46,8 @@ impl CommandServer {
                 self.list_frontends(client_id, &request.id, filters).await
             }
             CommandRequestData::LoadState { path } => {
-                self.load_state(Some(client_id), request.id, &path).await
+                self.load_state(Some(client_id.to_owned()), request.id.to_owned(), &path)
+                    .await
             }
             CommandRequestData::LaunchWorker(tag) => {
                 self.launch_worker(client_id, request.id, &tag).await
@@ -83,35 +84,24 @@ impl CommandServer {
         message_id: &str,
         path: &str,
     ) -> anyhow::Result<()> {
-        if let Ok(mut f) = fs::File::create(&path) {
-            match self.save_state_to_file(&mut f) {
-                Ok(counter) => {
-                    info!("wrote {} commands to {}", counter, path);
-                    self.answer_success(
-                        client_id,
-                        message_id,
-                        format!("saved {} config messages to {}", counter, path),
-                        None,
-                    )
-                    .await;
-                    Ok(())
-                }
-                Err(e) => {
-                    error!("failed writing state to file: {:?}", e);
-                    self.answer_error(client_id, message_id, "could not save state to file", None)
-                        .await;
-                    Err(anyhow::Error::from(e))
-                }
-            }
-        } else {
-            error!("could not open file: {}", &path);
-            self.answer_error(client_id, message_id, "could not open file", None)
-                .await;
-            Err(anyhow::Error::msg(format!(
-                "could not open file: {}",
-                &path
-            )))
-        }
+        let mut file = fs::File::create(&path)
+            .with_context(|| format!("could not open file at path: {}", &path))?;
+
+        let counter = self
+            .save_state_to_file(&mut file)
+            .with_context(|| "failed writing state to file")?;
+
+        info!("wrote {} commands to {}", counter, path);
+
+        // We can trickle up errors, now we should trickle up successes like this one
+        self.answer_success(
+            client_id,
+            message_id,
+            format!("saved {} config messages to {}", counter, path),
+            None,
+        )
+        .await;
+        Ok(())
     }
 
     pub fn save_state_to_file(&mut self, f: &mut fs::File) -> anyhow::Result<usize> {
@@ -165,22 +155,8 @@ impl CommandServer {
         message_id: String,
         path: &str,
     ) -> anyhow::Result<()> {
-        let mut file = match fs::File::open(&path) {
-            Err(e) => {
-                error!("cannot open file at path '{}': {:?}", path, e);
-                if let Some(id) = client_id {
-                    self.answer_error(
-                        id,
-                        message_id,
-                        format!("cannot open file at path '{}': {:?}", path, e),
-                        None,
-                    )
-                    .await;
-                }
-                return Err(anyhow::Error::from(e));
-            }
-            Ok(file) => file,
-        };
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("cannot open file at path '{}'", path))?;
 
         let mut buffer = Buffer::with_capacity(200000);
 
@@ -193,13 +169,15 @@ impl CommandServer {
         loop {
             let previous = buffer.available_data();
             //FIXME: we should read in streaming here
-            match file.read(buffer.space()) {
-                Ok(size) => buffer.fill(size),
+            let size = match file.read(buffer.space()) {
+                Ok(size) => size,
                 Err(e) => {
                     error!("error reading state file: {}", e);
                     break;
                 }
             };
+
+            buffer.fill(size);
 
             if buffer.available_data() == 0 {
                 debug!("Empty buffer");
@@ -212,6 +190,15 @@ impl CommandServer {
                     if i.len() > 0 {
                         debug!("could not parse {} bytes", i.len());
                         if previous == buffer.available_data() {
+                            if let Some(id) = client_id {
+                                self.answer_error(
+                                    id,
+                                    message_id,
+                                    "Error consuming load state message",
+                                    None,
+                                )
+                                .await;
+                            }
                             bail!("error consuming load state message");
                         }
                     }
@@ -219,7 +206,10 @@ impl CommandServer {
 
                     if orders.iter().find(|o| {
                         if o.version > sozu_command::command::PROTOCOL_VERSION {
-                            error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", sozu_command::command::PROTOCOL_VERSION, o.version);
+                            error!(
+                                "configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}",
+                                sozu_command::command::PROTOCOL_VERSION, o.version
+                            );
                             true
                         } else {
                             false
@@ -275,14 +265,16 @@ impl CommandServer {
             buffer.consume(offset);
         }
 
-        let client_tx = if let Some(id) = client_id.as_ref() {
-            self.clients.get(id).cloned()
-        } else {
-            None
+        let client_tx = match client_id.as_ref() {
+            Some(id) => self.clients.get(id).cloned(),
+            None => None,
         };
 
-        error!("stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
-        buffer.available_data(), message_counter, diff_counter);
+        println!("Client sender: {:#?}", client_tx);
+        info!(
+            "stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
+            buffer.available_data(), message_counter, diff_counter
+        );
         if diff_counter > 0 {
             info!(
                 "state loaded from {}, will start sending {} messages to workers",
@@ -291,7 +283,10 @@ impl CommandServer {
             smol::spawn(async move {
                 let mut ok = 0usize;
                 let mut error = 0usize;
-                while let Some(proxy_response) = load_state_rx.next().await {
+
+                info!("coucou");
+                // logs may stop here
+                while let Some(proxy_response) = dbg!(load_state_rx.next().await) {
                     match proxy_response.status {
                         ProxyResponseStatus::Ok => {
                             ok += 1;
@@ -305,37 +300,47 @@ impl CommandServer {
                     debug!("ok:{}, error: {}", ok, error);
                 }
 
+                debug!(
+                    "Finished sending messages to workers. ok:{}, error: {}",
+                    ok, error
+                );
+
                 if let Some(mut sender) = client_tx {
-                    if error == 0 {
-                        if let Err(e) = sender
-                            .send(CommandResponse::new(
-                                message_id.to_string(),
-                                CommandStatus::Ok,
-                                format!("ok: {} messages, error: 0", ok),
-                                None,
-                            ))
-                            .await
-                        {
-                            error!("could not send message to client {:?}: {:?}", client_id, e);
+                    match error {
+                        0 => {
+                            if let Err(e) = sender
+                                .send(CommandResponse::new(
+                                    message_id.to_string(),
+                                    CommandStatus::Ok,
+                                    format!("ok: {} messages, error: 0", ok),
+                                    None,
+                                ))
+                                .await
+                            {
+                                error!("could not send message to client {:?}: {:?}", client_id, e);
+                            }
                         }
-                    } else {
-                        if let Err(e) = sender
-                            .send(CommandResponse::new(
-                                message_id.to_string(),
-                                CommandStatus::Error,
-                                format!("ok: {} messages, error: {}", ok, error),
-                                None,
-                            ))
-                            .await
-                        {
-                            error!("could not send message to client {:?}: {:?}", client_id, e);
+                        _ => {
+                            if let Err(e) = sender
+                                .send(CommandResponse::new(
+                                    message_id.to_string(),
+                                    CommandStatus::Error,
+                                    format!(
+                                        "Partially loaded the state. ok: {} messages, error: {}",
+                                        ok, error
+                                    ),
+                                    None,
+                                ))
+                                .await
+                            {
+                                error!("could not send message to client {:?}: {:?}", client_id, e);
+                            }
                         }
                     }
                 } else {
-                    if error == 0 {
-                        info!("loading state: {} ok messages, 0 errors", ok);
-                    } else {
-                        error!("loading state: {} ok messages, {} errors", ok, error);
+                    match error {
+                        0 => info!("loading state: {} ok messages, 0 errors", ok),
+                        _ => error!("loading state: {} ok messages, {} errors", ok, error),
                     }
                 }
             })
@@ -448,21 +453,14 @@ impl CommandServer {
         request_id: String,
         _tag: &str,
     ) -> anyhow::Result<()> {
-        let mut worker = match start_worker(
+        let mut worker = start_worker(
             self.next_id,
             &self.config,
             self.executable_path.clone(),
             &self.state,
             None,
-        ) {
-            Ok(worker) => worker,
-            Err(e) => {
-                error!("Failed at creating worker");
-                self.answer_error(client_id, request_id, "failed creating worker", None)
-                    .await;
-                return Err(e);
-            }
-        };
+        )
+        .with_context(|| "Failed at creating worker")?;
 
         if let Some(sender) = self.clients.get_mut(&client_id) {
             if let Err(e) = sender
@@ -474,6 +472,7 @@ impl CommandServer {
                 ))
                 .await
             {
+                // should we stop here and bail?
                 error!("could not send message to client {:?}: {:?}", client_id, e);
             }
         }
@@ -534,6 +533,7 @@ impl CommandServer {
 
         self.workers.push(worker);
 
+        // again, should we trickle up successes?
         self.answer_success(client_id, request_id, "", None).await;
 
         Ok(())
@@ -544,7 +544,8 @@ impl CommandServer {
         client_id: String,
         request_id: String,
     ) -> anyhow::Result<()> {
-        self.disable_cloexec_before_upgrade()?;
+        self.disable_cloexec_before_upgrade()
+            .with_context(|| "Could not disable cloexec before upgrade")?;
 
         if let Some(sender) = self.clients.get_mut(&client_id) {
             if let Err(e) = sender
@@ -561,7 +562,8 @@ impl CommandServer {
         }
 
         let (pid, mut channel) =
-            start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data())?;
+            start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data())
+                .with_context(|| "Could not start new main process")?;
         channel.set_blocking(true);
         let res = match channel.read_message() {
             Ok(res) => res,
@@ -601,14 +603,7 @@ impl CommandServer {
             std::thread::sleep(Duration::from_secs(2));
             std::process::exit(0);
         } else {
-            self.answer_error(
-                client_id,
-                request_id,
-                "could not upgrade main process",
-                None,
-            )
-            .await;
-            Ok(())
+            bail!("could not upgrade main process",)
         }
     }
 
@@ -633,17 +628,10 @@ impl CommandServer {
             })
             .is_none()
         {
-            self.answer_error(
-                client_id,
-                &request_id,
-                format!(
-                    "The worker {} does not exist, or is stopped / stopping.",
-                    &id
-                ),
-                None,
-            )
-            .await;
-            return Ok(());
+            bail!(format!(
+                "The worker {} does not exist, or is stopped / stopping.",
+                &id
+            ));
         }
 
         // same as launch_worker
@@ -674,16 +662,14 @@ impl CommandServer {
 
             worker
         } else {
-            return Ok(self
-                .answer_error(client_id, &request_id, "failed creating worker", None)
-                .await);
+            bail!("failed creating worker")
         };
 
         let sock = worker.channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
         worker.sender = Some(worker_tx);
 
-        if let Err(e) = worker
+        worker
             .sender
             .as_mut()
             .unwrap()
@@ -692,12 +678,7 @@ impl CommandServer {
                 order: ProxyRequestData::Status,
             })
             .await
-        {
-            error!(
-                "could not send status message to worker {:?}: {:?}",
-                worker.id, e
-            );
-        }
+            .with_context(|| format!("could not send status message to worker {:?}", worker.id,))?;
 
         let mut listeners = None;
         {
@@ -838,6 +819,7 @@ impl CommandServer {
         info!("sent config messages to the new worker");
         self.workers.push(worker);
 
+        // Should we trickle up success?
         self.answer_success(client_id, request_id, "", None).await;
         info!("finished upgrade");
         Ok(())
@@ -849,26 +831,9 @@ impl CommandServer {
         message_id: String,
         config_path: Option<String>,
     ) -> anyhow::Result<()> {
-        let new_config = match Config::load_from_path(
-            config_path.as_deref().unwrap_or(&self.config.config_path),
-        ) {
-            Err(e) => {
-                if let Some(id) = client_id {
-                    self.answer_error(
-                        id,
-                        message_id,
-                        format!(
-                            "cannot load configuration from '{}': {:?}",
-                            self.config.config_path, e
-                        ),
-                        None,
-                    )
-                    .await;
-                }
-                return Err(anyhow::Error::from(e));
-            }
-            Ok(c) => c,
-        };
+        let path = config_path.as_deref().unwrap_or(&self.config.config_path);
+        let new_config = Config::load_from_path(path)
+            .with_context(|| format!("cannot load configuration from '{}'", path))?;
 
         let mut diff_counter = 0usize;
 
@@ -1226,13 +1191,10 @@ impl CommandServer {
             if worker_id.is_none() {
                 match order {
                     ProxyRequestData::RemoveBackend(ref backend) => {
-                        let msg = format!(
+                        bail!(format!(
                             "cannot remove backend: cluster {} has no backends {} at {}",
                             backend.cluster_id, backend.backend_id, backend.address,
-                        );
-                        error!("{}", msg);
-                        self.answer_error(client_id, request_id, msg, None).await;
-                        return Ok(());
+                        ));
                     }
                     ProxyRequestData::RemoveHttpFrontend(h)
                     | ProxyRequestData::RemoveHttpsFrontend(h) => {
@@ -1243,36 +1205,31 @@ impl CommandServer {
                             ),
                             Route::Deny => format!("No such frontend at {}", h.address),
                         };
-                        error!("{}", msg);
-                        self.answer_error(client_id, request_id, msg, None).await;
-                        return Ok(());
+                        bail!(msg);
                     }
                     ProxyRequestData::RemoveTcpFrontend(TcpFrontend {
                         ref cluster_id,
                         ref address,
                     }) => {
-                        let msg = format!(
+                        bail!(format!(
                             "cannot remove TCP frontend: cluster {} has no frontends at {}",
                             cluster_id, address,
-                        );
-                        error!("{}", msg);
-                        self.answer_error(client_id, request_id, msg, None).await;
-                        return Ok(());
+                        ));
                     }
                     _ => {}
                 };
             }
         }
 
-        if self.config.automatic_state_save {
-            if order != ProxyRequestData::SoftStop || order != ProxyRequestData::HardStop {
-                if let Some(path) = self.config.saved_state.clone() {
-                    if let Ok(mut f) = fs::File::create(&path) {
-                        let _ = self.save_state_to_file(&mut f).map_err(|e| {
-                            error!("could not save state automatically to {}: {:?}", path, e);
-                        });
-                    }
-                }
+        if self.config.automatic_state_save
+            & (order != ProxyRequestData::SoftStop || order != ProxyRequestData::HardStop)
+        {
+            if let Some(path) = self.config.saved_state.clone() {
+                let mut file = fs::File::create(&path)
+                    .with_context(|| "Could not create file to automatically save the state")?;
+
+                self.save_state_to_file(&mut file)
+                    .with_context(|| format!("could not save state automatically to {}", path))?;
             }
         }
 
