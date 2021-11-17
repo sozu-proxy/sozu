@@ -734,7 +734,7 @@ impl CommandServer {
             let result: anyhow::Result<OrderSuccess> = match msg {
                 CommandMessage::ClientNew { id, sender } => {
                     debug!("adding new client {}", id);
-                    self.clients.insert(id, sender);
+                    self.clients.insert(id.to_owned(), sender);
                     Ok(OrderSuccess::ClientNew(id))
                 }
                 CommandMessage::ClientClose { id } => {
@@ -764,32 +764,6 @@ impl CommandServer {
                 Ok(order_success) => {
                     info!("Successful order: {}", order_success);
 
-                    let command_response_data = match order_success {
-                        OrderSuccess::DumpState(crd) => Some(crd),
-                        OrderSuccess::ListFrontends(crd) => Some(crd),
-                        OrderSuccess::ListWorkers(crd) => Some(crd),
-                        OrderSuccess::Query(crd) => Some(crd),
-                        // should list OrderSuccess::Metrics(crd) as well
-                        _ => None,
-                    };
-
-                    let message_client_id = match msg {
-                        CommandMessage::ClientNew { id, .. } => Some(id),
-                        CommandMessage::ClientClose { id } => Some(id),
-                        CommandMessage::ClientRequest { id, .. } => Some(id),
-                        _ => None,
-                    };
-
-                    if let Some(client_id) = message_client_id {
-                        self.answer_success(
-                            client_id,
-                            message_id,
-                            order_success,
-                            command_response_data,
-                        )
-                        .await;
-                    }
-
                     // perform shutdowns
                     match order_success {
                         OrderSuccess::UpgradeMain(_) => {
@@ -807,20 +781,9 @@ impl CommandServer {
                     }
                 }
                 Err(error) => {
-                    // log the error on the main process
-                    error!("{:#?}", error);
+                    // log the error on the main process without stopping it
 
-                    let message_client_id = match msg {
-                        CommandMessage::ClientNew { id, .. } => Some(id),
-                        CommandMessage::ClientClose { id } => Some(id),
-                        CommandMessage::ClientRequest { id, .. } => Some(id),
-                        _ => None,
-                    };
-                    //  and and answer_error() to the client
-                    if let Some(client_id) = message_client_id {
-                        self.answer_error(client_id, message_id, order_success, None)
-                            .await;
-                    }
+                    error!("{:#?}", error);
                 }
             }
         }
@@ -1002,6 +965,7 @@ async fn worker_loop(
 pub enum OrderSuccess {
     ClientClose(String),
     ClientNew(String),
+    ClientRequest,
     DumpState(CommandResponseData), // contains the cloned state
     LaunchWorker(u32),
     ListFrontends(CommandResponseData),
@@ -1030,6 +994,7 @@ impl std::fmt::Display for OrderSuccess {
         match self {
             Self::ClientClose(id) => write!(f, "Close client: {}", id),
             Self::ClientNew(id) => write!(f, "New client successfully added: {}", id),
+            Self::ClientRequest => write!(f, "Successfully executed client request"),
             Self::DumpState(_) => write!(f, "Successfully gathered state from the main process"),
             Self::LaunchWorker(worker_id) => {
                 write!(f, "Successfully launched worker {}", worker_id)
@@ -1064,11 +1029,11 @@ impl std::fmt::Display for OrderSuccess {
             }
             Self::WorkerKilled(id) => write!(f, "Successfully killed worker {}", id),
             Self::WorkerOrder(worker) => {
-                if let worker_id = worker {
+                if let Some(worker_id) = worker {
                     write!(
                         f,
                         "Successfully executed the order on worker {}",
-                        worker_id.unwrap()
+                        worker_id
                     )
                 } else {
                     write!(f, "Successfully executed the order on worker")

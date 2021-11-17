@@ -248,7 +248,6 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         let now = std::time::Instant::now();
 
         loop {
-            println!("waiting for response");
             if timeout.is_some() {
                 if now.elapsed() >= timeout.unwrap() {
                     return Ok(None);

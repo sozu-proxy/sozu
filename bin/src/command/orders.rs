@@ -36,54 +36,85 @@ impl CommandServer {
         client_id: String,
         request: sozu_command::command::CommandRequest,
     ) -> anyhow::Result<OrderSuccess> {
-        match request.data {
-            CommandRequestData::SaveState { path } => {
-                self.save_state(client_id, &request.id, &path).await
-            }
-            CommandRequestData::DumpState => self.dump_state(client_id, &request.id).await,
-            CommandRequestData::ListWorkers => self.list_workers(client_id, request.id).await,
-            CommandRequestData::ListFrontends(filters) => {
-                self.list_frontends(client_id, &request.id, filters).await
-            }
+        let owned_client_id = client_id.to_owned();
+        let owned_request_id = request.id.to_owned();
+
+        let result: anyhow::Result<OrderSuccess> = match request.data {
+            CommandRequestData::SaveState { path } => self.save_state(&path).await,
+            CommandRequestData::DumpState => self.dump_state().await,
+            CommandRequestData::ListWorkers => self.list_workers().await,
+            CommandRequestData::ListFrontends(filters) => self.list_frontends(filters).await,
             CommandRequestData::LoadState { path } => {
-                self.load_state(Some(client_id.to_owned()), request.id.to_owned(), &path)
+                self.load_state(Some(owned_client_id), owned_request_id.to_owned(), &path)
                     .await
             }
             CommandRequestData::LaunchWorker(tag) => {
-                self.launch_worker(client_id, request.id, &tag).await
+                self.launch_worker(owned_client_id, owned_request_id, &tag)
+                    .await
             }
-            CommandRequestData::UpgradeMain => self.upgrade_main(client_id, request.id).await,
+            CommandRequestData::UpgradeMain => {
+                self.upgrade_main(owned_client_id, owned_request_id).await
+            }
             CommandRequestData::UpgradeWorker(worker_id) => {
-                self.upgrade_worker(client_id, request.id, worker_id).await
+                self.upgrade_worker(owned_client_id, owned_request_id, worker_id)
+                    .await
             }
 
             CommandRequestData::Proxy(proxy_request) => match proxy_request {
-                ProxyRequestData::Metrics(config) => {
-                    self.metrics(client_id, request.id, config).await
-                }
-                ProxyRequestData::Query(query) => self.query(client_id, request.id, query).await,
+                ProxyRequestData::Metrics(config) => self.metrics(owned_request_id, config).await,
+                ProxyRequestData::Query(query) => self.query(owned_request_id, query).await,
                 order => {
-                    self.worker_order(client_id, request.id, order, request.worker_id)
+                    self.worker_order(owned_client_id, owned_request_id, order, request.worker_id)
                         .await
                 }
             },
             CommandRequestData::SubscribeEvents => {
                 self.event_subscribers.insert(client_id.clone());
-                Ok(OrderSuccess::SubscribeEvent(client_id))
+                Ok(OrderSuccess::SubscribeEvent(client_id.clone()))
             }
             CommandRequestData::ReloadConfiguration { path } => {
-                self.reload_configuration(Some(client_id), request.id, path)
+                self.reload_configuration(Some(owned_client_id), owned_request_id, path)
                     .await
+            }
+        };
+        match result {
+            Ok(order_success) => {
+                // no need to log the successhere, it is down upstream
+
+                let success_message = order_success.to_string().to_owned();
+
+                match order_success {
+                    // should list OrderSuccess::Metrics(crd) as well
+                    OrderSuccess::DumpState(command_respond_data)
+                    | OrderSuccess::ListFrontends(command_respond_data)
+                    | OrderSuccess::ListWorkers(command_respond_data)
+                    | OrderSuccess::Query(command_respond_data) => {
+                        self.answer_success(
+                            client_id,
+                            request.id,
+                            success_message,
+                            Some(command_respond_data),
+                        )
+                        .await;
+                    }
+                    _ => {
+                        self.answer_success(client_id, request.id, success_message, None)
+                            .await
+                    }
+                };
+
+                Ok(OrderSuccess::ClientRequest)
+            }
+            Err(error) => {
+                // no need to log the error here, it is down upstream
+                self.answer_error(client_id, request.id, error.to_string(), None)
+                    .await;
+                Err(error)
             }
         }
     }
 
-    pub async fn save_state(
-        &mut self,
-        client_id: String,
-        message_id: &str,
-        path: &str,
-    ) -> anyhow::Result<OrderSuccess> {
+    pub async fn save_state(&mut self, path: &str) -> anyhow::Result<OrderSuccess> {
         let mut file = fs::File::create(&path)
             .with_context(|| format!("could not open file at path: {}", &path))?;
 
@@ -129,11 +160,7 @@ impl CommandServer {
         Ok(res?)
     }
 
-    pub async fn dump_state(
-        &mut self,
-        client_id: String,
-        message_id: &str,
-    ) -> anyhow::Result<OrderSuccess> {
+    pub async fn dump_state(&mut self) -> anyhow::Result<OrderSuccess> {
         let state = self.state.clone();
 
         Ok(OrderSuccess::DumpState(CommandResponseData::State(state)))
@@ -315,8 +342,6 @@ impl CommandServer {
 
     pub async fn list_frontends(
         &mut self,
-        client_id: String,
-        message_id: &str,
         filters: FrontendFilters,
     ) -> anyhow::Result<OrderSuccess> {
         info!(
@@ -370,11 +395,7 @@ impl CommandServer {
         ))
     }
 
-    pub async fn list_workers(
-        &mut self,
-        client_id: String,
-        request_id: String,
-    ) -> anyhow::Result<OrderSuccess> {
+    pub async fn list_workers(&mut self) -> anyhow::Result<OrderSuccess> {
         let workers: Vec<WorkerInfo> = self
             .workers
             .iter()
@@ -871,7 +892,6 @@ impl CommandServer {
 
     pub async fn metrics(
         &mut self,
-        client_id: String,
         request_id: String,
         config: MetricsConfiguration,
     ) -> anyhow::Result<OrderSuccess> {
@@ -890,7 +910,6 @@ impl CommandServer {
             self.in_flight.insert(req_id, (tx.clone(), 1));
         }
 
-        // let mut client_tx = self.clients.get_mut(&client_id).unwrap().clone();
         let prefix = format!("{}-metrics-", request_id);
 
         // It would be great if we could just return OrderSuccess::Metrics from this thread
@@ -943,7 +962,6 @@ impl CommandServer {
 
     pub async fn query(
         &mut self,
-        client_id: String,
         request_id: String,
         query: Query,
     ) -> anyhow::Result<OrderSuccess> {
@@ -989,7 +1007,6 @@ impl CommandServer {
             &Query::Metrics(_) => {}
         };
 
-        // let mut client_tx = self.clients.get_mut(&client_id).unwrap().clone();
         let prefix = format!("{}-query-", request_id);
 
         let task: smol::Task<anyhow::Result<OrderSuccess>> = smol::spawn(async move {
