@@ -1144,8 +1144,14 @@ fn default_accept_queue_timeout() -> u32 {
 }
 
 impl Config {
-    pub fn load_from_path(path: &str) -> io::Result<Config> {
-        FileConfig::load_from_path(path).map(|config| config.into(path))
+    pub fn load_from_path(path: &str) -> anyhow::Result<Config> {
+        let mut config = FileConfig::load_from_path(path).map(|config| config.into(path))?;
+
+        config.saved_state = config
+            .saved_state_path()
+            .with_context(|| "Invalid saved_state in the config. Check your config file")?;
+
+        Ok(config)
     }
 
     pub fn generate_config_messages(&self) -> Vec<CommandRequest> {
@@ -1283,22 +1289,44 @@ impl Config {
             .with_context(|| "could not parse command socket path")
     }
 
-    pub fn saved_state_path(&self) -> Option<String> {
-        self.saved_state.as_ref().and_then(|path| {
-            let config_path_buf = PathBuf::from(self.config_path.clone());
-            let config_folder = config_path_buf
-                .parent()
-                .expect("could not get parent folder of configuration file");
-            let mut saved_state_path_raw = config_folder.to_path_buf();
-            saved_state_path_raw.push(path);
+    pub fn saved_state_path(&self) -> anyhow::Result<Option<String>> {
+        let path = match self.saved_state.as_ref() {
+            Some(path) => path,
+            None => return Ok(None),
+        };
+
+        debug!("saved_stated path in the config: {}", path);
+
+        let config_path_buf = PathBuf::from(self.config_path.clone());
+        debug!("Config path buffer: {:?}", config_path_buf);
+
+        let config_folder = config_path_buf
+            .parent()
+            .with_context(|| "could not get parent folder of configuration file")?;
+
+        debug!("Config folder: {:?}", config_folder);
+
+        let mut saved_state_path_raw = config_folder.to_path_buf();
+
+        saved_state_path_raw.push(path);
+        debug!(
+            "Looking for saved state on the path {:?}",
             saved_state_path_raw
-                .canonicalize()
-                .map_err(|e| {
-                    error!("could not get saved state path: {}", e);
-                })
-                .ok()
-                .and_then(|path| path.to_str().map(|s| s.to_string()))
-        })
+        );
+
+        saved_state_path_raw.canonicalize().with_context(|| {
+            format!(
+                "could not get saved state path from config file input {:?}",
+                self.saved_state
+            )
+        })?;
+
+        let stringified_path = saved_state_path_raw
+            .to_str()
+            .ok_or(anyhow::Error::msg("Unvalid UTF8"))?
+            .to_string();
+
+        return Ok(Some(stringified_path));
     }
 
     pub fn load_file(path: &str) -> io::Result<String> {
