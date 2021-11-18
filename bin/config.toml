@@ -5,6 +5,7 @@
 # path to a file sozu can use to load an initial configuration state for its
 # routing. You can generate this file from sozu's current routing by running
 # the command `sozuctl state save -f state.json`
+# this must be RELATIVE to config.toml
 saved_state = "./state.json"
 
 # save the configuration to the saved_state file every time we receive a

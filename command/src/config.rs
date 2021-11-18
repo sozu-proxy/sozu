@@ -1145,7 +1145,10 @@ fn default_accept_queue_timeout() -> u32 {
 
 impl Config {
     pub fn load_from_path(path: &str) -> anyhow::Result<Config> {
-        let mut config = FileConfig::load_from_path(path).map(|config| config.into(path))?;
+        let file_config =
+            FileConfig::load_from_path(path).with_context(|| "Could not load the config file")?;
+
+        let mut config = file_config.into(path);
 
         config.saved_state = config
             .saved_state_path()
@@ -1289,7 +1292,7 @@ impl Config {
             .with_context(|| "could not parse command socket path")
     }
 
-    pub fn saved_state_path(&self) -> anyhow::Result<Option<String>> {
+    fn saved_state_path(&self) -> anyhow::Result<Option<String>> {
         let path = match self.saved_state.as_ref() {
             Some(path) => path,
             None => return Ok(None),
@@ -1323,7 +1326,7 @@ impl Config {
 
         let stringified_path = saved_state_path_raw
             .to_str()
-            .ok_or(anyhow::Error::msg("Unvalid UTF8"))?
+            .ok_or(anyhow::Error::msg("Unvalid character format, expected UTF8"))?
             .to_string();
 
         return Ok(Some(stringified_path));
