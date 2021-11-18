@@ -598,26 +598,9 @@ impl MutexWrappedCertificateResolver {
     fn generate_certified_key(
         certificate_and_key: &ParsedCertificateAndKey,
     ) -> Option<CertifiedKey> {
-        let mut chains = Vec::new();
-
-        let mut cert_reader = BufReader::new(&*certificate_and_key.certificate.contents);
-        let parsed_certs = rustls_pemfile::certs(&mut cert_reader);
-
-        if let Ok(certs) = parsed_certs {
-            for cert in certs {
-                chains.push(Certificate(cert));
-            }
-        } else {
-            return None;
-        }
-
-        for chain in certificate_and_key.chain.iter() {
-            let mut chain_cert_reader = BufReader::new(&*chain.contents);
-            if let Ok(parsed_chain_certs) = rustls_pemfile::certs(&mut chain_cert_reader) {
-                for cert in parsed_chain_certs {
-                    chains.push(Certificate(cert));
-                }
-            }
+        let mut chains = vec![Certificate(certificate_and_key.certificate.contents.to_owned())];
+        for certificate in &certificate_and_key.chain {
+            chains.push(Certificate(certificate.contents.to_owned()));
         }
 
         let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
