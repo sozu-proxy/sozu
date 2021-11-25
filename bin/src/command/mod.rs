@@ -627,11 +627,12 @@ pub fn start(
         })
         .detach();
 
-        let saved_state = config.saved_state_path();
+        let saved_state_path = config.saved_state.clone();
+
         let mut server = CommandServer::new(fd, config, tx, command_rx, workers, accept_cancel_tx)?;
         server.load_static_application_configuration().await;
 
-        if let Some(path) = saved_state {
+        if let Some(path) = saved_state_path {
             server
                 .load_state(None, "INITIALIZATION".to_string(), &path)
                 .await?;
