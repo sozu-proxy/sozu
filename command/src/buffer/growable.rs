@@ -1,6 +1,5 @@
 use pool::Reset;
 use std::io::{self, Read, Write};
-use std::iter::repeat;
 use std::{cmp, ptr};
 
 #[derive(Debug, PartialEq, Clone)]
@@ -13,10 +12,8 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn with_capacity(capacity: usize) -> Buffer {
-        let mut v = Vec::with_capacity(capacity);
-        v.extend(repeat(0).take(capacity));
         Buffer {
-            memory: v,
+            memory: vec![0; capacity],
             capacity,
             position: 0,
             end: 0,

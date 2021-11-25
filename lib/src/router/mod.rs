@@ -14,6 +14,12 @@ pub struct Router {
     post: Vec<(DomainRule, PathRule, MethodRule, Route)>,
 }
 
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Router {
     pub fn new() -> Router {
         Router {
@@ -170,11 +176,7 @@ impl Router {
                     self.tree.domain_lookup_mut(hostname.as_bytes(), false)
                 {
                     empty = false;
-                    if paths
-                        .iter()
-                        .find(|(p, m, _)| *p == path && *m == method)
-                        .is_none()
-                    {
+                    if !paths.iter().any(|(p, m, _)| *p == path && *m == method) {
                         paths.push((path, method, app_id));
                         return true;
                     }
@@ -236,11 +238,10 @@ impl Router {
         method: MethodRule,
         app_id: Route,
     ) -> bool {
-        if self
+        if !self
             .pre
             .iter()
-            .position(|(d, p, m, _)| *d == domain && *p == path && *m == method)
-            .is_none()
+            .any(|(d, p, m, _)| *d == domain && *p == path && *m == method)
         {
             self.pre.push((domain, path, method, app_id));
             true
@@ -256,11 +257,10 @@ impl Router {
         method: MethodRule,
         app_id: Route,
     ) -> bool {
-        if self
+        if !self
             .post
             .iter()
-            .position(|(d, p, m, _)| *d == domain && *p == path && *m == method)
-            .is_none()
+            .any(|(d, p, m, _)| *d == domain && *p == path && *m == method)
         {
             self.post.push((domain, path, method, app_id));
             true
@@ -327,7 +327,7 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
             for i in index + 1..s.len() {
                 if s[i] == b'/' {
                     match std::str::from_utf8(&s[index + 1..i]) {
-                        Ok(r) => result.extend(r.chars()),
+                        Ok(r) => result.push_str(r),
                         Err(_) => return None,
                     }
                     index = i + 1;
@@ -344,7 +344,7 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
                 index = i;
                 if i < s.len() && s[i] == b'.' {
                     match std::str::from_utf8(&s[start..i]) {
-                        Ok(r) => result.extend(r.chars()),
+                        Ok(r) => result.push_str(r),
                         Err(_) => return None,
                     }
                     break;
@@ -352,7 +352,7 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
             }
             if index == s.len() {
                 match std::str::from_utf8(&s[start..]) {
-                    Ok(r) => result.extend(r.chars()),
+                    Ok(r) => result.push_str(r),
                     Err(_) => return None,
                 }
             }
@@ -360,13 +360,11 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
 
         if index == s.len() {
             return Some(result);
+        } else if s[index] == b'.' {
+            result.push_str("\\.");
+            index += 1;
         } else {
-            if s[index] == b'.' {
-                result.extend("\\.".chars());
-                index += 1;
-            } else {
-                return None;
-            }
+            return None;
         }
     }
 }
@@ -377,7 +375,7 @@ impl DomainRule {
             DomainRule::Any => true,
             DomainRule::Wildcard(s) => {
                 let len_without_suffix = hostname.len() - s.len() + 1;
-                hostname.ends_with(&s[1..].as_bytes())
+                hostname.ends_with(s[1..].as_bytes())
                     && !&hostname[..len_without_suffix].contains(&b'.')
             }
             DomainRule::Exact(s) => s.as_bytes() == hostname,
@@ -413,7 +411,7 @@ impl std::str::FromStr for DomainRule {
                 None => return Err(()),
             }
         } else if s.contains('*') {
-            if s.chars().next() == Some('*') {
+            if s.starts_with('*') {
                 match ::idna::domain_to_ascii(s) {
                     Ok(r) => DomainRule::Wildcard(r),
                     Err(_) => return Err(()),

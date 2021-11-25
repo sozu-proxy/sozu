@@ -29,9 +29,9 @@ pub struct Logger {
     pub initialized: bool,
 }
 
-impl Logger {
-    pub fn new() -> Logger {
-        Logger {
+impl Default for Logger {
+    fn default() -> Self {
+        Self {
             directives: vec![LogDirective {
                 name: None,
                 level: LogLevelFilter::Error,
@@ -42,6 +42,12 @@ impl Logger {
             pid: 0,
             initialized: false,
         }
+    }
+}
+
+impl Logger {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn init(
@@ -234,7 +240,7 @@ pub enum LogLevel {
     Trace,
 }
 
-static LOG_LEVEL_NAMES: [&'static str; 6] = ["OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
+static LOG_LEVEL_NAMES: [&str; 6] = ["OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
 
 impl Clone for LogLevel {
     #[inline]
@@ -428,7 +434,7 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
         );
         return dirs;
     }
-    mods.map(|m| {
+    if let Some(m) = mods {
         for s in m.split(',') {
             if s.is_empty() {
                 continue;
@@ -470,7 +476,7 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
                 level: log_level,
             });
         }
-    });
+    }
 
     dirs
 }
@@ -478,9 +484,8 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
 pub fn target_to_backend(target: &str) -> LoggerBackend {
     if target == "stdout" {
         LoggerBackend::Stdout(stdout())
-    } else if target.starts_with("udp://") {
-        let addr_res = (&target[6..]).to_socket_addrs();
-        match addr_res {
+    } else if let Some(addr) = target.strip_prefix("udp://") {
+        match addr.to_socket_addrs() {
             Err(e) => {
                 println!("invalid log target configuration ({:?}): {}", e, target);
                 LoggerBackend::Stdout(stdout())
@@ -490,22 +495,18 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
                 LoggerBackend::Udp(socket, addrs.next().unwrap())
             }
         }
-    } else if target.starts_with("tcp://") {
-        let addr_res = (&target[6..]).to_socket_addrs();
-        match addr_res {
+    } else if let Some(addr) = target.strip_prefix("tcp://") {
+        match addr.to_socket_addrs() {
             Err(e) => {
                 println!("invalid log target configuration ({:?}): {}", e, target);
                 LoggerBackend::Stdout(stdout())
             }
             Ok(mut addrs) => LoggerBackend::Tcp(TcpStream::connect(addrs.next().unwrap()).unwrap()),
         }
-    } else if target.starts_with("unix://") {
-        let path = Path::new(&target[7..]);
+    } else if let Some(addr) = target.strip_prefix("unix://") {
+        let path = Path::new(addr);
         if !path.exists() {
-            println!(
-                "invalid log target configuration: {} is not a file",
-                &target[7..]
-            );
+            println!("invalid log target configuration: {} is not a file", addr);
             LoggerBackend::Stdout(stdout())
         } else {
             let mut dir = env::temp_dir();
@@ -519,15 +520,14 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
             socket.connect(path).unwrap();
             LoggerBackend::Unix(socket)
         }
-    } else if target.starts_with("file://") {
-        let path = Path::new(&target[7..]);
+    } else if let Some(addr) = target.strip_prefix("file://") {
+        let path = Path::new(addr);
         match OpenOptions::new().create(true).append(true).open(path) {
             Ok(file) => LoggerBackend::File(crate::writer::MultiLineWriter::new(file)),
             Err(e) => {
                 println!(
                     "invalid log target configuration: could not open file at {} (error: {:?})",
-                    &target[7..],
-                    e
+                    addr, e
                 );
                 LoggerBackend::Stdout(stdout())
             }

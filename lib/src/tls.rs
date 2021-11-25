@@ -17,9 +17,9 @@ use crate::sozu_command::proxy::{
 };
 
 use rustls::{
-    Certificate, PrivateKey,
     server::{ClientHello, ResolvesServerCert},
     sign::{CertifiedKey, RsaSigningKey},
+    Certificate, PrivateKey,
 };
 use sha2::{Digest, Sha256};
 use sozu_command::proxy::TlsVersion;
@@ -236,7 +236,7 @@ impl CertificateResolver for GenericCertificateResolver {
 
             self.name_fingerprint_idx
                 .entry(name)
-                .or_insert_with(|| HashSet::new())
+                .or_insert_with(HashSet::new)
                 .insert(fingerprint.to_owned());
         }
 
@@ -477,13 +477,13 @@ impl GenericCertificateResolver {
                 .parse_x509()
                 .map_err(|err| GenericCertificateResolverError::DerParseError(err.to_string()))?;
 
-            let certificate_names = match self.get_names_override(&fingerprint) {
+            let certificate_names = match self.get_names_override(fingerprint) {
                 Some(names) => names,
                 None => self.certificate_names(&parsed_certificate_and_key.certificate)?,
             };
 
             let certificate_expiration = self
-                .get_expiration_override(&fingerprint)
+                .get_expiration_override(fingerprint)
                 .unwrap_or_else(|| certificate.validity().not_after.timestamp());
 
             let extra_names = certificate_names
@@ -557,7 +557,7 @@ impl ResolvesServerCert for MutexWrappedCertificateResolver {
             return None;
         }
 
-        let name: &str = server_name.unwrap().into();
+        let name: &str = server_name.unwrap();
         trace!(
             "trying to resolve name: {:?} for signature scheme: {:?}",
             name,
@@ -621,16 +621,13 @@ impl MutexWrappedCertificateResolver {
                     if !keys.is_empty() {
                         let key = PrivateKey(keys.swap_remove(0));
                         if let Ok(signing_key) = RsaSigningKey::new(&key) {
-                            let certified =
-                                CertifiedKey::new(chains, Arc::new(signing_key));
+                            let certified = CertifiedKey::new(chains, Arc::new(signing_key));
+                            return Some(certified);
+                        } else if let Ok(k) = rustls::sign::any_ecdsa_type(&key) {
+                            let certified = CertifiedKey::new(chains, k);
                             return Some(certified);
                         } else {
-                            if let Ok(k) = rustls::sign::any_ecdsa_type(&key) {
-                                let certified = CertifiedKey::new(chains, k);
-                                return Some(certified);
-                            } else {
-                                error!("could not decode signing key (tried RSA and ECDSA)");
-                            }
+                            error!("could not decode signing key (tried RSA and ECDSA)");
                         }
                     }
                 }

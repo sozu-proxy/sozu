@@ -96,22 +96,21 @@ impl SocketHandler for TcpStream {
 
     fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
         match self.write_vectored(bufs) {
-            Ok(0) => return (0, SocketResult::Continue),
-            Ok(sz) => return (sz, SocketResult::Continue),
+            Ok(sz) => (sz, SocketResult::Continue),
             Err(e) => match e.kind() {
-                ErrorKind::WouldBlock => return (0, SocketResult::WouldBlock),
+                ErrorKind::WouldBlock => (0, SocketResult::WouldBlock),
                 ErrorKind::ConnectionReset
                 | ErrorKind::ConnectionAborted
                 | ErrorKind::BrokenPipe
                 | ErrorKind::ConnectionRefused => {
                     incr!("tcp.write.error");
-                    return (0, SocketResult::Closed);
+                    (0, SocketResult::Closed)
                 }
                 _ => {
                     //FIXME: timeout and other common errors should be sent up
                     error!("SOCKET\tsocket_write error={:?}", e);
                     incr!("tcp.write.error");
-                    return (0, SocketResult::Error);
+                    (0, SocketResult::Error)
                 }
             },
         }

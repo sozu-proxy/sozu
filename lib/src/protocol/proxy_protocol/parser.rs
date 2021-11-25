@@ -81,8 +81,8 @@ fn parse_ipv6_on_v2(i: &[u8]) -> IResult<&[u8], ProxyAddr> {
     Ok((
         i,
         ProxyAddr::Ipv6Addr {
-            src_addr: SocketAddrV6::new(slice_to_ipv6(&src_ip[..]), src_port, 0, 0),
-            dst_addr: SocketAddrV6::new(slice_to_ipv6(&dest_ip[..]), dest_port, 0, 0),
+            src_addr: SocketAddrV6::new(slice_to_ipv6(src_ip), src_port, 0, 0),
+            dst_addr: SocketAddrV6::new(slice_to_ipv6(dest_ip), dest_port, 0, 0),
         },
     ))
 }

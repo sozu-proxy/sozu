@@ -88,30 +88,33 @@ impl ConfigState {
                 self.clusters.remove(cluster_id).is_some()
             }
             &ProxyRequestData::AddHttpListener(ref listener) => {
-                if self.http_listeners.contains_key(&listener.address) {
-                    false
-                } else {
-                    self.http_listeners
-                        .insert(listener.address, (listener.clone(), false));
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.http_listeners.entry(listener.address)
+                {
+                    e.insert((listener.clone(), false));
                     true
+                } else {
+                    false
                 }
             }
             &ProxyRequestData::AddHttpsListener(ref listener) => {
-                if self.https_listeners.contains_key(&listener.address) {
-                    false
-                } else {
-                    self.https_listeners
-                        .insert(listener.address, (listener.clone(), false));
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.https_listeners.entry(listener.address)
+                {
+                    e.insert((listener.clone(), false));
                     true
+                } else {
+                    false
                 }
             }
             &ProxyRequestData::AddTcpListener(ref listener) => {
-                if self.tcp_listeners.contains_key(&listener.address) {
-                    false
-                } else {
-                    self.tcp_listeners
-                        .insert(listener.address, (listener.clone(), false));
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.tcp_listeners.entry(listener.address)
+                {
+                    e.insert((listener.clone(), false));
                     true
+                } else {
+                    false
                 }
             }
             &ProxyRequestData::RemoveListener(ref remove) => match remove.proxy {
@@ -154,24 +157,18 @@ impl ConfigState {
                     .is_some(),
             },
             &ProxyRequestData::AddHttpFrontend(ref front) => {
-                if self.http_fronts.contains_key(&RouteKey(
-                    front.address,
-                    front.hostname.to_string(),
-                    front.path.clone(),
-                    front.method.clone(),
-                )) {
-                    false
-                } else {
-                    self.http_fronts.insert(
-                        RouteKey(
-                            front.address,
-                            front.hostname.to_string(),
-                            front.path.clone(),
-                            front.method.clone(),
-                        ),
-                        front.clone(),
-                    );
+                if let std::collections::btree_map::Entry::Vacant(e) =
+                    self.http_fronts.entry(RouteKey(
+                        front.address,
+                        front.hostname.to_string(),
+                        front.path.clone(),
+                        front.method.clone(),
+                    ))
+                {
+                    e.insert(front.clone());
                     true
+                } else {
+                    false
                 }
             }
             &ProxyRequestData::RemoveHttpFrontend(ref front) => self
@@ -185,7 +182,7 @@ impl ConfigState {
                 .is_some(),
             &ProxyRequestData::AddCertificate(ref add) => {
                 let fingerprint =
-                    match calculate_fingerprint(&add.certificate.certificate.as_bytes()[..]) {
+                    match calculate_fingerprint(add.certificate.certificate.as_bytes()) {
                         Some(f) => CertificateFingerprint(f),
                         None => {
                             error!("cannot obtain the certificate's fingerprint");
@@ -193,20 +190,19 @@ impl ConfigState {
                         }
                     };
 
-                if !self.certificates.contains_key(&add.address) {
-                    self.certificates
-                        .insert(add.address.clone(), HashMap::new());
-                }
+                self.certificates
+                    .entry(add.address)
+                    .or_insert_with(HashMap::new);
                 if !self
                     .certificates
                     .get(&add.address)
                     .unwrap()
                     .contains_key(&fingerprint)
                 {
-                    self.certificates.get_mut(&add.address).unwrap().insert(
-                        fingerprint.clone(),
-                        (add.certificate.clone(), add.names.clone()),
-                    );
+                    self.certificates
+                        .get_mut(&add.address)
+                        .unwrap()
+                        .insert(fingerprint, (add.certificate.clone(), add.names.clone()));
                     true
                 } else {
                     false
@@ -224,15 +220,14 @@ impl ConfigState {
                     .and_then(|certs| certs.remove(&replace.old_fingerprint))
                     .is_some();
 
-                let fingerprint = match calculate_fingerprint(
-                    &replace.new_certificate.certificate.as_bytes()[..],
-                ) {
-                    Some(f) => CertificateFingerprint(f),
-                    None => {
-                        error!("cannot obtain the certificate's fingerprint");
-                        return changed;
-                    }
-                };
+                let fingerprint =
+                    match calculate_fingerprint(replace.new_certificate.certificate.as_bytes()) {
+                        Some(f) => CertificateFingerprint(f),
+                        None => {
+                            error!("cannot obtain the certificate's fingerprint");
+                            return changed;
+                        }
+                    };
 
                 if !self
                     .certificates
@@ -253,24 +248,18 @@ impl ConfigState {
                 }
             }
             &ProxyRequestData::AddHttpsFrontend(ref front) => {
-                if self.https_fronts.contains_key(&RouteKey(
-                    front.address,
-                    front.hostname.to_string(),
-                    front.path.clone(),
-                    front.method.clone(),
-                )) {
-                    false
-                } else {
-                    self.https_fronts.insert(
-                        RouteKey(
-                            front.address,
-                            front.hostname.to_string(),
-                            front.path.clone(),
-                            front.method.clone(),
-                        ),
-                        front.clone(),
-                    );
+                if let std::collections::btree_map::Entry::Vacant(e) =
+                    self.https_fronts.entry(RouteKey(
+                        front.address,
+                        front.hostname.to_string(),
+                        front.path.clone(),
+                        front.method.clone(),
+                    ))
+                {
+                    e.insert(front.clone());
                     true
+                } else {
+                    false
                 }
             }
             &ProxyRequestData::RemoveHttpsFrontend(ref front) => self
@@ -347,7 +336,7 @@ impl ConfigState {
             v.push(ProxyRequestData::AddHttpListener(listener.clone()));
             if active {
                 v.push(ProxyRequestData::ActivateListener(ActivateListener {
-                    address: listener.address.clone(),
+                    address: listener.address,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
                 }));
@@ -358,7 +347,7 @@ impl ConfigState {
             v.push(ProxyRequestData::AddHttpsListener(listener.clone()));
             if active {
                 v.push(ProxyRequestData::ActivateListener(ActivateListener {
-                    address: listener.address.clone(),
+                    address: listener.address,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
                 }));
@@ -369,7 +358,7 @@ impl ConfigState {
             v.push(ProxyRequestData::AddTcpListener(listener.clone()));
             if active {
                 v.push(ProxyRequestData::ActivateListener(ActivateListener {
-                    address: listener.address.clone(),
+                    address: listener.address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
                 }));
@@ -384,10 +373,10 @@ impl ConfigState {
             v.push(ProxyRequestData::AddHttpFrontend(front.clone()));
         }
 
-        for (ref front, ref certs) in self.certificates.iter() {
+        for (front, certs) in self.certificates.iter() {
             for &(ref certificate_and_key, ref names) in certs.values() {
                 v.push(ProxyRequestData::AddCertificate(AddCertificate {
-                    address: **front,
+                    address: *front,
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
                     expired_at: None,
@@ -727,12 +716,12 @@ impl ConfigState {
         }
 
         let mut my_http_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
-        for (ref route, ref front) in self.http_fronts.iter() {
-            my_http_fronts.insert((&route, &front));
+        for (route, front) in self.http_fronts.iter() {
+            my_http_fronts.insert((route, front));
         }
         let mut their_http_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
-        for (ref route, ref front) in other.http_fronts.iter() {
-            their_http_fronts.insert((&route, &front));
+        for (route, front) in other.http_fronts.iter() {
+            their_http_fronts.insert((route, front));
         }
 
         let removed_http_fronts = my_http_fronts.difference(&their_http_fronts);
@@ -747,12 +736,12 @@ impl ConfigState {
         }
 
         let mut my_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
-        for (ref route, ref front) in self.https_fronts.iter() {
-            my_https_fronts.insert((&route, &front));
+        for (route, front) in self.https_fronts.iter() {
+            my_https_fronts.insert((route, front));
         }
         let mut their_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
-        for (ref route, ref front) in other.https_fronts.iter() {
-            their_https_fronts.insert((&route, &front));
+        for (route, front) in other.https_fronts.iter() {
+            their_https_fronts.insert((route, front));
         }
         let removed_https_fronts = my_https_fronts.difference(&their_https_fronts);
         let added_https_fronts = their_https_fronts.difference(&my_https_fronts);
@@ -766,15 +755,15 @@ impl ConfigState {
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
-        for (ref app_id, ref front_list) in self.tcp_fronts.iter() {
-            for ref front in front_list.iter() {
-                my_tcp_fronts.insert((&app_id, &front));
+        for (app_id, front_list) in self.tcp_fronts.iter() {
+            for front in front_list.iter() {
+                my_tcp_fronts.insert((app_id, front));
             }
         }
         let mut their_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
-        for (ref app_id, ref front_list) in other.tcp_fronts.iter() {
-            for ref front in front_list.iter() {
-                their_tcp_fronts.insert((&app_id, &front));
+        for (app_id, front_list) in other.tcp_fronts.iter() {
+            for front in front_list.iter() {
+                their_tcp_fronts.insert((app_id, front));
             }
         }
 
@@ -831,7 +820,7 @@ impl ConfigState {
             let listener = &other.tcp_listeners[address];
             if listener.1 {
                 v.push(ProxyRequestData::ActivateListener(ActivateListener {
-                    address: listener.0.address.clone(),
+                    address: listener.0.address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
                 }));
@@ -849,12 +838,12 @@ impl ConfigState {
             .map(|cluster_id| {
                 let mut s = DefaultHasher::new();
                 self.clusters.get(cluster_id).hash(&mut s);
-                self.backends
-                    .get(cluster_id)
-                    .map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
-                self.tcp_fronts
-                    .get(cluster_id)
-                    .map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
+                if let Some(v) = self.backends.get(cluster_id) {
+                    v.iter().collect::<BTreeSet<_>>().hash(&mut s)
+                }
+                if let Some(v) = self.tcp_fronts.get(cluster_id) {
+                    v.iter().collect::<BTreeSet<_>>().hash(&mut s)
+                }
                 (cluster_id.to_string(), s)
             })
             .collect();
@@ -1050,26 +1039,24 @@ impl<
                 // there are no more elements in other_it, all the next elements in my
                 // should be removed
                 (Some((k, _)), None) => return Some((k, DiffResult::Removed)),
-                (Some((k1, v1)), Some((k2, v2))) => {
-                    // element is present in my but not other
-                    if k1 < k2 {
-                        self.other = Some((k2, v2));
-                        return Some((k1, DiffResult::Removed));
-                    // element is present in other byt not in my
-                    } else if k1 > k2 {
-                        self.my = Some((k1, v1));
-                        return Some((k2, DiffResult::Added));
-                    } else {
-                        // key is present in both, if elements have changed
-                        // return a value, otherwise go to the next key for both maps
-                        if v1 != v2 {
-                            return Some((k1, DiffResult::Changed));
-                        }
-                    }
+                // element is present in my but not other
+                (Some((k1, _v1)), Some((k2, v2))) if k1 < k2 => {
+                    self.other = Some((k2, v2));
+                    return Some((k1, DiffResult::Removed));
                 }
+                // element is present in other byt not in my
+                (Some((k1, v1)), Some((k2, _v2))) if k1 > k2 => {
+                    self.my = Some((k1, v1));
+                    return Some((k2, DiffResult::Added));
+                }
+                (Some((k1, v1)), Some((_k2, v2))) if v1 != v2 => {
+                    // key is present in both, if elements have changed
+                    // return a value, otherwise go to the next key for both maps
+                    return Some((k1, DiffResult::Changed));
+                }
+                _ => {}
             }
         }
-        //None
     }
 }
 
@@ -1656,10 +1643,10 @@ impl<'de> Visitor<'de> for RouteKeyVisitor {
     where
         E: de::Error,
     {
-        let mut it = value.split(";");
+        let mut it = value.split(';');
         let address = it
             .next()
-            .ok_or_else(|| E::custom(format!("invalid format")))
+            .ok_or_else(|| E::custom("invalid format".to_string()))
             .and_then(|s| {
                 s.parse::<SocketAddr>()
                     .map_err(|e| E::custom(format!("could not deserialize SocketAddr: {:?}", e)))
@@ -1667,23 +1654,22 @@ impl<'de> Visitor<'de> for RouteKeyVisitor {
 
         let hostname = it
             .next()
-            .ok_or_else(|| E::custom(format!("invalid format")))?;
+            .ok_or_else(|| E::custom("invalid format".to_string()))?;
 
         let path_rule_str = it
             .next()
-            .ok_or_else(|| E::custom(format!("invalid format")))?;
+            .ok_or_else(|| E::custom("invalid format".to_string()))?;
 
         let path_rule = match path_rule_str.chars().next() {
             Some('R') => PathRule::Regex(String::from(&path_rule_str[1..])),
             Some('P') => PathRule::Prefix(String::from(&path_rule_str[1..])),
             Some('=') => PathRule::Equals(String::from(&path_rule_str[1..])),
-            _ => return Err(E::custom(format!("invalid path rule"))),
+            _ => return Err(E::custom("invalid path rule".to_string())),
         };
 
         let method = it.next().map(String::from);
 
-        let res = Ok(RouteKey(address, hostname.to_string(), path_rule, method));
-        res
+        Ok(RouteKey(address, hostname.to_string(), path_rule, method))
     }
 }
 

@@ -69,6 +69,12 @@ impl AppMetricsData {
     }
 }
 
+impl Default for AppMetricsData {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FilteredData {

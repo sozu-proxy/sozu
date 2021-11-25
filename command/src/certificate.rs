@@ -8,7 +8,7 @@ pub fn calculate_fingerprint(certificate: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub fn calculate_fingerprint_from_der(certificate: &[u8]) -> Vec<u8> {
-    Sha256::digest(&certificate).iter().cloned().collect()
+    Sha256::digest(certificate).iter().cloned().collect()
 }
 
 pub fn split_certificate_chain(mut chain: String) -> Vec<String> {
@@ -16,13 +16,14 @@ pub fn split_certificate_chain(mut chain: String) -> Vec<String> {
 
     let end = "-----END CERTIFICATE-----";
     loop {
-        match chain.find(end) {
-            Some(sz) => {
-                let cert: String = chain.drain(..sz + end.len()).collect();
-                v.push(cert.trim().to_string());
-            }
-            None => break,
+        if let Some(sz) = chain.find(end) {
+            let cert: String = chain.drain(..sz + end.len()).collect();
+            v.push(cert.trim().to_string());
+            continue;
         }
+
+        break;
     }
+
     v
 }

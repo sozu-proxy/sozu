@@ -323,10 +323,8 @@ impl<T> Timer<T> {
         timeout: &Timeout,
         delay_from_now: Duration,
     ) -> Option<Timeout> {
-        match self.cancel_timeout(timeout) {
-            None => None,
-            Some(state) => Some(self.set_timeout(delay_from_now, state)),
-        }
+        self.cancel_timeout(timeout)
+            .map(|state| self.set_timeout(delay_from_now, state))
     }
 
     /// Cancel a timeout.

@@ -129,9 +129,9 @@ impl BufferQueue {
     pub fn merge_input_slices(&self) -> usize {
         let mut acc = 0usize;
         for el in self.input_queue.iter() {
-            match el {
-                &InputElement::Splice(_) => break,
-                &InputElement::Slice(sz) => acc += sz,
+            match *el {
+                InputElement::Splice(_) => break,
+                InputElement::Slice(sz) => acc += sz,
             }
         }
 
@@ -145,9 +145,9 @@ impl BufferQueue {
     pub fn input_data_size(&self) -> usize {
         let mut acc = 0usize;
         for el in self.input_queue.iter() {
-            match el {
-                &InputElement::Splice(sz) => acc += sz,
-                &InputElement::Slice(sz) => acc += sz,
+            match *el {
+                InputElement::Splice(sz) => acc += sz,
+                InputElement::Slice(sz) => acc += sz,
             }
         }
         acc
@@ -229,7 +229,7 @@ impl BufferQueue {
     }
 
     pub fn has_output_data(&self) -> bool {
-        self.output_queue.len() > 0
+        !self.output_queue.is_empty()
     }
 
     pub fn output_data_size(&self) -> usize {
@@ -237,9 +237,9 @@ impl BufferQueue {
         let mut available_buffer_size = self.buffer.available_data();
 
         for el in self.output_queue.iter() {
-            match el {
-                &OutputElement::Splice(sz) => acc += sz,
-                &OutputElement::Slice(sz) => {
+            match *el {
+                OutputElement::Splice(sz) => acc += sz,
+                OutputElement::Slice(sz) => {
                     if available_buffer_size >= sz {
                         acc += sz;
                         available_buffer_size -= sz;
@@ -249,8 +249,8 @@ impl BufferQueue {
                         return acc;
                     }
                 }
-                &OutputElement::Insert(ref v) => acc += v.len(),
-                &OutputElement::Delete(sz) => {
+                OutputElement::Insert(ref v) => acc += v.len(),
+                OutputElement::Delete(sz) => {
                     if available_buffer_size >= sz {
                         available_buffer_size -= sz;
                     } else {
@@ -265,8 +265,8 @@ impl BufferQueue {
     pub fn merge_output_slices(&self) -> usize {
         let mut acc = 0usize;
         for el in self.output_queue.iter() {
-            match el {
-                &OutputElement::Slice(sz) => acc += sz,
+            match *el {
+                OutputElement::Slice(sz) => acc += sz,
                 _ => break,
             }
         }
@@ -281,8 +281,8 @@ impl BufferQueue {
     pub fn merge_output_deletes(&self) -> usize {
         let mut acc = 0usize;
         for el in self.output_queue.iter() {
-            match el {
-                &OutputElement::Delete(sz) => acc += sz,
+            match *el {
+                OutputElement::Delete(sz) => acc += sz,
                 _ => break,
             }
         }
@@ -304,20 +304,20 @@ impl BufferQueue {
         for el in it {
             //println!("start={}, length={}, el = {:?}", start, largest_size, el);
             if !delete_ended {
-                match el {
-                    &OutputElement::Delete(sz) => start += sz,
+                match *el {
+                    OutputElement::Delete(sz) => start += sz,
                     _ => {
                         delete_ended = true;
                         match el {
-                            &OutputElement::Slice(sz) => largest_size += sz,
-                            &OutputElement::Insert(ref v) => return &v[..],
+                            OutputElement::Slice(sz) => largest_size += *sz,
+                            OutputElement::Insert(v) => return v,
                             _ => break,
                         }
                     }
                 }
             } else {
-                match el {
-                    &OutputElement::Slice(sz) => largest_size += sz,
+                match *el {
+                    OutputElement::Slice(sz) => largest_size += sz,
                     _ => break,
                 }
             }
@@ -344,9 +344,9 @@ impl BufferQueue {
         let length = self.buffer.available_data();
         //println!("NEXT OUTPUT DATA:\nqueue:\n{:?}\nbuffer:\n{}", self.output_queue, self.buffer.data().to_hex(16));
         for el in it {
-            match el {
-                &OutputElement::Delete(sz) => start += sz,
-                &OutputElement::Slice(sz) => {
+            match *el {
+                OutputElement::Delete(sz) => start += sz,
+                OutputElement::Slice(sz) => {
                     //println!("Slice({})", sz);
                     if sz == 0 {
                         continue;
@@ -360,7 +360,7 @@ impl BufferQueue {
                         break;
                     }
                 }
-                &OutputElement::Insert(ref v) => {
+                OutputElement::Insert(ref v) => {
                     if v.is_empty() {
                         continue;
                     }
@@ -368,7 +368,7 @@ impl BufferQueue {
                     //println!("got Insert with {} bytes", v.len());
                     res.push(i);
                 }
-                &OutputElement::Splice(_sz) => {
+                OutputElement::Splice(_sz) => {
                     unimplemented!("splice not used in ioslice")
                 }
             }
@@ -424,7 +424,7 @@ impl BufferQueue {
                 }
                 Some(&OutputElement::Insert(ref v)) => {
                     if to_consume >= v.len() {
-                        to_consume = to_consume - v.len();
+                        to_consume -= v.len();
                         None
                     } else {
                         let new_element = OutputElement::Insert(Vec::from(&v[to_consume..]));
