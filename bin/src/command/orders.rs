@@ -36,6 +36,7 @@ impl CommandServer {
         client_id: String,
         request: sozu_command::command::CommandRequest,
     ) -> anyhow::Result<OrderSuccess> {
+        info!("Received order {:?}", request);
         let owned_client_id = client_id.to_owned();
         let owned_request_id = request.id.to_owned();
 
@@ -59,7 +60,6 @@ impl CommandServer {
                 self.upgrade_worker(owned_client_id, owned_request_id, worker_id)
                     .await
             }
-
             CommandRequestData::Proxy(proxy_request) => match proxy_request {
                 ProxyRequestData::Metrics(config) => self.metrics(owned_request_id, config).await,
                 ProxyRequestData::Query(query) => self.query(owned_request_id, query).await,
@@ -79,29 +79,26 @@ impl CommandServer {
         };
         match result {
             Ok(order_success) => {
-                // no need to log the successhere, it is down upstream
+                // no need to log the success here, it is down upstream
 
                 let success_message = order_success.to_string().to_owned();
 
-                match order_success {
+                let command_response_data = match order_success {
                     // should list OrderSuccess::Metrics(crd) as well
-                    OrderSuccess::DumpState(command_respond_data)
-                    | OrderSuccess::ListFrontends(command_respond_data)
-                    | OrderSuccess::ListWorkers(command_respond_data)
-                    | OrderSuccess::Query(command_respond_data) => {
-                        self.answer_success(
-                            client_id,
-                            request.id,
-                            success_message,
-                            Some(command_respond_data),
-                        )
-                        .await;
-                    }
-                    _ => {
-                        self.answer_success(client_id, request.id, success_message, None)
-                            .await
-                    }
+                    OrderSuccess::DumpState(crd)
+                    | OrderSuccess::ListFrontends(crd)
+                    | OrderSuccess::ListWorkers(crd)
+                    | OrderSuccess::Query(crd) => Some(crd),
+                    _ => None,
                 };
+
+                self.answer_success(
+                    client_id,
+                    request.id,
+                    success_message,
+                    command_response_data,
+                )
+                .await;
 
                 Ok(OrderSuccess::ClientRequest)
             }
@@ -294,7 +291,7 @@ impl CommandServer {
                 let mut ok = 0usize;
                 let mut error = 0usize;
 
-                info!("coucou");
+                info!("Waiting for responses from workers...");
                 // logs may stop here
                 while let Some(proxy_response) = dbg!(load_state_rx.next().await) {
                     match proxy_response.status {

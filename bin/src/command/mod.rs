@@ -731,6 +731,7 @@ enum CommandMessage {
 impl CommandServer {
     pub async fn run(&mut self) {
         while let Some(msg) = self.command_rx.next().await {
+            info!("Received order");
             let result: anyhow::Result<OrderSuccess> = match msg {
                 CommandMessage::ClientNew { id, sender } => {
                     debug!("adding new client {}", id);
@@ -782,8 +783,7 @@ impl CommandServer {
                 }
                 Err(error) => {
                     // log the error on the main process without stopping it
-
-                    error!("{:#?}", error);
+                    error!("Failed order: {:#?}", error);
                 }
             }
         }

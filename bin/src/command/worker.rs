@@ -46,6 +46,7 @@ impl Worker {
 
     pub async fn send(&mut self, request_id: String, data: ProxyRequestData) {
         if let Some(tx) = self.sender.as_mut() {
+            debug!("Sending order to worker {}", self.id);
             if let Err(e) = tx
                 .send(ProxyRequest {
                     id: request_id,
@@ -55,6 +56,8 @@ impl Worker {
             {
                 error!("error sending message to worker {:?}: {:?}", self.id, e);
             }
+        } else {
+            error!("No available sender to this worker");
         }
     }
 
