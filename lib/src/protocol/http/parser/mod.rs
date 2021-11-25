@@ -263,11 +263,12 @@ fn status_line(i: &[u8]) -> IResult<&[u8], StatusLine> {
 }
 
 #[derive(PartialEq, Debug)]
-pub struct Header<'a> {
-    pub name: &'a [u8],
-    pub value: &'a [u8],
+pub struct Header {
+    pub name: Vec<u8>,
+    pub value: Vec<u8>,
 }
 
+#[cfg(feature = "tolerant-http1-parser")]
 fn message_header(i: &[u8]) -> IResult<&[u8], Header> {
     // ToDo handle folding?
     let (i, (name, _, _, value, _)) = tuple((
@@ -278,7 +279,55 @@ fn message_header(i: &[u8]) -> IResult<&[u8], Header> {
         crlf,
     ))(i)?;
 
-    Ok((i, Header { name, value }))
+    Ok((
+        i,
+        Header {
+            name: name.to_owned(),
+            value: value.to_owned(),
+        },
+    ))
+}
+
+#[cfg(not(feature = "tolerant-http1-parser"))]
+fn message_header(i: &[u8]) -> IResult<&[u8], Header> {
+    // ToDo handle folding?
+    let (i, (name, _, _, value, _)) = tuple((
+        token,
+        tag(":"),
+        take_while(is_space),
+        take_while(is_header_value_char),
+        crlf,
+    ))(i)?;
+
+    // header value are formatted using character in the ascii table, so we are
+    // sure that the utf8 conversion will not fail.
+    //
+    // According to the rfc 2616, section 2.2 and 4.2, the linear white space
+    // (lws) which are the horizontal tabulation ('\t') and the space (' ') MAY
+    // be trimmed.
+    //
+    // See rfc 2616, section 4.2:
+    //
+    // > The field-content does not include any leading or trailing LWS:
+    // > linear white space occurring before the first non-whitespace
+    // > character of the field-value or after the last non-whitespace
+    // > character of the field-value. Such leading or trailing LWS MAY be
+    // > removed without changing the semantics of the field value. Any LWS
+    // > that occurs between field-content MAY be replaced with a single SP
+    // > before interpreting the field value or forwarding the message
+    // > downstream.
+    let value = String::from_utf8_lossy(value)
+        .trim_end_matches(|c| '\t' == c || ' ' == c)
+        .as_bytes()
+        .to_owned();
+
+    Ok((
+        i,
+        Header {
+            name: name.to_owned(),
+            value,
+        },
+    ))
 }
 
 //not a space nor a comma
@@ -599,43 +648,43 @@ pub enum HeaderResult<T> {
     Error,
 }
 
-impl<'a> Header<'a> {
+impl Header {
     pub fn value(&self) -> HeaderValue {
-        if compare_no_case(self.name, b"host") {
+        if compare_no_case(&self.name, b"host") {
             //FIXME: UTF8 conversion should be unchecked here, since we already checked the tokens?
-            if let Ok(s) = str::from_utf8(self.value).map(String::from) {
+            if let Ok(s) = str::from_utf8(&self.value).map(String::from) {
                 HeaderValue::Host(s)
             } else {
                 HeaderValue::Error
             }
-        } else if compare_no_case(self.name, b"content-length") {
-            if let Ok(l) = str::from_utf8(self.value) {
+        } else if compare_no_case(&self.name, b"content-length") {
+            if let Ok(l) = str::from_utf8(&self.value) {
                 if let Ok(length) = l.parse() {
                     return HeaderValue::ContentLength(length);
                 }
             }
             HeaderValue::Error
-        } else if compare_no_case(self.name, b"transfer-encoding") {
-            if compare_no_case(self.value, b"chunked") {
+        } else if compare_no_case(&self.name, b"transfer-encoding") {
+            if compare_no_case(&self.value, b"chunked") {
                 HeaderValue::Encoding(TransferEncodingValue::Chunked)
-            } else if compare_no_case(self.value, b"compress") {
+            } else if compare_no_case(&self.value, b"compress") {
                 HeaderValue::Encoding(TransferEncodingValue::Compress)
-            } else if compare_no_case(self.value, b"deflate") {
+            } else if compare_no_case(&self.value, b"deflate") {
                 HeaderValue::Encoding(TransferEncodingValue::Deflate)
-            } else if compare_no_case(self.value, b"gzip") {
+            } else if compare_no_case(&self.value, b"gzip") {
                 HeaderValue::Encoding(TransferEncodingValue::Gzip)
-            } else if compare_no_case(self.value, b"identity") {
+            } else if compare_no_case(&self.value, b"identity") {
                 HeaderValue::Encoding(TransferEncodingValue::Identity)
             } else {
                 HeaderValue::Encoding(TransferEncodingValue::Unknown)
             }
-        } else if compare_no_case(self.name, b"connection") {
+        } else if compare_no_case(&self.name, b"connection") {
             let mut has_close = false;
             let mut has_upgrade = false;
             let mut has_keep_alive = false;
             let mut to_delete = None;
 
-            match single_header_value(self.value) {
+            match single_header_value(&self.value) {
                 Ok((mut input, first)) => {
                     if compare_no_case(first, b"upgrade") {
                         has_upgrade = true;
@@ -690,38 +739,38 @@ impl<'a> Header<'a> {
                 }
                 Err(_) => HeaderValue::Error,
             }
-        } else if compare_no_case(self.name, b"upgrade") {
-            HeaderValue::Upgrade(self.value)
-        } else if compare_no_case(self.name, b"forwarded") {
-            HeaderValue::Forwarded(self.value)
-        } else if compare_no_case(self.name, b"x-forwarded-for") {
-            HeaderValue::XForwardedFor(self.value)
-        } else if compare_no_case(self.name, b"x-forwarded-proto") {
+        } else if compare_no_case(&self.name, b"upgrade") {
+            HeaderValue::Upgrade(&self.value)
+        } else if compare_no_case(&self.name, b"forwarded") {
+            HeaderValue::Forwarded(&self.value)
+        } else if compare_no_case(&self.name, b"x-forwarded-for") {
+            HeaderValue::XForwardedFor(&self.value)
+        } else if compare_no_case(&self.name, b"x-forwarded-proto") {
             //FIXME: should parse the header properly
             HeaderValue::XForwardedProto
-        } else if compare_no_case(self.name, b"x-forwarded-port") {
+        } else if compare_no_case(&self.name, b"x-forwarded-port") {
             //FIXME: should parse the header properly
             HeaderValue::XForwardedPort
-        } else if compare_no_case(self.name, b"expect") {
-            if compare_no_case(self.value, b"100-continue") {
+        } else if compare_no_case(&self.name, b"expect") {
+            if compare_no_case(&self.value, b"100-continue") {
                 HeaderValue::ExpectContinue
             } else {
                 HeaderValue::Error
             }
-        } else if compare_no_case(self.name, b"cookie") {
-            match parse_request_cookies(self.value) {
+        } else if compare_no_case(&self.name, b"cookie") {
+            match parse_request_cookies(&self.value) {
                 Some(cookies) => HeaderValue::Cookie(cookies),
                 None => HeaderValue::Error,
             }
         } else {
-            HeaderValue::Other(self.name, self.value)
+            HeaderValue::Other(&self.name, &self.value)
         }
     }
 
     pub fn should_delete(&self, conn: &Connection, sticky_name: &str) -> bool {
         //FIXME: we should delete this header anyway, and add a Connection: Upgrade if we detected an upgrade
-        if compare_no_case(self.name, b"connection") {
-            match single_header_value(self.value) {
+        if compare_no_case(&self.name, b"connection") {
+            match single_header_value(&self.value) {
                 Ok((mut input, first)) => {
                     if compare_no_case(first, b"upgrade") {
                         false
@@ -748,17 +797,17 @@ impl<'a> Header<'a> {
                 }
                 Err(_) => true,
             }
-        } else if compare_no_case(self.name, b"set-cookie") {
+        } else if compare_no_case(&self.name, b"set-cookie") {
             self.value.starts_with(sticky_name.as_bytes())
         } else {
-            let b = (compare_no_case(self.name, b"connection")
-                && !compare_no_case(self.value, b"upgrade"))
-                || compare_no_case(self.name, b"sozu-id")
+            let b = (compare_no_case(&self.name, b"connection")
+                && !compare_no_case(&self.value, b"upgrade"))
+                || compare_no_case(&self.name, b"sozu-id")
                 || {
                     let mut res = false;
                     if let Some(to_delete) = &conn.to_delete {
                         for header_value in to_delete {
-                            if compare_no_case(self.value, header_value) {
+                            if compare_no_case(&self.value, header_value) {
                                 res = true;
                                 break;
                             }
@@ -768,15 +817,15 @@ impl<'a> Header<'a> {
                     res
                 };
 
-            if compare_no_case(self.name, b"x-forwarded-proto")
-                || compare_no_case(self.name, b"x-forwarded-host")
-                || compare_no_case(self.name, b"x-forwarded-port")
+            if compare_no_case(&self.name, b"x-forwarded-proto")
+                || compare_no_case(&self.name, b"x-forwarded-host")
+                || compare_no_case(&self.name, b"x-forwarded-port")
             {
                 return false;
             }
 
-            if compare_no_case(self.name, b"x-forwarded-for")
-                || compare_no_case(self.name, b"forwarded")
+            if compare_no_case(&self.name, b"x-forwarded-for")
+                || compare_no_case(&self.name, b"forwarded")
             {
                 return true;
             }
@@ -786,11 +835,11 @@ impl<'a> Header<'a> {
     }
 
     pub fn must_mutate(&self) -> bool {
-        compare_no_case(self.name, b"cookie")
+        compare_no_case(&self.name, b"cookie")
     }
 
     pub fn mutate_header(&self, buf: &[u8], offset: usize, sticky_name: &str) -> Vec<BufferMove> {
-        if compare_no_case(self.name, b"cookie") {
+        if compare_no_case(&self.name, b"cookie") {
             self.remove_sticky_cookie_in_request(buf, offset, sticky_name)
         } else {
             vec![BufferMove::Advance(offset)]
@@ -803,7 +852,7 @@ impl<'a> Header<'a> {
         offset: usize,
         sticky_name: &str,
     ) -> Vec<BufferMove> {
-        if let Some(cookies) = parse_request_cookies(self.value) {
+        if let Some(cookies) = parse_request_cookies(&self.value) {
             // if we don't find the cookie, don't go further
             if let Some(sozu_balance_position) = cookies
                 .iter()
