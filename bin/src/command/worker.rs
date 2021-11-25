@@ -2,15 +2,15 @@ use futures::SinkExt;
 use libc::pid_t;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
-use std::collections::VecDeque;
-use std::fmt;
-use std::os::unix::io::AsRawFd;
+use std::{collections::VecDeque, fmt, os::unix::io::AsRawFd};
 
-use sozu_command::channel::Channel;
-use sozu_command::command::RunState;
-use sozu_command::config::Config;
-use sozu_command::proxy::{ProxyRequest, ProxyRequestData, ProxyResponse};
-use sozu_command::scm_socket::ScmSocket;
+use sozu_command_lib::{
+    channel::Channel,
+    command::RunState,
+    config::Config,
+    proxy::{ProxyRequest, ProxyRequestData, ProxyResponse},
+    scm_socket::ScmSocket,
+};
 
 pub struct Worker {
     pub id: u32,

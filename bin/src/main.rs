@@ -10,7 +10,7 @@ extern crate prettytable;
 #[macro_use]
 extern crate sozu_lib as sozu;
 #[macro_use]
-extern crate sozu_command_lib as sozu_command;
+extern crate sozu_command_lib;
 
 #[cfg(target_os = "linux")]
 extern crate num_cpus;
@@ -32,15 +32,17 @@ mod util;
 mod worker;
 
 use anyhow::{bail, Context};
-use sozu_command::config::Config;
+use sozu_command_lib::config::Config;
 use std::panic;
 use structopt::StructOpt;
 
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t, pid_t};
 
-use crate::command::Worker;
-use crate::worker::{get_executable_path, start_workers};
+use crate::{
+    command::Worker,
+    worker::{get_executable_path, start_workers},
+};
 use sozu::metrics::METRICS;
 
 fn main() -> anyhow::Result<()> {
@@ -111,7 +113,8 @@ fn start(matches: &cli::Sozu) -> Result<(), anyhow::Error> {
 
     let command_socket_path = config.command_socket_path()?;
 
-    command::start(config, command_socket_path, workers).with_context(|| "could not start Sozu")?;
+    command::start_server(config, command_socket_path, workers)
+        .with_context(|| "could not start Sozu")?;
 
     Ok(())
 }
@@ -197,7 +200,7 @@ fn update_process_limits(config: &Config) -> Result<(), anyhow::Error> {
     let wanted_opened_files = (config.max_connections as u64) * 2;
 
     // Ensure we don't exceed the system maximum capacity
-    let f = sozu_command::config::Config::load_file("/proc/sys/fs/file-max")
+    let f = Config::load_file("/proc/sys/fs/file-max")
         .with_context(|| "Couldn't read /proc/sys/fs/file-max")?;
     let re_max = Regex::new(r"(\d*)")?;
     let system_max_fd = re_max
