@@ -1,4 +1,4 @@
-use sozu_command::proxy::{LoadBalancingAlgorithms, TlsVersion};
+use sozu_command_lib::proxy::{LoadBalancingAlgorithms, TlsVersion};
 use std::net::SocketAddr;
 
 #[derive(StructOpt, PartialEq, Debug)]
@@ -355,11 +355,11 @@ pub enum Route {
     Deny,
 }
 
-impl std::convert::Into<sozu_command::proxy::Route> for Route {
-    fn into(self) -> sozu_command::proxy::Route {
+impl std::convert::Into<sozu_command_lib::proxy::Route> for Route {
+    fn into(self) -> sozu_command_lib::proxy::Route {
         match self {
-            Route::Deny => sozu_command::proxy::Route::Deny,
-            Route::Id { id } => sozu_command::proxy::Route::ClusterId(id),
+            Route::Deny => sozu_command_lib::proxy::Route::Deny,
+            Route::Id { id } => sozu_command_lib::proxy::Route::ClusterId(id),
         }
     }
 }

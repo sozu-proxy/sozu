@@ -1,33 +1,37 @@
 use crate::cli::{LoggingLevel, MetricsCmd};
-use sozu_command::certificate::{calculate_fingerprint, split_certificate_chain};
-use sozu_command::channel::Channel;
-use sozu_command::command::{
-    CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
-    FrontendFilters, RunState, WorkerInfo,
-};
-use sozu_command::config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig};
-use sozu_command::proxy::{
-    ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
-    DeactivateListener, FilteredData, HttpFrontend, ListenerType, LoadBalancingAlgorithms,
-    LoadBalancingParams, MetricsConfiguration, PathRule, ProxyRequestData, Query, QueryAnswer,
-    QueryAnswerCertificate, QueryAnswerMetrics, QueryApplicationDomain, QueryApplicationType,
-    QueryCertificateType, QueryMetricsType, RemoveBackend, RemoveCertificate, RemoveListener,
-    ReplaceCertificate, Route, RulePosition, TcpFrontend, TcpListener, TlsVersion,
+use sozu_command_lib::{
+    certificate::{calculate_fingerprint, split_certificate_chain},
+    channel::Channel,
+    command::{
+        CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
+        FrontendFilters, RunState, WorkerInfo,
+    },
+    config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
+    proxy::{
+        ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
+        Cluster, DeactivateListener, FilteredData, HttpFrontend, ListenerType,
+        LoadBalancingAlgorithms, LoadBalancingParams, MetricsConfiguration, PathRule,
+        ProxyRequestData, Query, QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics,
+        QueryApplicationDomain, QueryApplicationType, QueryCertificateType, QueryMetricsType,
+        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Route, RulePosition,
+        TcpFrontend, TcpListener, TlsVersion,
+    },
 };
 
 use super::create_channel;
 use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde_json;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::SocketAddr;
-use std::process::exit;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    net::SocketAddr,
+    process::exit,
+    sync::mpsc,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 // Used to display the JSON response of the status command
 #[derive(Serialize, Debug)]

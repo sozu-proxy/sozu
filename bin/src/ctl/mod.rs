@@ -1,17 +1,20 @@
 mod command;
 
-use crate::cli;
-use crate::util;
-use crate::{get_config_file_path, load_configuration};
-use anyhow::Context;
-use sozu_command::channel::Channel;
-use sozu_command::command::{CommandRequest, CommandResponse};
-use sozu_command::config::Config;
-use sozu_command::proxy::ListenerType;
-<<<<<<< HEAD
-=======
 use std::time::Duration;
->>>>>>> 5a13a06b (wrappring channel.read_message() with a timeout function)
+
+
+use anyhow::Context;
+use sozu_command_lib::{
+    channel::Channel,
+    command::{CommandRequest, CommandResponse},
+    config::Config,
+    proxy::ListenerType,
+};
+
+use crate::{
+    cli::{self, *},
+    get_config_file_path, load_configuration, util,
+};
 
 use self::command::{
     activate_listener, add_application, add_backend, add_certificate, add_http_frontend,
@@ -21,7 +24,6 @@ use self::command::{
     remove_backend, remove_certificate, remove_http_frontend, remove_listener, remove_tcp_frontend,
     replace_certificate, save_state, soft_stop, status, upgrade_main, upgrade_worker,
 };
-use crate::cli::*;
 
 pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
     let config_file_path = get_config_file_path(&matches)?;

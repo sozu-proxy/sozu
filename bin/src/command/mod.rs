@@ -1,41 +1,153 @@
 use anyhow::{bail, Context};
 use async_dup::Arc;
-use futures::channel::{mpsc::*, oneshot};
-use futures::{SinkExt, StreamExt};
-use futures_lite::{future, io::*};
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
-use serde_json;
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
-
 use async_io::Async;
-
-use sozu_command::command::{
-    CommandRequestData, CommandResponse, CommandResponseData, CommandStatus, Event, RunState,
+use futures::{
+    channel::{mpsc::*, oneshot},
+    {SinkExt, StreamExt},
 };
-use sozu_command::config::Config;
-
-use sozu_command::proxy::{
-    ProxyRequest, ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus,
+use futures_lite::{future, io::*};
+use nix::{
+    sys::signal::{kill, Signal},
+    unistd::Pid,
 };
-use sozu_command::scm_socket::{Listeners, ScmSocket};
-use sozu_command::state::ConfigState;
+use serde_json;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    os::unix::{
+        fs::PermissionsExt,
+        io::{AsRawFd, FromRawFd, IntoRawFd},
+        net::{UnixListener, UnixStream},
+    },
+    path::PathBuf,
+};
 
-use crate::get_executable_path;
-use crate::upgrade::SerializedWorker;
-use crate::upgrade::UpgradeData;
-use crate::util;
-use crate::worker::start_worker;
+use sozu_command_lib::{
+    command::{
+        CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
+        Event, RunState,
+    },
+    config::Config,
+    proxy::{
+        ProxyRequest, ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus,
+    },
+    scm_socket::{Listeners, ScmSocket},
+    state::ConfigState,
+};
+
+use crate::{
+    get_executable_path,
+    upgrade::{SerializedWorker, UpgradeData},
+    util,
+    worker::start_worker,
+};
 
 mod orders;
 mod worker;
 
 pub use worker::*;
+
+enum CommandMessage {
+    ClientNew {
+        id: String,
+        sender: Sender<CommandResponse>,
+    },
+    ClientClose {
+        id: String,
+    },
+    ClientRequest {
+        id: String,
+        message: CommandRequest,
+    },
+    WorkerResponse {
+        id: u32,
+        message: ProxyResponse,
+    },
+    WorkerClose {
+        id: u32,
+    },
+    MasterStop,
+}
+
+pub enum OrderSuccess {
+    ClientClose(String),
+    ClientNew(String),
+    ClientRequest,
+    DumpState(CommandResponseData), // contains the cloned state
+    LaunchWorker(u32),
+    ListFrontends(CommandResponseData),
+    ListWorkers(CommandResponseData),
+    LoadState(String, usize, usize), // path, ok, errors
+    MasterStop,
+    // this should contain CommandResponseData but the logic does not return anything
+    // is this logic gone into sozu_command_lib::proxy::Query::Metrics(_) ?
+    Metrics,
+    PropagatedWorkerEvent,
+    Query(CommandResponseData), // same remark
+    ReloadConfiguration,
+    SaveState(usize, String),
+    SubscribeEvent(String),
+    UpgradeMain(i32),
+    UpgradeWorker(u32),
+    WorkerKilled(u32),
+    WorkerOrder(Option<u32>),
+    WorkerResponse,
+    WorkerRestarted(u32),
+    WorkerStopped(u32),
+}
+
+impl std::fmt::Display for OrderSuccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::ClientClose(id) => write!(f, "Close client: {}", id),
+            Self::ClientNew(id) => write!(f, "New client successfully added: {}", id),
+            Self::ClientRequest => write!(f, "Successfully executed client request"),
+            Self::DumpState(_) => write!(f, "Successfully gathered state from the main process"),
+            Self::LaunchWorker(worker_id) => {
+                write!(f, "Successfully launched worker {}", worker_id)
+            }
+            Self::ListFrontends(_) => write!(f, "Successfully gathered the list of frontends"),
+            Self::ListWorkers(_) => write!(f, "Listed all workers"),
+            Self::LoadState(path, ok, error) => write!(
+                f,
+                "Successfully loaded state from path {}, {} ok messages, {} errors",
+                path, ok, error
+            ),
+            Self::MasterStop => write!(f, "stopping main process"),
+            Self::Metrics => write!(f, "Successfully fetched the metrics"),
+            Self::PropagatedWorkerEvent => {
+                write!(f, "Sent worker response to all subscribing clients")
+            }
+            Self::Query(_) => write!(f, "Ran the query successfully"),
+            Self::ReloadConfiguration => write!(f, "Successfully reloaded configuration"),
+            Self::SaveState(counter, path) => {
+                write!(f, "saved {} config messages to {}", counter, path)
+            }
+            Self::SubscribeEvent(client_id) => {
+                write!(f, "Successfully Added {} to subscribers", client_id)
+            }
+            Self::UpgradeMain(pid) => write!(
+                f,
+                "new main process launched with pid {}, closing the old one",
+                pid
+            ),
+            Self::UpgradeWorker(id) => {
+                write!(f, "Successfully upgraded worker with new id: {}", id)
+            }
+            Self::WorkerKilled(id) => write!(f, "Successfully killed worker {}", id),
+            Self::WorkerOrder(worker) => {
+                if let Some(worker_id) = worker {
+                    write!(f, "Successfully executed the order on worker {}", worker_id)
+                } else {
+                    write!(f, "Successfully executed the order on worker")
+                }
+            }
+            Self::WorkerResponse => write!(f, "Successfully handled worker response"),
+            Self::WorkerRestarted(id) => write!(f, "Successfully restarted worker {}", id),
+            Self::WorkerStopped(id) => write!(f, "Successfully stopped worker {}", id),
+        }
+    }
+}
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct ProxyConfiguration {
@@ -43,40 +155,14 @@ pub struct ProxyConfiguration {
     state: ConfigState,
 }
 
-/*pub struct CommandServer {
-  sock:              UnixListener,
-  buffer_size:       usize,
-  max_buffer_size:   usize,
-  clients:           Slab<CommandClient>,
-  workers:           HashMap<Token, Worker>,
-  event_subscribers: Vec<FrontToken>,
-  next_id:           u32,
-  state:             ConfigState,
-  pub poll:          Poll,
-  config:            Config,
-  token_count:       usize,
-  must_stop:         bool,
-  executable_path:   String,
-  //caching the number of backends instead of going through the whole state.backends hashmap
-  backends_count:    usize,
-  //caching the number of frontends instead of going through the whole state.http/hhtps/tcp_fronts hashmaps
-  frontends_count:   usize,
-}*/
-
 pub struct CommandServer {
     // file descriptor of the unix listener socket
     fd: i32,
     command_tx: Sender<CommandMessage>,
     command_rx: Receiver<CommandMessage>,
-    clients: HashMap<String, Sender<sozu_command::command::CommandResponse>>,
+    clients: HashMap<String, Sender<CommandResponse>>,
     workers: Vec<Worker>,
-    in_flight: HashMap<
-        String,
-        (
-            futures::channel::mpsc::Sender<sozu_command::proxy::ProxyResponse>,
-            usize,
-        ),
-    >,
+    in_flight: HashMap<String, (futures::channel::mpsc::Sender<ProxyResponse>, usize)>,
     event_subscribers: HashSet<String>,
     state: ConfigState,
     config: Config,
@@ -156,6 +242,67 @@ impl CommandServer {
             frontends_count,
             accept_cancel: Some(accept_cancel),
         })
+    }
+
+    pub async fn run(&mut self) {
+        while let Some(order) = self.command_rx.next().await {
+            let result: anyhow::Result<OrderSuccess> = match order {
+                CommandMessage::ClientNew { id, sender } => {
+                    debug!("adding new client {}", id);
+                    self.clients.insert(id.to_owned(), sender);
+                    Ok(OrderSuccess::ClientNew(id))
+                }
+                CommandMessage::ClientClose { id } => {
+                    debug!("removing client {}", id);
+                    self.clients.remove(&id);
+                    self.event_subscribers.remove(&id);
+                    Ok(OrderSuccess::ClientClose(id))
+                }
+                CommandMessage::ClientRequest { id, message } => {
+                    debug!("client {} sent {:?}", id, message);
+                    self.handle_client_request(id, message).await
+                }
+                CommandMessage::WorkerClose { id } => self
+                    .handle_worker_close(id)
+                    .await
+                    .with_context(|| "Could not close worker"),
+                CommandMessage::WorkerResponse { id, message } => self
+                    .handle_worker_response(id, message)
+                    .await
+                    .with_context(|| "Could not handle worker response"),
+                CommandMessage::MasterStop => {
+                    info!("stopping main process");
+                    Ok(OrderSuccess::MasterStop)
+                }
+            };
+
+            match result {
+                Ok(order_success) => {
+                    debug!("Order OK: {}", order_success);
+
+                    // perform shutdowns
+                    match order_success {
+                        OrderSuccess::UpgradeMain(_) => {
+                            // the main process has to shutdown after the other has launched successfully
+                            //FIXME: should do some cleanup before exiting
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            std::process::exit(0);
+                        }
+                        OrderSuccess::MasterStop => {
+                            // breaking the loop brings run() to return and ends Sōzu
+                            // shouldn't we have the same break for both shutdowns?
+
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Err(error) => {
+                    // log the error on the main process without stopping it
+                    error!("Failed order: {:#?}", error);
+                }
+            }
+        }
     }
 
     pub fn generate_upgrade_data(&self) -> UpgradeData {
@@ -602,9 +749,73 @@ impl CommandServer {
         }
         Ok(OrderSuccess::WorkerResponse)
     }
+
+    async fn answer_success<T, U>(
+        &mut self,
+        client_id: String,
+        id: T,
+        message: U,
+        data: Option<CommandResponseData>,
+    ) where
+        T: Clone + Into<String>,
+        U: Clone + Into<String>,
+    {
+        trace!(
+            "answer_success for client {} id {}, message {:#?} data {:#?}",
+            client_id,
+            id.clone().into(),
+            message.clone().into(),
+            data
+        );
+        if let Some(sender) = self.clients.get_mut(&client_id) {
+            if let Err(e) = sender
+                .send(CommandResponse::new(
+                    id.into(),
+                    CommandStatus::Ok,
+                    message.into(),
+                    data,
+                ))
+                .await
+            {
+                error!("could not send message to client {:?}: {:?}", client_id, e);
+            }
+        }
+    }
+
+    async fn answer_error<T, U>(
+        &mut self,
+        client_id: String,
+        id: T,
+        message: U,
+        data: Option<CommandResponseData>,
+    ) where
+        T: Clone + Into<String>,
+        U: Clone + Into<String>,
+    {
+        trace!(
+            "answer_error for client {} id {}, message {:#?} data {:#?}",
+            client_id,
+            id.clone().into(),
+            message.clone().into(),
+            data
+        );
+        if let Some(sender) = self.clients.get_mut(&client_id) {
+            if let Err(e) = sender
+                .send(CommandResponse::new(
+                    id.into(),
+                    CommandStatus::Error,
+                    message.into(),
+                    data,
+                ))
+                .await
+            {
+                error!("could not send message to client {:?}: {:?}", client_id, e);
+            }
+        }
+    }
 }
 
-pub fn start(
+pub fn start_server(
     config: Config,
     command_socket_path: String,
     workers: Vec<Worker>,
@@ -711,160 +922,11 @@ pub fn start(
     })
 }
 
-enum CommandMessage {
-    ClientNew {
-        id: String,
-        sender: Sender<sozu_command::command::CommandResponse>,
-    },
-    ClientClose {
-        id: String,
-    },
-    ClientRequest {
-        id: String,
-        message: sozu_command::command::CommandRequest,
-    },
-    WorkerResponse {
-        id: u32,
-        message: sozu_command::proxy::ProxyResponse,
-    },
-    WorkerClose {
-        id: u32,
-    },
-    MasterStop,
-}
-
-impl CommandServer {
-    pub async fn run(&mut self) {
-        while let Some(msg) = self.command_rx.next().await {
-            let result: anyhow::Result<OrderSuccess> = match msg {
-                CommandMessage::ClientNew { id, sender } => {
-                    debug!("adding new client {}", id);
-                    self.clients.insert(id.to_owned(), sender);
-                    Ok(OrderSuccess::ClientNew(id))
-                }
-                CommandMessage::ClientClose { id } => {
-                    debug!("removing client {}", id);
-                    self.clients.remove(&id);
-                    self.event_subscribers.remove(&id);
-                    Ok(OrderSuccess::ClientClose(id))
-                }
-                CommandMessage::ClientRequest { id, message } => {
-                    debug!("client {} sent {:?}", id, message);
-                    self.handle_client_message(id, message).await
-                }
-                CommandMessage::WorkerClose { id } => self
-                    .handle_worker_close(id)
-                    .await
-                    .with_context(|| "Could not close worker"),
-                CommandMessage::WorkerResponse { id, message } => self
-                    .handle_worker_response(id, message)
-                    .await
-                    .with_context(|| "Could not handle worker response"),
-                CommandMessage::MasterStop => {
-                    info!("stopping main process");
-                    Ok(OrderSuccess::MasterStop)
-                }
-            };
-
-            match result {
-                Ok(order_success) => {
-                    info!("Order OK: {}", order_success);
-
-                    // perform shutdowns
-                    match order_success {
-                        OrderSuccess::UpgradeMain(_) => {
-                            // the main process has to shutdown after the other has launched successfully
-                            //FIXME: should do some cleanup before exiting
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                            std::process::exit(0);
-                        }
-                        OrderSuccess::MasterStop => {
-                            // breaking the loop brings run() to return and ends Sōzu
-                            // shouldn't we have the same break for both shutdowns?
-                            
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                Err(error) => {
-                    // log the error on the main process without stopping it
-                    error!("Failed order: {:#?}", error);
-                }
-            }
-        }
-    }
-
-    async fn answer_success<T, U>(
-        &mut self,
-        client_id: String,
-        id: T,
-        message: U,
-        data: Option<CommandResponseData>,
-    ) where
-        T: Clone + Into<String>,
-        U: Clone + Into<String>,
-    {
-        trace!(
-            "answer_success for client {} id {}, message {:#?} data {:#?}",
-            client_id,
-            id.clone().into(),
-            message.clone().into(),
-            data
-        );
-        if let Some(sender) = self.clients.get_mut(&client_id) {
-            if let Err(e) = sender
-                .send(CommandResponse::new(
-                    id.into(),
-                    CommandStatus::Ok,
-                    message.into(),
-                    data,
-                ))
-                .await
-            {
-                error!("could not send message to client {:?}: {:?}", client_id, e);
-            }
-        }
-    }
-
-    async fn answer_error<T, U>(
-        &mut self,
-        client_id: String,
-        id: T,
-        message: U,
-        data: Option<CommandResponseData>,
-    ) where
-        T: Clone + Into<String>,
-        U: Clone + Into<String>,
-    {
-        trace!(
-            "answer_error for client {} id {}, message {:#?} data {:#?}",
-            client_id,
-            id.clone().into(),
-            message.clone().into(),
-            data
-        );
-        if let Some(sender) = self.clients.get_mut(&client_id) {
-            if let Err(e) = sender
-                .send(CommandResponse::new(
-                    id.into(),
-                    CommandStatus::Error,
-                    message.into(),
-                    data,
-                ))
-                .await
-            {
-                error!("could not send message to client {:?}: {:?}", client_id, e);
-            }
-        }
-    }
-}
-
 async fn client(
     id: String,
     stream: Async<UnixStream>,
     mut tx: Sender<CommandMessage>,
-    mut rx: Receiver<sozu_command::command::CommandResponse>,
+    mut rx: Receiver<CommandResponse>,
 ) -> std::io::Result<()> {
     let stream = Arc::new(stream);
     let mut s = stream.clone();
@@ -892,7 +954,7 @@ async fn client(
             Ok(msg) => msg,
         };
 
-        match serde_json::from_slice::<sozu_command::command::CommandRequest>(&message) {
+        match serde_json::from_slice::<CommandRequest>(&message) {
             Err(e) => {
                 error!("could not decode client message: {:?}", e);
                 break;
@@ -917,7 +979,7 @@ async fn worker_loop(
     id: u32,
     stream: Async<UnixStream>,
     mut tx: Sender<CommandMessage>,
-    mut rx: Receiver<sozu_command::proxy::ProxyRequest>,
+    mut rx: Receiver<ProxyRequest>,
 ) -> std::io::Result<()> {
     let stream = Arc::new(stream);
     let mut s = stream.clone();
@@ -946,7 +1008,7 @@ async fn worker_loop(
             Ok(msg) => msg,
         };
 
-        match serde_json::from_slice::<sozu_command::proxy::ProxyResponse>(&message) {
+        match serde_json::from_slice::<ProxyResponse>(&message) {
             Err(e) => {
                 error!("could not decode worker message: {:?}", e);
                 break;
@@ -964,84 +1026,4 @@ async fn worker_loop(
     tx.send(CommandMessage::WorkerClose { id }).await.unwrap();
 
     Ok(())
-}
-
-pub enum OrderSuccess {
-    ClientClose(String),
-    ClientNew(String),
-    ClientRequest,
-    DumpState(CommandResponseData), // contains the cloned state
-    LaunchWorker(u32),
-    ListFrontends(CommandResponseData),
-    ListWorkers(CommandResponseData),
-    LoadState(String, usize, usize), // path, ok, errors
-    MasterStop,
-    // this should contain CommandResponseData but the logic does not return anything
-    // is this logic gone into sozu_command_lib::proxy::Query::Metrics(_) ?
-    Metrics,
-    PropagatedWorkerEvent,
-    Query(CommandResponseData), // same remark
-    ReloadConfiguration,
-    SaveState(usize, String),
-    SubscribeEvent(String),
-    UpgradeMain(i32),
-    UpgradeWorker(u32),
-    WorkerKilled(u32),
-    WorkerOrder(Option<u32>),
-    WorkerResponse,
-    WorkerRestarted(u32),
-    WorkerStopped(u32),
-}
-
-impl std::fmt::Display for OrderSuccess {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Self::ClientClose(id) => write!(f, "Close client: {}", id),
-            Self::ClientNew(id) => write!(f, "New client successfully added: {}", id),
-            Self::ClientRequest => write!(f, "Successfully executed client request"),
-            Self::DumpState(_) => write!(f, "Successfully gathered state from the main process"),
-            Self::LaunchWorker(worker_id) => {
-                write!(f, "Successfully launched worker {}", worker_id)
-            }
-            Self::ListFrontends(_) => write!(f, "Successfully gathered the list of frontends"),
-            Self::ListWorkers(_) => write!(f, "Listed all workers"),
-            Self::LoadState(path, ok, error) => write!(
-                f,
-                "Successfully loaded state from path {}, {} ok messages, {} errors",
-                path, ok, error
-            ),
-            Self::MasterStop => write!(f, "stopping main process"),
-            Self::Metrics => write!(f, "Successfully fetched the metrics"),
-            Self::PropagatedWorkerEvent => {
-                write!(f, "Sent worker response to all subscribing clients")
-            }
-            Self::Query(_) => write!(f, "Ran the query successfully"),
-            Self::ReloadConfiguration => write!(f, "Successfully reloaded configuration"),
-            Self::SaveState(counter, path) => {
-                write!(f, "saved {} config messages to {}", counter, path)
-            }
-            Self::SubscribeEvent(client_id) => {
-                write!(f, "Successfully Added {} to subscribers", client_id)
-            }
-            Self::UpgradeMain(pid) => write!(
-                f,
-                "new main process launched with pid {}, closing the old one",
-                pid
-            ),
-            Self::UpgradeWorker(id) => {
-                write!(f, "Successfully upgraded worker with new id: {}", id)
-            }
-            Self::WorkerKilled(id) => write!(f, "Successfully killed worker {}", id),
-            Self::WorkerOrder(worker) => {
-                if let Some(worker_id) = worker {
-                    write!(f, "Successfully executed the order on worker {}", worker_id)
-                } else {
-                    write!(f, "Successfully executed the order on worker")
-                }
-            }
-            Self::WorkerResponse => write!(f, "Successfully handled worker response"),
-            Self::WorkerRestarted(id) => write!(f, "Successfully restarted worker {}", id),
-            Self::WorkerStopped(id) => write!(f, "Successfully stopped worker {}", id),
-        }
-    }
 }

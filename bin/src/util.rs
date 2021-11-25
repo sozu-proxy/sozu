@@ -1,14 +1,12 @@
+use crate::logging;
+
+use anyhow;
 use anyhow::Context;
 use libc;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
-use std::fs::File;
-use std::io::Write;
-use std::os::unix::io::RawFd;
-
-use crate::logging;
-use anyhow;
 use sozu::metrics;
-use sozu_command::config::Config;
+use sozu_command_lib::config::Config;
+use std::{fs::File, io::Write, os::unix::io::RawFd};
 
 pub fn enable_close_on_exec(fd: RawFd) -> Result<i32, anyhow::Error> {
     let file_descriptor =

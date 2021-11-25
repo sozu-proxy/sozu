@@ -4,21 +4,23 @@ use libc::{self, pid_t};
 use mio::net::UnixStream;
 use nix::unistd::*;
 use serde_json;
-use std::fs::File;
-use std::io::{Seek, SeekFrom};
-use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::{
+    fs::File,
+    io::{Seek, SeekFrom},
+    os::unix::io::{AsRawFd, FromRawFd},
+    os::unix::process::CommandExt,
+    process::Command,
+};
 use tempfile::tempfile;
 
-use sozu_command::channel::Channel;
-use sozu_command::command::RunState;
-use sozu_command::config::Config;
-use sozu_command::proxy::ProxyRequest;
-use sozu_command::state::ConfigState;
+use sozu_command_lib::{
+    channel::Channel, command::RunState, config::Config, proxy::ProxyRequest, state::ConfigState,
+};
 
-use crate::command::{CommandServer, Worker};
-use crate::util;
+use crate::{
+    command::{CommandServer, Worker},
+    util,
+};
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct SerializedWorker {

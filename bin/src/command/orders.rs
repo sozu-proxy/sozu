@@ -1,40 +1,46 @@
 use anyhow::{bail, Context};
+use async_io::Async;
 use futures::channel::mpsc::*;
 use futures::{SinkExt, StreamExt};
 use nom::{Err, HexDisplay, IResult, Offset};
 use serde_json;
-use std::collections::{BTreeMap, HashSet};
-use std::fs;
-use std::io::{self, Read, Write};
-use std::os::unix::io::{FromRawFd, IntoRawFd};
-use std::os::unix::net::UnixStream;
-use std::time::Duration;
-
-use async_io::Async;
-
-use sozu_command::buffer::fixed::Buffer;
-use sozu_command::command::{
-    CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
-    FrontendFilters, ListedFrontends, RunState, WorkerInfo,
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    io::{self, Read, Write},
+    os::unix::io::{FromRawFd, IntoRawFd},
+    os::unix::net::UnixStream,
+    time::Duration,
 };
-use sozu_command::logging;
-use sozu_command::proxy::{
-    MetricsConfiguration, ProxyRequest, ProxyRequestData, ProxyResponseData, ProxyResponseStatus,
-    Query, QueryAnswer, QueryApplicationType, Route, TcpFrontend,
-};
-use sozu_command::scm_socket::Listeners;
-use sozu_command::state::get_application_ids_by_domain;
-use sozu_command_lib::config::Config;
 
-use super::{CommandMessage, CommandServer, OrderSuccess};
-use crate::upgrade::start_new_main_process;
-use crate::worker::start_worker;
+use sozu_command_lib::{
+    buffer::fixed::Buffer,
+    command::{
+        CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
+        FrontendFilters, ListedFrontends, RunState, WorkerInfo, PROTOCOL_VERSION,
+    },
+    config::Config,
+    logging,
+    proxy::{
+        MetricsConfiguration, ProxyRequest, ProxyRequestData, ProxyResponseData,
+        ProxyResponseStatus, Query, QueryAnswer, QueryApplicationType, Route, TcpFrontend,
+    },
+    scm_socket::Listeners,
+    state::get_application_ids_by_domain,
+};
+// use sozu_command_lib::config::Config;
+
+use crate::{
+    command::{CommandMessage, CommandServer, OrderSuccess},
+    upgrade::start_new_main_process,
+    worker::start_worker,
+};
 
 impl CommandServer {
-    pub async fn handle_client_message(
+    pub async fn handle_client_request(
         &mut self,
         client_id: String,
-        request: sozu_command::command::CommandRequest,
+        request: CommandRequest,
     ) -> anyhow::Result<OrderSuccess> {
         info!("Received order {:?}", request);
         let owned_client_id = client_id.to_owned();
@@ -223,8 +229,8 @@ impl CommandServer {
                     offset = buffer.data().offset(i);
 
                     if orders.iter().find(|o| {
-                        if o.version > sozu_command::command::PROTOCOL_VERSION {
-                            error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", sozu_command::command::PROTOCOL_VERSION, o.version);
+                        if o.version > PROTOCOL_VERSION {
+                            error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, o.version);
                             true
                         } else {
                             false

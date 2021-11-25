@@ -1,14 +1,15 @@
 use anyhow::{bail, Context};
 use libc::{self, pid_t};
 use mio::net::UnixStream;
-use nix;
-use nix::unistd::*;
+use nix::{self, unistd::*};
 use serde_json;
-use std::fs::File;
-use std::io::{Seek, SeekFrom};
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
-use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::{
+    fs::File,
+    io::{Seek, SeekFrom},
+    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
+    os::unix::process::CommandExt,
+    process::Command,
+};
 use tempfile::tempfile;
 
 #[cfg(target_os = "macos")]
@@ -31,13 +32,15 @@ use std::mem::size_of;
 
 use sozu::metrics;
 use sozu::server::Server;
-use sozu_command::channel::Channel;
-use sozu_command::config::Config;
-use sozu_command::logging::target_to_backend;
-use sozu_command::proxy::{ProxyRequest, ProxyRequestData, ProxyResponse};
-use sozu_command::ready::Ready;
-use sozu_command::scm_socket::{Listeners, ScmSocket};
-use sozu_command::state::ConfigState;
+use sozu_command_lib::{
+    channel::Channel,
+    config::Config,
+    logging::target_to_backend,
+    proxy::{ProxyRequest, ProxyRequestData, ProxyResponse},
+    ready::Ready,
+    scm_socket::{Listeners, ScmSocket},
+    state::ConfigState,
+};
 
 use crate::command::Worker;
 use crate::logging;
