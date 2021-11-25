@@ -1,24 +1,15 @@
 #![allow(dead_code)]
 use super::cookies::{parse_request_cookies, RequestCookie};
 
-use nom::{
-    branch::alt,
-    bytes::{
+use nom::{Err, IResult, Needed, Offset, branch::alt, bytes::{
         self,
         complete::take_while1 as take_while1_complete,
         streaming::{is_not, tag, tag_no_case, take, take_while},
-    },
-    character::{
+    }, character::{
         complete::digit1 as digit_complete,
         is_alphanumeric, is_space,
         streaming::{char, one_of},
-    },
-    combinator::{complete, map_res, opt, recognize},
-    error::{Error, ErrorKind},
-    multi::many0,
-    sequence::{delimited, preceded, terminated, tuple},
-    Err, IResult, Needed, Offset,
-};
+    }, combinator::{complete, map_res, opt, recognize}, error::{Error, ErrorKind}, multi::many0, sequence::{delimited, preceded, terminated, tuple}};
 
 use std::collections::HashSet;
 use std::convert::From;
@@ -68,6 +59,14 @@ fn sp(i: &[u8]) -> IResult<&[u8], char> {
     char(' ')(i)
 }
 
+fn tabs(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    take_while(is_tab)(i)
+}
+
+fn optional_tabs(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    alt((tabs, tag("")))(i)
+}
+
 fn crlf(i: &[u8]) -> IResult<&[u8], &[u8]> {
     tag("\r\n")(i)
 }
@@ -86,7 +85,11 @@ fn is_header_value_char(i: u8) -> bool {
 
 #[cfg(not(feature = "tolerant-http1-parser"))]
 fn is_header_value_char(i: u8) -> bool {
-    i == 9 || (i >= 32 && i <= 126)
+    i >= 32 && i <= 126
+}
+
+fn is_tab(i: u8) -> bool {
+    i == 9
 }
 
 fn vchar_1(i: &[u8]) -> IResult<&[u8], &[u8]> {
@@ -270,19 +273,20 @@ pub struct Header<'a> {
 
 fn message_header(i: &[u8]) -> IResult<&[u8], Header> {
     // ToDo handle folding?
-    let (i, (name, _, _, value, _)) = tuple((
+    let (i, (name, _, _, value, _, _)) = tuple((
         token,
         tag(":"),
         take_while(is_space),
         take_while(is_header_value_char),
+        optional_tabs,
         crlf,
     ))(i)?;
 
     Ok((
         i,
         Header {
-            name: name,
-            value: value,
+            name,
+            value,
         },
     ))
 }

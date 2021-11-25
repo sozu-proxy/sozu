@@ -31,7 +31,7 @@ fn request_line_test() {
 
 #[test]
 fn header_test() {
-    let input = b"Accept: */*\r\n";
+    let input = b"Accept: */*\t\r\n";
     let result = message_header(input);
     let expected = Header {
         name: b"Accept",
