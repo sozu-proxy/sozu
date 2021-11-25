@@ -1150,6 +1150,7 @@ impl Config {
 
         let mut config = file_config.into(path);
 
+        // replace saved_state with a verified path
         config.saved_state = config
             .saved_state_path()
             .with_context(|| "Invalid saved_state in the config. Check your config file")?;
@@ -1320,13 +1321,15 @@ impl Config {
         saved_state_path_raw.canonicalize().with_context(|| {
             format!(
                 "could not get saved state path from config file input {:?}",
-                self.saved_state
+                path
             )
         })?;
 
         let stringified_path = saved_state_path_raw
             .to_str()
-            .ok_or(anyhow::Error::msg("Unvalid character format, expected UTF8"))?
+            .ok_or(anyhow::Error::msg(
+                "Unvalid character format, expected UTF8",
+            ))?
             .to_string();
 
         return Ok(Some(stringified_path));
@@ -1444,8 +1447,9 @@ mod tests {
 
     #[test]
     fn parse() {
-        let res = Config::load_from_path("assets/config.toml");
-        let config = res.unwrap();
+        let path = "assets/config.toml";
+        let config =
+            Config::load_from_path(path).expect(&format!("Cannot load config from path {}", path));
         println!("config: {:#?}", config);
         //panic!();
     }
