@@ -1,4 +1,4 @@
-use sozu_command::logging::{target_to_backend, Logger, LoggerBackend};
+use sozu_command_lib::logging::{target_to_backend, Logger, LoggerBackend};
 use std::env;
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +20,7 @@ macro_rules! log {
 
     (__inner__ $target:expr, $lvl:expr, $format:expr, $level_tag:expr,
      [$($final_args:ident),*], [$($idents:ident),*]) => ({
-      static _META: $crate::sozu_command::logging::Metadata = $crate::sozu_command::logging::Metadata {
+      static _META: $crate::sozu_command_lib::logging::Metadata = $crate::sozu_command_lib::logging::Metadata {
           level:  $lvl,
           target: module_path!(),
       };
@@ -29,7 +29,7 @@ macro_rules! log {
         let pid = (*logger).pid;
         let tag = &*$crate::logging::TAG;
 
-        let (now, precise_time) = $crate::sozu_command::logging::now();
+        let (now, precise_time) = $crate::sozu_command_lib::logging::now();
         (*logger).log(
             &_META,
             format_args!(
@@ -54,7 +54,7 @@ pub fn init(
     backend: LoggerBackend,
     access_backend: Option<LoggerBackend>,
 ) {
-    let directives = crate::sozu_command::logging::parse_logging_spec(spec);
+    let directives = crate::sozu_command_lib::logging::parse_logging_spec(spec);
     let mut logger = MAIN_LOGGER.lock().unwrap();
     if !logger.initialized {
         println!("initializing logger");
