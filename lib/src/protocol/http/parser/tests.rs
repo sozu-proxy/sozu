@@ -34,8 +34,8 @@ fn header_test() {
     let input = b"Accept: */*\r\n";
     let result = message_header(input);
     let expected = Header {
-        name: b"Accept",
-        value: b"*/*",
+        name: b"Accept".to_vec(),
+        value: b"*/*".to_vec(),
     };
 
     assert_eq!(result, Ok((&b""[..], expected)))
@@ -74,8 +74,8 @@ fn header_without_space_test() {
     let input = b"Host:localhost\r\n";
     let result = message_header(input);
     let expected = Header {
-        name: b"Host",
-        value: b"localhost",
+        name: b"Host".to_vec(),
+        value: b"localhost".to_vec(),
     };
 
     assert_eq!(result, Ok((&b""[..], expected)))
@@ -89,8 +89,8 @@ fn header_user_agent() {
     assert_eq!(
       result,
       Ok((&b""[..], Header {
-        name: b"User-Agent",
-        value: b"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:44.0) Gecko/20100101 Firefox/44.0"
+        name: b"User-Agent".to_vec(),
+        value: b"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:44.0) Gecko/20100101 Firefox/44.0".to_vec()
       }))
     );
 }
@@ -1565,8 +1565,8 @@ fn parse_connection_upgrade_test() {
 #[test]
 fn header_cookies_must_mutate() {
     let header = Header {
-        name: b"Cookie",
-        value: b"FOO=BAR",
+        name: b"Cookie".to_vec(),
+        value: b"FOO=BAR".to_vec(),
     };
 
     assert!(header.must_mutate());
@@ -1785,14 +1785,14 @@ fn header_cookies_sticky_end() {
         BufferMove::Advance(7),
         BufferMove::Advance(7),
         BufferMove::Delete(1),
-        BufferMove::Delete(18),
+        BufferMove::Delete(16),
         BufferMove::Advance(2),
     ];
     let expected3 = vec![
         BufferMove::Advance(8),
         BufferMove::Advance(7),
         BufferMove::Delete(2),
-        BufferMove::Delete(17),
+        BufferMove::Delete(15),
         BufferMove::Advance(2),
     ];
     let expected4 = vec![
