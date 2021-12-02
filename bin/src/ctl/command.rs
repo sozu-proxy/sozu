@@ -1334,6 +1334,9 @@ pub fn query_application(
             // do nothing here
             // for other messages, we would loop over read_message
             // until an error or ok message was sent
+            
+            // or maybe just print what the processing has to say?
+            println!("{}", message.message);
         }
         CommandStatus::Error => {
             if json {
