@@ -16,7 +16,6 @@ pub struct Worker {
     pub id: u32,
     pub fd: i32,
     pub channel: Option<Channel<ProxyRequest, ProxyResponse>>,
-    //pub token:         Option<Token>,
     pub pid: pid_t,
     pub run_state: RunState,
     pub queue: VecDeque<ProxyRequest>,
@@ -45,15 +44,18 @@ impl Worker {
     }
 
     pub async fn send(&mut self, request_id: String, data: ProxyRequestData) {
-        if let Some(tx) = self.sender.as_mut() {
-            if let Err(e) = tx
+        if let Some(worker_tx) = self.sender.as_mut() {
+            if let Err(e) = worker_tx
                 .send(ProxyRequest {
-                    id: request_id,
+                    id: request_id.clone(),
                     order: data,
                 })
                 .await
             {
-                error!("error sending message to worker {:?}: {:?}", self.id, e);
+                error!(
+                    "error sending message {} to worker {:?}: {:?}",
+                    request_id, self.id, e
+                );
             }
         }
     }

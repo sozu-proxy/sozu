@@ -6,7 +6,7 @@ use nom::{Err, HexDisplay, IResult, Offset};
 use serde_json;
 use std::{
     collections::{BTreeMap, HashSet},
-    fs,
+    fs::File,
     io::{self, Read, Write},
     os::unix::io::{FromRawFd, IntoRawFd},
     os::unix::net::UnixStream,
@@ -28,10 +28,9 @@ use sozu_command_lib::{
     scm_socket::Listeners,
     state::get_application_ids_by_domain,
 };
-// use sozu_command_lib::config::Config;
 
 use crate::{
-    command::{CommandMessage, CommandServer, OrderSuccess},
+    command::{CommandMessage, CommandServer, RequestIdentifier, Response, Success},
     upgrade::start_new_main_process,
     worker::start_worker,
 };
@@ -41,84 +40,72 @@ impl CommandServer {
         &mut self,
         client_id: String,
         request: CommandRequest,
-    ) -> anyhow::Result<OrderSuccess> {
-        info!("Received order {:?}", request);
-        let owned_client_id = client_id.to_owned();
-        let owned_request_id = request.id.to_owned();
+    ) -> anyhow::Result<Success> {
+        trace!("Received order {:?}", request);
+        let request_identifier = RequestIdentifier {
+            client: client_id.to_owned(),
+            request: request.id.to_owned(),
+        };
+        let cloned_identifier = request_identifier.clone();
 
-        let result = match request.data {
+        let result: anyhow::Result<Option<Success>> = match request.data {
             CommandRequestData::SaveState { path } => self.save_state(&path).await,
             CommandRequestData::DumpState => self.dump_state().await,
             CommandRequestData::ListWorkers => self.list_workers().await,
             CommandRequestData::ListFrontends(filters) => self.list_frontends(filters).await,
             CommandRequestData::LoadState { path } => {
-                self.load_state(Some(owned_client_id), owned_request_id.to_owned(), &path)
-                    .await
+                self.load_state(
+                    Some(request_identifier.client),
+                    request_identifier.request,
+                    &path,
+                )
+                .await
             }
             CommandRequestData::LaunchWorker(tag) => {
-                self.launch_worker(owned_client_id, owned_request_id, &tag)
-                    .await
+                self.launch_worker(request_identifier, &tag).await
             }
-            CommandRequestData::UpgradeMain => {
-                self.upgrade_main(owned_client_id, owned_request_id).await
-            }
+            CommandRequestData::UpgradeMain => self.upgrade_main(request_identifier).await,
             CommandRequestData::UpgradeWorker(worker_id) => {
-                self.upgrade_worker(owned_client_id, owned_request_id, worker_id)
-                    .await
+                self.upgrade_worker(request_identifier, worker_id).await
             }
             CommandRequestData::Proxy(proxy_request) => match proxy_request {
-                ProxyRequestData::Metrics(config) => self.metrics(owned_request_id, config).await,
-                ProxyRequestData::Query(query) => self.query(owned_request_id, query).await,
+                ProxyRequestData::Metrics(config) => self.metrics(request_identifier, config).await,
+                ProxyRequestData::Query(query) => self.query(request_identifier, query).await,
                 order => {
-                    self.worker_order(owned_client_id, owned_request_id, order, request.worker_id)
+                    self.worker_order(request_identifier, order, request.worker_id)
                         .await
                 }
             },
             CommandRequestData::SubscribeEvents => {
                 self.event_subscribers.insert(client_id.clone());
-                Ok(OrderSuccess::SubscribeEvent(client_id.clone()))
+                Ok(Some(Success::SubscribeEvent(client_id.clone())))
             }
             CommandRequestData::ReloadConfiguration { path } => {
-                self.reload_configuration(Some(owned_client_id), owned_request_id, path)
-                    .await
+                self.reload_configuration(request_identifier, path).await
             }
         };
+
+        // Notify the command server by sending using his command_tx
         match result {
-            Ok(order_success) => {
-                // no need to log the success here, it is down upstream
-
-                let success_message = order_success.to_string().to_owned();
-
-                let command_response_data = match order_success {
-                    // should list OrderSuccess::Metrics(crd) as well
-                    OrderSuccess::DumpState(crd)
-                    | OrderSuccess::ListFrontends(crd)
-                    | OrderSuccess::ListWorkers(crd)
-                    | OrderSuccess::Query(crd) => Some(crd),
-                    _ => None,
-                };
-
-                self.answer_success(
-                    client_id,
-                    request.id,
-                    success_message,
-                    command_response_data,
-                )
-                .await;
-
-                Ok(OrderSuccess::ClientRequest)
+            Ok(Some(success)) => {
+                info!("{}", success);
+                return_success(self.command_tx.clone(), cloned_identifier, success).await;
             }
-            Err(error) => {
-                // no need to log the error here, it is down upstream
-                self.answer_error(client_id, request.id, error.to_string(), None)
-                    .await;
-                Err(error)
+            Err(error_message) => {
+                error!("{}", error_message);
+                return_error(self.command_tx.clone(), cloned_identifier, error_message).await;
+            }
+            Ok(None) => {
+                // do nothing here. Ok(None) means the function has already returned its result
+                // on its own to the command server
             }
         }
+
+        Ok(Success::HandledClientRequest)
     }
 
-    pub async fn save_state(&mut self, path: &str) -> anyhow::Result<OrderSuccess> {
-        let mut file = fs::File::create(&path)
+    pub async fn save_state(&mut self, path: &str) -> anyhow::Result<Option<Success>> {
+        let mut file = File::create(&path)
             .with_context(|| format!("could not open file at path: {}", &path))?;
 
         let counter = self
@@ -127,14 +114,14 @@ impl CommandServer {
 
         info!("wrote {} commands to {}", counter, path);
 
-        Ok(OrderSuccess::SaveState(counter, path.into()))
+        Ok(Some(Success::SaveState(counter, path.into())))
     }
 
-    pub fn save_state_to_file(&mut self, f: &mut fs::File) -> anyhow::Result<usize> {
+    pub fn save_state_to_file(&mut self, file: &mut File) -> anyhow::Result<usize> {
         let mut counter = 0usize;
         let orders = self.state.generate_orders();
 
-        let res: io::Result<usize> = (move || {
+        let result: io::Result<usize> = (move || {
             for command in orders {
                 let message = CommandRequest::new(
                     format!("SAVE-{}", counter),
@@ -142,55 +129,41 @@ impl CommandServer {
                     None,
                 );
 
-                f.write_all(
+                file.write_all(
                     &serde_json::to_string(&message)
                         .map(|s| s.into_bytes())
                         .unwrap_or(vec![]),
                 )?;
-                f.write_all(&b"\n\0"[..])?;
+                file.write_all(&b"\n\0"[..])?;
 
                 if counter % 1000 == 0 {
                     info!("writing command {}", counter);
-                    f.sync_all()?;
+                    file.sync_all()?;
                 }
                 counter += 1;
             }
-            f.sync_all()?;
+            file.sync_all()?;
 
             Ok(counter)
         })();
 
-        Ok(res?)
+        Ok(result?)
     }
 
-    pub async fn dump_state(&mut self) -> anyhow::Result<OrderSuccess> {
+    pub async fn dump_state(&mut self) -> anyhow::Result<Option<Success>> {
         let state = self.state.clone();
 
-        Ok(OrderSuccess::DumpState(CommandResponseData::State(state)))
+        Ok(Some(Success::DumpState(CommandResponseData::State(state))))
     }
 
     pub async fn load_state(
         &mut self,
         client_id: Option<String>,
-        message_id: String,
+        request_id: String,
         path: &str,
-    ) -> anyhow::Result<OrderSuccess> {
-        let mut file = match fs::File::open(&path) {
-            Err(e) => {
-                error!("cannot open file at path '{}': {:?}", path, e);
-                if let Some(id) = client_id {
-                    self.answer_error(
-                        id,
-                        message_id,
-                        format!("cannot open file at path '{}': {:?}", path, e),
-                        None,
-                    )
-                    .await;
-                }
-                return Err(anyhow::Error::from(e));
-            }
-            Ok(file) => file,
-        };
+    ) -> anyhow::Result<Option<Success>> {
+        let mut file =
+            File::open(&path).with_context(|| format!("Cannot open file at path {}", path))?;
 
         let mut buffer = Buffer::with_capacity(200000);
 
@@ -218,17 +191,18 @@ impl CommandServer {
 
             let mut offset = 0usize;
             match parse(buffer.data()) {
-                Ok((i, orders)) => {
+                Ok((i, requests)) => {
                     if i.len() > 0 {
                         debug!("could not parse {} bytes", i.len());
                         if previous == buffer.available_data() {
-                            error!("error consuming load state message");
-                            break;
+                            // this bail! is new here, it was a break before. Please comment
+                            bail!("error consuming load state message");
+                            // break;
                         }
                     }
                     offset = buffer.data().offset(i);
 
-                    if orders.iter().find(|o| {
+                    if requests.iter().find(|o| {
                         if o.version > PROTOCOL_VERSION {
                             error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, o.version);
                             true
@@ -239,15 +213,15 @@ impl CommandServer {
                         break;
                     }
 
-                    for message in orders {
-                        if let CommandRequestData::Proxy(order) = message.data {
+                    for request in requests {
+                        if let CommandRequestData::Proxy(order) = request.data {
                             message_counter += 1;
 
                             if self.state.handle_order(&order) {
                                 diff_counter += 1;
 
                                 let mut found = false;
-                                let id = format!("LOAD-STATE-{}-{}", message_id, diff_counter);
+                                let id = format!("LOAD-STATE-{}-{}", request_id, diff_counter);
 
                                 for ref mut worker in self.workers.iter_mut().filter(|worker| {
                                     worker.run_state != RunState::Stopping
@@ -262,8 +236,7 @@ impl CommandServer {
                                 }
 
                                 if !found {
-                                    // FIXME: should send back error here
-                                    error!("no worker found");
+                                    bail!("no worker found");
                                 }
                             }
                         }
@@ -286,21 +259,21 @@ impl CommandServer {
             buffer.consume(offset);
         }
 
-        let client_tx = if let Some(id) = client_id.as_ref() {
-            self.clients.get(id).cloned()
-        } else {
-            None
-        };
+        error!(
+            "stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
+            buffer.available_data(), message_counter, diff_counter
+        );
 
-        error!("stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
-        buffer.available_data(), message_counter, diff_counter);
-        let mut oks_and_errors: [usize; 2] = [0, 0];
         if diff_counter > 0 {
             info!(
                 "state loaded from {}, will start sending {} messages to workers",
                 path, diff_counter
             );
-            let task = smol::spawn(async move {
+
+            let command_tx = self.command_tx.clone();
+            let path = path.to_owned();
+
+            smol::spawn(async move {
                 let mut ok = 0usize;
                 let mut error = 0usize;
                 while let Some(proxy_response) = load_state_rx.next().await {
@@ -317,31 +290,12 @@ impl CommandServer {
                     debug!("ok:{}, error: {}", ok, error);
                 }
 
-                if let Some(mut sender) = client_tx {
-                    if error == 0 {
-                        if let Err(e) = sender
-                            .send(CommandResponse::new(
-                                message_id.to_string(),
-                                CommandStatus::Ok,
-                                format!("ok: {} messages, error: 0", ok),
-                                None,
-                            ))
-                            .await
-                        {
-                            error!("could not send message to client {:?}: {:?}", client_id, e);
-                        }
-                    } else {
-                        if let Err(e) = sender
-                            .send(CommandResponse::new(
-                                message_id.to_string(),
-                                CommandStatus::Error,
-                                format!("ok: {} messages, error: {}", ok, error),
-                                None,
-                            ))
-                            .await
-                        {
-                            error!("could not send message to client {:?}: {:?}", client_id, e);
-                        }
+                // or pattern matching
+
+                let request_identifier = if let Some(client_id) = client_id {
+                    RequestIdentifier {
+                        client: client_id,
+                        request: request_id,
                     }
                 } else {
                     if error == 0 {
@@ -349,15 +303,42 @@ impl CommandServer {
                     } else {
                         error!("loading state: {} ok messages, {} errors", ok, error);
                     }
+                    return;
+                };
+
+                // notify the command server
+                if error == 0 {
+                    return_success(
+                        command_tx,
+                        request_identifier,
+                        Success::LoadState(path.to_string(), ok, error),
+                    )
+                    .await;
+                } else {
+                    return_error(
+                        command_tx,
+                        request_identifier,
+                        format!(
+                            "Loading state failed, ok: {}, error: {}, path: {}",
+                            ok, error, path
+                        ),
+                    )
+                    .await;
                 }
-                [ok, error]
-            });
-            oks_and_errors = task.await;
+            })
+            .detach();
         } else {
             info!("no messages sent to workers: local state already had those messages");
-            if let Some(id) = client_id {
-                self.answer_success(id, message_id, format!("ok: 0 messages, error: 0"), None)
-                    .await;
+            if client_id.is_some() {
+                return_success(
+                    self.command_tx.clone(),
+                    RequestIdentifier {
+                        client: client_id.unwrap(),
+                        request: request_id,
+                    },
+                    Success::LoadState(path.to_string(), 0, 0),
+                )
+                .await;
             }
         }
 
@@ -366,30 +347,17 @@ impl CommandServer {
         gauge!("configuration.clusters", self.state.clusters.len());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
-        match oks_and_errors[0] {
-            0 => Ok(OrderSuccess::LoadState(
-                path.to_string(),
-                oks_and_errors[0],
-                oks_and_errors[1],
-            )),
-            _ => bail!(format!(
-                "Partially loaded stated: {} ok, {} errors",
-                oks_and_errors[0], oks_and_errors[1]
-            )),
-        }
+        Ok(None)
     }
 
     pub async fn list_frontends(
         &mut self,
-
         filters: FrontendFilters,
-    ) -> anyhow::Result<OrderSuccess> {
+    ) -> anyhow::Result<Option<Success>> {
         info!(
-            "Received a request to list frontends, along these filters: {:#?}",
+            "Received a request to list frontends, along these filters: {:?}",
             filters
         );
-
-        info!("Here are the filters: {:#?}", filters);
 
         // if no http / https / tcp filter is provided, list all of them
         let list_all = !filters.http && !filters.https && !filters.tcp;
@@ -430,12 +398,12 @@ impl CommandServer {
             }
         }
 
-        Ok(OrderSuccess::ListFrontends(
+        Ok(Some(Success::ListFrontends(
             CommandResponseData::FrontendList(listed_frontends),
-        ))
+        )))
     }
 
-    pub async fn list_workers(&mut self) -> anyhow::Result<OrderSuccess> {
+    pub async fn list_workers(&mut self) -> anyhow::Result<Option<Success>> {
         let workers: Vec<WorkerInfo> = self
             .workers
             .iter()
@@ -446,61 +414,37 @@ impl CommandServer {
             })
             .collect();
 
-        Ok(OrderSuccess::ListWorkers(CommandResponseData::Workers(
+        Ok(Some(Success::ListWorkers(CommandResponseData::Workers(
             workers,
-        )))
+        ))))
     }
 
     pub async fn launch_worker(
         &mut self,
-        client_id: String,
-        request_id: String,
+        request_identifier: RequestIdentifier,
         _tag: &str,
-    ) -> anyhow::Result<OrderSuccess> {
-        let mut worker = match start_worker(
+    ) -> anyhow::Result<Option<Success>> {
+        let mut worker = start_worker(
             self.next_id,
             &self.config,
             self.executable_path.clone(),
             &self.state,
             None,
-        ) {
-            Ok(worker) => worker,
-            Err(e) => {
-                error!("Failed at creating worker");
-                self.answer_error(client_id, request_id, "failed creating worker", None)
-                    .await;
-                return Err(e);
-            }
-        };
+        )
+        .with_context(|| format!("Failed at creating worker {}", self.next_id))?;
 
-        if let Some(sender) = self.clients.get_mut(&client_id) {
-            if let Err(e) = sender
-                .send(CommandResponse::new(
-                    request_id.clone(),
-                    CommandStatus::Processing,
-                    "sending configuration orders".to_string(),
-                    None,
-                ))
-                .await
-            {
-                error!("could not send message to client {:?}: {:?}", client_id, e);
-            }
-        }
+        // Todo: refactor the CLI, see issue #740
+        // return_processing(
+        //     self.command_tx.clone(),
+        //     request_identifier.clone(),
+        //     "Sending configuration orders",
+        // )
+        // .await;
 
         info!("created new worker: {}", worker.id);
 
         self.next_id += 1;
-        /*
-        let worker_token = self.token_count + 1;
-        self.token_count = worker_token;
-        worker.token     = Some(Token(worker_token));*/
 
-        /*debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
-        worker_token, tag, worker.id, worker.channel.sock.take_error());
-        self.poll.registry().register(&mut worker.channel.sock, Token(worker_token),
-          Interest::READABLE | Interest::WRITABLE).unwrap();
-        worker.token = Some(Token(worker_token));
-        */
         let sock = worker.channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
         worker.sender = Some(worker_tx);
@@ -512,7 +456,7 @@ impl CommandServer {
 
         let id = worker.id;
         let command_tx = self.command_tx.clone();
-        //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
+
         smol::spawn(async move {
             super::worker_loop(id, stream, command_tx, worker_rx)
                 .await
@@ -540,61 +484,59 @@ impl CommandServer {
 
         self.workers.push(worker);
 
-        self.answer_success(client_id, request_id, "", None).await;
-
-        Ok(OrderSuccess::LaunchWorker(id))
+        return_success(
+            self.command_tx.clone(),
+            request_identifier,
+            Success::WorkerLaunched(id),
+        )
+        .await;
+        Ok(None)
     }
 
     pub async fn upgrade_main(
         &mut self,
-        client_id: String,
-        request_id: String,
-    ) -> anyhow::Result<OrderSuccess> {
+        request_identifier: RequestIdentifier,
+    ) -> anyhow::Result<Option<Success>> {
         self.disable_cloexec_before_upgrade()?;
 
-        if let Some(sender) = self.clients.get_mut(&client_id) {
-            if let Err(e) = sender
-                .send(CommandResponse::new(
-                    request_id.clone(),
-                    CommandStatus::Processing,
-                    "The proxy is processing the upgrade command".to_string(),
-                    None,
-                ))
-                .await
-            {
-                error!("could not send message to client {:?}: {:?}", client_id, e);
-            }
-        }
+        // Todo: refactor the CLI, see issue #740
+        // return_processing(
+        //     self.command_tx.clone(),
+        //     request_identifier,
+        //     "The proxy is processing the upgrade command.",
+        // )
+        // .await;
 
         let (pid, mut channel) =
-            start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data())?;
+            start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data())
+                .with_context(|| "Could not start a new main process")?;
+
         channel.set_blocking(true);
         let res = channel.read_message();
-        debug!("upgrade channel sent: {:?}", res);
+        debug!("upgrade channel sent {:?}", res);
 
         // signaling the accept loop that it should stop
         if let Err(e) = self.accept_cancel.take().unwrap().send(()) {
             error!("could not close the accept loop: {:?}", e);
         }
 
-        if let Some(true) = res {
-            info!("wrote final message, closing");
-
-            return Ok(OrderSuccess::UpgradeMain(pid));
-        } else {
-            bail!("could not upgrade main process")
+        match res {
+            Some(true) => {
+                info!("wrote final message, closing");
+                Ok(Some(Success::UpgradeMain(pid)))
+            }
+            _ => bail!("could not upgrade main process"),
         }
     }
 
     pub async fn upgrade_worker(
         &mut self,
-        client_id: String,
-        request_id: String,
+        request_identifier: RequestIdentifier,
         id: u32,
-    ) -> anyhow::Result<OrderSuccess> {
+    ) -> anyhow::Result<Option<Success>> {
         info!(
             "client[{}] msg {} wants to upgrade worker {}",
-            client_id, request_id, id
+            request_identifier.client, request_identifier.request, id
         );
 
         if self
@@ -615,34 +557,26 @@ impl CommandServer {
 
         // same as launch_worker
         let next_id = self.next_id;
-        let mut worker = if let Ok(worker) = start_worker(
+        let mut worker = start_worker(
             next_id,
             &self.config,
             self.executable_path.clone(),
             &self.state,
             None,
-        ) {
-            if let Some(sender) = self.clients.get_mut(&client_id) {
-                if let Err(e) = sender
-                    .send(CommandResponse::new(
-                        request_id.clone(),
-                        CommandStatus::Processing,
-                        "sending configuration orders".to_string(),
-                        None,
-                    ))
-                    .await
-                {
-                    error!("could not send message to client {:?}: {:?}", client_id, e);
-                }
-            }
-            info!("created new worker: {}", next_id);
+        )
+        .with_context(|| "failed at creating worker")?;
 
-            self.next_id += 1;
+        // Todo: refactor the CLI, see issue #740
+        // return_processing(
+        //     self.command_tx.clone(),
+        //     request_identifier.clone(),
+        //     "sending configuration orders",
+        // )
+        // .await;
 
-            worker
-        } else {
-            bail!("failed creating worker")
-        };
+        info!("created new worker: {}", next_id);
+
+        self.next_id += 1;
 
         let sock = worker.channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
@@ -674,16 +608,18 @@ impl CommandServer {
             info!("sent returnlistensockets message to worker");
             old_worker.channel.set_blocking(false);
             */
-            let (tx, mut rx) = futures::channel::mpsc::channel(3);
-            let id = format!("{}-return-sockets", request_id);
-            self.in_flight.insert(id.clone(), (tx, 1));
+            let (sockets_return_tx, mut sockets_return_rx) = futures::channel::mpsc::channel(3);
+            let id = format!("{}-return-sockets", request_identifier.client);
+            self.in_flight.insert(id.clone(), (sockets_return_tx, 1));
             old_worker
                 .send(id.clone(), ProxyRequestData::ReturnListenSockets)
                 .await;
 
             info!("sent ReturnListenSockets to old worker");
+
+            // should we notify the command server here?
             smol::spawn(async move {
-                while let Some(proxy_response) = rx.next().await {
+                while let Some(proxy_response) = sockets_return_rx.next().await {
                     match proxy_response.status {
                         ProxyResponseStatus::Ok => {
                             info!("returnsockets OK");
@@ -721,9 +657,9 @@ impl CommandServer {
             info!("got scm sockets");
             old_worker.run_state = RunState::Stopping;
 
-            let (tx, mut rx) = futures::channel::mpsc::channel(10);
-            let id = format!("{}-softstop", request_id);
-            self.in_flight.insert(id.clone(), (tx, 1));
+            let (softstop_tx, mut softstop_rx) = futures::channel::mpsc::channel(10);
+            let id = format!("{}-softstop", request_identifier.client);
+            self.in_flight.insert(id.clone(), (softstop_tx, 1));
             old_worker
                 .send(id.clone(), ProxyRequestData::SoftStop)
                 .await;
@@ -731,8 +667,9 @@ impl CommandServer {
             let mut command_tx = self.command_tx.clone();
             let worker_id = old_worker.id;
             smol::spawn(async move {
-                while let Some(proxy_response) = rx.next().await {
+                while let Some(proxy_response) = softstop_rx.next().await {
                     match proxy_response.status {
+                        // should we send all this to the command server?
                         ProxyResponseStatus::Ok => {
                             info!("softstop OK"); // this doesn't display :-(
                             if let Err(e) = command_tx
@@ -757,6 +694,8 @@ impl CommandServer {
                         }
                     };
                 }
+                // shouldn't we use return_success() here, to notify the command server
+                // and the client?
             })
             .detach();
         }
@@ -779,7 +718,6 @@ impl CommandServer {
 
         let id = worker.id;
         let command_tx = self.command_tx.clone();
-        //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
         smol::spawn(async move {
             super::worker_loop(id, stream, command_tx, worker_rx)
                 .await
@@ -791,24 +729,25 @@ impl CommandServer {
         let mut count = 0usize;
         for order in activate_orders.into_iter() {
             worker
-                .send(format!("{}-ACTIVATE-{}", request_id, count), order)
+                .send(
+                    format!("{}-ACTIVATE-{}", request_identifier.client, count),
+                    order,
+                )
                 .await;
             count += 1;
         }
         info!("sent config messages to the new worker");
         self.workers.push(worker);
 
-        self.answer_success(client_id, request_id, "", None).await;
         info!("finished upgrade");
-        Ok(OrderSuccess::UpgradeWorker(id))
+        Ok(Some(Success::UpgradeWorker(id)))
     }
 
     pub async fn reload_configuration(
         &mut self,
-        client_id: Option<String>,
-        message_id: String,
+        request_identifier: RequestIdentifier,
         config_path: Option<String>,
-    ) -> anyhow::Result<OrderSuccess> {
+    ) -> anyhow::Result<Option<Success>> {
         // check that this works
         let path = config_path.as_deref().unwrap_or(&self.config.config_path);
         let new_config = Config::load_from_path(path)
@@ -824,7 +763,7 @@ impl CommandServer {
                     diff_counter += 1;
 
                     let mut found = false;
-                    let id = format!("LOAD-STATE-{}-{}", message_id, diff_counter);
+                    let id = format!("LOAD-STATE-{}-{}", request_identifier.request, diff_counter);
 
                     for ref mut worker in self.workers.iter_mut().filter(|worker| {
                         worker.run_state != RunState::Stopping
@@ -846,11 +785,9 @@ impl CommandServer {
             }
         }
 
-        let client_tx = if let Some(id) = client_id.as_ref() {
-            self.clients.get(id).cloned()
-        } else {
-            None
-        };
+        // clone everything we will need in the detached thread
+        let command_tx = self.command_tx.clone();
+        let cloned_identifier = request_identifier.clone();
 
         if diff_counter > 0 {
             info!(
@@ -874,48 +811,28 @@ impl CommandServer {
                     debug!("ok:{}, error: {}", ok, error);
                 }
 
-                if let Some(mut sender) = client_tx {
-                    if error == 0 {
-                        if let Err(e) = sender
-                            .send(CommandResponse::new(
-                                message_id.to_string(),
-                                CommandStatus::Ok,
-                                format!("ok: {} messages, error: 0", ok),
-                                None,
-                            ))
-                            .await
-                        {
-                            error!("could not send message to client {:?}: {:?}", client_id, e);
-                        }
-                    } else {
-                        if let Err(e) = sender
-                            .send(CommandResponse::new(
-                                message_id.to_string(),
-                                CommandStatus::Error,
-                                format!("ok: {} messages, error: {}", ok, error),
-                                None,
-                            ))
-                            .await
-                        {
-                            error!("could not send message to client {:?}: {:?}", client_id, e);
-                        }
-                    }
+                if error == 0 {
+                    return_success(
+                        command_tx,
+                        cloned_identifier,
+                        Success::ReloadConfiguration(ok, error),
+                    )
+                    .await;
                 } else {
-                    if error == 0 {
-                        info!("loading state: {} ok messages, 0 errors", ok);
-                    } else {
-                        error!("loading state: {} ok messages, {} errors", ok, error);
-                    }
+                    return_error(
+                        command_tx,
+                        cloned_identifier,
+                        format!(
+                            "Reloading configuration failed. ok: {} messages, error: {}",
+                            ok, error
+                        ),
+                    )
+                    .await;
                 }
             })
             .detach();
         } else {
             info!("no messages sent to workers: local state already had those messages");
-            // this may be redundant with the Ok(OrderSuccess) return value
-            if let Some(id) = client_id {
-                self.answer_success(id, message_id, format!("ok: 0 messages, error: 0"), None)
-                    .await;
-            }
         }
 
         self.backends_count = self.state.count_backends();
@@ -925,40 +842,49 @@ impl CommandServer {
         gauge!("configuration.frontends", self.frontends_count);
 
         self.config = new_config;
-        Ok(OrderSuccess::ReloadConfiguration)
+
+        // Todo: refactor the CLI to accept processing, see issue #740
+        // return_processing(
+        //     self.command_tx.clone(),
+        //     request_identifier,
+        //     "Reloading configuration...",
+        // )
+        // .await;
+        Ok(None)
     }
 
+    // This is maybe obsolote and replaced with "query metrics" in the CLI
     pub async fn metrics(
         &mut self,
-        request_id: String,
+        request_identifier: RequestIdentifier,
         config: MetricsConfiguration,
-    ) -> anyhow::Result<OrderSuccess> {
-        let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
+    ) -> anyhow::Result<Option<Success>> {
+        let (metrics_tx, mut metrics_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
             .workers
             .iter_mut()
             .filter(|worker| worker.run_state != RunState::Stopped)
         {
-            let req_id = format!("{}-metrics-{}", request_id, worker.id);
+            let req_id = format!("{}-metrics-{}", request_identifier.client, worker.id);
             worker
                 .send(req_id.clone(), ProxyRequestData::Metrics(config.clone()))
                 .await;
             count += 1;
-            self.in_flight.insert(req_id, (tx.clone(), 1));
+            self.in_flight.insert(req_id, (metrics_tx.clone(), 1));
         }
 
-        let prefix = format!("{}-metrics-", request_id);
-        // It would be great if we could just return OrderSuccess::Metrics from this thread
+        let prefix = format!("{}-metrics-", request_identifier.client);
+        // It would be great if we could just return Success::Metrics from this thread
 
-        let task: smol::Task<anyhow::Result<OrderSuccess>> = smol::spawn(async move {
-            let mut v = Vec::new();
+        smol::spawn(async move {
+            let mut responses = Vec::new();
             let mut i = 0;
-            while let Some(proxy_response) = rx.next().await {
+            while let Some(proxy_response) = metrics_rx.next().await {
                 match proxy_response.status {
                     ProxyResponseStatus::Ok => {
                         let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
-                        v.push((tag, proxy_response));
+                        responses.push((tag, proxy_response));
                     }
                     ProxyResponseStatus::Processing => {
                         //info!("metrics processing");
@@ -966,7 +892,7 @@ impl CommandServer {
                     }
                     ProxyResponseStatus::Error(_) => {
                         let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
-                        v.push((tag, proxy_response));
+                        responses.push((tag, proxy_response));
                     }
                 };
 
@@ -990,30 +916,29 @@ impl CommandServer {
             }
             */
             // TODO : make sure this returns with CommandResponseData
-            Ok(OrderSuccess::Metrics)
-        });
-        task.await
-        // .detach();
+        })
+        .detach();
+        Ok(None)
     }
 
     pub async fn query(
         &mut self,
-        request_id: String,
+        request_identifier: RequestIdentifier,
         query: Query,
-    ) -> anyhow::Result<OrderSuccess> {
-        let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
+    ) -> anyhow::Result<Option<Success>> {
+        let (query_tx, mut query_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
             .workers
             .iter_mut()
             .filter(|worker| worker.run_state != RunState::Stopped)
         {
-            let req_id = format!("{}-query-{}", request_id, worker.id);
+            let req_id = format!("{}-query-{}", request_identifier.client, worker.id);
             worker
                 .send(req_id.clone(), ProxyRequestData::Query(query.clone()))
                 .await;
             count += 1;
-            self.in_flight.insert(req_id, (tx.clone(), 1));
+            self.in_flight.insert(req_id, (query_tx.clone(), 1));
         }
 
         let mut main_query_answer = None;
@@ -1043,16 +968,18 @@ impl CommandServer {
             &Query::Metrics(_) => {}
         };
 
-        let prefix = format!("{}-query-", request_id);
-
-        let task: smol::Task<anyhow::Result<OrderSuccess>> = smol::spawn(async move {
-            let mut v = Vec::new();
+        // all theses are passed to the thread
+        let prefix = format!("{}-query-", request_identifier.client);
+        let command_tx = self.command_tx.clone();
+        let cloned_identifier = request_identifier.clone();
+        smol::spawn(async move {
+            let mut responses = Vec::new();
             let mut i = 0;
-            while let Some(proxy_response) = rx.next().await {
+            while let Some(proxy_response) = query_rx.next().await {
                 match proxy_response.status {
                     ProxyResponseStatus::Ok => {
                         let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
-                        v.push((tag, proxy_response));
+                        responses.push((tag, proxy_response));
                     }
                     ProxyResponseStatus::Processing => {
                         info!("metrics processing");
@@ -1060,7 +987,7 @@ impl CommandServer {
                     }
                     ProxyResponseStatus::Error(_) => {
                         let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
-                        v.push((tag, proxy_response));
+                        responses.push((tag, proxy_response));
                     }
                 };
 
@@ -1070,7 +997,7 @@ impl CommandServer {
                 }
             }
 
-            let mut query_answers_map: BTreeMap<String, QueryAnswer> = v
+            let mut query_answers_map: BTreeMap<String, QueryAnswer> = responses
                 .into_iter()
                 .filter_map(|(tag, query)| {
                     if let Some(ProxyResponseData::Query(d)) = query.data {
@@ -1081,38 +1008,42 @@ impl CommandServer {
                 })
                 .collect();
 
-            match &query {
+            let success = match &query {
                 &Query::ApplicationsHashes | &Query::Applications(_) => {
                     let main = main_query_answer.unwrap();
                     query_answers_map.insert(String::from("main"), main);
-                    Ok(OrderSuccess::Query(CommandResponseData::Query(
-                        query_answers_map,
-                    )))
+                    Success::Query(CommandResponseData::Query(query_answers_map))
                 }
                 &Query::Certificates(_) => {
                     info!("certificates query received: {:?}", query_answers_map);
-                    Ok(OrderSuccess::Query(CommandResponseData::Query(
-                        query_answers_map,
-                    )))
+                    Success::Query(CommandResponseData::Query(query_answers_map))
                 }
                 &Query::Metrics(_) => {
                     debug!("metrics query received: {:?}", query_answers_map);
-                    Ok(OrderSuccess::Query(CommandResponseData::Query(
-                        query_answers_map,
-                    )))
+                    Success::Query(CommandResponseData::Query(query_answers_map))
                 }
-            }
-        });
-        task.await
+            };
+
+            return_success(command_tx, cloned_identifier, success).await;
+        })
+        .detach();
+
+        // Todo: refactor the CLI to accept processing, see issue #740
+        // return_processing(
+        //     self.command_tx.clone(),
+        //     request_identifier,
+        //     "Processing the query…",
+        // )
+        // .await;
+        Ok(None)
     }
 
     pub async fn worker_order(
         &mut self,
-        client_id: String,
-        request_id: String,
+        request_identifier: RequestIdentifier,
         order: ProxyRequestData,
         worker_id: Option<u32>,
-    ) -> anyhow::Result<OrderSuccess> {
+    ) -> anyhow::Result<Option<Success>> {
         if let &ProxyRequestData::AddCertificate(_) = &order {
             debug!("workerconfig client order AddCertificate()");
         } else {
@@ -1169,7 +1100,7 @@ impl CommandServer {
             & (order != ProxyRequestData::SoftStop || order != ProxyRequestData::HardStop)
         {
             if let Some(path) = self.config.saved_state.clone() {
-                let mut file = fs::File::create(&path)
+                let mut file = File::create(&path)
                     .with_context(|| "Could not create file to automatically save the state")?;
 
                 self.save_state_to_file(&mut file)
@@ -1177,7 +1108,8 @@ impl CommandServer {
             }
         }
 
-        let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
+        let (worker_order_tx, mut worker_order_rx) =
+            futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut found = false;
         let mut stopping_workers = HashSet::new();
 
@@ -1198,9 +1130,9 @@ impl CommandServer {
                 stopping_workers.insert(worker.id);
             }
 
-            let req_id = format!("{}-worker-{}", request_id, worker.id);
+            let req_id = format!("{}-worker-{}", request_identifier.client, worker.id);
             worker.send(req_id.clone(), order.clone()).await;
-            self.in_flight.insert(req_id, (tx.clone(), 1));
+            self.in_flight.insert(req_id, (worker_order_tx.clone(), 1));
 
             found = true;
             count += 1;
@@ -1210,17 +1142,17 @@ impl CommandServer {
             || order == ProxyRequestData::HardStop)
             && worker_id.is_none();
 
-        let mut client_tx = self.clients.get_mut(&client_id).unwrap().clone();
         let mut command_tx = self.command_tx.clone();
-        let prefix = format!("{}-worker-", request_id);
+        let thread_request_identifier = request_identifier.clone();
+        let prefix = format!("{}-worker-", request_identifier.client);
         smol::spawn(async move {
-            let mut v = Vec::new();
+            let mut responses = Vec::new();
             let mut i = 0usize;
-            while let Some(proxy_response) = rx.next().await {
+            while let Some(proxy_response) = worker_order_rx.next().await {
                 match proxy_response.status {
                     ProxyResponseStatus::Ok => {
                         let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
-                        v.push((tag.clone(), proxy_response));
+                        responses.push((tag.clone(), proxy_response));
 
                         let id: u32 = tag.parse().unwrap();
                         if stopping_workers.contains(&id) {
@@ -1233,12 +1165,12 @@ impl CommandServer {
                         }
                     }
                     ProxyResponseStatus::Processing => {
-                        info!("metrics processing");
+                        info!("Order is processing");
                         continue;
                     }
                     ProxyResponseStatus::Error(_) => {
                         let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
-                        v.push((tag, proxy_response));
+                        responses.push((tag, proxy_response));
                     }
                 };
 
@@ -1256,46 +1188,35 @@ impl CommandServer {
 
             let mut messages = vec![];
             let mut has_error = false;
-            for response in v.iter() {
-                if let ProxyResponseStatus::Error(ref e) = response.1.status {
-                    messages.push(format!("{}: {}", response.0, e));
-                    has_error = true;
-                } else {
-                    messages.push(format!("{}: OK", response.0));
+            for response in responses.iter() {
+                match response.1.status {
+                    ProxyResponseStatus::Error(ref e) => {
+                        messages.push(format!("{}: {}", response.0, e));
+                        has_error = true;
+                    }
+                    _ => {
+                        messages.push(format!("{}: OK", response.0));
+                    }
                 }
             }
 
             if has_error {
-                if let Err(e) = client_tx
-                    .send(CommandResponse::new(
-                        request_id,
-                        CommandStatus::Error,
-                        messages.join(", "),
-                        None,
-                    ))
-                    .await
-                {
-                    error!("could not send message to client {:?}: {:?}", client_id, e);
-                }
+                return_error(command_tx, thread_request_identifier, messages.join(", ")).await;
             } else {
-                if let Err(e) = client_tx
-                    .send(CommandResponse::new(
-                        request_id,
-                        CommandStatus::Ok,
-                        "".to_string(),
-                        None,
-                    ))
-                    .await
-                {
-                    error!("could not send message to client {:?}: {:?}", client_id, e);
-                }
+                return_success(
+                    command_tx,
+                    thread_request_identifier,
+                    Success::WorkerOrder(worker_id),
+                )
+                .await;
             }
         })
         .detach();
 
         if !found {
             // FIXME: should send back error here
-            error!("no worker found");
+            // is this fix OK?
+            bail!("no worker found");
         }
 
         match order {
@@ -1316,7 +1237,144 @@ impl CommandServer {
         gauge!("configuration.clusters", self.state.clusters.len());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
-        Ok(OrderSuccess::WorkerOrder(worker_id))
+
+        // Todo: refactor the CLI, see issue #740
+        // return_processing(
+        //     self.command_tx.clone(),
+        //     request_identifier,
+        //     "Processing worker order",
+        // )
+        // .await;
+
+        Ok(None)
+    }
+
+    pub async fn notify_advancement_to_client(
+        &mut self,
+        request_identifier: RequestIdentifier,
+        response: Response,
+    ) -> anyhow::Result<Success> {
+        let RequestIdentifier {
+            client: client_id,
+            request: request_id,
+        } = request_identifier.clone();
+
+        let command_response: CommandResponse;
+
+        match response {
+            Response::Ok(success) => {
+                let success_message = success.to_string();
+
+                let command_response_data = match success {
+                    // should list Success::Metrics(crd) as well
+                    Success::DumpState(crd)
+                    | Success::ListFrontends(crd)
+                    | Success::ListWorkers(crd)
+                    | Success::Query(crd) => Some(crd),
+                    _ => None,
+                };
+
+                command_response = CommandResponse::new(
+                    request_id.clone(),
+                    CommandStatus::Ok,
+                    success_message,
+                    command_response_data,
+                );
+            }
+            // Todo: refactor the CLI to accept processing, see issue #740
+            // Response::Processing(_) => {
+            //     command_response = CommandResponse::new(
+            //         request_id.clone(),
+            //         CommandStatus::Processing,
+            //         processing_message,
+            //         None,
+            //     );
+            // }
+            Response::Error(error_message) => {
+                command_response = CommandResponse::new(
+                    request_id.clone(),
+                    CommandStatus::Error,
+                    error_message,
+                    None,
+                );
+            }
+        }
+
+        trace!(
+            "Sending response to request {} of client {}: {:?}",
+            request_id,
+            client_id,
+            command_response
+        );
+
+        match self.clients.get_mut(&client_id) {
+            Some(sender) => {
+                sender.send(command_response).await.with_context(|| {
+                    format!(
+                        "Could not notify client {} about request {}",
+                        client_id, request_identifier.request,
+                    )
+                })?;
+            }
+            None => bail!(format!("Could not find client {}", client_id)),
+        }
+
+        Ok(Success::NotifiedClient(client_id))
+    }
+}
+
+// Those return functions are meant to be called in detached threads
+// to notify the command server of an order's advancement.
+async fn return_error<T>(
+    mut command_tx: Sender<CommandMessage>,
+    request_identifier: RequestIdentifier,
+    error_message: T,
+) where
+    T: ToString,
+{
+    let error_command_message = CommandMessage::Advancement {
+        request_identifier: request_identifier.to_owned(),
+        response: Response::Error(error_message.to_string()),
+    };
+
+    if let Err(e) = command_tx.send(error_command_message).await {
+        error!("Error while return error to the command server: {}", e)
+    }
+}
+
+// Todo: refactor the CLI, see issue #740
+// async fn return_processing<T>(
+//     mut command_tx: Sender<CommandMessage>,
+//     request_identifier: RequestIdentifier,
+//     processing_message: T,
+// ) where
+//     T: ToString,
+// {
+//     let processing_command_message = CommandMessage::Advancement {
+//         request_identifier: request_identifier.to_owned(),
+//         response: Response::Processing(processing_message.to_string()),
+//     };
+//
+//     if let Err(e) = command_tx.send(processing_command_message).await {
+//         error!(
+//             "Error while returning processing to the command server: {}",
+//             e
+//         )
+//     }
+// }
+
+async fn return_success(
+    mut command_tx: Sender<CommandMessage>,
+    request_identifier: RequestIdentifier,
+    success: Success,
+) {
+    let success_command_message = CommandMessage::Advancement {
+        request_identifier: request_identifier.to_owned(),
+        response: Response::Ok(success),
+    };
+
+    if let Err(e) = command_tx.send(success_command_message).await {
+        error!("Error while returning success to the command server: {}", e)
     }
 }
 
