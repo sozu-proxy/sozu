@@ -7,7 +7,7 @@ use serde_json;
 use std::{
     collections::{BTreeMap, HashSet},
     fs::File,
-    io::{self, Read, Write},
+    io::{Read, Write},
     os::unix::io::{FromRawFd, IntoRawFd},
     os::unix::net::UnixStream,
     time::Duration,
@@ -121,7 +121,7 @@ impl CommandServer {
         let mut counter = 0usize;
         let orders = self.state.generate_orders();
 
-        let result: io::Result<usize> = (move || {
+        let result: anyhow::Result<usize> = (move || {
             for command in orders {
                 let message = CommandRequest::new(
                     format!("SAVE-{}", counter),
@@ -133,21 +133,31 @@ impl CommandServer {
                     &serde_json::to_string(&message)
                         .map(|s| s.into_bytes())
                         .unwrap_or(vec![]),
-                )?;
-                file.write_all(&b"\n\0"[..])?;
+                )
+                .with_context(|| {
+                    format!(
+                        "Could not add this instruction line to the saved state file: {:?}",
+                        message
+                    )
+                })?;
+
+                file.write_all(&b"\n\0"[..])
+                    .with_context(|| "Could not add new line to the saved state file")?;
 
                 if counter % 1000 == 0 {
                     info!("writing command {}", counter);
-                    file.sync_all()?;
+                    file.sync_all()
+                        .with_context(|| "Failed to sync the saved state file")?;
                 }
                 counter += 1;
             }
-            file.sync_all()?;
+            file.sync_all()
+                .with_context(|| "Failed to sync the saved state file")?;
 
             Ok(counter)
         })();
 
-        Ok(result?)
+        Ok(result.with_context(|| "Could not write the state onto the state file")?)
     }
 
     pub async fn dump_state(&mut self) -> anyhow::Result<Option<Success>> {
@@ -270,7 +280,7 @@ impl CommandServer {
                 path, diff_counter
             );
 
-            let command_tx = self.command_tx.clone();
+            let command_tx = self.command_tx.to_owned();
             let path = path.to_owned();
 
             smol::spawn(async move {
@@ -293,10 +303,7 @@ impl CommandServer {
                 // or pattern matching
 
                 let request_identifier = if let Some(client_id) = client_id {
-                    RequestIdentifier {
-                        client: client_id,
-                        request: request_id,
-                    }
+                    RequestIdentifier::new(client_id, request_id)
                 } else {
                     if error == 0 {
                         info!("loading state: {} ok messages, 0 errors", ok);
@@ -458,9 +465,7 @@ impl CommandServer {
         let command_tx = self.command_tx.clone();
 
         smol::spawn(async move {
-            super::worker_loop(id, stream, command_tx, worker_rx)
-                .await
-                .unwrap();
+            super::worker_loop(id, stream, command_tx, worker_rx).await;
         })
         .detach();
 
@@ -696,6 +701,9 @@ impl CommandServer {
                 }
                 // shouldn't we use return_success() here, to notify the command server
                 // and the client?
+                // Answer: actually, the CLI could not take several success messages
+                // about upgraded workers. See issue #740. The best would be to return
+                // Processing here. See issue #740
             })
             .detach();
         }
@@ -719,9 +727,7 @@ impl CommandServer {
         let id = worker.id;
         let command_tx = self.command_tx.clone();
         smol::spawn(async move {
-            super::worker_loop(id, stream, command_tx, worker_rx)
-                .await
-                .unwrap();
+            super::worker_loop(id, stream, command_tx, worker_rx).await;
         })
         .detach();
 
@@ -1257,11 +1263,9 @@ impl CommandServer {
         let RequestIdentifier {
             client: client_id,
             request: request_id,
-        } = request_identifier.clone();
+        } = request_identifier.to_owned();
 
-        let command_response: CommandResponse;
-
-        match response {
+        let command_response = match response {
             Response::Ok(success) => {
                 let success_message = success.to_string();
 
@@ -1274,12 +1278,12 @@ impl CommandServer {
                     _ => None,
                 };
 
-                command_response = CommandResponse::new(
+                CommandResponse::new(
                     request_id.clone(),
                     CommandStatus::Ok,
                     success_message,
                     command_response_data,
-                );
+                )
             }
             // Todo: refactor the CLI to accept processing, see issue #740
             // Response::Processing(_) => {
@@ -1290,15 +1294,13 @@ impl CommandServer {
             //         None,
             //     );
             // }
-            Response::Error(error_message) => {
-                command_response = CommandResponse::new(
-                    request_id.clone(),
-                    CommandStatus::Error,
-                    error_message,
-                    None,
-                );
-            }
-        }
+            Response::Error(error_message) => CommandResponse::new(
+                request_id.clone(),
+                CommandStatus::Error,
+                error_message,
+                None,
+            ),
+        };
 
         trace!(
             "Sending response to request {} of client {}: {:?}",

@@ -75,12 +75,25 @@ enum CommandMessage {
     MasterStop,
 }
 
-#[derive(Clone)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub struct RequestIdentifier {
     client: String,  // the client who sent the request (ex: "CL-0")
     request: String, // the request id (ex: "ID-MAN9QF")
 }
 
+impl RequestIdentifier {
+    pub fn new<T>(client: T, request: T) -> Self
+    where
+        T: ToString,
+    {
+        Self {
+            client: client.to_string(),
+            request: request.to_string(),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Response {
     Error(String),
     // Todo: refactor the CLI, see issue #740
@@ -90,7 +103,7 @@ pub enum Response {
 
 // Indicates success of either inner Sōzu logic and of handling the ClientRequest,
 // in which case Success caries the response data.
-#[derive(Clone)]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Success {
     ClientClose(String),            // the client id
     ClientNew(String),              // the client id
@@ -252,12 +265,7 @@ impl CommandServer {
             let id = worker.id;
             let command_tx = command_tx.clone();
             smol::spawn(async move {
-                if worker_loop(id, stream, command_tx, worker_rx)
-                    .await
-                    .is_err()
-                {
-                    error!("The worker loop of worker {} crashed", id);
-                }
+                worker_loop(id, stream, command_tx, worker_rx).await;
             })
             .detach();
         }
@@ -445,9 +453,7 @@ impl CommandServer {
                 let command_tx = tx.clone();
                 //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
                 smol::spawn(async move {
-                    worker_loop(id, stream, command_tx, worker_rx)
-                        .await
-                        .unwrap();
+                    worker_loop(id, stream, command_tx, worker_rx).await;
                 })
                 .detach();
 
@@ -648,7 +654,7 @@ impl CommandServer {
         self.next_id += 1;
 
         let sock = worker.channel.take().unwrap().sock;
-        let (worker_tx, worker_rx) = channel(10000);
+        let (worker_tx, worker_rx) = channel(10_000);
         worker.sender = Some(worker_tx);
 
         let stream = Async::new(unsafe {
@@ -659,9 +665,7 @@ impl CommandServer {
         let id = worker.id;
         let command_tx = self.command_tx.clone();
         smol::spawn(async move {
-            worker_loop(id, stream, command_tx, worker_rx)
-                .await
-                .unwrap();
+            worker_loop(id, stream, command_tx, worker_rx).await;
         })
         .detach();
 
@@ -901,7 +905,7 @@ async fn client_loop(
     stream: Async<UnixStream>,
     mut command_tx: Sender<CommandMessage>,
     mut client_rx: Receiver<CommandResponse>,
-) -> std::io::Result<()> {
+) {
     let stream = Arc::new(stream);
     let mut s = stream.clone();
 
@@ -952,10 +956,15 @@ async fn client_loop(
     }
 
     // If the loop breaks, order the command server to close the client
-    if let Err(e) = command_tx.send(CommandMessage::ClientClose { id }).await {
-        error!("error writing to client: {:?}", e);
+    if let Err(send_error) = command_tx
+        .send(CommandMessage::ClientClose { id: id.to_owned() })
+        .await
+    {
+        error!(
+            "The client loop {} could not send ClientClose to the command server: {:?}",
+            id, send_error
+        );
     }
-    Ok(())
 }
 
 async fn worker_loop(
@@ -963,7 +972,7 @@ async fn worker_loop(
     stream: Async<UnixStream>,
     mut command_tx: Sender<CommandMessage>,
     mut worker_rx: Receiver<ProxyRequest>,
-) -> std::io::Result<()> {
+) {
     let stream = Arc::new(stream);
     let mut s = stream.clone();
 
@@ -1015,10 +1024,13 @@ async fn worker_loop(
     }
 
     // if the loop breaks, order the command server to close the worker
-    command_tx
-        .send(CommandMessage::WorkerClose { id })
+    if let Err(send_error) = command_tx
+        .send(CommandMessage::WorkerClose { id: id.to_owned() })
         .await
-        .unwrap();
-
-    Ok(())
+    {
+        error!(
+            "The worker loop {} could not send WorkerClose to the CommandServer: {:?}",
+            id, send_error
+        );
+    }
 }
