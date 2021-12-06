@@ -189,8 +189,7 @@ impl CommandServer {
             match file.read(buffer.space()) {
                 Ok(sz) => buffer.fill(sz),
                 Err(e) => {
-                    error!("error reading state file: {}", e);
-                    break;
+                    bail!("Error reading the saved state file: {}", e);
                 }
             };
 
@@ -205,9 +204,7 @@ impl CommandServer {
                     if i.len() > 0 {
                         debug!("could not parse {} bytes", i.len());
                         if previous == buffer.available_data() {
-                            // this bail! is new here, it was a break before. Please comment
                             bail!("error consuming load state message");
-                            // break;
                         }
                     }
                     offset = buffer.data().offset(i);
@@ -269,7 +266,7 @@ impl CommandServer {
             buffer.consume(offset);
         }
 
-        error!(
+        info!(
             "stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
             buffer.available_data(), message_counter, diff_counter
         );
@@ -299,8 +296,6 @@ impl CommandServer {
                     };
                     debug!("ok:{}, error: {}", ok, error);
                 }
-
-                // or pattern matching
 
                 let request_identifier = if let Some(client_id) = client_id {
                     RequestIdentifier::new(client_id, request_id)
@@ -339,10 +334,7 @@ impl CommandServer {
             if client_id.is_some() {
                 return_success(
                     self.command_tx.clone(),
-                    RequestIdentifier {
-                        client: client_id.unwrap(),
-                        request: request_id,
-                    },
+                    RequestIdentifier::new(client_id.unwrap(), request_id),
                     Success::LoadState(path.to_string(), 0, 0),
                 )
                 .await;
@@ -699,11 +691,7 @@ impl CommandServer {
                         }
                     };
                 }
-                // shouldn't we use return_success() here, to notify the command server
-                // and the client?
-                // Answer: actually, the CLI could not take several success messages
-                // about upgraded workers. See issue #740. The best would be to return
-                // Processing here. See issue #740
+                // The best would be to return Processing here. See issue #740
             })
             .detach();
         }
