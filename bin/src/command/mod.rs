@@ -353,7 +353,7 @@ impl CommandServer {
                 }
                 Err(error) => {
                     // log the error on the main process without stopping it
-                    error!("Failed order: {:?}", error);
+                    error!("Failed order: {:#?}", error);
                 }
             }
         }
