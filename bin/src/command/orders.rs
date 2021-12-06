@@ -48,7 +48,7 @@ impl CommandServer {
         };
         let cloned_identifier = request_identifier.clone();
 
-        let result: anyhow::Result<Option<Success>> = match request.data {
+        let result: Result<Option<Success>, anyhow::Error> = match request.data {
             CommandRequestData::SaveState { path } => self.save_state(&path).await,
             CommandRequestData::DumpState => self.dump_state().await,
             CommandRequestData::ListWorkers => self.list_workers().await,
@@ -91,9 +91,17 @@ impl CommandServer {
                 info!("{}", success);
                 return_success(self.command_tx.clone(), cloned_identifier, success).await;
             }
-            Err(error_message) => {
-                error!("{}", error_message);
-                return_error(self.command_tx.clone(), cloned_identifier, error_message).await;
+            Err(error) => {
+                error!(
+                    "Failed client request {}: {:?}",
+                    cloned_identifier.client, error
+                );
+                return_error(
+                    self.command_tx.clone(),
+                    cloned_identifier,
+                    format!("{:#?}", error),
+                )
+                .await;
             }
             Ok(None) => {
                 // do nothing here. Ok(None) means the function has already returned its result
@@ -172,103 +180,45 @@ impl CommandServer {
         request_id: String,
         path: &str,
     ) -> anyhow::Result<Option<Success>> {
-        let mut file =
-            File::open(&path).with_context(|| format!("Cannot open file at path {}", path))?;
-
-        let mut buffer = Buffer::with_capacity(200000);
-
-        info!("starting to load state from {}", path);
-
         let mut message_counter = 0usize;
         let mut diff_counter = 0usize;
-
         let (load_state_tx, mut load_state_rx) = futures::channel::mpsc::channel(10000);
-        loop {
-            let previous = buffer.available_data();
-            //FIXME: we should read in streaming here
-            match file.read(buffer.space()) {
-                Ok(sz) => buffer.fill(sz),
-                Err(e) => {
-                    bail!("Error reading the saved state file: {}", e);
-                }
-            };
 
-            if buffer.available_data() == 0 {
-                debug!("Empty buffer");
-                break;
-            }
+        let requests =
+            parse_state_data(path).with_context(|| "Could not parse state from state file")?;
 
-            let mut offset = 0usize;
-            match parse(buffer.data()) {
-                Ok((i, requests)) => {
-                    if i.len() > 0 {
-                        debug!("could not parse {} bytes", i.len());
-                        if previous == buffer.available_data() {
-                            bail!("error consuming load state message");
-                        }
-                    }
-                    offset = buffer.data().offset(i);
+        for request in requests {
+            if let CommandRequestData::Proxy(order) = request.data {
+                message_counter += 1;
 
-                    if requests.iter().find(|o| {
-                        if o.version > PROTOCOL_VERSION {
-                            error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, o.version);
-                            true
-                        } else {
-                            false
-                        }
-                    }).is_some() {
-                        break;
+                if self.state.handle_order(&order) {
+                    diff_counter += 1;
+
+                    let mut found = false;
+                    let id = format!("LOAD-STATE-{}-{}", request_id, diff_counter);
+
+                    for ref mut worker in self.workers.iter_mut().filter(|worker| {
+                        worker.run_state != RunState::Stopping
+                            && worker.run_state != RunState::Stopped
+                    }) {
+                        let worker_message_id = format!("{}-{}", id, worker.id);
+                        worker.send(worker_message_id.clone(), order.clone()).await;
+                        self.in_flight
+                            .insert(worker_message_id, (load_state_tx.clone(), 1));
+
+                        found = true;
                     }
 
-                    for request in requests {
-                        if let CommandRequestData::Proxy(order) = request.data {
-                            message_counter += 1;
-
-                            if self.state.handle_order(&order) {
-                                diff_counter += 1;
-
-                                let mut found = false;
-                                let id = format!("LOAD-STATE-{}-{}", request_id, diff_counter);
-
-                                for ref mut worker in self.workers.iter_mut().filter(|worker| {
-                                    worker.run_state != RunState::Stopping
-                                        && worker.run_state != RunState::Stopped
-                                }) {
-                                    let worker_message_id = format!("{}-{}", id, worker.id);
-                                    worker.send(worker_message_id.clone(), order.clone()).await;
-                                    self.in_flight
-                                        .insert(worker_message_id, (load_state_tx.clone(), 1));
-
-                                    found = true;
-                                }
-
-                                if !found {
-                                    bail!("no worker found");
-                                }
-                            }
-                        }
+                    if !found {
+                        bail!("no worker found");
                     }
-                }
-                Err(Err::Incomplete(_)) => {
-                    if buffer.available_data() == buffer.capacity() {
-                        error!(
-                            "message too big, stopping parsing:\n{}",
-                            buffer.data().to_hex(16)
-                        );
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!("saved state parse error: {:?}", e);
-                    break;
                 }
             }
-            buffer.consume(offset);
         }
 
         info!(
-            "stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
-            buffer.available_data(), message_counter, diff_counter
+            "stopped loading data from file, saw {} messages, generated {} diff messages",
+            message_counter, diff_counter
         );
 
         if diff_counter > 0 {
@@ -1375,8 +1325,87 @@ use nom::{
     multi::many0,
     sequence::terminated,
 };
+
+pub fn parse_state_data(path: &str) -> anyhow::Result<Vec<CommandRequest>> {
+    let mut file =
+        File::open(&path).with_context(|| format!("Cannot open file at path {}", path))?;
+
+    let mut buffer = Buffer::with_capacity(200_000);
+
+    info!("starting to load state from {}", path);
+
+    let mut parsed_requests: Vec<CommandRequest> = Vec::new();
+
+    loop {
+        let previous = buffer.available_data();
+        //FIXME: we should read in streaming here
+        // read the file content into the buffer's available space
+        match file.read(
+            //
+            buffer.space(),
+        ) {
+            // tell the buffer how much data we gave him
+            Ok(sz) => buffer.fill(sz),
+            Err(e) => {
+                bail!("Error reading the saved state file: {}", e);
+            }
+        };
+
+        // If the buffer has no data, break the loop
+        if buffer.available_data() == 0 {
+            debug!("Empty buffer");
+            break;
+        }
+
+        let mut offset = 0usize;
+        match parse(
+            // get the data from the buffer: &[u8]
+            buffer.data(),
+        ) {
+            // i is the slice of unparsed data: &[u8]
+            Ok((i, requests)) => {
+                if i.len() > 0 {
+                    debug!("{} bytes are left to parse", i.len());
+                    // compare data before parsing and left to parse
+                    // this is always true if the file is bigger than the buffe. That's the bug.
+                    // tried to replace buffer.available_data() with i.len() - nope, same error
+                    if previous == buffer.available_data() {
+                        // what would be a better error message?
+                        bail!("error consuming load state message");
+                    }
+                }
+                offset = buffer.data().offset(i);
+
+                for request in requests.iter() {
+                    if request.version > PROTOCOL_VERSION {
+                        bail!(format!(
+                            "configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}",
+                            PROTOCOL_VERSION, request.version))
+                    }
+                    parsed_requests.push(request.to_owned())
+                }
+            }
+            Err(Err::Incomplete(_)) => {
+                if buffer.available_data() == buffer.capacity() {
+                    bail!(format!(
+                        "message too big, stopping parsing:\n{}",
+                        buffer.data().to_hex(16)
+                    ))
+                }
+            }
+            Err(e) => {
+                bail!(format!("Parsing error: {:?}", e));
+            }
+        }
+        buffer.consume(offset);
+    }
+    Ok(parsed_requests)
+}
+
 pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<CommandRequest>> {
     use serde_json::from_slice;
+
+    // many0 means there is a success even if there is 0 element
     many0(complete(terminated(
         map_res(is_not("\0"), from_slice),
         char('\0'),
