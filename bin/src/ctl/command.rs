@@ -1104,10 +1104,10 @@ impl CommandManager {
             .write_message(&CommandRequest::new(id.clone(), command, None));
 
         let message = self.read_channel_message_with_timeout()?;
-
         if id != message.id {
             bail!("received message with invalid id: {:?}", message);
         }
+      
         match message.status {
             CommandStatus::Processing => {
                 // do nothing here
