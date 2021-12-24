@@ -1,17 +1,11 @@
 use nom;
 
+use crate::command::CommandRequest;
 use nom::{
-    bytes::complete::is_not,
-    // bytes::streaming::is_not,
-    // character::streaming::char,
-    combinator::{complete, cut, map_res},
-    error::Error as NomError,
     error::{ErrorKind, FromExternalError},
     multi::many0,
-    sequence::terminated,
     IResult,
 };
-use serde_json::from_str;
 
 #[derive(Debug)]
 pub struct CustomError {
@@ -19,13 +13,13 @@ pub struct CustomError {
     serde_json_error: Option<serde_json::Error>,
 }
 
-impl FromExternalError<&str, serde_json::Error> for CustomError {
+impl FromExternalError<&[u8], serde_json::Error> for CustomError {
     fn from_external_error(
-        input: &str,
+        input: &[u8],
         kind: ErrorKind,
         serde_json_error: serde_json::Error,
     ) -> Self {
-        println!("input: {}, error kind: {:?}", input, kind);
+        // println!("input: {:?}, error kind: {:?}", input, kind);
         Self {
             kind,
             serde_json_error: Some(serde_json_error),
@@ -33,9 +27,9 @@ impl FromExternalError<&str, serde_json::Error> for CustomError {
     }
 }
 
-impl nom::error::ParseError<&str> for CustomError {
-    fn from_error_kind(input: &str, kind: ErrorKind) -> Self {
-        println!("input: {}, error kind: {:?}", input, kind);
+impl nom::error::ParseError<&[u8]> for CustomError {
+    fn from_error_kind(input: &[u8], kind: ErrorKind) -> Self {
+        // println!("input: {:?}, error kind: {:?}", input, kind);
 
         Self {
             kind,
@@ -43,18 +37,18 @@ impl nom::error::ParseError<&str> for CustomError {
         }
     }
 
-    fn append(_input: &str, _kind: ErrorKind, other: Self) -> Self {
+    fn append(_input: &[u8], _kind: ErrorKind, other: Self) -> Self {
         other
     }
 }
 
-pub fn parse_one_struct<'de, T>(input: &str) -> IResult<&str, T, CustomError>
-where
-    T: serde::de::Deserialize<'de>,
+pub fn parse_one_command(input: &[u8]) -> IResult<&[u8], CommandRequest, CustomError>
+// where
+//    &'de T: serde::de::Deserialize<'de>,
 {
-    let (next_input, json_data) = is_not("\n")(input)?;
+    let (next_input, json_data) = nom::bytes::complete::is_not("\0")(input)?;
 
-    let parsed_struct = match serde_json::from_str::<T>(json_data) {
+    let command = match serde_json::from_slice::<CommandRequest>(json_data) {
         Ok(user) => user,
         Err(serde_error) => {
             return Err(nom::Err::Failure(CustomError::from_external_error(
@@ -65,16 +59,16 @@ where
         }
     };
 
-    let (next_input, _) = nom::character::complete::char('\n')(i)?;
+    let (next_input, _) = nom::character::complete::char('\0')(next_input)?;
 
-    Ok((next_input, parsed_struct))
+    Ok((next_input, command))
 }
 
-pub fn parse_several_structs<'de, T>(input: &str) -> IResult<&str, Vec<T>, CustomError>
-where
-    T: serde::de::Deserialize<'de>,
+pub fn parse_several_commands(input: &[u8]) -> IResult<&[u8], Vec<CommandRequest>, CustomError>
+// where
+//    T: serde::de::Deserialize<'de>,
 {
-    many0(parse_one_struct)(input)
+    many0(parse_one_command)(input)
 }
 
 #[cfg(test)]
@@ -91,18 +85,25 @@ mod test {
             Some(5),
         );
 
-        let mut stringified_request = serde_json::ser::to_string(&command_request).unwrap();
-        stringified_request.push('\0');
+        let mut string = serde_json::ser::to_string(&command_request).unwrap();
+
+        string.push('\0');
+
+        println!("string to parse: {}", string);
+
+        let bytes = &string.as_bytes();
+
+        let empty_vec: Vec<u8> = vec![];
 
         assert_eq!(
-            parse_several_structs::<CommandRequest>(&stringified_request).unwrap(),
-            ("", command_request)
+            parse_one_command(&bytes).unwrap(),
+            (&empty_vec[..], command_request)
         )
     }
 
     #[test]
-    fn parse_several_command_requestes_works() {
-        let vector_of_requests = vec![
+    fn parse_several_command_requests_works() {
+        let commands = vec![
             CommandRequest::new(
                 "Some request".to_string(),
                 CommandRequestData::SaveState {
@@ -122,30 +123,21 @@ mod test {
             ),
         ];
 
-        let mut stringified_requests: String;
+        let mut serialized_commands = String::new();
 
-        // append command requests and \0 chars
+        for command in commands.iter() {
+            serialized_commands += &serde_json::ser::to_string(&command).unwrap();
+            serialized_commands.push('\0');
+        }
 
+        let bytes_to_parse = &serialized_commands.as_bytes();
 
+        let parsed_commands = parse_several_commands(&bytes_to_parse).unwrap();
 
-        println!("{}", stringified_users);
-        assert_eq!(
-            parse_several_users(&stringified_users).unwrap(),
-            ("", random_users)
-        )
-    }
+        println!("parsed commands: {:?}", parsed_commands);
 
-    #[test]
-    fn bad_input_yields_an_error() {
-        let bad_users_input = r#"{"username":345,"password":"hV9StRA"}
-{"username":"qETqU6t","password":"gykzW8x"}
-{"username":"2vhA0B0","password":"SDGJDGk"}
-"#;
+        let empty_vec: Vec<u8> = vec![];
 
-        assert!(
-            parse_several_users(bad_users_input).is_err(),
-            // Err(nom::error::Error(serde_json::Error { err: "bla" }))
-            // nom::Err::Error(nom::error::Error { input: bad_users_input, code: ErrorKind::Fail })
-        );
+        assert_eq!(parsed_commands, (&empty_vec[..], commands))
     }
 }
