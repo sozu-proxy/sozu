@@ -13,3 +13,4 @@ pub mod ready;
 pub mod scm_socket;
 pub mod state;
 pub mod writer;
+pub mod parser;
