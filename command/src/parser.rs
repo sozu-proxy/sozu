@@ -15,7 +15,7 @@ pub struct CustomError {
 
 impl FromExternalError<&[u8], serde_json::Error> for CustomError {
     fn from_external_error(
-        input: &[u8],
+        _input: &[u8],
         kind: ErrorKind,
         serde_json_error: serde_json::Error,
     ) -> Self {
@@ -28,7 +28,7 @@ impl FromExternalError<&[u8], serde_json::Error> for CustomError {
 }
 
 impl nom::error::ParseError<&[u8]> for CustomError {
-    fn from_error_kind(input: &[u8], kind: ErrorKind) -> Self {
+    fn from_error_kind(_input: &[u8], kind: ErrorKind) -> Self {
         // println!("input: {:?}, error kind: {:?}", input, kind);
 
         Self {
@@ -42,13 +42,13 @@ impl nom::error::ParseError<&[u8]> for CustomError {
     }
 }
 
-pub fn parse_one_command(input: &[u8]) -> IResult<&[u8], CommandRequest, CustomError>
-// where
-//    &'de T: serde::de::Deserialize<'de>,
+pub fn parse_one_command<'a, T>(input: &'a [u8]) -> IResult<&[u8], T, CustomError>
+where
+    T: serde::de::Deserialize<'a>,
 {
     let (next_input, json_data) = nom::bytes::complete::is_not("\0")(input)?;
 
-    let command = match serde_json::from_slice::<CommandRequest>(json_data) {
+    let command = match serde_json::from_slice::<T>(json_data) {
         Ok(user) => user,
         Err(serde_error) => {
             return Err(nom::Err::Failure(CustomError::from_external_error(
@@ -64,9 +64,9 @@ pub fn parse_one_command(input: &[u8]) -> IResult<&[u8], CommandRequest, CustomE
     Ok((next_input, command))
 }
 
-pub fn parse_several_commands(input: &[u8]) -> IResult<&[u8], Vec<CommandRequest>, CustomError>
-// where
-//    T: serde::de::Deserialize<'de>,
+pub fn parse_several_commands<'a, T>(input: &'a [u8]) -> IResult<&[u8], Vec<T>, CustomError>
+where
+    T: serde::de::Deserialize<'a>,
 {
     many0(parse_one_command)(input)
 }
