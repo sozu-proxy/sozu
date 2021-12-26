@@ -1,13 +1,12 @@
-use nom;
-
-use crate::command::CommandRequest;
 use nom::{
+    self,
     error::{ErrorKind, FromExternalError},
     multi::many0,
     IResult,
 };
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct CustomError {
     kind: ErrorKind,
     serde_json_error: Option<serde_json::Error>,
