@@ -54,7 +54,7 @@ Run it with the command:
 
 ```bash
 docker run \
-  --name sozu-proxy
+  --name sozu-proxy \
   -v /run/sozu:/run/sozu \
   -v /path/to/config/file:/etc/sozu \
   -v /my/state/:/var/lib/sozu \
