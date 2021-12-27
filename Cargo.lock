@@ -1545,6 +1545,7 @@ dependencies = [
  "memchr",
  "mio 0.8.0",
  "nix",
+ "nom",
  "pem",
  "pool",
  "poule",
