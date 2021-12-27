@@ -23,6 +23,7 @@ include = [
 
 [dependencies]
 anyhow = "^1.0.42"
+nom = "7.0.0"
 hex = "^0.4"
 log = "^0.4"
 pem = "^1.0"

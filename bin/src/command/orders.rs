@@ -2,7 +2,7 @@ use anyhow::{bail, Context};
 use async_io::Async;
 use futures::channel::mpsc::*;
 use futures::{SinkExt, StreamExt};
-use nom::{Err, HexDisplay, IResult, Offset};
+use nom::{Err, HexDisplay, Offset};
 use serde_json;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -21,6 +21,7 @@ use sozu_command_lib::{
     },
     config::Config,
     logging,
+    parser::parse_several_commands,
     proxy::{
         MetricsConfiguration, ProxyRequest, ProxyRequestData, ProxyResponseData,
         ProxyResponseStatus, Query, QueryAnswer, QueryApplicationType, Route, TcpFrontend,
@@ -199,7 +200,7 @@ impl CommandServer {
             }
 
             let mut offset = 0usize;
-            match parse(buffer.data()) {
+            match parse_several_commands::<CommandRequest>(buffer.data()) {
                 Ok((i, requests)) => {
                     if i.len() > 0 {
                         debug!("could not parse {} bytes", i.len());
@@ -258,9 +259,8 @@ impl CommandServer {
                         break;
                     }
                 }
-                Err(e) => {
-                    error!("saved state parse error: {:?}", e);
-                    break;
+                Err(parse_error) => {
+                    bail!("saved state parse error: {:?}", parse_error);
                 }
             }
             buffer.consume(offset);
@@ -1366,19 +1366,4 @@ async fn return_success(
     if let Err(e) = command_tx.send(success_command_message).await {
         error!("Error while returning success to the command server: {}", e)
     }
-}
-
-use nom::{
-    bytes::streaming::is_not,
-    character::streaming::char,
-    combinator::{complete, map_res},
-    multi::many0,
-    sequence::terminated,
-};
-pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<CommandRequest>> {
-    use serde_json::from_slice;
-    many0(complete(terminated(
-        map_res(is_not("\0"), from_slice),
-        char('\0'),
-    )))(input)
 }
