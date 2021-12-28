@@ -85,32 +85,7 @@ impl CommandManager {
                 } => self.list_frontends(http, https, tcp, domain),
             },
             SubCmd::Listener { cmd } => match cmd {
-                ListenerCmd::Http { cmd } => match cmd {
-                    HttpListenerCmd::Add {
-                        address,
-                        public_address,
-                        answer_404,
-                        answer_503,
-                        expect_proxy,
-                        sticky_name,
-                    } => self.add_http_listener(
-                        address,
-                        public_address,
-                        answer_404,
-                        answer_503,
-                        expect_proxy,
-                        sticky_name,
-                    ),
-                    HttpListenerCmd::Remove { address } => {
-                        self.remove_listener(address, ListenerType::HTTP)
-                    }
-                    HttpListenerCmd::Activate { address } => {
-                        self.activate_listener(address, ListenerType::HTTP)
-                    }
-                    HttpListenerCmd::Deactivate { address } => {
-                        self.deactivate_listener(address, ListenerType::HTTP)
-                    }
-                },
+                ListenerCmd::Http { cmd } => self.http_listener_command(cmd),
                 ListenerCmd::Https { cmd } => self.https_listener_command(cmd),
                 ListenerCmd::Tcp { cmd } => match cmd {
                     TcpListenerCmd::Add {

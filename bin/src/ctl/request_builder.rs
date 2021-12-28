@@ -21,7 +21,8 @@ use std::{net::SocketAddr, process::exit};
 
 use crate::{
     cli::{
-        ApplicationCmd, BackendCmd, HttpFrontendCmd, HttpsListenerCmd, LoggingLevel, TcpFrontendCmd,
+        ApplicationCmd, BackendCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd,
+        LoggingLevel, TcpFrontendCmd,
     },
     ctl::{
         create_channel,
@@ -227,27 +228,38 @@ impl CommandManager {
         }
     }
 
-    pub fn add_http_listener(
-        &mut self,
-        address: SocketAddr,
-        public_address: Option<SocketAddr>,
-        answer_404: Option<String>,
-        answer_503: Option<String>,
-        expect_proxy: bool,
-        sticky_name: Option<String>,
-    ) -> Result<(), anyhow::Error> {
-        let mut listener = Listener::new(address, FileListenerProtocolConfig::Http);
-        listener.public_address = public_address;
-        listener.answer_404 = answer_404;
-        listener.answer_503 = answer_503;
-        listener.expect_proxy = Some(expect_proxy);
-        if let Some(sticky_name) = sticky_name {
-            listener.sticky_name = sticky_name;
-        }
-
-        match listener.to_http(None, None, None) {
-            Some(conf) => self.order_command(ProxyRequestData::AddHttpListener(conf)),
-            None => bail!("Error creating HTTP listener"),
+    pub fn http_listener_command(&mut self, cmd: HttpListenerCmd) -> Result<(), anyhow::Error> {
+        match cmd {
+            HttpListenerCmd::Add {
+                address,
+                public_address,
+                answer_404,
+                answer_503,
+                expect_proxy,
+                sticky_name,
+            } => {
+                let mut listener = Listener::new(address, FileListenerProtocolConfig::Http);
+                listener.public_address = public_address;
+                listener.answer_404 = answer_404;
+                listener.answer_503 = answer_503;
+                listener.expect_proxy = Some(expect_proxy);
+                if let Some(sticky_name) = sticky_name {
+                    listener.sticky_name = sticky_name;
+                }
+                match listener.to_http(None, None, None) {
+                    Some(conf) => self.order_command(ProxyRequestData::AddHttpListener(conf)),
+                    None => bail!("Error creating HTTP listener"),
+                }
+            }
+            HttpListenerCmd::Remove { address } => {
+                self.remove_listener(address, ListenerType::HTTP)
+            }
+            HttpListenerCmd::Activate { address } => {
+                self.activate_listener(address, ListenerType::HTTP)
+            }
+            HttpListenerCmd::Deactivate { address } => {
+                self.deactivate_listener(address, ListenerType::HTTP)
+            }
         }
     }
 
