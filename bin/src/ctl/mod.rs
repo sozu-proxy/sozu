@@ -71,24 +71,7 @@ impl CommandManager {
                 StateCmd::Dump { json } => self.dump_state(json),
             },
             SubCmd::Reload { file, json } => self.reload_configuration(file, json),
-            SubCmd::Application { cmd } => match cmd {
-                ApplicationCmd::Add {
-                    id,
-                    sticky_session,
-                    https_redirect,
-                    send_proxy,
-                    expect_proxy,
-                    load_balancing_policy,
-                } => self.add_application(
-                    &id,
-                    sticky_session,
-                    https_redirect,
-                    send_proxy,
-                    expect_proxy,
-                    load_balancing_policy,
-                ),
-                ApplicationCmd::Remove { id } => self.remove_application(&id),
-            },
+            SubCmd::Application { cmd } => self.application_command(cmd),
             SubCmd::Backend { cmd } => match cmd {
                 BackendCmd::Add {
                     id,

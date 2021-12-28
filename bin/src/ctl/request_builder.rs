@@ -17,18 +17,10 @@ use sozu_command_lib::{
 };
 
 use anyhow::{bail, Context};
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    net::SocketAddr,
-    process::exit,
-    sync::mpsc,
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
+use std::{net::SocketAddr, process::exit};
 
 use crate::{
-    cli::{HttpFrontendCmd, LoggingLevel, MetricsCmd},
+    cli::{ApplicationCmd, HttpFrontendCmd, LoggingLevel, MetricsCmd},
     ctl::{
         create_channel,
         display::{
@@ -71,37 +63,36 @@ impl CommandManager {
         }))
     }
 
-    pub fn add_application(
-        &mut self,
-        cluster_id: &str,
-        sticky_session: bool,
-        https_redirect: bool,
-        send_proxy: bool,
-        expect_proxy: bool,
-        load_balancing: LoadBalancingAlgorithms,
-    ) -> Result<(), anyhow::Error> {
-        let proxy_protocol = match (send_proxy, expect_proxy) {
-            (true, true) => Some(ProxyProtocolConfig::RelayHeader),
-            (true, false) => Some(ProxyProtocolConfig::SendHeader),
-            (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
-            _ => None,
-        };
-
-        self.order_command(ProxyRequestData::AddCluster(Cluster {
-            cluster_id: String::from(cluster_id),
-            sticky_session,
-            https_redirect,
-            proxy_protocol,
-            load_balancing,
-            load_metric: None,
-            answer_503: None,
-        }))
-    }
-
-    pub fn remove_application(&mut self, cluster_id: &str) -> Result<(), anyhow::Error> {
-        self.order_command(ProxyRequestData::RemoveCluster {
-            cluster_id: String::from(cluster_id),
-        })
+    pub fn application_command(&mut self, cmd: ApplicationCmd) -> Result<(), anyhow::Error> {
+        match cmd {
+            ApplicationCmd::Add {
+                id,
+                sticky_session,
+                https_redirect,
+                send_proxy,
+                expect_proxy,
+                load_balancing_policy,
+            } => {
+                let proxy_protocol = match (send_proxy, expect_proxy) {
+                    (true, true) => Some(ProxyProtocolConfig::RelayHeader),
+                    (true, false) => Some(ProxyProtocolConfig::SendHeader),
+                    (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
+                    _ => None,
+                };
+                self.order_command(ProxyRequestData::AddCluster(Cluster {
+                    cluster_id: String::from(id),
+                    sticky_session,
+                    https_redirect,
+                    proxy_protocol,
+                    load_balancing: load_balancing_policy,
+                    load_metric: None,
+                    answer_503: None,
+                }))
+            }
+            ApplicationCmd::Remove { id } => self.order_command(ProxyRequestData::RemoveCluster {
+                cluster_id: String::from(id),
+            }),
+        }
     }
 
     pub fn add_tcp_frontend(
