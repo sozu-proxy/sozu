@@ -1,22 +1,15 @@
 use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain},
-    command::{
-        CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
-        FrontendFilters, RunState, WorkerInfo,
-    },
     config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
     proxy::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
-        Cluster, DeactivateListener, FilteredData, HttpFrontend, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, MetricsConfiguration, PathRule,
-        ProxyRequestData, Query, QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics,
-        QueryApplicationDomain, QueryApplicationType, QueryCertificateType, QueryMetricsType,
-        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Route, RulePosition,
-        TcpFrontend, TcpListener, TlsVersion,
+        Cluster, DeactivateListener, HttpFrontend, ListenerType, LoadBalancingParams, PathRule,
+        ProxyRequestData, RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate,
+        RulePosition, TcpFrontend, TcpListener, TlsVersion,
     },
 };
 
-use anyhow::{bail, Context};
+use anyhow::bail;
 use std::{net::SocketAddr, process::exit};
 
 use crate::{
@@ -24,14 +17,7 @@ use crate::{
         ApplicationCmd, BackendCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd,
         LoggingLevel, TcpFrontendCmd, TcpListenerCmd,
     },
-    ctl::{
-        create_channel,
-        display::{
-            create_queried_application_table, print_frontend_list, print_json_response,
-            print_query_answers,
-        },
-        CommandManager,
-    },
+    ctl::CommandManager,
 };
 
 impl CommandManager {

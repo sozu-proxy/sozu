@@ -1,23 +1,17 @@
 use sozu_command_lib::{
-    certificate::{calculate_fingerprint, split_certificate_chain},
     command::{
         CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
         FrontendFilters, RunState, WorkerInfo,
     },
-    config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
     proxy::{
-        ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
-        Cluster, DeactivateListener, FilteredData, HttpFrontend, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, MetricsConfiguration, PathRule,
-        ProxyRequestData, Query, QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics,
+        MetricsConfiguration, ProxyRequestData, Query, QueryAnswer, QueryAnswerCertificate,
         QueryApplicationDomain, QueryApplicationType, QueryCertificateType, QueryMetricsType,
-        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Route, RulePosition,
-        TcpFrontend, TcpListener, TlsVersion,
+        Route,
     },
 };
 
 use crate::{
-    cli::{HttpFrontendCmd, LoggingLevel, MetricsCmd},
+    cli::MetricsCmd,
     ctl::{
         create_channel,
         display::{
@@ -32,8 +26,7 @@ use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    net::SocketAddr,
+    collections::{HashMap, HashSet},
     process::exit,
     sync::mpsc,
     sync::{Arc, Mutex},
@@ -1156,10 +1149,6 @@ impl CommandManager {
         }
 
         Ok(())
-    }
-
-    pub fn logging_filter(&mut self, filter: &LoggingLevel) -> Result<(), anyhow::Error> {
-        self.order_command(ProxyRequestData::Logging(filter.to_string().to_lowercase()))
     }
 
     pub fn events(&mut self) -> Result<(), anyhow::Error> {

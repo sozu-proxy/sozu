@@ -5,7 +5,7 @@ use sozu_command_lib::{
     proxy::{FilteredData, QueryAnswer, QueryAnswerMetrics},
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 pub fn print_frontend_list(frontends: ListedFrontends) {
     trace!(" We received this frontends to display {:#?}", frontends);

@@ -11,7 +11,6 @@ use sozu_command_lib::{
     channel::Channel,
     command::{CommandRequest, CommandResponse},
     config::Config,
-    proxy::ListenerType,
 };
 use std::time::Duration;
 
