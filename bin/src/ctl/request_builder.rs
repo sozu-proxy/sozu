@@ -20,7 +20,7 @@ use anyhow::{bail, Context};
 use std::{net::SocketAddr, process::exit};
 
 use crate::{
-    cli::{ApplicationCmd, BackendCmd, HttpFrontendCmd, LoggingLevel, MetricsCmd},
+    cli::{ApplicationCmd, BackendCmd, HttpFrontendCmd, LoggingLevel, TcpFrontendCmd},
     ctl::{
         create_channel,
         display::{
@@ -92,26 +92,21 @@ impl CommandManager {
         }
     }
 
-    pub fn add_tcp_frontend(
-        &mut self,
-        cluster_id: &str,
-        address: SocketAddr,
-    ) -> Result<(), anyhow::Error> {
-        self.order_command(ProxyRequestData::AddTcpFrontend(TcpFrontend {
-            cluster_id: String::from(cluster_id),
-            address,
-        }))
-    }
-
-    pub fn remove_tcp_frontend(
-        &mut self,
-        cluster_id: &str,
-        address: SocketAddr,
-    ) -> Result<(), anyhow::Error> {
-        self.order_command(ProxyRequestData::RemoveTcpFrontend(TcpFrontend {
-            cluster_id: String::from(cluster_id),
-            address,
-        }))
+    pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> Result<(), anyhow::Error> {
+        match cmd {
+            TcpFrontendCmd::Add { id, address } => {
+                self.order_command(ProxyRequestData::AddTcpFrontend(TcpFrontend {
+                    cluster_id: String::from(id),
+                    address,
+                }))
+            }
+            TcpFrontendCmd::Remove { id, address } => {
+                self.order_command(ProxyRequestData::RemoveTcpFrontend(TcpFrontend {
+                    cluster_id: String::from(id),
+                    address,
+                }))
+            }
+        }
     }
 
     pub fn http_frontend_command(&mut self, cmd: HttpFrontendCmd) -> Result<(), anyhow::Error> {

@@ -76,12 +76,7 @@ impl CommandManager {
             SubCmd::Frontend { cmd } => match cmd {
                 FrontendCmd::Http { cmd } => self.http_frontend_command(cmd),
                 FrontendCmd::Https { cmd } => self.https_frontend_command(cmd),
-                FrontendCmd::Tcp { cmd } => match cmd {
-                    TcpFrontendCmd::Add { id, address } => self.add_tcp_frontend(&id, address),
-                    TcpFrontendCmd::Remove { id, address } => {
-                        self.remove_tcp_frontend(&id, address)
-                    }
-                },
+                FrontendCmd::Tcp { cmd } => self.tcp_frontend_command(cmd),
                 FrontendCmd::List {
                     http,
                     https,
