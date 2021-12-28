@@ -4,8 +4,8 @@ use sozu_command_lib::{
         FrontendFilters, RunState, WorkerInfo,
     },
     proxy::{
-        MetricsConfiguration, ProxyRequestData, Query, QueryAnswer, QueryAnswerCertificate,
-        QueryApplicationDomain, QueryApplicationType, QueryCertificateType, QueryMetricsType,
+        MetricsConfiguration, ProxyRequestData, Query, QueryApplicationDomain,
+        QueryApplicationType, QueryCertificateType, QueryMetricsType,
     },
 };
 
@@ -14,7 +14,8 @@ use crate::{
     ctl::{
         create_channel,
         display::{
-            print_frontend_list, print_json_response, print_metrics, print_query_response_data,
+            print_certificates, print_frontend_list, print_json_response, print_metrics,
+            print_query_response_data,
         },
         CommandManager,
     },
@@ -771,57 +772,7 @@ impl CommandManager {
             }
             CommandStatus::Ok => {
                 if let Some(CommandResponseData::Query(data)) = message.data {
-                    if json {
-                        print_json_response(&data)?;
-                        return Ok(());
-                    }
-
-                    //println!("received: {:?}", data);
-                    let it = data.iter().map(|(k, v)| match v {
-                        QueryAnswer::Certificates(c) => (k, c),
-                        v => {
-                            eprintln!("unexpected certificates query answer: {:?}", v);
-                            exit(1);
-                        }
-                    });
-
-                    for (k, v) in it {
-                        println!("process '{}':", k);
-
-                        match v {
-                            QueryAnswerCertificate::All(h) => {
-                                for (addr, h2) in h.iter() {
-                                    println!("\t{}:", addr);
-
-                                    for (domain, fingerprint) in h2.iter() {
-                                        println!("\t\t{}:\t{}", domain, hex::encode(fingerprint));
-                                    }
-
-                                    println!("");
-                                }
-                            }
-                            QueryAnswerCertificate::Domain(h) => {
-                                for (addr, opt) in h.iter() {
-                                    println!("\t{}:", addr);
-                                    if let Some((key, fingerprint)) = opt {
-                                        println!("\t\t{}:\t{}", key, hex::encode(fingerprint));
-                                    } else {
-                                        println!("\t\tnot found");
-                                    }
-
-                                    println!("");
-                                }
-                            }
-                            QueryAnswerCertificate::Fingerprint(opt) => {
-                                if let Some((s, v)) = opt {
-                                    println!("\tfrontends: {:?}\ncertificate:\n{}", v, s);
-                                } else {
-                                    println!("\tnot found");
-                                }
-                            }
-                        }
-                        println!("");
-                    }
+                    print_certificates(data, json)?;
                 } else {
                     bail!("unexpected response: {:?}", message.data);
                 }

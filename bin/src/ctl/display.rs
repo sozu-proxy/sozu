@@ -1,11 +1,14 @@
-use anyhow::{self, Context};
+use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 use sozu_command_lib::{
     command::{CommandResponseData, ListedFrontends},
-    proxy::{FilteredData, QueryAnswer, QueryAnswerMetrics, Route},
+    proxy::{FilteredData, QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics, Route},
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    process::exit,
+};
 
 pub fn print_frontend_list(frontends: ListedFrontends) {
     trace!(" We received this frontends to display {:#?}", frontends);
@@ -494,6 +497,61 @@ pub fn print_query_response_data(
 
             table.printstd();
         }
+    }
+    Ok(())
+}
+
+pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> anyhow::Result<()> {
+    if json {
+        print_json_response(&data)?;
+        return Ok(());
+    }
+
+    //println!("received: {:?}", data);
+    let it = data.iter().map(|(k, v)| match v {
+        QueryAnswer::Certificates(c) => (k, c),
+        v => {
+            eprintln!("unexpected certificates query answer: {:?}", v);
+            exit(1);
+        }
+    });
+
+    for (k, v) in it {
+        println!("process '{}':", k);
+
+        match v {
+            QueryAnswerCertificate::All(h) => {
+                for (addr, h2) in h.iter() {
+                    println!("\t{}:", addr);
+
+                    for (domain, fingerprint) in h2.iter() {
+                        println!("\t\t{}:\t{}", domain, hex::encode(fingerprint));
+                    }
+
+                    println!("");
+                }
+            }
+            QueryAnswerCertificate::Domain(h) => {
+                for (addr, opt) in h.iter() {
+                    println!("\t{}:", addr);
+                    if let Some((key, fingerprint)) = opt {
+                        println!("\t\t{}:\t{}", key, hex::encode(fingerprint));
+                    } else {
+                        println!("\t\tnot found");
+                    }
+
+                    println!("");
+                }
+            }
+            QueryAnswerCertificate::Fingerprint(opt) => {
+                if let Some((s, v)) = opt {
+                    println!("\tfrontends: {:?}\ncertificate:\n{}", v, s);
+                } else {
+                    println!("\tnot found");
+                }
+            }
+        }
+        println!("");
     }
     Ok(())
 }
