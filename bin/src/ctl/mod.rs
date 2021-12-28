@@ -72,20 +72,7 @@ impl CommandManager {
             },
             SubCmd::Reload { file, json } => self.reload_configuration(file, json),
             SubCmd::Application { cmd } => self.application_command(cmd),
-            SubCmd::Backend { cmd } => match cmd {
-                BackendCmd::Add {
-                    id,
-                    backend_id,
-                    address,
-                    sticky_id,
-                    backup,
-                } => self.add_backend(&id, &backend_id, address, sticky_id, backup),
-                BackendCmd::Remove {
-                    id,
-                    backend_id,
-                    address,
-                } => self.remove_backend(&id, &backend_id, address),
-            },
+            SubCmd::Backend { cmd } => self.backend_command(cmd),
             SubCmd::Frontend { cmd } => match cmd {
                 FrontendCmd::Http { cmd } => self.http_frontend_command(cmd),
                 FrontendCmd::Https { cmd } => self.https_frontend_command(cmd),

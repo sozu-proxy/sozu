@@ -20,7 +20,7 @@ use anyhow::{bail, Context};
 use std::{net::SocketAddr, process::exit};
 
 use crate::{
-    cli::{ApplicationCmd, HttpFrontendCmd, LoggingLevel, MetricsCmd},
+    cli::{ApplicationCmd, BackendCmd, HttpFrontendCmd, LoggingLevel, MetricsCmd},
     ctl::{
         create_channel,
         display::{
@@ -32,35 +32,32 @@ use crate::{
 };
 
 impl CommandManager {
-    pub fn add_backend(
-        &mut self,
-        cluster_id: &str,
-        backend_id: &str,
-        address: SocketAddr,
-        sticky_id: Option<String>,
-        backup: Option<bool>,
-    ) -> Result<(), anyhow::Error> {
-        self.order_command(ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from(cluster_id),
-            address: address,
-            backend_id: String::from(backend_id),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: sticky_id,
-            backup: backup,
-        }))
-    }
-
-    pub fn remove_backend(
-        &mut self,
-        cluster_id: &str,
-        backend_id: &str,
-        address: SocketAddr,
-    ) -> Result<(), anyhow::Error> {
-        self.order_command(ProxyRequestData::RemoveBackend(RemoveBackend {
-            cluster_id: String::from(cluster_id),
-            address: address,
-            backend_id: String::from(backend_id),
-        }))
+    pub fn backend_command(&mut self, cmd: BackendCmd) -> Result<(), anyhow::Error> {
+        match cmd {
+            BackendCmd::Add {
+                id,
+                backend_id,
+                address,
+                sticky_id,
+                backup,
+            } => self.order_command(ProxyRequestData::AddBackend(Backend {
+                cluster_id: String::from(id),
+                address,
+                backend_id,
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id,
+                backup,
+            })),
+            BackendCmd::Remove {
+                id,
+                backend_id,
+                address,
+            } => self.order_command(ProxyRequestData::RemoveBackend(RemoveBackend {
+                cluster_id: String::from(id),
+                address,
+                backend_id,
+            })),
+        }
     }
 
     pub fn application_command(&mut self, cmd: ApplicationCmd) -> Result<(), anyhow::Error> {
