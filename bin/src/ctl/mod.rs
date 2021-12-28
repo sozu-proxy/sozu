@@ -1,5 +1,6 @@
 mod command;
 mod display;
+mod request_builder;
 
 use crate::{
     cli::{self, *},
