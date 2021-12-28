@@ -111,38 +111,7 @@ impl CommandManager {
                         self.deactivate_listener(address, ListenerType::HTTP)
                     }
                 },
-                ListenerCmd::Https { cmd } => match cmd {
-                    HttpsListenerCmd::Add {
-                        address,
-                        public_address,
-                        answer_404,
-                        answer_503,
-                        tls_versions,
-                        cipher_list,
-                        rustls_cipher_list,
-                        expect_proxy,
-                        sticky_name,
-                    } => self.add_https_listener(
-                        address,
-                        public_address,
-                        answer_404,
-                        answer_503,
-                        tls_versions,
-                        cipher_list,
-                        rustls_cipher_list,
-                        expect_proxy,
-                        sticky_name,
-                    ),
-                    HttpsListenerCmd::Remove { address } => {
-                        self.remove_listener(address, ListenerType::HTTPS)
-                    }
-                    HttpsListenerCmd::Activate { address } => {
-                        self.activate_listener(address, ListenerType::HTTPS)
-                    }
-                    HttpsListenerCmd::Deactivate { address } => {
-                        self.deactivate_listener(address, ListenerType::HTTPS)
-                    }
-                },
+                ListenerCmd::Https { cmd } => self.https_listener_command(cmd),
                 ListenerCmd::Tcp { cmd } => match cmd {
                     TcpListenerCmd::Add {
                         address,
