@@ -6,7 +6,6 @@ use sozu_command_lib::{
     proxy::{
         MetricsConfiguration, ProxyRequestData, Query, QueryAnswer, QueryAnswerCertificate,
         QueryApplicationDomain, QueryApplicationType, QueryCertificateType, QueryMetricsType,
-        Route,
     },
 };
 
@@ -15,15 +14,14 @@ use crate::{
     ctl::{
         create_channel,
         display::{
-            create_queried_application_table, print_frontend_list, print_json_response,
-            print_query_answers, print_query_response_data,
+            print_frontend_list, print_json_response, print_metrics, print_query_response_data,
         },
         CommandManager,
     },
 };
 
 use anyhow::{self, bail, Context};
-use prettytable::{Row, Table};
+use prettytable::Table;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use std::{
     collections::{HashMap, HashSet},
@@ -892,7 +890,7 @@ impl CommandManager {
                 }
                 CommandStatus::Ok => {
                     if let Some(CommandResponseData::Query(answers)) = message.data {
-                        print_query_answers(answers, json, list)?;
+                        print_metrics(answers, json, list)?;
                     }
                 }
             }

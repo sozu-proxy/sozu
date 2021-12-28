@@ -61,7 +61,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
     }
 }
 
-pub fn print_query_answers(
+pub fn print_metrics(
     answers: BTreeMap<String, QueryAnswer>,
     json: bool,
     list: bool,
@@ -125,16 +125,7 @@ pub fn print_query_answers(
         })
         .collect::<BTreeMap<_, _>>();
 
-    print_metrics("Result", &answers);
-    Ok(())
-}
-
-// input: map worker_id -> (map key -> value)
-pub fn print_metrics(
-    table_name: &str,
-    b_tree_map: &BTreeMap<String, BTreeMap<String, FilteredData>>,
-) {
-    let mut metrics = b_tree_map
+    let mut metrics = answers
         .values()
         .flat_map(|map| {
             map.iter().filter_map(|(k, v)| match v {
@@ -153,15 +144,15 @@ pub fn print_metrics(
         let mut table = Table::new();
         table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
 
-        let mut row = vec![cell!(table_name)];
-        for key in b_tree_map.keys() {
+        let mut row = vec![cell!("Result")];
+        for key in answers.keys() {
             row.push(cell!(key));
         }
         table.set_titles(Row::new(row));
 
         for metric in metrics {
             let mut row = vec![cell!(metric)];
-            for worker_data in b_tree_map.values() {
+            for worker_data in answers.values() {
                 match worker_data.get(metric) {
                     Some(FilteredData::Count(c)) => row.push(cell!(c)),
                     Some(FilteredData::Gauge(c)) => row.push(cell!(c)),
@@ -174,7 +165,7 @@ pub fn print_metrics(
         table.printstd();
     }
 
-    let mut time_metrics = b_tree_map
+    let mut time_metrics = answers
         .values()
         .flat_map(|map| {
             map.iter().filter_map(|(k, v)| match v {
@@ -193,8 +184,8 @@ pub fn print_metrics(
         let mut timing_table = Table::new();
         timing_table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
 
-        let mut row = vec![cell!(table_name)];
-        for key in b_tree_map.keys() {
+        let mut row = vec![cell!("Results")];
+        for key in answers.keys() {
             row.push(cell!(key));
         }
         timing_table.set_titles(Row::new(row));
@@ -209,7 +200,7 @@ pub fn print_metrics(
             let mut row_p99_999 = vec![cell!(format!("{}.p99.999", metric))];
             let mut row_p100 = vec![cell!(format!("{}.p100", metric))];
 
-            for worker_data in b_tree_map.values() {
+            for worker_data in answers.values() {
                 match worker_data.get(metric) {
                     Some(FilteredData::Percentiles(p)) => {
                         row_samples.push(cell!(p.samples));
@@ -245,6 +236,7 @@ pub fn print_metrics(
 
         timing_table.printstd();
     }
+    Ok(())
 }
 
 pub fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), anyhow::Error> {
