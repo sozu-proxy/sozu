@@ -20,7 +20,10 @@ use crate::{
     cli::{HttpFrontendCmd, LoggingLevel, MetricsCmd},
     ctl::{
         create_channel,
-        display::{create_queried_application_table, print_json_response, print_query_answers},
+        display::{
+            create_queried_application_table, print_frontend_list, print_json_response,
+            print_query_answers,
+        },
         CommandManager,
     },
 };
@@ -906,58 +909,8 @@ impl CommandManager {
             CommandStatus::Ok => {
                 debug!("We received this response: {:?}", message.data);
 
-                if let Some(CommandResponseData::FrontendList(data)) = message.data {
-                    trace!(" We received this data to display {:#?}", data);
-                    // HTTP frontends
-                    if !data.http_frontends.is_empty() {
-                        let mut table = Table::new();
-                        table.add_row(row!["HTTP frontends"]);
-                        table.add_row(row![
-                            "route", "address", "hostname", "path", "method", "position"
-                        ]);
-                        for http_frontend in data.http_frontends.iter() {
-                            table.add_row(row!(
-                                http_frontend.route,
-                                http_frontend.address.to_string(),
-                                http_frontend.hostname.to_string(),
-                                format!("{:?}", http_frontend.path),
-                                format!("{:?}", http_frontend.method),
-                                format!("{:?}", http_frontend.position),
-                            ));
-                        }
-                        table.printstd();
-                    }
-
-                    // HTTPS frontends
-                    if !data.https_frontends.is_empty() {
-                        let mut table = Table::new();
-                        table.add_row(row!["HTTPS frontends"]);
-                        table.add_row(row![
-                            "route", "address", "hostname", "path", "method", "position"
-                        ]);
-                        for https_frontend in data.https_frontends.iter() {
-                            table.add_row(row!(
-                                https_frontend.route,
-                                https_frontend.address.to_string(),
-                                https_frontend.hostname.to_string(),
-                                format!("{:?}", https_frontend.path),
-                                format!("{:?}", https_frontend.method),
-                                format!("{:?}", https_frontend.position),
-                            ));
-                        }
-                        table.printstd();
-                    }
-
-                    // TCP frontends
-                    if !data.tcp_frontends.is_empty() {
-                        let mut table = Table::new();
-                        table.add_row(row!["TCP frontends"]);
-                        table.add_row(row!["Cluster ID", "address"]);
-                        for tcp_frontend in data.tcp_frontends.iter() {
-                            table.add_row(row!(tcp_frontend.cluster_id, tcp_frontend.address,));
-                        }
-                        table.printstd();
-                    }
+                if let Some(CommandResponseData::FrontendList(frontends)) = message.data {
+                    print_frontend_list(frontends);
                 }
             }
         }
