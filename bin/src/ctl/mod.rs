@@ -87,22 +87,7 @@ impl CommandManager {
             SubCmd::Listener { cmd } => match cmd {
                 ListenerCmd::Http { cmd } => self.http_listener_command(cmd),
                 ListenerCmd::Https { cmd } => self.https_listener_command(cmd),
-                ListenerCmd::Tcp { cmd } => match cmd {
-                    TcpListenerCmd::Add {
-                        address,
-                        public_address,
-                        expect_proxy,
-                    } => self.add_tcp_listener(address, public_address, expect_proxy),
-                    TcpListenerCmd::Remove { address } => {
-                        self.remove_listener(address, ListenerType::TCP)
-                    }
-                    TcpListenerCmd::Activate { address } => {
-                        self.activate_listener(address, ListenerType::TCP)
-                    }
-                    TcpListenerCmd::Deactivate { address } => {
-                        self.deactivate_listener(address, ListenerType::TCP)
-                    }
-                },
+                ListenerCmd::Tcp { cmd } => self.tcp_listener_command(cmd),
             },
             SubCmd::Certificate { cmd } => match cmd {
                 CertificateCmd::Add {

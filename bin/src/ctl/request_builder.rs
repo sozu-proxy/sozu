@@ -22,7 +22,7 @@ use std::{net::SocketAddr, process::exit};
 use crate::{
     cli::{
         ApplicationCmd, BackendCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd,
-        LoggingLevel, TcpFrontendCmd,
+        LoggingLevel, TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::{
         create_channel,
@@ -263,20 +263,28 @@ impl CommandManager {
         }
     }
 
-    pub fn add_tcp_listener(
-        &mut self,
-        address: SocketAddr,
-        public_address: Option<SocketAddr>,
-        expect_proxy: bool,
-    ) -> Result<(), anyhow::Error> {
-        self.order_command(ProxyRequestData::AddTcpListener(TcpListener {
-            address,
-            public_address,
-            expect_proxy,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-        }))
+    pub fn tcp_listener_command(&mut self, cmd: TcpListenerCmd) -> Result<(), anyhow::Error> {
+        match cmd {
+            TcpListenerCmd::Add {
+                address,
+                public_address,
+                expect_proxy,
+            } => self.order_command(ProxyRequestData::AddTcpListener(TcpListener {
+                address,
+                public_address,
+                expect_proxy,
+                front_timeout: 60,
+                back_timeout: 30,
+                connect_timeout: 3,
+            })),
+            TcpListenerCmd::Remove { address } => self.remove_listener(address, ListenerType::TCP),
+            TcpListenerCmd::Activate { address } => {
+                self.activate_listener(address, ListenerType::TCP)
+            }
+            TcpListenerCmd::Deactivate { address } => {
+                self.deactivate_listener(address, ListenerType::TCP)
+            }
+        }
     }
 
     pub fn remove_listener(
