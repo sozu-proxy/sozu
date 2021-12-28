@@ -59,10 +59,7 @@ impl CommandManager {
                 }
             }
             SubCmd::Upgrade { worker: None } => self.upgrade_main(),
-            SubCmd::Upgrade { worker: Some(id) } => {
-                self.upgrade_worker(id)?;
-                Ok(())
-            }
+            SubCmd::Upgrade { worker: Some(id) } => self.upgrade_worker(id),
             SubCmd::Status { json } => self.status(json),
             SubCmd::Metrics { cmd } => self.metrics(cmd),
             SubCmd::Logging { level } => self.logging_filter(&level),
@@ -105,66 +102,8 @@ impl CommandManager {
                 } => self.remove_backend(&id, &backend_id, address),
             },
             SubCmd::Frontend { cmd } => match cmd {
-                FrontendCmd::Http { cmd } => match cmd {
-                    HttpFrontendCmd::Add {
-                        hostname,
-                        path_begin,
-                        address,
-                        method,
-                        route,
-                    } => self.add_http_frontend(
-                        route.into(),
-                        address,
-                        &hostname,
-                        &path_begin.unwrap_or("".to_string()),
-                        method.as_deref(),
-                        false,
-                    ),
-                    HttpFrontendCmd::Remove {
-                        hostname,
-                        path_begin,
-                        address,
-                        method,
-                        route,
-                    } => self.remove_http_frontend(
-                        route.into(),
-                        address,
-                        &hostname,
-                        &path_begin.unwrap_or("".to_string()),
-                        method.as_deref(),
-                        false,
-                    ),
-                },
-                FrontendCmd::Https { cmd } => match cmd {
-                    HttpFrontendCmd::Add {
-                        hostname,
-                        path_begin,
-                        address,
-                        method,
-                        route,
-                    } => self.add_http_frontend(
-                        route.into(),
-                        address,
-                        &hostname,
-                        &path_begin.unwrap_or("".to_string()),
-                        method.as_deref(),
-                        true,
-                    ),
-                    HttpFrontendCmd::Remove {
-                        hostname,
-                        path_begin,
-                        address,
-                        method,
-                        route,
-                    } => self.remove_http_frontend(
-                        route.into(),
-                        address,
-                        &hostname,
-                        &path_begin.unwrap_or("".to_string()),
-                        method.as_deref(),
-                        true,
-                    ),
-                },
+                FrontendCmd::Http { cmd } => self.http_frontend_command(cmd),
+                FrontendCmd::Https { cmd } => self.https_frontend_command(cmd),
                 FrontendCmd::Tcp { cmd } => match cmd {
                     TcpFrontendCmd::Add { id, address } => self.add_tcp_frontend(&id, address),
                     TcpFrontendCmd::Remove { id, address } => {

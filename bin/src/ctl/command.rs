@@ -18,6 +18,7 @@ use sozu_command_lib::{
 };
 
 use super::{create_channel, CommandManager};
+use crate::cli::HttpFrontendCmd;
 use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
@@ -645,63 +646,70 @@ impl CommandManager {
         })
     }
 
-    pub fn add_http_frontend(
-        &mut self,
-        route: Route,
-        address: SocketAddr,
-        hostname: &str,
-        path: &str,
-        method: Option<&str>,
-        https: bool,
-    ) -> Result<(), anyhow::Error> {
-        if https {
-            self.order_command(ProxyRequestData::AddHttpsFrontend(HttpFrontend {
+    pub fn http_frontend_command(&mut self, cmd: HttpFrontendCmd) -> Result<(), anyhow::Error> {
+        match cmd {
+            HttpFrontendCmd::Add {
+                hostname,
+                path_begin,
+                address,
+                method,
                 route,
+            } => self.order_command(ProxyRequestData::AddHttpFrontend(HttpFrontend {
+                route: route.into(),
                 address,
                 hostname: String::from(hostname),
-                path: PathRule::Prefix(String::from(path)),
+                path: PathRule::Prefix(String::from(&path_begin.unwrap_or("".to_string()))),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
-            }))
-        } else {
-            self.order_command(ProxyRequestData::AddHttpFrontend(HttpFrontend {
+            })),
+
+            HttpFrontendCmd::Remove {
+                hostname,
+                path_begin,
+                address,
+                method,
                 route,
+            } => self.order_command(ProxyRequestData::RemoveHttpFrontend(HttpFrontend {
+                route: route.into(),
                 address,
                 hostname: String::from(hostname),
-                path: PathRule::Prefix(String::from(path)),
+                path: PathRule::Prefix(String::from(&path_begin.unwrap_or("".to_string()))),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
-            }))
+            })),
         }
     }
 
-    pub fn remove_http_frontend(
-        &mut self,
-        route: Route,
-        address: SocketAddr,
-        hostname: &str,
-        path: &str,
-        method: Option<&str>,
-        https: bool,
-    ) -> Result<(), anyhow::Error> {
-        if https {
-            self.order_command(ProxyRequestData::RemoveHttpsFrontend(HttpFrontend {
+    pub fn https_frontend_command(&mut self, cmd: HttpFrontendCmd) -> Result<(), anyhow::Error> {
+        match cmd {
+            HttpFrontendCmd::Add {
+                hostname,
+                path_begin,
+                address,
+                method,
                 route,
+            } => self.order_command(ProxyRequestData::AddHttpsFrontend(HttpFrontend {
+                route: route.into(),
                 address,
                 hostname: String::from(hostname),
-                path: PathRule::Prefix(String::from(path)),
+                path: PathRule::Prefix(String::from(path_begin.unwrap_or("".to_string()))),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
-            }))
-        } else {
-            self.order_command(ProxyRequestData::RemoveHttpFrontend(HttpFrontend {
+            })),
+            HttpFrontendCmd::Remove {
+                hostname,
+                path_begin,
+                address,
+                method,
                 route,
+            } => self.order_command(ProxyRequestData::RemoveHttpsFrontend(HttpFrontend {
+                route: route.into(),
                 address,
                 hostname: String::from(hostname),
-                path: PathRule::Prefix(String::from(path)),
+                path: PathRule::Prefix(String::from(path_begin.unwrap_or("".to_string()))),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
-            }))
+            })),
         }
     }
 
@@ -1107,7 +1115,6 @@ impl CommandManager {
         if id != message.id {
             bail!("received message with invalid id: {:?}", message);
         }
-      
         match message.status {
             CommandStatus::Processing => {
                 // do nothing here
