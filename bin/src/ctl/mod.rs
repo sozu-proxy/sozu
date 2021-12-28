@@ -1,4 +1,5 @@
 mod command;
+mod display;
 
 use crate::{
     cli::{self, *},
