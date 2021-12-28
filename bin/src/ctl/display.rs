@@ -1,12 +1,83 @@
 use anyhow::{self, Context};
 use prettytable::{Row, Table};
-use sozu_command_lib::proxy::{FilteredData, QueryAnswer};
+use sozu_command_lib::proxy::{FilteredData, QueryAnswer, QueryAnswerMetrics};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+pub fn print_query_answers(
+    answers: BTreeMap<String, QueryAnswer>,
+    json: bool,
+    list: bool,
+) -> anyhow::Result<()> {
+    if json {
+        return print_json_response(&answers);
+    }
+
+    //println!("got answers: {:#?}", answers);
+    if list {
+        let metrics: HashSet<_> = answers
+            .values()
+            .filter_map(|value| match value {
+                QueryAnswer::Metrics(QueryAnswerMetrics::List(v)) => Some(v.iter()),
+                _ => None,
+            })
+            .flatten()
+            .map(|s| s.replace("\t", "."))
+            .collect();
+        let mut metrics: Vec<_> = metrics.iter().collect();
+        metrics.sort();
+        println!("available metrics: {:?}", metrics);
+        return Ok(());
+    }
+
+    let answers = answers
+        .iter()
+        .filter_map(|(key, value)| match value {
+            QueryAnswer::Metrics(QueryAnswerMetrics::Cluster(d)) => {
+                let mut metrics = BTreeMap::new();
+                for (cluster_id, cluster_metrics) in d.iter() {
+                    for (metric_key, value) in cluster_metrics.iter() {
+                        metrics.insert(
+                            format!("{} {}", cluster_id, metric_key.replace("\t", ".")),
+                            value.clone(),
+                        );
+                    }
+                }
+                Some((key.clone(), metrics))
+            }
+            QueryAnswer::Metrics(QueryAnswerMetrics::Backend(d)) => {
+                let mut metrics = BTreeMap::new();
+                for (cluster_id, cluster_metrics) in d.iter() {
+                    for (backend_id, backend_metrics) in cluster_metrics.iter() {
+                        for (metric_key, value) in backend_metrics.iter() {
+                            metrics.insert(
+                                format!(
+                                    "{}/{} {}",
+                                    cluster_id,
+                                    backend_id,
+                                    metric_key.replace("\t", ".")
+                                ),
+                                value.clone(),
+                            );
+                        }
+                    }
+                }
+                Some((key.clone(), metrics))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    print_metrics("Result", &answers);
+    Ok(())
+}
+
 // input: map worker_id -> (map key -> value)
-pub fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, FilteredData>>) {
-    let mut metrics = data
+pub fn print_metrics(
+    table_name: &str,
+    b_tree_map: &BTreeMap<String, BTreeMap<String, FilteredData>>,
+) {
+    let mut metrics = b_tree_map
         .values()
         .flat_map(|map| {
             map.iter().filter_map(|(k, v)| match v {
@@ -26,14 +97,14 @@ pub fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, 
         table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
 
         let mut row = vec![cell!(table_name)];
-        for key in data.keys() {
+        for key in b_tree_map.keys() {
             row.push(cell!(key));
         }
         table.set_titles(Row::new(row));
 
         for metric in metrics {
             let mut row = vec![cell!(metric)];
-            for worker_data in data.values() {
+            for worker_data in b_tree_map.values() {
                 match worker_data.get(metric) {
                     Some(FilteredData::Count(c)) => row.push(cell!(c)),
                     Some(FilteredData::Gauge(c)) => row.push(cell!(c)),
@@ -46,7 +117,7 @@ pub fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, 
         table.printstd();
     }
 
-    let mut time_metrics = data
+    let mut time_metrics = b_tree_map
         .values()
         .flat_map(|map| {
             map.iter().filter_map(|(k, v)| match v {
@@ -66,7 +137,7 @@ pub fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, 
         timing_table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
 
         let mut row = vec![cell!(table_name)];
-        for key in data.keys() {
+        for key in b_tree_map.keys() {
             row.push(cell!(key));
         }
         timing_table.set_titles(Row::new(row));
@@ -81,7 +152,7 @@ pub fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, 
             let mut row_p99_999 = vec![cell!(format!("{}.p99.999", metric))];
             let mut row_p100 = vec![cell!(format!("{}.p100", metric))];
 
-            for worker_data in data.values() {
+            for worker_data in b_tree_map.values() {
                 match worker_data.get(metric) {
                     Some(FilteredData::Percentiles(p)) => {
                         row_samples.push(cell!(p.samples));

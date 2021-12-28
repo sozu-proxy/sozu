@@ -20,7 +20,7 @@ use crate::{
     cli::{HttpFrontendCmd, LoggingLevel, MetricsCmd},
     ctl::{
         create_channel,
-        display::{print_json_response, print_metrics, create_queried_application_table},
+        display::{create_queried_application_table, print_json_response, print_query_answers},
         CommandManager,
     },
 };
@@ -230,6 +230,9 @@ impl CommandManager {
         Ok(())
     }
 
+    // 1. Request a list of workers
+    // 2. Send an UpgradeMain
+    // 3. Send an UpgradeWorker to each worker
     pub fn upgrade_main(&mut self) -> Result<(), anyhow::Error> {
         println!("Preparing to upgrade proxy...");
 
@@ -1548,73 +1551,8 @@ impl CommandManager {
                     }
                 }
                 CommandStatus::Ok => {
-                    if let Some(CommandResponseData::Query(data)) = message.data {
-                        if json {
-                            return print_json_response(&data);
-                        }
-
-                        //println!("got data: {:#?}", data);
-                        if list {
-                            let metrics: HashSet<_> = data
-                                .values()
-                                .filter_map(|value| match value {
-                                    QueryAnswer::Metrics(QueryAnswerMetrics::List(v)) => {
-                                        Some(v.iter())
-                                    }
-                                    _ => None,
-                                })
-                                .flatten()
-                                .map(|s| s.replace("\t", "."))
-                                .collect();
-                            let mut metrics: Vec<_> = metrics.iter().collect();
-                            metrics.sort();
-                            println!("available metrics: {:?}", metrics);
-                            return Ok(());
-                        }
-
-                        let data = data
-                            .iter()
-                            .filter_map(|(key, value)| match value {
-                                QueryAnswer::Metrics(QueryAnswerMetrics::Cluster(d)) => {
-                                    let mut metrics = BTreeMap::new();
-                                    for (cluster_id, cluster_metrics) in d.iter() {
-                                        for (metric_key, value) in cluster_metrics.iter() {
-                                            metrics.insert(
-                                                format!(
-                                                    "{} {}",
-                                                    cluster_id,
-                                                    metric_key.replace("\t", ".")
-                                                ),
-                                                value.clone(),
-                                            );
-                                        }
-                                    }
-                                    Some((key.clone(), metrics))
-                                }
-                                QueryAnswer::Metrics(QueryAnswerMetrics::Backend(d)) => {
-                                    let mut metrics = BTreeMap::new();
-                                    for (cluster_id, cluster_metrics) in d.iter() {
-                                        for (backend_id, backend_metrics) in cluster_metrics.iter()
-                                        {
-                                            for (metric_key, value) in backend_metrics.iter() {
-                                                metrics.insert(
-                                                    format!(
-                                                        "{}/{} {}",
-                                                        cluster_id,
-                                                        backend_id,
-                                                        metric_key.replace("\t", ".")
-                                                    ),
-                                                    value.clone(),
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Some((key.clone(), metrics))
-                                }
-                                _ => None,
-                            })
-                            .collect::<BTreeMap<_, _>>();
-                        print_metrics("Result", &data);
+                    if let Some(CommandResponseData::Query(answers)) = message.data {
+                        print_query_answers(answers, json, list);
                     }
                 }
             }
