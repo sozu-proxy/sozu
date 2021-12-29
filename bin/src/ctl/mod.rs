@@ -1,4 +1,6 @@
 mod command;
+mod display;
+mod request_builder;
 
 use crate::{
     cli::{self, *},
@@ -9,7 +11,6 @@ use sozu_command_lib::{
     channel::Channel,
     command::{CommandRequest, CommandResponse},
     config::Config,
-    proxy::ListenerType,
 };
 use std::time::Duration;
 
@@ -59,10 +60,7 @@ impl CommandManager {
                 }
             }
             SubCmd::Upgrade { worker: None } => self.upgrade_main(),
-            SubCmd::Upgrade { worker: Some(id) } => {
-                self.upgrade_worker(id)?;
-                Ok(())
-            }
+            SubCmd::Upgrade { worker: Some(id) } => self.upgrade_worker(id),
             SubCmd::Status { json } => self.status(json),
             SubCmd::Metrics { cmd } => self.metrics(cmd),
             SubCmd::Logging { level } => self.logging_filter(&level),
@@ -72,105 +70,12 @@ impl CommandManager {
                 StateCmd::Dump { json } => self.dump_state(json),
             },
             SubCmd::Reload { file, json } => self.reload_configuration(file, json),
-            SubCmd::Application { cmd } => match cmd {
-                ApplicationCmd::Add {
-                    id,
-                    sticky_session,
-                    https_redirect,
-                    send_proxy,
-                    expect_proxy,
-                    load_balancing_policy,
-                } => self.add_application(
-                    &id,
-                    sticky_session,
-                    https_redirect,
-                    send_proxy,
-                    expect_proxy,
-                    load_balancing_policy,
-                ),
-                ApplicationCmd::Remove { id } => self.remove_application(&id),
-            },
-            SubCmd::Backend { cmd } => match cmd {
-                BackendCmd::Add {
-                    id,
-                    backend_id,
-                    address,
-                    sticky_id,
-                    backup,
-                } => self.add_backend(&id, &backend_id, address, sticky_id, backup),
-                BackendCmd::Remove {
-                    id,
-                    backend_id,
-                    address,
-                } => self.remove_backend(&id, &backend_id, address),
-            },
+            SubCmd::Application { cmd } => self.application_command(cmd),
+            SubCmd::Backend { cmd } => self.backend_command(cmd),
             SubCmd::Frontend { cmd } => match cmd {
-                FrontendCmd::Http { cmd } => match cmd {
-                    HttpFrontendCmd::Add {
-                        hostname,
-                        path_begin,
-                        address,
-                        method,
-                        route,
-                    } => self.add_http_frontend(
-                        route.into(),
-                        address,
-                        &hostname,
-                        &path_begin.unwrap_or("".to_string()),
-                        method.as_deref(),
-                        false,
-                    ),
-                    HttpFrontendCmd::Remove {
-                        hostname,
-                        path_begin,
-                        address,
-                        method,
-                        route,
-                    } => self.remove_http_frontend(
-                        route.into(),
-                        address,
-                        &hostname,
-                        &path_begin.unwrap_or("".to_string()),
-                        method.as_deref(),
-                        false,
-                    ),
-                },
-                FrontendCmd::Https { cmd } => match cmd {
-                    HttpFrontendCmd::Add {
-                        hostname,
-                        path_begin,
-                        address,
-                        method,
-                        route,
-                    } => self.add_http_frontend(
-                        route.into(),
-                        address,
-                        &hostname,
-                        &path_begin.unwrap_or("".to_string()),
-                        method.as_deref(),
-                        true,
-                    ),
-                    HttpFrontendCmd::Remove {
-                        hostname,
-                        path_begin,
-                        address,
-                        method,
-                        route,
-                    } => self.remove_http_frontend(
-                        route.into(),
-                        address,
-                        &hostname,
-                        &path_begin.unwrap_or("".to_string()),
-                        method.as_deref(),
-                        true,
-                    ),
-                },
-                FrontendCmd::Tcp { cmd } => match cmd {
-                    TcpFrontendCmd::Add { id, address } => self.add_tcp_frontend(&id, address),
-                    TcpFrontendCmd::Remove { id, address } => {
-                        self.remove_tcp_frontend(&id, address)
-                    }
-                },
+                FrontendCmd::Http { cmd } => self.http_frontend_command(cmd),
+                FrontendCmd::Https { cmd } => self.https_frontend_command(cmd),
+                FrontendCmd::Tcp { cmd } => self.tcp_frontend_command(cmd),
                 FrontendCmd::List {
                     http,
                     https,
@@ -179,80 +84,9 @@ impl CommandManager {
                 } => self.list_frontends(http, https, tcp, domain),
             },
             SubCmd::Listener { cmd } => match cmd {
-                ListenerCmd::Http { cmd } => match cmd {
-                    HttpListenerCmd::Add {
-                        address,
-                        public_address,
-                        answer_404,
-                        answer_503,
-                        expect_proxy,
-                        sticky_name,
-                    } => self.add_http_listener(
-                        address,
-                        public_address,
-                        answer_404,
-                        answer_503,
-                        expect_proxy,
-                        sticky_name,
-                    ),
-                    HttpListenerCmd::Remove { address } => {
-                        self.remove_listener(address, ListenerType::HTTP)
-                    }
-                    HttpListenerCmd::Activate { address } => {
-                        self.activate_listener(address, ListenerType::HTTP)
-                    }
-                    HttpListenerCmd::Deactivate { address } => {
-                        self.deactivate_listener(address, ListenerType::HTTP)
-                    }
-                },
-                ListenerCmd::Https { cmd } => match cmd {
-                    HttpsListenerCmd::Add {
-                        address,
-                        public_address,
-                        answer_404,
-                        answer_503,
-                        tls_versions,
-                        cipher_list,
-                        rustls_cipher_list,
-                        expect_proxy,
-                        sticky_name,
-                    } => self.add_https_listener(
-                        address,
-                        public_address,
-                        answer_404,
-                        answer_503,
-                        tls_versions,
-                        cipher_list,
-                        rustls_cipher_list,
-                        expect_proxy,
-                        sticky_name,
-                    ),
-                    HttpsListenerCmd::Remove { address } => {
-                        self.remove_listener(address, ListenerType::HTTPS)
-                    }
-                    HttpsListenerCmd::Activate { address } => {
-                        self.activate_listener(address, ListenerType::HTTPS)
-                    }
-                    HttpsListenerCmd::Deactivate { address } => {
-                        self.deactivate_listener(address, ListenerType::HTTPS)
-                    }
-                },
-                ListenerCmd::Tcp { cmd } => match cmd {
-                    TcpListenerCmd::Add {
-                        address,
-                        public_address,
-                        expect_proxy,
-                    } => self.add_tcp_listener(address, public_address, expect_proxy),
-                    TcpListenerCmd::Remove { address } => {
-                        self.remove_listener(address, ListenerType::TCP)
-                    }
-                    TcpListenerCmd::Activate { address } => {
-                        self.activate_listener(address, ListenerType::TCP)
-                    }
-                    TcpListenerCmd::Deactivate { address } => {
-                        self.deactivate_listener(address, ListenerType::TCP)
-                    }
-                },
+                ListenerCmd::Http { cmd } => self.http_listener_command(cmd),
+                ListenerCmd::Https { cmd } => self.https_listener_command(cmd),
+                ListenerCmd::Tcp { cmd } => self.tcp_listener_command(cmd),
             },
             SubCmd::Certificate { cmd } => match cmd {
                 CertificateCmd::Add {
