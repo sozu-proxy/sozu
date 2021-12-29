@@ -1,20 +1,19 @@
 use std::io::Read;
 
-use super::header::ProxyAddr;
-use super::parser::parse_v2_header;
-use crate::pool::Checkout;
-use crate::protocol::pipe::Pipe;
-use crate::protocol::ProtocolResult;
-use crate::socket::{SocketHandler, SocketResult};
-use crate::sozu_command::ready::Ready;
-use crate::Protocol;
-use crate::Readiness;
-use crate::SessionMetrics;
-use crate::SessionResult;
-use mio::net::TcpStream;
-use mio::*;
+use mio::{net::TcpStream, *};
 use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
+
+use crate::{
+    pool::Checkout,
+    protocol::pipe::Pipe,
+    protocol::ProtocolResult,
+    socket::{SocketHandler, SocketResult},
+    sozu_command::ready::Ready,
+    Protocol, Readiness, SessionMetrics, SessionResult,
+};
+
+use super::{header::ProxyAddr, parser::parse_v2_header};
 
 #[derive(Clone, Copy)]
 pub enum HeaderLen {

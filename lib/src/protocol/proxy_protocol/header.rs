@@ -1,5 +1,7 @@
-use std::fmt;
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::{
+    fmt,
+    net::{SocketAddr, SocketAddrV4, SocketAddrV6},
+};
 
 #[derive(PartialEq, Debug)]
 pub enum ProxyProtocolHeader {

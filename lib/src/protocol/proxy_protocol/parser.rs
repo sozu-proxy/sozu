@@ -1,12 +1,12 @@
+use std::convert::From;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
 use nom::{
     bytes::streaming::{tag, take},
     error::{Error, ErrorKind, ParseError},
     number::streaming::{be_u16, be_u8},
     Err, IResult,
 };
-
-use std::convert::From;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 use crate::protocol::proxy_protocol::header::*;
 
