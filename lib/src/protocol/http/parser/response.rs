@@ -1,10 +1,8 @@
-use crate::buffer_queue::BufferQueue;
-use crate::protocol::http::StickySession;
+use std::{convert::From, str};
 
 use nom::{Err, HexDisplay, IResult, Offset};
 
-use std::convert::From;
-use std::str;
+use crate::{buffer_queue::BufferQueue, protocol::http::StickySession};
 
 use super::{
     crlf, message_header, status_line, BufferMove, Chunk, Connection, Header, HeaderValue,

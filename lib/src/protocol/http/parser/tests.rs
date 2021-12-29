@@ -1,10 +1,15 @@
-use super::*;
+use std::{
+    io::Write,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
+
+use nom::{error::ErrorKind, Err, HexDisplay};
+
 use crate::buffer_queue::{buf_with_capacity, OutputElement};
 #[cfg(test)]
 use crate::protocol::http::AddedRequestHeader;
-use nom::{error::ErrorKind, Err, HexDisplay};
-use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use super::*;
 
 /*
 #[test]
