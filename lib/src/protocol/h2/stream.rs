@@ -1,9 +1,14 @@
-use hpack::Decoder;
-use std::collections::{HashMap, VecDeque};
-use std::str::from_utf8;
+use std::{
+    collections::{HashMap, VecDeque},
+    str::from_utf8,
+};
 
-use super::parser;
-use super::state::{FrameResult, OutputFrame};
+use hpack::Decoder;
+
+use super::{
+    parser,
+    state::{FrameResult, OutputFrame},
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum St {

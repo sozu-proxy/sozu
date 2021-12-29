@@ -1,16 +1,17 @@
 //FIXME: we disallow warnings for the HTTP/2 module temporarily
 #![allow(warnings)]
-use crate::pool::{Checkout, Pool};
-use crate::socket::{SocketHandler, SocketResult};
-use crate::sozu_command::buffer::fixed::Buffer;
-use crate::sozu_command::ready::Ready;
-use crate::{Protocol, Readiness, SessionMetrics, SessionResult};
-use mio::net::TcpStream;
-use mio::*;
+use std::{cell::RefCell, net::SocketAddr, rc::Weak};
+
+use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
-use std::cell::RefCell;
-use std::net::SocketAddr;
-use std::rc::Weak;
+
+use crate::{
+    pool::{Checkout, Pool},
+    socket::{SocketHandler, SocketResult},
+    sozu_command::buffer::fixed::Buffer,
+    sozu_command::ready::Ready,
+    {Protocol, Readiness, SessionMetrics, SessionResult},
+};
 
 mod parser;
 mod serializer;
