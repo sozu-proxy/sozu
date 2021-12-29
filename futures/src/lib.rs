@@ -1,3 +1,8 @@
+use std::{
+    io::{self, Error, ErrorKind},
+    str::from_utf8,
+};
+
 #[macro_use]
 extern crate log;
 extern crate sozu_command_lib as sozu_command;
@@ -5,8 +10,6 @@ extern crate sozu_command_lib as sozu_command;
 use bytes::BytesMut;
 use futures::{SinkExt, TryStreamExt};
 use sozu_command::command::{CommandRequest, CommandResponse, CommandStatus};
-use std::io::{self, Error, ErrorKind};
-use std::str::from_utf8;
 use tokio::net::UnixStream;
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
