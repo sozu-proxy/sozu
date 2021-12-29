@@ -1,8 +1,14 @@
-use crate::pool::{Checkout, Pool};
-use crate::pool_crate::Reset;
-use std::cmp::{max, min};
-use std::io::{self, Write};
-use std::{fmt, str};
+use std::{
+    cmp::{max, min},
+    fmt,
+    io::{self, Write},
+    str,
+};
+
+use crate::{
+    pool::{Checkout, Pool},
+    pool_crate::Reset,
+};
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum InputElement {

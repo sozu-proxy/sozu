@@ -2,11 +2,13 @@
 //!
 //! code imported from mio-extras
 //! License: MIT or Apache 2.0
-use crate::server::TIMER;
+use std::{cmp, iter, u64, usize};
+
 use mio::Token;
 use slab::Slab;
-use std::{cmp, iter, u64, usize};
 use time::{Duration, Instant};
+
+use crate::server::TIMER;
 
 // Conversion utilities
 mod convert {

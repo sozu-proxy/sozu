@@ -6,10 +6,14 @@
 /// Right now, we wrap the `pool` crate, but we might write a different
 /// buffer pool in the future, so this module will still be useful to
 /// test the differences
+use std::{
+    cmp,
+    io::{self, Read, Write},
+    ops, ptr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
 use poule;
-use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{cmp, ops, ptr};
 
 static BUFFER_COUNT: AtomicUsize = AtomicUsize::new(0);
 

@@ -1,9 +1,14 @@
-use libc::types::os::arch::posix88::{off_t, ssize_t};
-use libc::{c_int, c_uint, size_t};
+use std::{
+    io::{Error, ErrorKind},
+    os::unix::io::AsRawFd,
+    ptr,
+};
+
+use libc::{
+    c_int, c_uint, size_t,
+    types::os::arch::posix88::{off_t, ssize_t},
+};
 use mio::tcp::TcpStream;
-use std::io::{Error, ErrorKind};
-use std::os::unix::io::AsRawFd;
-use std::ptr;
 
 const SPLICE_F_NONBLOCK: c_uint = 2;
 extern "C" {
