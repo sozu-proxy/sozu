@@ -1,24 +1,26 @@
 //! parsing data from the configuration file
-use anyhow::{bail, Context};
-use std::collections::{HashMap, HashSet};
-use std::env;
-use std::fs::File;
-use std::io::{self, Error, ErrorKind, Read};
-
-use std::net::SocketAddr;
-use std::path::PathBuf;
-
-use crate::certificate::split_certificate_chain;
-use toml;
-
-use crate::proxy::{
-    ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
-    HttpListener, HttpsListener, ListenerType, LoadBalancingAlgorithms, LoadBalancingParams,
-    LoadMetric, PathRule, ProxyRequestData, Route, RulePosition, TcpFrontend, TcpListener,
-    TlsProvider, TlsVersion,
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    fs::File,
+    io::{self, Error, ErrorKind, Read},
+    net::SocketAddr,
+    path::PathBuf,
 };
 
-use crate::command::{CommandRequest, CommandRequestData, PROTOCOL_VERSION};
+use anyhow::{bail, Context};
+use toml;
+
+use crate::{
+    certificate::split_certificate_chain,
+    command::{CommandRequest, CommandRequestData, PROTOCOL_VERSION},
+    proxy::{
+        ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
+        HttpListener, HttpsListener, ListenerType, LoadBalancingAlgorithms, LoadBalancingParams,
+        LoadMetric, PathRule, ProxyRequestData, Route, RulePosition, TcpFrontend, TcpListener,
+        TlsProvider, TlsVersion,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
