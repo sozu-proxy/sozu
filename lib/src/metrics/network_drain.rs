@@ -1,14 +1,17 @@
-use super::writer::{MetricSocket, MetricsWriter};
-use mio::net::UdpSocket;
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::io::{ErrorKind, Write};
-use std::net::SocketAddr;
-use std::str;
-use std::time::{Duration, Instant};
+use std::{
+    collections::{hash_map::Entry, HashMap, VecDeque},
+    io::{ErrorKind, Write},
+    net::SocketAddr,
+    str,
+    time::{Duration, Instant},
+};
 
-use super::{MetricData, StoredMetricData, Subscriber};
+use mio::net::UdpSocket;
+
+use super::{
+    writer::{MetricSocket, MetricsWriter},
+    MetricData, StoredMetricData, Subscriber,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
