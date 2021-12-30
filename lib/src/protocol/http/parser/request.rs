@@ -1,17 +1,17 @@
-use crate::buffer_queue::BufferQueue;
-use crate::sozu_command::buffer::fixed::Buffer;
+use std::str;
 
 use nom::{Err, HexDisplay, IResult, Offset};
-
 use url::Url;
 
-use std::str;
+use crate::{
+    buffer_queue::BufferQueue, protocol::http::AddedRequestHeader,
+    sozu_command::buffer::fixed::Buffer,
+};
 
 use super::{
     crlf, message_header, request_line, BufferMove, Chunk, Connection, Continue, Header,
     HeaderValue, Host, LengthInformation, Method, RRequestLine, TransferEncodingValue, Version,
 };
-use crate::protocol::http::AddedRequestHeader;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestState {

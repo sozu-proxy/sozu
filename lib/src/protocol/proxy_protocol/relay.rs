@@ -1,20 +1,20 @@
 use std::io::Read;
 use std::io::Write;
 
-use super::parser::parse_v2_header;
-use crate::pool::Checkout;
-use crate::protocol::pipe::Pipe;
-use crate::protocol::ProtocolResult;
-use crate::socket::{SocketHandler, SocketResult};
-use crate::sozu_command::ready::Ready;
-use crate::Protocol;
-use crate::Readiness;
-use crate::SessionMetrics;
-use crate::SessionResult;
 use mio::net::TcpStream;
 use mio::*;
 use nom::{Err, Offset};
 use rusty_ulid::Ulid;
+
+use crate::{
+    pool::Checkout,
+    protocol::{pipe::Pipe, ProtocolResult},
+    socket::{SocketHandler, SocketResult},
+    sozu_command::ready::Ready,
+    Protocol, Readiness, SessionMetrics, SessionResult,
+};
+
+use super::parser::parse_v2_header;
 
 pub struct RelayProxyProtocol<Front: SocketHandler> {
     pub header_size: Option<usize>,

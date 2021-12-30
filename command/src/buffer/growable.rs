@@ -1,6 +1,10 @@
+use std::{
+    cmp,
+    io::{self, Read, Write},
+    ptr,
+};
+
 use pool::Reset;
-use std::io::{self, Read, Write};
-use std::{cmp, ptr};
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Buffer {

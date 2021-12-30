@@ -1,33 +1,40 @@
 //! event loop management
+use std::{
+    cell::RefCell,
+    collections::{HashSet, VecDeque},
+    convert::TryFrom,
+    net::SocketAddr,
+    os::unix::io::{AsRawFd, FromRawFd},
+    rc::Rc,
+};
+
 use mio::net::*;
 use mio::*;
 use slab::Slab;
-use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
-use std::convert::TryFrom;
-use std::net::SocketAddr;
-use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::rc::Rc;
 use time::{Duration, Instant};
 
-use crate::sozu_command::channel::Channel;
-use crate::sozu_command::config::Config;
-use crate::sozu_command::proxy::{
-    HttpsListener, ListenerType, MessageId, ProxyEvent, ProxyRequest, ProxyRequestData,
-    ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
-    QueryAnswerCertificate, QueryApplicationType, QueryCertificateType, TlsProvider, Topic,
+use crate::{
+    backends::BackendMap,
+    features::FEATURES,
+    http,
+    metrics::METRICS,
+    pool::Pool,
+    sozu_command::{
+        channel::Channel,
+        config::Config,
+        proxy::{
+            HttpsListener, ListenerType, MessageId, ProxyEvent, ProxyRequest, ProxyRequestData,
+            ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
+            QueryAnswerCertificate, QueryApplicationType, QueryCertificateType, TlsProvider, Topic,
+        },
+        ready::Ready,
+        scm_socket::{Listeners, ScmSocket},
+        state::{get_application_ids_by_domain, get_certificate, ConfigState},
+    },
+    tcp,
+    timer::Timer,
+    AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession,
 };
-use crate::sozu_command::ready::Ready;
-use crate::sozu_command::scm_socket::{Listeners, ScmSocket};
-use crate::sozu_command::state::{get_application_ids_by_domain, get_certificate, ConfigState};
-
-use crate::backends::BackendMap;
-use crate::features::FEATURES;
-use crate::metrics::METRICS;
-use crate::pool::Pool;
-use crate::timer::Timer;
-use crate::{http, tcp};
-use crate::{AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession};
 
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;

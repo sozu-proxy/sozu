@@ -1,6 +1,10 @@
+use std::{
+    cmp,
+    io::{self, Read, Write},
+    ptr,
+};
+
 use poule::Reset;
-use std::io::{self, Read, Write};
-use std::{cmp, ptr};
 
 #[derive(Debug, PartialEq, Clone, Default)]
 pub struct BufferMetadata {

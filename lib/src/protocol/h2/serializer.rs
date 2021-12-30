@@ -1,10 +1,11 @@
-use super::parser::{FrameHeader, FrameType};
 use cookie_factory::{
     bytes::{be_u24, be_u32, be_u8},
     gen,
     sequence::tuple,
     GenError,
 };
+
+use super::parser::{FrameHeader, FrameType};
 
 pub fn gen_frame_header<'a, 'b>(
     x: (&'a mut [u8], usize),

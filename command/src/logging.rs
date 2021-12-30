@@ -1,17 +1,18 @@
+use std::{
+    cell::RefCell,
+    cmp::{self, Ord},
+    env,
+    fmt::{format, Arguments},
+    fs::{File, OpenOptions},
+    io::{stdout, Stdout, Write},
+    net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
+    path::Path,
+    str::FromStr,
+};
+
 use libc;
 use mio::net::UnixDatagram;
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
-use std::cell::RefCell;
-use std::cmp::{self, Ord};
-use std::env;
-use std::fmt::{format, Arguments};
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::{stdout, Stdout, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::path::Path;
-use std::str::FromStr;
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
 
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());

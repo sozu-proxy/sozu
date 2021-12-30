@@ -1,15 +1,18 @@
-use crate::certificate::calculate_fingerprint;
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-use std::iter::{repeat, FromIterator};
-use std::net::SocketAddr;
+use std::{
+    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet},
+    hash::{Hash, Hasher},
+    iter::{repeat, FromIterator},
+    net::SocketAddr,
+};
 
-use crate::proxy::{
-    ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
-    DeactivateListener, HttpFrontend, HttpListener, HttpsListener, ListenerType, PathRule,
-    ProxyRequestData, QueryAnswerApplication, RemoveBackend, RemoveCertificate, RemoveListener,
-    Route, TcpFrontend, TcpListener,
+use crate::{
+    certificate::calculate_fingerprint,
+    proxy::{
+        ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
+        Cluster, DeactivateListener, HttpFrontend, HttpListener, HttpsListener, ListenerType,
+        PathRule, ProxyRequestData, QueryAnswerApplication, RemoveBackend, RemoveCertificate,
+        RemoveListener, Route, TcpFrontend, TcpListener,
+    },
 };
 
 pub type ClusterId = String;

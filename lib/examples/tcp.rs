@@ -4,11 +4,13 @@ extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 extern crate time;
 
-use crate::sozu_command::channel::Channel;
-use crate::sozu_command::logging::{Logger, LoggerBackend};
-use crate::sozu_command::proxy::{self, LoadBalancingParams, TcpListener};
-use std::io::stdout;
-use std::thread;
+use std::{io::stdout, thread};
+
+use crate::sozu_command::{
+    channel::Channel,
+    logging::{Logger, LoggerBackend},
+    proxy::{self, LoadBalancingParams, TcpListener},
+};
 
 fn main() {
     /*

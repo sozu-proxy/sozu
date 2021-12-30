@@ -1,13 +1,15 @@
+use std::{
+    net::SocketAddr,
+    os::unix::{
+        io::{FromRawFd, IntoRawFd, RawFd},
+        net,
+    },
+    str::from_utf8,
+};
+
 use mio::net::TcpListener;
-use nix::cmsg_space;
-use nix::sys::socket;
-use nix::sys::uio;
-use nix::Result as NixResult;
+use nix::{cmsg_space, sys::socket, sys::uio, Result as NixResult};
 use serde_json;
-use std::net::SocketAddr;
-use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::net;
-use std::str::from_utf8;
 
 pub const MAX_FDS_OUT: usize = 200;
 pub const MAX_BYTES_OUT: usize = 4096;

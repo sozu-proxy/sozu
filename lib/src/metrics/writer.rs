@@ -1,10 +1,13 @@
-use libc::{c_uint, c_void, iovec, msghdr};
-use mio::net::UdpSocket;
-use std::io::{self, Error, ErrorKind, Write};
 #[cfg(target_env = "musl")]
 use std::mem;
-use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
+use std::{
+    io::{self, Error, ErrorKind, Write},
+    net::SocketAddr,
+    os::unix::io::AsRawFd,
+};
+
+use libc::{c_uint, c_void, iovec, msghdr};
+use mio::net::UdpSocket;
 
 pub struct MetricSocket {
     pub addr: SocketAddr,

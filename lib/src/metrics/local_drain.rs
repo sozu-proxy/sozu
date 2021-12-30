@@ -1,13 +1,13 @@
 #![allow(dead_code)]
+use std::{collections::BTreeMap, str, time::Instant};
+
+use hdrhistogram::Histogram;
+use time::{Duration, OffsetDateTime};
+
 use crate::sozu_command::proxy::{
     AppMetricsData, FilteredData, MetricsConfiguration, MetricsData, Percentiles,
     QueryAnswerMetrics, QueryMetricsType,
 };
-use hdrhistogram::Histogram;
-use std::collections::BTreeMap;
-use std::str;
-use std::time::Instant;
-use time::{Duration, OffsetDateTime};
 
 use super::{MetricData, Subscriber};
 

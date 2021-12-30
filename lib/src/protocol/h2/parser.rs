@@ -1,3 +1,5 @@
+use std::convert::From;
+
 use nom::{
     bytes::streaming::{tag, take},
     combinator::{complete, map, map_opt},
@@ -7,7 +9,6 @@ use nom::{
     sequence::tuple,
     Err, HexDisplay, IResult, Offset,
 };
-use std::convert::From;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameHeader {

@@ -1,20 +1,22 @@
-use mio::event::Source;
-use mio::net::UnixStream;
-use serde::de::DeserializeOwned;
-use serde::ser::Serialize;
-use serde_json;
-use std::cmp::min;
-use std::fmt::Debug;
-use std::io::{self, ErrorKind, Read, Write};
-use std::iter::Iterator;
-use std::marker::PhantomData;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::net;
-use std::str::from_utf8;
-use std::time::Duration;
+use std::{
+    cmp::min,
+    fmt::Debug,
+    io::{self, ErrorKind, Read, Write},
+    iter::Iterator,
+    marker::PhantomData,
+    os::unix::{
+        io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
+        net,
+    },
+    str::from_utf8,
+    time::Duration,
+};
 
-use crate::buffer::growable::Buffer;
-use crate::ready::Ready;
+use mio::{event::Source, net::UnixStream};
+use serde::{de::DeserializeOwned, ser::Serialize};
+use serde_json;
+
+use crate::{buffer::growable::Buffer, ready::Ready};
 
 #[derive(Debug, PartialEq)]
 pub enum ConnError {

@@ -1,66 +1,70 @@
-use mio::net::*;
-use mio::unix::SourceFd;
-use mio::*;
-use openssl::dh::Dh;
-use openssl::error::ErrorStack;
 #[cfg(feature = "use-openssl")]
-use nom::HexDisplay;
-
-use openssl::nid;
-use openssl::pkey::{PKey, Private};
-use openssl::ssl::SslVersion;
-use openssl::ssl::{
-    self, select_next_proto, AlpnError, NameType, SniError, Ssl, SslAlert, SslContext,
-    SslContextBuilder, SslMethod, SslOptions, SslRef, SslSessionCacheMode, SslStream,
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    io::ErrorKind,
+    net::{Shutdown, SocketAddr},
+    os::unix::io::AsRawFd,
+    rc::{Rc, Weak},
+    str::from_utf8_unchecked,
+    sync::{Arc, Mutex},
 };
-use openssl::x509::X509;
+
+use mio::{net::*, unix::SourceFd, *};
+use nom::HexDisplay;
+use openssl::{
+    dh::Dh,
+    error::ErrorStack,
+    nid,
+    pkey::{PKey, Private},
+    ssl::{
+        self, select_next_proto, AlpnError, NameType, SniError, Ssl, SslAlert, SslContext,
+        SslContextBuilder, SslMethod, SslOptions, SslRef, SslSessionCacheMode, SslStream,
+        SslVersion,
+    },
+    x509::X509,
+};
 use rusty_ulid::Ulid;
 use slab::Slab;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::net::Shutdown;
-use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
-use std::rc::{Rc, Weak};
-use std::str::from_utf8_unchecked;
-use std::sync::{Arc, Mutex};
 use time::{Duration, Instant};
 
-use crate::sozu_command::logging;
-use crate::sozu_command::proxy::{
-    CertificateFingerprint, Cluster, HttpFrontend, HttpsListener, ProxyEvent, ProxyRequest,
-    ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
-    QueryAnswerCertificate, QueryCertificateType, Route, TlsVersion,
-};
-use crate::sozu_command::ready::Ready;
-use crate::sozu_command::scm_socket::ScmSocket;
-
-use crate::backends::BackendMap;
-use crate::pool::Pool;
-use crate::protocol::h2::Http2;
-use crate::protocol::http::DefaultAnswerStatus;
-use crate::protocol::http::{
-    answers::HttpAnswers,
-    parser::{hostname_and_port, Method, RRequestLine, RequestState},
-};
-use crate::protocol::openssl::TlsHandshake;
-use crate::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use crate::protocol::{Http, Pipe, ProtocolResult, StickySession};
-use crate::retry::RetryPolicy;
-use crate::router::Router;
-use crate::server::{
-    push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken,
-    CONN_RETRIES,
-};
-use crate::socket::server_bind;
-use crate::timer::TimeoutContainer;
-use crate::tls::{
-    CertificateResolver, GenericCertificateResolver, GenericCertificateResolverError,
-    ParsedCertificateAndKey,
-};
-use crate::util::UnwrapLog;
 use crate::{
+    backends::BackendMap,
+    pool::Pool,
+    protocol::{
+        h2::Http2,
+        http::{
+            answers::HttpAnswers,
+            parser::{hostname_and_port, Method, RRequestLine, RequestState},
+            DefaultAnswerStatus,
+        },
+        openssl::TlsHandshake,
+        proxy_protocol::expect::ExpectProxyProtocol,
+        Http, Pipe, ProtocolResult, StickySession,
+    },
+    retry::RetryPolicy,
+    router::Router,
+    server::{
+        push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken,
+        CONN_RETRIES,
+    },
+    socket::server_bind,
+    sozu_command::{
+        logging,
+        proxy::{
+            CertificateFingerprint, Cluster, HttpFrontend, HttpsListener, ProxyEvent, ProxyRequest,
+            ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query,
+            QueryAnswer, QueryAnswerCertificate, QueryCertificateType, Route, TlsVersion,
+        },
+        ready::Ready,
+        scm_socket::ScmSocket,
+    },
+    timer::TimeoutContainer,
+    tls::{
+        CertificateResolver, GenericCertificateResolver, GenericCertificateResolverError,
+        ParsedCertificateAndKey,
+    },
+    util::UnwrapLog,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
     ConnectionError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
     SessionResult,

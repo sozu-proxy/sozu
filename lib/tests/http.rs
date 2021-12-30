@@ -6,19 +6,23 @@ extern crate time;
 extern crate tiny_http;
 extern crate ureq;
 
-use crate::sozu_command::channel::Channel;
-use crate::sozu_command::logging::{Logger, LoggerBackend};
-use crate::sozu_command::proxy;
-use crate::sozu_command::proxy::{LoadBalancingParams, PathRule, Route, RulePosition};
-use std::thread;
 use std::{
     io::{stdout, Read, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
     str,
     sync::{Arc, Barrier},
+    thread,
     time::Duration,
 };
+
 use tiny_http::{Response, Server};
+
+use crate::sozu_command::{
+    channel::Channel,
+    logging::{Logger, LoggerBackend},
+    proxy,
+    proxy::{LoadBalancingParams, PathRule, Route, RulePosition},
+};
 
 #[test]
 fn test() {

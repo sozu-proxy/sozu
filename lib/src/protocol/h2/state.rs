@@ -1,9 +1,10 @@
-use super::{parser, serializer};
-use crate::Ready;
-use nom::Offset;
 use std::collections::{HashMap, VecDeque};
 
-use super::stream;
+use nom::Offset;
+
+use crate::Ready;
+
+use super::{parser, serializer, stream};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutputFrame {

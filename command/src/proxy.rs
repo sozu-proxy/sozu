@@ -1,13 +1,18 @@
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap, HashSet},
+    convert::From,
+    default::Default,
+    error, fmt,
+    net::SocketAddr,
+    str::FromStr,
+};
+
 use hex::{self, FromHex};
-use serde;
-use serde::de::{self, Visitor};
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::convert::From;
-use std::default::Default;
-use std::net::SocketAddr;
-use std::str::FromStr;
-use std::{error, fmt};
+use serde::{
+    self,
+    de::{self, Visitor},
+};
 
 use crate::config::ProxyProtocolConfig;
 
