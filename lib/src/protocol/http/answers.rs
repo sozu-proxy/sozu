@@ -1,7 +1,7 @@
-use super::DefaultAnswerStatus;
 use crate::ClusterId;
-use std::collections::HashMap;
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
+
+use super::DefaultAnswerStatus;
 
 #[allow(non_snake_case)]
 pub struct DefaultAnswers {

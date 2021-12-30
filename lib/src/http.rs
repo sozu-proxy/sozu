@@ -1,44 +1,54 @@
-use mio::net::*;
-use mio::unix::SourceFd;
-use mio::*;
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    io::ErrorKind,
+    net::{Shutdown, SocketAddr},
+    os::unix::io::{AsRawFd, IntoRawFd},
+    rc::{Rc, Weak},
+    str::from_utf8_unchecked,
+};
+
+use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::net::{Shutdown, SocketAddr};
-use std::os::unix::io::{AsRawFd, IntoRawFd};
-use std::rc::{Rc, Weak};
-use std::str::from_utf8_unchecked;
 use time::{Duration, Instant};
 
-use crate::sozu_command::logging;
-use crate::sozu_command::proxy::{
-    Cluster, HttpFrontend, HttpListener, ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse,
-    ProxyResponseStatus, Route,
+use crate::{
+    router::Router,
+    sozu_command::{
+        logging,
+        proxy::{
+            Cluster, HttpFrontend, HttpListener, ProxyEvent, ProxyRequest, ProxyRequestData,
+            ProxyResponse, ProxyResponseStatus, Route,
+        },
+        ready::Ready,
+        scm_socket::{Listeners, ScmSocket},
+    },
+    timer::TimeoutContainer,
+    util::UnwrapLog,
 };
-use crate::sozu_command::scm_socket::{Listeners, ScmSocket};
 
-use super::backends::BackendMap;
-use super::pool::Pool;
-use super::protocol::http::parser::{hostname_and_port, Method, RequestState};
-use super::protocol::http::{answers::HttpAnswers, DefaultAnswerStatus};
-use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use super::protocol::{Http, Pipe, ProtocolResult, StickySession};
-use super::retry::RetryPolicy;
-use super::server::{
-    push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, CONN_RETRIES,
-};
-use super::socket::server_bind;
 use super::{
+    backends::BackendMap,
+    pool::Pool,
+    protocol::{
+        http::{
+            answers::HttpAnswers,
+            parser::{hostname_and_port, Method, RequestState},
+            DefaultAnswerStatus,
+        },
+        proxy_protocol::expect::ExpectProxyProtocol,
+        {Http, Pipe, ProtocolResult, StickySession},
+    },
+    retry::RetryPolicy,
+    server::{
+        push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, CONN_RETRIES,
+    },
+    socket::server_bind,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
     ConnectionError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
     SessionResult,
 };
-use crate::router::Router;
-use crate::sozu_command::ready::Ready;
-use crate::timer::TimeoutContainer;
-use crate::util::UnwrapLog;
 
 #[derive(PartialEq)]
 pub enum SessionStatus {

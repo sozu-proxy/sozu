@@ -209,17 +209,15 @@ pub mod https_openssl;
 
 pub mod https_rustls;
 
-use mio::net::TcpStream;
-use mio::Token;
-use std::cell::RefCell;
-use std::fmt;
-use std::net::SocketAddr;
-use std::rc::Rc;
-use std::str;
+use std::{cell::RefCell, fmt, net::SocketAddr, rc::Rc, str};
+
+use mio::{net::TcpStream, Token};
 use time::{Duration, Instant};
 
-use crate::sozu_command::proxy::{LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse};
-use crate::sozu_command::ready::Ready;
+use crate::sozu_command::{
+    proxy::{LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse},
+    ready::Ready,
+};
 
 use self::retry::RetryPolicy;
 

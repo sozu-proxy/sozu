@@ -1,10 +1,13 @@
+use std::{
+    io::{self, ErrorKind, Read, Write},
+    net::SocketAddr,
+};
+
 use mio::net::{TcpListener, TcpStream};
 #[cfg(feature = "use-openssl")]
 use openssl::ssl::{ErrorCode, SslStream, SslVersion};
 use rustls::{ProtocolVersion, ServerConnection};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::io::{self, ErrorKind, Read, Write};
-use std::net::SocketAddr;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum SocketResult {

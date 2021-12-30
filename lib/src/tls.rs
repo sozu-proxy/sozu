@@ -10,12 +10,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::router::trie::*;
-use crate::sozu_command::proxy::{
-    AddCertificate, CertificateAndKey, CertificateFingerprint, RemoveCertificate,
-    ReplaceCertificate,
-};
-
 use rustls::{
     server::{ClientHello, ResolvesServerCert},
     sign::{CertifiedKey, RsaSigningKey},
@@ -26,6 +20,14 @@ use sozu_command::proxy::TlsVersion;
 use x509_parser::{
     oid_registry::{OID_X509_COMMON_NAME, OID_X509_EXT_SUBJECT_ALT_NAME},
     pem::{parse_x509_pem, Pem},
+};
+
+use crate::{
+    router::trie::*,
+    sozu_command::proxy::{
+        AddCertificate, CertificateAndKey, CertificateFingerprint, RemoveCertificate,
+        ReplaceCertificate,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -598,7 +600,9 @@ impl MutexWrappedCertificateResolver {
     fn generate_certified_key(
         certificate_and_key: &ParsedCertificateAndKey,
     ) -> Option<CertifiedKey> {
-        let mut chains = vec![Certificate(certificate_and_key.certificate.contents.to_owned())];
+        let mut chains = vec![Certificate(
+            certificate_and_key.certificate.contents.to_owned(),
+        )];
         for certificate in &certificate_and_key.chain {
             chains.push(Certificate(certificate.contents.to_owned()));
         }

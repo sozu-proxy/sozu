@@ -1,13 +1,13 @@
-use mio::net::TcpStream;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::rc::Rc;
+use std::{cell::RefCell, collections::HashMap, net::SocketAddr, rc::Rc};
 
-use crate::sozu_command::proxy::{self, LoadBalancingAlgorithms};
+use mio::net::TcpStream;
+
+use crate::{
+    server::push_event,
+    sozu_command::proxy::{self, LoadBalancingAlgorithms},
+};
 
 use super::{load_balancing::*, Backend, ClusterId, ConnectionError};
-use crate::server::push_event;
 
 #[derive(Debug)]
 pub struct BackendMap {

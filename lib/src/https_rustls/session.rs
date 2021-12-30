@@ -1,35 +1,46 @@
-use crate::sozu_command::proxy::ProxyEvent;
-use mio::net::*;
-use mio::unix::SourceFd;
-use mio::*;
+use std::{
+    cell::RefCell,
+    io::{ErrorKind, Read},
+    net::{Shutdown, SocketAddr},
+    os::unix::prelude::AsRawFd,
+    rc::{Rc, Weak},
+    str::from_utf8_unchecked,
+};
+
+use mio::{net::*, unix::SourceFd, *};
 use rustls::{CipherSuite, ProtocolVersion, ServerConnection, SupportedCipherSuite};
 use rusty_ulid::Ulid;
-use std::cell::RefCell;
-use std::io::{ErrorKind, Read};
-use std::net::{Shutdown, SocketAddr};
-use std::os::unix::prelude::AsRawFd;
-use std::rc::{Rc, Weak};
-use std::str::from_utf8_unchecked;
 use time::{Duration, Instant};
 
-use super::configuration::Proxy;
-use crate::buffer_queue::BufferQueue;
-use crate::pool::Pool;
-use crate::protocol::http::parser::{hostname_and_port, Method, RRequestLine, RequestState};
-use crate::protocol::http::{answers::HttpAnswers, DefaultAnswerStatus};
-use crate::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use crate::protocol::rustls::TlsHandshake;
-use crate::protocol::{Http, Pipe, ProtocolResult, StickySession};
-use crate::retry::RetryPolicy;
-use crate::server::{push_event, CONN_RETRIES};
-use crate::socket::FrontRustls;
-use crate::sozu_command::{proxy::Route, ready::Ready};
-use crate::timer::TimeoutContainer;
-use crate::util::UnwrapLog;
 use crate::{
-    Backend, BackendConnectAction, BackendConnectionStatus, ConnectionError, Protocol,
-    ProxySession, Readiness, SessionMetrics, SessionResult,
+    buffer_queue::BufferQueue,
+    pool::Pool,
+    protocol::{
+        http::{
+            answers::HttpAnswers,
+            parser::{hostname_and_port, Method, RRequestLine, RequestState},
+            DefaultAnswerStatus,
+        },
+        proxy_protocol::expect::ExpectProxyProtocol,
+        rustls::TlsHandshake,
+        Http, Pipe, ProtocolResult, StickySession,
+    },
+    retry::RetryPolicy,
+    server::{push_event, CONN_RETRIES},
+    socket::FrontRustls,
+    sozu_command::{
+        proxy::{ProxyEvent, Route},
+        ready::Ready,
+    },
+    timer::TimeoutContainer,
+    util::UnwrapLog,
+    {
+        Backend, BackendConnectAction, BackendConnectionStatus, ConnectionError, Protocol,
+        ProxySession, Readiness, SessionMetrics, SessionResult,
+    },
 };
+
+use super::configuration::Proxy;
 
 pub enum State {
     Expect(ExpectProxyProtocol<TcpStream>, ServerConnection),

@@ -1,24 +1,28 @@
-use super::super::{LogDuration, Protocol, Readiness, SessionMetrics, SessionResult};
-use crate::buffer_queue::BufferQueue;
-use crate::pool::Pool;
-use crate::protocol::ProtocolResult;
-use crate::socket::{SocketHandler, SocketResult, TransportProtocol};
-use crate::sozu_command::ready::Ready;
-use crate::timer::TimeoutContainer;
-use crate::util::UnwrapLog;
-use crate::Backend;
-use mio::net::TcpStream;
-use mio::*;
-use rusty_ulid::Ulid;
-use std::cell::RefCell;
-use std::cmp::min;
-use std::net::{IpAddr, SocketAddr};
-use std::rc::{Rc, Weak};
-use time::{Duration, Instant};
-
 pub mod answers;
 pub mod cookies;
 pub mod parser;
+
+use std::{
+    cell::RefCell,
+    cmp::min,
+    net::{IpAddr, SocketAddr},
+    rc::{Rc, Weak},
+};
+
+use mio::{net::TcpStream, *};
+use rusty_ulid::Ulid;
+use time::{Duration, Instant};
+
+use crate::{
+    buffer_queue::BufferQueue,
+    pool::Pool,
+    protocol::ProtocolResult,
+    socket::{SocketHandler, SocketResult, TransportProtocol},
+    sozu_command::ready::Ready,
+    timer::TimeoutContainer,
+    util::UnwrapLog,
+    Backend, LogDuration, {Protocol, Readiness, SessionMetrics, SessionResult},
+};
 
 use self::parser::{
     compare_no_case, parse_request_until_stop, parse_response_until_stop, Chunk, Continue, Method,

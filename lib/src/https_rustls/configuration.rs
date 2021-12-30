@@ -1,42 +1,40 @@
-use mio::net::*;
-use mio::*;
+use std::{
+    cell::RefCell, collections::HashMap, io::ErrorKind, net::SocketAddr, os::unix::io::AsRawFd,
+    rc::Rc, str::from_utf8_unchecked, sync::Arc,
+};
+
+use mio::{net::*, *};
 use rustls::{cipher_suite::*, ServerConfig, ServerConnection};
 use slab::Slab;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
-use std::rc::Rc;
-use std::str::from_utf8_unchecked;
-use std::sync::Arc;
 use time::Duration;
 
-use crate::sozu_command::logging;
-use crate::sozu_command::proxy::{
-    AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListener, ProxyRequest,
-    ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
-    QueryAnswerCertificate, QueryCertificateType, RemoveCertificate, Route, TlsVersion,
+use crate::{
+    backends::BackendMap,
+    pool::Pool,
+    protocol::http::{
+        answers::HttpAnswers,
+        parser::{hostname_and_port, Method},
+    },
+    router::Router,
+    server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
+    socket::server_bind,
+    sozu_command::{
+        logging,
+        proxy::{
+            AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListener,
+            ProxyRequest, ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus,
+            Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType, RemoveCertificate,
+            Route, TlsVersion,
+        },
+        scm_socket::ScmSocket,
+    },
+    tls::{
+        CertificateResolver, GenericCertificateResolverError, MutexWrappedCertificateResolver,
+        ParsedCertificateAndKey,
+    },
+    util::UnwrapLog,
+    {AcceptError, ClusterId, Protocol, ProxyConfiguration, ProxySession},
 };
-use crate::sozu_command::scm_socket::ScmSocket;
-
-use crate::backends::BackendMap;
-use crate::pool::Pool;
-use crate::protocol::http::{
-    answers::HttpAnswers,
-    parser::{hostname_and_port, Method},
-};
-use crate::router::Router;
-use crate::server::{
-    ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken,
-};
-use crate::socket::server_bind;
-use crate::tls::{
-    CertificateResolver, GenericCertificateResolverError, MutexWrappedCertificateResolver,
-    ParsedCertificateAndKey,
-};
-use crate::util::UnwrapLog;
-use crate::{AcceptError, ClusterId, Protocol, ProxyConfiguration, ProxySession};
 
 use super::session::Session;
 

@@ -1,6 +1,7 @@
+use std::{fmt::Debug, iter, str};
+
 use hashbrown::HashMap;
 use regex::bytes::Regex;
-use std::{fmt::Debug, iter, str};
 
 pub type Key = Vec<u8>;
 pub type KeyValue<K, V> = (K, V);

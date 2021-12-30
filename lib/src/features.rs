@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
 thread_local! {
   pub static FEATURES: RefCell<FeatureFlags> = RefCell::new(FeatureFlags::new());

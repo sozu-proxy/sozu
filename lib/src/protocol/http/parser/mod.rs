@@ -1,5 +1,10 @@
 #![allow(dead_code)]
-use super::cookies::{parse_request_cookies, RequestCookie};
+use std::{
+    collections::HashSet,
+    convert::From,
+    str::from_utf8,
+    {fmt, str},
+};
 
 use nom::{
     branch::alt,
@@ -20,18 +25,14 @@ use nom::{
     Err, IResult, Needed, Offset,
 };
 
-use std::collections::HashSet;
-use std::convert::From;
-use std::str::from_utf8;
-use std::{fmt, str};
+use super::cookies::{parse_request_cookies, RequestCookie};
+
+pub use self::{request::*, response::*};
 
 mod request;
 mod response;
 #[cfg(test)]
 mod tests;
-
-pub use self::request::*;
-pub use self::response::*;
 
 pub fn compare_no_case(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {

@@ -5,13 +5,14 @@ extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 extern crate time;
 
-use crate::sozu_command::channel::Channel;
-use crate::sozu_command::logging::{Logger, LoggerBackend};
-use crate::sozu_command::proxy;
-use crate::sozu_command::proxy::{LoadBalancingParams, PathRule, Route, RulePosition};
-use std::env;
-use std::io::stdout;
-use std::thread;
+use std::{env, io::stdout, thread};
+
+use crate::sozu_command::{
+    channel::Channel,
+    logging::{Logger, LoggerBackend},
+    proxy,
+    proxy::{LoadBalancingParams, PathRule, Route, RulePosition},
+};
 
 fn main() {
     if env::var("RUST_LOG").is_ok() {

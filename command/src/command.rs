@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::{collections::BTreeMap, net::SocketAddr};
 
-use crate::proxy::{
-    AggregatedMetricsData, HttpFrontend, ProxyEvent, ProxyRequestData, QueryAnswer, TcpFrontend,
+use crate::{
+    proxy::{
+        AggregatedMetricsData, HttpFrontend, ProxyEvent, ProxyRequestData, QueryAnswer, TcpFrontend,
+    },
+    state::ConfigState,
 };
-use crate::state::ConfigState;
 
 pub const PROTOCOL_VERSION: u8 = 0;
 

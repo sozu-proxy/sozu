@@ -1,13 +1,16 @@
-use crate::pool::Checkout;
-use crate::socket::{SocketHandler, SocketResult, TransportProtocol};
-use crate::sozu_command::ready::Ready;
-use crate::timer::TimeoutContainer;
-use crate::{LogDuration, Protocol};
-use crate::{Readiness, SessionMetrics, SessionResult};
+use std::net::SocketAddr;
+
 use mio::net::*;
 use mio::*;
 use rusty_ulid::Ulid;
-use std::net::SocketAddr;
+
+use crate::{
+    pool::Checkout,
+    socket::{SocketHandler, SocketResult, TransportProtocol},
+    sozu_command::ready::Ready,
+    timer::TimeoutContainer,
+    {LogDuration, Protocol}, {Readiness, SessionMetrics, SessionResult},
+};
 
 #[derive(PartialEq)]
 pub enum SessionStatus {

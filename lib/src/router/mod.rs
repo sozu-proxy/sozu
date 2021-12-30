@@ -1,10 +1,13 @@
-use crate::protocol::http::parser::Method;
-use crate::sozu_command::proxy::{HttpFrontend, Route, RulePosition};
+pub mod pattern_trie;
+pub mod trie;
+
 use regex::bytes::Regex;
 use std::str::from_utf8;
 
-pub mod pattern_trie;
-pub mod trie;
+use crate::{
+    protocol::http::parser::Method,
+    sozu_command::proxy::{HttpFrontend, Route, RulePosition},
+};
 
 use self::pattern_trie::TrieNode;
 

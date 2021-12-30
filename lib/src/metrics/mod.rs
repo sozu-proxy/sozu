@@ -1,20 +1,23 @@
-use crate::sozu_command::proxy::{
-    FilteredData, MetricsConfiguration, MetricsData, QueryAnswerMetrics, QueryMetricsType,
-};
-use mio::net::UdpSocket;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::io::{self, Write};
-use std::net::SocketAddr;
-use std::str;
-use std::time::Instant;
-
 mod local_drain;
 mod network_drain;
 mod writer;
 
-use self::local_drain::LocalDrain;
-use self::network_drain::NetworkDrain;
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    io::{self, Write},
+    net::SocketAddr,
+    str,
+    time::Instant,
+};
+
+use mio::net::UdpSocket;
+
+use crate::sozu_command::proxy::{
+    FilteredData, MetricsConfiguration, MetricsData, QueryAnswerMetrics, QueryMetricsType,
+};
+
+use self::{local_drain::LocalDrain, network_drain::NetworkDrain};
 
 thread_local! {
   pub static METRICS: RefCell<Aggregator> = RefCell::new(Aggregator::new(String::from("sozu")));

@@ -1,41 +1,46 @@
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    io::ErrorKind,
+    net::{Shutdown, SocketAddr},
+    os::unix::io::AsRawFd,
+    rc::Rc,
+};
+
 use mio::net::*;
 use mio::unix::SourceFd;
 use mio::*;
 use rusty_ulid::Ulid;
 use slab::Slab;
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::net::{Shutdown, SocketAddr};
-use std::os::unix::io::AsRawFd;
-use std::rc::Rc;
 use time::{Duration, Instant};
 
-use crate::sozu_command::config::ProxyProtocolConfig;
-use crate::sozu_command::logging;
-use crate::sozu_command::proxy::TcpListener as TcpListenerConfig;
-use crate::sozu_command::proxy::{
-    LoadBalancingAlgorithms, ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse,
-    ProxyResponseStatus,
-};
-use crate::sozu_command::ready::Ready;
-use crate::sozu_command::scm_socket::ScmSocket;
-
-use crate::backends::BackendMap;
-use crate::pool::{Checkout, Pool};
-use crate::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use crate::protocol::proxy_protocol::relay::RelayProxyProtocol;
-use crate::protocol::proxy_protocol::send::SendProxyProtocol;
-use crate::protocol::{Pipe, ProtocolResult};
-use crate::retry::RetryPolicy;
-use crate::server::{
-    push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, CONN_RETRIES,
-    TIMER,
-};
-use crate::socket::server_bind;
-use crate::timer::TimeoutContainer;
-use crate::util::UnwrapLog;
 use crate::{
+    backends::BackendMap,
+    pool::{Checkout, Pool},
+    protocol::{
+        proxy_protocol::{
+            expect::ExpectProxyProtocol, relay::RelayProxyProtocol, send::SendProxyProtocol,
+        },
+        {Pipe, ProtocolResult},
+    },
+    retry::RetryPolicy,
+    server::{
+        push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, CONN_RETRIES,
+        TIMER,
+    },
+    socket::server_bind,
+    sozu_command::{
+        config::ProxyProtocolConfig,
+        logging,
+        proxy::{
+            LoadBalancingAlgorithms, ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse,
+            ProxyResponseStatus, TcpListener as TcpListenerConfig,
+        },
+        ready::Ready,
+        scm_socket::ScmSocket,
+    },
+    timer::TimeoutContainer,
+    util::UnwrapLog,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
     ConnectionError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
     SessionResult,

@@ -1,14 +1,13 @@
+use std::fmt::Debug;
+use std::{cell::RefCell, rc::Rc};
+
 use rand::{
     distributions::{Distribution, WeightedIndex},
     seq::SliceRandom,
     thread_rng, Rng,
 };
 
-use crate::Backend;
-
-use crate::sozu_command::proxy::LoadMetric;
-use std::fmt::Debug;
-use std::{cell::RefCell, rc::Rc};
+use crate::{sozu_command::proxy::LoadMetric, Backend};
 
 pub trait LoadBalancingAlgorithm: Debug {
     fn next_available_backend(
