@@ -1,9 +1,3 @@
-use anyhow::{bail, Context};
-use async_io::Async;
-use futures::channel::mpsc::*;
-use futures::{SinkExt, StreamExt};
-use nom::{Err, HexDisplay, Offset};
-use serde_json;
 use std::{
     collections::{BTreeMap, HashSet},
     fs::File,
@@ -12,6 +6,12 @@ use std::{
     os::unix::net::UnixStream,
     time::Duration,
 };
+
+use anyhow::{bail, Context};
+use async_io::Async;
+use futures::{channel::mpsc::*, SinkExt, StreamExt};
+use nom::{Err, HexDisplay, Offset};
+use serde_json;
 
 use sozu_command_lib::{
     buffer::fixed::Buffer,
