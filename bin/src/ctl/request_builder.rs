@@ -1,3 +1,7 @@
+use std::{net::SocketAddr, process::exit};
+
+use anyhow::bail;
+
 use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain},
     config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
@@ -8,9 +12,6 @@ use sozu_command_lib::{
         RulePosition, TcpFrontend, TcpListener, TlsVersion,
     },
 };
-
-use anyhow::bail;
-use std::{net::SocketAddr, process::exit};
 
 use crate::{
     cli::{

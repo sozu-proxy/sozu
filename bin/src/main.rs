@@ -31,19 +31,20 @@ mod upgrade;
 mod util;
 mod worker;
 
-use anyhow::{bail, Context};
-use sozu_command_lib::config::Config;
 use std::panic;
-use structopt::StructOpt;
 
+use anyhow::{bail, Context};
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t, pid_t};
+use structopt::StructOpt;
+
+use sozu_command_lib::config::Config;
+use sozu::metrics::METRICS;
 
 use crate::{
     command::Worker,
     worker::{get_executable_path, start_workers},
 };
-use sozu::metrics::METRICS;
 
 fn main() -> anyhow::Result<()> {
     register_panic_hook();

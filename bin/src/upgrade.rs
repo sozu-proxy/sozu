@@ -1,9 +1,3 @@
-use anyhow::{bail, Context};
-use futures_lite::future;
-use libc::{self, pid_t};
-use mio::net::UnixStream;
-use nix::unistd::*;
-use serde_json;
 use std::{
     fs::File,
     io::{Seek, SeekFrom},
@@ -11,6 +5,13 @@ use std::{
     os::unix::process::CommandExt,
     process::Command,
 };
+
+use anyhow::{bail, Context};
+use futures_lite::future;
+use libc::{self, pid_t};
+use mio::net::UnixStream;
+use nix::unistd::*;
+use serde_json;
 use tempfile::tempfile;
 
 use sozu_command_lib::{

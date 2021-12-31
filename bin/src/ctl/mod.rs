@@ -4,8 +4,8 @@ mod request_builder;
 
 use std::time::Duration;
 
-
 use anyhow::Context;
+
 use sozu_command_lib::{
     channel::Channel,
     command::{CommandRequest, CommandResponse},

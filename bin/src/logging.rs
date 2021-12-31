@@ -1,6 +1,9 @@
+use std::{
+    env,
+    sync::{Arc, Mutex},
+};
+
 use sozu_command_lib::logging::{target_to_backend, Logger, LoggerBackend};
-use std::env;
-use std::sync::{Arc, Mutex};
 
 lazy_static! {
     pub static ref MAIN_LOGGER: Arc<Mutex<Logger>> = Arc::new(Mutex::new(Logger::new()));

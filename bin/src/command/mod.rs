@@ -1,3 +1,14 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    os::unix::{
+        fs::PermissionsExt,
+        io::{AsRawFd, FromRawFd, IntoRawFd},
+        net::{UnixListener, UnixStream},
+    },
+    path::PathBuf,
+};
+
 use anyhow::{bail, Context};
 use async_dup::Arc;
 use async_io::Async;
@@ -11,16 +22,6 @@ use nix::{
     unistd::Pid,
 };
 use serde_json;
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    os::unix::{
-        fs::PermissionsExt,
-        io::{AsRawFd, FromRawFd, IntoRawFd},
-        net::{UnixListener, UnixStream},
-    },
-    path::PathBuf,
-};
 
 use sozu_command_lib::{
     command::{

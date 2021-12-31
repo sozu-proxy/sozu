@@ -1,3 +1,16 @@
+use std::{
+    collections::{HashMap, HashSet},
+    process::exit,
+    sync::mpsc,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
+
+use anyhow::{self, bail, Context};
+use prettytable::Table;
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
+
 use sozu_command_lib::{
     command::{
         CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
@@ -21,17 +34,6 @@ use crate::{
     },
 };
 
-use anyhow::{self, bail, Context};
-use prettytable::Table;
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
-use std::{
-    collections::{HashMap, HashSet},
-    process::exit,
-    sync::mpsc,
-    sync::{Arc, Mutex},
-    thread,
-    time::Duration,
-};
 
 // Used to display the JSON response of the status command
 #[derive(Serialize, Debug)]
