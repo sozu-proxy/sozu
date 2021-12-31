@@ -2,17 +2,20 @@ mod command;
 mod display;
 mod request_builder;
 
-use crate::{
-    cli::{self, *},
-    get_config_file_path, load_configuration, util,
-};
+use std::time::Duration;
+
 use anyhow::Context;
+
 use sozu_command_lib::{
     channel::Channel,
     command::{CommandRequest, CommandResponse},
     config::Config,
 };
-use std::time::Duration;
+
+use crate::{
+    cli::{self, *},
+    get_config_file_path, load_configuration, util,
+};
 
 pub struct CommandManager {
     channel: Channel<CommandRequest, CommandResponse>,

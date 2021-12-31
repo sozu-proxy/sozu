@@ -1,8 +1,15 @@
-use anyhow::{bail, Context};
-use libc::{self, pid_t};
-use mio::net::UnixStream;
-use nix::{self, unistd::*};
-use serde_json;
+#[cfg(target_os = "freebsd")]
+use std::ffi::c_void;
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
+#[cfg(target_os = "macos")]
+use std::iter::repeat;
+#[cfg(target_os = "freebsd")]
+use std::iter::repeat;
+#[cfg(target_os = "freebsd")]
+use std::mem::size_of;
+#[cfg(target_os = "macos")]
+use std::ptr::null_mut;
 use std::{
     fs::File,
     io::{Seek, SeekFrom},
@@ -10,28 +17,19 @@ use std::{
     os::unix::process::CommandExt,
     process::Command,
 };
-use tempfile::tempfile;
 
+use anyhow::{bail, Context};
+use libc::{self, pid_t};
 #[cfg(target_os = "macos")]
 use libc::{c_char, PATH_MAX};
-#[cfg(target_os = "macos")]
-use std::ffi::CString;
-#[cfg(target_os = "macos")]
-use std::iter::repeat;
-#[cfg(target_os = "macos")]
-use std::ptr::null_mut;
-
 #[cfg(target_os = "freebsd")]
 use libc::{sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
-#[cfg(target_os = "freebsd")]
-use std::ffi::c_void;
-#[cfg(target_os = "freebsd")]
-use std::iter::repeat;
-#[cfg(target_os = "freebsd")]
-use std::mem::size_of;
+use mio::net::UnixStream;
+use nix::{self, unistd::*};
+use serde_json;
+use tempfile::tempfile;
 
-use sozu::metrics;
-use sozu::server::Server;
+use sozu::{metrics, server::Server};
 use sozu_command_lib::{
     channel::Channel,
     config::Config,
@@ -42,9 +40,7 @@ use sozu_command_lib::{
     state::ConfigState,
 };
 
-use crate::command::Worker;
-use crate::logging;
-use crate::util;
+use crate::{command::Worker, logging, util};
 
 pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result<Vec<Worker>> {
     let state = ConfigState::new();

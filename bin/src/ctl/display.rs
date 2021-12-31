@@ -1,13 +1,14 @@
-use anyhow::{self, bail, Context};
-use prettytable::{Row, Table};
-use sozu_command_lib::{
-    command::{CommandResponseData, ListedFrontends},
-    proxy::{FilteredData, QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics, Route},
-};
-
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     process::exit,
+};
+
+use anyhow::{self, bail, Context};
+use prettytable::{Row, Table};
+
+use sozu_command_lib::{
+    command::{CommandResponseData, ListedFrontends},
+    proxy::{FilteredData, QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics, Route},
 };
 
 pub fn print_frontend_list(frontends: ListedFrontends) {

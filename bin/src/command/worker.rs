@@ -1,8 +1,8 @@
+use std::{collections::VecDeque, fmt, os::unix::io::AsRawFd};
+
 use futures::SinkExt;
 use libc::pid_t;
-use nix::sys::signal::kill;
-use nix::unistd::Pid;
-use std::{collections::VecDeque, fmt, os::unix::io::AsRawFd};
+use nix::{sys::signal::kill, unistd::Pid};
 
 use sozu_command_lib::{
     channel::Channel,
