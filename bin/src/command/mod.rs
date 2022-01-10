@@ -901,32 +901,37 @@ pub fn start_server(
     })
 }
 
+// The client loop does two things:
+// - write everything destined to the client onto the unix stream
+// - parse CommandRequests from the unix stream and send them to the command server
 async fn client_loop(
     id: String,
     stream: Async<UnixStream>,
     mut command_tx: Sender<CommandMessage>,
     mut client_rx: Receiver<CommandResponse>,
 ) {
-    let stream = Arc::new(stream);
-    let mut s = stream.clone();
+    let read_stream = Arc::new(stream);
+    let mut write_stream = read_stream.clone();
 
-    // write everything destined to the client onto the unix stream
     smol::spawn(async move {
         while let Some(response) = client_rx.next().await {
             //info!("sending back message to client: {:?}", msg);
             let mut message: Vec<u8> = serde_json::to_string(&response)
-                .map(|s| s.into_bytes())
+                .map(|string| string.into_bytes())
                 .unwrap_or_else(|_| Vec::new());
+
+            // separate all messages with a 0 byte
             message.push(0);
-            let _ = s.write_all(&message).await;
+            let _ = write_stream.write_all(&message).await;
         }
     })
     .detach();
 
-    // parse CommandRequests from the unix stream and send them to the command server
     debug!("will start receiving messages from client {}", id);
-    let mut it = BufReader::new(stream).split(0);
-    while let Some(message) = it.next().await {
+
+    // Read the stream by splitting it on 0 bytes
+    let mut split_iterator = BufReader::new(read_stream).split(0);
+    while let Some(message) = split_iterator.next().await {
         let message = match message {
             Err(e) => {
                 error!("could not split message: {:?}", e);
@@ -968,33 +973,38 @@ async fn client_loop(
     }
 }
 
+// the worker loop does two things:
+// - write everything destined to the worker onto the unix stream
+// - parse ProxyResponses from the unix stream and send them to the CommandServer
 async fn worker_loop(
     id: u32,
     stream: Async<UnixStream>,
     mut command_tx: Sender<CommandMessage>,
     mut worker_rx: Receiver<ProxyRequest>,
 ) {
-    let stream = Arc::new(stream);
-    let mut s = stream.clone();
+    let read_stream = Arc::new(stream);
+    let mut write_stream = read_stream.clone();
 
-    // write everything destined to the worker onto the unix stream
     smol::spawn(async move {
         debug!("will start sending messages to worker {}", id);
         while let Some(request) = worker_rx.next().await {
             debug!("sending to worker {}: {:?}", id, request);
             let mut message: Vec<u8> = serde_json::to_string(&request)
-                .map(|s| s.into_bytes())
+                .map(|string| string.into_bytes())
                 .unwrap_or_else(|_| Vec::new());
+
+            // separate all messages with a 0 byte
             message.push(0);
-            let _ = s.write_all(&message).await;
+            let _ = write_stream.write_all(&message).await;
         }
     })
     .detach();
 
-    // parse ProxyResponses from the unix stream and send them to the CommandServer
     debug!("will start receiving messages from worker {}", id);
-    let mut it = BufReader::new(stream).split(0);
-    while let Some(message) = it.next().await {
+
+    // Read the stream by splitting it on 0 bytes
+    let mut split_iterator = BufReader::new(read_stream).split(0);
+    while let Some(message) = split_iterator.next().await {
         let message = match message {
             Err(e) => {
                 error!("could not split message: {:?}", e);
