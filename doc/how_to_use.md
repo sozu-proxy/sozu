@@ -48,7 +48,7 @@ You can build the image by doing:
 `docker build -t sozu .`
 
 There's also the [clevercloud/sozu](https://hub.docker.com/r/clevercloud/sozu/) image
-following the master branch.
+following the master branch (outdated).
 
 Run it with the command:
 
@@ -62,6 +62,10 @@ docker run \
   -p 8443:443 \
   sozu
 ```
+
+To build an image with a specific version of Alpine:
+
+`docker build --build-arg ALPINE_VERSION=3.14 -t sozu:main-alpine-3.14 .`
 
 ### Using a custom `config.toml` configuration file
 
