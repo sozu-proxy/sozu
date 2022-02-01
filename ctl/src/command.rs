@@ -1070,7 +1070,7 @@ pub fn remove_backend(channel: Channel<CommandRequest,CommandResponse>, timeout:
 }
 
 pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
-  certificate_path: &str, certificate_chain_path: &str, key_path: &str, versions: Vec<TlsVersion>) 
+  certificate_path: &str, certificate_chain_path: &str, key_path: &str, versions: Vec<TlsVersion>, names:Vec<String>) 
   -> Result<(), anyhow::Error> {
   if let Some(new_certificate) = load_full_certificate(certificate_path,
                                                        certificate_chain_path,
@@ -1078,7 +1078,7 @@ pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout
     order_command(channel, timeout, ProxyRequestData::AddCertificate(AddCertificate {
       front: address,
       certificate: new_certificate,
-      names: Vec::new(),
+      names,
     }))?;
   }
   Ok(())
