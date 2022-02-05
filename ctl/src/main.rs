@@ -137,8 +137,8 @@ fn main() -> Result<(), anyhow::Error> {
     }
     SubCmd::Certificate{ cmd } => {
       match cmd {
-        CertificateCmd::Add{ certificate, chain, key, address, tls_versions } => {
-          add_certificate(channel, timeout, address, &certificate, &chain, &key, tls_versions)
+        CertificateCmd::Add{ certificate, chain, key, address, tls_versions, names } => {
+          add_certificate(channel, timeout, address, &certificate, &chain, &key, tls_versions, names)
         },
         CertificateCmd::Remove{ certificate, address, fingerprint } => {
           remove_certificate(channel, timeout, address, certificate.as_deref(),

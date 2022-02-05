@@ -361,6 +361,8 @@ pub enum CertificateCmd {
     #[structopt(long = "tls-versions", help = "accepted TLS versions for this certificate",
                 parse(try_from_str = parse_tls_versions))]
     tls_versions: Vec<TlsVersion>,
+    #[structopt(long = "names", use_delimiter = true, help="list of comma separated domain names (wildcard allowed)")]
+    names : Vec<String>,
   },
   #[structopt(name = "remove", about = "Remove a certificate")]
   Remove {
