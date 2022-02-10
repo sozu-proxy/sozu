@@ -127,7 +127,7 @@ tls_provider = "rustls"
 
 # by default, all listeners start a TCP listen socket o startup
 # if set to false, this option will prevent them from listening. You can then add
-# the complete co,figuration, and send an ActivateListener message afterwards
+# the complete configuration, and send an ActivateListener message afterwards
 activate_listeners= true
 
 # various statistics can be sent to a server that supports the statsd protocol
@@ -165,7 +165,7 @@ address = "0.0.0.0:8080"
 # sticky_name = "SOZUBALANCEID"
 #
 # Configures the client socket to receive a PROXY protocol header
-# this option is incompatible with public_addresss
+# this option is incompatible with public_address
 # expect_proxy = false
 
 # Example for a HTTPS (OpenSSL based or rustls based) listener
@@ -183,7 +183,7 @@ address = "0.0.0.0:8443"
 # sticky_name = "SOZUBALANCEID"
 
 # Configures the client socket to receive a PROXY protocol header
-# this option is incompatible with public_addresss
+# this option is incompatible with public_address
 # expect_proxy = false
 
 # supported TLS versions. Possible values are "SSLv2", "SSLv3", "TLSv1",
@@ -215,7 +215,7 @@ tls_versions = ["TLSv1.3"]
 # public_address = "1.2.3.4:81"
 #
 # Configures the client socket to receive a PROXY protocol header
-# this option is incompatible with public_addresss
+# this option is incompatible with public_address
 # expect_proxy = false
 
 # static configuration for applications
