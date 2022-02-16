@@ -72,6 +72,11 @@ impl CommandServer {
             CommandRequestData::Proxy(proxy_request) => match proxy_request {
                 ProxyRequestData::Metrics(config) => self.metrics(request_identifier, config).await,
                 ProxyRequestData::Query(query) => self.query(request_identifier, query).await,
+                ProxyRequestData::Logging(logging_filter) => self.set_logging_level(logging_filter),
+                // we should have something like
+                // ProxyRequestData::SoftStop => self.do_something(),
+                // ProxyRequestData::HardStop => self.do_nothing_and_return_early(),
+                // but it goes in there instead:
                 order => {
                     self.worker_order(request_identifier, order, request.worker_id)
                         .await
@@ -1032,6 +1037,19 @@ impl CommandServer {
         Ok(None)
     }
 
+    pub fn set_logging_level(&mut self, logging_filter: String) -> anyhow::Result<Option<Success>> {
+        debug!("Changing main process log level to {}", logging_filter);
+        logging::LOGGER.with(|l| {
+            let directives = logging::parse_logging_spec(&logging_filter);
+            l.borrow_mut().set_directives(directives);
+        });
+        // also change / set the content of RUST_LOG so future workers / main thread
+        // will have the new logging filter value
+        ::std::env::set_var("RUST_LOG", logging_filter.to_owned());
+        debug!("Logging level now: {}", ::std::env::var("RUST_LOG")?);
+        Ok(Some(Success::Logging(logging_filter)))
+    }
+
     pub async fn worker_order(
         &mut self,
         request_identifier: RequestIdentifier,
@@ -1042,17 +1060,6 @@ impl CommandServer {
             debug!("workerconfig client order AddCertificate()");
         } else {
             debug!("workerconfig client order {:?}", order);
-        }
-
-        if let &ProxyRequestData::Logging(ref logging_filter) = &order {
-            debug!("Changing main process log level to {}", logging_filter);
-            logging::LOGGER.with(|l| {
-                let directives = logging::parse_logging_spec(&logging_filter);
-                l.borrow_mut().set_directives(directives);
-            });
-            // also change / set the content of RUST_LOG so future workers / main thread
-            // will have the new logging filter value
-            ::std::env::set_var("RUST_LOG", logging_filter);
         }
 
         if !self.state.handle_order(&order) {
