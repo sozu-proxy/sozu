@@ -1109,15 +1109,16 @@ impl CommandServer {
             }
         }
 
+        // sent out the order to all workers
         let (worker_order_tx, mut worker_order_rx) =
             futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut found = false;
         let mut stopping_workers = HashSet::new();
-
-        let mut count = 0usize;
+        let mut worker_count = 0usize;
         for ref mut worker in self.workers.iter_mut().filter(|worker| {
             worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
         }) {
+            // sort out the specificly targeted worker, if provided
             if let Some(id) = worker_id {
                 if id != worker.id {
                     continue;
@@ -1136,7 +1137,7 @@ impl CommandServer {
             self.in_flight.insert(req_id, (worker_order_tx.clone(), 1));
 
             found = true;
-            count += 1;
+            worker_count += 1;
         }
 
         let should_stop_main = (order == ProxyRequestData::SoftStop
@@ -1148,7 +1149,7 @@ impl CommandServer {
         let prefix = format!("{}-worker-", request_identifier.client);
         smol::spawn(async move {
             let mut responses = Vec::new();
-            let mut i = 0usize;
+            let mut response_count = 0usize;
             while let Some(proxy_response) = worker_order_rx.next().await {
                 match proxy_response.status {
                     ProxyResponseStatus::Ok => {
@@ -1175,12 +1176,13 @@ impl CommandServer {
                     }
                 };
 
-                i += 1;
-                if i == count {
+                response_count += 1;
+                if response_count == worker_count {
                     break;
                 }
             }
 
+            // send the order to kill the main process only after all workers responded
             if should_stop_main {
                 if let Err(e) = command_tx.send(CommandMessage::MasterStop).await {
                     error!("could not send main stop message: {:?}", e);
