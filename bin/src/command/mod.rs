@@ -113,6 +113,7 @@ pub enum Success {
     ListFrontends(CommandResponseData), // the list of frontends
     ListWorkers(CommandResponseData),
     LoadState(String, usize, usize), // state path, oks, errors
+    Logging(String),                 // new logging level
     MasterStop,
     // this should contain CommandResponseData but the logic does not return anything
     // is this logic gone into sozu_command_lib::proxy::Query::Metrics(_) ?
@@ -147,6 +148,11 @@ impl std::fmt::Display for Success {
                 f,
                 "Successfully loaded state from path {}, {} ok messages, {} errors",
                 path, ok, error
+            ),
+            Self::Logging(logging_filter) => write!(
+                f,
+                "Successfully set the logging level to {}",
+                logging_filter
             ),
             Self::MasterStop => write!(f, "stopping main process"),
             // Self::Metrics => write!(f, "Successfully fetched the metrics"),
