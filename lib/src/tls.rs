@@ -60,16 +60,16 @@ pub trait CertificateResolver {
         &mut self,
         opts: &ReplaceCertificate,
     ) -> Result<CertificateFingerprint, Self::Error> {
-        self.remove_certificate(&RemoveCertificate {
-            address: opts.address.to_owned(),
-            fingerprint: opts.old_fingerprint.to_owned(),
-        })?;
-
         let fingerprint = self.add_certificate(&AddCertificate {
             address: opts.address.to_owned(),
             certificate: opts.new_certificate.to_owned(),
             names: opts.new_names.to_owned(),
             expired_at: opts.new_expired_at.to_owned(),
+        })?;
+
+        self.remove_certificate(&RemoveCertificate {
+            address: opts.address.to_owned(),
+            fingerprint: opts.old_fingerprint.to_owned(),
         })?;
 
         Ok(fingerprint)
