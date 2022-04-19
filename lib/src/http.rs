@@ -2234,7 +2234,7 @@ mod tests {
             FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
         let listener = Listener {
             listener: None,
-            address: address,
+            address,
             fronts,
             answers: Rc::new(RefCell::new(HttpAnswers::new(
                 "HTTP/1.1 404 Not Found\r\n\r\n",

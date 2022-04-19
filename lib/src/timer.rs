@@ -505,11 +505,10 @@ mod test {
     #[test]
     pub fn test_timeout_next_tick() {
         let mut t = timer();
-        let mut tick;
 
         t.set_timeout_at(Duration::milliseconds(100), "a");
 
-        tick = ms_to_tick(&t, 50);
+        let mut tick = ms_to_tick(&t, 50);
         assert_eq!(None, t.poll_to(tick));
 
         tick = ms_to_tick(&t, 100);
@@ -528,12 +527,11 @@ mod test {
     #[test]
     pub fn test_clearing_timeout() {
         let mut t = timer();
-        let mut tick;
 
         let to = t.set_timeout_at(Duration::milliseconds(100), "a");
         assert_eq!("a", t.cancel_timeout(&to).unwrap());
 
-        tick = ms_to_tick(&t, 100);
+        let mut tick = ms_to_tick(&t, 100);
         assert_eq!(None, t.poll_to(tick));
 
         tick = ms_to_tick(&t, 200);
@@ -545,20 +543,19 @@ mod test {
     #[test]
     pub fn test_multiple_timeouts_same_tick() {
         let mut t = timer();
-        let mut tick;
 
         t.set_timeout_at(Duration::milliseconds(100), "a");
         t.set_timeout_at(Duration::milliseconds(100), "b");
 
         let mut rcv = vec![];
 
-        tick = ms_to_tick(&t, 100);
+        let mut tick = ms_to_tick(&t, 100);
         rcv.push(t.poll_to(tick).unwrap());
         rcv.push(t.poll_to(tick).unwrap());
 
         assert_eq!(None, t.poll_to(tick));
 
-        rcv.sort();
+        rcv.sort_unstable();
         assert!(rcv == ["a", "b"], "actual={:?}", rcv);
 
         tick = ms_to_tick(&t, 200);
@@ -570,7 +567,6 @@ mod test {
     #[test]
     pub fn test_multiple_timeouts_diff_tick() {
         let mut t = timer();
-        let mut tick;
 
         t.set_timeout_at(Duration::milliseconds(110), "a");
         t.set_timeout_at(Duration::milliseconds(220), "b");
@@ -578,7 +574,7 @@ mod test {
         t.set_timeout_at(Duration::milliseconds(440), "d");
         t.set_timeout_at(Duration::milliseconds(560), "e");
 
-        tick = ms_to_tick(&t, 100);
+        let mut tick = ms_to_tick(&t, 100);
         assert_eq!(Some("a"), t.poll_to(tick));
         assert_eq!(None, t.poll_to(tick));
 
@@ -622,7 +618,6 @@ mod test {
     #[test]
     pub fn test_timeout_hash_collision() {
         let mut t = timer();
-        let mut tick;
 
         t.set_timeout_at(Duration::milliseconds(100), "a");
         t.set_timeout_at(
@@ -630,7 +625,7 @@ mod test {
             "b",
         );
 
-        tick = ms_to_tick(&t, 100);
+        let mut tick = ms_to_tick(&t, 100);
         assert_eq!(Some("a"), t.poll_to(tick));
         assert_eq!(1, count(&t));
 
@@ -646,13 +641,12 @@ mod test {
     #[test]
     pub fn test_clearing_timeout_between_triggers() {
         let mut t = timer();
-        let mut tick;
 
         let a = t.set_timeout_at(Duration::milliseconds(100), "a");
         let _ = t.set_timeout_at(Duration::milliseconds(100), "b");
         let _ = t.set_timeout_at(Duration::milliseconds(200), "c");
 
-        tick = ms_to_tick(&t, 100);
+        let mut tick = ms_to_tick(&t, 100);
         assert_eq!(Some("b"), t.poll_to(tick));
         assert_eq!(2, count(&t));
 

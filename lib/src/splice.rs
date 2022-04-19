@@ -4,11 +4,7 @@ use std::{
     ptr,
 };
 
-use libc::{
-    c_int, c_uint, size_t,
-    types::os::arch::posix88::{off_t, ssize_t},
-};
-use mio::tcp::TcpStream;
+use libc::{c_int, c_uint, off_t, size_t, ssize_t};
 
 const SPLICE_F_NONBLOCK: c_uint = 2;
 extern "C" {
@@ -40,7 +36,7 @@ pub fn create_pipe() -> Option<Pipe> {
     }
 }
 
-pub fn splice_in(stream: &AsRawFd, pipe: Pipe) -> Option<usize> {
+pub fn splice_in(stream: &dyn AsRawFd, pipe: Pipe) -> Option<usize> {
     unsafe {
         let res = splice(
             stream.as_raw_fd(),
@@ -68,7 +64,7 @@ pub fn splice_in(stream: &AsRawFd, pipe: Pipe) -> Option<usize> {
     }
 }
 
-pub fn splice_out(pipe: Pipe, stream: &AsRawFd) -> Option<usize> {
+pub fn splice_out(pipe: Pipe, stream: &dyn AsRawFd) -> Option<usize> {
     unsafe {
         let res = splice(
             pipe[0],

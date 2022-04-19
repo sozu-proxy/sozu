@@ -213,7 +213,7 @@ mod expect_test {
         let middleware_addr: SocketAddr = "127.0.0.1:3500".parse().expect("parse address error");
         let barrier = Arc::new(Barrier::new(2));
 
-        let upfront = start_upfront_middleware(middleware_addr.clone(), barrier.clone());
+        let upfront = start_upfront_middleware(middleware_addr, barrier.clone());
         start_middleware(middleware_addr, barrier);
 
         upfront.join().expect("should join");

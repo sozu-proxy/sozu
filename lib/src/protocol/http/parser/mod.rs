@@ -87,7 +87,7 @@ fn is_header_value_char(i: u8) -> bool {
 
 #[cfg(not(feature = "tolerant-http1-parser"))]
 fn is_header_value_char(i: u8) -> bool {
-    i == 9 || (i >= 32 && i <= 126)
+    i == 9 || (32..=126).contains(&i)
 }
 
 fn vchar_1(i: &[u8]) -> IResult<&[u8], &[u8]> {
@@ -486,7 +486,7 @@ pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<&[u8]>)> {
 }
 
 pub fn is_hex_digit(chr: u8) -> bool {
-    (chr >= 0x30 && chr <= 0x39) || (chr >= 0x41 && chr <= 0x46) || (chr >= 0x61 && chr <= 0x66)
+    (0x30..=0x39).contains(&chr) || (0x41..=0x46).contains(&chr) || (0x61..=0x66).contains(&chr)
 }
 pub fn chunk_size(input: &[u8]) -> IResult<&[u8], usize> {
     let (i, s) = map_res(take_while(is_hex_digit), from_utf8)(input)?;

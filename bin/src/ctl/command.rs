@@ -10,6 +10,7 @@ use std::{
 use anyhow::{self, bail, Context};
 use prettytable::Table;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use serde::Serialize;
 
 use sozu_command_lib::{
     command::{
@@ -33,7 +34,6 @@ use crate::{
         CommandManager,
     },
 };
-
 
 // Used to display the JSON response of the status command
 #[derive(Serialize, Debug)]

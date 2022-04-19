@@ -497,7 +497,7 @@ impl CommandServer {
 
     pub async fn upgrade_main(
         &mut self,
-        request_identifier: RequestIdentifier,
+        _request_identifier: RequestIdentifier,
     ) -> anyhow::Result<Option<Success>> {
         self.disable_cloexec_before_upgrade()?;
 

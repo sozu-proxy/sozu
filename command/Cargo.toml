@@ -10,7 +10,6 @@ license = "LGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
 edition="2018"
-
 include = [
   "./README.md",
   "Cargo.toml",
@@ -22,26 +21,26 @@ include = [
 ]
 
 [dependencies]
-anyhow = "^1.0.42"
-nom = "7.0.0"
-hex = "^0.4"
-log = "^0.4"
-pem = "^1.0"
-nix = "^0.23"
-mio = { version = "^0.8", features = [ "os-poll", "net" ] }
-libc = "^0.2"
-pool = "^0.1"
-time = "^0.3"
-toml = "^0.5"
-sha2 = "^0.9"
-memchr = "2.3"
-regex = "1.1"
-rand = "^0.8"
-serde = "^1.0.34"
-serde_json = "^1.0.34"
-serde_derive = "^1.0.34"
-trailer = {version = "^0.1.2" }
-poule = "0.3"
+anyhow = "^1.0.56"
+hex = "^0.4.3"
+libc = "^0.2.124"
+log = "^0.4.16"
+time = "^0.3.9"
+toml = "^0.5.9"
+memchr = "^2.4.1"
+mio = { version = "^0.8.2", features = [ "os-poll", "net" ] }
+nix = "^0.23.1"
+nom = "^7.1.1"
+pem = "^1.0.2"
+regex = "^1.5.5"
+rand = "^0.8.5"
+serde = "^1.0.136"
+serde_json = "^1.0.79"
+serde_derive = "^1.0.136"
+sha2 = "^0.10.2"
+trailer = "^0.1.2"
+pool = "^0.1.4"
+poule = "^0.3.2"
 
 [features]
 unstable = []
