@@ -677,25 +677,25 @@ impl<Front: SocketHandler> Pipe<Front> {
         let tokens = self.tokens();
 
         if let Some(ref mut backend) = self.backend {
-            let (sz, r) = backend.socket_read(&mut self.back_buf.space());
-            self.back_buf.fill(sz);
+            let (size, remaining) = backend.socket_read(self.back_buf.space());
+            self.back_buf.fill(size);
 
             if let Some((front, back)) = tokens {
                 debug!(
                     "{}\tBACK  [{}<-{}]: read {} bytes",
-                    self.log_ctx, front.0, back.0, sz
+                    self.log_ctx, front.0, back.0, size
                 );
             }
 
-            if r != SocketResult::Continue || sz == 0 {
+            if remaining != SocketResult::Continue || size == 0 {
                 self.back_readiness.event.remove(Ready::readable());
             }
-            if sz > 0 {
+            if size > 0 {
                 self.front_readiness.interest.insert(Ready::writable());
-                metrics.backend_bin += sz;
+                metrics.backend_bin += size;
             }
 
-            if sz == 0 && r == SocketResult::Closed {
+            if size == 0 && remaining == SocketResult::Closed {
                 self.backend_status = match self.backend_status {
                     ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
                     ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
@@ -711,7 +711,7 @@ impl<Front: SocketHandler> Pipe<Front> {
                 }
             }
 
-            match r {
+            match remaining {
                 SocketResult::Error => {
                     metrics.service_stop();
                     incr!("pipe.errors");

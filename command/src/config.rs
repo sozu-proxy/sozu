@@ -1321,7 +1321,7 @@ impl Config {
             ))?
             .to_string();
 
-        return Ok(Some(stringified_path));
+        Ok(Some(stringified_path))
     }
 
     pub fn load_file(path: &str) -> io::Result<String> {
@@ -1434,8 +1434,8 @@ mod tests {
     #[test]
     fn parse() {
         let path = "assets/config.toml";
-        let config =
-            Config::load_from_path(path).expect(&format!("Cannot load config from path {}", path));
+        let config = Config::load_from_path(path)
+            .unwrap_or_else(|_| panic!("Cannot load config from path {}", path));
         println!("config: {:#?}", config);
         //panic!();
     }

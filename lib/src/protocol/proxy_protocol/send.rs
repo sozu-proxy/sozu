@@ -209,9 +209,9 @@ mod send_test {
         let barrier = Arc::new(Barrier::new(3));
         let end_barrier = Arc::new(Barrier::new(2));
 
-        start_client(addr_client.clone(), barrier.clone(), end_barrier.clone());
-        let backend = start_backend(addr_backend.clone(), barrier.clone(), end_barrier.clone());
-        start_middleware(addr_client, addr_backend, barrier.clone());
+        start_client(addr_client, barrier.clone(), end_barrier.clone());
+        let backend = start_backend(addr_backend, barrier.clone(), end_barrier);
+        start_middleware(addr_client, addr_backend, barrier);
 
         backend
             .join()

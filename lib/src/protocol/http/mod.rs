@@ -903,7 +903,7 @@ impl<Front: SocketHandler> Http<Front> {
             let (request_state, header_end) = parse_request_until_stop(
                 request_state,
                 header_end,
-                &mut self.front_buf.as_mut().unwrap(),
+                self.front_buf.as_mut().unwrap(),
                 self.added_req_header.as_ref(),
                 &self.sticky_name,
             );
@@ -977,7 +977,7 @@ impl<Front: SocketHandler> Http<Front> {
                     let (request_state, header_end) = parse_request_until_stop(
                         request_state,
                         header_end,
-                        &mut self.front_buf.as_mut().unwrap(),
+                        self.front_buf.as_mut().unwrap(),
                         self.added_req_header.as_ref(),
                         &self.sticky_name,
                     );
@@ -1008,7 +1008,7 @@ impl<Front: SocketHandler> Http<Front> {
                 let (request_state, header_end) = parse_request_until_stop(
                     request_state,
                     header_end,
-                    &mut self.front_buf.as_mut().unwrap(),
+                    self.front_buf.as_mut().unwrap(),
                     self.added_req_header.as_ref(),
                     &self.sticky_name,
                 );
@@ -1500,7 +1500,7 @@ impl<Front: SocketHandler> Http<Front> {
 
         let (sz, r) = {
             let sock = unwrap_msg!(self.backend.as_mut());
-            sock.socket_read(&mut self.back_buf.as_mut().unwrap().buffer.space())
+            sock.socket_read(self.back_buf.as_mut().unwrap().buffer.space())
         };
 
         if let Some(back_buf) = self.back_buf.as_mut() {
@@ -1599,7 +1599,7 @@ impl<Front: SocketHandler> Http<Front> {
                         let (response_state, header_end) = parse_response_until_stop(
                             response_state,
                             header_end,
-                            &mut self.back_buf.as_mut().unwrap(),
+                            self.back_buf.as_mut().unwrap(),
                             is_head,
                             &self.added_res_header,
                             &self.sticky_name,
@@ -1697,7 +1697,7 @@ impl<Front: SocketHandler> Http<Front> {
                     let (response_state2, header_end2) = parse_response_until_stop(
                         response_state,
                         header_end,
-                        &mut self.back_buf.as_mut().unwrap(),
+                        self.back_buf.as_mut().unwrap(),
                         is_head,
                         &self.added_res_header,
                         &self.sticky_name,

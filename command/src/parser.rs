@@ -95,7 +95,7 @@ mod test {
         let empty_vec: Vec<u8> = vec![];
 
         assert_eq!(
-            parse_one_command(&bytes).unwrap(),
+            parse_one_command(bytes).unwrap(),
             (&empty_vec[..], command_request)
         )
     }
@@ -131,7 +131,7 @@ mod test {
 
         let bytes_to_parse = &serialized_commands.as_bytes();
 
-        let parsed_commands = parse_several_commands(&bytes_to_parse).unwrap();
+        let parsed_commands = parse_several_commands(bytes_to_parse).unwrap();
 
         println!("parsed commands: {:?}", parsed_commands);
 
