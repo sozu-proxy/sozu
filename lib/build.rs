@@ -1,20 +1,18 @@
 use std::env;
 
 fn main() {
-    match env::var("DEP_OPENSSL_VERSION") {
-        Ok(ref v) if v == "101" => {
-            println!("cargo:rustc-cfg=ossl101");
+    match &env::var("DEP_OPENSSL_VERSION") {
+        Ok(v) if v == "101" || v == "102" => {
+            println!("cargo:rustc-cfg=ossl{}", v);
             println!("cargo:rustc-cfg=ossl10x");
         }
-        Ok(ref v) if v == "102" => {
-            println!("cargo:rustc-cfg=ossl102");
-            println!("cargo:rustc-cfg=ossl10x");
-        }
-        Ok(ref v) if v == "110" => {
-            println!("cargo:rustc-cfg=ossl110");
+        Ok(v) if v == "110" || v == "111" => {
+            println!("cargo:rustc-cfg=ossl{}", v);
+            println!("cargo:rustc-cfg=ossl11x");
         }
         _ => {
-            println!("cargo:rustc-cfg=ossl110");
+            println!("cargo:rustc-cfg=ossl111");
+            println!("cargo:rustc-cfg=ossl11x");
         } //panic!("Unable to detect OpenSSL version"),
     }
 

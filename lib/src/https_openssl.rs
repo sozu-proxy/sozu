@@ -2381,7 +2381,7 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     ctx.set_ecdh_auto(true)
 }
 
-#[cfg(ossl110)]
+#[cfg(ossl11x)]
 fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     use openssl::ec::EcKey;
 
@@ -2389,7 +2389,7 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     ctx.set_tmp_ecdh(&curve)
 }
 
-#[cfg(all(not(ossl101), not(ossl102), not(ossl110)))]
+#[cfg(all(not(ossl101), not(ossl102), not(ossl11x)))]
 fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     compile_error!("unsupported openssl version, please open an issue");
     Ok(())
