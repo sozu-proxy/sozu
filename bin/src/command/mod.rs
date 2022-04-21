@@ -21,6 +21,7 @@ use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,
 };
+use serde::{Deserialize, Serialize};
 use serde_json;
 
 use sozu_command_lib::{

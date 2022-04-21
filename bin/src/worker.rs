@@ -118,7 +118,7 @@ pub fn begin_worker_process(
         worker_id.clone(),
         &worker_config.log_level,
         &worker_config.log_target,
-        worker_config.log_access_target.as_ref().map(|s| s.as_str()),
+        worker_config.log_access_target.as_deref(),
     );
     let backend = target_to_backend(&worker_config.log_target);
     let access_backend = worker_config
@@ -137,7 +137,7 @@ pub fn begin_worker_process(
     let mut command: Channel<ProxyResponse, ProxyRequest> = command.into();
     command.readiness.insert(Ready::readable());
 
-    if let Some(ref metrics) = worker_config.metrics.as_ref() {
+    if let Some(metrics) = worker_config.metrics.as_ref() {
         metrics::setup(
             &metrics.address,
             worker_id,

@@ -1383,6 +1383,8 @@ fn version_str(version: ProtocolVersion) -> &'static str {
         ProtocolVersion::TLSv1_1 => "tls.version.TLSv1_1",
         ProtocolVersion::TLSv1_2 => "tls.version.TLSv1_2",
         ProtocolVersion::TLSv1_3 => "tls.version.TLSv1_3",
+        ProtocolVersion::DTLSv1_0 => "tls.version.DTLSv1_0",
+        ProtocolVersion::DTLSv1_2 => "tls.version.DTLSv1_2",
         ProtocolVersion::Unknown(_) => "tls.version.Unknown",
     }
 }

@@ -3,7 +3,7 @@ use std::{
     process::exit,
 };
 
-use anyhow::{self, bail, Context};
+use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::{
@@ -270,27 +270,26 @@ pub fn print_query_response_data(
     data: Option<CommandResponseData>,
     json: bool,
 ) -> anyhow::Result<()> {
-    if let Some(needle) = application_id.or(domain) {
-        if let Some(CommandResponseData::Query(data)) = data {
+    if let Some(needle) = application_id.or_else(|| domain) {
+        if let Some(CommandResponseData::Query(data)) = &data {
             if json {
-                return print_json_response(&data);
+                return print_json_response(data);
             }
 
             let application_headers = vec!["id", "sticky_session", "https_redirect"];
-            let mut application_table =
-                create_queried_application_table(application_headers, &data);
+            let mut application_table = create_queried_application_table(application_headers, data);
 
             let http_headers = vec!["id", "hostname", "path"];
-            let mut frontend_table = create_queried_application_table(http_headers, &data);
+            let mut frontend_table = create_queried_application_table(http_headers, data);
 
             let https_headers = vec!["id", "hostname", "path"];
-            let mut https_frontend_table = create_queried_application_table(https_headers, &data);
+            let mut https_frontend_table = create_queried_application_table(https_headers, data);
 
             let tcp_headers = vec!["id", "address"];
-            let mut tcp_frontend_table = create_queried_application_table(tcp_headers, &data);
+            let mut tcp_frontend_table = create_queried_application_table(tcp_headers, data);
 
             let backend_headers = vec!["backend id", "IP address", "Backup"];
-            let mut backend_table = create_queried_application_table(backend_headers, &data);
+            let mut backend_table = create_queried_application_table(backend_headers, data);
 
             let keys: HashSet<&String> = data.keys().collect();
 
@@ -300,31 +299,31 @@ pub fn print_query_response_data(
             let mut tcp_frontend_data = HashMap::new();
             let mut backend_data = HashMap::new();
 
-            for (ref key, ref metrics) in data.iter() {
+            for (key, metrics) in data.iter() {
                 //let m: u8 = metrics;
-                if let &QueryAnswer::Applications(ref apps) = *metrics {
+                if let QueryAnswer::Applications(apps) = metrics {
                     for app in apps.iter() {
                         let entry = application_data.entry(app).or_insert(Vec::new());
-                        entry.push((*key).clone());
+                        entry.push(key.to_owned());
 
                         for frontend in app.http_frontends.iter() {
                             let entry = frontend_data.entry(frontend).or_insert(Vec::new());
-                            entry.push((*key).clone());
+                            entry.push(key.to_owned());
                         }
 
                         for frontend in app.https_frontends.iter() {
                             let entry = https_frontend_data.entry(frontend).or_insert(Vec::new());
-                            entry.push((*key).clone());
+                            entry.push(key.to_owned());
                         }
 
                         for frontend in app.tcp_frontends.iter() {
                             let entry = tcp_frontend_data.entry(frontend).or_insert(Vec::new());
-                            entry.push((*key).clone());
+                            entry.push(key.to_owned());
                         }
 
                         for backend in app.backends.iter() {
                             let entry = backend_data.entry(backend).or_insert(Vec::new());
-                            entry.push((*key).clone());
+                            entry.push(key.to_owned());
                         }
                     }
                 }
@@ -332,29 +331,29 @@ pub fn print_query_response_data(
 
             println!("Cluster level configuration for {}:\n", needle);
 
-            for (ref key, ref values) in application_data.iter() {
+            for (key, values) in application_data.iter() {
                 let mut row = Vec::new();
                 row.push(cell!(key
                     .configuration
-                    .clone()
-                    .map(|conf| conf.cluster_id)
-                    .unwrap_or(String::from(""))));
+                    .as_ref()
+                    .map(|conf| conf.cluster_id.to_owned())
+                    .unwrap_or_else(String::new)));
                 row.push(cell!(key
                     .configuration
-                    .clone()
+                    .as_ref()
                     .map(|conf| conf.sticky_session)
-                    .unwrap_or(false)));
+                    .unwrap_or_else(|| false)));
                 row.push(cell!(key
                     .configuration
-                    .clone()
+                    .as_ref()
                     .map(|conf| conf.https_redirect)
-                    .unwrap_or(false)));
+                    .unwrap_or_else(|| false)));
 
-                for val in values.iter() {
+                for val in values {
                     if keys.contains(val) {
-                        row.push(cell!(String::from("X")));
+                        row.push(cell!("X"));
                     } else {
-                        row.push(cell!(String::from("")));
+                        row.push(cell!(""));
                     }
                 }
 
@@ -365,7 +364,7 @@ pub fn print_query_response_data(
 
             println!("\nHTTP frontends configuration for {}:\n", needle);
 
-            for (ref key, ref values) in frontend_data.iter() {
+            for (key, values) in frontend_data.iter() {
                 let mut row = Vec::new();
                 match &key.route {
                     Route::ClusterId(cluster_id) => row.push(cell!(cluster_id)),
@@ -376,9 +375,9 @@ pub fn print_query_response_data(
 
                 for val in values.iter() {
                     if keys.contains(val) {
-                        row.push(cell!(String::from("X")));
+                        row.push(cell!("X"));
                     } else {
-                        row.push(cell!(String::from("")));
+                        row.push(cell!(""));
                     }
                 }
 
@@ -389,7 +388,7 @@ pub fn print_query_response_data(
 
             println!("\nHTTPS frontends configuration for {}:\n", needle);
 
-            for (ref key, ref values) in https_frontend_data.iter() {
+            for (key, values) in https_frontend_data.iter() {
                 let mut row = Vec::new();
                 match &key.route {
                     Route::ClusterId(cluster_id) => row.push(cell!(cluster_id)),
@@ -400,9 +399,9 @@ pub fn print_query_response_data(
 
                 for val in values.iter() {
                     if keys.contains(val) {
-                        row.push(cell!(String::from("X")));
+                        row.push(cell!("X"));
                     } else {
-                        row.push(cell!(String::from("")));
+                        row.push(cell!(""));
                     }
                 }
 
@@ -413,10 +412,8 @@ pub fn print_query_response_data(
 
             println!("\nTCP frontends configuration for {}:\n", needle);
 
-            for (ref key, ref values) in tcp_frontend_data.iter() {
-                let mut row = Vec::new();
-                row.push(cell!(key.cluster_id));
-                row.push(cell!(format!("{}", key.address)));
+            for (key, values) in tcp_frontend_data.iter() {
+                let mut row = vec![cell!(key.cluster_id), cell!(format!("{}", key.address))];
 
                 for val in values.iter() {
                     if keys.contains(val) {
@@ -433,18 +430,21 @@ pub fn print_query_response_data(
 
             println!("\nbackends configuration for {}:\n", needle);
 
-            for (ref key, ref values) in backend_data.iter() {
-                let mut row = Vec::new();
-                let backend_backup = key.backup.map(|b| if b { "X" } else { "" }).unwrap_or("");
-                row.push(cell!(key.backend_id));
-                row.push(cell!(format!("{}", key.address)));
-                row.push(cell!(backend_backup));
+            for (key, values) in backend_data.iter() {
+                let mut row = vec![
+                    cell!(key.backend_id),
+                    cell!(format!("{}", key.address)),
+                    cell!(key
+                        .backup
+                        .map(|b| if b { "X" } else { "" })
+                        .unwrap_or_else(|| "")),
+                ];
 
-                for val in values.iter() {
-                    if keys.contains(val) {
-                        row.push(cell!(String::from("X")));
+                for val in values {
+                    if keys.contains(&val) {
+                        row.push(cell!("X"));
                     } else {
-                        row.push(cell!(String::from("")));
+                        row.push(cell!(""));
                     }
                 }
 
@@ -454,11 +454,10 @@ pub fn print_query_response_data(
             backend_table.printstd();
         }
     } else {
-        if let Some(CommandResponseData::Query(data)) = data {
+        if let Some(CommandResponseData::Query(data)) = &data {
             let mut table = Table::new();
-            let mut header = Vec::new();
-            header.push(cell!("key"));
-            for ref key in data.keys() {
+            let mut header = vec![cell!("key")];
+            for key in data.keys() {
                 header.push(cell!(&key));
             }
             header.push(cell!("desynchronized"));
@@ -466,31 +465,26 @@ pub fn print_query_response_data(
 
             let mut query_data = HashMap::new();
 
-            for ref metrics in data.values() {
+            for metrics in data.values() {
                 //let m: u8 = metrics;
-                if let &QueryAnswer::ApplicationsHashes(ref apps) = *metrics {
-                    for (ref key, ref value) in apps.iter() {
-                        (*(query_data.entry((*key).clone()).or_insert(Vec::new()))).push(*value);
+                if let QueryAnswer::ApplicationsHashes(apps) = metrics {
+                    for (key, value) in apps.iter() {
+                        query_data.entry(key).or_insert(Vec::new()).push(value);
                     }
                 }
             }
 
-            for (ref key, ref values) in query_data.iter() {
-                let mut row = Vec::new();
-                row.push(cell!(key));
-
+            for (key, values) in query_data.iter() {
+                let mut row = vec![cell!(key)];
                 for val in values.iter() {
                     row.push(cell!(format!("{}", val)));
                 }
 
                 let hs: HashSet<&u64> = values.iter().cloned().collect();
-
-                let diff = hs.len() > 1;
-
-                if diff {
-                    row.push(cell!(String::from("X")));
+                if hs.len() > 1 {
+                    row.push(cell!("X"));
                 } else {
-                    row.push(cell!(String::from("")));
+                    row.push(cell!(""));
                 }
 
                 table.add_row(Row::new(row));

@@ -11,6 +11,7 @@ use futures_lite::future;
 use libc::{self, pid_t};
 use mio::net::UnixStream;
 use nix::unistd::*;
+use serde::{Deserialize, Serialize};
 use serde_json;
 use tempfile::tempfile;
 
@@ -39,7 +40,7 @@ impl SerializedWorker {
             fd: worker.fd,
             pid: worker.pid,
             id: worker.id,
-            run_state: worker.run_state.clone(),
+            run_state: worker.run_state,
             //token:      worker.token.clone().map(|Token(t)| t),
             queue: worker.queue.clone().into(),
             scm: worker.scm.raw_fd(),
@@ -93,7 +94,7 @@ pub fn start_new_main_process(
             info!("main launched: {}", child);
             command.set_nonblocking(true);
 
-            return Ok((child.into(), command));
+            Ok((child.into(), command))
         }
         ForkResult::Child => {
             trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });

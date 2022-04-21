@@ -1,10 +1,6 @@
 extern crate nom;
 #[macro_use]
-extern crate serde_derive;
-#[macro_use]
 extern crate lazy_static;
-#[macro_use]
-extern crate structopt_derive;
 #[macro_use]
 extern crate prettytable;
 #[macro_use]
@@ -38,8 +34,8 @@ use anyhow::{bail, Context};
 use libc::{cpu_set_t, pid_t};
 use structopt::StructOpt;
 
-use sozu_command_lib::config::Config;
 use sozu::metrics::METRICS;
+use sozu_command_lib::config::Config;
 
 use crate::{
     command::Worker,
@@ -122,16 +118,18 @@ fn start(matches: &cli::Sozu) -> Result<(), anyhow::Error> {
 
 fn init_workers(config: &Config) -> Result<Vec<Worker>, anyhow::Error> {
     let path = unsafe { get_executable_path().with_context(|| "Could not get executable path")? };
-    start_workers(path, &config).with_context(|| "Failed at spawning workers")
+    start_workers(path, config).with_context(|| "Failed at spawning workers")
 }
 
 pub fn get_config_file_path(matches: &cli::Sozu) -> Result<&str, anyhow::Error> {
     match matches.config.as_ref() {
         Some(config_file) => Ok(config_file.as_str()),
-        None => option_env!("SOZU_CONFIG").ok_or(anyhow::Error::msg(
-            "Configuration file hasn't been specified. Either use -c with the start command \
+        None => option_env!("SOZU_CONFIG").ok_or_else(|| {
+            anyhow::Error::msg(
+                "Configuration file hasn't been specified. Either use -c with the start command \
             or use the SOZU_CONFIG environment variable when building sozu.",
-        )),
+            )
+        }),
     }
 }
 
@@ -159,16 +157,16 @@ fn set_workers_affinity(workers: &Vec<Worker>) {
 
     let main_pid = unsafe { libc::getpid() };
     set_process_affinity(main_pid, cpu_count);
-    cpu_count = cpu_count + 1;
+    cpu_count += 1;
 
-    for ref worker in workers {
+    for worker in workers {
         if cpu_count >= max_cpu {
             cpu_count = 0;
         }
 
         set_process_affinity(worker.pid, cpu_count);
 
-        cpu_count = cpu_count + 1;
+        cpu_count += 1;
     }
 }
 
@@ -188,7 +186,7 @@ fn set_process_affinity(pid: pid_t, cpu: usize) {
         let mut cpu_set: cpu_set_t = mem::zeroed();
         let size_cpu_set = mem::size_of::<cpu_set_t>();
         libc::CPU_SET(cpu, &mut cpu_set);
-        libc::sched_setaffinity(pid, size_cpu_set, &mut cpu_set);
+        libc::sched_setaffinity(pid, size_cpu_set, &cpu_set);
 
         debug!("Worker {} bound to CPU core {}", pid, cpu);
     };

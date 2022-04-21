@@ -657,21 +657,14 @@ impl ConfigState {
         }
 
         for ((cluster_id, backend_id), res) in diff_map(
-            self.backends
-                .iter()
-                .map(|(cluster_id, v)| {
-                    v.iter()
-                        .map(move |backend| ((cluster_id, &backend.backend_id), backend))
-                })
-                .flatten(),
-            other
-                .backends
-                .iter()
-                .map(|(cluster_id, v)| {
-                    v.iter()
-                        .map(move |backend| ((cluster_id, &backend.backend_id), backend))
-                })
-                .flatten(),
+            self.backends.iter().flat_map(|(cluster_id, v)| {
+                v.iter()
+                    .map(move |backend| ((cluster_id, &backend.backend_id), backend))
+            }),
+            other.backends.iter().flat_map(|(cluster_id, v)| {
+                v.iter()
+                    .map(move |backend| ((cluster_id, &backend.backend_id), backend))
+            }),
         ) {
             match res {
                 DiffResult::Added => {
@@ -905,16 +898,8 @@ impl ConfigState {
                 })
                 .cloned()
                 .collect(),
-            tcp_frontends: self
-                .tcp_fronts
-                .get(cluster_id)
-                .cloned()
-                .unwrap_or_else(Vec::new),
-            backends: self
-                .backends
-                .get(cluster_id)
-                .cloned()
-                .unwrap_or_else(Vec::new),
+            tcp_frontends: self.tcp_fronts.get(cluster_id).cloned().unwrap_or_default(),
+            backends: self.backends.get(cluster_id).cloned().unwrap_or_default(),
         }
     }
 

@@ -521,17 +521,13 @@ impl GenericCertificateResolver {
     }
 
     fn get_expiration_override(&self, fingerprint: &CertificateFingerprint) -> Option<i64> {
-        self.overrides
-            .get(fingerprint)
-            .map(|co| co.expiration)
-            .flatten()
+        self.overrides.get(fingerprint).and_then(|co| co.expiration)
     }
 
     fn get_names_override(&self, fingerprint: &CertificateFingerprint) -> Option<HashSet<String>> {
         self.overrides
             .get(fingerprint)
-            .map(|co| co.names.to_owned())
-            .flatten()
+            .and_then(|co| co.names.to_owned())
     }
 
     pub fn domain_lookup(
@@ -697,11 +693,7 @@ mod tests {
             match err {
                 GenericCertificateResolverError::IsStillInUseError => {}
                 _ => {
-                    return Err(format!(
-                        "the certificate must not been removed, {}",
-                        err.to_string()
-                    )
-                    .into());
+                    return Err(format!("the certificate must not been removed, {}", err).into());
                 }
             }
         }
@@ -751,11 +743,7 @@ mod tests {
             match err {
                 GenericCertificateResolverError::IsStillInUseError => {}
                 _ => {
-                    return Err(format!(
-                        "the certificate must not been removed, {}",
-                        err.to_string()
-                    )
-                    .into());
+                    return Err(format!("the certificate must not been removed, {}", err).into());
                 }
             }
         }
@@ -975,7 +963,7 @@ mod tests {
 
         let mut fingerprints = vec![];
         for certificate in &certificates {
-            let (_, pem) = parse_x509_pem(&certificate.certificate.as_bytes())
+            let (_, pem) = parse_x509_pem(certificate.certificate.as_bytes())
                 .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
 
             fingerprints.push(GenericCertificateResolver::fingerprint(&pem));

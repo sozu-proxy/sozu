@@ -42,12 +42,12 @@ pub fn setup_logging(config: &Config) {
         "MAIN".to_string(),
         &config.log_level,
         &config.log_target,
-        config.log_access_target.as_ref().map(|s| s.as_str()),
+        config.log_access_target.as_deref(),
     );
 }
 
 pub fn setup_metrics(config: &Config) {
-    if let Some(ref metrics) = config.metrics.as_ref() {
+    if let Some(metrics) = config.metrics.as_ref() {
         metrics::setup(
             &metrics.address,
             "MAIN",
@@ -58,12 +58,12 @@ pub fn setup_metrics(config: &Config) {
 }
 
 pub fn write_pid_file(config: &Config) -> Result<(), anyhow::Error> {
-    let pid_file_path = match config.pid_file_path {
-        Some(ref pid_file_path) => Some(pid_file_path.as_ref()),
-        None => option_env!("SOZU_PID_FILE_PATH"),
-    };
+    let pid_file_path: Option<&str> = config
+        .pid_file_path
+        .as_ref()
+        .map(|pid_file_path| pid_file_path.as_ref());
 
-    if let Some(ref pid_file_path) = pid_file_path {
+    if let Some(pid_file_path) = pid_file_path {
         let mut file = File::create(pid_file_path)?;
 
         let pid = unsafe { libc::getpid() };

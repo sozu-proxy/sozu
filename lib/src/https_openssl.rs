@@ -10,6 +10,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use foreign_types_shared::{ForeignType, ForeignTypeRef};
 use mio::{net::*, unix::SourceFd, *};
 use nom::HexDisplay;
 use openssl::{
@@ -2380,7 +2381,7 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     ctx.set_ecdh_auto(true)
 }
 
-#[cfg(ossl110)]
+#[cfg(ossl11x)]
 fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     use openssl::ec::EcKey;
 
@@ -2388,7 +2389,7 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     ctx.set_tmp_ecdh(&curve)
 }
 
-#[cfg(all(not(ossl101), not(ossl102), not(ossl110)))]
+#[cfg(all(not(ossl101), not(ossl102), not(ossl11x)))]
 fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     compile_error!("unsupported openssl version, please open an issue");
     Ok(())
@@ -2693,10 +2694,8 @@ extern "C" {
     pub fn SSL_set_options(ssl: *mut openssl_sys::SSL, op: libc::c_ulong) -> libc::c_ulong;
 }
 
-fn get_server_name<'a, 'b>(ssl: &'a mut SslRef) -> Option<&'b [u8]> {
+fn get_server_name<'a, 'b>(ssl: &'a SslRef) -> Option<&'b [u8]> {
     unsafe {
-        use foreign_types_shared::ForeignTypeRef;
-
         let mut out: *const libc::c_uchar = std::ptr::null();
         let mut outlen: libc::size_t = 0;
 
@@ -2719,7 +2718,6 @@ fn get_server_name<'a, 'b>(ssl: &'a mut SslRef) -> Option<&'b [u8]> {
 
 fn ssl_set_options(ssl: &mut SslRef, context: &SslContext) {
     unsafe {
-        use foreign_types_shared::{ForeignType, ForeignTypeRef};
         let options = openssl_sys::SSL_CTX_get_options(context.as_ptr());
         SSL_set_options(ssl.as_ptr(), options);
     }

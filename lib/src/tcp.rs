@@ -33,8 +33,8 @@ use crate::{
         config::ProxyProtocolConfig,
         logging,
         proxy::{
-            LoadBalancingAlgorithms, ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse,
-            ProxyResponseStatus, TcpListener as TcpListenerConfig,
+            ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse, ProxyResponseStatus,
+            TcpListener as TcpListenerConfig,
         },
         ready::Ready,
         scm_socket::ScmSocket,
@@ -1099,7 +1099,8 @@ impl Listener {
 #[derive(Debug)]
 pub struct ClusterConfiguration {
     proxy_protocol: Option<ProxyProtocolConfig>,
-    load_balancing: LoadBalancingAlgorithms,
+    // Uncomment this when implementing new load balancing algorythms
+    // load_balancing: LoadBalancingAlgorithms,
 }
 
 pub struct Proxy {
@@ -1273,7 +1274,7 @@ impl ProxyConfiguration<Session> for Proxy {
             ProxyRequestData::AddCluster(cluster) => {
                 let config = ClusterConfiguration {
                     proxy_protocol: cluster.proxy_protocol,
-                    load_balancing: cluster.load_balancing,
+                    //load_balancing: cluster.load_balancing,
                 };
                 self.configs.insert(cluster.cluster_id, config);
 
@@ -1649,17 +1650,17 @@ mod tests {
             setup_test_logger!();
             info!("starting event loop");
             let poll = Poll::new().expect("could not create event loop");
-            let max_buffers = 100;
+            let max_connections = 100;
             let buffer_size = 16384;
             let pool = Rc::new(RefCell::new(Pool::with_capacity(
                 1,
-                2 * max_buffers,
+                2 * max_connections,
                 buffer_size,
             )));
             let backends = Rc::new(RefCell::new(BackendMap::new()));
 
             let mut sessions: Slab<Rc<RefCell<dyn ProxySession>>> =
-                Slab::with_capacity(max_buffers);
+                Slab::with_capacity(max_connections);
             {
                 let entry = sessions.vacant_entry();
                 info!("taking token {:?} for channel", entry.key());
@@ -1682,7 +1683,7 @@ mod tests {
                 })));
             }
 
-            let sessions = SessionManager::new(sessions, max_buffers);
+            let sessions = SessionManager::new(sessions, max_connections);
             let registry = poll.registry().try_clone().unwrap();
             let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
             let listener_config = TcpListenerConfig {
@@ -1695,7 +1696,7 @@ mod tests {
             };
 
             {
-                let address = listener_config.address.clone();
+                let address = listener_config.address;
                 let mut s = sessions.borrow_mut();
                 let entry = s.slab.vacant_entry();
                 let _ =
@@ -1716,8 +1717,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let mut server_config: server::ServerConfig = Default::default();
-            server_config.max_connections = max_buffers;
+            let server_config = server::ServerConfig { max_connections, ..Default::default() };
             let mut s = Server::new(
                 poll,
                 channel,

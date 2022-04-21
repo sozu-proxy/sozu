@@ -31,7 +31,7 @@ impl CommandManager {
                 sticky_id,
                 backup,
             } => self.order_command(ProxyRequestData::AddBackend(Backend {
-                cluster_id: String::from(id),
+                cluster_id: id,
                 address,
                 backend_id,
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
@@ -43,7 +43,7 @@ impl CommandManager {
                 backend_id,
                 address,
             } => self.order_command(ProxyRequestData::RemoveBackend(RemoveBackend {
-                cluster_id: String::from(id),
+                cluster_id: id,
                 address,
                 backend_id,
             })),
@@ -67,7 +67,7 @@ impl CommandManager {
                     _ => None,
                 };
                 self.order_command(ProxyRequestData::AddCluster(Cluster {
-                    cluster_id: String::from(id),
+                    cluster_id: id,
                     sticky_session,
                     https_redirect,
                     proxy_protocol,
@@ -76,9 +76,9 @@ impl CommandManager {
                     answer_503: None,
                 }))
             }
-            ApplicationCmd::Remove { id } => self.order_command(ProxyRequestData::RemoveCluster {
-                cluster_id: String::from(id),
-            }),
+            ApplicationCmd::Remove { id } => {
+                self.order_command(ProxyRequestData::RemoveCluster { cluster_id: id })
+            }
         }
     }
 
@@ -86,13 +86,13 @@ impl CommandManager {
         match cmd {
             TcpFrontendCmd::Add { id, address } => {
                 self.order_command(ProxyRequestData::AddTcpFrontend(TcpFrontend {
-                    cluster_id: String::from(id),
+                    cluster_id: id,
                     address,
                 }))
             }
             TcpFrontendCmd::Remove { id, address } => {
                 self.order_command(ProxyRequestData::RemoveTcpFrontend(TcpFrontend {
-                    cluster_id: String::from(id),
+                    cluster_id: id,
                     address,
                 }))
             }
@@ -110,8 +110,8 @@ impl CommandManager {
             } => self.order_command(ProxyRequestData::AddHttpFrontend(HttpFrontend {
                 route: route.into(),
                 address,
-                hostname: String::from(hostname),
-                path: PathRule::Prefix(String::from(&path_begin.unwrap_or("".to_string()))),
+                hostname,
+                path: PathRule::Prefix(path_begin.unwrap_or_else(|| "".to_string())),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
             })),
@@ -125,8 +125,8 @@ impl CommandManager {
             } => self.order_command(ProxyRequestData::RemoveHttpFrontend(HttpFrontend {
                 route: route.into(),
                 address,
-                hostname: String::from(hostname),
-                path: PathRule::Prefix(String::from(&path_begin.unwrap_or("".to_string()))),
+                hostname,
+                path: PathRule::Prefix(path_begin.unwrap_or_else(|| "".to_string())),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
             })),
@@ -144,8 +144,8 @@ impl CommandManager {
             } => self.order_command(ProxyRequestData::AddHttpsFrontend(HttpFrontend {
                 route: route.into(),
                 address,
-                hostname: String::from(hostname),
-                path: PathRule::Prefix(String::from(path_begin.unwrap_or("".to_string()))),
+                hostname,
+                path: PathRule::Prefix(path_begin.unwrap_or_else(|| "".to_string())),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
             })),
@@ -158,8 +158,8 @@ impl CommandManager {
             } => self.order_command(ProxyRequestData::RemoveHttpsFrontend(HttpFrontend {
                 route: route.into(),
                 address,
-                hostname: String::from(hostname),
-                path: PathRule::Prefix(String::from(path_begin.unwrap_or("".to_string()))),
+                hostname,
+                path: PathRule::Prefix(path_begin.unwrap_or_else(|| "".to_string())),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
             })),
@@ -188,12 +188,12 @@ impl CommandManager {
                     listener.sticky_name = sticky_name;
                 }
                 listener.cipher_list = cipher_list;
-                listener.tls_versions = if tls_versions.len() == 0 {
+                listener.tls_versions = if tls_versions.is_empty() {
                     None
                 } else {
                     Some(tls_versions)
                 };
-                listener.rustls_cipher_list = if rustls_cipher_list.len() == 0 {
+                listener.rustls_cipher_list = if rustls_cipher_list.is_empty() {
                     None
                 } else {
                     Some(rustls_cipher_list)
@@ -366,7 +366,7 @@ impl CommandManager {
                 None
             }
         }
-    }).or(old_certificate_path.and_then(get_certificate_fingerprint)) {
+    }).or_else(|| old_certificate_path.and_then(get_certificate_fingerprint)) {
      self.order_command( ProxyRequestData::ReplaceCertificate(ReplaceCertificate {
         address,
         new_certificate,
@@ -404,7 +404,7 @@ impl CommandManager {
                     None
                 }
             })
-            .or(certificate_path.and_then(get_certificate_fingerprint))
+            .or_else(|| certificate_path.and_then(get_certificate_fingerprint))
         {
             self.order_command(ProxyRequestData::RemoveCertificate(RemoveCertificate {
                 address,

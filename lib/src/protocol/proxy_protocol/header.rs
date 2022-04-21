@@ -165,6 +165,10 @@ impl HeaderV2 {
         // signature + ver_and_cmd + family + len + addr
         12 + 1 + 1 + 2 + self.addr.len() as usize
     }
+
+    pub fn is_empty(&self) -> bool {
+        0 == self.len()
+    }
 }
 
 pub enum ProxyAddr {
