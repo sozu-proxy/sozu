@@ -874,7 +874,7 @@ impl LocalDrain {
         //if second != 0 {
         let previous_minute = now - time::Duration::seconds(second as i64);
         let timestamp = previous_minute.unix_timestamp();
-        let _res = self.store_time_metric_at(key, cluster_id, backend_id, timestamp, t);
+        self.store_time_metric_at(key, cluster_id, backend_id, timestamp, t);
         //} else {
         //}
     }

@@ -1,4 +1,8 @@
-use std::io::{ErrorKind, Read, Write};
+use std::{
+    cell::RefCell,
+    io::{ErrorKind, Read, Write},
+    rc::Rc,
+};
 
 use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
@@ -8,6 +12,7 @@ use crate::{
     protocol::{pipe::Pipe, ProtocolResult},
     socket::SocketHandler,
     sozu_command::ready::Ready,
+    tcp::Proxy,
     BackendConnectionStatus, Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
@@ -152,12 +157,19 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
         &mut self.back_readiness
     }
 
-    pub fn into_pipe(mut self, front_buf: Checkout, back_buf: Checkout) -> Pipe<Front> {
+    pub fn into_pipe(
+        mut self,
+        listener_token: Token,
+        front_buf: Checkout,
+        back_buf: Checkout,
+        proxy: Rc<RefCell<Proxy>>,
+    ) -> Pipe<Front, Proxy> {
         let backend_socket = self.backend.take().unwrap();
         let addr = self.front_socket().peer_addr().ok();
 
         let mut pipe = Pipe::new(
             self.frontend,
+            listener_token,
             self.frontend_token,
             self.request_id,
             None,
@@ -168,6 +180,7 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
             back_buf,
             addr,
             Protocol::TCP,
+            proxy,
         );
 
         pipe.front_readiness = self.front_readiness;

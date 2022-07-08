@@ -1,15 +1,13 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
-    io::ErrorKind,
+    collections::{BTreeMap, HashMap},
+    io::{self, ErrorKind},
     net::{Shutdown, SocketAddr},
     os::unix::io::AsRawFd,
     rc::Rc,
 };
 
-use mio::net::*;
-use mio::unix::SourceFd;
-use mio::*;
+use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
 use time::{Duration, Instant};
@@ -33,7 +31,7 @@ use crate::{
         config::ProxyProtocolConfig,
         logging,
         proxy::{
-            ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse,
+            ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse, TcpFrontend,
             TcpListener as TcpListenerConfig,
         },
         ready::Ready,
@@ -42,8 +40,8 @@ use crate::{
     timer::TimeoutContainer,
     util::UnwrapLog,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
-    ConnectionError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
-    SessionResult,
+    ConnectionError, CustomTags, Protocol, ProxyConfiguration, ProxySession, Readiness,
+    SessionMetrics, SessionResult,
 };
 
 pub enum UpgradeResult {
@@ -53,7 +51,7 @@ pub enum UpgradeResult {
 }
 
 pub enum State {
-    Pipe(Pipe<TcpStream>),
+    Pipe(Pipe<TcpStream, Proxy>),
     SendProxyProtocol(SendProxyProtocol<TcpStream>),
     RelayProxyProtocol(RelayProxyProtocol<TcpStream>),
     ExpectProxyProtocol(ExpectProxyProtocol<TcpStream>),
@@ -61,6 +59,7 @@ pub enum State {
 
 pub struct Session {
     backend: Option<Rc<RefCell<Backend>>>,
+    listener_token: Token,
     frontend_token: Token,
     backend_token: Option<Token>,
     back_connected: BackendConnectionStatus,
@@ -83,6 +82,7 @@ pub struct Session {
 impl Session {
     fn new(
         sock: TcpStream,
+        listener_token: Token,
         frontend_token: Token,
         accept_token: Token,
         proxy: Rc<RefCell<Proxy>>,
@@ -141,6 +141,7 @@ impl Session {
                 let mut pipe = Pipe::new(
                     sock,
                     frontend_token,
+                    listener_token,
                     request_id,
                     cluster_id.clone(),
                     backend_id.clone(),
@@ -150,6 +151,7 @@ impl Session {
                     back_buf,
                     frontend_address,
                     Protocol::TCP,
+                    proxy.clone(),
                 );
                 pipe.set_cluster_id(cluster_id.clone());
                 Some(State::Pipe(pipe))
@@ -161,11 +163,11 @@ impl Session {
 
         Session {
             backend: None,
+            listener_token,
             frontend_token,
             backend_token: None,
             back_connected: BackendConnectionStatus::NotConnected,
             accept_token,
-            proxy,
             request_id,
             cluster_id,
             backend_id,
@@ -178,6 +180,7 @@ impl Session {
             frontend_address,
             front_timeout,
             back_timeout,
+            proxy,
         }
     }
 
@@ -363,8 +366,10 @@ impl Session {
         if let Some(State::SendProxyProtocol(pp)) = protocol {
             if self.back_buf.is_some() && self.front_buf.is_some() {
                 let mut pipe = pp.into_pipe(
+                    self.listener_token,
                     self.front_buf.take().unwrap(),
                     self.back_buf.take().unwrap(),
+                    self.proxy.clone(),
                 );
                 pipe.set_cluster_id(self.cluster_id.clone());
                 self.protocol = Some(State::Pipe(pipe));
@@ -377,7 +382,11 @@ impl Session {
             }
         } else if let Some(State::RelayProxyProtocol(pp)) = protocol {
             if self.back_buf.is_some() {
-                let mut pipe = pp.into_pipe(self.back_buf.take().unwrap());
+                let mut pipe = pp.into_pipe(
+                    self.listener_token,
+                    self.back_buf.take().unwrap(),
+                    self.proxy.clone(),
+                );
                 pipe.set_cluster_id(self.cluster_id.clone());
                 self.protocol = Some(State::Pipe(pipe));
                 gauge_add!("protocol.proxy.relay", -1);
@@ -390,10 +399,12 @@ impl Session {
         } else if let Some(State::ExpectProxyProtocol(pp)) = protocol {
             if self.front_buf.is_some() && self.back_buf.is_some() {
                 let mut pipe = pp.into_pipe(
+                    self.listener_token,
                     self.front_buf.take().unwrap(),
                     self.back_buf.take().unwrap(),
                     None,
                     None,
+                    self.proxy.clone(),
                 );
                 pipe.set_cluster_id(self.cluster_id.clone());
                 self.protocol = Some(State::Pipe(pipe));
@@ -1047,6 +1058,7 @@ pub struct Listener {
     pool: Rc<RefCell<Pool>>,
     config: TcpListenerConfig,
     active: bool,
+    tags: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Listener {
@@ -1059,7 +1071,23 @@ impl Listener {
             pool,
             config,
             active: false,
+            tags: BTreeMap::new(),
         }
+    }
+
+    fn set_tags(&mut self, socket_addr: String, tags: Option<BTreeMap<String, String>>) {
+        match tags {
+            None => {
+                self.tags.remove(&socket_addr);
+            }
+            Some(tags) => {
+                self.tags.insert(socket_addr, tags);
+            }
+        }
+    }
+
+    fn get_tags(&self, socket_address: &str) -> Option<&BTreeMap<String, String>> {
+        self.tags.get(socket_address)
     }
 
     pub fn activate(
@@ -1110,6 +1138,18 @@ pub struct Proxy {
     configs: HashMap<ClusterId, ClusterConfiguration>,
     registry: Registry,
     sessions: Rc<RefCell<SessionManager>>,
+}
+
+impl CustomTags for Proxy {
+    fn get_tags(
+        &self,
+        listener_token: &Token,
+        hostname: &str,
+    ) -> Option<&BTreeMap<String, String>> {
+        self.listeners
+            .get(listener_token)
+            .and_then(|listener| listener.get_tags(hostname))
+    }
 }
 
 impl Proxy {
@@ -1178,26 +1218,92 @@ impl Proxy {
             .and_then(|l| l.listener.take().map(|sock| (l.token, sock)))
     }
 
-    pub fn add_tcp_front(&mut self, cluster_id: &str, address: &SocketAddr) -> bool {
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == *address) {
-            self.fronts.insert(cluster_id.to_string(), listener.token);
-            //info!("add_tcp_front: fronts are now: {:?}", self.fronts);
-            listener.cluster_id = Some(cluster_id.to_string());
-            true
+    pub fn add_tcp_front(&mut self, front: TcpFrontend) -> Result<(), io::Error> {
+        let listener = match self
+            .listeners
+            .values_mut()
+            .find(|l| l.address == front.address)
+        {
+            Some(l) => l,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no such listener for '{}'", front.address),
+                ));
+            }
+        };
+
+        self.fronts
+            .insert(front.cluster_id.to_string(), listener.token);
+
+        // In case that the socket address is "unspecified" (a.k.a "0.0.0.0" or "::"), we ask the
+        // the host to give us all its network ifaces.
+        if front.address.ip().is_unspecified() {
+            let ifaces = get_if_addrs::get_if_addrs()?;
+            let ifaces = ifaces
+                .iter()
+                .filter(|iface| {
+                    iface.addr.ip().is_ipv4() && front.address.is_ipv4()
+                        || iface.addr.ip().is_ipv6() && front.address.is_ipv6()
+                })
+                .collect::<Vec<_>>();
+
+            for iface in ifaces {
+                listener.set_tags(
+                    format!("{}:{}", iface.addr.ip(), front.address.port()),
+                    front.tags.to_owned(),
+                );
+            }
         } else {
-            false
+            listener.set_tags(front.address.to_string(), front.tags);
         }
+
+        listener.cluster_id = Some(front.cluster_id.to_string());
+        Ok(())
     }
 
-    pub fn remove_tcp_front(&mut self, address: SocketAddr) -> bool {
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == address) {
-            if let Some(cluster_id) = listener.cluster_id.take() {
-                self.fronts.remove(&cluster_id);
+    pub fn remove_tcp_front(&mut self, front: &TcpFrontend) -> Result<(), io::Error> {
+        let listener = match self
+            .listeners
+            .values_mut()
+            .find(|l| l.address == front.address)
+        {
+            Some(l) => l,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no such listener for '{}'", front.address),
+                ));
             }
-            true
+        };
+
+        // In case that the socket address is "unspecified" (a.k.a "0.0.0.0" or "::"), we ask the
+        // the host to give us all its network ifaces.
+        if front.address.ip().is_unspecified() {
+            let ifaces = get_if_addrs::get_if_addrs()?;
+            let ifaces = ifaces
+                .iter()
+                .filter(|iface| {
+                    iface.addr.ip().is_ipv4() && front.address.is_ipv4()
+                        || iface.addr.ip().is_ipv6() && front.address.is_ipv6()
+                })
+                .collect::<Vec<_>>();
+
+            for iface in ifaces {
+                listener.set_tags(
+                    format!("{}:{}", iface.addr.ip(), front.address.port()),
+                    None,
+                );
+            }
         } else {
-            false
+            listener.set_tags(front.address.to_string(), None);
         }
+
+        if let Some(cluster_id) = listener.cluster_id.take() {
+            self.fronts.remove(&cluster_id);
+        }
+
+        Ok(())
     }
 }
 
@@ -1205,12 +1311,17 @@ impl ProxyConfiguration<Session> for Proxy {
     fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
         match message.order {
             ProxyRequestData::AddTcpFrontend(front) => {
-                let _ = self.add_tcp_front(&front.cluster_id, &front.address);
+                if let Err(err) = self.add_tcp_front(front) {
+                    return ProxyResponse::error(message.id, err);
+                }
 
                 ProxyResponse::ok(message.id)
             }
             ProxyRequestData::RemoveTcpFrontend(front) => {
-                let _ = self.remove_tcp_front(front.address);
+                if let Err(err) = self.remove_tcp_front(&front) {
+                    return ProxyResponse::error(message.id, err);
+                }
+
                 ProxyResponse::ok(message.id)
             }
             ProxyRequestData::SoftStop => {
@@ -1341,6 +1452,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
                 let mut c = Session::new(
                     frontend_sock,
+                    listener.token,
                     session_token,
                     internal_token,
                     proxy,
@@ -1665,13 +1777,12 @@ mod tests {
 
             let (scm_server, scm_client) = UnixStream::pair().unwrap();
             let scm = ScmSocket::new(scm_client.into_raw_fd());
-            let _ = scm
-                .send_listeners(&Listeners {
-                    http: Vec::new(),
-                    tls: Vec::new(),
-                    tcp: Vec::new(),
-                })
-                .unwrap();
+            scm.send_listeners(&Listeners {
+                http: Vec::new(),
+                tls: Vec::new(),
+                tcp: Vec::new(),
+            })
+            .unwrap();
 
             let server_config = server::ServerConfig {
                 max_connections,
@@ -1701,6 +1812,7 @@ mod tests {
             let front = TcpFrontend {
                 cluster_id: String::from("yolo"),
                 address: "127.0.0.1:1234".parse().unwrap(),
+                tags: None,
             };
             let backend = proxy::Backend {
                 cluster_id: String::from("yolo"),
@@ -1724,6 +1836,7 @@ mod tests {
             let front = TcpFrontend {
                 cluster_id: String::from("yolo"),
                 address: "127.0.0.1:1235".parse().unwrap(),
+                tags: None,
             };
             let backend = proxy::Backend {
                 cluster_id: String::from("yolo"),

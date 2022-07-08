@@ -55,6 +55,7 @@ fn main() {
     let tcp_front = proxy::TcpFrontend {
         cluster_id: String::from("test"),
         address: "127.0.0.1:8080".parse().unwrap(),
+        tags: None,
     };
     let tcp_backend = proxy::Backend {
         cluster_id: String::from("test"),

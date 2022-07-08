@@ -18,7 +18,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
         let mut table = Table::new();
         table.add_row(row!["HTTP frontends"]);
         table.add_row(row![
-            "route", "address", "hostname", "path", "method", "position"
+            "route", "address", "hostname", "path", "method", "position", "tags"
         ]);
         for http_frontend in frontends.http_frontends.iter() {
             table.add_row(row!(
@@ -28,6 +28,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
                 format!("{:?}", http_frontend.path),
                 format!("{:?}", http_frontend.method),
                 format!("{:?}", http_frontend.position),
+                format_tags_to_string(http_frontend.tags.clone())
             ));
         }
         table.printstd();
@@ -38,7 +39,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
         let mut table = Table::new();
         table.add_row(row!["HTTPS frontends"]);
         table.add_row(row![
-            "route", "address", "hostname", "path", "method", "position"
+            "route", "address", "hostname", "path", "method", "position", "tags"
         ]);
         for https_frontend in frontends.https_frontends.iter() {
             table.add_row(row!(
@@ -48,6 +49,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
                 format!("{:?}", https_frontend.path),
                 format!("{:?}", https_frontend.method),
                 format!("{:?}", https_frontend.position),
+                format_tags_to_string(https_frontend.tags.clone())
             ));
         }
         table.printstd();
@@ -57,9 +59,13 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
     if !frontends.tcp_frontends.is_empty() {
         let mut table = Table::new();
         table.add_row(row!["TCP frontends"]);
-        table.add_row(row!["Cluster ID", "address"]);
+        table.add_row(row!["Cluster ID", "address", "tags"]);
         for tcp_frontend in frontends.tcp_frontends.iter() {
-            table.add_row(row!(tcp_frontend.cluster_id, tcp_frontend.address,));
+            table.add_row(row!(
+                tcp_frontend.cluster_id,
+                tcp_frontend.address,
+                format_tags_to_string(tcp_frontend.tags.clone())
+            ));
         }
         table.printstd();
     }
@@ -549,4 +555,16 @@ pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> an
         println!("");
     }
     Ok(())
+}
+
+fn format_tags_to_string(tags_option: Option<BTreeMap<String, String>>) -> String {
+    if let Some(tags) = tags_option {
+        let mut key_value_pairs: String = String::new();
+        for (key, value) in tags.iter() {
+            key_value_pairs.push_str(&format!("{}={}, ", key, value));
+        }
+        key_value_pairs
+    } else {
+        String::new()
+    }
 }

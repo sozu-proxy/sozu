@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
     os::unix::io::{AsRawFd, IntoRawFd},
@@ -26,6 +26,7 @@ use crate::{
     },
     timer::TimeoutContainer,
     util::UnwrapLog,
+    CustomTags,
 };
 
 use super::{
@@ -58,8 +59,8 @@ pub enum SessionStatus {
 
 pub enum State {
     Expect(ExpectProxyProtocol<TcpStream>),
-    Http(Http<TcpStream>),
-    WebSocket(Pipe<TcpStream>),
+    Http(Http<TcpStream, Proxy>),
+    WebSocket(Pipe<TcpStream, Proxy>),
 }
 
 pub struct Session {
@@ -99,7 +100,7 @@ impl Session {
     ) -> Option<Session> {
         let request_id = Ulid::generate();
         let mut front_timeout = TimeoutContainer::new_empty(request_timeout_duration);
-        let protocol = if expect_proxy {
+        let state = if expect_proxy {
             trace!("starting in expect proxy state");
             gauge_add!("protocol.proxy.expect", 1);
             front_timeout.set(token);
@@ -113,6 +114,7 @@ impl Session {
             let timeout = TimeoutContainer::new(request_timeout_duration, token);
             Some(State::Http(Http::new(
                 sock,
+                listen_token,
                 token,
                 request_id,
                 pool.clone(),
@@ -124,16 +126,16 @@ impl Session {
                 timeout,
                 frontend_timeout_duration,
                 backend_timeout_duration,
+                proxy.clone(),
             )))
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
-
-        protocol.map(|pr| {
+        if let Some(state) = state {
             let mut session = Session {
                 backend: None,
                 back_connected: BackendConnectionStatus::NotConnected,
-                protocol: Some(pr),
+                protocol: Some(state),
                 frontend_token: token,
                 pool,
                 proxy,
@@ -150,9 +152,10 @@ impl Session {
             };
 
             session.front_readiness().interest = Ready::readable() | Ready::hup() | Ready::error();
+            return Some(session);
+        }
 
-            session
-        })
+        None
     }
 
     pub fn upgrade(&mut self) -> bool {
@@ -204,6 +207,7 @@ impl Session {
                 gauge_add!("websocket.active_requests", 1);
                 let mut pipe = Pipe::new(
                     http.frontend,
+                    http.listener_token,
                     front_token,
                     http.request_id,
                     http.cluster_id,
@@ -214,6 +218,7 @@ impl Session {
                     back_buf,
                     http.session_address,
                     Protocol::HTTP,
+                    self.proxy.clone(),
                 );
 
                 pipe.front_readiness.event = http.front_readiness.event;
@@ -241,6 +246,7 @@ impl Session {
                         let readiness = expect.readiness;
                         let mut http = Http::new(
                             expect.frontend,
+                            self.listen_token,
                             expect.frontend_token,
                             expect.request_id,
                             self.pool.clone(),
@@ -252,6 +258,7 @@ impl Session {
                             self.front_timeout.take(),
                             self.frontend_timeout_duration,
                             self.backend_timeout_duration,
+                            self.proxy.clone(),
                         );
                         http.front_readiness.event = readiness.event;
 
@@ -279,14 +286,14 @@ impl Session {
         }
     }
 
-    pub fn http(&self) -> Option<&Http<TcpStream>> {
+    pub fn http(&self) -> Option<&Http<TcpStream, Proxy>> {
         self.protocol.as_ref().and_then(|protocol| match protocol {
             State::Http(ref http) => Some(http),
             _ => None,
         })
     }
 
-    pub fn http_mut(&mut self) -> Option<&mut Http<TcpStream>> {
+    pub fn http_mut(&mut self) -> Option<&mut Http<TcpStream, Proxy>> {
         self.protocol.as_mut().and_then(|protocol| match protocol {
             State::Http(ref mut http) => Some(http),
             _ => None,
@@ -1329,6 +1336,7 @@ pub struct Listener {
     config: HttpListener,
     pub token: Token,
     pub active: bool,
+    tags: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 pub struct Proxy {
@@ -1338,6 +1346,18 @@ pub struct Proxy {
     pool: Rc<RefCell<Pool>>,
     registry: Registry,
     sessions: Rc<RefCell<SessionManager>>,
+}
+
+impl CustomTags for Proxy {
+    fn get_tags(
+        &self,
+        listener_token: &Token,
+        hostname: &str,
+    ) -> Option<&BTreeMap<String, String>> {
+        self.listeners
+            .get(listener_token)
+            .and_then(|listener| listener.get_tags(hostname))
+    }
 }
 
 impl Proxy {
@@ -1365,6 +1385,10 @@ impl Proxy {
             self.listeners.insert(listener.token, listener);
             Some(token)
         }
+    }
+
+    pub fn get_listener(&self, token: &Token) -> Option<&Listener> {
+        self.listeners.get(token)
     }
 
     pub fn remove_listener(&mut self, address: SocketAddr) -> bool {
@@ -1436,7 +1460,23 @@ impl Listener {
             config,
             token,
             active: false,
+            tags: BTreeMap::new(),
         }
+    }
+
+    pub fn set_tags(&mut self, hostname: String, tags: Option<BTreeMap<String, String>>) {
+        match tags {
+            None => {
+                self.tags.remove(&hostname);
+            }
+            Some(tags) => {
+                self.tags.insert(hostname, tags);
+            }
+        }
+    }
+
+    pub fn get_tags(&self, hostname: &str) -> Option<&BTreeMap<String, String>> {
+        self.tags.get(hostname)
     }
 
     pub fn activate(
@@ -1559,8 +1599,12 @@ impl ProxyConfiguration<Session> for Proxy {
                     .values_mut()
                     .find(|l| l.address == front.address)
                 {
-                    match listener.add_http_front(front) {
-                        Ok(_) => ProxyResponse::ok(message.id),
+                    match listener.add_http_front(front.clone()) {
+                        Ok(_) => {
+                            listener.set_tags(front.hostname, front.tags);
+
+                            ProxyResponse::ok(message.id)
+                        }
                         Err(err) => ProxyResponse::error(message.id, err),
                     }
                 } else {
@@ -1580,8 +1624,11 @@ impl ProxyConfiguration<Session> for Proxy {
                     .values_mut()
                     .find(|l| l.address == front.address)
                 {
-                    match (*listener).remove_http_front(front) {
-                        Ok(_) => ProxyResponse::ok(message.id),
+                    match (*listener).remove_http_front(front.clone()) {
+                        Ok(_) => {
+                            listener.set_tags(front.hostname, None);
+                            ProxyResponse::ok(message.id)
+                        }
                         Err(err) => ProxyResponse::error(message.id, err),
                     }
                 } else {
@@ -1863,6 +1910,7 @@ mod tests {
             path: PathRule::Prefix(String::from("/")),
             method: None,
             position: RulePosition::Tree,
+            tags: None,
         };
         command.write_message(&ProxyRequest {
             id: String::from("ID_ABCD"),
@@ -1946,6 +1994,7 @@ mod tests {
             path: PathRule::Prefix(String::from("/")),
             method: None,
             position: RulePosition::Tree,
+            tags: None,
         };
         command.write_message(&ProxyRequest {
             id: String::from("ID_ABCD"),
@@ -2067,6 +2116,7 @@ mod tests {
             path: PathRule::Prefix(String::from("/")),
             method: None,
             position: RulePosition::Tree,
+            tags: None,
         };
         command.write_message(&ProxyRequest {
             id: String::from("ID_EFGH"),
@@ -2168,6 +2218,7 @@ mod tests {
             path: PathRule::Prefix(uri1),
             method: None,
             position: RulePosition::Tree,
+            tags: None,
         });
         fronts.add_http_front(HttpFrontend {
             route: Route::ClusterId(cluster_id2),
@@ -2176,6 +2227,7 @@ mod tests {
             path: PathRule::Prefix(uri2),
             method: None,
             position: RulePosition::Tree,
+            tags: None,
         });
         fronts.add_http_front(HttpFrontend {
             route: Route::ClusterId(cluster_id3),
@@ -2184,6 +2236,7 @@ mod tests {
             path: PathRule::Prefix(uri3),
             method: None,
             position: RulePosition::Tree,
+            tags: None,
         });
         fronts.add_http_front(HttpFrontend {
             route: Route::ClusterId("app_1".to_owned()),
@@ -2192,6 +2245,7 @@ mod tests {
             path: PathRule::Prefix("/test".to_owned()),
             method: None,
             position: RulePosition::Tree,
+            tags: None,
         });
 
         let address: SocketAddr =
@@ -2207,6 +2261,7 @@ mod tests {
             config: Default::default(),
             token: Token(0),
             active: true,
+            tags: BTreeMap::new(),
         };
 
         let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);

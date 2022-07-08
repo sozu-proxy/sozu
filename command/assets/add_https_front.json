@@ -13,7 +13,8 @@
       "path": {
         "PREFIX": "xxx"
       },
-      "position": "TREE"
+      "position": "TREE",
+      "tags": null
     }
   }
 }

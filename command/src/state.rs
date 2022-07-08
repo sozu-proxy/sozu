@@ -1066,6 +1066,7 @@ mod tests {
             method: None,
             address: "0.0.0.0:8080".parse().unwrap(),
             position: RulePosition::Tree,
+            tags: None,
         }));
         state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
             route: Route::ClusterId(String::from("app_2")),
@@ -1074,6 +1075,7 @@ mod tests {
             method: None,
             address: "0.0.0.0:8080".parse().unwrap(),
             position: RulePosition::Pre,
+            tags: None,
         }));
         state.handle_order(&ProxyRequestData::AddBackend(Backend {
             cluster_id: String::from("app_1"),
@@ -1134,6 +1136,7 @@ mod tests {
             method: None,
             address: "0.0.0.0:8080".parse().unwrap(),
             position: RulePosition::Post,
+            tags: None,
         }));
         state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
             route: Route::ClusterId(String::from("app_2")),
@@ -1142,6 +1145,7 @@ mod tests {
             method: None,
             address: "0.0.0.0:8080".parse().unwrap(),
             position: RulePosition::Tree,
+            tags: None,
         }));
         state.handle_order(&ProxyRequestData::AddBackend(Backend {
             cluster_id: String::from("app_1"),
@@ -1185,6 +1189,7 @@ mod tests {
             address: "0.0.0.0:8080".parse().unwrap(),
             method: None,
             position: RulePosition::Post,
+            tags: None,
         }));
         state2.handle_order(&ProxyRequestData::AddBackend(Backend {
             cluster_id: String::from("app_1"),
@@ -1228,6 +1233,7 @@ mod tests {
                 method: None,
                 address: "0.0.0.0:8080".parse().unwrap(),
                 position: RulePosition::Tree,
+                tags: None,
             }),
             ProxyRequestData::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("app_2"),
@@ -1291,6 +1297,7 @@ mod tests {
             method: None,
             address: "0.0.0.0:8080".parse().unwrap(),
             position: RulePosition::Tree,
+            tags: None,
         };
 
         let https_front_app1 = HttpFrontend {
@@ -1300,6 +1307,7 @@ mod tests {
             method: None,
             address: "0.0.0.0:8443".parse().unwrap(),
             position: RulePosition::Tree,
+            tags: None,
         };
 
         let http_front_app2 = HttpFrontend {
@@ -1309,6 +1317,7 @@ mod tests {
             method: None,
             address: "0.0.0.0:8080".parse().unwrap(),
             position: RulePosition::Tree,
+            tags: None,
         };
 
         let https_front_app2 = HttpFrontend {
@@ -1318,6 +1327,7 @@ mod tests {
             method: None,
             address: "0.0.0.0:8443".parse().unwrap(),
             position: RulePosition::Tree,
+            tags: None,
         };
 
         let add_http_front_order_app1 = ProxyRequestData::AddHttpFrontend(http_front_app1);

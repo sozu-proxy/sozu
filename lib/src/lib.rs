@@ -209,7 +209,7 @@ pub mod https_openssl;
 
 pub mod https_rustls;
 
-use std::{cell::RefCell, fmt, net::SocketAddr, rc::Rc, str};
+use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
 
 use mio::{net::TcpStream, Token};
 use time::{Duration, Instant};
@@ -268,6 +268,11 @@ pub trait ProxySession {
     fn shutting_down(&mut self);
 }
 
+pub trait CustomTags {
+    fn get_tags(&self, listener_token: &Token, hostname: &str)
+        -> Option<&BTreeMap<String, String>>;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BackendConnectionStatus {
     NotConnected,
@@ -305,6 +310,7 @@ pub trait ProxyConfiguration<Session> {
         token: ListenToken,
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
+        // should we insert the tags here?
     ) -> Result<(), AcceptError>;
 }
 

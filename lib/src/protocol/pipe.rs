@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 
 use mio::net::*;
 use mio::*;
@@ -9,7 +9,7 @@ use crate::{
     socket::{SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
-    {LogDuration, Protocol}, {Readiness, SessionMetrics, SessionResult},
+    CustomTags, LogDuration, Protocol, {Readiness, SessionMetrics, SessionResult},
 };
 
 #[derive(PartialEq)]
@@ -26,10 +26,11 @@ enum ConnectionStatus {
     Closed,
 }
 
-pub struct Pipe<Front: SocketHandler> {
+pub struct Pipe<Front: SocketHandler, P: CustomTags> {
     pub frontend: Front,
-    backend: Option<TcpStream>,
+    pub listener_token: Token,
     frontend_token: Token,
+    backend: Option<TcpStream>,
     backend_token: Option<Token>,
     pub front_buf: Checkout,
     back_buf: Checkout,
@@ -46,12 +47,14 @@ pub struct Pipe<Front: SocketHandler> {
     backend_status: ConnectionStatus,
     pub front_timeout: Option<TimeoutContainer>,
     pub back_timeout: Option<TimeoutContainer>,
+    pub proxy: Rc<RefCell<P>>,
 }
 
-impl<Front: SocketHandler> Pipe<Front> {
+impl<Front: SocketHandler, P: CustomTags> Pipe<Front, P> {
     pub fn new(
         frontend: Front,
         frontend_token: Token,
+        listener_token: Token,
         request_id: Ulid,
         cluster_id: Option<String>,
         backend_id: Option<String>,
@@ -61,7 +64,8 @@ impl<Front: SocketHandler> Pipe<Front> {
         back_buf: Checkout,
         session_address: Option<SocketAddr>,
         protocol: Protocol,
-    ) -> Pipe<Front> {
+        proxy: Rc<RefCell<P>>,
+    ) -> Pipe<Front, P> {
         let log_ctx = format!(
             "{} {} {}\t",
             &request_id,
@@ -77,6 +81,7 @@ impl<Front: SocketHandler> Pipe<Front> {
 
         let session = Pipe {
             frontend,
+            listener_token,
             backend,
             frontend_token,
             backend_token: None,
@@ -101,6 +106,7 @@ impl<Front: SocketHandler> Pipe<Front> {
             backend_status,
             front_timeout: None,
             back_timeout: None,
+            proxy,
         };
 
         trace!("created pipe");
@@ -244,7 +250,7 @@ impl<Front: SocketHandler> Pipe<Front> {
     }
 
     pub fn log_request_success(&self, metrics: &SessionMetrics) {
-        let session = match self.get_session_address() {
+        let session_addr = match self.get_session_address() {
             None => String::from("-"),
             Some(SocketAddr::V4(addr)) => format!("{}", addr),
             Some(SocketAddr::V6(addr)) => format!("{}", addr),
@@ -281,17 +287,38 @@ impl<Front: SocketHandler> Pipe<Front> {
 
         let proto = self.protocol_string();
 
+        let tags = match self.frontend.socket_ref().local_addr() {
+            Ok(addr) => {
+                let tags = self
+                    .proxy
+                    .borrow()
+                    .get_tags(dbg!(&self.listener_token), dbg!(&addr.to_string()))
+                    .map(|tags| {
+                        tags.iter()
+                            .map(|(k, v)| format!("\"{}={}\"", k, v))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    });
+                tags.unwrap_or_default()
+            }
+            Err(e) => {
+                error!("Could not find frontend address: {}", e);
+                String::new()
+            }
+        };
+
         info_access!(
-            "{}{} -> {}\t{} {} {} {}\t{} {}",
+            "{}{} -> {}\t{} {} {} {}\t{} {} {}",
             self.log_ctx,
-            session,
+            session_addr,
             backend,
             LogDuration(response_time),
             LogDuration(service_time),
             metrics.bin,
             metrics.bout,
             proto,
-            self.websocket_context.as_deref().unwrap_or("-")
+            self.websocket_context.as_deref().unwrap_or("-"),
+            tags
         );
     }
 
@@ -740,7 +767,7 @@ impl<Front: SocketHandler> Pipe<Front> {
     }
 }
 
-impl<Front: SocketHandler> std::ops::Drop for Pipe<Front> {
+impl<Front: SocketHandler, P: CustomTags> std::ops::Drop for Pipe<Front, P> {
     fn drop(&mut self) {
         match self.protocol {
             Protocol::TCP => {}

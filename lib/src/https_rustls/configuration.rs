@@ -1,6 +1,12 @@
 use std::{
-    cell::RefCell, collections::HashMap, io::ErrorKind, net::SocketAddr, os::unix::io::AsRawFd,
-    rc::Rc, str::from_utf8_unchecked, sync::Arc,
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    io::ErrorKind,
+    net::SocketAddr,
+    os::unix::io::AsRawFd,
+    rc::Rc,
+    str::from_utf8_unchecked,
+    sync::Arc,
 };
 
 use mio::{net::*, *};
@@ -33,7 +39,7 @@ use crate::{
         ParsedCertificateAndKey,
     },
     util::UnwrapLog,
-    {AcceptError, ClusterId, Protocol, ProxyConfiguration, ProxySession},
+    CustomTags, {AcceptError, ClusterId, Protocol, ProxyConfiguration, ProxySession},
 };
 
 use super::session::Session;
@@ -66,6 +72,7 @@ pub struct Listener {
     resolver: Arc<MutexWrappedCertificateResolver>,
     pub token: Token,
     active: bool,
+    tags: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl CertificateResolver for Listener {
@@ -178,7 +185,23 @@ impl Listener {
             resolver,
             token,
             active: false,
+            tags: BTreeMap::new(),
         })
+    }
+
+    pub fn set_tags(&mut self, hostname: String, tags: Option<BTreeMap<String, String>>) {
+        match tags {
+            None => {
+                self.tags.remove(&hostname);
+            }
+            Some(tags) => {
+                self.tags.insert(hostname, tags);
+            }
+        }
+    }
+
+    pub fn get_tags(&self, hostname: &str) -> Option<&BTreeMap<String, String>> {
+        self.tags.get(hostname)
     }
 
     pub fn activate(
@@ -268,6 +291,18 @@ pub struct Proxy {
     pool: Rc<RefCell<Pool>>,
     pub registry: Registry,
     pub sessions: Rc<RefCell<SessionManager>>,
+}
+
+impl CustomTags for Proxy {
+    fn get_tags(
+        &self,
+        listener_token: &Token,
+        hostname: &str,
+    ) -> Option<&BTreeMap<String, String>> {
+        self.listeners
+            .get(listener_token)
+            .and_then(|listener| listener.get_tags(hostname))
+    }
 }
 
 impl Proxy {
@@ -450,7 +485,8 @@ impl ProxyConfiguration<Session> for Proxy {
                     .values_mut()
                     .find(|l| l.address == front.address)
                 {
-                    listener.add_https_front(front);
+                    listener.add_https_front(front.clone());
+                    listener.set_tags(front.hostname, front.tags);
                     ProxyResponse::ok(message.id)
                 } else {
                     ProxyResponse::error(
@@ -466,7 +502,8 @@ impl ProxyConfiguration<Session> for Proxy {
                     .values_mut()
                     .find(|l| l.address == front.address)
                 {
-                    listener.remove_https_front(front);
+                    listener.remove_https_front(front.clone());
+                    listener.set_tags(front.hostname, None);
                     ProxyResponse::ok(message.id)
                 } else {
                     ProxyResponse::error(

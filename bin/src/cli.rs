@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{collections::BTreeMap, net::SocketAddr};
 
 use sozu_command_lib::proxy::{LoadBalancingAlgorithms, TlsVersion};
 use structopt::StructOpt;
@@ -384,6 +384,8 @@ pub enum HttpFrontendCmd {
         path_begin: Option<String>,
         #[structopt(short = "m", long = "method", help = "HTTP method")]
         method: Option<String>,
+        #[structopt(short = "t", long = "tag", help = "custom tags", parse(try_from_str = parse_tags))]
+        tags: Option<BTreeMap<String, String>>,
     },
     #[structopt(name = "remove")]
     Remove {
@@ -401,6 +403,8 @@ pub enum HttpFrontendCmd {
         path_begin: Option<String>,
         #[structopt(short = "m", long = "method", help = "HTTP method")]
         method: Option<String>,
+        #[structopt(short = "t", long = "tag", help = "custom tags", parse(try_from_str = parse_tags))]
+        tags: Option<BTreeMap<String, String>>,
     },
 }
 
@@ -416,6 +420,8 @@ pub enum TcpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
+        #[structopt(short = "t", long = "tag", help = "custom tags",  parse(try_from_str = parse_tags))]
+        tags: Option<BTreeMap<String, String>>,
     },
     #[structopt(name = "remove")]
     Remove {
@@ -427,6 +433,8 @@ pub enum TcpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
+        #[structopt(short = "t", long = "tag", help = "custom tags", parse(try_from_str = parse_tags))]
+        tags: Option<BTreeMap<String, String>>,
     },
 }
 
@@ -764,5 +772,42 @@ fn parse_tls_versions(i: &str) -> Result<TlsVersion, String> {
         "TLSv1.2" => Ok(TlsVersion::TLSv1_2),
         "TLSv1.3" => Ok(TlsVersion::TLSv1_2),
         s => return Err(format!("unrecognized TLS version: {}", s)),
+    }
+}
+
+fn parse_tags(string_to_parse: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut tags: BTreeMap<String, String> = BTreeMap::new();
+
+    for s in string_to_parse.split(",") {
+        if let Some((key, value)) = s.trim().split_once("=") {
+            tags.insert(key.to_owned(), value.to_owned());
+        } else {
+            return Err("something went wrong while parsing the tags".to_string());
+        }
+    }
+
+    Ok(tags)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parse_tags_from_string() {
+        use super::*;
+
+        let tags_to_parse =
+            "owner=John ,uuid=0dd8d7b1-a50a-461a-b1f9-5211a5f45a83=, hexkey=#846e84";
+
+        assert_eq!(
+            BTreeMap::from([
+                ("owner".to_owned(), "John".to_owned()),
+                (
+                    "uuid".to_owned(),
+                    "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83=".to_owned(),
+                ),
+                ("hexkey".to_owned(), "#846e84".to_owned())
+            ]),
+            parse_tags(tags_to_parse).expect("Could not parse this string to tags")
+        );
     }
 }

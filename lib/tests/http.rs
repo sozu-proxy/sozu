@@ -84,6 +84,7 @@ fn test() {
         path: PathRule::Prefix(String::from("/")),
         method: None,
         position: RulePosition::Tree,
+        tags: None,
     };
 
     command.write_message(&proxy::ProxyRequest {

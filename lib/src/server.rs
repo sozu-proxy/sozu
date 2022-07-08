@@ -1252,7 +1252,7 @@ impl Server {
                         ProxyResponseStatus::Error(String::from("cannot add TCP listener"))
                     };
 
-                    push_queue(ProxyResponse::status(id.to_string(), status));
+                    push_queue(ProxyResponse::status(id, status));
                 }
                 ProxyRequest {
                     ref id,

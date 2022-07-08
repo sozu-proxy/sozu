@@ -1,5 +1,8 @@
-use std::io::Read;
-use std::io::Write;
+use std::{
+    cell::RefCell,
+    io::{Read, Write},
+    rc::Rc,
+};
 
 use mio::net::TcpStream;
 use mio::*;
@@ -11,6 +14,7 @@ use crate::{
     protocol::{pipe::Pipe, ProtocolResult},
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
+    tcp::Proxy,
     Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
@@ -182,12 +186,18 @@ impl<Front: SocketHandler + Read> RelayProxyProtocol<Front> {
         &mut self.back_readiness
     }
 
-    pub fn into_pipe(mut self, back_buf: Checkout) -> Pipe<Front> {
+    pub fn into_pipe(
+        mut self,
+        listener_token: Token,
+        back_buf: Checkout,
+        proxy: Rc<RefCell<Proxy>>,
+    ) -> Pipe<Front, Proxy> {
         let backend_socket = self.backend.take().unwrap();
         let addr = self.front_socket().peer_addr().ok();
 
         let mut pipe = Pipe::new(
             self.frontend.take(0).into_inner(),
+            listener_token,
             self.frontend_token,
             self.request_id,
             None,
@@ -198,6 +208,7 @@ impl<Front: SocketHandler + Read> RelayProxyProtocol<Front> {
             back_buf,
             addr,
             Protocol::TCP,
+            proxy,
         );
 
         pipe.front_readiness.event = self.front_readiness.event;

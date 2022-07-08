@@ -1,6 +1,6 @@
 //! parsing data from the configuration file
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     fs::File,
     io::{self, Error, ErrorKind, Read},
@@ -356,6 +356,7 @@ pub struct FileAppFrontendConfig {
     pub tls_versions: Vec<TlsVersion>,
     #[serde(default)]
     pub position: RulePosition,
+    pub tags: Option<BTreeMap<String, String>>,
 }
 
 impl FileAppFrontendConfig {
@@ -380,6 +381,7 @@ impl FileAppFrontendConfig {
 
         Ok(TcpFrontendConfig {
             address: self.address,
+            tags: self.tags.clone(),
         })
     }
 
@@ -435,6 +437,7 @@ impl FileAppFrontendConfig {
             position: self.position,
             path,
             method: self.method.clone(),
+            tags: self.tags.clone(),
         })
     }
 }
@@ -576,6 +579,7 @@ pub struct HttpFrontendConfig {
     pub tls_versions: Vec<TlsVersion>,
     #[serde(default)]
     pub position: RulePosition,
+    pub tags: Option<BTreeMap<String, String>>,
 }
 
 impl HttpFrontendConfig {
@@ -602,6 +606,7 @@ impl HttpFrontendConfig {
                 path: self.path.clone(),
                 method: self.method.clone(),
                 position: self.position,
+                tags: self.tags.clone(),
             }));
         } else {
             //create the front both for HTTP and HTTPS if possible
@@ -612,6 +617,7 @@ impl HttpFrontendConfig {
                 path: self.path.clone(),
                 method: self.method.clone(),
                 position: self.position,
+                tags: self.tags.clone(),
             }));
         }
 
@@ -673,6 +679,7 @@ impl HttpAppConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TcpFrontendConfig {
     pub address: SocketAddr,
+    pub tags: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -702,6 +709,7 @@ impl TcpAppConfig {
             v.push(ProxyRequestData::AddTcpFrontend(TcpFrontend {
                 cluster_id: self.cluster_id.clone(),
                 address: frontend.address,
+                tags: frontend.tags.clone(),
             }));
         }
 

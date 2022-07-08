@@ -398,7 +398,7 @@ impl CommandServer {
 
         if (filters.tcp || list_all) && !filters.domain.is_some() {
             for tcp_frontend in self.state.tcp_fronts.values().map(|v| v.iter()).flatten() {
-                listed_frontends.tcp_frontends.push(tcp_frontend.to_owned());
+                listed_frontends.tcp_frontends.push(tcp_frontend.to_owned())
             }
         }
 
@@ -1086,10 +1086,11 @@ impl CommandServer {
                     ProxyRequestData::RemoveTcpFrontend(TcpFrontend {
                         ref cluster_id,
                         ref address,
+                        ref tags,
                     }) => {
                         bail!(format!(
-                            "cannot remove TCP frontend: cluster {} has no frontends at {}",
-                            cluster_id, address,
+                            "cannot remove TCP frontend: cluster {} has no frontends at {} (custom tags: {:?})",
+                            cluster_id, address, tags
                         ));
                     }
                     _ => {}

@@ -51,7 +51,7 @@ impl TlsHandshake {
 
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, SessionResult) {
         match self.state {
-            TlsState::Error(_) => return (ProtocolResult::Continue, SessionResult::CloseSession),
+            TlsState::Error(_) => (ProtocolResult::Continue, SessionResult::CloseSession),
             TlsState::Initial => {
                 let ssl = self
                     .ssl
@@ -65,7 +65,7 @@ impl TlsHandshake {
                     Ok(stream) => {
                         self.stream = Some(stream);
                         self.state = TlsState::Established;
-                        return (ProtocolResult::Upgrade, SessionResult::Continue);
+                        (ProtocolResult::Upgrade, SessionResult::Continue)
                     }
                     Err(HandshakeError::SetupFailure(e)) => {
                         error!(
@@ -73,7 +73,7 @@ impl TlsHandshake {
                             self.address, e
                         );
                         self.state = TlsState::Error(HandshakeError::SetupFailure(e));
-                        return (ProtocolResult::Continue, SessionResult::CloseSession);
+                        (ProtocolResult::Continue, SessionResult::CloseSession)
                     }
                     Err(HandshakeError::Failure(e)) => {
                         {
@@ -123,13 +123,13 @@ impl TlsHandshake {
                             }
                         }
                         self.state = TlsState::Error(HandshakeError::Failure(e));
-                        return (ProtocolResult::Continue, SessionResult::CloseSession);
+                        (ProtocolResult::Continue, SessionResult::CloseSession)
                     }
                     Err(HandshakeError::WouldBlock(mid)) => {
                         self.state = TlsState::Handshake;
                         self.mid = Some(mid);
                         self.readiness.event.remove(Ready::readable());
-                        return (ProtocolResult::Continue, SessionResult::Continue);
+                        (ProtocolResult::Continue, SessionResult::Continue)
                     }
                 }
             }
@@ -142,7 +142,7 @@ impl TlsHandshake {
                     Ok(stream) => {
                         self.stream = Some(stream);
                         self.state = TlsState::Established;
-                        return (ProtocolResult::Upgrade, SessionResult::Continue);
+                        (ProtocolResult::Upgrade, SessionResult::Continue)
                     }
                     Err(HandshakeError::SetupFailure(e)) => {
                         debug!(
@@ -150,7 +150,7 @@ impl TlsHandshake {
                             self.address, e
                         );
                         self.state = TlsState::Error(HandshakeError::SetupFailure(e));
-                        return (ProtocolResult::Continue, SessionResult::CloseSession);
+                        (ProtocolResult::Continue, SessionResult::CloseSession)
                     }
                     Err(HandshakeError::Failure(e)) => {
                         debug!(
@@ -158,19 +158,17 @@ impl TlsHandshake {
                             self.address, e
                         );
                         self.state = TlsState::Error(HandshakeError::Failure(e));
-                        return (ProtocolResult::Continue, SessionResult::CloseSession);
+                        (ProtocolResult::Continue, SessionResult::CloseSession)
                     }
                     Err(HandshakeError::WouldBlock(new_mid)) => {
                         self.state = TlsState::Handshake;
                         self.mid = Some(new_mid);
                         self.readiness.event.remove(Ready::readable());
-                        return (ProtocolResult::Continue, SessionResult::Continue);
+                        (ProtocolResult::Continue, SessionResult::Continue)
                     }
                 }
             }
-            TlsState::Established => {
-                return (ProtocolResult::Upgrade, SessionResult::Continue);
-            }
+            TlsState::Established => (ProtocolResult::Upgrade, SessionResult::Continue),
         }
     }
 

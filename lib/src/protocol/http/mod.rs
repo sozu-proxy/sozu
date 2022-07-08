@@ -21,7 +21,7 @@ use crate::{
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
     util::UnwrapLog,
-    Backend, LogDuration, {Protocol, Readiness, SessionMetrics, SessionResult},
+    Backend, CustomTags, LogDuration, {Protocol, Readiness, SessionMetrics, SessionResult},
 };
 
 use self::parser::{
@@ -70,9 +70,10 @@ pub enum TimeoutStatus {
     WaitingForResponse,
 }
 
-pub struct Http<Front: SocketHandler> {
+pub struct Http<Front: SocketHandler, P: CustomTags> {
     pub frontend: Front,
     pub backend: Option<TcpStream>,
+    pub listener_token: Token,
     frontend_token: Token,
     backend_token: Option<Token>,
     pub status: SessionStatus,
@@ -103,12 +104,14 @@ pub struct Http<Front: SocketHandler> {
     pub front_timeout: TimeoutContainer,
     pub back_timeout: TimeoutContainer,
     pub frontend_timeout_duration: Duration,
+    pub proxy: Rc<RefCell<P>>,
 }
 
-impl<Front: SocketHandler> Http<Front> {
+impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
     pub fn new(
         sock: Front,
-        token: Token,
+        listener_token: Token,
+        frontend_token: Token,
         request_id: Ulid,
         pool: Weak<RefCell<Pool>>,
         public_address: SocketAddr,
@@ -119,11 +122,13 @@ impl<Front: SocketHandler> Http<Front> {
         front_timeout: TimeoutContainer,
         frontend_timeout_duration: Duration,
         backend_timeout_duration: Duration,
-    ) -> Http<Front> {
+        proxy: Rc<RefCell<P>>,
+    ) -> Http<Front, P> {
         let mut session = Http {
             frontend: sock,
             backend: None,
-            frontend_token: token,
+            listener_token,
+            frontend_token,
             backend_token: None,
             status: SessionStatus::Normal,
             front_buf: None,
@@ -153,6 +158,7 @@ impl<Front: SocketHandler> Http<Front> {
             frontend_timeout_duration,
             answers,
             pool,
+            proxy,
         };
         session.added_req_header = Some(session.added_request_header(session_address));
         session.added_res_header = session.added_response_header();
@@ -614,9 +620,25 @@ impl<Front: SocketHandler> Http<Front> {
         }
 
         let proto = self.protocol_string();
+        let tags = host.inner.and_then(|host| {
+            let hostname = match host.split_once(':') {
+                None => host,
+                Some((hn, _)) => hn,
+            };
+
+            self.proxy
+                .borrow()
+                .get_tags(&self.listener_token, hostname)
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(k, v)| format!("\"{}={}\"", k, v))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+        });
 
         info_access!(
-            "{}{} -> {}\t{} {} {} {}\t{} {} {}\t{}",
+            "{}{} -> {}\t{} {} {} {}\t{} {} {}\t{} {}",
             self.log_context(),
             session,
             backend,
@@ -627,7 +649,8 @@ impl<Front: SocketHandler> Http<Front> {
             proto,
             host,
             request_line,
-            status_line
+            status_line,
+            OptionalString::from(tags.as_ref())
         );
     }
 
@@ -686,9 +709,25 @@ impl<Front: SocketHandler> Http<Front> {
         incr!("http.errors");
 
         let proto = self.protocol_string();
+        let tags = host.inner.and_then(|host| {
+            let hostname = match host.split_once(':') {
+                None => host,
+                Some((hn, _)) => hn,
+            };
+
+            self.proxy
+                .borrow()
+                .get_tags(&self.listener_token, hostname)
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(k, v)| format!("\"{}={}\"", k, v))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+        });
 
         info_access!(
-            "{}{} -> {}\t{} {} {} {}\t{} {} {}\t{}",
+            "{}{} -> {}\t{} {} {} {}\t{} {} {}\t{} {}",
             self.log_context(),
             session,
             backend,
@@ -699,7 +738,8 @@ impl<Front: SocketHandler> Http<Front> {
             proto,
             host,
             request_line,
-            status_line
+            status_line,
+            OptionalString::from(tags.as_ref())
         );
     }
 
@@ -751,9 +791,25 @@ impl<Front: SocketHandler> Http<Front> {
         }*/
 
         let proto = self.protocol_string();
+        let tags = host.inner.and_then(|host| {
+            let hostname = match host.split_once(':') {
+                None => host,
+                Some((hn, _)) => hn,
+            };
+
+            self.proxy
+                .borrow()
+                .get_tags(&self.listener_token, hostname)
+                .map(|tags| {
+                    tags.iter()
+                        .map(|(k, v)| format!("\"{}={}\"", k, v))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+        });
 
         error_access!(
-            "{}{} -> {}\t{} {} {} {}\t{} {} {}\t{} | {}",
+            "{}{} -> {}\t{} {} {} {}\t{} {} {}\t{} | {} {}",
             self.log_context(),
             session,
             backend,
@@ -765,7 +821,8 @@ impl<Front: SocketHandler> Http<Front> {
             host,
             request_line,
             status_line,
-            message
+            message,
+            OptionalString::from(tags.as_ref())
         );
     }
 
@@ -1868,8 +1925,14 @@ impl std::fmt::Display for SessionAddress {
     }
 }
 
-struct OptionalString<'a> {
+pub struct OptionalString<'a> {
     inner: Option<&'a str>,
+}
+
+impl<'a> From<Option<&'a String>> for OptionalString<'a> {
+    fn from(o: Option<&'a String>) -> Self {
+        Self::new(o.map(|s| s.as_str()))
+    }
 }
 
 impl<'a> std::fmt::Display for OptionalString<'a> {
@@ -1882,11 +1945,11 @@ impl<'a> std::fmt::Display for OptionalString<'a> {
 }
 
 impl<'a> OptionalString<'a> {
-    fn new(s: Option<&'a str>) -> Self {
+    pub fn new(s: Option<&'a str>) -> Self {
         OptionalString { inner: s }
     }
 
-    fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         match &self.inner {
             None => "-",
             Some(s) => s,

@@ -45,8 +45,8 @@ use super::configuration::Proxy;
 pub enum State {
     Expect(ExpectProxyProtocol<TcpStream>, ServerConnection),
     Handshake(TlsHandshake),
-    Http(Http<FrontRustls>),
-    WebSocket(Pipe<FrontRustls>),
+    Http(Http<FrontRustls, Proxy>),
+    WebSocket(Pipe<FrontRustls, Proxy>),
 }
 
 pub struct Session {
@@ -135,7 +135,7 @@ impl Session {
         session
     }
 
-    pub fn http(&self) -> Option<&Http<FrontRustls>> {
+    pub fn http(&self) -> Option<&Http<FrontRustls, Proxy>> {
         self.protocol.as_ref().and_then(|protocol| {
             if let State::Http(ref http) = protocol {
                 Some(http)
@@ -145,7 +145,7 @@ impl Session {
         })
     }
 
-    pub fn http_mut(&mut self) -> Option<&mut Http<FrontRustls>> {
+    pub fn http_mut(&mut self) -> Option<&mut Http<FrontRustls, Proxy>> {
         self.protocol.as_mut().and_then(|protocol| {
             if let State::Http(ref mut http) = *protocol {
                 Some(http)
@@ -220,6 +220,7 @@ impl Session {
                 let readiness = handshake.readiness.clone();
                 let mut http = Http::new(
                     front_stream,
+                    self.listen_token,
                     self.frontend_token,
                     handshake.request_id,
                     self.pool.clone(),
@@ -231,6 +232,7 @@ impl Session {
                     self.front_timeout.take(),
                     self.frontend_timeout_duration,
                     self.backend_timeout_duration,
+                    self.proxy.clone(),
                 );
 
                 let res = http.frontend.session.reader().read(front_buf.space());
@@ -298,6 +300,7 @@ impl Session {
 
                 let mut pipe = Pipe::new(
                     http.frontend,
+                    http.listener_token,
                     front_token,
                     http.request_id,
                     http.cluster_id,
@@ -308,6 +311,7 @@ impl Session {
                     back_buf,
                     http.session_address,
                     Protocol::HTTPS,
+                    self.proxy.clone(),
                 );
 
                 pipe.front_readiness.event = http.front_readiness.event;

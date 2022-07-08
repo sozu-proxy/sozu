@@ -4,7 +4,7 @@ extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 extern crate time;
 
-use std::{env, io::stdout, thread};
+use std::{collections::BTreeMap, env, io::stdout, thread};
 
 use crate::sozu_command::{
     channel::Channel,
@@ -52,6 +52,10 @@ fn main() {
         path: PathRule::Prefix(String::from("/")),
         method: None,
         position: RulePosition::Pre,
+        tags: Some(BTreeMap::from([
+            ("owner".to_owned(), "John".to_owned()),
+            ("id".to_owned(), "my-own-http-front".to_owned()),
+        ])),
     };
     let http_backend = proxy::Backend {
         cluster_id: String::from("test"),
