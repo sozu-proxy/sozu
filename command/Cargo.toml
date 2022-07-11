@@ -21,22 +21,21 @@ include = [
 ]
 
 [dependencies]
-anyhow = "^1.0.56"
+anyhow = "^1.0.58"
 hex = "^0.4.3"
-libc = "^0.2.124"
-log = "^0.4.16"
-time = "^0.3.9"
+libc = "^0.2.126"
+log = "^0.4.17"
+time = "^0.3.11"
 toml = "^0.5.9"
-memchr = "^2.4.1"
-mio = { version = "^0.8.2", features = [ "os-poll", "net" ] }
+memchr = "^2.5.0"
+mio = { version = "^0.8.4", features = [ "os-poll", "net" ] }
 nix = "^0.23.1"
 nom = "^7.1.1"
 pem = "^1.0.2"
-regex = "^1.5.5"
+regex = "^1.6.0"
 rand = "^0.8.5"
-serde = "^1.0.136"
-serde_json = "^1.0.79"
-serde_derive = "^1.0.136"
+serde = { version = "^1.0.139", features = ["derive"] }
+serde_json = "^1.0.82"
 sha2 = "^0.10.2"
 trailer = "^0.1.2"
 pool = "^0.1.4"
