@@ -1717,7 +1717,10 @@ mod tests {
                 })
                 .unwrap();
 
-            let server_config = server::ServerConfig { max_connections, ..Default::default() };
+            let server_config = server::ServerConfig {
+                max_connections,
+                ..Default::default()
+            };
             let mut s = Server::new(
                 poll,
                 channel,
