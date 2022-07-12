@@ -1570,9 +1570,16 @@ impl ProxyConfiguration<Session> for Proxy {
                         },
                     }
                 } else {
-                    panic!("no HTTP listener found for front: {:?}", front);
+                    ProxyResponse {
+                        id: message.id,
+                        status: ProxyResponseStatus::Error(format!(
+                            "no HTTP listener found for front: {:?}",
+                            front
+                        )),
+                        data: None,
+                    }
 
-                    //let (listener, tokens) = Listener::new(HttpListener::default(), event_loop,
+                    // let (listener, tokens) = Listener::new(HttpListener::default(), event_loop,
                     //  self.pool.clone(), None, token: Token) -> (Listener,HashSet<Token>
                 }
             }
@@ -1596,7 +1603,13 @@ impl ProxyConfiguration<Session> for Proxy {
                         },
                     }
                 } else {
-                    panic!("trying to remove front from non existing listener");
+                    ProxyResponse {
+                        id: message.id,
+                        status: ProxyResponseStatus::Error(format!(
+                            "trying to remove front from non existing listener"
+                        )),
+                        data: None,
+                    }
                 }
             }
             ProxyRequestData::RemoveListener(remove) => {
