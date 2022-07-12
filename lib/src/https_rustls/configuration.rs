@@ -465,7 +465,14 @@ impl ProxyConfiguration<Session> for Proxy {
                         data: None,
                     }
                 } else {
-                    panic!("unknown listener: {:?}", front.address)
+                    ProxyResponse {
+                        id: message.id,
+                        status: ProxyResponseStatus::Error(format!(
+                            "No listener found for the frontend {:?}",
+                            front
+                        )),
+                        data: None,
+                    }
                 }
             }
             ProxyRequestData::RemoveHttpsFrontend(front) => {
@@ -482,7 +489,14 @@ impl ProxyConfiguration<Session> for Proxy {
                         data: None,
                     }
                 } else {
-                    panic!("unknown listener: {:?}", front.address)
+                    ProxyResponse {
+                        id: message.id,
+                        status: ProxyResponseStatus::Error(format!(
+                            "No listener found for the frontend {:?}",
+                            front
+                        )),
+                        data: None,
+                    }
                 }
             }
             ProxyRequestData::AddCertificate(add_certificate) => {
