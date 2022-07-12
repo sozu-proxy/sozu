@@ -210,7 +210,7 @@ fn update_process_limits(config: &Config) -> Result<(), anyhow::Error> {
     if config.max_connections > system_max_fd {
         error!(
             "Proxies total max_connections can't be higher than system's file-max limit. \
-            Current limit: {}, current value: {}",
+            Current limit: {}, current value: {}",
             system_max_fd, config.max_connections
         );
         bail!("Too many allowed connections");

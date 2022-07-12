@@ -853,7 +853,7 @@ impl Session {
             if let Some(fd) = self.back_socket_mut().map(|s| s.as_raw_fd()) {
                 let proxy = self.proxy.borrow_mut();
                 if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                    error!("1error deregistering socket({:?}): {:?}", fd, e);
+                    error!("1error deregistering socket({:?}): {:?}", fd, e);
                 }
 
                 proxy.sessions.borrow_mut().slab.try_remove(token.0);
@@ -1280,7 +1280,7 @@ impl ProxySession for Session {
         let fd = self.front_socket().as_raw_fd();
         let proxy = self.proxy.borrow_mut();
         if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-            error!("1error deregistering socket({:?}): {:?}", fd, e);
+            error!("1error deregistering socket({:?}): {:?}", fd, e);
         }
     }
 

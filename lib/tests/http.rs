@@ -349,6 +349,6 @@ fn start_server(port: u16, barrier: Arc<Barrier>) {
             eprintln!("server session stopped");
         }
 
-        eprintln!("server on port {} closed", port);
+        eprintln!("server on port {} closed", port);
     });
 }

@@ -145,7 +145,7 @@ impl BackendMap {
 
                 conn.map(|c| (b.clone(), c)).map_err(|e| {
                     error!(
-                        "could not connect {} to {:?} using session {} ({} failures)",
+                        "could not connect {} to {:?} using session {} ({} failures)",
                         cluster_id, backend.address, sticky_session, backend.failures
                     );
                     e

@@ -467,7 +467,7 @@ pub enum HttpListenerCmd {
         answer_404: Option<String>,
         #[structopt(
             long = "answer-503",
-            help = "path to file of the 503 answer sent to the client when an application has no backends available"
+            help = "path to file of the 503 answer sent to the client when an application has no backends available"
         )]
         answer_503: Option<String>,
         #[structopt(
@@ -525,7 +525,7 @@ pub enum HttpsListenerCmd {
         answer_404: Option<String>,
         #[structopt(
             long = "answer-503",
-            help = "path to file of the 503 answer sent to the client when an application has no backends available"
+            help = "path to file of the 503 answer sent to the client when an application has no backends available"
         )]
         answer_503: Option<String>,
         #[structopt(long = "tls-versions", help = "list of TLS versions to use")]

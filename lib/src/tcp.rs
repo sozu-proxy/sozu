@@ -789,7 +789,7 @@ impl Session {
         ) {
             let proxy = self.proxy.borrow_mut();
             if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                error!("error deregistering socket({:?}): {:?}", fd, e);
+                error!("error deregistering socket({:?}): {:?}", fd, e);
             }
 
             proxy.sessions.borrow_mut().slab.try_remove(token.0);
@@ -805,7 +805,7 @@ impl Session {
             if let Some(sock) = self.back_socket_mut() {
                 if let Err(e) = sock.shutdown(Shutdown::Both) {
                     if e.kind() != ErrorKind::NotConnected {
-                        error!("error closing back socket({:?}): {:?}", sock, e);
+                        error!("error closing back socket({:?}): {:?}", sock, e);
                     }
                 }
             }
@@ -864,7 +864,7 @@ impl Session {
             Ok((backend, mut stream)) => {
                 if let Err(e) = stream.set_nodelay(true) {
                     error!(
-                        "error setting nodelay on back socket({:?}): {:?}",
+                        "error setting nodelay on back socket({:?}): {:?}",
                         stream, e
                     );
                 }
@@ -884,7 +884,7 @@ impl Session {
                     back_token,
                     Interest::READABLE | Interest::WRITABLE,
                 ) {
-                    error!("error registering back socket({:?}): {:?}", stream, e);
+                    error!("error registering back socket({:?}): {:?}", stream, e);
                 }
 
                 let connect_timeout_duration = Duration::seconds(
@@ -919,7 +919,7 @@ impl ProxySession for Session {
         if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
             if e.kind() != ErrorKind::NotConnected {
                 error!(
-                    "error shutting down front socket({:?}): {:?}",
+                    "error shutting down front socket({:?}): {:?}",
                     self.front_socket(),
                     e
                 );
@@ -939,7 +939,7 @@ impl ProxySession for Session {
         let fd = self.front_socket().as_raw_fd();
         let proxy = self.proxy.borrow_mut();
         if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-            error!("1error deregistering socket({:?}): {:?}", fd, e);
+            error!("1error deregistering socket({:?}): {:?}", fd, e);
         }
     }
 
@@ -1084,7 +1084,7 @@ impl Listener {
 
         if let Some(ref mut sock) = listener {
             if let Err(e) = registry.register(sock, self.token, Interest::READABLE) {
-                error!("error registering socket({:?}): {:?}", sock, e);
+                error!("error registering socket({:?}): {:?}", sock, e);
             }
         } else {
             return None;
@@ -1330,7 +1330,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
                 if let Err(e) = frontend_sock.set_nodelay(true) {
                     error!(
-                        "error setting nodelay on front socket({:?}): {:?}",
+                        "error setting nodelay on front socket({:?}): {:?}",
                         frontend_sock, e
                     );
                 }
@@ -1361,7 +1361,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     Interest::READABLE | Interest::WRITABLE,
                 ) {
                     error!(
-                        "error registering front socket({:?}): {:?}",
+                        "error registering front socket({:?}): {:?}",
                         c.front_socket(),
                         e
                     );

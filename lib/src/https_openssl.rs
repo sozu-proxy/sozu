@@ -891,7 +891,7 @@ impl Session {
             let token = self.frontend_token.clone();
             let back = self.back_readiness().cloned();
             error!(
-                "PROXY\t{:?} readiness: {:?} -> {:?} | front: {:?} | back: {:?} ",
+                "PROXY\t{:?} readiness: {:?} -> {:?} | front: {:?} | back: {:?} ",
                 token,
                 self.front_readiness(),
                 back,
@@ -911,7 +911,7 @@ impl Session {
             if let Some(fd) = self.back_socket_mut().map(|s| s.as_raw_fd()) {
                 let proxy = self.proxy.borrow_mut();
                 if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                    error!("1error deregistering socket({:?}): {:?}", fd, e);
+                    error!("1error deregistering socket({:?}): {:?}", fd, e);
                 }
 
                 proxy.sessions.borrow_mut().slab.try_remove(token.0);
@@ -1314,7 +1314,7 @@ impl ProxySession for Session {
         if let Some(fd) = self.front_socket_mut().map(|s| s.as_raw_fd()) {
             let proxy = self.proxy.borrow_mut();
             if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                error!("1error deregistering socket({:?}): {:?}", fd, e);
+                error!("1error deregistering socket({:?}): {:?}", fd, e);
             }
         }
     }

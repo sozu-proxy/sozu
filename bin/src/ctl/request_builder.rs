@@ -235,7 +235,7 @@ impl CommandManager {
                 }
                 match listener.to_http(None, None, None) {
                     Some(conf) => self.order_command(ProxyRequestData::AddHttpListener(conf)),
-                    None => bail!("Error creating HTTP listener"),
+                    None => bail!("Error creating HTTP listener"),
                 }
             }
             HttpListenerCmd::Remove { address } => {

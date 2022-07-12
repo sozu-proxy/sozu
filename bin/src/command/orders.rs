@@ -1282,7 +1282,7 @@ impl CommandServer {
                     command_response_data,
                 )
             }
-            // Todo: refactor the CLI to accept processing, see issue #740
+            // Todo: refactor the CLI to accept processing, see issue #740
             // Response::Processing(_) => {
             //     command_response = CommandResponse::new(
             //         request_id.clone(),
