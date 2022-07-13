@@ -25,6 +25,53 @@ pub struct ProxyResponse {
     pub data: Option<ProxyResponseData>,
 }
 
+impl ProxyResponse {
+    pub fn ok<T>(id: T) -> Self
+    where
+        T: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            status: ProxyResponseStatus::Ok,
+            data: None,
+        }
+    }
+
+    pub fn error<T, U>(id: T, error: U) -> Self
+    where
+        T: ToString,
+        U: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            status: ProxyResponseStatus::Error(error.to_string()),
+            data: None,
+        }
+    }
+
+    pub fn processing<T>(id: T) -> Self
+    where
+        T: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            status: ProxyResponseStatus::Processing,
+            data: None,
+        }
+    }
+
+    pub fn status<T>(id: T, status: ProxyResponseStatus) -> Self
+    where
+        T: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            status,
+            data: None,
+        }
+    }
+}
+
 impl fmt::Display for ProxyResponse {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}-{:?}", self.id, self.status)

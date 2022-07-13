@@ -33,7 +33,7 @@ use crate::{
         config::ProxyProtocolConfig,
         logging,
         proxy::{
-            ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse, ProxyResponseStatus,
+            ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse,
             TcpListener as TcpListenerConfig,
         },
         ready::Ready,
@@ -1206,19 +1206,12 @@ impl ProxyConfiguration<Session> for Proxy {
         match message.order {
             ProxyRequestData::AddTcpFrontend(front) => {
                 let _ = self.add_tcp_front(&front.cluster_id, &front.address);
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::RemoveTcpFrontend(front) => {
                 let _ = self.remove_tcp_front(front.address);
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::SoftStop => {
                 info!("{} processing soft shutdown", message.id);
@@ -1228,11 +1221,7 @@ impl ProxyConfiguration<Session> for Proxy {
                         .take()
                         .map(|mut sock| self.registry.deregister(&mut sock));
                 }
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Processing,
-                    data: None,
-                }
+                ProxyResponse::processing(message.id)
             }
             ProxyRequestData::HardStop => {
                 info!("{} hard shutdown", message.id);
@@ -1242,19 +1231,11 @@ impl ProxyConfiguration<Session> for Proxy {
                         .take()
                         .map(|mut sock| self.registry.deregister(&mut sock));
                 }
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::Status => {
                 info!("{} status", message.id);
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::Logging(logging_filter) => {
                 info!(
@@ -1265,11 +1246,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     let directives = logging::parse_logging_spec(&logging_filter);
                     l.borrow_mut().set_directives(directives);
                 });
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::AddCluster(cluster) => {
                 let config = ClusterConfiguration {
@@ -1277,37 +1254,20 @@ impl ProxyConfiguration<Session> for Proxy {
                     //load_balancing: cluster.load_balancing,
                 };
                 self.configs.insert(cluster.cluster_id, config);
-
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::RemoveCluster { cluster_id } => {
                 self.configs.remove(&cluster_id);
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::RemoveListener(remove) => {
                 if !self.remove_listener(remove.address) {
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Error(format!(
-                            "no TCP listener to remove at address {:?}",
-                            remove.address
-                        )),
-                        data: None,
-                    }
+                    ProxyResponse::error(
+                        message.id,
+                        format!("no TCP listener to remove at address {:?}", remove.address),
+                    )
                 } else {
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Ok,
-                        data: None,
-                    }
+                    ProxyResponse::ok(message.id)
                 }
             }
             command => {
@@ -1315,11 +1275,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     "{} unsupported message for TCP proxy, ignoring {:?}",
                     message.id, command
                 );
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Error(String::from("unsupported message")),
-                    data: None,
-                }
+                ProxyResponse::error(message.id, "unsupported message")
             }
         }
     }

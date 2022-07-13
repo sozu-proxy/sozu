@@ -436,20 +436,12 @@ impl ProxyConfiguration<Session> for Proxy {
             ProxyRequestData::AddCluster(cluster) => {
                 debug!("{} add cluster {:?}", message.id, cluster);
                 self.add_cluster(cluster);
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::RemoveCluster { cluster_id } => {
                 debug!("{} remove cluster {:?}", message.id, cluster_id);
                 self.remove_cluster(&cluster_id);
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::AddHttpsFrontend(front) => {
                 //info!("HTTPS\t{} add front {:?}", id, front);
@@ -459,20 +451,12 @@ impl ProxyConfiguration<Session> for Proxy {
                     .find(|l| l.address == front.address)
                 {
                     listener.add_https_front(front);
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Ok,
-                        data: None,
-                    }
+                    ProxyResponse::ok(message.id)
                 } else {
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Error(format!(
-                            "No listener found for the frontend {:?}",
-                            front
-                        )),
-                        data: None,
-                    }
+                    ProxyResponse::error(
+                        message.id,
+                        format!("No listener found for the frontend {:?}", front),
+                    )
                 }
             }
             ProxyRequestData::RemoveHttpsFrontend(front) => {
@@ -483,20 +467,12 @@ impl ProxyConfiguration<Session> for Proxy {
                     .find(|l| l.address == front.address)
                 {
                     listener.remove_https_front(front);
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Ok,
-                        data: None,
-                    }
+                    ProxyResponse::ok(message.id)
                 } else {
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Error(format!(
-                            "No listener found for the frontend {:?}",
-                            front
-                        )),
-                        data: None,
-                    }
+                    ProxyResponse::error(
+                        message.id,
+                        format!("No listener found for the frontend {:?}", front),
+                    )
                 }
             }
             ProxyRequestData::AddCertificate(add_certificate) => {
@@ -506,24 +482,12 @@ impl ProxyConfiguration<Session> for Proxy {
                     .find(|l| l.address == add_certificate.address)
                 {
                     match listener.add_certificate(&add_certificate) {
-                        Ok(_) => ProxyResponse {
-                            id: message.id,
-                            status: ProxyResponseStatus::Ok,
-                            data: None,
-                        },
-                        Err(err) => ProxyResponse {
-                            id: message.id,
-                            status: ProxyResponseStatus::Error(err.to_string()),
-                            data: None,
-                        },
+                        Ok(_) => ProxyResponse::ok(message.id),
+                        Err(err) => ProxyResponse::error(message.id, err),
                     }
                 } else {
                     error!("replacing certificate to unknown listener");
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Error(String::from("unsupported message")),
-                        data: None,
-                    }
+                    ProxyResponse::error(message.id, "unsupported message")
                 }
             }
             ProxyRequestData::RemoveCertificate(remove_certificate) => {
@@ -534,24 +498,12 @@ impl ProxyConfiguration<Session> for Proxy {
                     .find(|l| l.address == remove_certificate.address)
                 {
                     match listener.remove_certificate(&remove_certificate) {
-                        Ok(_) => ProxyResponse {
-                            id: message.id,
-                            status: ProxyResponseStatus::Ok,
-                            data: None,
-                        },
-                        Err(err) => ProxyResponse {
-                            id: message.id,
-                            status: ProxyResponseStatus::Error(err.to_string()),
-                            data: None,
-                        },
+                        Ok(_) => ProxyResponse::ok(message.id),
+                        Err(err) => ProxyResponse::error(message.id, err),
                     }
                 } else {
                     error!("replacing certificate to unknown listener");
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Error(String::from("unsupported message")),
-                        data: None,
-                    }
+                    ProxyResponse::error(message.id, "unsupported message")
                 }
             }
             ProxyRequestData::ReplaceCertificate(replace_certificate) => {
@@ -562,43 +514,26 @@ impl ProxyConfiguration<Session> for Proxy {
                     .find(|l| l.address == replace_certificate.address)
                 {
                     match listener.replace_certificate(&replace_certificate) {
-                        Ok(_) => ProxyResponse {
-                            id: message.id,
-                            status: ProxyResponseStatus::Ok,
-                            data: None,
-                        },
-                        Err(err) => ProxyResponse {
-                            id: message.id,
-                            status: ProxyResponseStatus::Error(err.to_string()),
-                            data: None,
-                        },
+                        Ok(_) => ProxyResponse::ok(message.id),
+                        Err(err) => ProxyResponse::error(message.id, err),
                     }
                 } else {
                     error!("replacing certificate to unknown listener");
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Error(String::from("unsupported message")),
-                        data: None,
-                    }
+                    ProxyResponse::error(message.id, "unsupported message")
                 }
             }
             ProxyRequestData::RemoveListener(remove) => {
                 debug!("removing HTTPS listener at address: {:?}", remove.address);
                 if !self.remove_listener(remove.address) {
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Error(format!(
+                    ProxyResponse::error(
+                        message.id,
+                        format!(
                             "no HTTPS listener to remove at address {:?}",
                             remove.address
-                        )),
-                        data: None,
-                    }
+                        ),
+                    )
                 } else {
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Ok,
-                        data: None,
-                    }
+                    ProxyResponse::ok(message.id)
                 }
             }
             ProxyRequestData::SoftStop => {
@@ -611,11 +546,7 @@ impl ProxyConfiguration<Session> for Proxy {
                         }
                     };
                 }
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Processing,
-                    data: None,
-                }
+                ProxyResponse::processing(message.id)
             }
             ProxyRequestData::HardStop => {
                 info!("{} hard shutdown", message.id);
@@ -627,19 +558,11 @@ impl ProxyConfiguration<Session> for Proxy {
                         }
                     };
                 }
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Processing,
-                    data: None,
-                }
+                ProxyResponse::processing(message.id)
             }
             ProxyRequestData::Status => {
                 debug!("{} status", message.id);
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::Logging(logging_filter) => {
                 debug!(
@@ -650,11 +573,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     let directives = logging::parse_logging_spec(&logging_filter);
                     l.borrow_mut().set_directives(directives);
                 });
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
                 let res = self
@@ -708,11 +627,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     "{} unsupported message for rustls proxy, ignoring {:?}",
                     message.id, command
                 );
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Error(String::from("unsupported message")),
-                    data: None,
-                }
+                ProxyResponse::error(message.id, "unsupported message")
             }
         }
     }

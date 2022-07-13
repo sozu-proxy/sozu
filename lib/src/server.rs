@@ -465,11 +465,7 @@ impl Server {
             // it so happens that trying to upgrade a dead worker will bring no message
             // which brings the whole main process to crash because it unwraps a None
             if let Some(msg) = msg {
-                server.channel.write_message(&ProxyResponse {
-                    id: msg.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                });
+                server.channel.write_message(&ProxyResponse::ok(msg.id));
             }
             server.channel.set_nonblocking(true);
         }
@@ -604,11 +600,7 @@ impl Server {
                                 if let ProxyRequestData::HardStop = msg.order {
                                     let id_msg = msg.id.clone();
                                     self.notify(msg);
-                                    self.channel.write_message(&ProxyResponse {
-                                        id: id_msg,
-                                        status: ProxyResponseStatus::Ok,
-                                        data: None,
-                                    });
+                                    self.channel.write_message(&ProxyResponse::ok(id_msg));
                                     self.channel.run();
                                     return;
                                 } else if let ProxyRequestData::SoftStop = msg.order {
@@ -814,11 +806,7 @@ impl Server {
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).configure(configuration);
 
-                push_queue(ProxyResponse {
-                    id: message.id.clone(),
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                });
+                push_queue(ProxyResponse::ok(message.id.clone()));
             });
             return;
         }
@@ -836,7 +824,7 @@ impl Server {
                     return;
                 }
                 Query::Applications(query_type) => {
-                    let answer = match query_type {
+                    let query_answer = match query_type {
                         QueryApplicationType::ClusterId(cluster_id) => {
                             QueryAnswer::Applications(vec![self
                                 .config_state
@@ -856,11 +844,10 @@ impl Server {
                             QueryAnswer::Applications(answer)
                         }
                     };
-
                     push_queue(ProxyResponse {
                         id: message.id.clone(),
                         status: ProxyResponseStatus::Ok,
-                        data: Some(ProxyResponseData::Query(answer)),
+                        data: Some(ProxyResponseData::Query(query_answer)),
                     });
                     return;
                 }
@@ -935,12 +922,7 @@ impl Server {
                     .borrow_mut()
                     .add_backend(&backend.cluster_id, new_backend);
 
-                let answer = ProxyResponse {
-                    id: id.to_string(),
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                };
-                push_queue(answer);
+                push_queue(ProxyResponse::ok(id));
                 return;
             }
             ProxyRequest {
@@ -951,12 +933,7 @@ impl Server {
                     .borrow_mut()
                     .remove_backend(&backend.cluster_id, &backend.address);
 
-                let answer = ProxyResponse {
-                    id: id.to_string(),
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                };
-                push_queue(answer);
+                push_queue(ProxyResponse::ok(id));
                 return;
             }
             _ => {}
@@ -974,13 +951,10 @@ impl Server {
                     debug!("{} add http listener {:?}", id, listener);
 
                     if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-                        push_queue(ProxyResponse {
-                            id: id.to_string(),
-                            status: ProxyResponseStatus::Error(String::from(
-                                "session list is full, cannot add a listener",
-                            )),
-                            data: None,
-                        });
+                        push_queue(ProxyResponse::error(
+                            id.to_string(),
+                            "session list is full, cannot add a listener",
+                        ));
                         return;
                     }
 
@@ -1004,12 +978,7 @@ impl Server {
                         ProxyResponseStatus::Error(String::from("cannot add HTTP listener"))
                     };
 
-                    let answer = ProxyResponse {
-                        id: id.to_string(),
-                        status,
-                        data: None,
-                    };
-                    push_queue(answer);
+                    push_queue(ProxyResponse::status(id, status));
                 }
                 ProxyRequest {
                     ref id,
@@ -1052,12 +1021,7 @@ impl Server {
                             }
                         };
 
-                        let answer = ProxyResponse {
-                            id: id.to_string(),
-                            status,
-                            data: None,
-                        };
-                        push_queue(answer);
+                        push_queue(ProxyResponse::status(id.to_string(), status));
                     }
                 }
                 ProxyRequest {
@@ -1112,12 +1076,7 @@ impl Server {
                             }
                         };
 
-                        let answer = ProxyResponse {
-                            id: id.to_string(),
-                            status,
-                            data: None,
-                        };
-                        push_queue(answer);
+                        push_queue(ProxyResponse::status(id.to_string(), status));
                     }
                 }
                 ref m => push_queue(self.http.borrow_mut().notify(m.clone())),
@@ -1133,13 +1092,10 @@ impl Server {
                     debug!("{} add https listener {:?}", id, listener);
 
                     if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-                        push_queue(ProxyResponse {
-                            id: id.to_string(),
-                            status: ProxyResponseStatus::Error(String::from(
-                                "session list is full, cannot add a listener",
-                            )),
-                            data: None,
-                        });
+                        push_queue(ProxyResponse::error(
+                            id.to_string(),
+                            "session list is full, cannot add a listener",
+                        ));
                         return;
                     }
 
@@ -1158,12 +1114,7 @@ impl Server {
                         ProxyResponseStatus::Error(String::from("cannot add HTTPS listener"))
                     };
 
-                    let answer = ProxyResponse {
-                        id: id.to_string(),
-                        status,
-                        data: None,
-                    };
-                    push_queue(answer);
+                    push_queue(ProxyResponse::status(id.to_string(), status));
                 }
                 ProxyRequest {
                     ref id,
@@ -1203,12 +1154,7 @@ impl Server {
                             }
                         };
 
-                        let answer = ProxyResponse {
-                            id: id.to_string(),
-                            status,
-                            data: None,
-                        };
-                        push_queue(answer);
+                        push_queue(ProxyResponse::status(id.to_string(), status));
                     }
                 }
                 ProxyRequest {
@@ -1258,12 +1204,7 @@ impl Server {
                             }
                         };
 
-                        let answer = ProxyResponse {
-                            id: id.to_string(),
-                            status,
-                            data: None,
-                        };
-                        push_queue(answer);
+                        push_queue(ProxyResponse::status(id.to_string(), status));
                     }
                 }
                 ref m => push_queue(self.https.notify(m.clone())),
@@ -1279,13 +1220,10 @@ impl Server {
                     debug!("{} add tcp listener {:?}", id, listener);
 
                     if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-                        push_queue(ProxyResponse {
+                        push_queue(ProxyResponse::error(
                             id,
-                            status: ProxyResponseStatus::Error(String::from(
-                                "session list is full, cannot add a listener",
-                            )),
-                            data: None,
-                        });
+                            "session list is full, cannot add a listener",
+                        ));
                         return;
                     }
 
@@ -1308,12 +1246,8 @@ impl Server {
                         error!("Couldn't add TCP listener");
                         ProxyResponseStatus::Error(String::from("cannot add TCP listener"))
                     };
-                    let answer = ProxyResponse {
-                        id,
-                        status,
-                        data: None,
-                    };
-                    push_queue(answer);
+
+                    push_queue(ProxyResponse::status(id.to_string(), status));
                 }
                 ProxyRequest {
                     ref id,
@@ -1356,12 +1290,7 @@ impl Server {
                             }
                         };
 
-                        let answer = ProxyResponse {
-                            id: id.to_string(),
-                            status,
-                            data: None,
-                        };
-                        push_queue(answer);
+                        push_queue(ProxyResponse::status(id.to_string(), status));
                     }
                 }
                 ProxyRequest {
@@ -1412,12 +1341,7 @@ impl Server {
                                 }
                             };
 
-                        let answer = ProxyResponse {
-                            id: id.to_string(),
-                            status,
-                            data: None,
-                        };
-                        push_queue(answer);
+                        push_queue(ProxyResponse::status(id.to_string(), status));
                     }
                 }
                 m => push_queue(self.tcp.borrow_mut().notify(m)),
