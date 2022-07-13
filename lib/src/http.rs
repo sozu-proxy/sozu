@@ -19,7 +19,7 @@ use crate::{
         logging,
         proxy::{
             Cluster, HttpFrontend, HttpListener, ProxyEvent, ProxyRequest, ProxyRequestData,
-            ProxyResponse, ProxyResponseStatus, Route,
+            ProxyResponse, Route,
         },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
@@ -1535,20 +1535,12 @@ impl ProxyConfiguration<Session> for Proxy {
             ProxyRequestData::AddCluster(cluster) => {
                 debug!("{} add cluster {:?}", message.id, cluster);
                 self.add_cluster(cluster);
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::RemoveCluster { cluster_id } => {
                 debug!("{} remove cluster {:?}", message.id, cluster_id);
                 self.remove_cluster(&cluster_id);
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::AddHttpFrontend(front) => {
                 debug!("{} add front {:?}", message.id, front);
@@ -1558,26 +1550,14 @@ impl ProxyConfiguration<Session> for Proxy {
                     .find(|l| l.address == front.address)
                 {
                     match listener.add_http_front(front) {
-                        Ok(_) => ProxyResponse {
-                            id: message.id,
-                            status: ProxyResponseStatus::Ok,
-                            data: None,
-                        },
-                        Err(err) => ProxyResponse {
-                            id: message.id,
-                            status: ProxyResponseStatus::Error(err),
-                            data: None,
-                        },
+                        Ok(_) => ProxyResponse::ok(message.id),
+                        Err(err) => ProxyResponse::error(message.id, err),
                     }
                 } else {
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Error(format!(
-                            "no HTTP listener found for front: {:?}",
-                            front
-                        )),
-                        data: None,
-                    }
+                    ProxyResponse::error(
+                        message.id,
+                        format!("no HTTP listener found for front: {:?}", front),
+                    )
 
                     // let (listener, tokens) = Listener::new(HttpListener::default(), event_loop,
                     //  self.pool.clone(), None, token: Token) -> (Listener,HashSet<Token>
@@ -1591,44 +1571,25 @@ impl ProxyConfiguration<Session> for Proxy {
                     .find(|l| l.address == front.address)
                 {
                     match (*listener).remove_http_front(front) {
-                        Ok(_) => ProxyResponse {
-                            id: message.id,
-                            status: ProxyResponseStatus::Ok,
-                            data: None,
-                        },
-                        Err(err) => ProxyResponse {
-                            id: message.id,
-                            status: ProxyResponseStatus::Error(err),
-                            data: None,
-                        },
+                        Ok(_) => ProxyResponse::ok(message.id),
+                        Err(err) => ProxyResponse::error(message.id, err),
                     }
                 } else {
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Error(format!(
-                            "trying to remove front from non existing listener"
-                        )),
-                        data: None,
-                    }
+                    ProxyResponse::error(
+                        message.id,
+                        "trying to remove front from non existing listener",
+                    )
                 }
             }
             ProxyRequestData::RemoveListener(remove) => {
                 debug!("removing HTTP listener at address {:?}", remove.address);
                 if !self.remove_listener(remove.address) {
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Error(format!(
-                            "no HTTP listener to remove at address {:?}",
-                            remove.address
-                        )),
-                        data: None,
-                    }
+                    ProxyResponse::error(
+                        message.id,
+                        format!("no HTTP listener to remove at address {:?}", remove.address),
+                    )
                 } else {
-                    ProxyResponse {
-                        id: message.id,
-                        status: ProxyResponseStatus::Ok,
-                        data: None,
-                    }
+                    ProxyResponse::ok(message.id)
                 }
             }
             ProxyRequestData::SoftStop => {
@@ -1641,11 +1602,7 @@ impl ProxyConfiguration<Session> for Proxy {
                         }
                     }
                 }
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Processing,
-                    data: None,
-                }
+                ProxyResponse::processing(message.id)
             }
             ProxyRequestData::HardStop => {
                 info!("{} hard shutdown", message.id);
@@ -1657,19 +1614,11 @@ impl ProxyConfiguration<Session> for Proxy {
                         }
                     }
                 }
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Processing,
-                    data: None,
-                }
+                ProxyResponse::processing(message.id)
             }
             ProxyRequestData::Status => {
                 debug!("{} status", message.id);
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             ProxyRequestData::Logging(logging_filter) => {
                 info!(
@@ -1680,22 +1629,14 @@ impl ProxyConfiguration<Session> for Proxy {
                     let directives = logging::parse_logging_spec(&logging_filter);
                     l.borrow_mut().set_directives(directives);
                 });
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Ok,
-                    data: None,
-                }
+                ProxyResponse::ok(message.id)
             }
             command => {
                 debug!(
                     "{} unsupported message for HTTP proxy, ignoring: {:?}",
                     message.id, command
                 );
-                ProxyResponse {
-                    id: message.id,
-                    status: ProxyResponseStatus::Error(String::from("unsupported message")),
-                    data: None,
-                }
+                ProxyResponse::error(message.id, "unsupported message")
             }
         }
     }
