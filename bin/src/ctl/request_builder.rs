@@ -1,6 +1,6 @@
-use std::{net::SocketAddr, process::exit};
+use std::net::SocketAddr;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 
 use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain},
@@ -321,17 +321,16 @@ impl CommandManager {
         key_path: &str,
         versions: Vec<TlsVersion>,
     ) -> Result<(), anyhow::Error> {
-        if let Some(new_certificate) =
-            load_full_certificate(certificate_path, certificate_chain_path, key_path, versions)?
-        {
-            self.order_command(ProxyRequestData::AddCertificate(AddCertificate {
-                address,
-                certificate: new_certificate,
-                names: vec![],
-                expired_at: None,
-            }))?;
-        }
-        Ok(())
+        let new_certificate =
+            load_full_certificate(certificate_path, certificate_chain_path, key_path, versions)
+                .with_context(|| "Could not load the full certificate")?;
+
+        self.order_command(ProxyRequestData::AddCertificate(AddCertificate {
+            address,
+            certificate: new_certificate,
+            names: vec![],
+            expired_at: None,
+        }))
     }
 
     pub fn replace_certificate(
@@ -344,38 +343,35 @@ impl CommandManager {
         old_fingerprint: Option<&str>,
         versions: Vec<TlsVersion>,
     ) -> Result<(), anyhow::Error> {
-        if old_certificate_path.is_some() && old_fingerprint.is_some() {
-            bail!("Error: Either provide the old certificate's path or its fingerprint");
-        }
+        let old_fingerprint = match (old_certificate_path, old_fingerprint) {
+            (None, None) | (Some(_), Some(_)) => {
+                bail!("Error: Please provide either one, the old certificate's path OR its fingerprint")
+            }
+            (Some(old_certificate_path), None) => {
+                get_fingerprint_from_certificate_path(old_certificate_path).with_context(|| {
+                    "Could not retrieve the fingerprint from the given certificate path"
+                })?
+            }
+            (None, Some(fingerprint)) => decode_fingerprint(fingerprint)
+                .with_context(|| "Error decoding the given fingerprint")?,
+        };
 
-        if old_certificate_path.is_none() && old_fingerprint.is_none() {
-            bail!("Error: Either provide the old certificate's path or its fingerprint");
-        }
-
-        if let Some(new_certificate) = load_full_certificate(
+        let new_certificate = load_full_certificate(
             new_certificate_path,
             new_certificate_chain_path,
             new_key_path,
             versions,
-        )? {
-            if let Some(old_fingerprint) = old_fingerprint.and_then(|s| {
-        match hex::decode(s) {
-            Ok(v) => Some(CertificateFingerprint(v)),
-            Err(e) => {
-                eprintln!("Error decoding the certificate fingerprint (expected hexadecimal data): {:?}", e);
-                None
-            }
-        }
-    }).or_else(|| old_certificate_path.and_then(get_certificate_fingerprint)) {
-     self.order_command( ProxyRequestData::ReplaceCertificate(ReplaceCertificate {
-        address,
-        new_certificate,
-        old_fingerprint,
-        new_names: vec![],
-        new_expired_at: None,
-      }))?;
-    }
-        }
+        )
+        .with_context(|| "Could not load the full certificate")?;
+
+        self.order_command(ProxyRequestData::ReplaceCertificate(ReplaceCertificate {
+            address,
+            new_certificate,
+            old_fingerprint,
+            new_names: vec![],
+            new_expired_at: None,
+        }))?;
+
         Ok(())
     }
 
@@ -385,50 +381,50 @@ impl CommandManager {
         certificate_path: Option<&str>,
         fingerprint: Option<&str>,
     ) -> Result<(), anyhow::Error> {
-        if certificate_path.is_some() && fingerprint.is_some() {
-            bail!("Error: Either provide the certificate's path or its fingerprint");
-        }
+        let fingerprint = match (certificate_path, fingerprint) {
+            (None, None) | (Some(_), Some(_)) => {
+                bail!("Error: Please provide either one, the path OR the fingerprint of the certificate")
+            }
+            (Some(certificate_path), None) => {
+                get_fingerprint_from_certificate_path(certificate_path).with_context(|| {
+                    "Could not retrieve the finger print from the given certificate path"
+                })?
+            }
+            (None, Some(fingerprint)) => decode_fingerprint(fingerprint)
+                .with_context(|| "Error decoding the given fingerprint")?,
+        };
 
-        if certificate_path.is_none() && fingerprint.is_none() {
-            bail!("Error: Either provide the certificate's path or its fingerprint");
-        }
-
-        if let Some(fingerprint) = fingerprint
-            .and_then(|s| match hex::decode(s) {
-                Ok(v) => Some(CertificateFingerprint(v)),
-                Err(e) => {
-                    eprintln!(
-                    "Error decoding the certificate fingerprint (expected hexadecimal data): {:?}",
-                    e
-                );
-                    None
-                }
-            })
-            .or_else(|| certificate_path.and_then(get_certificate_fingerprint))
-        {
-            self.order_command(ProxyRequestData::RemoveCertificate(RemoveCertificate {
-                address,
-                fingerprint,
-            }))?
-        }
-        Ok(())
+        self.order_command(ProxyRequestData::RemoveCertificate(RemoveCertificate {
+            address,
+            fingerprint,
+        }))
     }
 }
 
-fn get_certificate_fingerprint(certificate_path: &str) -> Option<CertificateFingerprint> {
-    match Config::load_file_bytes(certificate_path) {
-        Ok(data) => match calculate_fingerprint(&data) {
-            Some(fingerprint) => Some(CertificateFingerprint(fingerprint)),
-            None => {
-                eprintln!("could not calculate finrprint for certificate");
-                exit(1);
-            }
-        },
-        Err(e) => {
-            eprintln!("could not load file: {:?}", e);
-            exit(1);
-        }
-    }
+fn get_fingerprint_from_certificate_path(
+    certificate_path: &str,
+) -> anyhow::Result<CertificateFingerprint> {
+    let bytes = Config::load_file_bytes(certificate_path).with_context(|| {
+        format!(
+            "could not load certificate file on path {}",
+            certificate_path
+        )
+    })?;
+
+    let parsed_bytes = calculate_fingerprint(&bytes).with_context(|| {
+        format!(
+            "could not calculate fingerprint for the certificate at {}",
+            certificate_path
+        )
+    })?;
+
+    Ok(CertificateFingerprint(parsed_bytes))
+}
+
+fn decode_fingerprint(fingerprint: &str) -> anyhow::Result<CertificateFingerprint> {
+    let bytes = hex::decode(fingerprint)
+        .with_context(|| "Failed at decoding the string (expected hexadecimal data)")?;
+    Ok(CertificateFingerprint(bytes))
 }
 
 fn load_full_certificate(
@@ -436,28 +432,30 @@ fn load_full_certificate(
     certificate_chain_path: &str,
     key_path: &str,
     versions: Vec<TlsVersion>,
-) -> Result<Option<CertificateAndKey>, anyhow::Error> {
-    match Config::load_file(certificate_path) {
-        Err(e) => {
-            bail!("could not load certificate: {:?}", e);
-        }
-        Ok(certificate) => {
-            match Config::load_file(certificate_chain_path).map(split_certificate_chain) {
-                Err(e) => {
-                    bail!("could not load certificate chain: {:?}", e);
-                }
-                Ok(certificate_chain) => match Config::load_file(key_path) {
-                    Err(e) => {
-                        bail!("could not load key: {:?}", e);
-                    }
-                    Ok(key) => Ok(Some(CertificateAndKey {
-                        certificate,
-                        certificate_chain,
-                        key,
-                        versions,
-                    })),
-                },
-            }
-        }
-    }
+) -> Result<CertificateAndKey, anyhow::Error> {
+    let certificate = Config::load_file(certificate_path).with_context(|| {
+        format!(
+            "Could not load certificate file on path {}",
+            certificate_path
+        )
+    })?;
+
+    let certificate_chain = Config::load_file(certificate_chain_path)
+        .map(split_certificate_chain)
+        .with_context(|| {
+            format!(
+                "could not load certificate chain on path: {}",
+                certificate_chain_path
+            )
+        })?;
+
+    let key = Config::load_file(key_path)
+        .with_context(|| format!("Could not load key file on path {}", key_path))?;
+
+    Ok(CertificateAndKey {
+        certificate,
+        certificate_chain,
+        key,
+        versions,
+    })
 }
