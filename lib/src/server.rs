@@ -528,16 +528,18 @@ impl Server {
                 }
             };
 
-            if let Err(error) = self.poll.poll(
+            match self.poll.poll(
                 &mut events,
                 timeout.and_then(|t| std::time::Duration::try_from(t).ok()),
             ) {
-                error!("Error while polling events: {:?}", error);
-                current_poll_errors += 1;
-                continue;
-            } else {
-                current_poll_errors = 0;
+                Ok(_) => current_poll_errors = 0,
+                Err(error) => {
+                    error!("Error while polling events: {:?}", error);
+                    current_poll_errors += 1;
+                    continue;
+                }
             }
+
             let after_epoll = Instant::now();
             time!(
                 "epoll_time",
@@ -548,92 +550,97 @@ impl Server {
             self.send_queue();
 
             for event in events.iter() {
-                if event.token() == Token(0) {
-                    if event.is_error() {
-                        error!("error reading from command channel");
-                        continue;
-                    }
-                    if event.is_read_closed() || event.is_write_closed() {
-                        error!("command channel was closed");
-                        continue;
-                    }
-                    let ready = Ready::from(event);
-                    self.channel.handle_events(ready);
-
-                    // loop here because iterations has borrow issues
-                    loop {
-                        QUEUE.with(|queue| {
-                            if !(*queue.borrow()).is_empty() {
-                                self.channel.interest.insert(Ready::writable());
-                            }
-                        });
-
-                        //trace!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements",
-                        //  line!(), self.channel.readiness, self.channel.interest, self.queue.len());
-                        if self.channel.readiness() == Ready::empty() {
-                            break;
+                match event.token() {
+                    Token(0) => {
+                        if event.is_error() {
+                            error!("error reading from command channel");
+                            continue;
                         }
+                        if event.is_read_closed() || event.is_write_closed() {
+                            error!("command channel was closed");
+                            continue;
+                        }
+                        let ready = Ready::from(event);
+                        self.channel.handle_events(ready);
 
-                        if self.channel.readiness().is_readable() {
-                            if let Err(e) = self.channel.readable() {
-                                error!("error reading from channel: {:?}", e);
+                        // loop here because iterations has borrow issues
+                        loop {
+                            QUEUE.with(|queue| {
+                                if !(*queue.borrow()).is_empty() {
+                                    self.channel.interest.insert(Ready::writable());
+                                }
+                            });
+
+                            //trace!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements",
+                            //  line!(), self.channel.readiness, self.channel.interest, self.queue.len());
+                            if self.channel.readiness() == Ready::empty() {
+                                break;
                             }
 
-                            loop {
-                                let msg = self.channel.read_message();
+                            if self.channel.readiness().is_readable() {
+                                if let Err(e) = self.channel.readable() {
+                                    error!("error reading from channel: {:?}", e);
+                                }
 
-                                // if the message was too large, we grow the buffer and retry to read if possible
-                                if msg.is_none() {
-                                    if (self.channel.interest & self.channel.readiness)
-                                        .is_readable()
-                                    {
-                                        if let Err(e) = self.channel.readable() {
-                                            error!("error reading from channel: {:?}", e);
+                                loop {
+                                    let msg = self.channel.read_message();
+
+                                    // if the message was too large, we grow the buffer and retry to read if possible
+                                    if msg.is_none() {
+                                        if (self.channel.interest & self.channel.readiness)
+                                            .is_readable()
+                                        {
+                                            if let Err(e) = self.channel.readable() {
+                                                error!("error reading from channel: {:?}", e);
+                                            }
+                                            continue;
+                                        } else {
+                                            break;
                                         }
-                                        continue;
-                                    } else {
-                                        break;
+                                    }
+
+                                    let msg = msg.expect("the message should be valid");
+
+                                    match msg.order {
+                                        ProxyRequestData::HardStop => {
+                                            let id_msg = msg.id.clone();
+                                            self.notify(msg);
+                                            self.channel.write_message(&ProxyResponse::ok(id_msg));
+                                            self.channel.run();
+                                            return;
+                                        }
+                                        ProxyRequestData::SoftStop => {
+                                            self.shutting_down = Some(msg.id.clone());
+                                            last_sessions_len = self.sessions.borrow().slab.len();
+                                            self.notify(msg);
+                                        }
+                                        ProxyRequestData::ReturnListenSockets => {
+                                            info!("received ReturnListenSockets order");
+                                            self.return_listen_sockets();
+                                        }
+                                        _ => self.notify(msg),
                                     }
                                 }
+                            }
 
-                                let msg = msg.expect("the message should be valid");
-                                if let ProxyRequestData::HardStop = msg.order {
-                                    let id_msg = msg.id.clone();
-                                    self.notify(msg);
-                                    self.channel.write_message(&ProxyResponse::ok(id_msg));
-                                    self.channel.run();
-                                    return;
-                                } else if let ProxyRequestData::SoftStop = msg.order {
-                                    self.shutting_down = Some(msg.id.clone());
-                                    last_sessions_len = self.sessions.borrow().slab.len();
-                                    self.notify(msg);
-                                } else if let ProxyRequestData::ReturnListenSockets = msg.order {
-                                    info!("received ReturnListenSockets order");
-                                    self.return_listen_sockets();
-                                } else {
-                                    self.notify(msg);
+                            QUEUE.with(|queue| {
+                                if !(*queue.borrow()).is_empty() {
+                                    self.channel.interest.insert(Ready::writable());
                                 }
-                            }
+                            });
+
+                            self.send_queue();
                         }
-
-                        QUEUE.with(|queue| {
-                            if !(*queue.borrow()).is_empty() {
-                                self.channel.interest.insert(Ready::writable());
-                            }
-                        });
-
-                        self.send_queue();
                     }
-                } else if event.token() == Token(1) {
-                    while let Some(t) = TIMER.with(|timer| timer.borrow_mut().poll()) {
-                        self.timeout(t);
+                    Token(1) => {
+                        while let Some(t) = TIMER.with(|timer| timer.borrow_mut().poll()) {
+                            self.timeout(t);
+                        }
                     }
-                } else if event.token() == Token(2) {
-                    METRICS.with(|metrics| {
+                    Token(2) => METRICS.with(|metrics| {
                         (*metrics.borrow_mut()).writable();
-                    });
-                } else {
-                    self.ready(event.token(), Ready::from(event));
+                    }),
+                    _ => self.ready(event.token(), Ready::from(event)),
                 }
             }
 
@@ -739,11 +746,9 @@ impl Server {
                                 new_sessions_count,
                                 self.base_sessions_count
                             );
-                            last_shutting_down_message = Some(now);
                         }
-                    } else {
-                        last_shutting_down_message = Some(now);
                     }
+                    last_shutting_down_message = Some(now);
                 }
 
                 if new_sessions_count <= self.base_sessions_count {
