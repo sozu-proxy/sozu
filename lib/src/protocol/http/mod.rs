@@ -1235,26 +1235,30 @@ impl<Front: SocketHandler> Http<Front> {
                 // with no keepalive on backend, we could open a new backend ConnectionError
                 // with no keepalive on front but keepalive on backend, we could have
                 // a pool of connections
-                if front_keep_alive && back_keep_alive {
-                    debug!("{} keep alive front/back", self.log_context());
-                    self.reset();
-                    self.front_readiness.interest =
-                        Ready::readable() | Ready::hup() | Ready::error();
-                    self.back_readiness.interest = Ready::hup() | Ready::error();
+                match (front_keep_alive, back_keep_alive) {
+                    (true, true) => {
+                        debug!("{} keep alive front/back", self.log_context());
+                        self.reset();
+                        self.front_readiness.interest =
+                            Ready::readable() | Ready::hup() | Ready::error();
+                        self.back_readiness.interest = Ready::hup() | Ready::error();
 
-                    SessionResult::Continue
-                } else if front_keep_alive && !back_keep_alive {
-                    debug!("{} keep alive front", self.log_context());
-                    self.reset();
-                    self.front_readiness.interest =
-                        Ready::readable() | Ready::hup() | Ready::error();
-                    self.back_readiness.interest = Ready::hup() | Ready::error();
-                    SessionResult::CloseBackend
-                } else {
-                    debug!("{} no keep alive", self.log_context());
-                    self.front_readiness.reset();
-                    self.back_readiness.reset();
-                    SessionResult::CloseSession
+                        SessionResult::Continue
+                    }
+                    (true, false) => {
+                        debug!("{} keep alive front", self.log_context());
+                        self.reset();
+                        self.front_readiness.interest =
+                            Ready::readable() | Ready::hup() | Ready::error();
+                        self.back_readiness.interest = Ready::hup() | Ready::error();
+                        SessionResult::CloseBackend
+                    }
+                    _ => {
+                        debug!("{} no keep alive", self.log_context());
+                        self.front_readiness.reset();
+                        self.back_readiness.reset();
+                        SessionResult::CloseSession
+                    }
                 }
             }
             Some(ResponseState::ResponseWithBodyCloseDelimited(_, _, back_closed)) => {
