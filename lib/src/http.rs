@@ -158,108 +158,118 @@ impl Session {
     pub fn upgrade(&mut self) -> bool {
         debug!("HTTP::upgrade");
         let protocol = unwrap_msg!(self.protocol.take());
-        if let State::Http(mut http) = protocol {
-            debug!("switching to pipe");
-            let front_token = self.frontend_token;
-            let back_token = unwrap_msg!(http.back_token());
-            let ws_context = http.websocket_context();
 
-            let front_buf = match http.front_buf {
-                Some(buf) => buf.buffer,
-                None => {
-                    if let Some(p) = self.pool.upgrade() {
-                        if let Some(buf) = p.borrow_mut().checkout() {
-                            buf
-                        } else {
-                            return false;
-                        }
-                    } else {
-                        return false;
+        match protocol {
+            State::Http(mut http) => {
+                debug!("switching to pipe");
+                let front_token = self.frontend_token;
+                let back_token = unwrap_msg!(http.back_token());
+                let ws_context = http.websocket_context();
+
+                let front_buf = match http.front_buf {
+                    Some(buf) => buf.buffer,
+                    None => {
+                        let pool = match self.pool.upgrade() {
+                            Some(p) => p,
+                            None => return false,
+                        };
+
+                        let buffer = match pool.borrow_mut().checkout() {
+                            Some(buf) => buf,
+                            None => return false,
+                        };
+                        buffer
                     }
-                }
-            };
+                };
 
-            let back_buf = match http.back_buf {
-                Some(buf) => buf.buffer,
-                None => {
-                    if let Some(p) = self.pool.upgrade() {
-                        if let Some(buf) = p.borrow_mut().checkout() {
-                            buf
-                        } else {
-                            return false;
-                        }
-                    } else {
-                        return false;
+                let back_buf = match http.back_buf {
+                    Some(buf) => buf.buffer,
+                    None => {
+                        let pool = match self.pool.upgrade() {
+                            Some(p) => p,
+                            None => return false,
+                        };
+
+                        let buffer = match pool.borrow_mut().checkout() {
+                            Some(buf) => buf,
+                            None => return false,
+                        };
+                        buffer
                     }
-                }
-            };
+                };
 
-            gauge_add!("protocol.http", -1);
-            gauge_add!("protocol.ws", 1);
-            gauge_add!("http.active_requests", -1);
-            gauge_add!("websocket.active_requests", 1);
-            let mut pipe = Pipe::new(
-                http.frontend,
-                front_token,
-                http.request_id,
-                http.cluster_id,
-                http.backend_id,
-                Some(ws_context),
-                Some(unwrap_msg!(http.backend)),
-                front_buf,
-                back_buf,
-                http.session_address,
-                Protocol::HTTP,
-            );
-
-            pipe.front_readiness.event = http.front_readiness.event;
-            pipe.back_readiness.event = http.back_readiness.event;
-            http.front_timeout
-                .set_duration(self.frontend_timeout_duration);
-            http.back_timeout
-                .set_duration(self.backend_timeout_duration);
-            pipe.front_timeout = Some(http.front_timeout);
-            pipe.back_timeout = Some(http.back_timeout);
-            pipe.set_back_token(back_token);
-            //pipe.set_cluster_id(self.cluster_id.clone());
-
-            self.protocol = Some(State::WebSocket(pipe));
-            true
-        } else if let State::Expect(expect) = protocol {
-            debug!("switching to HTTP");
-            if let Some((Some(public_address), Some(client_address))) = expect
-                .addresses
-                .as_ref()
-                .map(|add| (add.destination(), add.source()))
-            {
-                let readiness = expect.readiness;
-                let mut http = Http::new(
-                    expect.frontend,
-                    expect.frontend_token,
-                    expect.request_id,
-                    self.pool.clone(),
-                    public_address,
-                    Some(client_address),
-                    self.sticky_name.clone(),
+                gauge_add!("protocol.http", -1);
+                gauge_add!("protocol.ws", 1);
+                gauge_add!("http.active_requests", -1);
+                gauge_add!("websocket.active_requests", 1);
+                let mut pipe = Pipe::new(
+                    http.frontend,
+                    front_token,
+                    http.request_id,
+                    http.cluster_id,
+                    http.backend_id,
+                    Some(ws_context),
+                    Some(unwrap_msg!(http.backend)),
+                    front_buf,
+                    back_buf,
+                    http.session_address,
                     Protocol::HTTP,
-                    self.answers.clone(),
-                    self.front_timeout.take(),
-                    self.frontend_timeout_duration,
-                    self.backend_timeout_duration,
                 );
-                http.front_readiness.event = readiness.event;
 
-                gauge_add!("protocol.proxy.expect", -1);
-                gauge_add!("protocol.http", 1);
-                self.protocol = Some(State::Http(http));
+                pipe.front_readiness.event = http.front_readiness.event;
+                pipe.back_readiness.event = http.back_readiness.event;
+                http.front_timeout
+                    .set_duration(self.frontend_timeout_duration);
+                http.back_timeout
+                    .set_duration(self.backend_timeout_duration);
+                pipe.front_timeout = Some(http.front_timeout);
+                pipe.back_timeout = Some(http.back_timeout);
+                pipe.set_back_token(back_token);
+                //pipe.set_cluster_id(self.cluster_id.clone());
+
+                self.protocol = Some(State::WebSocket(pipe));
                 true
-            } else {
-                self.protocol = Some(State::Expect(expect));
-                false
             }
-        } else {
-            self.protocol = Some(protocol);
-            true
+            State::Expect(expect) => {
+                debug!("switching to HTTP");
+                match expect
+                    .addresses
+                    .as_ref()
+                    .map(|add| (add.destination(), add.source()))
+                {
+                    Some((Some(public_address), Some(client_address))) => {
+                        let readiness = expect.readiness;
+                        let mut http = Http::new(
+                            expect.frontend,
+                            expect.frontend_token,
+                            expect.request_id,
+                            self.pool.clone(),
+                            public_address,
+                            Some(client_address),
+                            self.sticky_name.clone(),
+                            Protocol::HTTP,
+                            self.answers.clone(),
+                            self.front_timeout.take(),
+                            self.frontend_timeout_duration,
+                            self.backend_timeout_duration,
+                        );
+                        http.front_readiness.event = readiness.event;
+
+                        gauge_add!("protocol.proxy.expect", -1);
+                        gauge_add!("protocol.http", 1);
+                        self.protocol = Some(State::Http(http));
+                        true
+                    }
+                    _ => {
+                        self.protocol = Some(State::Expect(expect));
+                        false
+                    }
+                }
+            }
+            _ => {
+                self.protocol = Some(protocol);
+                true
+            }
         }
     }
 

@@ -164,167 +164,174 @@ impl Session {
     pub fn upgrade(&mut self) -> bool {
         let protocol = unwrap_msg!(self.protocol.take());
 
-        if let State::Expect(expect, ssl) = protocol {
-            debug!("switching to TLS handshake");
-            if let Some(ref addresses) = expect.addresses {
-                if let (Some(public_address), Some(session_address)) =
-                    (addresses.destination(), addresses.source())
-                {
-                    self.public_address = public_address;
-                    self.peer_address = Some(session_address);
+        match protocol {
+            State::Expect(expect, ssl) => {
+                debug!("switching to TLS handshake");
+                if let Some(ref addresses) = expect.addresses {
+                    if let (Some(public_address), Some(session_address)) =
+                        (addresses.destination(), addresses.source())
+                    {
+                        self.public_address = public_address;
+                        self.peer_address = Some(session_address);
 
-                    let ExpectProxyProtocol {
-                        frontend,
-                        readiness,
-                        request_id,
-                        ..
-                    } = expect;
+                        let ExpectProxyProtocol {
+                            frontend,
+                            readiness,
+                            request_id,
+                            ..
+                        } = expect;
 
-                    let mut tls = TlsHandshake::new(ssl, frontend, request_id);
-                    tls.readiness.event = readiness.event;
-                    tls.readiness.event.insert(Ready::readable());
+                        let mut tls = TlsHandshake::new(ssl, frontend, request_id);
+                        tls.readiness.event = readiness.event;
+                        tls.readiness.event.insert(Ready::readable());
 
-                    gauge_add!("protocol.proxy.expect", -1);
-                    gauge_add!("protocol.tls.handshake", 1);
-                    self.protocol = Some(State::Handshake(tls));
-                    return true;
-                }
-            }
-
-            // currently, only happens in expect proxy protocol with AF_UNSPEC address
-            //error!("failed to upgrade from expect");
-            self.protocol = Some(State::Expect(expect, ssl));
-            false
-        } else if let State::Handshake(handshake) = protocol {
-            let front_buf = self.pool.upgrade().and_then(|p| p.borrow_mut().checkout());
-            if front_buf.is_none() {
-                self.protocol = Some(State::Handshake(handshake));
-                return false;
-            }
-
-            let mut front_buf = front_buf.unwrap();
-            if let Some(version) = handshake.session.protocol_version() {
-                incr!(version_str(version));
-            };
-            if let Some(cipher) = handshake.session.negotiated_cipher_suite() {
-                incr!(ciphersuite_str(cipher));
-            };
-
-            let front_stream = FrontRustls {
-                stream: handshake.stream,
-                session: handshake.session,
-            };
-
-            let readiness = handshake.readiness.clone();
-            let mut http = Http::new(
-                front_stream,
-                self.frontend_token,
-                handshake.request_id,
-                self.pool.clone(),
-                self.public_address,
-                self.peer_address,
-                self.sticky_name.clone(),
-                Protocol::HTTPS,
-                self.answers.clone(),
-                self.front_timeout.take(),
-                self.frontend_timeout_duration,
-                self.backend_timeout_duration,
-            );
-
-            let res = http.frontend.session.reader().read(front_buf.space());
-            match res {
-                Ok(sz) => {
-                    //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-                    front_buf.fill(sz);
-                    count!("bytes_in", sz as i64);
-                    self.metrics.bin += sz;
-                }
-                Err(e) => {
-                    error!("read error: {:?}", e);
-                }
-            }
-
-            let sz = front_buf.available_data();
-            let mut buf = BufferQueue::with_buffer(front_buf);
-            buf.sliced_input(sz);
-
-            gauge_add!("protocol.tls.handshake", -1);
-            gauge_add!("protocol.https", 1);
-            http.front_buf = Some(buf);
-            http.front_readiness = readiness;
-            http.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
-
-            self.protocol = Some(State::Http(http));
-            true
-        } else if let State::Http(mut http) = protocol {
-            debug!("https switching to wss");
-            let front_token = self.frontend_token;
-            let back_token = unwrap_msg!(http.back_token());
-            let ws_context = http.websocket_context();
-
-            let front_buf = match http.front_buf {
-                Some(buf) => buf.buffer,
-                None => {
-                    if let Some(p) = self.pool.upgrade() {
-                        if let Some(buf) = p.borrow_mut().checkout() {
-                            buf
-                        } else {
-                            return false;
-                        }
-                    } else {
-                        return false;
+                        gauge_add!("protocol.proxy.expect", -1);
+                        gauge_add!("protocol.tls.handshake", 1);
+                        self.protocol = Some(State::Handshake(tls));
+                        return true;
                     }
                 }
-            };
-            let back_buf = match http.back_buf {
-                Some(buf) => buf.buffer,
-                None => {
-                    if let Some(p) = self.pool.upgrade() {
-                        if let Some(buf) = p.borrow_mut().checkout() {
-                            buf
-                        } else {
-                            return false;
-                        }
-                    } else {
-                        return false;
+
+                // currently, only happens in expect proxy protocol with AF_UNSPEC address
+                //error!("failed to upgrade from expect");
+                self.protocol = Some(State::Expect(expect, ssl));
+                false
+            }
+            State::Handshake(handshake) => {
+                let front_buf = self.pool.upgrade().and_then(|p| p.borrow_mut().checkout());
+                if front_buf.is_none() {
+                    self.protocol = Some(State::Handshake(handshake));
+                    return false;
+                }
+
+                let mut front_buf = front_buf.unwrap();
+                if let Some(version) = handshake.session.protocol_version() {
+                    incr!(version_str(version));
+                };
+                if let Some(cipher) = handshake.session.negotiated_cipher_suite() {
+                    incr!(ciphersuite_str(cipher));
+                };
+
+                let front_stream = FrontRustls {
+                    stream: handshake.stream,
+                    session: handshake.session,
+                };
+
+                let readiness = handshake.readiness.clone();
+                let mut http = Http::new(
+                    front_stream,
+                    self.frontend_token,
+                    handshake.request_id,
+                    self.pool.clone(),
+                    self.public_address,
+                    self.peer_address,
+                    self.sticky_name.clone(),
+                    Protocol::HTTPS,
+                    self.answers.clone(),
+                    self.front_timeout.take(),
+                    self.frontend_timeout_duration,
+                    self.backend_timeout_duration,
+                );
+
+                let res = http.frontend.session.reader().read(front_buf.space());
+                match res {
+                    Ok(sz) => {
+                        //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
+                        front_buf.fill(sz);
+                        count!("bytes_in", sz as i64);
+                        self.metrics.bin += sz;
+                    }
+                    Err(e) => {
+                        error!("read error: {:?}", e);
                     }
                 }
-            };
 
-            let mut pipe = Pipe::new(
-                http.frontend,
-                front_token,
-                http.request_id,
-                http.cluster_id,
-                http.backend_id,
-                Some(ws_context),
-                http.backend,
-                front_buf,
-                back_buf,
-                http.session_address,
-                Protocol::HTTPS,
-            );
+                let sz = front_buf.available_data();
+                let mut buf = BufferQueue::with_buffer(front_buf);
+                buf.sliced_input(sz);
 
-            pipe.front_readiness.event = http.front_readiness.event;
-            pipe.back_readiness.event = http.back_readiness.event;
-            http.front_timeout
-                .set_duration(self.frontend_timeout_duration);
-            http.back_timeout
-                .set_duration(self.backend_timeout_duration);
-            pipe.front_timeout = Some(http.front_timeout);
-            pipe.back_timeout = Some(http.back_timeout);
-            pipe.set_back_token(back_token);
-            pipe.set_cluster_id(self.cluster_id.clone());
+                gauge_add!("protocol.tls.handshake", -1);
+                gauge_add!("protocol.https", 1);
+                http.front_buf = Some(buf);
+                http.front_readiness = readiness;
+                http.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
 
-            gauge_add!("protocol.https", -1);
-            gauge_add!("protocol.wss", 1);
-            gauge_add!("websocket.active_requests", 1);
-            gauge_add!("http.active_requests", -1);
-            self.protocol = Some(State::WebSocket(pipe));
-            true
-        } else {
-            self.protocol = Some(protocol);
-            true
+                self.protocol = Some(State::Http(http));
+                true
+            }
+            State::Http(mut http) => {
+                debug!("https switching to wss");
+                let front_token = self.frontend_token;
+                let back_token = unwrap_msg!(http.back_token());
+                let ws_context = http.websocket_context();
+
+                let front_buf = match http.front_buf {
+                    Some(buf) => buf.buffer,
+                    None => {
+                        let pool = match self.pool.upgrade() {
+                            Some(p) => p,
+                            None => return false,
+                        };
+
+                        let buffer = match pool.borrow_mut().checkout() {
+                            Some(buf) => buf,
+                            None => return false,
+                        };
+                        buffer
+                    }
+                };
+                let back_buf = match http.back_buf {
+                    Some(buf) => buf.buffer,
+                    None => {
+                        let pool = match self.pool.upgrade() {
+                            Some(p) => p,
+                            None => return false,
+                        };
+
+                        let buffer = match pool.borrow_mut().checkout() {
+                            Some(buf) => buf,
+                            None => return false,
+                        };
+                        buffer
+                    }
+                };
+
+                let mut pipe = Pipe::new(
+                    http.frontend,
+                    front_token,
+                    http.request_id,
+                    http.cluster_id,
+                    http.backend_id,
+                    Some(ws_context),
+                    http.backend,
+                    front_buf,
+                    back_buf,
+                    http.session_address,
+                    Protocol::HTTPS,
+                );
+
+                pipe.front_readiness.event = http.front_readiness.event;
+                pipe.back_readiness.event = http.back_readiness.event;
+                http.front_timeout
+                    .set_duration(self.frontend_timeout_duration);
+                http.back_timeout
+                    .set_duration(self.backend_timeout_duration);
+                pipe.front_timeout = Some(http.front_timeout);
+                pipe.back_timeout = Some(http.back_timeout);
+                pipe.set_back_token(back_token);
+                pipe.set_cluster_id(self.cluster_id.clone());
+
+                gauge_add!("protocol.https", -1);
+                gauge_add!("protocol.wss", 1);
+                gauge_add!("websocket.active_requests", 1);
+                gauge_add!("http.active_requests", -1);
+                self.protocol = Some(State::WebSocket(pipe));
+                true
+            }
+            _ => {
+                self.protocol = Some(protocol);
+                true
+            }
         }
     }
 

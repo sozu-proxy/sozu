@@ -369,65 +369,65 @@ impl ProxyConfiguration<Session> for Proxy {
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
-        if let Some(listener) = self.listeners.get(&Token(token.0)) {
-            if let Err(e) = frontend_sock.set_nodelay(true) {
-                error!(
-                    "error setting nodelay on front socket({:?}): {:?}",
-                    frontend_sock, e
-                );
-            }
+        let listener = match self.listeners.get(&Token(token.0)) {
+            Some(l) => l,
+            None => return Err(AcceptError::IoError), //FIXME
+        };
 
-            let mut s = self.sessions.borrow_mut();
-            let entry = s.slab.vacant_entry();
-            let session_token = Token(entry.key());
-
-            if let Err(e) = self.registry.register(
-                &mut frontend_sock,
-                session_token,
-                Interest::READABLE | Interest::WRITABLE,
-            ) {
-                error!(
-                    "error registering fron socket({:?}): {:?}",
-                    frontend_sock, e
-                );
-            }
-
-            let session = match ServerConnection::new(listener.ssl_config.clone()) {
-                Ok(session) => session,
-                Err(e) => {
-                    error!("failed to create server session: {:?}", e);
-                    return Err(AcceptError::IoError);
-                }
-            };
-            let c = Session::new(
-                session,
-                frontend_sock,
-                session_token,
-                Rc::downgrade(&self.pool),
-                proxy,
-                listener
-                    .config
-                    .public_address
-                    .unwrap_or(listener.config.address),
-                listener.config.expect_proxy,
-                listener.config.sticky_name.clone(),
-                listener.answers.clone(),
-                Token(token.0),
-                wait_time,
-                Duration::seconds(listener.config.front_timeout as i64),
-                Duration::seconds(listener.config.back_timeout as i64),
-                Duration::seconds(listener.config.request_timeout as i64),
+        if let Err(e) = frontend_sock.set_nodelay(true) {
+            error!(
+                "error setting nodelay on front socket({:?}): {:?}",
+                frontend_sock, e
             );
-
-            let session = Rc::new(RefCell::new(c));
-            entry.insert(session);
-
-            s.incr();
-            Ok(())
-        } else {
-            //FIXME
-            Err(AcceptError::IoError)
         }
+
+        let mut s = self.sessions.borrow_mut();
+        let entry = s.slab.vacant_entry();
+        let session_token = Token(entry.key());
+
+        if let Err(e) = self.registry.register(
+            &mut frontend_sock,
+            session_token,
+            Interest::READABLE | Interest::WRITABLE,
+        ) {
+            error!(
+                "error registering fron socket({:?}): {:?}",
+                frontend_sock, e
+            );
+        }
+
+        let session = match ServerConnection::new(listener.ssl_config.clone()) {
+            Ok(session) => session,
+            Err(e) => {
+                error!("failed to create server session: {:?}", e);
+                return Err(AcceptError::IoError);
+            }
+        };
+        let c = Session::new(
+            session,
+            frontend_sock,
+            session_token,
+            Rc::downgrade(&self.pool),
+            proxy,
+            listener
+                .config
+                .public_address
+                .unwrap_or(listener.config.address),
+            listener.config.expect_proxy,
+            listener.config.sticky_name.clone(),
+            listener.answers.clone(),
+            Token(token.0),
+            wait_time,
+            Duration::seconds(listener.config.front_timeout as i64),
+            Duration::seconds(listener.config.back_timeout as i64),
+            Duration::seconds(listener.config.request_timeout as i64),
+        );
+
+        let session = Rc::new(RefCell::new(c));
+        entry.insert(session);
+
+        s.incr();
+        Ok(())
     }
 
     fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
