@@ -1,6 +1,5 @@
-use std::{fmt::Debug, iter, str};
+use std::{collections::HashMap, fmt::Debug, iter, str};
 
-use hashbrown::HashMap;
 use regex::bytes::Regex;
 
 pub type Key = Vec<u8>;
@@ -790,6 +789,6 @@ mod tests {
 
     #[test]
     fn size() {
-        assert_size!(TrieNode<u32>, 152);
+        assert_size!(TrieNode<u32>, 136);
     }
 }

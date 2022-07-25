@@ -166,7 +166,6 @@ extern crate url;
 #[macro_use]
 extern crate sozu_command_lib as sozu_command;
 extern crate cookie_factory;
-extern crate hashbrown;
 extern crate hpack;
 extern crate idna;
 extern crate lazycell;

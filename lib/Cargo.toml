@@ -26,7 +26,6 @@ include = [
 [dependencies]
 cookie-factory = "^0.3.2"
 foreign-types-shared = "^0.1.1"
-hashbrown = "^0.12.2"
 hdrhistogram = "^7.5.0"
 hpack = "^0.3.0"
 idna = "^0.2.3"
