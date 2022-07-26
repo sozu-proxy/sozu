@@ -1119,10 +1119,7 @@ mod tests {
                     backend_id: String::from("xxx-0"),
                     address: "0.0.0.0:8080".parse().unwrap(),
                     sticky_id: None,
-                    load_balancing_parameters: Some(LoadBalancingParams {
-                        weight: 0,
-                        ..Default::default()
-                    }),
+                    load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
                     backup: None,
                 })
         );

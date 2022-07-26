@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 #[cfg(feature = "use-openssl")]
 use std::{
     cell::RefCell,
@@ -67,7 +68,7 @@ use crate::{
     },
     util::UnwrapLog,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
-    ConnectionError, CustomTags, Protocol, ProxyConfiguration, ProxySession, Readiness,
+    ConnectionError, ListenerHandler, Protocol, ProxyConfiguration, ProxySession, Readiness,
     SessionMetrics, SessionResult,
 };
 
@@ -85,8 +86,8 @@ pub struct TlsApp {
 pub enum State {
     Expect(ExpectProxyProtocol<TcpStream>, Ssl),
     Handshake(TlsHandshake),
-    Http(Http<SslStream<TcpStream>, Proxy>),
-    WebSocket(Pipe<SslStream<TcpStream>, Proxy>),
+    Http(Http<SslStream<TcpStream>, Listener>),
+    WebSocket(Pipe<SslStream<TcpStream>, Listener>),
     Http2(Http2<SslStream<TcpStream>>),
 }
 
@@ -114,6 +115,7 @@ pub struct Session {
     front_timeout: TimeoutContainer,
     frontend_timeout_duration: Duration,
     backend_timeout_duration: Duration,
+    listener: Rc<RefCell<Listener>>,
 }
 
 impl Session {
@@ -132,6 +134,7 @@ impl Session {
         frontend_timeout_duration: Duration,
         backend_timeout_duration: Duration,
         request_timeout_duration: Duration,
+        listener: Rc<RefCell<Listener>>,
     ) -> Session {
         let peer_address = if expect_proxy {
             // Will be defined later once the expect proxy header has been received and parsed
@@ -161,7 +164,6 @@ impl Session {
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
-
         let mut session = Session {
             frontend_token: token,
             backend: None,
@@ -181,13 +183,14 @@ impl Session {
             front_timeout,
             frontend_timeout_duration,
             backend_timeout_duration,
+            listener,
         };
-        session.front_readiness().interest = Ready::readable() | Ready::hup() | Ready::error();
 
+        session.front_readiness().interest = Ready::readable() | Ready::hup() | Ready::error();
         session
     }
 
-    pub fn http(&self) -> Option<&Http<SslStream<TcpStream>, Proxy>> {
+    pub fn http(&self) -> Option<&Http<SslStream<TcpStream>, Listener>> {
         self.protocol.as_ref().and_then(|protocol| {
             if let &State::Http(ref http) = protocol {
                 Some(http)
@@ -197,7 +200,7 @@ impl Session {
         })
     }
 
-    pub fn http_mut(&mut self) -> Option<&mut Http<SslStream<TcpStream>, Proxy>> {
+    pub fn http_mut(&mut self) -> Option<&mut Http<SslStream<TcpStream>, Listener>> {
         self.protocol.as_mut().and_then(|protocol| {
             if let &mut State::Http(ref mut http) = protocol {
                 Some(http)
@@ -305,7 +308,6 @@ impl Session {
                     let backend_timeout_duration = self.backend_timeout_duration;
                     let mut http = Http::new(
                         unwrap_msg!(handshake.stream),
-                        self.listen_token,
                         self.frontend_token,
                         handshake.request_id,
                         pool,
@@ -317,7 +319,7 @@ impl Session {
                         self.front_timeout.take(),
                         self.frontend_timeout_duration,
                         backend_timeout_duration,
-                        self.proxy.clone(),
+                        self.listener.clone(),
                     );
 
                     http.front_readiness = readiness;
@@ -374,7 +376,6 @@ impl Session {
             let mut pipe = Pipe::new(
                 http.frontend,
                 front_token,
-                self.listen_token,
                 http.request_id,
                 http.cluster_id,
                 http.backend_id,
@@ -384,7 +385,7 @@ impl Session {
                 back_buf,
                 http.session_address,
                 Protocol::HTTPS,
-                self.proxy.clone(),
+                self.listener.clone(),
             );
 
             pipe.front_readiness.event = http.front_readiness.event;
@@ -595,8 +596,8 @@ impl Session {
                 h.cancel_backend_timeout();
             });
 
-            self.backend.as_ref().map(|backend| {
-                let backend = &mut (*backend.borrow_mut());
+            if let Some(backend) = &self.backend {
+                let mut backend = backend.borrow_mut();
 
                 if backend.retry_policy.is_down() {
                     incr!(
@@ -604,10 +605,12 @@ impl Session {
                         self.cluster_id.as_deref(),
                         self.metrics.backend_id.as_deref()
                     );
+
                     info!(
                         "backend server {} at {} is up",
                         backend.backend_id, backend.address
                     );
+
                     push_event(ProxyEvent::BackendUp(
                         backend.backend_id.clone(),
                         backend.address,
@@ -619,10 +622,9 @@ impl Session {
                 }
 
                 backend.active_requests += 1;
-
                 backend.failures = 0;
                 backend.retry_policy.succeed();
-            });
+            }
         }
     }
 
@@ -636,7 +638,7 @@ impl Session {
                 h.clear_back_token()
             }
 
-            (*backend.borrow_mut()).dec_connections();
+            backend.borrow_mut().dec_connections();
         }
     }
 
@@ -665,7 +667,7 @@ impl Session {
 
     fn fail_backend_connection(&mut self) {
         self.backend.as_ref().map(|backend| {
-            let backend = &mut (*backend.borrow_mut());
+            let mut backend = backend.borrow_mut();
             backend.failures += 1;
 
             let already_unavailable = backend.retry_policy.is_down();
@@ -912,7 +914,7 @@ impl Session {
     fn close_backend(&mut self) {
         if let Some(token) = self.back_token() {
             if let Some(fd) = self.back_socket_mut().map(|s| s.as_raw_fd()) {
-                let proxy = self.proxy.borrow_mut();
+                let proxy = self.proxy.borrow();
                 if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
                     error!("1error deregistering socket({:?}): {:?}", fd, e);
                 }
@@ -1057,7 +1059,7 @@ impl Session {
         let res = match (front_should_stick, sticky_session) {
             (true, Some(sticky_session)) => self
                 .proxy
-                .borrow_mut()
+                .borrow()
                 .backends
                 .borrow_mut()
                 .backend_from_sticky_session(cluster_id, sticky_session)
@@ -1070,7 +1072,7 @@ impl Session {
                 }),
             _ => self
                 .proxy
-                .borrow_mut()
+                .borrow()
                 .backends
                 .borrow_mut()
                 .backend_from_cluster_id(cluster_id),
@@ -1084,6 +1086,7 @@ impl Session {
             Ok((backend, conn)) => {
                 if front_should_stick {
                     let sticky_name = self.proxy.borrow().listeners[&self.listen_token]
+                        .borrow()
                         .config
                         .sticky_name
                         .clone();
@@ -1125,7 +1128,7 @@ impl Session {
             .listeners
             .get(&self.listen_token)
             .as_ref()
-            .and_then(|l| l.frontend_from_request(host, uri, method));
+            .and_then(|l| l.borrow().frontend_from_request(host, uri, method));
         match route_res {
             Some(Route::ClusterId(cluster_id)) => Ok(cluster_id),
             Some(Route::Deny) => {
@@ -1218,7 +1221,7 @@ impl Session {
                 .listeners
                 .get(&self.listen_token)
                 .as_ref()
-                .map(|l| l.config.connect_timeout)
+                .map(|l| l.borrow().config.connect_timeout)
                 .unwrap(),
         ));
 
@@ -1321,7 +1324,7 @@ impl ProxySession for Session {
         }
 
         if let Some(fd) = self.front_socket_mut().map(|s| s.as_raw_fd()) {
-            let proxy = self.proxy.borrow_mut();
+            let proxy = self.proxy.borrow();
             if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
                 error!("1error deregistering socket({:?}): {:?}", fd, e);
             }
@@ -1472,6 +1475,23 @@ pub struct Listener {
     tags: BTreeMap<String, BTreeMap<String, String>>,
 }
 
+impl ListenerHandler for Listener {
+    fn get_addr(&self) -> &SocketAddr {
+        &self.address
+    }
+
+    fn get_tags(&self, key: &str) -> Option<&BTreeMap<String, String>> {
+        self.tags.get(key)
+    }
+
+    fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>) {
+        match tags {
+            Some(tags) => self.tags.insert(key, tags),
+            None => self.tags.remove(&key),
+        };
+    }
+}
+
 impl CertificateResolver for Listener {
     type Error = ListenerError;
 
@@ -1593,21 +1613,6 @@ impl Listener {
             token,
             tags: BTreeMap::new(),
         })
-    }
-
-    pub fn set_tags(&mut self, hostname: String, tags: Option<BTreeMap<String, String>>) {
-        match tags {
-            None => {
-                self.tags.remove(&hostname);
-            }
-            Some(tags) => {
-                self.tags.insert(hostname, tags);
-            }
-        }
-    }
-
-    pub fn get_tags(&self, hostname: &str) -> Option<&BTreeMap<String, String>> {
-        self.tags.get(hostname)
     }
 
     pub fn activate(
@@ -1947,24 +1952,12 @@ impl Listener {
 }
 
 pub struct Proxy {
-    listeners: HashMap<Token, Listener>,
+    listeners: HashMap<Token, Rc<RefCell<Listener>>>,
     clusters: HashMap<ClusterId, Cluster>,
     backends: Rc<RefCell<BackendMap>>,
     pool: Rc<RefCell<Pool>>,
     registry: Registry,
     sessions: Rc<RefCell<SessionManager>>,
-}
-
-impl CustomTags for Proxy {
-    fn get_tags(
-        &self,
-        listener_token: &Token,
-        hostname: &str,
-    ) -> Option<&BTreeMap<String, String>> {
-        self.listeners
-            .get(listener_token)
-            .and_then(|listener| listener.get_tags(hostname))
-    }
 }
 
 impl Proxy {
@@ -1988,16 +1981,16 @@ impl Proxy {
         if self.listeners.contains_key(&token) {
             None
         } else {
-            let listener = Listener::try_new(config, token).ok()?;
-            self.listeners.insert(listener.token, listener);
+            let listener = Rc::new(RefCell::new(Listener::try_new(config, token).ok()?));
+            self.listeners.insert(token, listener);
             Some(token)
         }
     }
 
     pub fn remove_listener(&mut self, address: SocketAddr) -> bool {
         let len = self.listeners.len();
-        self.listeners.retain(|_, l| l.address != address);
 
+        self.listeners.retain(|_, l| l.borrow().address != address);
         self.listeners.len() < len
     }
 
@@ -2006,33 +1999,47 @@ impl Proxy {
         addr: &SocketAddr,
         tcp_listener: Option<TcpListener>,
     ) -> Option<Token> {
-        for listener in self.listeners.values_mut() {
-            if &listener.address == addr {
-                return listener.activate(&self.registry, tcp_listener);
-            }
-        }
-        None
+        self.listeners
+            .values()
+            .find(|listener| listener.borrow().address == *addr)
+            .and_then(|listener| listener.borrow_mut().activate(&self.registry, tcp_listener))
     }
 
     pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
         self.listeners
-            .values_mut()
-            .filter(|l| l.listener.is_some())
-            .map(|l| (l.address, l.listener.take().unwrap()))
+            .values()
+            .filter_map(|listener| {
+                let mut owned = listener.borrow_mut();
+                if let Some(listener) = owned.listener.take() {
+                    return Some((owned.address, listener));
+                }
+
+                None
+            })
             .collect()
     }
 
     pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, TcpListener)> {
         self.listeners
-            .values_mut()
-            .find(|l| l.address == address)
-            .and_then(|l| l.listener.take().map(|sock| (l.token, sock)))
+            .values()
+            .find(|listener| listener.borrow().address == address)
+            .map(|listener| {
+                let mut owned = listener.borrow_mut();
+
+                owned
+                    .listener
+                    .take()
+                    .map(|listener| (owned.token, listener))
+            })
+            .flatten()
     }
 
     pub fn add_cluster(&mut self, mut cluster: Cluster) {
         if let Some(answer_503) = cluster.answer_503.take() {
-            for l in self.listeners.values_mut() {
-                l.answers
+            for listener in self.listeners.values() {
+                listener
+                    .borrow()
+                    .answers
                     .borrow_mut()
                     .add_custom_answer(&cluster.cluster_id, &answer_503);
             }
@@ -2043,15 +2050,23 @@ impl Proxy {
 
     pub fn remove_cluster(&mut self, cluster_id: &str) {
         self.clusters.remove(cluster_id);
-        for l in self.listeners.values_mut() {
-            l.answers.borrow_mut().remove_custom_answer(cluster_id);
+        for listener in self.listeners.values() {
+            listener
+                .borrow()
+                .answers
+                .borrow_mut()
+                .remove_custom_answer(cluster_id);
         }
     }
 }
 
 impl ProxyConfiguration<Session> for Proxy {
     fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
-        self.listeners.get_mut(&Token(token.0)).unwrap().accept()
+        self.listeners
+            .get(&Token(token.0))
+            .unwrap()
+            .borrow_mut()
+            .accept()
     }
 
     fn create_session(
@@ -2068,7 +2083,9 @@ impl ProxyConfiguration<Session> for Proxy {
                     frontend_sock, e
                 );
             }
-            if let Ok(ssl) = Ssl::new(&listener.default_context) {
+
+            let owned = listener.borrow();
+            if let Ok(ssl) = Ssl::new(&owned.default_context) {
                 let mut s = self.sessions.borrow_mut();
                 let entry = s.slab.vacant_entry();
                 let session_token = Token(entry.key());
@@ -2090,18 +2107,16 @@ impl ProxyConfiguration<Session> for Proxy {
                     session_token,
                     Rc::downgrade(&self.pool),
                     proxy,
-                    listener
-                        .config
-                        .public_address
-                        .unwrap_or(listener.config.address),
-                    listener.config.expect_proxy,
-                    listener.config.sticky_name.clone(),
-                    listener.answers.clone(),
+                    owned.config.public_address.unwrap_or(owned.config.address),
+                    owned.config.expect_proxy,
+                    owned.config.sticky_name.clone(),
+                    owned.answers.clone(),
                     Token(token.0),
                     wait_time,
-                    Duration::seconds(listener.config.front_timeout as i64),
-                    Duration::seconds(listener.config.back_timeout as i64),
-                    Duration::seconds(listener.config.request_timeout as i64),
+                    Duration::seconds(owned.config.front_timeout as i64),
+                    Duration::seconds(owned.config.back_timeout as i64),
+                    Duration::seconds(owned.config.request_timeout as i64),
+                    listener.clone(),
                 );
 
                 let session = Rc::new(RefCell::new(c));
@@ -2135,11 +2150,12 @@ impl ProxyConfiguration<Session> for Proxy {
                 //info!("HTTPS\t{} add front {:?}", id, front);
                 if let Some(listener) = self
                     .listeners
-                    .values_mut()
-                    .find(|l| l.address == front.address)
+                    .values()
+                    .find(|l| l.borrow().address == front.address)
                 {
-                    listener.add_https_front(front.clone());
-                    listener.set_tags(front.hostname, front.tags);
+                    let mut owned = listener.borrow_mut();
+                    owned.set_tags(front.hostname.to_owned(), front.tags.to_owned());
+                    owned.add_https_front(front);
                     ProxyResponse::ok(message.id)
                 } else {
                     ProxyResponse::error(
@@ -2152,11 +2168,12 @@ impl ProxyConfiguration<Session> for Proxy {
                 //info!("HTTPS\t{} remove front {:?}", id, front);
                 if let Some(listener) = self
                     .listeners
-                    .values_mut()
-                    .find(|l| l.address == front.address)
+                    .values()
+                    .find(|l| l.borrow_mut().address == front.address)
                 {
-                    listener.remove_https_front(front.clone());
-                    listener.set_tags(front.hostname, None);
+                    let mut owned = listener.borrow_mut();
+                    owned.set_tags(front.hostname.to_owned(), None);
+                    owned.remove_https_front(front);
                     ProxyResponse::ok(message.id)
                 } else {
                     ProxyResponse::error(
@@ -2168,11 +2185,11 @@ impl ProxyConfiguration<Session> for Proxy {
             ProxyRequestData::AddCertificate(add_certificate) => {
                 if let Some(listener) = self
                     .listeners
-                    .values_mut()
-                    .find(|l| l.address == add_certificate.address)
+                    .values()
+                    .find(|l| l.borrow().address == add_certificate.address)
                 {
                     //info!("HTTPS\t{} add certificate: {:?}", id, certificate_and_key);
-                    match listener.add_certificate(&add_certificate) {
+                    match listener.borrow_mut().add_certificate(&add_certificate) {
                         Ok(_) => ProxyResponse::ok(message.id),
                         Err(err) => ProxyResponse::error(message.id, err),
                     }
@@ -2184,10 +2201,13 @@ impl ProxyConfiguration<Session> for Proxy {
             ProxyRequestData::RemoveCertificate(remove_certificate) => {
                 if let Some(listener) = self
                     .listeners
-                    .values_mut()
-                    .find(|l| l.address == remove_certificate.address)
+                    .values()
+                    .find(|l| l.borrow().address == remove_certificate.address)
                 {
-                    match listener.remove_certificate(&remove_certificate) {
+                    match listener
+                        .borrow_mut()
+                        .remove_certificate(&remove_certificate)
+                    {
                         Ok(_) => ProxyResponse::ok(message.id),
                         Err(err) => ProxyResponse::error(message.id, err),
                     }
@@ -2200,9 +2220,9 @@ impl ProxyConfiguration<Session> for Proxy {
                 if let Some(listener) = self
                     .listeners
                     .values_mut()
-                    .find(|l| l.address == replace.address)
+                    .find(|l| l.borrow().address == replace.address)
                 {
-                    match listener.replace_certificate(&replace) {
+                    match listener.borrow_mut().replace_certificate(&replace) {
                         Ok(_) => ProxyResponse::ok(message.id),
                         Err(err) => ProxyResponse::error(message.id, err),
                     }
@@ -2227,9 +2247,9 @@ impl ProxyConfiguration<Session> for Proxy {
             }
             ProxyRequestData::SoftStop => {
                 info!("{} processing soft shutdown", message.id);
-                let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
-                for (_, l) in listeners.iter_mut() {
-                    l.listener.take().map(|mut sock| {
+                let listeners: HashMap<_, _> = self.listeners.drain().collect();
+                for (_, listener) in listeners.iter() {
+                    listener.borrow_mut().listener.take().map(|mut sock| {
                         if let Err(e) = self.registry.deregister(&mut sock) {
                             error!("error deregistering listen socket({:?}): {:?}", sock, e);
                         }
@@ -2239,9 +2259,9 @@ impl ProxyConfiguration<Session> for Proxy {
             }
             ProxyRequestData::HardStop => {
                 info!("{} hard shutdown", message.id);
-                let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
-                for (_, mut l) in listeners.drain() {
-                    l.listener.take().map(|mut sock| {
+                let listeners: HashMap<_, _> = self.listeners.drain().collect();
+                for (_, listener) in listeners.iter() {
+                    listener.borrow_mut().listener.take().map(|mut sock| {
                         if let Err(e) = self.registry.deregister(&mut sock) {
                             error!("error dereginstering listen socket({:?}): {:?}", sock, e);
                         }
@@ -2269,7 +2289,8 @@ impl ProxyConfiguration<Session> for Proxy {
                     .listeners
                     .values()
                     .map(|listener| {
-                        let resolver = unwrap_msg!(listener.resolver.lock());
+                        let owned = listener.borrow();
+                        let resolver = unwrap_msg!(owned.resolver.lock());
                         let res = resolver
                             .domains
                             .to_hashmap()
@@ -2277,7 +2298,7 @@ impl ProxyConfiguration<Session> for Proxy {
                             .map(|(k, v)| (String::from_utf8(k).unwrap(), v.0))
                             .collect();
 
-                        (listener.address, res)
+                        (owned.address, res)
                     })
                     .collect::<HashMap<_, _>>();
 
@@ -2296,9 +2317,10 @@ impl ProxyConfiguration<Session> for Proxy {
                     .listeners
                     .values()
                     .map(|listener| {
-                        let resolver = unwrap_msg!(listener.resolver.lock());
+                        let owned = listener.borrow();
+                        let resolver = unwrap_msg!(owned.resolver.lock());
                         (
-                            listener.address,
+                            owned.address,
                             resolver.domain_lookup(d.as_bytes(), true).map(|(k, v)| {
                                 (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
                             }),

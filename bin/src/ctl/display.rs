@@ -28,7 +28,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
                 format!("{:?}", http_frontend.path),
                 format!("{:?}", http_frontend.method),
                 format!("{:?}", http_frontend.position),
-                format_tags_to_string(http_frontend.tags.clone())
+                format_tags_to_string(http_frontend.tags.as_ref())
             ));
         }
         table.printstd();
@@ -49,7 +49,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
                 format!("{:?}", https_frontend.path),
                 format!("{:?}", https_frontend.method),
                 format!("{:?}", https_frontend.position),
-                format_tags_to_string(https_frontend.tags.clone())
+                format_tags_to_string(https_frontend.tags.as_ref())
             ));
         }
         table.printstd();
@@ -64,7 +64,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
             table.add_row(row!(
                 tcp_frontend.cluster_id,
                 tcp_frontend.address,
-                format_tags_to_string(tcp_frontend.tags.clone())
+                format_tags_to_string(tcp_frontend.tags.as_ref())
             ));
         }
         table.printstd();
@@ -557,14 +557,12 @@ pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> an
     Ok(())
 }
 
-fn format_tags_to_string(tags_option: Option<BTreeMap<String, String>>) -> String {
-    if let Some(tags) = tags_option {
-        let mut key_value_pairs: String = String::new();
-        for (key, value) in tags.iter() {
-            key_value_pairs.push_str(&format!("{}={}, ", key, value));
-        }
-        key_value_pairs
-    } else {
-        String::new()
-    }
+fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
+    tags.map(|tags| {
+        tags.iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+    .unwrap_or_default()
 }

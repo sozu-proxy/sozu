@@ -776,7 +776,7 @@ impl std::fmt::Display for Rfc3339Time {
             f,
             "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
             t.year(),
-            t.month(),
+            t.month() as u8,
             t.day(),
             t.hour(),
             t.minute(),

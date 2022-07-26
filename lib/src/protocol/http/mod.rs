@@ -21,7 +21,7 @@ use crate::{
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
     util::UnwrapLog,
-    Backend, CustomTags, LogDuration, {Protocol, Readiness, SessionMetrics, SessionResult},
+    Backend, ListenerHandler, LogDuration, {Protocol, Readiness, SessionMetrics, SessionResult},
 };
 
 use self::parser::{
@@ -62,6 +62,23 @@ pub enum DefaultAnswerStatus {
     Answer504,
 }
 
+#[allow(clippy::from_over_into)]
+impl Into<u16> for DefaultAnswerStatus {
+    fn into(self) -> u16 {
+        match self {
+            Self::Answer301 => 301,
+            Self::Answer400 => 400,
+            Self::Answer401 => 401,
+            Self::Answer404 => 404,
+            Self::Answer408 => 408,
+            Self::Answer413 => 413,
+            Self::Answer502 => 502,
+            Self::Answer503 => 503,
+            Self::Answer504 => 504,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TimeoutStatus {
     Request,
@@ -70,10 +87,9 @@ pub enum TimeoutStatus {
     WaitingForResponse,
 }
 
-pub struct Http<Front: SocketHandler, P: CustomTags> {
+pub struct Http<Front: SocketHandler, L: ListenerHandler> {
     pub frontend: Front,
     pub backend: Option<TcpStream>,
-    pub listener_token: Token,
     frontend_token: Token,
     backend_token: Option<Token>,
     pub status: SessionStatus,
@@ -104,13 +120,12 @@ pub struct Http<Front: SocketHandler, P: CustomTags> {
     pub front_timeout: TimeoutContainer,
     pub back_timeout: TimeoutContainer,
     pub frontend_timeout_duration: Duration,
-    pub proxy: Rc<RefCell<P>>,
+    pub listener: Rc<RefCell<L>>,
 }
 
-impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
+impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
     pub fn new(
         sock: Front,
-        listener_token: Token,
         frontend_token: Token,
         request_id: Ulid,
         pool: Weak<RefCell<Pool>>,
@@ -122,12 +137,11 @@ impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
         front_timeout: TimeoutContainer,
         frontend_timeout_duration: Duration,
         backend_timeout_duration: Duration,
-        proxy: Rc<RefCell<P>>,
-    ) -> Http<Front, P> {
+        listener: Rc<RefCell<L>>,
+    ) -> Http<Front, L> {
         let mut session = Http {
             frontend: sock,
             backend: None,
-            listener_token,
             frontend_token,
             backend_token: None,
             status: SessionStatus::Normal,
@@ -158,11 +172,11 @@ impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
             frontend_timeout_duration,
             answers,
             pool,
-            proxy,
+            listener,
         };
+
         session.added_req_header = Some(session.added_request_header(session_address));
         session.added_res_header = session.added_response_header();
-
         session
     }
 
@@ -585,7 +599,7 @@ impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
         );
         let status_line = OptionalStatus::new(
             self.get_response_status()
-                .map(|line| (line.status, line.reason.as_str())),
+                .map(|line| line.status),
         );
 
         let response_time = metrics.response_time();
@@ -626,19 +640,16 @@ impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
                 Some((hn, _)) => hn,
             };
 
-            self.proxy
-                .borrow()
-                .get_tags(&self.listener_token, hostname)
-                .map(|tags| {
-                    tags.iter()
-                        .map(|(k, v)| format!("\"{}={}\"", k, v))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
+            self.listener.borrow().get_tags(hostname).map(|tags| {
+                tags.iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
         });
 
         info_access!(
-            "{}{} -> {}\t{} {} {} {}\t{} {} {}\t{} {}",
+            "{}{} -> {}\t{} {} {} {}\t{}\t{} {} {}\t{}",
             self.log_context(),
             session,
             backend,
@@ -646,11 +657,11 @@ impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
             LogDuration(service_time),
             metrics.bin,
             metrics.bout,
+            OptionalString::from(tags.as_ref()),
             proto,
             host,
-            request_line,
             status_line,
-            OptionalString::from(tags.as_ref())
+            request_line
         );
     }
 
@@ -659,28 +670,8 @@ impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
         let backend = SessionAddress(self.get_backend_address());
 
         let status_line = match self.status {
-            SessionStatus::Normal => "-",
-            SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer301, _, _) => {
-                "301 Moved Permanently"
-            }
-            SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer400, _, _) => "400 Bad Request",
-            SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer401, _, _) => {
-                "400 Unauthorized"
-            }
-            SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer404, _, _) => "404 Not Found",
-            SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer408, _, _) => {
-                "408 Request Timeout"
-            }
-            SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer413, _, _) => {
-                "413 Payload Too Large"
-            }
-            SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer502, _, _) => "502 Bad Gateway",
-            SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer503, _, _) => {
-                "503 Service Unavailable"
-            }
-            SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer504, _, _) => {
-                "504 Gateway Timeout"
-            }
+            SessionStatus::Normal => OptionalStatus::new(None),
+            SessionStatus::DefaultAnswer(answers, _, _) => OptionalStatus::new(Some(answers.into())),
         };
 
         let host = OptionalString::new(self.get_host());
@@ -715,19 +706,16 @@ impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
                 Some((hn, _)) => hn,
             };
 
-            self.proxy
-                .borrow()
-                .get_tags(&self.listener_token, hostname)
-                .map(|tags| {
-                    tags.iter()
-                        .map(|(k, v)| format!("\"{}={}\"", k, v))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
+            self.listener.borrow().get_tags(hostname).map(|tags| {
+                tags.iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
         });
 
         info_access!(
-            "{}{} -> {}\t{} {} {} {}\t{} {} {}\t{} {}",
+            "{}{} -> {}\t{} {} {} {}\t{}\t{} {} {}\t{}",
             self.log_context(),
             session,
             backend,
@@ -735,11 +723,11 @@ impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
             LogDuration(service_time),
             metrics.bin,
             metrics.bout,
+            OptionalString::from(tags.as_ref()),
             proto,
             host,
-            request_line,
             status_line,
-            OptionalString::from(tags.as_ref())
+            request_line
         );
     }
 
@@ -759,7 +747,7 @@ impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
         let status_line = OptionalStatus::new(
             self.get_response_status()
                 .as_ref()
-                .map(|line| (line.status, line.reason.as_str())),
+                .map(|line| line.status),
         );
 
         let response_time = metrics.response_time();
@@ -797,15 +785,12 @@ impl<Front: SocketHandler, P: CustomTags> Http<Front, P> {
                 Some((hn, _)) => hn,
             };
 
-            self.proxy
-                .borrow()
-                .get_tags(&self.listener_token, hostname)
-                .map(|tags| {
-                    tags.iter()
-                        .map(|(k, v)| format!("\"{}={}\"", k, v))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
+            self.listener.borrow().get_tags(hostname).map(|tags| {
+                tags.iter()
+                    .map(|(k, v)| format!("\"{}={}\"", k, v))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
         });
 
         error_access!(
@@ -1976,21 +1961,21 @@ impl<'a> std::fmt::Display for OptionalRequest<'a> {
     }
 }
 
-struct OptionalStatus<'a> {
-    inner: Option<(u16, &'a str)>,
+struct OptionalStatus {
+    inner: Option<u16>,
 }
 
-impl<'a> OptionalStatus<'a> {
-    fn new(inner: Option<(u16, &'a str)>) -> Self {
+impl<'a> OptionalStatus {
+    fn new(inner: Option<u16>) -> Self {
         OptionalStatus { inner }
     }
 }
 
-impl<'a> std::fmt::Display for OptionalStatus<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<'a> std::fmt::Display for OptionalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match &self.inner {
             None => write!(f, "-"),
-            Some((s1, s2)) => write!(f, "{} {}", s1, s2),
+            Some(code) => write!(f, "{}", code),
         }
     }
 }

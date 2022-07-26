@@ -268,9 +268,12 @@ pub trait ProxySession {
     fn shutting_down(&mut self);
 }
 
-pub trait CustomTags {
-    fn get_tags(&self, listener_token: &Token, hostname: &str)
-        -> Option<&BTreeMap<String, String>>;
+pub trait ListenerHandler {
+    fn get_addr(&self) -> &SocketAddr;
+
+    fn get_tags(&self, key: &str) -> Option<&BTreeMap<String, String>>;
+
+    fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

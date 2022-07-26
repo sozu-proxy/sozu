@@ -1396,10 +1396,7 @@ mod tests {
         };
         println!("https: {:?}", to_string(&https));
 
-        let mut listeners = Vec::new();
-        listeners.push(http);
-        listeners.push(https);
-
+        let listeners = vec![http, https];
         let config = FileConfig {
             command_socket: Some(String::from("./command_folder/sock")),
             saved_state: None,

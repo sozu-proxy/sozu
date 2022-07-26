@@ -251,7 +251,7 @@ load_balancing = "round_robin"
 frontends = [
   { address = "0.0.0.0:8080", hostname = "lolcatho.st", tags = { key = "value" } },
   # HTTPS frontends also have an optional `tls_versions` key like the HTTPS listeners
-  { address = "0.0.0.0:8443", hostname = "lolcatho.st", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" }
+  { address = "0.0.0.0:8443", hostname = "lolcatho.st", tags = { key = "value" }, certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" }
 ]
 
 # backends configuration

@@ -6,10 +6,11 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
+    protocol::http::OptionalString,
     socket::{SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
-    CustomTags, LogDuration, Protocol, {Readiness, SessionMetrics, SessionResult},
+    ListenerHandler, LogDuration, Protocol, {Readiness, SessionMetrics, SessionResult},
 };
 
 #[derive(PartialEq)]
@@ -26,9 +27,8 @@ enum ConnectionStatus {
     Closed,
 }
 
-pub struct Pipe<Front: SocketHandler, P: CustomTags> {
+pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     pub frontend: Front,
-    pub listener_token: Token,
     frontend_token: Token,
     backend: Option<TcpStream>,
     backend_token: Option<Token>,
@@ -47,14 +47,13 @@ pub struct Pipe<Front: SocketHandler, P: CustomTags> {
     backend_status: ConnectionStatus,
     pub front_timeout: Option<TimeoutContainer>,
     pub back_timeout: Option<TimeoutContainer>,
-    pub proxy: Rc<RefCell<P>>,
+    pub listener: Rc<RefCell<L>>,
 }
 
-impl<Front: SocketHandler, P: CustomTags> Pipe<Front, P> {
+impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     pub fn new(
         frontend: Front,
         frontend_token: Token,
-        listener_token: Token,
         request_id: Ulid,
         cluster_id: Option<String>,
         backend_id: Option<String>,
@@ -64,8 +63,8 @@ impl<Front: SocketHandler, P: CustomTags> Pipe<Front, P> {
         back_buf: Checkout,
         session_address: Option<SocketAddr>,
         protocol: Protocol,
-        proxy: Rc<RefCell<P>>,
-    ) -> Pipe<Front, P> {
+        listener: Rc<RefCell<L>>,
+    ) -> Pipe<Front, L> {
         let log_ctx = format!(
             "{} {} {}\t",
             &request_id,
@@ -81,7 +80,6 @@ impl<Front: SocketHandler, P: CustomTags> Pipe<Front, P> {
 
         let session = Pipe {
             frontend,
-            listener_token,
             backend,
             frontend_token,
             backend_token: None,
@@ -106,7 +104,7 @@ impl<Front: SocketHandler, P: CustomTags> Pipe<Front, P> {
             backend_status,
             front_timeout: None,
             back_timeout: None,
-            proxy,
+            listener,
         };
 
         trace!("created pipe");
@@ -286,29 +284,18 @@ impl<Front: SocketHandler, P: CustomTags> Pipe<Front, P> {
         }
 
         let proto = self.protocol_string();
-
-        let tags = match self.frontend.socket_ref().local_addr() {
-            Ok(addr) => {
-                let tags = self
-                    .proxy
-                    .borrow()
-                    .get_tags(dbg!(&self.listener_token), dbg!(&addr.to_string()))
-                    .map(|tags| {
-                        tags.iter()
-                            .map(|(k, v)| format!("\"{}={}\"", k, v))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    });
-                tags.unwrap_or_default()
-            }
-            Err(e) => {
-                error!("Could not find frontend address: {}", e);
-                String::new()
-            }
-        };
+        let listener = self.listener.borrow();
+        let tags = listener
+            .get_tags(&listener.get_addr().to_string())
+            .map(|tags| {
+                tags.iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
 
         info_access!(
-            "{}{} -> {}\t{} {} {} {}\t{} {} {}",
+            "{}{} -> {}\t{} {} {} {}\t{}\t{} {}",
             self.log_ctx,
             session_addr,
             backend,
@@ -316,9 +303,9 @@ impl<Front: SocketHandler, P: CustomTags> Pipe<Front, P> {
             LogDuration(service_time),
             metrics.bin,
             metrics.bout,
+            OptionalString::from(tags.as_ref()),
             proto,
-            self.websocket_context.as_deref().unwrap_or("-"),
-            tags
+            self.websocket_context.as_deref().unwrap_or("-")
         );
     }
 
@@ -767,7 +754,7 @@ impl<Front: SocketHandler, P: CustomTags> Pipe<Front, P> {
     }
 }
 
-impl<Front: SocketHandler, P: CustomTags> std::ops::Drop for Pipe<Front, P> {
+impl<Front: SocketHandler, L: ListenerHandler> std::ops::Drop for Pipe<Front, L> {
     fn drop(&mut self) {
         match self.protocol {
             Protocol::TCP => {}

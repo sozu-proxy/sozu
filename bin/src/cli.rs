@@ -782,7 +782,10 @@ fn parse_tags(string_to_parse: &str) -> Result<BTreeMap<String, String>, String>
         if let Some((key, value)) = s.trim().split_once("=") {
             tags.insert(key.to_owned(), value.to_owned());
         } else {
-            return Err("something went wrong while parsing the tags".to_string());
+            return Err(format!(
+                "something went wrong while parsing the tags '{}'",
+                string_to_parse
+            ));
         }
     }
 
@@ -799,15 +802,15 @@ mod tests {
             "owner=John ,uuid=0dd8d7b1-a50a-461a-b1f9-5211a5f45a83=, hexkey=#846e84";
 
         assert_eq!(
-            BTreeMap::from([
+            Ok(BTreeMap::from([
                 ("owner".to_owned(), "John".to_owned()),
                 (
                     "uuid".to_owned(),
                     "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83=".to_owned(),
                 ),
                 ("hexkey".to_owned(), "#846e84".to_owned())
-            ]),
-            parse_tags(tags_to_parse).expect("Could not parse this string to tags")
+            ])),
+            parse_tags(tags_to_parse)
         );
     }
 }

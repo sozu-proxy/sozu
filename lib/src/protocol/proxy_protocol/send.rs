@@ -12,7 +12,7 @@ use crate::{
     protocol::{pipe::Pipe, ProtocolResult},
     socket::SocketHandler,
     sozu_command::ready::Ready,
-    tcp::Proxy,
+    tcp::Listener,
     BackendConnectionStatus, Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
@@ -159,17 +159,15 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
 
     pub fn into_pipe(
         mut self,
-        listener_token: Token,
         front_buf: Checkout,
         back_buf: Checkout,
-        proxy: Rc<RefCell<Proxy>>,
-    ) -> Pipe<Front, Proxy> {
+        listener: Rc<RefCell<Listener>>,
+    ) -> Pipe<Front, Listener> {
         let backend_socket = self.backend.take().unwrap();
         let addr = self.front_socket().peer_addr().ok();
 
         let mut pipe = Pipe::new(
             self.frontend,
-            listener_token,
             self.frontend_token,
             self.request_id,
             None,
@@ -180,7 +178,7 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
             back_buf,
             addr,
             Protocol::TCP,
-            proxy,
+            listener,
         );
 
         pipe.front_readiness = self.front_readiness;

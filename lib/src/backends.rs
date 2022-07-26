@@ -65,7 +65,7 @@ impl BackendMap {
     pub fn close_backend_connection(&mut self, cluster_id: &str, addr: &SocketAddr) {
         if let Some(app_backends) = self.backends.get_mut(cluster_id) {
             if let Some(ref mut backend) = app_backends.find_backend(addr) {
-                (*backend.borrow_mut()).dec_connections();
+                backend.borrow_mut().dec_connections();
             }
         }
     }
@@ -88,7 +88,7 @@ impl BackendMap {
             }
 
             if let Some(ref mut b) = app_backends.next_available_backend() {
-                let backend = &mut (*b.borrow_mut());
+                let mut backend = b.borrow_mut();
 
                 debug!(
                     "Connecting {} -> {:?}",
@@ -99,8 +99,8 @@ impl BackendMap {
                         backend.failures
                     )
                 );
-                let conn = backend.try_connect();
 
+                let conn = backend.try_connect();
                 let res = conn.map(|c| (b.clone(), c)).map_err(|e| {
                     error!(
                         "could not connect {} to {:?} ({} failures)",
@@ -140,7 +140,7 @@ impl BackendMap {
             .get_mut(cluster_id)
             .and_then(|app_backends| app_backends.find_sticky(sticky_session))
             .map(|b| {
-                let backend = &mut *b.borrow_mut();
+                let mut backend = b.borrow_mut();
                 let conn = backend.try_connect();
 
                 conn.map(|c| (b.clone(), c)).map_err(|e| {
@@ -249,7 +249,7 @@ impl BackendList {
     pub fn has_backend(&self, backend_address: &SocketAddr) -> bool {
         self.backends
             .iter()
-            .any(|backend| &(*backend.borrow()).address == backend_address)
+            .any(|backend| backend.borrow().address == *backend_address)
     }
 
     pub fn find_backend(
@@ -258,7 +258,7 @@ impl BackendList {
     ) -> Option<&mut Rc<RefCell<Backend>>> {
         self.backends
             .iter_mut()
-            .find(|backend| &(*backend.borrow()).address == backend_address)
+            .find(|backend| backend.borrow().address == *backend_address)
     }
 
     pub fn find_sticky(&mut self, sticky_session: &str) -> Option<&mut Rc<RefCell<Backend>>> {
@@ -272,9 +272,11 @@ impl BackendList {
         self.backends
             .iter()
             .filter(|backend| {
-                (*backend.borrow()).backup == backup && (*backend.borrow()).can_open()
+                let owned = backend.borrow();
+
+                owned.backup == backup && owned.can_open()
             })
-            .map(|backend| (*backend).clone())
+            .map(Clone::clone)
             .collect()
     }
 
