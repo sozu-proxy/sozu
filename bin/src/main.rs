@@ -10,6 +10,7 @@ extern crate sozu_command_lib;
 
 #[cfg(target_os = "linux")]
 extern crate num_cpus;
+use cli::Args;
 #[cfg(target_os = "linux")]
 use regex::Regex;
 
@@ -32,7 +33,6 @@ use std::panic;
 use anyhow::{bail, Context};
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t, pid_t};
-use structopt::StructOpt;
 
 use sozu::metrics::METRICS;
 use sozu_command_lib::config::Config;
@@ -42,14 +42,13 @@ use crate::{
     worker::{get_executable_path, start_workers},
 };
 
-fn main() -> anyhow::Result<()> {
+#[paw::main]
+fn main(args: Args) -> anyhow::Result<()> {
     register_panic_hook();
 
-    let matches = cli::Sozu::from_args();
-
-    match matches.cmd {
+    match args.cmd {
         cli::SubCmd::Start => {
-            start(&matches)?;
+            start(&args)?;
             info!("main process stopped");
             Ok(())
         }
@@ -87,12 +86,12 @@ fn main() -> anyhow::Result<()> {
                 max_command_buffer_size,
             )
         }
-        _ => ctl::ctl(matches),
+        _ => ctl::ctl(args),
     }
 }
 
-fn start(matches: &cli::Sozu) -> Result<(), anyhow::Error> {
-    let config_file_path = get_config_file_path(matches)?;
+fn start(args: &cli::Args) -> Result<(), anyhow::Error> {
+    let config_file_path = get_config_file_path(args)?;
     let config = load_configuration(config_file_path)?;
 
     util::setup_logging(&config);
@@ -121,8 +120,8 @@ fn init_workers(config: &Config) -> Result<Vec<Worker>, anyhow::Error> {
     start_workers(path, config).with_context(|| "Failed at spawning workers")
 }
 
-pub fn get_config_file_path(matches: &cli::Sozu) -> Result<&str, anyhow::Error> {
-    match matches.config.as_ref() {
+pub fn get_config_file_path(args: &cli::Args) -> Result<&str, anyhow::Error> {
+    match args.config.as_ref() {
         Some(config_file) => Ok(config_file.as_str()),
         None => option_env!("SOZU_CONFIG").ok_or_else(|| {
             anyhow::Error::msg(

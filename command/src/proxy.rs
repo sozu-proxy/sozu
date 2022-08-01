@@ -557,15 +557,9 @@ impl FromStr for LoadBalancingAlgorithms {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LoadBalancingParams {
     pub weight: u8,
-}
-
-impl Default for LoadBalancingParams {
-    fn default() -> Self {
-        Self { weight: 0 }
-    }
 }
 
 /// how sozu measures which backend is less loaded
@@ -855,25 +849,13 @@ pub enum QueryAnswer {
     Metrics(QueryAnswerMetrics),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueryAnswerApplication {
     pub configuration: Option<Cluster>,
     pub http_frontends: Vec<HttpFrontend>,
     pub https_frontends: Vec<HttpFrontend>,
     pub tcp_frontends: Vec<TcpFrontend>,
     pub backends: Vec<Backend>,
-}
-
-impl Default for QueryAnswerApplication {
-    fn default() -> QueryAnswerApplication {
-        QueryAnswerApplication {
-            configuration: None,
-            http_frontends: vec![],
-            https_frontends: vec![],
-            tcp_frontends: vec![],
-            backends: vec![],
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -23,8 +23,8 @@ pub struct CommandManager {
     config: Config,
 }
 
-pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
-    let config_file_path = get_config_file_path(&matches)?;
+pub fn ctl(args: cli::Args) -> Result<(), anyhow::Error> {
+    let config_file_path = get_config_file_path(&args)?;
     let config = load_configuration(config_file_path)?;
 
     util::setup_logging(&config);
@@ -32,7 +32,7 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
     // If the command is `config check` then exit because if we are here, the configuration is valid
     if let SubCmd::Config {
         cmd: ConfigCmd::Check {},
-    } = matches.cmd
+    } = args.cmd
     {
         println!("Configuration file is valid");
         std::process::exit(0);
@@ -42,14 +42,14 @@ pub fn ctl(matches: cli::Sozu) -> Result<(), anyhow::Error> {
         "could not connect to the command unix socket. Are you sure the proxy is up?"
     })?;
 
-    let timeout = Duration::from_millis(matches.timeout.unwrap_or(config.ctl_command_timeout));
+    let timeout = Duration::from_millis(args.timeout.unwrap_or(config.ctl_command_timeout));
 
     let mut command_manager = CommandManager {
         channel,
         timeout,
         config,
     };
-    command_manager.handle_command(matches.cmd)
+    command_manager.handle_command(args.cmd)
 }
 
 impl CommandManager {
