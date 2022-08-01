@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::{hash_map::Entry, BTreeMap, HashMap},
     io::ErrorKind,
     net::SocketAddr,
     os::unix::io::AsRawFd,
@@ -317,15 +317,13 @@ impl Proxy {
         config: HttpsListener,
         token: Token,
     ) -> Result<Option<Token>, rustls::Error> {
-        Ok(
-            if let std::collections::hash_map::Entry::Vacant(e) = self.listeners.entry(token) {
-                let listener = Rc::new(RefCell::new(Listener::new(config, token)?));
-                e.insert(listener);
-                Some(token)
-            } else {
-                None
-            },
-        )
+        match self.listeners.entry(token) {
+            Entry::Vacant(entry) => {
+                entry.insert(Rc::new(RefCell::new(Listener::new(config, token)?)));
+                Ok(Some(token))
+            }
+            _ => Ok(None),
+        }
     }
 
     pub fn remove_listener(&mut self, address: SocketAddr) -> bool {

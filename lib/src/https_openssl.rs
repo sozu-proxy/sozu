@@ -1978,12 +1978,14 @@ impl Proxy {
     }
 
     pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
-        if self.listeners.contains_key(&token) {
-            None
-        } else {
-            let listener = Rc::new(RefCell::new(Listener::try_new(config, token).ok()?));
-            self.listeners.insert(token, listener);
-            Some(token)
+        match self.listeners.entry(token) {
+            Entry::Vacant(entry) => {
+                entry.insert(Rc::new(RefCell::new(
+                    Listener::try_new(config, token).ok()?,
+                )));
+                Some(token)
+            }
+            _ => None,
         }
     }
 
