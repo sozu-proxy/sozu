@@ -396,7 +396,6 @@ mod tests {
                 address: "127.0.0.1:8080".parse().unwrap(),
                 load_balancing_parameters: Some(LoadBalancingParams {
                     weight: 0,
-                    ..Default::default()
                 }),
                 sticky_id: Some(String::from("xxx-0")),
                 backup: Some(false),
