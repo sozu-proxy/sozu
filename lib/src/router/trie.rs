@@ -1,6 +1,4 @@
-use std::{fmt::Debug, iter, str};
-
-use hashbrown::HashMap;
+use std::{collections::HashMap, fmt::Debug, iter, str};
 
 pub type Key = Vec<u8>;
 pub type KeyValue<K, V> = (K, V);
@@ -707,6 +705,6 @@ mod tests {
 
     #[test]
     fn size() {
-        assert_size!(TrieNode<u32>, 128);
+        assert_size!(TrieNode<u32>, 112);
     }
 }

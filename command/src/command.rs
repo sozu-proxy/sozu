@@ -179,6 +179,7 @@ mod tests {
                 method: None,
                 address: "0.0.0.0:8080".parse().unwrap(),
                 position: RulePosition::Tree,
+                tags: None,
             }))
         );
     }
@@ -262,6 +263,7 @@ mod tests {
                 method: None,
                 address: "0.0.0.0:8080".parse().unwrap(),
                 position: RulePosition::Tree,
+                tags: None,
             })),
             worker_id: None
         }
@@ -280,6 +282,13 @@ mod tests {
                 method: None,
                 address: "0.0.0.0:8080".parse().unwrap(),
                 position: RulePosition::Tree,
+                tags: Some(BTreeMap::from([
+                    ("owner".to_owned(), "John".to_owned()),
+                    (
+                        "uuid".to_owned(),
+                        "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
+                    )
+                ]))
             })),
             worker_id: None
         }
@@ -298,6 +307,7 @@ mod tests {
                 method: None,
                 address: "0.0.0.0:8443".parse().unwrap(),
                 position: RulePosition::Tree,
+                tags: None,
             })),
             worker_id: None
         }
@@ -316,6 +326,13 @@ mod tests {
                 method: None,
                 address: "0.0.0.0:8443".parse().unwrap(),
                 position: RulePosition::Tree,
+                tags: Some(BTreeMap::from([
+                    ("owner".to_owned(), "John".to_owned()),
+                    (
+                        "uuid".to_owned(),
+                        "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
+                    )
+                ]))
             })),
             worker_id: None
         }

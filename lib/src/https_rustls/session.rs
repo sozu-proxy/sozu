@@ -14,6 +14,7 @@ use time::{Duration, Instant};
 
 use crate::{
     buffer_queue::BufferQueue,
+    https_rustls::configuration::{Listener, Proxy},
     pool::Pool,
     protocol::{
         http::{
@@ -40,13 +41,11 @@ use crate::{
     },
 };
 
-use super::configuration::Proxy;
-
 pub enum State {
     Expect(ExpectProxyProtocol<TcpStream>, ServerConnection),
     Handshake(TlsHandshake),
-    Http(Http<FrontRustls>),
-    WebSocket(Pipe<FrontRustls>),
+    Http(Http<FrontRustls, Listener>),
+    WebSocket(Pipe<FrontRustls, Listener>),
 }
 
 pub struct Session {
@@ -68,6 +67,7 @@ pub struct Session {
     front_timeout: TimeoutContainer,
     frontend_timeout_duration: Duration,
     backend_timeout_duration: Duration,
+    pub listener: Rc<RefCell<Listener>>,
 }
 
 impl Session {
@@ -86,6 +86,7 @@ impl Session {
         frontend_timeout_duration: Duration,
         backend_timeout_duration: Duration,
         request_timeout_duration: Duration,
+        listener: Rc<RefCell<Listener>>,
     ) -> Session {
         let peer_address = if expect_proxy {
             // Will be defined later once the expect proxy header has been received and parsed
@@ -130,12 +131,13 @@ impl Session {
             front_timeout,
             frontend_timeout_duration,
             backend_timeout_duration,
+            listener,
         };
         session.front_readiness().interest = Ready::readable() | Ready::hup() | Ready::error();
         session
     }
 
-    pub fn http(&self) -> Option<&Http<FrontRustls>> {
+    pub fn http(&self) -> Option<&Http<FrontRustls, Listener>> {
         self.protocol.as_ref().and_then(|protocol| {
             if let State::Http(ref http) = protocol {
                 Some(http)
@@ -145,7 +147,7 @@ impl Session {
         })
     }
 
-    pub fn http_mut(&mut self) -> Option<&mut Http<FrontRustls>> {
+    pub fn http_mut(&mut self) -> Option<&mut Http<FrontRustls, Listener>> {
         self.protocol.as_mut().and_then(|protocol| {
             if let State::Http(ref mut http) = *protocol {
                 Some(http)
@@ -231,6 +233,7 @@ impl Session {
                     self.front_timeout.take(),
                     self.frontend_timeout_duration,
                     self.backend_timeout_duration,
+                    self.listener.clone(),
                 );
 
                 let res = http.frontend.session.reader().read(front_buf.space());
@@ -308,6 +311,7 @@ impl Session {
                     back_buf,
                     http.session_address,
                     Protocol::HTTPS,
+                    self.listener.clone(),
                 );
 
                 pipe.front_readiness.event = http.front_readiness.event;
@@ -539,8 +543,8 @@ impl Session {
                 h.cancel_backend_timeout();
             };
 
-            if let Some(backend) = self.backend.as_ref() {
-                let backend = &mut (*backend.borrow_mut());
+            if let Some(backend) = &self.backend {
+                let mut backend = backend.borrow_mut();
 
                 if backend.retry_policy.is_down() {
                     incr!(
@@ -580,7 +584,7 @@ impl Session {
                 h.clear_back_token();
             }
 
-            (*backend.borrow_mut()).dec_connections();
+            backend.borrow_mut().dec_connections();
         }
     }
 
@@ -851,9 +855,9 @@ impl Session {
     fn close_backend(&mut self) {
         if let Some(token) = self.back_token() {
             if let Some(fd) = self.back_socket_mut().map(|s| s.as_raw_fd()) {
-                let proxy = self.proxy.borrow_mut();
+                let proxy = self.proxy.borrow();
                 if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-                    error!("1error deregistering socket({:?}): {:?}", fd, e);
+                    error!("1error deregistering socket({:?}): {:?}", fd, e);
                 }
 
                 proxy.sessions.borrow_mut().slab.try_remove(token.0);
@@ -1019,7 +1023,7 @@ impl Session {
         let res = match (front_should_stick, sticky_session) {
             (true, Some(sticky_session)) => self
                 .proxy
-                .borrow_mut()
+                .borrow()
                 .backends
                 .borrow_mut()
                 .backend_from_sticky_session(cluster_id, sticky_session)
@@ -1032,7 +1036,7 @@ impl Session {
                 }),
             _ => self
                 .proxy
-                .borrow_mut()
+                .borrow()
                 .backends
                 .borrow_mut()
                 .backend_from_cluster_id(cluster_id),
@@ -1046,6 +1050,7 @@ impl Session {
             Ok((backend, conn)) => {
                 if front_should_stick {
                     let sticky_name = self.proxy.borrow().listeners[&self.listen_token]
+                        .borrow()
                         .config
                         .sticky_name
                         .clone();
@@ -1087,7 +1092,7 @@ impl Session {
             .listeners
             .get(&listen_token)
             .as_ref()
-            .and_then(|l| l.frontend_from_request(host, uri, method));
+            .and_then(|l| l.borrow().frontend_from_request(host, uri, method));
 
         match route_res {
             Some(Route::ClusterId(cluster_id)) => Ok(cluster_id),
@@ -1178,7 +1183,7 @@ impl Session {
                 .listeners
                 .get(&self.listen_token)
                 .as_ref()
-                .map(|l| l.config.connect_timeout)
+                .map(|l| l.borrow().config.connect_timeout)
                 .unwrap(),
         ));
 
@@ -1278,9 +1283,9 @@ impl ProxySession for Session {
         }
 
         let fd = self.front_socket().as_raw_fd();
-        let proxy = self.proxy.borrow_mut();
+        let proxy = self.proxy.borrow();
         if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-            error!("1error deregistering socket({:?}): {:?}", fd, e);
+            error!("1error deregistering socket({:?}): {:?}", fd, e);
         }
     }
 

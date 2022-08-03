@@ -13,7 +13,11 @@
       "path": {
         "PREFIX": "xxx"
       },
-      "position": "TREE"
+      "position": "TREE",
+      "tags": {
+        "owner": "John",
+        "uuid": "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83"
+      }
     }
   }
 }

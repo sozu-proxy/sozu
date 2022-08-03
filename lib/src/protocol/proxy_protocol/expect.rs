@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::{cell::RefCell, io::Read, rc::Rc};
 
 use mio::{net::TcpStream, *};
 use nom::{Err, HexDisplay};
@@ -10,6 +10,7 @@ use crate::{
     protocol::ProtocolResult,
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
+    tcp::Listener,
     Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
@@ -159,7 +160,8 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
         back_buf: Checkout,
         backend_socket: Option<TcpStream>,
         backend_token: Option<Token>,
-    ) -> Pipe<Front> {
+        listener: Rc<RefCell<Listener>>,
+    ) -> Pipe<Front, Listener> {
         let addr = self.front_socket().peer_addr().ok();
 
         let mut pipe = Pipe::new(
@@ -174,6 +176,7 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
             back_buf,
             addr,
             Protocol::TCP,
+            listener,
         );
 
         pipe.front_readiness.event = self.readiness.event;

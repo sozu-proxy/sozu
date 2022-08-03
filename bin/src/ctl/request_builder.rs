@@ -84,16 +84,18 @@ impl CommandManager {
 
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> Result<(), anyhow::Error> {
         match cmd {
-            TcpFrontendCmd::Add { id, address } => {
+            TcpFrontendCmd::Add { id, address, tags } => {
                 self.order_command(ProxyRequestData::AddTcpFrontend(TcpFrontend {
                     cluster_id: id,
                     address,
+                    tags,
                 }))
             }
-            TcpFrontendCmd::Remove { id, address } => {
+            TcpFrontendCmd::Remove { id, address, tags } => {
                 self.order_command(ProxyRequestData::RemoveTcpFrontend(TcpFrontend {
                     cluster_id: id,
                     address,
+                    tags,
                 }))
             }
         }
@@ -107,6 +109,7 @@ impl CommandManager {
                 address,
                 method,
                 route,
+                tags,
             } => self.order_command(ProxyRequestData::AddHttpFrontend(HttpFrontend {
                 route: route.into(),
                 address,
@@ -114,6 +117,7 @@ impl CommandManager {
                 path: PathRule::Prefix(path_begin.unwrap_or_else(|| "".to_string())),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
+                tags,
             })),
 
             HttpFrontendCmd::Remove {
@@ -122,6 +126,7 @@ impl CommandManager {
                 address,
                 method,
                 route,
+                tags,
             } => self.order_command(ProxyRequestData::RemoveHttpFrontend(HttpFrontend {
                 route: route.into(),
                 address,
@@ -129,6 +134,7 @@ impl CommandManager {
                 path: PathRule::Prefix(path_begin.unwrap_or_else(|| "".to_string())),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
+                tags,
             })),
         }
     }
@@ -141,6 +147,7 @@ impl CommandManager {
                 address,
                 method,
                 route,
+                tags,
             } => self.order_command(ProxyRequestData::AddHttpsFrontend(HttpFrontend {
                 route: route.into(),
                 address,
@@ -148,6 +155,7 @@ impl CommandManager {
                 path: PathRule::Prefix(path_begin.unwrap_or_else(|| "".to_string())),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
+                tags,
             })),
             HttpFrontendCmd::Remove {
                 hostname,
@@ -155,6 +163,7 @@ impl CommandManager {
                 address,
                 method,
                 route,
+                tags,
             } => self.order_command(ProxyRequestData::RemoveHttpsFrontend(HttpFrontend {
                 route: route.into(),
                 address,
@@ -162,6 +171,7 @@ impl CommandManager {
                 path: PathRule::Prefix(path_begin.unwrap_or_else(|| "".to_string())),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
+                tags,
             })),
         }
     }
@@ -235,7 +245,7 @@ impl CommandManager {
                 }
                 match listener.to_http(None, None, None) {
                     Some(conf) => self.order_command(ProxyRequestData::AddHttpListener(conf)),
-                    None => bail!("Error creating HTTP listener"),
+                    None => bail!("Error creating HTTP listener"),
                 }
             }
             HttpListenerCmd::Remove { address } => {

@@ -103,7 +103,7 @@ pub enum Response {
     Ok(Success),
 }
 
-// Indicates success of either inner Sōzu logic and of handling the ClientRequest,
+// Indicates success of either inner Sōzu logic and of handling the ClientRequest,
 // in which case Success caries the response data.
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Success {

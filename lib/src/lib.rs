@@ -166,7 +166,6 @@ extern crate url;
 #[macro_use]
 extern crate sozu_command_lib as sozu_command;
 extern crate cookie_factory;
-extern crate hashbrown;
 extern crate hpack;
 extern crate idna;
 extern crate lazycell;
@@ -209,7 +208,7 @@ pub mod https_openssl;
 
 pub mod https_rustls;
 
-use std::{cell::RefCell, fmt, net::SocketAddr, rc::Rc, str};
+use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
 
 use mio::{net::TcpStream, Token};
 use time::{Duration, Instant};
@@ -268,6 +267,14 @@ pub trait ProxySession {
     fn shutting_down(&mut self);
 }
 
+pub trait ListenerHandler {
+    fn get_addr(&self) -> &SocketAddr;
+
+    fn get_tags(&self, key: &str) -> Option<&BTreeMap<String, String>>;
+
+    fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BackendConnectionStatus {
     NotConnected,
@@ -305,6 +312,7 @@ pub trait ProxyConfiguration<Session> {
         token: ListenToken,
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
+        // should we insert the tags here?
     ) -> Result<(), AcceptError>;
 }
 

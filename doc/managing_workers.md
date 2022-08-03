@@ -65,7 +65,7 @@ For instance, loading a new state implies to:
 
 -   parse a state file to derive instructions from it
 -   send ALL instructions to ALL workers
--   wait for ALL workers to reply
+-   wait for ALL workers to reply
 
 Blocking the main thread is unthinkable. Therefore, Sōzu detaches threads by doing, for instance:
 

@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 
 use mio::net::*;
 use mio::*;
@@ -6,10 +6,11 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
+    protocol::http::OptionalString,
     socket::{SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
-    {LogDuration, Protocol}, {Readiness, SessionMetrics, SessionResult},
+    ListenerHandler, LogDuration, Protocol, {Readiness, SessionMetrics, SessionResult},
 };
 
 #[derive(PartialEq)]
@@ -26,10 +27,10 @@ enum ConnectionStatus {
     Closed,
 }
 
-pub struct Pipe<Front: SocketHandler> {
+pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     pub frontend: Front,
-    backend: Option<TcpStream>,
     frontend_token: Token,
+    backend: Option<TcpStream>,
     backend_token: Option<Token>,
     pub front_buf: Checkout,
     back_buf: Checkout,
@@ -46,9 +47,10 @@ pub struct Pipe<Front: SocketHandler> {
     backend_status: ConnectionStatus,
     pub front_timeout: Option<TimeoutContainer>,
     pub back_timeout: Option<TimeoutContainer>,
+    pub listener: Rc<RefCell<L>>,
 }
 
-impl<Front: SocketHandler> Pipe<Front> {
+impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     pub fn new(
         frontend: Front,
         frontend_token: Token,
@@ -61,7 +63,8 @@ impl<Front: SocketHandler> Pipe<Front> {
         back_buf: Checkout,
         session_address: Option<SocketAddr>,
         protocol: Protocol,
-    ) -> Pipe<Front> {
+        listener: Rc<RefCell<L>>,
+    ) -> Pipe<Front, L> {
         let log_ctx = format!(
             "{} {} {}\t",
             &request_id,
@@ -101,6 +104,7 @@ impl<Front: SocketHandler> Pipe<Front> {
             backend_status,
             front_timeout: None,
             back_timeout: None,
+            listener,
         };
 
         trace!("created pipe");
@@ -244,7 +248,7 @@ impl<Front: SocketHandler> Pipe<Front> {
     }
 
     pub fn log_request_success(&self, metrics: &SessionMetrics) {
-        let session = match self.get_session_address() {
+        let session_addr = match self.get_session_address() {
             None => String::from("-"),
             Some(SocketAddr::V4(addr)) => format!("{}", addr),
             Some(SocketAddr::V6(addr)) => format!("{}", addr),
@@ -280,16 +284,26 @@ impl<Front: SocketHandler> Pipe<Front> {
         }
 
         let proto = self.protocol_string();
+        let listener = self.listener.borrow();
+        let tags = listener
+            .get_tags(&listener.get_addr().to_string())
+            .map(|tags| {
+                tags.iter()
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
 
         info_access!(
-            "{}{} -> {}\t{} {} {} {}\t{} {}",
+            "{}{} -> {}\t{} {} {} {}\t{}\t{} {}",
             self.log_ctx,
-            session,
+            session_addr,
             backend,
             LogDuration(response_time),
             LogDuration(service_time),
             metrics.bin,
             metrics.bout,
+            OptionalString::from(tags.as_ref()),
             proto,
             self.websocket_context.as_deref().unwrap_or("-")
         );
@@ -740,7 +754,7 @@ impl<Front: SocketHandler> Pipe<Front> {
     }
 }
 
-impl<Front: SocketHandler> std::ops::Drop for Pipe<Front> {
+impl<Front: SocketHandler, L: ListenerHandler> std::ops::Drop for Pipe<Front, L> {
     fn drop(&mut self) {
         match self.protocol {
             Protocol::TCP => {}

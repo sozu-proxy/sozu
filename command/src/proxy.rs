@@ -387,6 +387,7 @@ pub struct HttpFrontend {
     pub method: Option<String>,
     #[serde(default)]
     pub position: RulePosition,
+    pub tags: Option<BTreeMap<String, String>>,
 }
 
 impl Ord for HttpFrontend {
@@ -450,6 +451,7 @@ pub struct ReplaceCertificate {
 pub struct TcpFrontend {
     pub cluster_id: String,
     pub address: SocketAddr,
+    pub tags: Option<BTreeMap<String, String>>,
 }
 
 impl Ord for TcpFrontend {
@@ -1076,13 +1078,14 @@ mod tests {
                     method: None,
                     address: "127.0.0.1:4242".parse().unwrap(),
                     position: RulePosition::Tree,
+                    tags: None,
                 })
         );
     }
 
     #[test]
     fn remove_front_test() {
-        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242"}}"#;
+        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: ProxyRequestData =
             serde_json::from_str(raw_json).expect("could not parse json");
         println!("{:?}", command);
@@ -1095,6 +1098,10 @@ mod tests {
                     method: None,
                     address: "127.0.0.1:4242".parse().unwrap(),
                     position: RulePosition::Tree,
+                    tags: Some(BTreeMap::from([
+                        ("owner".to_owned(), "John".to_owned()),
+                        ("id".to_owned(), "some-long-id".to_owned())
+                    ])),
                 })
         );
     }
@@ -1112,10 +1119,7 @@ mod tests {
                     backend_id: String::from("xxx-0"),
                     address: "0.0.0.0:8080".parse().unwrap(),
                     sticky_id: None,
-                    load_balancing_parameters: Some(LoadBalancingParams {
-                        weight: 0,
-                        ..Default::default()
-                    }),
+                    load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
                     backup: None,
                 })
         );
@@ -1139,7 +1143,7 @@ mod tests {
 
     #[test]
     fn http_front_crash_test() {
-        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242"}}"#;
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: ProxyRequestData =
             serde_json::from_str(raw_json).expect("could not parse json");
         println!("{:?}", command);
@@ -1152,6 +1156,10 @@ mod tests {
                     method: None,
                     address: "127.0.0.1:4242".parse().unwrap(),
                     position: RulePosition::Tree,
+                    tags: Some(BTreeMap::from([
+                        ("owner".to_owned(), "John".to_owned()),
+                        ("id".to_owned(), "some-long-id".to_owned())
+                    ])),
                 })
         );
     }
@@ -1170,6 +1178,7 @@ mod tests {
                     method: None,
                     address: "127.0.0.1:4242".parse().unwrap(),
                     position: RulePosition::Tree,
+                    tags: None,
                 }
         );
     }

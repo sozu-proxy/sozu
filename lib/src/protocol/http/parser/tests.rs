@@ -1927,7 +1927,7 @@ mod bench {
                 if position >= data.len() {
                     break;
                 }
-                //println!("pos: {}, len: {}, state: {:?}, remaining:\n{}", position, data.len(), current_state, (&data[position..]).to_hex(16));
+                //println!("pos: {}, len: {}, state: {:?}, remaining:\n{}", position, data.len(), current_state, (&data[position..]).to_hex(16));
             }
         });
     }

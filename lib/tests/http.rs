@@ -84,6 +84,7 @@ fn test() {
         path: PathRule::Prefix(String::from("/")),
         method: None,
         position: RulePosition::Tree,
+        tags: None,
     };
 
     command.write_message(&proxy::ProxyRequest {
@@ -349,6 +350,6 @@ fn start_server(port: u16, barrier: Arc<Barrier>) {
             eprintln!("server session stopped");
         }
 
-        eprintln!("server on port {} closed", port);
+        eprintln!("server on port {} closed", port);
     });
 }

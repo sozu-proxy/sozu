@@ -55,6 +55,7 @@ fn main() {
         path: PathRule::Prefix(String::from("/")),
         method: None,
         position: RulePosition::Tree,
+        tags: None,
     };
 
     let http_backend = proxy::Backend {
@@ -133,6 +134,7 @@ fn main() {
         path: PathRule::Prefix(String::from("/")),
         method: None,
         position: RulePosition::Tree,
+        tags: None,
     };
 
     command2.write_message(&proxy::ProxyRequest {
@@ -180,6 +182,7 @@ fn main() {
         path: PathRule::Prefix(String::from("/")),
         method: None,
         position: RulePosition::Tree,
+        tags: None,
     };
 
     command2.write_message(&proxy::ProxyRequest {
