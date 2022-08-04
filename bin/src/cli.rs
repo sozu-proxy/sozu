@@ -267,7 +267,7 @@ pub enum ApplicationCmd {
         id: String,
         #[clap(short = 's', long = "sticky-session")]
         sticky_session: bool,
-        #[clap(short = 'h', long = "https-redirect")]
+        #[clap(short = 'r', long = "https-redirect")]
         https_redirect: bool,
         #[clap(
             long = "send-proxy",
@@ -397,7 +397,7 @@ pub enum HttpFrontendCmd {
         path_begin: Option<String>,
         #[clap(short = 'm', long = "method", help = "HTTP method")]
         method: Option<String>,
-        #[clap(short = 't', long = "tag", help = "custom tags", parse(try_from_str = parse_tags))]
+        #[clap(long = "tag", help = "custom tags", parse(try_from_str = parse_tags))]
         tags: Option<BTreeMap<String, String>>,
     },
     #[clap(name = "remove")]
@@ -416,7 +416,7 @@ pub enum HttpFrontendCmd {
         path_begin: Option<String>,
         #[clap(short = 'm', long = "method", help = "HTTP method")]
         method: Option<String>,
-        #[clap(short = 't', long = "tag", help = "custom tags", parse(try_from_str = parse_tags))]
+        #[clap(long = "tag", help = "custom tags", parse(try_from_str = parse_tags))]
         tags: Option<BTreeMap<String, String>>,
     },
 }
@@ -433,7 +433,7 @@ pub enum TcpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
-        #[clap(short = 't', long = "tag", help = "custom tags",  parse(try_from_str = parse_tags))]
+        #[clap(long = "tag", help = "custom tags",  parse(try_from_str = parse_tags))]
         tags: Option<BTreeMap<String, String>>,
     },
     #[clap(name = "remove")]
@@ -446,7 +446,7 @@ pub enum TcpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
-        #[clap(short = 't', long = "tag", help = "custom tags", parse(try_from_str = parse_tags))]
+        #[clap(long = "tag", help = "custom tags", parse(try_from_str = parse_tags))]
         tags: Option<BTreeMap<String, String>>,
     },
 }
