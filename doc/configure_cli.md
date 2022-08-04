@@ -9,7 +9,7 @@ You can specify its path by adding to your `config.toml`:
 command_socket = "path/to/your/command_folder/sock"
 ```
 
-## Add application with http frontend
+## Add an application with an http frontend
 
 First you need to create a new application with an id and a load balancing policy (roundrobin or random):
 
@@ -27,6 +27,12 @@ Then you need to add a backend:
 
 ```bash
 sozu --config /etc/sozu/config.toml backend add --address 127.0.0.1:3000 --backend-id <my_backend_id> --id <my_application_id>
+```
+
+And an http listener:
+
+```bash
+sozu --config /etc/sozu/config.toml listener http add --address 0.0.0.0:80
 ```
 
 Finally you have to create a frontend to allow sozu to send traffic from the listener to your backend:
@@ -48,7 +54,7 @@ sozu --config /etc/sozu/config.toml status
 It will show global statistics about sozu, workers and applications metrics.
 
 ```bash
-sozu --config /etc/sozu/config.toml metrics
+sozu --config /etc/sozu/config.toml query metrics
 ```
 
 ## Dump and restore state
