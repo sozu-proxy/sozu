@@ -91,11 +91,11 @@ impl CommandManager {
                     tags,
                 }))
             }
-            TcpFrontendCmd::Remove { id, address, tags } => {
+            TcpFrontendCmd::Remove { id, address } => {
                 self.order_command(ProxyRequestData::RemoveTcpFrontend(TcpFrontend {
                     cluster_id: id,
                     address,
-                    tags,
+                    tags: None,
                 }))
             }
         }
@@ -126,7 +126,6 @@ impl CommandManager {
                 address,
                 method,
                 route,
-                tags,
             } => self.order_command(ProxyRequestData::RemoveHttpFrontend(HttpFrontend {
                 route: route.into(),
                 address,
@@ -134,7 +133,7 @@ impl CommandManager {
                 path: PathRule::Prefix(path_begin.unwrap_or_else(|| "".to_string())),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
-                tags,
+                tags: None,
             })),
         }
     }
@@ -163,7 +162,6 @@ impl CommandManager {
                 address,
                 method,
                 route,
-                tags,
             } => self.order_command(ProxyRequestData::RemoveHttpsFrontend(HttpFrontend {
                 route: route.into(),
                 address,
@@ -171,7 +169,7 @@ impl CommandManager {
                 path: PathRule::Prefix(path_begin.unwrap_or_else(|| "".to_string())),
                 method: method.map(String::from),
                 position: RulePosition::Tree,
-                tags,
+                tags: None,
             })),
         }
     }
