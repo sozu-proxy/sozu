@@ -568,11 +568,11 @@ impl CommandManager {
                 println!("Proxy is processing: {}", message.message);
             }
             CommandStatus::Error => {
-                bail!("could not stop the proxy: {}", message.message);
+                bail!("Error with metrics command: {}", message.message);
             }
             CommandStatus::Ok => {
                 if &id == &message.id {
-                    println!("Successfully stopped the proxy");
+                    println!("Successfull metrics command: {}", message.message);
                 }
             }
         }

@@ -31,7 +31,8 @@ use sozu_command_lib::{
     },
     config::Config,
     proxy::{
-        ProxyRequest, ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus,
+        MetricsConfiguration, ProxyRequest, ProxyRequestData, ProxyResponse, ProxyResponseData,
+        ProxyResponseStatus,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -115,6 +116,7 @@ pub enum Success {
     ListWorkers(CommandResponseData),
     LoadState(String, usize, usize), // state path, oks, errors
     Logging(String),                 // new logging level
+    Metrics(MetricsConfiguration),   // enable / disable / clear metrics on the proxy
     MasterStop,
     // this should contain CommandResponseData but the logic does not return anything
     // is this logic gone into sozu_command_lib::proxy::Query::Metrics(_) ?
@@ -155,6 +157,9 @@ impl std::fmt::Display for Success {
                 "Successfully set the logging level to {}",
                 logging_filter
             ),
+            Self::Metrics(metrics_cfg) => {
+                write!(f, "Successfully set the metrics to {:?}", metrics_cfg)
+            }
             Self::MasterStop => write!(f, "stopping main process"),
             // Self::Metrics => write!(f, "Successfully fetched the metrics"),
             Self::NotifiedClient(id) => {
