@@ -182,6 +182,7 @@ impl LocalDrain {
         debug!("query: {:?}", q);
         match q {
             QueryMetricsType::List => {
+                debug!("Here are the metrics keys: {:?}", self.metrics.keys());
                 QueryAnswerMetrics::List(self.metrics.keys().cloned().collect())
             }
             QueryMetricsType::Cluster {

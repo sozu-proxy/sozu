@@ -745,11 +745,16 @@ pub enum QueryCmd {
         #[clap(
             short = 'k',
             long = "clusters",
-            help = "list of cluster ids",
+            help = "list of cluster ids (= application id)",
             use_delimiter = true
         )]
         clusters: Vec<String>,
-        #[clap(short = 'b', long="backends", help="list of backend ids", use_delimiter = true, parse(try_from_str = split_slash))]
+        #[clap(
+            short = 'b',
+            long="backends",
+            help="list of backends, in the form 'cluster_id/backend_id, other_cluster/other_backend'",
+            use_delimiter = true,
+            parse(try_from_str = split_slash))]
         backends: Vec<(String, String)>,
     },
 }
@@ -761,7 +766,7 @@ fn split_slash(input: &str) -> Result<(String, String), String> {
         Ok((cluster, backend))
     } else {
         Err(format!(
-            "could not split cluster id and backend id in {}",
+            "could not split cluster id and backend id in '{}', they must have the form 'cluster_id/backend_id'",
             input
         ))
     }

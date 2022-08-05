@@ -77,6 +77,7 @@ pub fn print_metrics(
     list: bool,
 ) -> anyhow::Result<()> {
     if json {
+        println!("Here are the metrics, per worker");
         return print_json_response(&answers);
     }
 

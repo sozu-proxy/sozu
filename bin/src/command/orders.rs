@@ -935,6 +935,8 @@ impl CommandServer {
         request_identifier: RequestIdentifier,
         query: Query,
     ) -> anyhow::Result<Option<Success>> {
+
+        debug!("Received this query: {:?}", query);
         let (query_tx, mut query_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self

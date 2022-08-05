@@ -877,9 +877,9 @@ impl Server {
                         }
                     }
                 }
-                Query::Metrics(q) => {
+                Query::Metrics(query_metrics_type) => {
                     METRICS.with(|metrics| {
-                        let data = (*metrics.borrow_mut()).query(q);
+                        let data = (*metrics.borrow_mut()).query(query_metrics_type);
 
                         push_queue(ProxyResponse {
                             id: message.id.clone(),
