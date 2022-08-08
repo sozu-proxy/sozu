@@ -1,10 +1,11 @@
 use std::{
+    io::{IoSlice, IoSliceMut},
     net::SocketAddr,
     os::unix::{
         io::{FromRawFd, IntoRawFd, RawFd},
         net,
     },
-    str::from_utf8, io::{IoSlice, IoSliceMut},
+    str::from_utf8,
 };
 
 use mio::net::TcpListener;

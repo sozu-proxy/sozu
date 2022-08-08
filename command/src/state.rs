@@ -1,9 +1,12 @@
 use std::{
     collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet},
+    fmt,
     hash::{Hash, Hasher},
     iter::{repeat, FromIterator},
     net::SocketAddr,
 };
+
+use serde::de::{self, Visitor};
 
 use crate::{
     certificate::calculate_fingerprint,
@@ -55,20 +58,8 @@ pub struct ConfigState {
 }
 
 impl ConfigState {
-    pub fn new() -> ConfigState {
-        ConfigState {
-            clusters: BTreeMap::new(),
-            backends: BTreeMap::new(),
-            http_listeners: HashMap::new(),
-            https_listeners: HashMap::new(),
-            tcp_listeners: HashMap::new(),
-            http_fronts: BTreeMap::new(),
-            https_fronts: BTreeMap::new(),
-            tcp_fronts: HashMap::new(),
-            certificates: HashMap::new(),
-            http_addresses: Vec::new(),
-            https_addresses: Vec::new(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn add_http_address(&mut self, address: SocketAddr) {
@@ -1579,7 +1570,10 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// `RouteKey` is a the routing key built from the following tuple.
+/// The tuple is made of (socket address, hostname, path, method).
+// TODO: Create a custom type for the hostname and use a common type for the method.
+#[derive(PartialOrd, Ord, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteKey(pub SocketAddr, pub String, pub PathRule, pub Option<String>);
 
 impl serde::Serialize for RouteKey {
@@ -1601,33 +1595,17 @@ impl serde::Serialize for RouteKey {
     }
 }
 
-//FIXME: custom ordering implementation for now, as libstd will implement PartialOrd and Ord for SocketAddr from rust 1.45.0
-use std::cmp::{Ord, Ordering, PartialOrd};
-impl PartialOrd for RouteKey {
-    fn partial_cmp(&self, other: &RouteKey) -> Option<Ordering> {
-        Some(self.cmp(other))
+impl From<HttpFrontend> for RouteKey {
+    fn from(frontend: HttpFrontend) -> Self {
+        Self(
+            frontend.address,
+            frontend.hostname,
+            frontend.path,
+            frontend.method,
+        )
     }
 }
 
-impl Ord for RouteKey {
-    fn cmp(&self, other: &RouteKey) -> Ordering {
-        let order = match (self.0, other.0) {
-            (SocketAddr::V4(_), SocketAddr::V6(_)) => Ordering::Less,
-            (SocketAddr::V6(_), SocketAddr::V4(_)) => Ordering::Greater,
-            (SocketAddr::V4(s), SocketAddr::V4(o)) => {
-                s.ip().cmp(o.ip()).then(s.port().cmp(&o.port()))
-            }
-            (SocketAddr::V6(s), SocketAddr::V6(o)) => {
-                s.ip().cmp(o.ip()).then(s.port().cmp(&o.port()))
-            }
-        };
-
-        order.then(self.1.cmp(&other.1)).then(self.2.cmp(&other.2))
-    }
-}
-
-use serde::de::{self, Visitor};
-use std::fmt;
 struct RouteKeyVisitor {}
 
 impl<'de> Visitor<'de> for RouteKeyVisitor {

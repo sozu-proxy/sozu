@@ -597,10 +597,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             self.get_request_line()
                 .map(|line| (&line.method, line.uri.as_str())),
         );
-        let status_line = OptionalStatus::new(
-            self.get_response_status()
-                .map(|line| line.status),
-        );
+        let status_line = OptionalStatus::new(self.get_response_status().map(|line| line.status));
 
         let response_time = metrics.response_time();
         let service_time = metrics.service_time();
@@ -671,7 +668,9 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
         let status_line = match self.status {
             SessionStatus::Normal => OptionalStatus::new(None),
-            SessionStatus::DefaultAnswer(answers, _, _) => OptionalStatus::new(Some(answers.into())),
+            SessionStatus::DefaultAnswer(answers, _, _) => {
+                OptionalStatus::new(Some(answers.into()))
+            }
         };
 
         let host = OptionalString::new(self.get_host());
@@ -744,11 +743,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             self.get_request_line()
                 .map(|line| (&line.method, line.uri.as_str())),
         );
-        let status_line = OptionalStatus::new(
-            self.get_response_status()
-                .as_ref()
-                .map(|line| line.status),
-        );
+        let status_line =
+            OptionalStatus::new(self.get_response_status().as_ref().map(|line| line.status));
 
         let response_time = metrics.response_time();
         let service_time = metrics.service_time();
