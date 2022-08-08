@@ -1324,9 +1324,7 @@ impl Config {
 
         let stringified_path = saved_state_path_raw
             .to_str()
-            .ok_or_else(|| anyhow::Error::msg(
-                "Unvalid character format, expected UTF8",
-            ))?
+            .ok_or_else(|| anyhow::Error::msg("Unvalid character format, expected UTF8"))?
             .to_string();
 
         Ok(Some(stringified_path))

@@ -14,7 +14,7 @@ use serde::{
     de::{self, Visitor},
 };
 
-use crate::config::ProxyProtocolConfig;
+use crate::{config::ProxyProtocolConfig, state::RouteKey};
 
 pub type MessageId = String;
 
@@ -371,10 +371,11 @@ impl std::fmt::Display for PathRule {
 pub enum Route {
     // send a 401 default answer
     Deny,
+    // TODO: create a custom type `ClusterId`
     ClusterId(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpFrontend {
     pub route: Route,
     pub address: SocketAddr,
@@ -390,21 +391,18 @@ pub struct HttpFrontend {
     pub tags: Option<BTreeMap<String, String>>,
 }
 
-impl Ord for HttpFrontend {
-    fn cmp(&self, o: &HttpFrontend) -> Ordering {
-        self.route
-            .cmp(&o.route)
-            .then(self.hostname.cmp(&o.hostname))
-            .then(self.path.cmp(&o.path))
-            .then(self.method.cmp(&o.method))
-            .then(socketaddr_cmp(&self.address, &o.address))
-            .then(self.position.cmp(&o.position))
+impl HttpFrontend {
+    /// `is_cluster_id` chech if the frontend is dedicated to the given cluster_id
+    pub fn is_cluster_id(&self, cluster_id: &str) -> bool {
+        match &self.route {
+            Route::ClusterId(id) if id == cluster_id => true,
+            _ => false,
+        }
     }
-}
 
-impl PartialOrd for HttpFrontend {
-    fn partial_cmp(&self, other: &HttpFrontend) -> Option<Ordering> {
-        Some(self.cmp(other))
+    /// `route_key` returns a representation of the frontend as a route key
+    pub fn route_key(self) -> RouteKey {
+        self.into()
     }
 }
 
@@ -447,25 +445,11 @@ pub struct ReplaceCertificate {
     pub new_expired_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TcpFrontend {
     pub cluster_id: String,
     pub address: SocketAddr,
     pub tags: Option<BTreeMap<String, String>>,
-}
-
-impl Ord for TcpFrontend {
-    fn cmp(&self, o: &TcpFrontend) -> Ordering {
-        self.cluster_id
-            .cmp(&o.cluster_id)
-            .then(socketaddr_cmp(&self.address, &o.address))
-    }
-}
-
-impl PartialOrd for TcpFrontend {
-    fn partial_cmp(&self, other: &TcpFrontend) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
