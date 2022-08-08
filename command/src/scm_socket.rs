@@ -4,11 +4,11 @@ use std::{
         io::{FromRawFd, IntoRawFd, RawFd},
         net,
     },
-    str::from_utf8,
+    str::from_utf8, io::{IoSlice, IoSliceMut},
 };
 
 use mio::net::TcpListener;
-use nix::{cmsg_space, sys::socket, sys::uio, Result as NixResult};
+use nix::{cmsg_space, sys::socket, Result as NixResult};
 use serde_json;
 
 pub const MAX_FDS_OUT: usize = 200;
@@ -133,8 +133,8 @@ impl ScmSocket {
         }
     }
 
-    pub fn send_msg(&self, bytes: &[u8], fds: &[RawFd]) -> NixResult<()> {
-        let iov = [uio::IoVec::from_slice(bytes)];
+    pub fn send_msg(&self, buf: &[u8], fds: &[RawFd]) -> NixResult<()> {
+        let iov = [IoSlice::new(buf)];
         let flags = if self.blocking {
             socket::MsgFlags::empty()
         } else {
@@ -144,17 +144,17 @@ impl ScmSocket {
         if !fds.is_empty() {
             let cmsgs = [socket::ControlMessage::ScmRights(fds)];
             //println!("{} send with data", self.fd);
-            socket::sendmsg(self.fd, &iov, &cmsgs, flags, None)?;
+            socket::sendmsg::<()>(self.fd, &iov, &cmsgs, flags, None)?;
         } else {
             //println!("{} send empty", self.fd);
-            socket::sendmsg(self.fd, &iov, &[], flags, None)?;
+            socket::sendmsg::<()>(self.fd, &iov, &[], flags, None)?;
         };
         Ok(())
     }
 
-    pub fn rcv_msg(&self, buffer: &mut [u8], fds: &mut [RawFd]) -> NixResult<(usize, usize)> {
+    pub fn rcv_msg(&self, buf: &mut [u8], fds: &mut [RawFd]) -> NixResult<(usize, usize)> {
         let mut cmsg = cmsg_space!([RawFd; MAX_FDS_OUT]);
-        let iov = [uio::IoVec::from_mut_slice(buffer)];
+        let mut iov = [IoSliceMut::new(buf)];
 
         let flags = if self.blocking {
             socket::MsgFlags::empty()
@@ -163,7 +163,7 @@ impl ScmSocket {
         };
 
         //let msg = socket::recvmsg(self.fd, &iov[..], Some(&mut cmsg), socket::MSG_DONTWAIT)?;
-        let msg = socket::recvmsg(self.fd, &iov[..], Some(&mut cmsg), flags)?;
+        let msg = socket::recvmsg::<()>(self.fd, &mut iov[..], Some(&mut cmsg), flags)?;
 
         let mut fd_count = 0;
         let received_fds = msg
