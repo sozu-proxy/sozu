@@ -15,7 +15,7 @@ use sozu_command_lib::{
 
 use crate::{
     cli::{
-        ApplicationCmd, BackendCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd,
+        ClusterCmd, BackendCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd,
         LoggingLevel, TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
@@ -50,9 +50,9 @@ impl CommandManager {
         }
     }
 
-    pub fn application_command(&mut self, cmd: ApplicationCmd) -> Result<(), anyhow::Error> {
+    pub fn cluster_command(&mut self, cmd: ClusterCmd) -> Result<(), anyhow::Error> {
         match cmd {
-            ApplicationCmd::Add {
+            ClusterCmd::Add {
                 id,
                 sticky_session,
                 https_redirect,
@@ -76,7 +76,7 @@ impl CommandManager {
                     answer_503: None,
                 }))
             }
-            ApplicationCmd::Remove { id } => {
+            ClusterCmd::Remove { id } => {
                 self.order_command(ProxyRequestData::RemoveCluster { cluster_id: id })
             }
         }

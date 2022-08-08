@@ -598,7 +598,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         SessionResult::Continue
     }
 
-    // Forward content to application
+    // Forward content to cluster
     pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         trace!("pipe back_writable");
 
@@ -678,7 +678,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         SessionResult::Continue
     }
 
-    // Read content from application
+    // Read content from cluster
     pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.reset_timeouts();
 

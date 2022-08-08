@@ -959,7 +959,7 @@ impl Session {
             .borrow()
             .clusters
             .get(&cluster_id)
-            .map(|app| app.https_redirect)
+            .map(|cluster| cluster.https_redirect)
             .unwrap_or(false);
         if front_should_redirect_https {
             let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, uri);
@@ -992,7 +992,7 @@ impl Session {
                 .backend_from_sticky_session(cluster_id, sticky_session)
                 .map_err(|e| {
                     debug!(
-                        "Couldn't find a backend corresponding to sticky_session {} for app {}",
+                        "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
                         sticky_session, cluster_id
                     );
                     e
@@ -1104,7 +1104,7 @@ impl Session {
             .borrow()
             .clusters
             .get(&cluster_id)
-            .map(|app| app.sticky_session)
+            .map(|cluster| cluster.sticky_session)
             .unwrap_or(false);
 
         let mut socket = self.backend_from_request(&cluster_id, front_should_stick)?;
@@ -1940,7 +1940,7 @@ mod tests {
         });
 
         let front = HttpFrontend {
-            route: Route::ClusterId(String::from("app_1")),
+            route: Route::ClusterId(String::from("cluster_1")),
             address: "127.0.0.1:1024".parse().unwrap(),
             hostname: String::from("localhost"),
             path: PathRule::Prefix(String::from("/")),
@@ -1953,8 +1953,8 @@ mod tests {
             order: ProxyRequestData::AddHttpFrontend(front),
         });
         let backend = Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-0"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1025".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
@@ -2024,7 +2024,7 @@ mod tests {
         });
 
         let front = HttpFrontend {
-            route: Route::ClusterId(String::from("app_1")),
+            route: Route::ClusterId(String::from("cluster_1")),
             address: "127.0.0.1:1031".parse().unwrap(),
             hostname: String::from("localhost"),
             path: PathRule::Prefix(String::from("/")),
@@ -2037,8 +2037,8 @@ mod tests {
             order: ProxyRequestData::AddHttpFrontend(front),
         });
         let backend = Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-0"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1028".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
@@ -2133,7 +2133,7 @@ mod tests {
         });
 
         let cluster = Cluster {
-            cluster_id: String::from("app_1"),
+            cluster_id: String::from("cluster_1"),
             sticky_session: false,
             https_redirect: true,
             proxy_protocol: None,
@@ -2146,7 +2146,7 @@ mod tests {
             order: ProxyRequestData::AddCluster(cluster),
         });
         let front = HttpFrontend {
-            route: Route::ClusterId(String::from("app_1")),
+            route: Route::ClusterId(String::from("cluster_1")),
             address: "127.0.0.1:1041".parse().unwrap(),
             hostname: String::from("localhost"),
             path: PathRule::Prefix(String::from("/")),
@@ -2159,8 +2159,8 @@ mod tests {
             order: ProxyRequestData::AddHttpFrontend(front),
         });
         let backend = Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-0"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1040".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
@@ -2239,9 +2239,9 @@ mod tests {
 
     #[test]
     fn frontend_from_request_test() {
-        let cluster_id1 = "app_1".to_owned();
-        let cluster_id2 = "app_2".to_owned();
-        let cluster_id3 = "app_3".to_owned();
+        let cluster_id1 = "cluster_1".to_owned();
+        let cluster_id2 = "cluster_2".to_owned();
+        let cluster_id3 = "cluster_3".to_owned();
         let uri1 = "/".to_owned();
         let uri2 = "/yolo".to_owned();
         let uri3 = "/yolo/swag".to_owned();
@@ -2275,7 +2275,7 @@ mod tests {
             tags: None,
         });
         fronts.add_http_front(HttpFrontend {
-            route: Route::ClusterId("app_1".to_owned()),
+            route: Route::ClusterId("cluster_1".to_owned()),
             address: "0.0.0.0:80".parse().unwrap(),
             hostname: "other.domain".to_owned(),
             path: PathRule::Prefix("/test".to_owned()),
@@ -2307,19 +2307,19 @@ mod tests {
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
         assert_eq!(
             frontend1.expect("should find frontend"),
-            Route::ClusterId("app_1".to_string())
+            Route::ClusterId("cluster_1".to_string())
         );
         assert_eq!(
             frontend2.expect("should find frontend"),
-            Route::ClusterId("app_1".to_string())
+            Route::ClusterId("cluster_1".to_string())
         );
         assert_eq!(
             frontend3.expect("should find frontend"),
-            Route::ClusterId("app_2".to_string())
+            Route::ClusterId("cluster_2".to_string())
         );
         assert_eq!(
             frontend4.expect("should find frontend"),
-            Route::ClusterId("app_3".to_string())
+            Route::ClusterId("cluster_3".to_string())
         );
         assert_eq!(frontend5, None);
     }

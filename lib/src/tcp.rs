@@ -837,7 +837,7 @@ impl Session {
             .cluster_id
             .is_none()
         {
-            error!("no TCP application corresponds to that front address");
+            error!("no TCP cluster corresponds to that front address");
             return Err(ConnectionError::HostNotFound);
         }
 
@@ -1387,7 +1387,7 @@ impl ProxyConfiguration<Session> for Proxy {
             if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
                 if owned.cluster_id.is_none() {
                     error!(
-                        "listener at address {:?} has no linked application",
+                        "listener at address {:?} has no linked cluster",
                         owned.address
                     );
                     return Err(AcceptError::IoError);

@@ -1334,7 +1334,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         }
     }
 
-    // Forward content to application
+    // Forward content to cluster
     pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         if let SessionStatus::DefaultAnswer(_, _, _) = self.status {
             error!(
@@ -1499,7 +1499,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         }
     }
 
-    // Read content from application
+    // Read content from cluster
     pub fn back_readable(
         &mut self,
         metrics: &mut SessionMetrics,
@@ -1831,7 +1831,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                 }
                 TimeoutStatus::Response => {
                     error!(
-                        "backend {:?} timeout while receiving response (application {:?})",
+                        "backend {:?} timeout while receiving response (cluster {:?})",
                         self.backend_id, self.cluster_id
                     );
                     SessionResult::CloseSession

@@ -41,7 +41,7 @@
 //!
 //! Once the thread is launched, the proxy will start its event loop and handle
 //! events on the listening interface and port specified in the configuration
-//! object. Since no applications to proxy for were specified, it will receive
+//! object. Since no clusters were specified for the proxy, it will receive
 //! the connections, parse the request, then send a default (but configurable)
 //! answer.
 //!
@@ -71,7 +71,7 @@
 //! println!("HTTP -> {:?}", command.read_message());
 //! ```
 //!
-//! An application is identified by its `cluster_id`, a string that will be shared
+//! A cluster is identified by its `cluster_id`, a string that will be shared
 //! between one or multiple "fronts", and one or multiple "backends".
 //!
 //! A "front" is a way to recognize a request and match it to an `cluster_id`,
@@ -79,7 +79,7 @@
 //!
 //! A backend corresponds to one backend server, indicated by its IP and port.
 //!
-//! An application can have multiple backend servers, and they can be added or
+//! A cluster can have multiple backend servers, and they can be added or
 //! removed while the proxy is running. If a backend is removed from the configuration
 //! while the proxy is handling a request to that server, it will finish that
 //! request and stop sending new traffic to that server.

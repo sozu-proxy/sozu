@@ -24,10 +24,10 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proxy::{
         MetricsConfiguration, ProxyRequest, ProxyRequestData, ProxyResponseData,
-        ProxyResponseStatus, Query, QueryAnswer, QueryApplicationType, Route, TcpFrontend,
+        ProxyResponseStatus, Query, QueryAnswer, QueryClusterType, Route, TcpFrontend,
     },
     scm_socket::Listeners,
-    state::get_application_ids_by_domain,
+    state::get_cluster_ids_by_domain,
 };
 
 use crate::{
@@ -942,23 +942,23 @@ impl CommandServer {
 
         let mut main_query_answer = None;
         match &query {
-            &Query::ApplicationsHashes => {
-                main_query_answer = Some(QueryAnswer::ApplicationsHashes(self.state.hash_state()));
+            &Query::ClustersHashes => {
+                main_query_answer = Some(QueryAnswer::ClustersHashes(self.state.hash_state()));
             }
-            &Query::Applications(ref query_type) => {
-                main_query_answer = Some(QueryAnswer::Applications(match query_type {
-                    QueryApplicationType::ClusterId(ref cluster_id) => {
-                        vec![self.state.application_state(cluster_id)]
+            &Query::Clusters(ref query_type) => {
+                main_query_answer = Some(QueryAnswer::Clusters(match query_type {
+                    QueryClusterType::ClusterId(ref cluster_id) => {
+                        vec![self.state.cluster_state(cluster_id)]
                     }
-                    QueryApplicationType::Domain(ref domain) => {
-                        let cluster_ids = get_application_ids_by_domain(
+                    QueryClusterType::Domain(ref domain) => {
+                        let cluster_ids = get_cluster_ids_by_domain(
                             &self.state,
                             domain.hostname.clone(),
                             domain.path.clone(),
                         );
                         cluster_ids
                             .iter()
-                            .map(|ref cluster_id| self.state.application_state(cluster_id))
+                            .map(|ref cluster_id| self.state.cluster_state(cluster_id))
                             .collect()
                     }
                 }));
@@ -1008,7 +1008,7 @@ impl CommandServer {
                 .collect();
 
             let success = match &query {
-                &Query::ApplicationsHashes | &Query::Applications(_) => {
+                &Query::ClustersHashes | &Query::Clusters(_) => {
                     let main = main_query_answer.unwrap();
                     query_answers_map.insert(String::from("main"), main);
                     Success::Query(CommandResponseData::Query(query_answers_map))

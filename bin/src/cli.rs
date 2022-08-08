@@ -132,7 +132,7 @@ pub enum SubCmd {
     },
     #[clap(
         name = "reload",
-        about = "Reloads routing configuration (applications, frontends and backends)"
+        about = "Reloads routing configuration (clusters, frontends and backends)"
     )]
     Reload {
         #[clap(
@@ -148,10 +148,10 @@ pub enum SubCmd {
         )]
         json: bool,
     },
-    #[clap(name = "application", about = "application management")]
-    Application {
+    #[clap(name = "cluster", about = "cluster management")]
+    Cluster {
         #[clap(subcommand)]
-        cmd: ApplicationCmd,
+        cmd: ClusterCmd,
     },
     #[clap(name = "backend", about = "backend management")]
     Backend {
@@ -255,15 +255,15 @@ pub enum StateCmd {
 }
 
 #[derive(Subcommand, PartialEq, Clone, Debug)]
-pub enum ApplicationCmd {
-    #[clap(name = "remove", about = "Remove an application")]
+pub enum ClusterCmd {
+    #[clap(name = "remove", about = "Remove a cluster")]
     Remove {
-        #[clap(short = 'i', long = "id")]
+        #[clap(short = 'i', long = "id", help = "cluster id")]
         id: String,
     },
-    #[clap(name = "add", about = "Add an application")]
+    #[clap(name = "add", about = "Add a cluster")]
     Add {
-        #[clap(short = 'i', long = "id")]
+        #[clap(short = 'i', long = "id", help = "cluster id")]
         id: String,
         #[clap(short = 's', long = "sticky-session")]
         sticky_session: bool,
@@ -361,9 +361,9 @@ pub enum FrontendCmd {
 
 #[derive(Subcommand, PartialEq, Clone, Debug)]
 pub enum Route {
-    /// traffic will go to the backend servers with this application id
+    /// traffic will go to the backend servers with this cluster id
     Id {
-        /// traffic will go to the backend servers with this application id
+        /// traffic will go to the backend servers with this cluster id
         id: String,
     },
     /// traffic to this frontend will be rejected with HTTP 401
@@ -423,7 +423,7 @@ pub enum HttpFrontendCmd {
 pub enum TcpFrontendCmd {
     #[clap(name = "add")]
     Add {
-        #[clap(short = 'i', long = "id", help = "app id of the frontend")]
+        #[clap(short = 'i', long = "id", help = "the id of the cluster to which the frontend belongs")]
         id: String,
         #[clap(
             short = 'a',
@@ -431,12 +431,16 @@ pub enum TcpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
-        #[clap(long = "tags", help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')",  parse(try_from_str = parse_tags))]
+        #[clap(
+            long = "tags",
+            help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')",
+            parse(try_from_str = parse_tags)
+        )]
         tags: Option<BTreeMap<String, String>>,
     },
     #[clap(name = "remove")]
     Remove {
-        #[clap(short = 'i', long = "id", help = "app id of the frontend")]
+        #[clap(short = 'i', long = "id", help = "the id of the cluster to which the frontend belongs")]
         id: String,
         #[clap(
             short = 'a',
@@ -484,7 +488,7 @@ pub enum HttpListenerCmd {
         answer_404: Option<String>,
         #[clap(
             long = "answer-503",
-            help = "path to file of the 503 answer sent to the client when an application has no backends available"
+            help = "path to file of the 503 answer sent to the client when a cluster has no backends available"
         )]
         answer_503: Option<String>,
         #[clap(
@@ -542,7 +546,7 @@ pub enum HttpsListenerCmd {
         answer_404: Option<String>,
         #[clap(
             long = "answer-503",
-            help = "path to file of the 503 answer sent to the client when an application has no backends available"
+            help = "path to file of the 503 answer sent to the client when a cluster has no backends available"
         )]
         answer_503: Option<String>,
         #[clap(long = "tls-versions", help = "list of TLS versions to use")]
@@ -708,17 +712,13 @@ pub enum CertificateCmd {
 
 #[derive(Subcommand, PartialEq, Clone, Debug)]
 pub enum QueryCmd {
-    #[clap(
-        name = "applications",
-        about = "Query applications matching a specific filter"
-    )]
-    Applications {
-        #[clap(short = 'i', long = "id", help = "application identifier")]
+    #[clap(name = "clusters", about = "Query clusters matching a specific filter")]
+    Clusters {
+        #[clap(short = 'i', long = "id", help = "cluster identifier")]
         id: Option<String>,
-        #[clap(short = 'd', long = "domain", help = "application domain name")]
+        #[clap(short = 'd', long = "domain", help = "cluster domain name")]
         domain: Option<String>,
     },
-
     #[clap(
         name = "certificates",
         about = "Query certificates matching a specific filter"
@@ -729,7 +729,6 @@ pub enum QueryCmd {
         #[clap(short = 'd', long = "domain", help = "domain name")]
         domain: Option<String>,
     },
-
     #[clap(name = "metrics", about = "Query metrics matching a specific filter")]
     Metrics {
         #[clap(short, long, help = "list available metrics")]

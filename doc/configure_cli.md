@@ -9,24 +9,24 @@ You can specify its path by adding to your `config.toml`:
 command_socket = "path/to/your/command_folder/sock"
 ```
 
-## Add an application with an http frontend
+## Add a cluster with an http frontend
 
-First you need to create a new application with an id and a load balancing policy (roundrobin or random):
+First you need to create a new cluster with an id and a load balancing policy (roundrobin or random):
 
 ```bash
-sozu --config /etc/sozu/config.toml application add --id <my_application_id> --load-balancing-policy roundrobin
+sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy roundrobin
 ```
 
-It won't show anything but you can verify that the application has been added successfully by querying sozu:
+It won't show anything but you can verify that the cluster has been added successfully by querying sozu:
 
 ```bash
-sozu --config /etc/sozu/config.toml query applications
+sozu --config /etc/sozu/config.toml query clusters
 ```
 
 Then you need to add a backend:
 
 ```bash
-sozu --config /etc/sozu/config.toml backend add --address 127.0.0.1:3000 --backend-id <my_backend_id> --id <my_application_id>
+sozu --config /etc/sozu/config.toml backend add --address 127.0.0.1:3000 --backend-id <my_backend_id> --id <my_cluster_id>
 ```
 
 And an http listener:
@@ -38,7 +38,7 @@ sozu --config /etc/sozu/config.toml listener http add --address 0.0.0.0:80
 Finally you have to create a frontend to allow sozu to send traffic from the listener to your backend:
 
 ```bash
-sozu --config /etc/sozu/config.toml frontend http add --address 0.0.0.0:80 --hostname <my_application_hostname> --id <my_application_id>
+sozu --config /etc/sozu/config.toml frontend http add --address 0.0.0.0:80 --hostname <my_cluster_hostname> --id <my_cluster_id>
 ```
 
 ## Check the status of sozu
@@ -51,7 +51,7 @@ sozu --config /etc/sozu/config.toml status
 
 ## Get metrics and statistics
 
-It will show global statistics about sozu, workers and applications metrics.
+It will show global statistics about sozu, workers and clusters metrics.
 
 ```bash
 sozu --config /etc/sozu/config.toml query metrics
@@ -59,7 +59,7 @@ sozu --config /etc/sozu/config.toml query metrics
 
 ## Dump and restore state
 
-If sozu configurations (applications, frontends & backends) are not written in the config file, you can save sozu state to restore it later.
+If sozu configurations (clusters, frontends & backends) are not written in the config file, you can save sozu state to restore it later.
 
 ```bash
 sozu --config /etc/sozu/config.toml state save --file state.json
@@ -77,4 +77,4 @@ Restart sozu and restore its state:
 sozu --config /etc/sozu/config.toml state load --file state.json
 ```
 
-You should be able to request your application like before the shutdown.
+You should be able to request your cluster like before the shutdown.

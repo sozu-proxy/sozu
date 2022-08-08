@@ -25,11 +25,11 @@ use crate::{
         proxy::{
             HttpsListener, ListenerType, MessageId, ProxyEvent, ProxyRequest, ProxyRequestData,
             ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
-            QueryAnswerCertificate, QueryApplicationType, QueryCertificateType, TlsProvider, Topic,
+            QueryAnswerCertificate, QueryClusterType, QueryCertificateType, TlsProvider, Topic,
         },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
-        state::{get_application_ids_by_domain, get_certificate, ConfigState},
+        state::{get_cluster_ids_by_domain, get_certificate, ConfigState},
     },
     tcp,
     timer::Timer,
@@ -241,7 +241,7 @@ impl SessionManager {
 /// communication with the configuration channel.
 ///
 /// A listener wraps a listen socket, the associated proxying protocols
-/// (HTTP, HTTPS and TCP) and the routing configuration for applications.
+/// (HTTP, HTTPS and TCP) and the routing configuration for clusters.
 /// Listeners handle creating sessions from accepted sockets.
 ///
 /// A session manages a "front" socket for a connected client, and all
@@ -818,35 +818,35 @@ impl Server {
 
         if let ProxyRequestData::Query(ref query) = message.order {
             match query {
-                Query::ApplicationsHashes => {
+                Query::ClustersHashes => {
                     push_queue(ProxyResponse {
                         id: message.id.clone(),
                         status: ProxyResponseStatus::Ok,
-                        data: Some(ProxyResponseData::Query(QueryAnswer::ApplicationsHashes(
+                        data: Some(ProxyResponseData::Query(QueryAnswer::ClustersHashes(
                             self.config_state.hash_state(),
                         ))),
                     });
                     return;
                 }
-                Query::Applications(query_type) => {
+                Query::Clusters(query_type) => {
                     let query_answer = match query_type {
-                        QueryApplicationType::ClusterId(cluster_id) => {
-                            QueryAnswer::Applications(vec![self
+                        QueryClusterType::ClusterId(cluster_id) => {
+                            QueryAnswer::Clusters(vec![self
                                 .config_state
-                                .application_state(cluster_id)])
+                                .cluster_state(cluster_id)])
                         }
-                        QueryApplicationType::Domain(domain) => {
-                            let cluster_ids = get_application_ids_by_domain(
+                        QueryClusterType::Domain(domain) => {
+                            let cluster_ids = get_cluster_ids_by_domain(
                                 &self.config_state,
                                 domain.hostname.clone(),
                                 domain.path.clone(),
                             );
                             let answer = cluster_ids
                                 .iter()
-                                .map(|cluster_id| self.config_state.application_state(cluster_id))
+                                .map(|cluster_id| self.config_state.cluster_state(cluster_id))
                                 .collect();
 
-                            QueryAnswer::Applications(answer)
+                            QueryAnswer::Clusters(answer)
                         }
                     };
                     push_queue(ProxyResponse {
@@ -905,7 +905,7 @@ impl Server {
             } => {
                 self.backends
                     .borrow_mut()
-                    .set_load_balancing_policy_for_app(
+                    .set_load_balancing_policy_for_cluster(
                         &cluster.cluster_id,
                         cluster.load_balancing,
                         cluster.load_metric,

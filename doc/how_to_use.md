@@ -22,7 +22,7 @@ To start the reverse proxy:
 sozu start -c config.toml
 ```
 
-You can edit the reverse proxy's configuration with the `config.toml` file. You can declare new applications, their frontends and backends through that file.
+You can edit the reverse proxy's configuration with the `config.toml` file. You can declare new clusters, their frontends and backends through that file.
 
 **But** for more flexibility, you should use the command socket (you can find one end of that unix socket at the path designed by `command_socket` in the configuration file).
 

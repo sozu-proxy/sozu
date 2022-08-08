@@ -262,7 +262,7 @@ pub fn parse_response(
     buf: &[u8],
     is_head: bool,
     sticky_name: &str,
-    app_id: Option<&str>,
+    cluster_id: Option<&str>,
 ) -> (BufferMove, ResponseState) {
     match state {
         ResponseState::Initial => {
@@ -332,7 +332,7 @@ pub fn parse_response(
                             }
                         }
                         res => {
-                            error!("PARSER\tHasStatusLine could not parse header for input(app={:?}):\n{}\n", app_id, buf.to_hex(16));
+                            error!("PARSER\tHasStatusLine could not parse header for input(cluster={:?}):\n{}\n", cluster_id, buf.to_hex(16));
                             default_response_result(ResponseState::HasStatusLine(sl, conn), res)
                         }
                     }
@@ -375,7 +375,7 @@ pub fn parse_response(
                             }
                         }
                         res => {
-                            error!("PARSER\tHasLength could not parse header for input(app={:?}):\n{}\n", app_id, buf.to_hex(16));
+                            error!("PARSER\tHasLength could not parse header for input(cluster={:?}):\n{}\n", cluster_id, buf.to_hex(16));
                             default_response_result(ResponseState::HasLength(sl, conn, length), res)
                         }
                     }
@@ -412,8 +412,8 @@ pub fn parse_response(
                 }
                 res => {
                     error!(
-                        "PARSER\tHasUpgrade could not parse header for input(app={:?}):\n{}\n",
-                        app_id,
+                        "PARSER\tHasUpgrade could not parse header for input(cluster={:?}):\n{}\n",
+                        cluster_id,
                         buf.to_hex(16)
                     );
                     default_response_result(ResponseState::HasUpgrade(sl, conn, protocol), res)
@@ -446,7 +446,7 @@ pub fn parse_response_until_stop(
     added_res_header: &str,
     sticky_name: &str,
     sticky_session: Option<&StickySession>,
-    app_id: Option<&str>,
+    cluster_id: Option<&str>,
 ) -> (ResponseState, Option<usize>) {
     loop {
         //trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
@@ -455,7 +455,7 @@ pub fn parse_response_until_stop(
             buf.unparsed_data(),
             is_head,
             sticky_name,
-            app_id,
+            cluster_id,
         );
         //trace!("PARSER\tinput:\n{}\nmv: {:?}, new state: {:?}\n", buf.unparsed_data().to_hex(16), mv, new_state);
         //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);

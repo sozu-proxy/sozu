@@ -32,7 +32,7 @@ pub struct Http2<Front: SocketHandler> {
     frontend_token: Token,
     backend_token: Option<Token>,
     back_buf: Option<Checkout>,
-    pub app_id: Option<String>,
+    pub cluster_id: Option<String>,
     pub request_id: Ulid,
     pub back_readiness: Readiness,
     pub log_ctx: String,
@@ -65,7 +65,7 @@ impl<Front: SocketHandler> Http2<Front> {
             backend: None,
             backend_token: None,
             back_buf: None,
-            app_id: None,
+            cluster_id: None,
             state: Some(state::State::new()),
             request_id,
             back_readiness: Readiness {
@@ -115,8 +115,8 @@ impl<Front: SocketHandler> Http2<Front> {
     pub fn close(&mut self) {}
 
     pub fn log_context(&self) -> String {
-        if let Some(ref app_id) = self.app_id {
-            format!("{}\t{}\t", self.request_id, app_id)
+        if let Some(ref cluster_id) = self.cluster_id {
+            format!("{}\t{}\t", self.request_id, cluster_id)
         } else {
             format!("{}\tunknown\t", self.request_id)
         }
@@ -291,7 +291,7 @@ impl<Front: SocketHandler> Http2<Front> {
         SessionResult::Continue
     }
 
-    // Forward content to application
+    // Forward content to cluster
     pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         trace!("http2 back_writable");
         error!("todo[{}:{}]: back_writable", file!(), line!());
@@ -350,7 +350,7 @@ impl<Front: SocketHandler> Http2<Front> {
         */
     }
 
-    // Read content from application
+    // Read content from cluster
     pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         trace!("http2 back_readable");
         error!("todo[{}:{}]: back_readable", file!(), line!());

@@ -257,7 +257,7 @@ pub fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), anyho
     Ok(())
 }
 
-pub fn create_queried_application_table(
+pub fn create_queried_cluster_table(
     headers: Vec<&str>,
     data: &BTreeMap<String, QueryAnswer>,
 ) -> Table {
@@ -271,35 +271,35 @@ pub fn create_queried_application_table(
 }
 
 pub fn print_query_response_data(
-    application_id: Option<String>,
+    cluster_id: Option<String>,
     domain: Option<String>,
     data: Option<CommandResponseData>,
     json: bool,
 ) -> anyhow::Result<()> {
-    if let Some(needle) = application_id.or_else(|| domain) {
+    if let Some(needle) = cluster_id.or_else(|| domain) {
         if let Some(CommandResponseData::Query(data)) = &data {
             if json {
                 return print_json_response(data);
             }
 
-            let application_headers = vec!["id", "sticky_session", "https_redirect"];
-            let mut application_table = create_queried_application_table(application_headers, data);
+            let cluster_headers = vec!["id", "sticky_session", "https_redirect"];
+            let mut cluster_table = create_queried_cluster_table(cluster_headers, data);
 
             let http_headers = vec!["id", "hostname", "path"];
-            let mut frontend_table = create_queried_application_table(http_headers, data);
+            let mut frontend_table = create_queried_cluster_table(http_headers, data);
 
             let https_headers = vec!["id", "hostname", "path"];
-            let mut https_frontend_table = create_queried_application_table(https_headers, data);
+            let mut https_frontend_table = create_queried_cluster_table(https_headers, data);
 
             let tcp_headers = vec!["id", "address"];
-            let mut tcp_frontend_table = create_queried_application_table(tcp_headers, data);
+            let mut tcp_frontend_table = create_queried_cluster_table(tcp_headers, data);
 
             let backend_headers = vec!["backend id", "IP address", "Backup"];
-            let mut backend_table = create_queried_application_table(backend_headers, data);
+            let mut backend_table = create_queried_cluster_table(backend_headers, data);
 
             let keys: HashSet<&String> = data.keys().collect();
 
-            let mut application_data = HashMap::new();
+            let mut cluster_data = HashMap::new();
             let mut frontend_data = HashMap::new();
             let mut https_frontend_data = HashMap::new();
             let mut tcp_frontend_data = HashMap::new();
@@ -307,27 +307,27 @@ pub fn print_query_response_data(
 
             for (key, metrics) in data.iter() {
                 //let m: u8 = metrics;
-                if let QueryAnswer::Applications(apps) = metrics {
-                    for app in apps.iter() {
-                        let entry = application_data.entry(app).or_insert(Vec::new());
+                if let QueryAnswer::Clusters(clusters) = metrics {
+                    for cluster in clusters.iter() {
+                        let entry = cluster_data.entry(cluster).or_insert(Vec::new());
                         entry.push(key.to_owned());
 
-                        for frontend in app.http_frontends.iter() {
+                        for frontend in cluster.http_frontends.iter() {
                             let entry = frontend_data.entry(frontend).or_insert(Vec::new());
                             entry.push(key.to_owned());
                         }
 
-                        for frontend in app.https_frontends.iter() {
+                        for frontend in cluster.https_frontends.iter() {
                             let entry = https_frontend_data.entry(frontend).or_insert(Vec::new());
                             entry.push(key.to_owned());
                         }
 
-                        for frontend in app.tcp_frontends.iter() {
+                        for frontend in cluster.tcp_frontends.iter() {
                             let entry = tcp_frontend_data.entry(frontend).or_insert(Vec::new());
                             entry.push(key.to_owned());
                         }
 
-                        for backend in app.backends.iter() {
+                        for backend in cluster.backends.iter() {
                             let entry = backend_data.entry(backend).or_insert(Vec::new());
                             entry.push(key.to_owned());
                         }
@@ -337,7 +337,7 @@ pub fn print_query_response_data(
 
             println!("Cluster level configuration for {}:\n", needle);
 
-            for (key, values) in application_data.iter() {
+            for (key, values) in cluster_data.iter() {
                 let mut row = Vec::new();
                 row.push(cell!(key
                     .configuration
@@ -363,10 +363,10 @@ pub fn print_query_response_data(
                     }
                 }
 
-                application_table.add_row(Row::new(row));
+                cluster_table.add_row(Row::new(row));
             }
 
-            application_table.printstd();
+            cluster_table.printstd();
 
             println!("\nHTTP frontends configuration for {}:\n", needle);
 
@@ -473,8 +473,8 @@ pub fn print_query_response_data(
 
             for metrics in data.values() {
                 //let m: u8 = metrics;
-                if let QueryAnswer::ApplicationsHashes(apps) = metrics {
-                    for (key, value) in apps.iter() {
+                if let QueryAnswer::ClustersHashes(clusters) = metrics {
+                    for (key, value) in clusters.iter() {
                         query_data.entry(key).or_insert(Vec::new()).push(value);
                     }
                 }

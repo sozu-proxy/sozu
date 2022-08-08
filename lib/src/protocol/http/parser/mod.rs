@@ -452,7 +452,7 @@ fn is_hostname_char(i: u8) -> bool {
     is_alphanumeric(i) ||
   // the domain name should not start with a hyphen or dot
   // but is it important here, since we will match this to
-  // the list of accepted applications?
+  // the list of accepted clusters?
   // BTW each label between dots has a max of 63 chars,
   // and the whole domain shuld not be larger than 253 chars
   //
@@ -467,7 +467,7 @@ fn is_hostname_char(i: u8) -> bool {
     is_alphanumeric(i) ||
   // the domain name should not start with a hyphen or dot
   // but is it important here, since we will match this to
-  // the list of accepted applications?
+  // the list of accepted clusters?
   // BTW each label between dots has a max of 63 chars,
   // and the whole domain shuld not be larger than 253 chars
   b"-.".contains(&i)

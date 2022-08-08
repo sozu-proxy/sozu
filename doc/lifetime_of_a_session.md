@@ -138,27 +138,27 @@ the `ConnectBackend` result is returned all the way up to the event loop, to ask
 It will first check if the session has triggered its circuit breaker (it will
 then refuse to connect and send back an error to the client). Then it will
 [extract the hostname and URL from the request](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1472-L1524)
-and [find an application](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1297-L1332)
-that can handle that request. If we do not find an application, we will send a
+and [find a cluster](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1297-L1332)
+that can handle that request. If we do not find a cluster, we will send a
 HTTP 404 Not Found response to the client.
 
-Once we know the application id, if this is the first request (not a follow up
-request in keep-alive), we must find a backend server for this application.
+Once we know the cluster id, if this is the first request (not a follow up
+request in keep-alive), we must find a backend server for this cluster.
 
 <details>
 <summary>keep-alive</summary>
 In HTTP keep-alive, a TCP connection can be kept after receiving the response,
 to send more requests. Since sozu supports routing on the URL along with the
-hostname, the next request might go to a different application.
+hostname, the next request might go to a different cluster.
 
-So when we get the application id from the request, we check if it is the same
+So when we get the cluster id from the request, we check if it is the same
 as the previous one, and if it is the same, we test if the back socket is still
 valid. If it is, we can reuse it. Otherwise, we will replace the back socket
 with a new one.
 </details>
 
 We [look up the backends list](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1428-L1470)
-for the application, depending on a sticky session if needed.
+for the cluster, depending on a sticky session if needed.
 
 <details>
 <summary>sticky session</summary>
@@ -168,7 +168,7 @@ coming with the same id in that cookie will be sent to the same backend server.
 
 That look up will return a result depending on which backend server are
 considered valid (if they're answering properly) and on the load balancing
-policies configured for the application.
+policies configured for the cluster.
 If a backend was found, we open a TCP connection to the backend server,
 otherwise we return a HTTP 503 response.
 

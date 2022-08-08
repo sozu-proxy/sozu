@@ -37,7 +37,7 @@
             }
           },
           "clusters": {
-            "app_1": {
+            "cluster_1": {
               "data": {
                 "request_time": {
                   "type": "PERCENTILES",
@@ -54,7 +54,7 @@
                 }
               },
               "backends": {
-                "app_1-0": {
+                "cluster_1-0": {
                   "bytes_in": {
                     "type": "COUNT",
                     "data": 256

@@ -343,7 +343,7 @@ pub enum PathRuleType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FileAppFrontendConfig {
+pub struct FileClusterFrontendConfig {
     pub address: SocketAddr,
     pub hostname: Option<String>,
     pub path: Option<String>,
@@ -359,7 +359,7 @@ pub struct FileAppFrontendConfig {
     pub tags: Option<BTreeMap<String, String>>,
 }
 
-impl FileAppFrontendConfig {
+impl FileClusterFrontendConfig {
     pub fn to_tcp_front(&self) -> Result<TcpFrontendConfig, String> {
         if self.hostname.is_some() {
             return Err(String::from("invalid 'hostname' field for TCP frontend"));
@@ -452,17 +452,17 @@ pub enum FileListenerProtocolConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "lowercase")]
-pub enum FileAppProtocolConfig {
+pub enum FileClusterProtocolConfig {
     Http,
     Tcp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FileAppConfig {
-    pub frontends: Vec<FileAppFrontendConfig>,
+pub struct FileClusterConfig {
+    pub frontends: Vec<FileClusterFrontendConfig>,
     pub backends: Vec<BackendConfig>,
-    pub protocol: FileAppProtocolConfig,
+    pub protocol: FileClusterProtocolConfig,
     pub sticky_session: Option<bool>,
     pub https_redirect: Option<bool>,
     #[serde(default)]
@@ -484,27 +484,27 @@ pub struct BackendConfig {
     pub backend_id: Option<String>,
 }
 
-impl FileAppConfig {
-    pub fn to_app_config(
+impl FileClusterConfig {
+    pub fn to_cluster_config(
         self,
         cluster_id: &str,
         expect_proxy: &HashSet<SocketAddr>,
-    ) -> Result<AppConfig, String> {
+    ) -> Result<ClusterConfig, String> {
         match self.protocol {
-            FileAppProtocolConfig::Tcp => {
+            FileClusterProtocolConfig::Tcp => {
                 let mut has_expect_proxy = None;
                 let mut frontends = Vec::new();
                 for f in self.frontends {
                     if expect_proxy.contains(&f.address) {
                         match has_expect_proxy {
               Some(true) => {},
-              Some(false) => return Err(format!("all the listeners for application {} should have the same expect_proxy option", cluster_id)),
+              Some(false) => return Err(format!("all the listeners for cluster {} should have the same expect_proxy option", cluster_id)),
               None => has_expect_proxy = Some(true),
             }
                     } else {
                         match has_expect_proxy {
               Some(false) => {},
-              Some(true) => return Err(format!("all the listeners for application {} should have the same expect_proxy option", cluster_id)),
+              Some(true) => return Err(format!("all the listeners for cluster {} should have the same expect_proxy option", cluster_id)),
               None => has_expect_proxy = Some(false),
             }
                     }
@@ -523,7 +523,7 @@ impl FileAppConfig {
                     _ => None,
                 };
 
-                Ok(AppConfig::Tcp(TcpAppConfig {
+                Ok(ClusterConfig::Tcp(TcpClusterConfig {
                     cluster_id: cluster_id.to_string(),
                     frontends,
                     backends: self.backends,
@@ -532,7 +532,7 @@ impl FileAppConfig {
                     load_metric: self.load_metric,
                 }))
             }
-            FileAppProtocolConfig::Http => {
+            FileClusterProtocolConfig::Http => {
                 let mut frontends = Vec::new();
                 for f in self.frontends {
                     match f.to_http_front(cluster_id) {
@@ -550,7 +550,7 @@ impl FileAppConfig {
                         .ok()
                 });
 
-                Ok(AppConfig::Http(HttpAppConfig {
+                Ok(ClusterConfig::Http(HttpClusterConfig {
                     cluster_id: cluster_id.to_string(),
                     frontends,
                     backends: self.backends,
@@ -627,7 +627,7 @@ impl HttpFrontendConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HttpAppConfig {
+pub struct HttpClusterConfig {
     pub cluster_id: String,
     pub frontends: Vec<HttpFrontendConfig>,
     pub backends: Vec<BackendConfig>,
@@ -638,7 +638,7 @@ pub struct HttpAppConfig {
     pub answer_503: Option<String>,
 }
 
-impl HttpAppConfig {
+impl HttpClusterConfig {
     pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
         let mut v = vec![ProxyRequestData::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
@@ -683,7 +683,7 @@ pub struct TcpFrontendConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TcpAppConfig {
+pub struct TcpClusterConfig {
     pub cluster_id: String,
     pub frontends: Vec<TcpFrontendConfig>,
     pub backends: Vec<BackendConfig>,
@@ -693,7 +693,7 @@ pub struct TcpAppConfig {
     pub load_metric: Option<LoadMetric>,
 }
 
-impl TcpAppConfig {
+impl TcpClusterConfig {
     pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
         let mut v = vec![ProxyRequestData::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
@@ -735,16 +735,16 @@ impl TcpAppConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum AppConfig {
-    Http(HttpAppConfig),
-    Tcp(TcpAppConfig),
+pub enum ClusterConfig {
+    Http(HttpClusterConfig),
+    Tcp(TcpClusterConfig),
 }
 
-impl AppConfig {
+impl ClusterConfig {
     pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
         match *self {
-            AppConfig::Http(ref http) => http.generate_orders(),
-            AppConfig::Tcp(ref tcp) => tcp.generate_orders(),
+            ClusterConfig::Http(ref http) => http.generate_orders(),
+            ClusterConfig::Tcp(ref tcp) => tcp.generate_orders(),
         }
     }
 }
@@ -769,7 +769,7 @@ pub struct FileConfig {
     pub worker_automatic_restart: Option<bool>,
     pub metrics: Option<MetricsConfig>,
     pub listeners: Option<Vec<Listener>>,
-    pub applications: Option<HashMap<String, FileAppConfig>>,
+    pub clusters: Option<HashMap<String, FileClusterConfig>>,
     pub handle_process_affinity: Option<bool>,
     pub ctl_command_timeout: Option<u64>,
     pub pid_file_path: Option<String>,
@@ -823,18 +823,18 @@ impl FileConfig {
                     }
                 }
 
-                //FIXME: verify how apps and listeners share addresses
+                //FIXME: verify how clusters and listeners share addresses
                 /*
-                if let Some(ref apps) = config.applications {
-                  for (key, app) in apps.iter() {
-                    if let (Some(address), Some(port)) = (app.ip_address.clone(), app.port) {
+                if let Some(ref clusters) = config.clusters {
+                  for (key, cluster) in clusters.iter() {
+                    if let (Some(address), Some(port)) = (cluster.ip_address.clone(), cluster.port) {
                       let addr = (address, port);
                       if reserved_address.contains(&addr) {
-                        println!("TCP app '{}' listening address ( {}:{} ) is already used in the configuration",
+                        println!("TCP cluster '{}' listening address ( {}:{} ) is already used in the configuration",
                           key, addr.0, addr.1);
                         return Err(Error::new(
                           ErrorKind::InvalidData,
-                          format!("TCP app '{}' listening address ( {}:{} ) is already used in the configuration",
+                          format!("TCP cluster '{}' listening address ( {}:{} ) is already used in the configuration",
                             key, addr.0, addr.1)));
                       } else {
                         reserved_address.insert(addr.clone());
@@ -850,7 +850,7 @@ impl FileConfig {
     }
 
     pub fn into(self, config_path: &str) -> Config {
-        let mut applications = HashMap::new();
+        let mut clusters = HashMap::new();
         let mut http_listeners = Vec::new();
         let mut https_listeners = Vec::new();
         let mut tcp_listeners = Vec::new();
@@ -913,12 +913,12 @@ impl FileConfig {
             }
         }
 
-        if let Some(mut apps) = self.applications {
-            for (id, app) in apps.drain() {
-                match app.to_app_config(id.as_str(), &expect_proxy) {
-                    Ok(app_config) => {
-                        match app_config {
-                            AppConfig::Http(ref http) => {
+        if let Some(mut file_cluster_configs) = self.clusters {
+            for (id, file_cluster_config) in file_cluster_configs.drain() {
+                match file_cluster_config.to_cluster_config(id.as_str(), &expect_proxy) {
+                    Ok(cluster_config) => {
+                        match cluster_config {
+                            ClusterConfig::Http(ref http) => {
                                 for frontend in http.frontends.iter() {
                                     match known_addresses.get(&frontend.address) {
                                         Some(FileListenerProtocolConfig::Tcp) => {
@@ -976,8 +976,8 @@ impl FileConfig {
                                     }
                                 }
                             }
-                            AppConfig::Tcp(ref tcp) => {
-                                //FIXME: verify that different TCP apps do not request the same address
+                            ClusterConfig::Tcp(ref tcp) => {
+                                //FIXME: verify that different TCP clusters do not request the same address
                                 for frontend in &tcp.frontends {
                                     match known_addresses.get(&frontend.address) {
                                         Some(FileListenerProtocolConfig::Http)
@@ -1012,10 +1012,10 @@ impl FileConfig {
                             }
                         }
 
-                        applications.insert(id, app_config);
+                        clusters.insert(id, cluster_config);
                     }
                     Err(s) => {
-                        panic!("error parsing application configuration for {}: {}", id, s);
+                        panic!("error parsing cluster configuration for {}: {}", id, s);
                     }
                 }
             }
@@ -1062,7 +1062,7 @@ impl FileConfig {
             http_listeners,
             https_listeners,
             tcp_listeners,
-            applications,
+            clusters,
             handle_process_affinity: self.handle_process_affinity.unwrap_or(false),
             ctl_command_timeout: self.ctl_command_timeout.unwrap_or(1_000),
             pid_file_path: self.pid_file_path,
@@ -1101,7 +1101,7 @@ pub struct Config {
     pub http_listeners: Vec<HttpListener>,
     pub https_listeners: Vec<HttpsListener>,
     pub tcp_listeners: Vec<TcpListener>,
-    pub applications: HashMap<String, AppConfig>,
+    pub clusters: HashMap<String, ClusterConfig>,
     pub handle_process_affinity: bool,
     pub ctl_command_timeout: u64,
     pub pid_file_path: Option<String>,
@@ -1193,8 +1193,8 @@ impl Config {
             count += 1;
         }
 
-        for app in self.applications.values() {
-            let mut orders = app.generate_orders();
+        for cluster in self.clusters.values() {
+            let mut orders = cluster.generate_orders();
             for order in orders.drain(..) {
                 v.push(CommandRequest {
                     id: format!("CONFIG-{}", count),
@@ -1324,9 +1324,7 @@ impl Config {
 
         let stringified_path = saved_state_path_raw
             .to_str()
-            .ok_or_else(|| anyhow::Error::msg(
-                "Unvalid character format, expected UTF8",
-            ))?
+            .ok_or_else(|| anyhow::Error::msg("Unvalid character format, expected UTF8"))?
             .to_string();
 
         Ok(Some(stringified_path))
@@ -1419,7 +1417,7 @@ mod tests {
                 prefix: Some(String::from("sozu-metrics")),
             }),
             listeners: Some(listeners),
-            applications: None,
+            clusters: None,
             ctl_command_timeout: None,
             pid_file_path: None,
             tls_provider: None,

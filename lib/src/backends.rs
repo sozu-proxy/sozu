@@ -56,15 +56,15 @@ impl BackendMap {
             backends.remove_backend(backend_address);
         } else {
             error!(
-                "Backend was already removed: app id {}, address {:?}",
+                "Backend was already removed: cluster id {}, address {:?}",
                 cluster_id, backend_address
             );
         }
     }
 
     pub fn close_backend_connection(&mut self, cluster_id: &str, addr: &SocketAddr) {
-        if let Some(app_backends) = self.backends.get_mut(cluster_id) {
-            if let Some(ref mut backend) = app_backends.find_backend(addr) {
+        if let Some(cluster_backends) = self.backends.get_mut(cluster_id) {
+            if let Some(ref mut backend) = cluster_backends.find_backend(addr) {
                 backend.borrow_mut().dec_connections();
             }
         }
@@ -81,13 +81,13 @@ impl BackendMap {
         &mut self,
         cluster_id: &str,
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), ConnectionError> {
-        if let Some(ref mut app_backends) = self.backends.get_mut(cluster_id) {
-            if app_backends.backends.is_empty() {
+        if let Some(ref mut cluster_backends) = self.backends.get_mut(cluster_id) {
+            if cluster_backends.backends.is_empty() {
                 self.available = false;
                 return Err(ConnectionError::NoBackendAvailable);
             }
 
-            if let Some(ref mut b) = app_backends.next_available_backend() {
+            if let Some(ref mut b) = cluster_backends.next_available_backend() {
                 let mut backend = b.borrow_mut();
 
                 debug!(
@@ -116,7 +116,7 @@ impl BackendMap {
                 res
             } else {
                 if self.available {
-                    error!("no more available backends for app {}", cluster_id);
+                    error!("no more available backends for cluster {}", cluster_id);
                     self.available = false;
 
                     push_event(proxy::ProxyEvent::NoAvailableBackends(
@@ -138,7 +138,7 @@ impl BackendMap {
         let sticky_conn: Option<Result<(Rc<RefCell<Backend>>, TcpStream), ConnectionError>> = self
             .backends
             .get_mut(cluster_id)
-            .and_then(|app_backends| app_backends.find_sticky(sticky_session))
+            .and_then(|cluster_backends| cluster_backends.find_sticky(sticky_session))
             .map(|b| {
                 let mut backend = b.borrow_mut();
                 let conn = backend.try_connect();
@@ -156,26 +156,26 @@ impl BackendMap {
             res
         } else {
             debug!(
-                "Couldn't find a backend corresponding to sticky_session {} for app {}",
+                "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
                 sticky_session, cluster_id
             );
             self.backend_from_cluster_id(cluster_id)
         }
     }
 
-    pub fn set_load_balancing_policy_for_app(
+    pub fn set_load_balancing_policy_for_cluster(
         &mut self,
         cluster_id: &str,
         lb_algo: proxy::LoadBalancingAlgorithms,
         metric: Option<proxy::LoadMetric>,
     ) {
-        // The application can be created before the backends were registered because of the async config messages.
+        // The cluster can be created before the backends were registered because of the async config messages.
         // So when we set the load balancing policy, we have to create the backend list if if it doesn't exist yet.
-        let app_backends = self.get_or_create_backend_list_for_app(cluster_id);
-        app_backends.set_load_balancing_policy(lb_algo, metric);
+        let cluster_backends = self.get_or_create_backend_list_for_cluster(cluster_id);
+        cluster_backends.set_load_balancing_policy(lb_algo, metric);
     }
 
-    pub fn get_or_create_backend_list_for_app(&mut self, cluster_id: &str) -> &mut BackendList {
+    pub fn get_or_create_backend_list_for_cluster(&mut self, cluster_id: &str) -> &mut BackendList {
         self.backends
             .entry(cluster_id.to_string())
             .or_insert_with(BackendList::new)
@@ -343,7 +343,7 @@ mod backends_test {
     #[test]
     fn it_should_retrieve_a_backend_from_cluster_id_when_backends_have_been_recorded() {
         let mut backend_map = BackendMap::new();
-        let cluster_id = "myapp";
+        let cluster_id = "mycluster";
 
         let backend_addr = "127.0.0.1:1236";
         let (sender, receiver) = channel();
@@ -367,14 +367,14 @@ mod backends_test {
     #[test]
     fn it_should_not_retrieve_a_backend_from_cluster_id_when_backend_has_not_been_recorded() {
         let mut backend_map = BackendMap::new();
-        let app_not_recorded = "not";
+        let cluster_not_recorded = "not";
         backend_map.add_backend(
             "foo",
             Backend::new("foo-1", "127.0.0.1:9001".parse().unwrap(), None, None, None),
         );
 
         assert!(backend_map
-            .backend_from_cluster_id(app_not_recorded)
+            .backend_from_cluster_id(cluster_not_recorded)
             .is_err());
     }
 
@@ -388,7 +388,7 @@ mod backends_test {
     #[test]
     fn it_should_retrieve_a_backend_from_sticky_session_when_the_backend_has_been_recorded() {
         let mut backend_map = BackendMap::new();
-        let cluster_id = "myapp";
+        let cluster_id = "mycluster";
         let sticky_session = "server-2";
 
         let backend_addr = "127.0.0.1:3456";
@@ -437,7 +437,7 @@ mod backends_test {
     fn it_should_not_retrieve_a_backend_from_sticky_session_when_the_backend_has_not_been_recorded()
     {
         let mut backend_map = BackendMap::new();
-        let cluster_id = "myapp";
+        let cluster_id = "mycluster";
         let sticky_session = "test";
 
         assert!(backend_map
@@ -448,11 +448,11 @@ mod backends_test {
     #[test]
     fn it_should_not_retrieve_a_backend_from_sticky_session_when_the_backend_list_is_empty() {
         let mut backend_map = BackendMap::new();
-        let myapp_not_recorded = "myapp";
+        let mycluster_not_recorded = "mycluster";
         let sticky_session = "test";
 
         assert!(backend_map
-            .backend_from_sticky_session(myapp_not_recorded, sticky_session)
+            .backend_from_sticky_session(mycluster_not_recorded, sticky_session)
             .is_err());
     }
 

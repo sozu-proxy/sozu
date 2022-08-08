@@ -125,7 +125,7 @@ address = "0.0.0.0:80"
 #answer_503 = "/etc/sozu/html/503.html"
 
 # defines the sticky session cookie's name, if `sticky_session` is activated for
-# an application. Defaults to "SOZUBALANCEID"
+# a cluster. Defaults to "SOZUBALANCEID"
 # sticky_name = "SOZUBALANCEID"
 #
 # Configures the client socket to receive a PROXY protocol header
@@ -160,7 +160,7 @@ tls_versions = ["TLSv1.2", "TLSv1.3"]
 #rustls_cipher_list = ["TLS13_CHACHA20_POLY1305_SHA256"]
 
 
-# static configuration for applications
+# static configuration for clusters
 #
-# those applications will be routed by sozu directly from start
-[applications]
+# those clusters will be routed by sozu directly from start
+[clusters]

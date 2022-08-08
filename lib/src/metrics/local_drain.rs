@@ -5,7 +5,7 @@ use hdrhistogram::Histogram;
 use time::{Duration, OffsetDateTime};
 
 use crate::sozu_command::proxy::{
-    AppMetricsData, FilteredData, MetricsConfiguration, MetricsData, Percentiles,
+    ClusterMetricsData, FilteredData, MetricsConfiguration, MetricsData, Percentiles,
     QueryAnswerMetrics, QueryMetricsType,
 };
 
@@ -83,7 +83,7 @@ pub fn aggregated_to_filtered(value: &AggregatedMetric) -> FilteredData {
 }
 
 #[derive(Clone, Debug)]
-pub struct AppMetrics {
+pub struct ClusterMetrics {
     pub data: BTreeMap<String, AggregatedMetric>,
     pub backend_data: BTreeMap<String, BTreeMap<String, AggregatedMetric>>,
 }
@@ -186,9 +186,9 @@ impl LocalDrain {
             }
             QueryMetricsType::Cluster {
                 metrics,
-                clusters,
+                cluster_ids,
                 date,
-            } => self.query_cluster(metrics, clusters, *date),
+            } => self.query_cluster(metrics, cluster_ids, *date),
             QueryMetricsType::Backend {
                 metrics,
                 backends,
@@ -259,12 +259,12 @@ impl LocalDrain {
     fn query_cluster(
         &mut self,
         metrics: &[String],
-        clusters: &[String],
+        cluster_ids: &[String],
         date: Option<i64>,
     ) -> QueryAnswerMetrics {
-        let mut apps: BTreeMap<String, BTreeMap<String, FilteredData>> = BTreeMap::new();
-        for cluster_id in clusters.iter() {
-            apps.insert(cluster_id.to_string(), BTreeMap::new());
+        let mut clusters: BTreeMap<String, BTreeMap<String, FilteredData>> = BTreeMap::new();
+        for cluster_id in cluster_ids.iter() {
+            clusters.insert(cluster_id.to_string(), BTreeMap::new());
         }
 
         let timestamp = date.unwrap_or_else(|| {
@@ -276,7 +276,7 @@ impl LocalDrain {
         trace!("current metrics: {:#?}", self.metrics);
 
         for prefix_key in metrics.iter() {
-            for cluster_id in clusters.iter() {
+            for cluster_id in cluster_ids.iter() {
                 let key = format!("{}\t{}", prefix_key, cluster_id);
 
                 let res = self.metrics.get(&key);
@@ -292,15 +292,15 @@ impl LocalDrain {
                 }
 
                 if let Some(filtered_data) = self.query_metric(&key, false, timestamp, *kind) {
-                    apps.get_mut(cluster_id)
+                    clusters.get_mut(cluster_id)
                         .unwrap()
                         .insert(key.to_string(), filtered_data);
                 }
             }
         }
 
-        trace!("query result: {:#?}", apps);
-        QueryAnswerMetrics::Cluster(apps)
+        trace!("query result: {:#?}", clusters);
+        QueryAnswerMetrics::Cluster(clusters)
     }
 
     fn query_backend(
@@ -396,8 +396,8 @@ impl LocalDrain {
         None
     }
 
-    pub fn dump_cluster_data(&mut self) -> BTreeMap<String, AppMetricsData> {
-        //let apps = BTreeMap::new();
+    pub fn dump_cluster_data(&mut self) -> BTreeMap<String, ClusterMetricsData> {
+        //let clusters = BTreeMap::new();
 
         /*
         for (key, (meta, kind)) in self.metrics.iter() {
@@ -410,14 +410,14 @@ impl LocalDrain {
 
                         let mut it = k.split(|c: &u8| *c == b'\t');
                         let key = std::str::from_utf8(it.next().unwrap()).unwrap();
-                        let app_id = std::str::from_utf8(it.next().unwrap()).unwrap();
+                        let cluster_id = std::str::from_utf8(it.next().unwrap()).unwrap();
                         //let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
                         let timestamp = std::str::from_utf8(it.next().unwrap()).unwrap();//.parse().unwrap();
 
                         info!("looking at key = {}, id = {}, ts = {}",
-                              key, app_id, timestamp);
+                              key, cluster_id, timestamp);
 
-                        let metrics_data = apps.entry(app_id.to_string()).or_insert_with(AppMetricsData::new);
+                        let metrics_data = clusters.entry(cluster_id.to_string()).or_insert_with(ClusterMetricsData::new);
                         match kind {
                             MetricKind::Gauge => {
                                 /*if metrics_data.data.contains_key(key) {
@@ -445,16 +445,16 @@ impl LocalDrain {
 
                         let mut it = k.split(|c: &u8| *c == b'\t');
                         let key = std::str::from_utf8(it.next().unwrap()).unwrap();
-                        let app_id = std::str::from_utf8(it.next().unwrap()).unwrap();
+                        let cluster_id = std::str::from_utf8(it.next().unwrap()).unwrap();
                         let backend_id = std::str::from_utf8(it.next().unwrap()).unwrap();
                         //let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
                         let timestamp = std::str::from_utf8(it.next().unwrap()).unwrap();//.parse().unwrap();
 
                         info!("looking at key = {}, cluster id = {}, bid: {}, ts = {}",
-                              key, app_id, backend_id, timestamp);
+                              key, cluster_id, backend_id, timestamp);
 
-                        let app_metrics_data = apps.entry(app_id.to_string()).or_insert_with(AppMetricsData::new);
-                        let backend_metrics_data = app_metrics_data.backends.entry(backend_id.to_string()).or_insert_with(BTreeMap::new);
+                        let cluster_metrics_data = clusters.entry(cluster_id.to_string()).or_insert_with(ClusterMetricsData::new);
+                        let backend_metrics_data = cluster_metrics_data.backends.entry(backend_id.to_string()).or_insert_with(BTreeMap::new);
                         match kind {
                             MetricKind::Gauge => {
                                 /*if backend_metrics_data.contains_key(key) {
@@ -483,7 +483,7 @@ impl LocalDrain {
         // still clear the DB for now
         //self.db.clear();
 
-        //apps
+        //clusters
 
         BTreeMap::new()
     }

@@ -33,12 +33,12 @@ impl Router {
     }
 
     pub fn lookup(&self, hostname: &[u8], path: &[u8], method: &Method) -> Option<Route> {
-        for (domain_rule, path_rule, method_rule, app_id) in self.pre.iter() {
+        for (domain_rule, path_rule, method_rule, cluster_id) in self.pre.iter() {
             if domain_rule.matches(hostname)
                 && path_rule.matches(path) != PathRuleResult::None
                 && method_rule.matches(method) != MethodRuleResult::None
             {
-                return Some(app_id.clone());
+                return Some(cluster_id.clone());
             }
         }
 
@@ -46,14 +46,14 @@ impl Router {
             let mut prefix_length = 0;
             let mut res = None;
 
-            for (rule, method_rule, app_id) in path_rules.iter() {
+            for (rule, method_rule, cluster_id) in path_rules.iter() {
                 match rule.matches(path) {
                     PathRuleResult::Regex | PathRuleResult::Equals => {
                         match method_rule.matches(method) {
-                            MethodRuleResult::Equals => return Some(app_id.clone()),
+                            MethodRuleResult::Equals => return Some(cluster_id.clone()),
                             MethodRuleResult::All => {
                                 prefix_length = path.len();
-                                res = Some(app_id);
+                                res = Some(cluster_id);
                             }
                             MethodRuleResult::None => {}
                         }
@@ -64,11 +64,11 @@ impl Router {
                                 // FIXME: the rule order will be important here
                                 MethodRuleResult::Equals => {
                                     prefix_length = sz;
-                                    res = Some(app_id);
+                                    res = Some(cluster_id);
                                 }
                                 MethodRuleResult::All => {
                                     prefix_length = sz;
-                                    res = Some(app_id);
+                                    res = Some(cluster_id);
                                 }
                                 MethodRuleResult::None => {}
                             }
@@ -78,17 +78,17 @@ impl Router {
                 }
             }
 
-            if let Some(app_id) = res {
-                return Some(app_id.clone());
+            if let Some(cluster_id) = res {
+                return Some(cluster_id.clone());
             }
         }
 
-        for (domain_rule, path_rule, method_rule, app_id) in self.post.iter() {
+        for (domain_rule, path_rule, method_rule, cluster_id) in self.post.iter() {
             if domain_rule.matches(hostname)
                 && path_rule.matches(path) != PathRuleResult::None
                 && method_rule.matches(method) != MethodRuleResult::None
             {
-                return Some(app_id.clone());
+                return Some(cluster_id.clone());
             }
         }
 
@@ -164,7 +164,7 @@ impl Router {
         hostname: &[u8],
         path: PathRule,
         method: MethodRule,
-        app_id: Route,
+        cluster_id: Route,
     ) -> bool {
         let hostname = match from_utf8(hostname) {
             Err(_) => return false,
@@ -180,14 +180,14 @@ impl Router {
                 {
                     empty = false;
                     if !paths.iter().any(|(p, m, _)| *p == path && *m == method) {
-                        paths.push((path, method, app_id));
+                        paths.push((path, method, cluster_id));
                         return true;
                     }
                 }
 
                 if empty {
                     self.tree
-                        .domain_insert(hostname.into_bytes(), vec![(path, method, app_id)]);
+                        .domain_insert(hostname.into_bytes(), vec![(path, method, cluster_id)]);
                     return true;
                 }
 
@@ -202,7 +202,7 @@ impl Router {
         hostname: &[u8],
         path: PathRule,
         method: MethodRule,
-        _app_id: Route,
+        _cluster_id: Route,
     ) -> bool {
         let hostname = match from_utf8(hostname) {
             Err(_) => return false,
@@ -239,14 +239,14 @@ impl Router {
         domain: DomainRule,
         path: PathRule,
         method: MethodRule,
-        app_id: Route,
+        cluster_id: Route,
     ) -> bool {
         if !self
             .pre
             .iter()
             .any(|(d, p, m, _)| *d == domain && *p == path && *m == method)
         {
-            self.pre.push((domain, path, method, app_id));
+            self.pre.push((domain, path, method, cluster_id));
             true
         } else {
             false
@@ -258,14 +258,14 @@ impl Router {
         domain: DomainRule,
         path: PathRule,
         method: MethodRule,
-        app_id: Route,
+        cluster_id: Route,
     ) -> bool {
         if !self
             .post
             .iter()
             .any(|(d, p, m, _)| *d == domain && *p == path && *m == method)
         {
-            self.post.push((domain, path, method, app_id));
+            self.post.push((domain, path, method, cluster_id));
             true
         } else {
             false

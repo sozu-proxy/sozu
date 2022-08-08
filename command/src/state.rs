@@ -10,7 +10,7 @@ use crate::{
     proxy::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, DeactivateListener, HttpFrontend, HttpListener, HttpsListener, ListenerType,
-        PathRule, ProxyRequestData, QueryAnswerApplication, RemoveBackend, RemoveCertificate,
+        PathRule, ProxyRequestData, QueryAnswerCluster, RemoveBackend, RemoveCertificate,
         RemoveListener, Route, TcpFrontend, TcpListener,
     },
 };
@@ -751,15 +751,15 @@ impl ConfigState {
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
-        for (app_id, front_list) in self.tcp_fronts.iter() {
+        for (cluster_id, front_list) in self.tcp_fronts.iter() {
             for front in front_list.iter() {
-                my_tcp_fronts.insert((app_id, front));
+                my_tcp_fronts.insert((cluster_id, front));
             }
         }
         let mut their_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
-        for (app_id, front_list) in other.tcp_fronts.iter() {
+        for (cluster_id, front_list) in other.tcp_fronts.iter() {
             for front in front_list.iter() {
-                their_tcp_fronts.insert((app_id, front));
+                their_tcp_fronts.insert((cluster_id, front));
             }
         }
 
@@ -865,8 +865,8 @@ impl ConfigState {
             .collect()
     }
 
-    pub fn application_state(&self, cluster_id: &str) -> QueryAnswerApplication {
-        QueryAnswerApplication {
+    pub fn cluster_state(&self, cluster_id: &str) -> QueryAnswerCluster {
+        QueryAnswerCluster {
             configuration: self.clusters.get(cluster_id).cloned(),
             http_frontends: self
                 .http_fronts
@@ -914,7 +914,7 @@ impl ConfigState {
     }
 }
 
-pub fn get_application_ids_by_domain(
+pub fn get_cluster_ids_by_domain(
     state: &ConfigState,
     hostname: String,
     path: Option<String>,
@@ -1060,7 +1060,7 @@ mod tests {
     fn serialize() {
         let mut state: ConfigState = Default::default();
         state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
-            route: Route::ClusterId(String::from("app_1")),
+            route: Route::ClusterId(String::from("cluster_1")),
             hostname: String::from("lolcatho.st:8080"),
             path: PathRule::Prefix(String::from("/")),
             method: None,
@@ -1069,7 +1069,7 @@ mod tests {
             tags: None,
         }));
         state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
-            route: Route::ClusterId(String::from("app_2")),
+            route: Route::ClusterId(String::from("cluster_2")),
             hostname: String::from("test.local"),
             path: PathRule::Prefix(String::from("/abc")),
             method: None,
@@ -1078,40 +1078,40 @@ mod tests {
             tags: None,
         }));
         state.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-0"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1026".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
             backup: None,
         }));
         state.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-1"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-1"),
             address: "127.0.0.2:1027".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
             backup: None,
         }));
         state.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_2"),
-            backend_id: String::from("app_2-0"),
+            cluster_id: String::from("cluster_2"),
+            backend_id: String::from("cluster_2-0"),
             address: "192.167.1.2:1026".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
             backup: None,
         }));
         state.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-3"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-3"),
             address: "192.168.1.3:1027".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
             backup: None,
         }));
         state.handle_order(&ProxyRequestData::RemoveBackend(RemoveBackend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-3"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-3"),
             address: "192.168.1.3:1027".parse().unwrap(),
         }));
 
@@ -1130,7 +1130,7 @@ mod tests {
     fn diff() {
         let mut state: ConfigState = Default::default();
         state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
-            route: Route::ClusterId(String::from("app_1")),
+            route: Route::ClusterId(String::from("cluster_1")),
             hostname: String::from("lolcatho.st:8080"),
             path: PathRule::Prefix(String::from("/")),
             method: None,
@@ -1139,7 +1139,7 @@ mod tests {
             tags: None,
         }));
         state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
-            route: Route::ClusterId(String::from("app_2")),
+            route: Route::ClusterId(String::from("cluster_2")),
             hostname: String::from("test.local"),
             path: PathRule::Prefix(String::from("/abc")),
             method: None,
@@ -1148,31 +1148,31 @@ mod tests {
             tags: None,
         }));
         state.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-0"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1026".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
             backup: None,
         }));
         state.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-1"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-1"),
             address: "127.0.0.2:1027".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
             backup: None,
         }));
         state.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_2"),
-            backend_id: String::from("app_2-0"),
+            cluster_id: String::from("cluster_2"),
+            backend_id: String::from("cluster_2-0"),
             address: "192.167.1.2:1026".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
             backup: None,
         }));
         state.handle_order(&ProxyRequestData::AddCluster(Cluster {
-            cluster_id: String::from("app_2"),
+            cluster_id: String::from("cluster_2"),
             sticky_session: true,
             https_redirect: true,
             proxy_protocol: None,
@@ -1183,7 +1183,7 @@ mod tests {
 
         let mut state2: ConfigState = Default::default();
         state2.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
-            route: Route::ClusterId(String::from("app_1")),
+            route: Route::ClusterId(String::from("cluster_1")),
             hostname: String::from("lolcatho.st:8080"),
             path: PathRule::Prefix(String::from("/")),
             address: "0.0.0.0:8080".parse().unwrap(),
@@ -1192,31 +1192,31 @@ mod tests {
             tags: None,
         }));
         state2.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-0"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1026".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
             backup: None,
         }));
         state2.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-1"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-1"),
             address: "127.0.0.2:1027".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
             backup: None,
         }));
         state2.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-2"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-2"),
             address: "127.0.0.2:1028".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
             backup: None,
         }));
         state2.handle_order(&ProxyRequestData::AddCluster(Cluster {
-            cluster_id: String::from("app_3"),
+            cluster_id: String::from("cluster_3"),
             sticky_session: false,
             https_redirect: false,
             proxy_protocol: None,
@@ -1227,7 +1227,7 @@ mod tests {
 
         let e = vec![
             ProxyRequestData::RemoveHttpFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("app_2")),
+                route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
                 method: None,
@@ -1236,23 +1236,23 @@ mod tests {
                 tags: None,
             }),
             ProxyRequestData::RemoveBackend(RemoveBackend {
-                cluster_id: String::from("app_2"),
-                backend_id: String::from("app_2-0"),
+                cluster_id: String::from("cluster_2"),
+                backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
             }),
             ProxyRequestData::AddBackend(Backend {
-                cluster_id: String::from("app_1"),
-                backend_id: String::from("app_1-2"),
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
             }),
             ProxyRequestData::RemoveCluster {
-                cluster_id: String::from("app_2"),
+                cluster_id: String::from("cluster_2"),
             },
             ProxyRequestData::AddCluster(Cluster {
-                cluster_id: String::from("app_3"),
+                cluster_id: String::from("cluster_3"),
                 sticky_session: false,
                 https_redirect: false,
                 proxy_protocol: None,
@@ -1272,8 +1272,8 @@ mod tests {
         let hash2 = state2.hash_state();
         let mut state3 = state.clone();
         state3.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-2"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-2"),
             address: "127.0.0.2:1028".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
@@ -1288,10 +1288,10 @@ mod tests {
     }
 
     #[test]
-    fn application_ids_by_domain() {
+    fn cluster_ids_by_domain() {
         let mut config = ConfigState::new();
-        let http_front_app1 = HttpFrontend {
-            route: Route::ClusterId(String::from("MyApp_1")),
+        let http_front_cluster1 = HttpFrontend {
+            route: Route::ClusterId(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::Prefix(String::from("")),
             method: None,
@@ -1300,8 +1300,8 @@ mod tests {
             tags: None,
         };
 
-        let https_front_app1 = HttpFrontend {
-            route: Route::ClusterId(String::from("MyApp_1")),
+        let https_front_cluster1 = HttpFrontend {
+            route: Route::ClusterId(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::Prefix(String::from("")),
             method: None,
@@ -1310,8 +1310,8 @@ mod tests {
             tags: None,
         };
 
-        let http_front_app2 = HttpFrontend {
-            route: Route::ClusterId(String::from("MyApp_2")),
+        let http_front_cluster2 = HttpFrontend {
+            route: Route::ClusterId(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::Prefix(String::from("/api")),
             method: None,
@@ -1320,8 +1320,8 @@ mod tests {
             tags: None,
         };
 
-        let https_front_app2 = HttpFrontend {
-            route: Route::ClusterId(String::from("MyApp_2")),
+        let https_front_cluster2 = HttpFrontend {
+            route: Route::ClusterId(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::Prefix(String::from("/api")),
             method: None,
@@ -1330,41 +1330,43 @@ mod tests {
             tags: None,
         };
 
-        let add_http_front_order_app1 = ProxyRequestData::AddHttpFrontend(http_front_app1);
-        let add_http_front_order_app2 = ProxyRequestData::AddHttpFrontend(http_front_app2);
-        let add_https_front_order_app1 = ProxyRequestData::AddHttpsFrontend(https_front_app1);
-        let add_https_front_order_app2 = ProxyRequestData::AddHttpsFrontend(https_front_app2);
-        config.handle_order(&add_http_front_order_app1);
-        config.handle_order(&add_http_front_order_app2);
-        config.handle_order(&add_https_front_order_app1);
-        config.handle_order(&add_https_front_order_app2);
+        let add_http_front_order_cluster1 = ProxyRequestData::AddHttpFrontend(http_front_cluster1);
+        let add_http_front_order_cluster2 = ProxyRequestData::AddHttpFrontend(http_front_cluster2);
+        let add_https_front_order_cluster1 =
+            ProxyRequestData::AddHttpsFrontend(https_front_cluster1);
+        let add_https_front_order_cluster2 =
+            ProxyRequestData::AddHttpsFrontend(https_front_cluster2);
+        config.handle_order(&add_http_front_order_cluster1);
+        config.handle_order(&add_http_front_order_cluster2);
+        config.handle_order(&add_https_front_order_cluster1);
+        config.handle_order(&add_https_front_order_cluster2);
 
-        let mut app1_app2: HashSet<ClusterId> = HashSet::new();
-        app1_app2.insert(String::from("MyApp_1"));
-        app1_app2.insert(String::from("MyApp_2"));
+        let mut cluster1_cluster2: HashSet<ClusterId> = HashSet::new();
+        cluster1_cluster2.insert(String::from("MyCluster_1"));
+        cluster1_cluster2.insert(String::from("MyCluster_2"));
 
-        let mut app2: HashSet<ClusterId> = HashSet::new();
-        app2.insert(String::from("MyApp_2"));
+        let mut cluster2: HashSet<ClusterId> = HashSet::new();
+        cluster2.insert(String::from("MyCluster_2"));
 
         let empty: HashSet<ClusterId> = HashSet::new();
         assert_eq!(
-            get_application_ids_by_domain(&config, String::from("lolcatho.st"), None),
-            app1_app2
+            get_cluster_ids_by_domain(&config, String::from("lolcatho.st"), None),
+            cluster1_cluster2
         );
         assert_eq!(
-            get_application_ids_by_domain(
+            get_cluster_ids_by_domain(
                 &config,
                 String::from("lolcatho.st"),
                 Some(String::from("/api"))
             ),
-            app2
+            cluster2
         );
         assert_eq!(
-            get_application_ids_by_domain(&config, String::from("lolcathost"), None),
+            get_cluster_ids_by_domain(&config, String::from("lolcathost"), None),
             empty
         );
         assert_eq!(
-            get_application_ids_by_domain(
+            get_cluster_ids_by_domain(
                 &config,
                 String::from("lolcathost"),
                 Some(String::from("/sozu"))
@@ -1377,8 +1379,8 @@ mod tests {
     fn duplicate_backends() {
         let mut state: ConfigState = Default::default();
         state.handle_order(&ProxyRequestData::AddBackend(Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-0"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1026".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
@@ -1386,8 +1388,8 @@ mod tests {
         }));
 
         let b = Backend {
-            cluster_id: String::from("app_1"),
-            backend_id: String::from("app_1-0"),
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1026".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: Some("sticky".to_string()),
@@ -1396,7 +1398,7 @@ mod tests {
 
         state.handle_order(&ProxyRequestData::AddBackend(b.clone()));
 
-        assert_eq!(state.backends.get("app_1").unwrap(), &vec![b]);
+        assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
     }
 
     #[test]

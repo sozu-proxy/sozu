@@ -534,7 +534,7 @@ impl CommandServer {
         Ok(())
     }
 
-    pub async fn load_static_application_configuration(&mut self) {
+    pub async fn load_static_cluster_configuration(&mut self) {
         let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
 
         let mut total_message_count = 0usize;
@@ -890,7 +890,7 @@ pub fn start_server(
         let saved_state_path = config.saved_state.clone();
 
         let mut server = CommandServer::new(fd, config, tx, command_rx, workers, accept_cancel_tx)?;
-        server.load_static_application_configuration().await;
+        server.load_static_cluster_configuration().await;
 
         if let Some(path) = saved_state_path {
             server
