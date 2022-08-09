@@ -73,7 +73,7 @@ impl CommandManager {
                 StateCmd::Dump { json } => self.dump_state(json),
             },
             SubCmd::Reload { file, json } => self.reload_configuration(file, json),
-            SubCmd::Application { cmd } => self.application_command(cmd),
+            SubCmd::Cluster { cmd } => self.cluster_command(cmd),
             SubCmd::Backend { cmd } => self.backend_command(cmd),
             SubCmd::Frontend { cmd } => match cmd {
                 FrontendCmd::Http { cmd } => self.http_frontend_command(cmd),
@@ -125,7 +125,7 @@ impl CommandManager {
                 ),
             },
             SubCmd::Query { cmd, json } => match cmd {
-                QueryCmd::Applications { id, domain } => self.query_application(json, id, domain),
+                QueryCmd::Clusters { id, domain } => self.query_cluster(json, id, domain),
                 QueryCmd::Certificates {
                     fingerprint,
                     domain,

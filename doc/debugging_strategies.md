@@ -10,10 +10,10 @@ It is useful to gather information on the configuration state in a production sy
 Here are some commands you can use to take a snapshot of the current state:
 
 ```bash
-sozuctl -c /etc/config.toml status > "sozu-status-$(date -Iseconds).txt"
-sozuctl -c /etc/config.toml metrics > "sozu-metrics-$(date -Iseconds).txt"
-sozuctl -c /etc/config.toml query applications > "sozu-applications-$(date -Iseconds).txt"
-sozuctl -c /etc/config.toml state save -f "sozu-state-$(date -Iseconds).txt"
+sozu -c /etc/config.toml status > "sozu-status-$(date -Iseconds).txt"
+sozu -c /etc/config.toml query metrics > "sozu-metrics-$(date -Iseconds).txt"
+sozu -c /etc/config.toml query clusters > "sozu-applications-$(date -Iseconds).txt"
+sozu -c /etc/config.toml state save -f "sozu-state-$(date -Iseconds).txt"
 ```
 
 ### Logging
@@ -64,7 +64,7 @@ tagged_metrics = true
 Access logs have the following format:
 
 ```txt
-2018-09-21T14:01:51Z 821136800672570 71013 WRK-00 INFO  450b071a-53b8-4fd7-b2f2-1213f03ef032 MyApp      127.0.0.1:52323 -> 127.0.0.1:1027       241ms 855μs 560 33084   200 OK lolcatho.st:8080 GET /
+2018-09-21T14:01:51Z 821136800672570 71013 WRK-00 INFO  450b071a-53b8-4fd7-b2f2-1213f03ef032 MyCluster      127.0.0.1:52323 -> 127.0.0.1:1027       241ms 855μs 560 33084   200 OK lolcatho.st:8080 GET /
 ```
 
 From left to right:
@@ -75,7 +75,7 @@ From left to right:
 * worker name ("MAIN" for the main process)
 * log level
 * request id (UUID, generated randomly for each request, changes on the same connection if doing multiple requests in keep-alive)
-* application id
+* cluster id
 * client's source IP and port
 * backend server's destination IP and port
 * response time (from first byte received from the client, to last byte sent to the client)
@@ -98,7 +98,7 @@ The following metrics track requests that are correctly sent to the backend serv
 
 There are global `sozu.bytes_in` and `sozu.bytes_out` metrics counting the front traffic
 for sozu.
-These metrics can also have a backend ID and application ID. They would then indicate
+These metrics can also have a backend ID and cluster ID. They would then indicate
 bytes in and out from the point of view of the backend server.
 
 #### Response time
@@ -135,7 +135,7 @@ The `sozu.http.errors` counter is the sum of failed requests. It contains the fo
 * `sozu.http.400.errors`: cannot parse hostname
 * `sozu.http.404.errors`: unknown hostname and/or path
 * `sozu.http.413.errors`: request too large
-* `sozu.http.503.errors`: could not connect to backend server, or no backend server available for the corresponding application
+* `sozu.http.503.errors`: could not connect to backend server, or no backend server available for the corresponding cluster
 
 Going further, backend connections issues are tracked by the following metrics:
 
@@ -148,19 +148,19 @@ after the circuit breaker triggered (we wait for 3 failed connections to the bac
 A backend connection error would result in the following log message:
 
 ```txt
-2018-09-21T14:36:08Z 823194694977734 71501 WRK-00 ERROR 839f592b-a194-4c3b-848b-8ef024129969    MyApp    error connecting to backend, trying again
+2018-09-21T14:36:08Z 823194694977734 71501 WRK-00 ERROR 839f592b-a194-4c3b-848b-8ef024129969    MyCluster    error connecting to backend, trying again
 ```
 
 The circuit breaker triggering will write this to the logs:
 
 ```txt
-2018-09-21T14:36:57Z 823243245414405 71524 WRK-00 ERROR 7029d66e-57a8-406e-ae61-e4bf9ff7b6b8    MyApp    max connection attempt reached
+2018-09-21T14:36:57Z 823243245414405 71524 WRK-00 ERROR 7029d66e-57a8-406e-ae61-e4bf9ff7b6b8    MyCluster    max connection attempt reached
 ```
 
 The retry policy marking a backend server as down will write the following log message:
 
 ```txt
-2018-09-21T14:37:31Z 823277868708804 71524 WRK-00 ERROR no more available backends for app MyApp
+2018-09-21T14:37:31Z 823277868708804 71524 WRK-00 ERROR no more available backends for cluster MyCluster
 ```
 
 ### Scalability
@@ -238,21 +238,21 @@ Normal traffic (`sozu.http.requests`) drops while 404 (`sozu.http.404.errors`) a
 Check the configuration state with;
 
 ```bash
-sozuctl -c /etc/config.toml query applications
+sozuctl -c /etc/config.toml query clusters
 ```
 
-And, for the complete configuration for a specific application id:
+And, for the complete configuration for a specific cluster id:
 
 ```bash
-sozuctl -c /etc/config.toml query applications -i app_id
+sozuctl -c /etc/config.toml query clusters -i cluster_id
 ```
 
 ### Backend server unavailable
 
 `sozu.http.503.errors` increases, lots of `sozu.backend.connections.errors` and a
 `sozu.backend.down` record: a backend server is down.
-Check the logs for `error connecting to backend, trying again` and `no more available backends for app <app_id>`
-to find out which application is affected
+Check the logs for `error connecting to backend, trying again` and `no more available backends for cluster <cluster_id>`
+to find out which cluster is affected
 
 ### Zombies
 

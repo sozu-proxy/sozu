@@ -1029,7 +1029,7 @@ impl Session {
                 .backend_from_sticky_session(cluster_id, sticky_session)
                 .map_err(|e| {
                     debug!(
-                        "Couldn't find a backend corresponding to sticky_session {} for app {}",
+                        "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
                         sticky_session, cluster_id
                     );
                     e
@@ -1165,7 +1165,7 @@ impl Session {
             .borrow()
             .clusters
             .get(&cluster_id)
-            .map(|app| app.sticky_session)
+            .map(|cluster| cluster.sticky_session)
             .unwrap_or(false);
         let mut socket = self.backend_from_request(&cluster_id, front_should_stick)?;
 

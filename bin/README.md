@@ -6,7 +6,7 @@ receives configuration commands through anonymous unix sockets.
 
 This executable requires a configuration file in the TOML format, that describes
 the worker types and numbers, along with global information. This file can
-describe the applications handled by the proxy, but it is more recommended to
+describe clusters handled by the proxy, but it is more recommended to
 use the command unix socket, through which the proxy listens for orders or
 configuration changes. The path of that unix socket is set in the configuration
 file.

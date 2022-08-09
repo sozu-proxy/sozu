@@ -45,7 +45,7 @@ use crate::{
 use super::session::Session;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TlsApp {
+pub struct TlsCluster {
     pub cluster_id: String,
     pub hostname: String,
     pub path_begin: String,

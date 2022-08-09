@@ -2,15 +2,15 @@
 
 `sozu_lib` provides tools to write a proxy that can be reconfigured
 without any downtime. See `examples/minimal.rs` for a small example
-of starting a HTTP proxy with one application.
+of starting a HTTP proxy with one cluster.
 
 A proxy starts as an event loop with which you communicate through
-a `Channel`. You can add or remove applications by sending messages
+a `Channel`. You can add or remove clusters by sending messages
 through that channel. Each message has an identifier that the event
 loop will use in its answer.
 
 The proxy implementations handle differently the frontend and backend
-configurations. A single application could have multiple backend
+configurations. A single cluster could have multiple backend
 servers, but it can also answer to different hostnames and various
 TLS certificates. All those settings can be changed independently
 from the currently active connections. As an example, a backend

@@ -18,8 +18,8 @@ use sozu_command_lib::{
         FrontendFilters, RunState, WorkerInfo,
     },
     proxy::{
-        MetricsConfiguration, ProxyRequestData, Query, QueryApplicationDomain,
-        QueryApplicationType, QueryCertificateType, QueryMetricsType,
+        MetricsConfiguration, ProxyRequestData, Query, QueryClusterDomain,
+        QueryClusterType, QueryCertificateType, QueryMetricsType,
     },
 };
 
@@ -658,19 +658,19 @@ impl CommandManager {
         Ok(())
     }
 
-    pub fn query_application(
+    pub fn query_cluster(
         &mut self,
         json: bool,
-        application_id: Option<String>,
+        cluster_id: Option<String>,
         domain: Option<String>,
     ) -> Result<(), anyhow::Error> {
-        if application_id.is_some() && domain.is_some() {
-            bail!("Error: Either request an application ID or a domain name");
+        if cluster_id.is_some() && domain.is_some() {
+            bail!("Error: Either request an cluster ID or a domain name");
         }
 
-        let command = if let Some(ref cluster_id) = application_id {
-            CommandRequestData::Proxy(ProxyRequestData::Query(Query::Applications(
-                QueryApplicationType::ClusterId(cluster_id.to_string()),
+        let command = if let Some(ref cluster_id) = cluster_id {
+            CommandRequestData::Proxy(ProxyRequestData::Query(Query::Clusters(
+                QueryClusterType::ClusterId(cluster_id.to_string()),
             )))
         } else if let Some(ref domain) = domain {
             let splitted: Vec<String> =
@@ -680,7 +680,7 @@ impl CommandManager {
                 bail!("Domain can't be empty");
             }
 
-            let query_domain = QueryApplicationDomain {
+            let query_domain = QueryClusterDomain {
                 hostname: splitted
                     .get(0)
                     .with_context(|| "Domain can't be empty")?
@@ -688,11 +688,11 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{}", path)), // We add the / again because of the splitn removing it
             };
 
-            CommandRequestData::Proxy(ProxyRequestData::Query(Query::Applications(
-                QueryApplicationType::Domain(query_domain),
+            CommandRequestData::Proxy(ProxyRequestData::Query(Query::Clusters(
+                QueryClusterType::Domain(query_domain),
             )))
         } else {
-            CommandRequestData::Proxy(ProxyRequestData::Query(Query::ApplicationsHashes))
+            CommandRequestData::Proxy(ProxyRequestData::Query(Query::ClustersHashes))
         };
 
         let id = generate_id();
@@ -720,7 +720,7 @@ impl CommandManager {
                 bail!("could not query proxy state: {}", message.message);
             }
             CommandStatus::Ok => {
-                print_query_response_data(application_id, domain, message.data, json)?;
+                print_query_response_data(cluster_id, domain, message.data, json)?;
             }
         }
 
@@ -790,18 +790,18 @@ impl CommandManager {
         list: bool,
         refresh: Option<u32>,
         names: Vec<String>,
-        clusters: Vec<String>,
-        backends: Vec<(String, String)>,
+        cluster_ids: Vec<String>,
+        backends: Vec<(String, String)>, // (cluster_id, backend_id)
     ) -> Result<(), anyhow::Error> {
         let query = if list {
             QueryMetricsType::List
-        } else if !clusters.is_empty() && !backends.is_empty() {
+        } else if !cluster_ids.is_empty() && !backends.is_empty() {
             bail!("Error: Either request a list of clusters or a list of backends");
         } else {
-            if !clusters.is_empty() {
+            if !cluster_ids.is_empty() {
                 QueryMetricsType::Cluster {
                     metrics: names,
-                    clusters,
+                    cluster_ids,
                     date: None,
                 }
             } else {
@@ -913,8 +913,8 @@ impl CommandManager {
                 //deactivate success messages for now
                 /*
                 match order {
-                  ProxyRequestData::AddCluster(_) => println!("application added : {}", message.message),
-                  ProxyRequestData::RemoveCluster(_) => println!("application removed : {} ", message.message),
+                  ProxyRequestData::AddCluster(_) => println!("cluster added : {}", message.message),
+                  ProxyRequestData::RemoveCluster(_) => println!("cluster removed : {} ", message.message),
                   ProxyRequestData::AddBackend(_) => println!("backend added : {}", message.message),
                   ProxyRequestData::RemoveBackend(_) => println!("backend removed : {} ", message.message),
                   ProxyRequestData::AddCertificate(_) => println!("certificate added: {}", message.message),

@@ -59,7 +59,7 @@ The logger can be invoked through a thread local storage variable accessible fro
 
 ## Load balancing
 
-For a given application, Sōzu keeps a list of backends to which the connection is redirected.
+For a given cluster, Sōzu keeps a list of backends to which the connection is redirected.
 Sōzu detects broken servers and redirects traffic only to healthy ones, with several available loadbalancing algorithms:
 round robin (default), random, least_loaded, and power of two.
 

@@ -157,7 +157,7 @@ mod tests {
     use crate::certificate::split_certificate_chain;
     use crate::config::ProxyProtocolConfig;
     use crate::proxy::{
-        AddCertificate, AppMetricsData, Backend, CertificateAndKey, CertificateFingerprint,
+        AddCertificate, ClusterMetricsData, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, FilteredData, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams,
         MetricsData, PathRule, Percentiles, ProxyRequestData, RemoveBackend, RemoveCertificate,
         Route, RulePosition, TlsVersion,
@@ -572,8 +572,8 @@ mod tests {
                         .cloned()
                         .collect(),
                         clusters: [(
-                            String::from("app_1"),
-                            AppMetricsData {
+                            String::from("cluster_1"),
+                            ClusterMetricsData {
                                 data: [(
                                     String::from("request_time"),
                                     FilteredData::Percentiles(Percentiles {
@@ -591,7 +591,7 @@ mod tests {
                                 .cloned()
                                 .collect(),
                                 backends: [(
-                                    String::from("app_1-0"),
+                                    String::from("cluster_1-0"),
                                     [
                                         (String::from("bytes_in"), FilteredData::Count(256)),
                                         (String::from("bytes_out"), FilteredData::Count(128)),

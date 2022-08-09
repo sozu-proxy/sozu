@@ -103,25 +103,25 @@ pub struct AggregatedMetricsData {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetricsData {
     pub proxy: BTreeMap<String, FilteredData>,
-    pub clusters: BTreeMap<String, AppMetricsData>,
+    pub clusters: BTreeMap<String, ClusterMetricsData>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppMetricsData {
+pub struct ClusterMetricsData {
     pub data: BTreeMap<String, FilteredData>,
     pub backends: BTreeMap<String, BTreeMap<String, FilteredData>>,
 }
 
-impl AppMetricsData {
+impl ClusterMetricsData {
     pub fn new() -> Self {
-        AppMetricsData {
+        ClusterMetricsData {
             data: BTreeMap::new(),
             backends: BTreeMap::new(),
         }
     }
 }
 
-impl Default for AppMetricsData {
+impl Default for ClusterMetricsData {
     fn default() -> Self {
         Self::new()
     }
@@ -779,21 +779,21 @@ pub enum MetricsConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Query {
-    Applications(QueryApplicationType),
+    Clusters(QueryClusterType),
     Certificates(QueryCertificateType),
     Metrics(QueryMetricsType),
-    ApplicationsHashes,
+    ClustersHashes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum QueryApplicationType {
+pub enum QueryClusterType {
     ClusterId(String),
-    Domain(QueryApplicationDomain),
+    Domain(QueryClusterDomain),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct QueryApplicationDomain {
+pub struct QueryClusterDomain {
     pub hostname: String,
     pub path: Option<String>,
 }
@@ -812,13 +812,12 @@ pub enum QueryMetricsType {
     List,
     Cluster {
         metrics: Vec<String>,
-        clusters: Vec<String>,
+        cluster_ids: Vec<String>,
         date: Option<i64>,
     },
-    // tuple cluster_id, backend_id
     Backend {
         metrics: Vec<String>,
-        backends: Vec<(String, String)>,
+        backends: Vec<(String, String)>, // (cluster_id, backend_id)
         date: Option<i64>,
     },
 }
@@ -826,15 +825,15 @@ pub enum QueryMetricsType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryAnswer {
-    Applications(Vec<QueryAnswerApplication>),
-    /// application id, hash of application information
-    ApplicationsHashes(BTreeMap<String, u64>),
+    Clusters(Vec<QueryAnswerCluster>),
+    /// cluster id, hash of cluster information
+    ClustersHashes(BTreeMap<String, u64>),
     Certificates(QueryAnswerCertificate),
     Metrics(QueryAnswerMetrics),
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct QueryAnswerApplication {
+pub struct QueryAnswerCluster {
     pub configuration: Option<Cluster>,
     pub http_frontends: Vec<HttpFrontend>,
     pub https_frontends: Vec<HttpFrontend>,

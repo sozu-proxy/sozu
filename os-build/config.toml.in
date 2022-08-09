@@ -128,7 +128,7 @@ address = "0.0.0.0:80"
 #answer_503 = "__DATADIR__/html/503.html"
 
 # defines the sticky session cookie's name, if `sticky_session` is activated for
-# an application. Defaults to "SOZUBALANCEID"
+# a cluster. Defaults to "SOZUBALANCEID"
 # sticky_name = "SOZUBALANCEID"
 #
 # Configures the client socket to receive a PROXY protocol header
@@ -172,39 +172,39 @@ address = "0.0.0.0:443"
 # Configures the client socket to receive a PROXY protocol header
 # expect_proxy = false
 
-# static configuration for applications
+# static configuration for clusters
 #
-# those applications will be routed by sozu directly from start
-[applications]
+# those clusters will be routed by sozu directly from start
+[clusters]
 
-# every application has an "application id", here it is "MyApp"
+# every cluster has an "cluster id", here it is "MyCluster"
 # this is an example of a routing configuration for the HTTP and HTTPS proxies
-[applications.MyApp]
+[clusters.MyCluster]
 
 # the protocol option indicates if we will use HTTP or TCP proxying
 # possible options are "http" or "tcp"
 protocol = "http"
 
-# per application load balancing algorithm. The possible values are
+# per cluster load balancing algorithm. The possible values are
 # "roundrobin" and "random". Defaults to "roundrobin"
 # load_balancing_policy="roundrobin"
 
 # frontends configuration
-# this specifies which listeners; domains, certificates that will be configured for an application
+# this specifies which listeners; domains, certificates that will be configured for an cluster
 # each element of the array must be specified on one line (toml format limitation)
 # possible frontend options:
 # - address: TCP listener
-# - hostname: host name of the application
-# - path_begin = "/api" # optional. an application can receive requests going to a hostname and path prefix
-# - sticky_session = false # activates sticky sessions for this application
-# - https_redirect = false #  activates automatic redirection to HTTPS for this application
+# - hostname: host name of the cluster
+# - path_begin = "/api" # optional. an cluster can receive requests going to a hostname and path prefix
+# - sticky_session = false # activates sticky sessions for this cluster
+# - https_redirect = false #  activates automatic redirection to HTTPS for this cluster
 frontends = [
   { address = "0.0.0.0:80", hostname = "lolcatho.st" },
   { address = "0.0.0.0:443", hostname = "lolcatho.st", certificate = "__DATADIR__/ssl/certificate.pem", key = "__DATADIR__/ssl/key.pem", certificate_chain = "__DATADIR__/ssl/certificate_chain.pem" }
 ]
 
 # backends configuration
-# this indicates the backend servers used by the application
+# this indicates the backend servers used by the cluster
 # possible options:
 # - address: IP and port of the backend server
 # - weight: weight used by the load balancing algorithm
@@ -214,7 +214,7 @@ backends = [
 ]
 
 # this is an example of a routing configuration for the TCP proxy
-[applications.TcpTest]
+[clusters.TcpTest]
 protocol = "tcp"
 
 frontends = [

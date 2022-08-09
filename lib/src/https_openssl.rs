@@ -77,7 +77,7 @@ use crate::{
 const SERVER_PROTOS: &[u8] = b"\x08http/1.1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TlsApp {
+pub struct TlsCluster {
     pub cluster_id: String,
     pub hostname: String,
     pub path_begin: String,
@@ -1065,7 +1065,7 @@ impl Session {
                 .backend_from_sticky_session(cluster_id, sticky_session)
                 .map_err(|e| {
                     debug!(
-                        "Couldn't find a backend corresponding to sticky_session {} for app {}",
+                        "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
                         sticky_session, cluster_id
                     );
                     e
@@ -1180,7 +1180,7 @@ impl Session {
             }
         }
 
-        //replacing with a connection to another application
+        //replacing with a connection to another cluster
         if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
             if let Some(token) = self.back_token() {
                 self.close_backend();
@@ -1201,7 +1201,7 @@ impl Session {
             .borrow()
             .clusters
             .get(&cluster_id)
-            .map(|app| app.sticky_session)
+            .map(|cluster| cluster.sticky_session)
             .unwrap_or(false);
         let mut socket = self.backend_from_request(&cluster_id, front_should_stick)?;
 
@@ -2510,9 +2510,9 @@ mod tests {
 
     #[test]
     fn frontend_from_request_test() {
-        let cluster_id1 = "app_1".to_owned();
-        let cluster_id2 = "app_2".to_owned();
-        let cluster_id3 = "app_3".to_owned();
+        let cluster_id1 = "cluster_1".to_owned();
+        let cluster_id2 = "cluster_2".to_owned();
+        let cluster_id3 = "cluster_3".to_owned();
         let uri1 = "/".to_owned();
         let uri2 = "/yolo".to_owned();
         let uri3 = "/yolo/swag".to_owned();
@@ -2576,25 +2576,25 @@ mod tests {
         let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);
         assert_eq!(
             frontend1.expect("should find a frontend"),
-            Route::ClusterId("app_1".to_string())
+            Route::ClusterId("cluster_1".to_string())
         );
         println!("TEST {}", line!());
         let frontend2 = listener.frontend_from_request("lolcatho.st", "/test", &Method::Get);
         assert_eq!(
             frontend2.expect("should find a frontend"),
-            Route::ClusterId("app_1".to_string())
+            Route::ClusterId("cluster_1".to_string())
         );
         println!("TEST {}", line!());
         let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test", &Method::Get);
         assert_eq!(
             frontend3.expect("should find a frontend"),
-            Route::ClusterId("app_2".to_string())
+            Route::ClusterId("cluster_2".to_string())
         );
         println!("TEST {}", line!());
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         assert_eq!(
             frontend4.expect("should find a frontend"),
-            Route::ClusterId("app_3".to_string())
+            Route::ClusterId("cluster_3".to_string())
         );
         println!("TEST {}", line!());
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
