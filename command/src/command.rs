@@ -66,8 +66,8 @@ pub enum CommandStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandResponseData {
     Workers(Vec<WorkerInfo>),
-    Metrics(AggregatedMetricsData),
-    Query(BTreeMap<String, QueryAnswer>),
+    Metrics(AggregatedMetricsData), // this isn't used anywhere except in a test
+    Query(BTreeMap<String, QueryAnswer>), // worker_id -> query_answer
     State(ConfigState),
     Event(Event),
     FrontendList(ListedFrontends),
@@ -157,10 +157,10 @@ mod tests {
     use crate::certificate::split_certificate_chain;
     use crate::config::ProxyProtocolConfig;
     use crate::proxy::{
-        AddCertificate, ClusterMetricsData, Backend, CertificateAndKey, CertificateFingerprint,
-        Cluster, FilteredData, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams,
-        MetricsData, PathRule, Percentiles, ProxyRequestData, RemoveBackend, RemoveCertificate,
-        Route, RulePosition, TlsVersion,
+        AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
+        ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
+        LoadBalancingParams, WorkerMetrics, PathRule, Percentiles, ProxyRequestData, RemoveBackend,
+        RemoveCertificate, Route, RulePosition, TlsVersion,
     };
     use hex::FromHex;
     use serde_json;
@@ -562,7 +562,7 @@ mod tests {
                 .collect(),
                 workers: [(
                     String::from("0"),
-                    MetricsData {
+                    WorkerMetrics {
                         proxy: [
                             (String::from("sozu.gauge"), FilteredData::Gauge(1)),
                             (String::from("sozu.count"), FilteredData::Count(-2)),

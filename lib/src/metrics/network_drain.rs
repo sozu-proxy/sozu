@@ -252,8 +252,10 @@ impl NetworkDrain {
                 let res = match stored_metric.data {
                     MetricData::Gauge(value) => {
                         if self.use_tagged_metrics {
-                            self.remote.write_fmt(format_args!("{}.backend.{},origin={},version={},cluster_id={},backend_id={}:{}|g\n",
-              self.prefix, key.2, self.origin, VERSION, key.0, key.1, value))
+                            self.remote.write_fmt(format_args!(
+                                "{}.backend.{},origin={},version={},cluster_id={},backend_id={}:{}|g\n",
+                                self.prefix, key.2, self.origin, VERSION, key.0, key.1, value
+                            ))
                         } else {
                             self.remote.write_fmt(format_args!(
                                 "{}.{}.cluster.{}.backend.{}.{}:{}|g\n",
@@ -267,8 +269,10 @@ impl NetworkDrain {
                         }
 
                         let res = if self.use_tagged_metrics {
-                            self.remote.write_fmt(format_args!("{}.backend.{},origin={},version={},cluster_id={},backend_id={}:{}|c\n",
-              self.prefix, key.2, self.origin, VERSION, key.0, key.1, value))
+                            self.remote.write_fmt(format_args!(
+                                "{}.backend.{},origin={},version={},cluster_id={},backend_id={}:{}|c\n",
+                                self.prefix, key.2, self.origin, VERSION, key.0, key.1, value
+                            ))
                         } else {
                             self.remote.write_fmt(format_args!(
                                 "{}.{}.cluster.{}.backend.{}.{}:{}|c\n",
@@ -326,8 +330,10 @@ impl NetworkDrain {
                 let res = match (metric.cluster_id, metric.backend_id) {
                     (Some(cluster_id), Some(backend_id)) => {
                         if self.use_tagged_metrics {
-                            self.remote.write_fmt(format_args!("{}.backend.{},origin={},version={},cluster_id={},backend_id={}:{}|ms\n",
-              self.prefix, metric.label, self.origin, VERSION, cluster_id, backend_id, metric.duration))
+                            self.remote.write_fmt(format_args!(
+                                "{}.backend.{},origin={},version={},cluster_id={},backend_id={}:{}|ms\n",
+                                self.prefix, metric.label, self.origin, VERSION, cluster_id, backend_id, metric.duration
+                            ))
                         } else {
                             self.remote.write_fmt(format_args!(
                                 "{}.{}.cluster.{}.backend.{}.{}:{}|ms\n",

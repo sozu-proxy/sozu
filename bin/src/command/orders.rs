@@ -1026,11 +1026,11 @@ impl CommandServer {
                     Success::Query(CommandResponseData::Query(query_answers_map))
                 }
                 &Query::Certificates(_) => {
-                    info!("certificates query received: {:?}", query_answers_map);
+                    info!("certificates query answer received: {:?}", query_answers_map);
                     Success::Query(CommandResponseData::Query(query_answers_map))
                 }
                 &Query::Metrics(_) => {
-                    debug!("metrics query received: {:?}", query_answers_map);
+                    debug!("metrics query answer received: {:?}", query_answers_map);
                     Success::Query(CommandResponseData::Query(query_answers_map))
                 }
             };

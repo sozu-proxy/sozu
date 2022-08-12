@@ -14,7 +14,7 @@ use std::{
 use mio::net::UdpSocket;
 
 use crate::sozu_command::proxy::{
-    FilteredData, MetricsConfiguration, MetricsData, QueryAnswerMetrics, QueryMetricsType,
+    FilteredData, MetricsConfiguration, QueryAnswerMetrics, QueryMetricsType, WorkerMetrics,
 };
 
 use self::{local_drain::LocalDrain, network_drain::NetworkDrain};
@@ -212,6 +212,8 @@ impl Aggregator {
         }
     }
 
+    /* these are never used here, only at the local drain level
+
     pub fn dump_metrics_data(&mut self) -> MetricsData {
         self.local.dump_metrics_data()
     }
@@ -219,6 +221,7 @@ impl Aggregator {
     pub fn dump_process_data(&mut self) -> BTreeMap<String, FilteredData> {
         self.local.dump_process_data()
     }
+    */
 
     pub fn query(&mut self, q: &QueryMetricsType) -> QueryAnswerMetrics {
         self.local.query(q)

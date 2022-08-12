@@ -8,7 +8,10 @@ use prettytable::{Row, Table};
 
 use sozu_command_lib::{
     command::{CommandResponseData, ListedFrontends},
-    proxy::{FilteredData, QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics, Route},
+    proxy::{
+        ClusterMetricsData, FilteredData, QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics,
+        Route, WorkerMetrics,
+    },
 };
 
 pub fn print_frontend_list(frontends: ListedFrontends) {
@@ -71,7 +74,87 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
     }
 }
 
+fn filter_cluster_metrics(
+    // cluster_id -> (key, value)
+    cluster_metrics: &BTreeMap<String, BTreeMap<String, FilteredData>>,
+) -> BTreeMap<String, FilteredData> {
+    let mut filtered_metrics = BTreeMap::new();
+    for (cluster_id, filtered_data) in cluster_metrics.iter() {
+        for (metric_key, filtered_value) in filtered_data.iter() {
+            filtered_metrics.insert(
+                format!("{} {}", cluster_id, metric_key.replace("\t", ".")),
+                filtered_value.clone(),
+            );
+        }
+    }
+    filtered_metrics
+}
+
+fn filter_backend_metrics(
+    // cluster_id -> (backend_id -> (key -> metric))
+    backend_metrics: &BTreeMap<String, BTreeMap<String, BTreeMap<String, FilteredData>>>,
+) -> BTreeMap<String, FilteredData> {
+    let mut filtered_metrics = BTreeMap::new();
+    for (cluster_id, cluster_metrics) in backend_metrics.iter() {
+        for (backend_id, backend_metrics) in cluster_metrics.iter() {
+            for (metric_key, filtered_value) in backend_metrics.iter() {
+                filtered_metrics.insert(
+                    format!(
+                        "{}/{} {}",
+                        cluster_id,
+                        backend_id,
+                        metric_key.replace("\t", ".")
+                    ),
+                    filtered_value.clone(),
+                );
+            }
+        }
+    }
+    filtered_metrics
+}
+
+fn filter_worker_metrics(
+    // key -> value
+    proxy_metrics: &BTreeMap<String, FilteredData>,
+    // cluster_id -> cluster+backend metrics
+    cluster_metrics: &BTreeMap<String, ClusterMetricsData>,
+) -> BTreeMap<String, FilteredData> {
+    let mut filtered_metrics = BTreeMap::new();
+
+    for (metric_key, filtered_value) in proxy_metrics.iter() {
+        filtered_metrics.insert(
+            format!("{}", metric_key.replace("\t", ".")),
+            filtered_value.clone(),
+        );
+    }
+    for (cluster_id, cluster_metric_data) in cluster_metrics.iter() {
+        // cluster metrics
+        for (metric_key, filtered_value) in cluster_metric_data.data.iter() {
+            filtered_metrics.insert(
+                format!("{} {}", cluster_id, metric_key.replace("\t", ".")),
+                filtered_value.clone(),
+            );
+        }
+        // backend metrics
+        for (backend_id, backend_metrics) in cluster_metric_data.backends.iter() {
+            for (metric_key, filtered_value) in backend_metrics.iter() {
+                filtered_metrics.insert(
+                    format!(
+                        "{}/{} {}",
+                        cluster_id,
+                        backend_id,
+                        metric_key.replace("\t", ".")
+                    ),
+                    filtered_value.clone(),
+                );
+            }
+        }
+    }
+    filtered_metrics
+}
+
 pub fn print_metrics(
+    // worker_id
     answers: BTreeMap<String, QueryAnswer>,
     json: bool,
     list: bool,
@@ -81,62 +164,30 @@ pub fn print_metrics(
         return print_json_response(&answers);
     }
 
-    //println!("got answers: {:#?}", answers);
     if list {
-        let metrics: HashSet<_> = answers
-            .values()
-            .filter_map(|value| match value {
-                QueryAnswer::Metrics(QueryAnswerMetrics::List(v)) => Some(v.iter()),
-                _ => None,
-            })
-            .flatten()
-            .map(|s| s.replace("\t", "."))
-            .collect();
-        let mut metrics: Vec<_> = metrics.iter().collect();
-        metrics.sort();
-        println!("available metrics: {:?}", metrics);
-        return Ok(());
+        return print_available_metrics(&answers);
     }
 
-    let answers = answers
+    let filtered_answers = answers
         .iter()
         .filter_map(|(key, value)| match value {
-            QueryAnswer::Metrics(QueryAnswerMetrics::Cluster(d)) => {
-                let mut metrics = BTreeMap::new();
-                for (cluster_id, cluster_metrics) in d.iter() {
-                    for (metric_key, value) in cluster_metrics.iter() {
-                        metrics.insert(
-                            format!("{} {}", cluster_id, metric_key.replace("\t", ".")),
-                            value.clone(),
-                        );
-                    }
-                }
-                Some((key.clone(), metrics))
+            QueryAnswer::Metrics(QueryAnswerMetrics::Cluster(m)) => {
+                Some((key.clone(), filter_cluster_metrics(m)))
             }
-            QueryAnswer::Metrics(QueryAnswerMetrics::Backend(d)) => {
-                let mut metrics = BTreeMap::new();
-                for (cluster_id, cluster_metrics) in d.iter() {
-                    for (backend_id, backend_metrics) in cluster_metrics.iter() {
-                        for (metric_key, value) in backend_metrics.iter() {
-                            metrics.insert(
-                                format!(
-                                    "{}/{} {}",
-                                    cluster_id,
-                                    backend_id,
-                                    metric_key.replace("\t", ".")
-                                ),
-                                value.clone(),
-                            );
-                        }
-                    }
-                }
-                Some((key.clone(), metrics))
+            QueryAnswer::Metrics(QueryAnswerMetrics::Backend(m)) => {
+                Some((key.clone(), filter_backend_metrics(m)))
             }
-            _ => None,
+            QueryAnswer::Metrics(QueryAnswerMetrics::All(WorkerMetrics { proxy, clusters })) => {
+                Some((key.clone(), filter_worker_metrics(proxy, clusters)))
+            }
+            _ => {
+                println!("nothing to show here. This message shouldn't display.");
+                None
+            }
         })
         .collect::<BTreeMap<_, _>>();
 
-    let mut metrics = answers
+    let mut metrics = filtered_answers
         .values()
         .flat_map(|map| {
             map.iter().filter_map(|(k, v)| match v {
@@ -163,7 +214,7 @@ pub fn print_metrics(
 
         for metric in metrics {
             let mut row = vec![cell!(metric)];
-            for worker_data in answers.values() {
+            for worker_data in filtered_answers.values() {
                 match worker_data.get(metric) {
                     Some(FilteredData::Count(c)) => row.push(cell!(c)),
                     Some(FilteredData::Gauge(c)) => row.push(cell!(c)),
@@ -176,7 +227,7 @@ pub fn print_metrics(
         table.printstd();
     }
 
-    let mut time_metrics = answers
+    let mut time_metrics = filtered_answers
         .values()
         .flat_map(|map| {
             map.iter().filter_map(|(k, v)| match v {
@@ -196,7 +247,7 @@ pub fn print_metrics(
         timing_table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
 
         let mut row = vec![cell!("Results")];
-        for key in answers.keys() {
+        for key in filtered_answers.keys() {
             row.push(cell!(key));
         }
         timing_table.set_titles(Row::new(row));
@@ -211,7 +262,7 @@ pub fn print_metrics(
             let mut row_p99_999 = vec![cell!(format!("{}.p99.999", metric))];
             let mut row_p100 = vec![cell!(format!("{}.p100", metric))];
 
-            for worker_data in answers.values() {
+            for worker_data in filtered_answers.values() {
                 match worker_data.get(metric) {
                     Some(FilteredData::Percentiles(p)) => {
                         row_samples.push(cell!(p.samples));
@@ -566,4 +617,23 @@ fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
             .join(", ")
     })
     .unwrap_or_default()
+}
+
+fn print_available_metrics(answers: &BTreeMap<String, QueryAnswer>) -> anyhow::Result<()> {
+    let metrics: HashSet<String> = answers
+        .values()
+        .filter_map(|value| match value {
+            QueryAnswer::Metrics(QueryAnswerMetrics::List(v)) => Some(v.iter()),
+            _ => None,
+        })
+        .flatten()
+        .map(|s| s.replace("\t", "."))
+        .collect();
+    let mut metrics: Vec<_> = metrics.iter().collect();
+    metrics.sort();
+    println!("Available metrics on the proxy level:");
+    for metric in metrics {
+        println!("\t{}", metric);
+    }
+    Ok(())
 }

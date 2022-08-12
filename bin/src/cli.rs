@@ -178,7 +178,8 @@ pub enum SubCmd {
         #[clap(
             short = 'j',
             long = "json",
-            help = "Print the command result in JSON format"
+            help = "Print the command result in JSON format",
+            global = true
         )]
         json: bool,
         #[clap(subcommand)]
@@ -423,7 +424,11 @@ pub enum HttpFrontendCmd {
 pub enum TcpFrontendCmd {
     #[clap(name = "add")]
     Add {
-        #[clap(short = 'i', long = "id", help = "the id of the cluster to which the frontend belongs")]
+        #[clap(
+            short = 'i',
+            long = "id",
+            help = "the id of the cluster to which the frontend belongs"
+        )]
         id: String,
         #[clap(
             short = 'a',
@@ -440,7 +445,11 @@ pub enum TcpFrontendCmd {
     },
     #[clap(name = "remove")]
     Remove {
-        #[clap(short = 'i', long = "id", help = "the id of the cluster to which the frontend belongs")]
+        #[clap(
+            short = 'i',
+            long = "id",
+            help = "the id of the cluster to which the frontend belongs"
+        )]
         id: String,
         #[clap(
             short = 'a',
@@ -729,9 +738,12 @@ pub enum QueryCmd {
         #[clap(short = 'd', long = "domain", help = "domain name")]
         domain: Option<String>,
     },
-    #[clap(name = "metrics", about = "Query metrics matching a specific filter")]
+    #[clap(
+        name = "metrics",
+        about = "Query all metrics, or matching a specific filter"
+    )]
     Metrics {
-        #[clap(short, long, help = "list available metrics")]
+        #[clap(short, long, help = "list the available metrics on the proxy level")]
         list: bool,
         #[clap(short, long, help = "refresh metrics results (in seconds)")]
         refresh: Option<u32>,
