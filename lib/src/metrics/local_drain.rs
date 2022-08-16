@@ -107,8 +107,10 @@ enum MetricMeta {
     ClusterBackend,
 }
 
+/// This gathers metrics locally, to be queried by the CLI
 #[derive(Debug)]
 pub struct LocalDrain {
+    /// a prefix to metric keys, usually "sozu-"
     pub prefix: String,
     pub created: Instant,
     pub cluster_tree: BTreeMap<String, u64>,
@@ -138,7 +140,15 @@ impl LocalDrain {
         }
     }
 
-    fn tree(&mut self, is_backend: bool) -> &mut BTreeMap<String, u64> {
+    fn tree(&self, is_backend: bool) -> &BTreeMap<String, u64> {
+        if is_backend {
+            &self.backend_tree
+        } else {
+            &self.cluster_tree
+        }
+    }
+
+    fn tree_mut(&mut self, is_backend: bool) -> &mut BTreeMap<String, u64> {
         if is_backend {
             &mut self.backend_tree
         } else {
@@ -365,11 +375,11 @@ impl LocalDrain {
     }
 
     fn get_last_before(&self, start: &str, end: &str, is_backend: bool) -> Option<u64> {
-        let tree = if is_backend {
-            &self.backend_tree
-        } else {
-            &self.cluster_tree
-        };
+        let tree = self.tree(is_backend);
+        // let tree = match is_backend {
+        //     true => &self.backend_tree,
+        //     false => &self.cluster_tree,
+        // };
 
         //if let Some((k, v)) = tree.get_lt(end.as_bytes())? {
         if let Some((k, v)) = tree.range(start.to_string()..end.to_string()).rev().next() {
@@ -518,22 +528,24 @@ impl LocalDrain {
             if backend_id.is_some() {
                 self.store_time_metric(key, cluster_id, backend_id, t);
             }
-        } else {
+            return;
+        }
+
+        self.store_metric(
+            &format!("{}\t{}", key, cluster_id),
+            cluster_id,
+            None,
+            &metric,
+        );
+
+        // backend metrics are stored twice, in cluster_metrics and backend_metrics
+        if let Some(bid) = backend_id {
             self.store_metric(
-                &format!("{}\t{}", key, cluster_id),
+                &format!("{}\t{}\t{}", key, cluster_id, bid),
                 cluster_id,
-                None,
+                backend_id,
                 &metric,
             );
-
-            if let Some(bid) = backend_id {
-                self.store_metric(
-                    &format!("{}\t{}\t{}", key, cluster_id, bid),
-                    cluster_id,
-                    backend_id,
-                    &metric,
-                );
-            }
         }
     }
 
@@ -593,7 +605,7 @@ impl LocalDrain {
         let complete_key = format!("{}\t{}", key, timestamp);
 
         trace!("store gauge at {} -> {}", complete_key, i);
-        self.tree(is_backend).insert(complete_key, i as u64);
+        self.tree_mut(is_backend).insert(complete_key, i as u64);
 
         // aggregate at the last hour
         let second = now.second();
@@ -603,7 +615,7 @@ impl LocalDrain {
 
             let complete_key = format!("{}\t{}", key, timestamp);
 
-            self.tree(is_backend)
+            self.tree_mut(is_backend)
                 .entry(complete_key)
                 .or_insert(i as u64);
             let minute = previous_minute.minute();
@@ -612,7 +624,7 @@ impl LocalDrain {
                 let timestamp = previous_hour.unix_timestamp();
 
                 let complete_key = format!("{}\t{}", key, timestamp);
-                self.tree(is_backend)
+                self.tree_mut(is_backend)
                     .entry(complete_key)
                     .or_insert(i as u64);
             }
@@ -639,7 +651,7 @@ impl LocalDrain {
         };
 
         let new_value = value + i;
-        self.tree(is_backend).insert(complete_key, new_value as u64);
+        self.tree_mut(is_backend).insert(complete_key, new_value as u64);
 
         // aggregate at the last hour
         let second = now.second();
@@ -662,7 +674,7 @@ impl LocalDrain {
             };
 
             let new_value = value + i;
-            self.tree(is_backend).insert(complete_key, new_value as u64);
+            self.tree_mut(is_backend).insert(complete_key, new_value as u64);
 
             let minute = previous_minute.minute();
             if minute != 0 {
@@ -681,7 +693,7 @@ impl LocalDrain {
                 };
 
                 let new_value = value + i;
-                self.tree(is_backend).insert(complete_key, new_value as u64);
+                self.tree_mut(is_backend).insert(complete_key, new_value as u64);
             }
         }
     }
@@ -693,9 +705,9 @@ impl LocalDrain {
 
         trace!("store count at {} -> {}", complete_key, i);
 
-        match self.tree(is_backend).get_mut(&complete_key) {
+        match self.tree_mut(is_backend).get_mut(&complete_key) {
             None => {
-                self.tree(is_backend).insert(complete_key, i as u64);
+                self.tree_mut(is_backend).insert(complete_key, i as u64);
             }
             Some(v) => *v += i as u64,
         };
@@ -707,9 +719,9 @@ impl LocalDrain {
             let timestamp = previous_minute.unix_timestamp();
 
             let complete_key = format!("{}\t{}", key, timestamp);
-            match self.tree(is_backend).get_mut(&complete_key) {
+            match self.tree_mut(is_backend).get_mut(&complete_key) {
                 None => {
-                    self.tree(is_backend).insert(complete_key, i as u64);
+                    self.tree_mut(is_backend).insert(complete_key, i as u64);
                 }
                 Some(v) => *v += i as u64,
             };
@@ -720,9 +732,9 @@ impl LocalDrain {
                 let timestamp = previous_hour.unix_timestamp();
 
                 let complete_key = format!("{}\t{}", key, timestamp);
-                match self.tree(is_backend).get_mut(&complete_key) {
+                match self.tree_mut(is_backend).get_mut(&complete_key) {
                     None => {
-                        self.tree(is_backend).insert(complete_key, i as u64);
+                        self.tree_mut(is_backend).insert(complete_key, i as u64);
                     }
                     Some(v) => *v += i as u64,
                 };
@@ -1099,14 +1111,32 @@ impl Subscriber for LocalDrain {
             "receiving metric with key {}, cluster_id: {:?}, backend_id: {:?}, metric data: {:?}",
             key, cluster_id, backend_id, metric
         );
+
+        // cluster metric
+        if let Some(id) = cluster_id {
+            self.receive_cluster_metric(key, id, backend_id, metric);
+            return;
+        }
+
+        // proxy metric
+        match self.proxy_metrics.get_mut(key) {
+            Some(stored_metric) => stored_metric.update(key, metric),
+            None => {
+                self.proxy_metrics
+                    .insert(String::from(key), AggregatedMetric::new(metric));
+            }
+        }
+
+        /* this was rewritten above, same logic
         if let Some(id) = cluster_id {
             self.receive_cluster_metric(key, id, backend_id, metric);
         } else if dbg!(!self.proxy_metrics.contains_key(key)) {
             self.proxy_metrics
-                .insert(String::from(key), AggregatedMetric::new(metric));
+            .insert(String::from(key), AggregatedMetric::new(metric));
         } else if let Some(stored_metric) = self.proxy_metrics.get_mut(key) {
             stored_metric.update(key, metric);
         }
+        */
     }
 }
 

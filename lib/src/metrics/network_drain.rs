@@ -24,16 +24,19 @@ pub struct MetricLine {
     duration: usize,
 }
 
+/// gathers metrics and send them on a UDP socket
 pub struct NetworkDrain {
     queue: VecDeque<MetricLine>,
+    /// a prefix appended to metrics keys, usually "sozu-"
     pub prefix: String,
+    /// writes metrics onto a UDP socket
     pub remote: MetricsWriter,
     is_writable: bool,
-    data: HashMap<String, StoredMetricData>,
+    proxy_metrics: HashMap<String, StoredMetricData>,
     /// (cluster_id, key) -> metric
-    cluster_data: HashMap<(String, String), StoredMetricData>,
+    cluster_metrics: HashMap<(String, String), StoredMetricData>,
     /// (cluster_id, backend_id, key) -> metric
-    backend_data: HashMap<(String, String, String), StoredMetricData>,
+    backend_metrics: HashMap<(String, String, String), StoredMetricData>,
     pub use_tagged_metrics: bool,
     pub origin: String,
     created: Instant,
@@ -48,9 +51,9 @@ impl NetworkDrain {
             prefix,
             remote: MetricsWriter::new(MetricSocket { addr, socket }),
             is_writable: true,
-            data: HashMap::new(),
-            cluster_data: HashMap::new(),
-            backend_data: HashMap::new(),
+            proxy_metrics: HashMap::new(),
+            cluster_metrics: HashMap::new(),
+            backend_metrics: HashMap::new(),
             use_tagged_metrics: false,
             origin: String::from("x"),
             created: Instant::now(),
@@ -67,16 +70,16 @@ impl NetworkDrain {
         let mut send_count = 0;
 
         // remove metrics that were not touched in the last 10mn
-        self.cluster_data.retain(|_, ref value| {
+        self.cluster_metrics.retain(|_, ref value| {
             value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00)
         });
-        self.backend_data.retain(|_, ref value| {
+        self.backend_metrics.retain(|_, ref value| {
             value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00)
         });
 
         if self.is_writable {
             for (ref key, ref mut stored_metric) in
-                self.data.iter_mut().filter(|&(_, ref value)| {
+                self.proxy_metrics.iter_mut().filter(|&(_, ref value)| {
                     value.updated && now.duration_since(value.last_sent) > secs
                 })
             {
@@ -160,7 +163,7 @@ impl NetworkDrain {
 
         if self.is_writable {
             for (key, mut stored_metric) in
-                self.cluster_data.iter_mut().filter(|&(_, ref value)| {
+                self.cluster_metrics.iter_mut().filter(|&(_, ref value)| {
                     value.updated && now.duration_since(value.last_sent) > secs
                 })
             {
@@ -244,7 +247,7 @@ impl NetworkDrain {
 
         if self.is_writable {
             for (key, mut stored_metric) in self
-                .backend_data
+                .backend_metrics
                 .iter_mut()
                 .filter(|(_, value)| value.updated && now.duration_since(value.last_sent) > secs)
             {
@@ -433,28 +436,63 @@ impl Subscriber for NetworkDrain {
                     duration: millis,
                 });
             }
-        } else if let Some(id) = cluster_id {
-            if let Some(bid) = backend_id {
-                let k = (String::from(id), String::from(bid), String::from(key));
-                if let Entry::Vacant(e) = self.backend_data.entry(k.to_owned()) {
+            return;
+        }
+
+        match (cluster_id, backend_id) {
+            (None, _) => {}
+            (Some(cid), None) => {
+                let k = (String::from(cid), String::from(key));
+                if let Entry::Vacant(e) = self.cluster_metrics.entry(k.to_owned()) {
                     e.insert(StoredMetricData::new(self.created, metric));
-                } else if let Some(stored_metric) = self.backend_data.get_mut(&k) {
+                } else if let Some(stored_metric) = self.cluster_metrics.get_mut(&k) {
                     stored_metric.update(key, metric);
                 }
-            } else {
-                let k = (String::from(id), String::from(key));
-                if let Entry::Vacant(e) = self.cluster_data.entry(k.to_owned()) {
+                return;
+            }
+            (Some(cid), Some(bid)) => {
+                let k = (String::from(cid), String::from(bid), String::from(key));
+                if let Entry::Vacant(e) = self.backend_metrics.entry(k.to_owned()) {
                     e.insert(StoredMetricData::new(self.created, metric));
-                } else if let Some(stored_metric) = self.cluster_data.get_mut(&k) {
+                } else if let Some(stored_metric) = self.backend_metrics.get_mut(&k) {
                     stored_metric.update(key, metric);
+                }
+                return;
+            }
+        }
+        /*
+        if let Some(id) = cluster_id {
+            match backend_id {
+                Some(bid) => {
+                    let k = (String::from(id), String::from(bid), String::from(key));
+                    if let Entry::Vacant(e) = self.backend_metrics.entry(k.to_owned()) {
+                        e.insert(StoredMetricData::new(self.created, metric));
+                    } else if let Some(stored_metric) = self.backend_metrics.get_mut(&k) {
+                        stored_metric.update(key, metric);
+                    }
+                }
+                None => {
+                    let k = (String::from(id), String::from(key));
+                    if let Entry::Vacant(e) = self.cluster_metrics.entry(k.to_owned()) {
+                        e.insert(StoredMetricData::new(self.created, metric));
+                    } else if let Some(stored_metric) = self.cluster_metrics.get_mut(&k) {
+                        stored_metric.update(key, metric);
+                    }
                 }
             }
-        } else if !self.data.contains_key(key) {
-            self.data.insert(
+            return;
+        }
+        */
+
+        if !self.proxy_metrics.contains_key(key) {
+            self.proxy_metrics.insert(
                 String::from(key),
                 StoredMetricData::new(self.created, metric),
             );
-        } else if let Some(stored_metric) = self.data.get_mut(key) {
+            return;
+        }
+
+        if let Some(stored_metric) = self.proxy_metrics.get_mut(key) {
             stored_metric.update(key, metric);
         }
     }

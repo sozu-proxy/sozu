@@ -144,8 +144,11 @@ pub trait Subscriber {
 }
 
 pub struct Aggregator {
+    /// appended to metric keys, usually "sozu-"
     prefix: String,
+    /// gathers metrics and sends them on a UDP socket
     network: Option<NetworkDrain>,
+    /// gather metrics locally, queried by the CLI
     local: LocalDrain,
 }
 
