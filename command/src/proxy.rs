@@ -837,7 +837,7 @@ pub enum QueryMetricsType {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryAnswer {
     Clusters(Vec<QueryAnswerCluster>),
-    /// cluster id, hash of cluster information
+    /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
     Certificates(QueryAnswerCertificate),
     Metrics(QueryAnswerMetrics),

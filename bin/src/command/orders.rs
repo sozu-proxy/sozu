@@ -1008,10 +1008,10 @@ impl CommandServer {
                 }
             }
 
-            let mut query_answers_map: BTreeMap<String, QueryAnswer> = responses
+            let mut proxy_responses_map: BTreeMap<String, QueryAnswer> = responses
                 .into_iter()
-                .filter_map(|(tag, query)| {
-                    if let Some(ProxyResponseData::Query(d)) = query.data {
+                .filter_map(|(tag, proxy_response)| {
+                    if let Some(ProxyResponseData::Query(d)) = proxy_response.data {
                         Some((tag, d))
                     } else {
                         None
@@ -1022,16 +1022,16 @@ impl CommandServer {
             let success = match &query {
                 &Query::ClustersHashes | &Query::Clusters(_) => {
                     let main = main_query_answer.unwrap();
-                    query_answers_map.insert(String::from("main"), main);
-                    Success::Query(CommandResponseData::Query(query_answers_map))
+                    proxy_responses_map.insert(String::from("main"), main);
+                    Success::Query(CommandResponseData::Query(proxy_responses_map))
                 }
                 &Query::Certificates(_) => {
-                    info!("certificates query answer received: {:?}", query_answers_map);
-                    Success::Query(CommandResponseData::Query(query_answers_map))
+                    info!("certificates query answer received: {:?}", proxy_responses_map);
+                    Success::Query(CommandResponseData::Query(proxy_responses_map))
                 }
                 &Query::Metrics(_) => {
-                    debug!("metrics query answer received: {:?}", query_answers_map);
-                    Success::Query(CommandResponseData::Query(query_answers_map))
+                    debug!("metrics query answer received: {:?}", proxy_responses_map);
+                    Success::Query(CommandResponseData::Query(proxy_responses_map))
                 }
             };
 

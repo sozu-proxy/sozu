@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::{collections::BTreeMap, str, time::Instant};
+use std::{collections::BTreeMap, str, time::Instant};use std::convert::TryInto;
 
 use hdrhistogram::Histogram;
 use time::{Duration, OffsetDateTime};
@@ -416,84 +416,114 @@ impl LocalDrain {
 
     pub fn dump_cluster_data(&mut self) -> BTreeMap<String, ClusterMetricsData> {
         let clusters = BTreeMap::new();
-
         /*
-        for (key, (meta, kind)) in self.metrics.iter() {
+        for (key, (meta, kind)) in self.cluster_metrics.iter() {
             let end = format!("{}\x7F", key);
 
             match meta {
                 MetricMeta::Cluster => {
-                    for res in self.cluster_tree.range(key.as_bytes()..end.as_bytes()) {
-                        let (k, v) = res?;
+                    for (k, v) in self.cluster_tree.range(key..&end) {
+                        // let (k, v) = res?;
 
-                        let mut it = k.split(|c: &u8| *c == b'\t');
-                        let key = std::str::from_utf8(it.next().unwrap()).unwrap();
-                        let cluster_id = std::str::from_utf8(it.next().unwrap()).unwrap();
+                        let mut it = k.split(|c: char| c == '\t');
+                        let key = it.next().unwrap();
+                        let cluster_id = it.next().unwrap();
+                        let timestamp = it.next().unwrap();
+
                         //let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
-                        let timestamp = std::str::from_utf8(it.next().unwrap()).unwrap();//.parse().unwrap();
 
-                        info!("looking at key = {}, id = {}, ts = {}",
-                              key, cluster_id, timestamp);
+                        info!(
+                            "looking at key = {}, id = {}, ts = {}",
+                            key, cluster_id, timestamp
+                        );
 
-                        let metrics_data = clusters.entry(cluster_id.to_string()).or_insert_with(ClusterMetricsData::new);
+                        let metrics_data = clusters
+                            .entry(cluster_id.to_string())
+                            .or_insert_with(ClusterMetricsData::new);
                         match kind {
                             MetricKind::Gauge => {
                                 /*if metrics_data.data.contains_key(key) {
                                     let v2 = metrics_data.data.get(key).unwrap().clone();
                                 } else {*/
-                                    metrics_data.data.insert(key.to_string(), FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
+                                metrics_data.data.insert(
+                                    key.to_string(),
+                                    FilteredData::Gauge(usize::from_le_bytes(
+                                        (*v).try_into().unwrap(),
+                                    )),
+                                );
                                 //}
-                            },
+                            }
                             MetricKind::Count => {
                                 /*if metrics_data.data.contains_key(key) {
                                     let v2 = metrics_data.data.get(key).unwrap().clone();
                                 } else {*/
-                                    metrics_data.data.insert(key.to_string(), FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
+                                metrics_data.data.insert(
+                                    key.to_string(),
+                                    FilteredData::Count(i64::from_le_bytes(
+                                        (*v).try_into().unwrap(),
+                                    )),
+                                );
                                 //}
-                            },
+                            }
                             MetricKind::Time => {
                                 //unimplemented for now
                             }
                         }
                     }
-                },
+                }
                 MetricMeta::ClusterBackend => {
-                    for res in self.backend_tree.range(key.as_bytes()..end.as_bytes()) {
-                        let (k, v) = res?;
+                    for (k, v) in self.backend_tree.range(key..&end) {
+                        // let (k, v) = res?;
 
-                        let mut it = k.split(|c: &u8| *c == b'\t');
-                        let key = std::str::from_utf8(it.next().unwrap()).unwrap();
-                        let cluster_id = std::str::from_utf8(it.next().unwrap()).unwrap();
-                        let backend_id = std::str::from_utf8(it.next().unwrap()).unwrap();
-                        //let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
-                        let timestamp = std::str::from_utf8(it.next().unwrap()).unwrap();//.parse().unwrap();
+                        let mut it = k.split(|c: char| c == '\t');
+                        let key = it.next().unwrap();
+                        let cluster_id = it.next().unwrap();
+                        let backend_id = it.next().unwrap();
+                        let timestamp = it.next().unwrap();
 
-                        info!("looking at key = {}, cluster id = {}, bid: {}, ts = {}",
-                              key, cluster_id, backend_id, timestamp);
+                        info!(
+                            "looking at key = {}, cluster id = {}, bid: {}, ts = {}",
+                            key, cluster_id, backend_id, timestamp
+                        );
 
-                        let cluster_metrics_data = clusters.entry(cluster_id.to_string()).or_insert_with(ClusterMetricsData::new);
-                        let backend_metrics_data = cluster_metrics_data.backends.entry(backend_id.to_string()).or_insert_with(BTreeMap::new);
+                        let cluster_metrics_data = clusters
+                            .entry(cluster_id.to_string())
+                            .or_insert_with(ClusterMetricsData::new);
+                        let backend_metrics_data = cluster_metrics_data
+                            .backends
+                            .entry(backend_id.to_string())
+                            .or_insert_with(BTreeMap::new);
                         match kind {
                             MetricKind::Gauge => {
                                 /*if backend_metrics_data.contains_key(key) {
                                     let v2 = backend_metrics_data.get(key).unwrap().clone();
                                 } else {*/
-                                    backend_metrics_data.insert(key.to_string(), FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
+                                backend_metrics_data.insert(
+                                    key.to_string(),
+                                    FilteredData::Gauge(usize::from_le_bytes(
+                                        (*v).try_into().unwrap(),
+                                    )),
+                                );
                                 //}
-                            },
+                            }
                             MetricKind::Count => {
                                 /*if backend_metrics_data.contains_key(key) {
                                     let v2 = backend_metrics_data.get(key).unwrap().clone();
                                 } else {*/
-                                    backend_metrics_data.insert(key.to_string(), FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
+                                backend_metrics_data.insert(
+                                    key.to_string(),
+                                    FilteredData::Count(i64::from_le_bytes(
+                                        (*v).try_into().unwrap(),
+                                    )),
+                                );
                                 //}
-                            },
+                            }
                             MetricKind::Time => {
                                 //unimplemented for now
                             }
                         }
                     }
-                },
+                }
             }
         }
         */
@@ -651,7 +681,8 @@ impl LocalDrain {
         };
 
         let new_value = value + i;
-        self.tree_mut(is_backend).insert(complete_key, new_value as u64);
+        self.tree_mut(is_backend)
+            .insert(complete_key, new_value as u64);
 
         // aggregate at the last hour
         let second = now.second();
@@ -674,7 +705,8 @@ impl LocalDrain {
             };
 
             let new_value = value + i;
-            self.tree_mut(is_backend).insert(complete_key, new_value as u64);
+            self.tree_mut(is_backend)
+                .insert(complete_key, new_value as u64);
 
             let minute = previous_minute.minute();
             if minute != 0 {
@@ -693,7 +725,8 @@ impl LocalDrain {
                 };
 
                 let new_value = value + i;
-                self.tree_mut(is_backend).insert(complete_key, new_value as u64);
+                self.tree_mut(is_backend)
+                    .insert(complete_key, new_value as u64);
             }
         }
     }
