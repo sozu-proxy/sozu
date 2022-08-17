@@ -90,7 +90,7 @@ pub fn print_metrics(
     }
 
     for (worker_id, query_answer) in answers.iter() {
-        println!("Worker {}", worker_id);
+        println!("\nWorker {}\n=========", worker_id);
         print_worker_metrics(query_answer)?;
     }
     Ok(())
@@ -207,7 +207,7 @@ fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredData>) {
     }
 
     let mut table = Table::new();
-    table.set_format(*prettytable::format::consts::FORMAT_DEFAULT);
+    table.set_format(*prettytable::format::consts::FORMAT_NO_TITLE);
 
     table.set_titles(Row::new(vec![cell!(""), cell!("gauge"), cell!("count")]));
 
@@ -247,7 +247,7 @@ fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredData>) {
     }
 
     let mut percentile_table = Table::new();
-    percentile_table.set_format(*prettytable::format::consts::FORMAT_DEFAULT);
+    percentile_table.set_format(*prettytable::format::consts::FORMAT_NO_TITLE);
 
     percentile_table.set_titles(Row::new(vec![
         cell!("Percentiles"),

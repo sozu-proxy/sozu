@@ -201,7 +201,7 @@ impl LocalDrain {
             QueryMetricsType::List => {
                 debug!("Here are the metrics keys: {:?}", self.proxy_metrics.keys());
                 let proxy_metrics_names = self.proxy_metrics.keys().cloned().collect();
-                let cluster_metrics_names = Vec::new();
+                let cluster_metrics_names = self.cluster_metrics.keys().cloned().collect();
                 QueryAnswerMetrics::List((proxy_metrics_names, cluster_metrics_names))
             }
             QueryMetricsType::Cluster {
