@@ -602,20 +602,46 @@ fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
 }
 
 fn print_available_metrics(answers: &BTreeMap<String, QueryAnswer>) -> anyhow::Result<()> {
-    let metrics: HashSet<String> = answers
-        .values()
-        .filter_map(|value| match value {
-            QueryAnswer::Metrics(QueryAnswerMetrics::List(v)) => Some(v.iter()),
-            _ => None,
-        })
-        .flatten()
-        .map(|s| s.replace("\t", "."))
-        .collect();
-    let mut metrics: Vec<_> = metrics.iter().collect();
-    metrics.sort();
+    let mut available_metrics: (HashSet<String>, HashSet<String>) =
+        (HashSet::new(), HashSet::new());
+    for query_answer in answers.values() {
+        match query_answer {
+            QueryAnswer::Metrics(QueryAnswerMetrics::List((
+                proxy_metric_keys,
+                cluster_metric_keys,
+            ))) => {
+                for key in proxy_metric_keys {
+                    available_metrics
+                        .0
+                        .insert(key.replace("\t", ".").to_owned());
+                }
+                for key in cluster_metric_keys {
+                    available_metrics
+                        .1
+                        .insert(key.replace("\t", ".").to_owned());
+                }
+            }
+            _ => bail!("The proxy responded nonsense instead of metric names"),
+        }
+    }
+    let proxy_metrics_names = available_metrics
+        .0
+        .iter()
+        .map(|s| s.to_owned())
+        .collect::<Vec<String>>();
+    let cluster_metrics_names = available_metrics
+        .1
+        .iter()
+        .map(|s| s.to_owned())
+        .collect::<Vec<String>>();
+
     println!("Available metrics on the proxy level:");
-    for metric in metrics {
-        println!("\t{}", metric);
+    for metric_name in proxy_metrics_names {
+        println!("\t{}", metric_name);
+    }
+    println!("Available metrics on the cluster level:");
+    for metric_name in cluster_metrics_names {
+        println!("\t{}", metric_name);
     }
     Ok(())
 }

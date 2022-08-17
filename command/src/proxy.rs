@@ -864,7 +864,8 @@ pub enum QueryAnswerCertificate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryAnswerMetrics {
-    List(Vec<String>),
+    /// (list of proxy metrics, list of cluster metrics)
+    List((Vec<String>, Vec<String>)),
     /// cluster_id -> (key -> metric)
     Cluster(BTreeMap<String, BTreeMap<String, FilteredData>>),
     /// cluster_id -> (backend_id -> (key -> metric))

@@ -4,7 +4,6 @@ mod writer;
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
     io::{self, Write},
     net::SocketAddr,
     str,
@@ -13,9 +12,7 @@ use std::{
 
 use mio::net::UdpSocket;
 
-use crate::sozu_command::proxy::{
-    FilteredData, MetricsConfiguration, QueryAnswerMetrics, QueryMetricsType, WorkerMetrics,
-};
+use crate::sozu_command::proxy::{MetricsConfiguration, QueryAnswerMetrics, QueryMetricsType};
 
 use self::{local_drain::LocalDrain, network_drain::NetworkDrain};
 
