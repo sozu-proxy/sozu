@@ -20,7 +20,7 @@ include = [
 name = "sozu"
 
 [dependencies]
-anyhow = "=1.0.59"
+anyhow = "^1.0.62"
 async-dup = "^1.2.2"
 async-io = "^1.7.0"
 clap = { version = "^3.2.16", features = ["derive"] }

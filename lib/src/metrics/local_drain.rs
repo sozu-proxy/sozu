@@ -341,10 +341,10 @@ impl LocalDrain {
         let mut response: BTreeMap<String, BTreeMap<String, BTreeMap<String, FilteredData>>> =
             BTreeMap::new();
         for (cluster_id, backend_id) in backends.iter() {
-            let t = response
+            response
                 .entry(cluster_id.to_string())
-                .or_insert_with(BTreeMap::new);
-            t.insert(backend_id.to_string(), BTreeMap::new());
+                .or_insert_with(BTreeMap::new)
+                .insert(backend_id.to_string(), BTreeMap::new());
         }
 
         let timestamp = date.unwrap_or_else(|| {
