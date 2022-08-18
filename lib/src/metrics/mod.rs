@@ -4,7 +4,6 @@ mod writer;
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
     io::{self, Write},
     net::SocketAddr,
     str,
@@ -13,9 +12,7 @@ use std::{
 
 use mio::net::UdpSocket;
 
-use crate::sozu_command::proxy::{
-    FilteredData, MetricsConfiguration, MetricsData, QueryAnswerMetrics, QueryMetricsType,
-};
+use crate::sozu_command::proxy::{MetricsConfiguration, QueryAnswerMetrics, QueryMetricsType};
 
 use self::{local_drain::LocalDrain, network_drain::NetworkDrain};
 
@@ -144,8 +141,11 @@ pub trait Subscriber {
 }
 
 pub struct Aggregator {
+    /// appended to metric keys, usually "sozu-"
     prefix: String,
+    /// gathers metrics and sends them on a UDP socket
     network: Option<NetworkDrain>,
+    /// gather metrics locally, queried by the CLI
     local: LocalDrain,
 }
 
@@ -212,6 +212,8 @@ impl Aggregator {
         }
     }
 
+    /* these are never used here, only at the local drain level
+
     pub fn dump_metrics_data(&mut self) -> MetricsData {
         self.local.dump_metrics_data()
     }
@@ -219,6 +221,7 @@ impl Aggregator {
     pub fn dump_process_data(&mut self) -> BTreeMap<String, FilteredData> {
         self.local.dump_process_data()
     }
+    */
 
     pub fn query(&mut self, q: &QueryMetricsType) -> QueryAnswerMetrics {
         self.local.query(q)

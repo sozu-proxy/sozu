@@ -178,7 +178,8 @@ pub enum SubCmd {
         #[clap(
             short = 'j',
             long = "json",
-            help = "Print the command result in JSON format"
+            help = "Print the command result in JSON format",
+            global = true
         )]
         json: bool,
         #[clap(subcommand)]
@@ -197,12 +198,12 @@ pub enum SubCmd {
 pub enum MetricsCmd {
     #[clap(name = "enable", about = "Enables local metrics collection")]
     Enable {
-        #[clap(short, long, help = "Enables time metrics collection")]
+        #[clap(long, help = "Enables time metrics collection")]
         time: bool,
     },
     #[clap(name = "disable", about = "Disables local metrics collection")]
     Disable {
-        #[clap(short, long, help = "Disables time metrics collection")]
+        #[clap(long, help = "Disables time metrics collection")]
         time: bool,
     },
     #[clap(name = "clear", about = "Deletes local metrics data")]
@@ -423,7 +424,11 @@ pub enum HttpFrontendCmd {
 pub enum TcpFrontendCmd {
     #[clap(name = "add")]
     Add {
-        #[clap(short = 'i', long = "id", help = "the id of the cluster to which the frontend belongs")]
+        #[clap(
+            short = 'i',
+            long = "id",
+            help = "the id of the cluster to which the frontend belongs"
+        )]
         id: String,
         #[clap(
             short = 'a',
@@ -440,7 +445,11 @@ pub enum TcpFrontendCmd {
     },
     #[clap(name = "remove")]
     Remove {
-        #[clap(short = 'i', long = "id", help = "the id of the cluster to which the frontend belongs")]
+        #[clap(
+            short = 'i',
+            long = "id",
+            help = "the id of the cluster to which the frontend belongs"
+        )]
         id: String,
         #[clap(
             short = 'a',
@@ -729,9 +738,12 @@ pub enum QueryCmd {
         #[clap(short = 'd', long = "domain", help = "domain name")]
         domain: Option<String>,
     },
-    #[clap(name = "metrics", about = "Query metrics matching a specific filter")]
+    #[clap(
+        name = "metrics",
+        about = "Query all metrics, or matching a specific filter"
+    )]
     Metrics {
-        #[clap(short, long, help = "list available metrics")]
+        #[clap(short, long, help = "list the available metrics on the proxy level")]
         list: bool,
         #[clap(short, long, help = "refresh metrics results (in seconds)")]
         refresh: Option<u32>,
@@ -745,11 +757,16 @@ pub enum QueryCmd {
         #[clap(
             short = 'k',
             long = "clusters",
-            help = "list of cluster ids",
+            help = "list of cluster ids (= application id)",
             use_delimiter = true
         )]
         clusters: Vec<String>,
-        #[clap(short = 'b', long="backends", help="list of backend ids", use_delimiter = true, parse(try_from_str = split_slash))]
+        #[clap(
+            short = 'b',
+            long="backends",
+            help="list of backends, in the form 'cluster_id/backend_id, other_cluster/other_backend'",
+            use_delimiter = true,
+            parse(try_from_str = split_slash))]
         backends: Vec<(String, String)>,
     },
 }
@@ -761,7 +778,7 @@ fn split_slash(input: &str) -> Result<(String, String), String> {
         Ok((cluster, backend))
     } else {
         Err(format!(
-            "could not split cluster id and backend id in {}",
+            "could not split cluster id and backend id in '{}', they must have the form 'cluster_id/backend_id'",
             input
         ))
     }

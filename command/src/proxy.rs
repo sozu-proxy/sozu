@@ -88,27 +88,37 @@ pub enum ProxyResponseStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyResponseData {
-    //placeholder for now
-    Metrics(MetricsData),
+    /// contains proxy & cluster metrics
+    Metrics(WorkerMetrics),
     Query(QueryAnswer),
     Event(ProxyEvent),
 }
 
+/// This was used to aggregate the metrics of the main process and workers,
+/// but it isn't used anywhere here except in a test
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedMetricsData {
+    /// key -> value
     pub main: BTreeMap<String, FilteredData>,
-    pub workers: BTreeMap<String, MetricsData>,
+    /// worker_id -> proxy & clusters data
+    pub workers: BTreeMap<String, WorkerMetrics>,
 }
 
+/// All metrics of a worker, proxy and clusters
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetricsData {
+pub struct WorkerMetrics {
+    /// key -> value
     pub proxy: BTreeMap<String, FilteredData>,
+    /// cluster_id -> cluster_metrics
     pub clusters: BTreeMap<String, ClusterMetricsData>,
 }
 
+/// the metrics of a given cluster, with several backends
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterMetricsData {
+    /// TO_CHECK: key -> metric
     pub data: BTreeMap<String, FilteredData>,
+    /// TO_CHECK: backend_id -> (key -> metric)
     pub backends: BTreeMap<String, BTreeMap<String, FilteredData>>,
 }
 
@@ -820,13 +830,14 @@ pub enum QueryMetricsType {
         backends: Vec<(String, String)>, // (cluster_id, backend_id)
         date: Option<i64>,
     },
+    All, // dump proxy and cluster metrics
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryAnswer {
     Clusters(Vec<QueryAnswerCluster>),
-    /// cluster id, hash of cluster information
+    /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
     Certificates(QueryAnswerCertificate),
     Metrics(QueryAnswerMetrics),
@@ -853,11 +864,14 @@ pub enum QueryAnswerCertificate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryAnswerMetrics {
-    List(Vec<String>),
+    /// (list of proxy metrics, list of cluster metrics)
+    List((Vec<String>, Vec<String>)),
     /// cluster_id -> (key -> metric)
     Cluster(BTreeMap<String, BTreeMap<String, FilteredData>>),
     /// cluster_id -> (backend_id -> (key -> metric))
     Backend(BTreeMap<String, BTreeMap<String, BTreeMap<String, FilteredData>>>),
+    /// all worker metrics, proxy & clusters
+    All(WorkerMetrics),
 }
 
 impl ProxyRequestData {

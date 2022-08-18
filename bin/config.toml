@@ -262,7 +262,7 @@ frontends = [
 # - weight: weight used by the load balancing algorithm
 # - sticky-id: sticky session identifier
 backends = [
-  { address = "127.0.0.1:1026" }
+  { address = "127.0.0.1:1026", backend_id = "the-backend-to-my-app" }
 ]
 
 # this is an example of a routing configuration for the TCP proxy

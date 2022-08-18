@@ -852,7 +852,8 @@ impl CommandServer {
         Ok(None)
     }
 
-    // This is maybe obsolote and replaced with "query metrics" in the CLI
+    // This handles the CLI's "metrics enable", "metrics disable", "metrics clear"
+    // To get the proxy's metrics, the cli command is "query metrics", handled by the query() function
     pub async fn metrics(
         &mut self,
         request_identifier: RequestIdentifier,
@@ -874,8 +875,9 @@ impl CommandServer {
         }
 
         let prefix = format!("{}-metrics-", request_identifier.client);
-        // It would be great if we could just return Success::Metrics from this thread
 
+        let command_tx = self.command_tx.clone();
+        let thread_request_identifier = request_identifier.clone();
         smol::spawn(async move {
             let mut responses = Vec::new();
             let mut i = 0;
@@ -900,21 +902,29 @@ impl CommandServer {
                     break;
                 }
             }
-            // the legacy code does not return anything, how weird is that?
-            /*
-            if let Err(e) = client_tx
-            .send(CommandResponse::new(
-                request_id.clone(),
-                CommandStatus::Ok,
-                "".to_string(),
-                None,
-            ))
-            .await
-            {
-                error!("could not send back metrics to client: {:?}", e);
+
+            let mut messages = vec![];
+            let mut has_error = false;
+            for response in responses.iter() {
+                match response.1.status {
+                    ProxyResponseStatus::Error(ref e) => {
+                        messages.push(format!("{}: {}", response.0, e));
+                        has_error = true;
+                    }
+                    _ => messages.push(format!("{}: OK", response.0)),
+                }
             }
-            */
-            // TODO : make sure this returns with CommandResponseData
+
+            if has_error {
+                return_error(command_tx, thread_request_identifier, messages.join(", ")).await;
+            } else {
+                return_success(
+                    command_tx,
+                    thread_request_identifier,
+                    Success::Metrics(config),
+                )
+                .await;
+            }
         })
         .detach();
         Ok(None)
@@ -925,6 +935,8 @@ impl CommandServer {
         request_identifier: RequestIdentifier,
         query: Query,
     ) -> anyhow::Result<Option<Success>> {
+
+        debug!("Received this query: {:?}", query);
         let (query_tx, mut query_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
@@ -996,10 +1008,10 @@ impl CommandServer {
                 }
             }
 
-            let mut query_answers_map: BTreeMap<String, QueryAnswer> = responses
+            let mut proxy_responses_map: BTreeMap<String, QueryAnswer> = responses
                 .into_iter()
-                .filter_map(|(tag, query)| {
-                    if let Some(ProxyResponseData::Query(d)) = query.data {
+                .filter_map(|(tag, proxy_response)| {
+                    if let Some(ProxyResponseData::Query(d)) = proxy_response.data {
                         Some((tag, d))
                     } else {
                         None
@@ -1010,16 +1022,16 @@ impl CommandServer {
             let success = match &query {
                 &Query::ClustersHashes | &Query::Clusters(_) => {
                     let main = main_query_answer.unwrap();
-                    query_answers_map.insert(String::from("main"), main);
-                    Success::Query(CommandResponseData::Query(query_answers_map))
+                    proxy_responses_map.insert(String::from("main"), main);
+                    Success::Query(CommandResponseData::Query(proxy_responses_map))
                 }
                 &Query::Certificates(_) => {
-                    info!("certificates query received: {:?}", query_answers_map);
-                    Success::Query(CommandResponseData::Query(query_answers_map))
+                    info!("certificates query answer received: {:?}", proxy_responses_map);
+                    Success::Query(CommandResponseData::Query(proxy_responses_map))
                 }
                 &Query::Metrics(_) => {
-                    debug!("metrics query received: {:?}", query_answers_map);
-                    Success::Query(CommandResponseData::Query(query_answers_map))
+                    debug!("metrics query answer received: {:?}", proxy_responses_map);
+                    Success::Query(CommandResponseData::Query(proxy_responses_map))
                 }
             };
 
@@ -1198,9 +1210,7 @@ impl CommandServer {
                         messages.push(format!("{}: {}", response.0, e));
                         has_error = true;
                     }
-                    _ => {
-                        messages.push(format!("{}: OK", response.0));
-                    }
+                    _ => messages.push(format!("{}: OK", response.0)),
                 }
             }
 

@@ -27,6 +27,7 @@ impl Write for MetricSocket {
 #[cfg(not(target_os = "linux"))]
 pub type MetricsWriter = sozu_command::writer::MultiLineWriter<MetricSocket>;
 
+/// Writes metrics on its UDP socket
 #[cfg(target_os = "linux")]
 pub struct MetricsWriter {
     inner: Option<MetricSocket>,

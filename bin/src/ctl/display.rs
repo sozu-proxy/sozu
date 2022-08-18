@@ -3,12 +3,15 @@ use std::{
     process::exit,
 };
 
-use anyhow::{self, Context};
+use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::{
     command::{CommandResponseData, ListedFrontends},
-    proxy::{FilteredData, QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics, Route},
+    proxy::{
+        ClusterMetricsData, FilteredData, QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics,
+        Route, WorkerMetrics,
+    },
 };
 
 pub fn print_frontend_list(frontends: ListedFrontends) {
@@ -72,181 +75,212 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
 }
 
 pub fn print_metrics(
+    // worker_id -> query answer
     answers: BTreeMap<String, QueryAnswer>,
     json: bool,
     list: bool,
 ) -> anyhow::Result<()> {
     if json {
+        println!("Here are the metrics, per worker");
         return print_json_response(&answers);
     }
 
-    //println!("got answers: {:#?}", answers);
     if list {
-        let metrics: HashSet<_> = answers
-            .values()
-            .filter_map(|value| match value {
-                QueryAnswer::Metrics(QueryAnswerMetrics::List(v)) => Some(v.iter()),
-                _ => None,
-            })
-            .flatten()
-            .map(|s| s.replace("\t", "."))
-            .collect();
-        let mut metrics: Vec<_> = metrics.iter().collect();
-        metrics.sort();
-        println!("available metrics: {:?}", metrics);
-        return Ok(());
+        return print_available_metrics(&answers);
     }
 
-    let answers = answers
-        .iter()
-        .filter_map(|(key, value)| match value {
-            QueryAnswer::Metrics(QueryAnswerMetrics::Cluster(d)) => {
-                let mut metrics = BTreeMap::new();
-                for (cluster_id, cluster_metrics) in d.iter() {
-                    for (metric_key, value) in cluster_metrics.iter() {
-                        metrics.insert(
-                            format!("{} {}", cluster_id, metric_key.replace("\t", ".")),
-                            value.clone(),
-                        );
-                    }
-                }
-                Some((key.clone(), metrics))
-            }
-            QueryAnswer::Metrics(QueryAnswerMetrics::Backend(d)) => {
-                let mut metrics = BTreeMap::new();
-                for (cluster_id, cluster_metrics) in d.iter() {
-                    for (backend_id, backend_metrics) in cluster_metrics.iter() {
-                        for (metric_key, value) in backend_metrics.iter() {
-                            metrics.insert(
-                                format!(
-                                    "{}/{} {}",
-                                    cluster_id,
-                                    backend_id,
-                                    metric_key.replace("\t", ".")
-                                ),
-                                value.clone(),
-                            );
-                        }
-                    }
-                }
-                Some((key.clone(), metrics))
-            }
-            _ => None,
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    let mut metrics = answers
-        .values()
-        .flat_map(|map| {
-            map.iter().filter_map(|(k, v)| match v {
-                FilteredData::Count(_) | FilteredData::Gauge(_) => Some(k),
-                _ => None,
-            })
-        })
-        .collect::<HashSet<_>>();
-
-    // sort the metrics so they always appear in the same order
-    let mut metrics: Vec<_> = metrics.drain().collect();
-    metrics.sort();
-    //println!("metrics list: {:?}", metrics);
-
-    if !metrics.is_empty() {
-        let mut table = Table::new();
-        table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
-
-        let mut row = vec![cell!("Result")];
-        for key in answers.keys() {
-            row.push(cell!(key));
-        }
-        table.set_titles(Row::new(row));
-
-        for metric in metrics {
-            let mut row = vec![cell!(metric)];
-            for worker_data in answers.values() {
-                match worker_data.get(metric) {
-                    Some(FilteredData::Count(c)) => row.push(cell!(c)),
-                    Some(FilteredData::Gauge(c)) => row.push(cell!(c)),
-                    _ => row.push(cell!("")),
-                }
-            }
-            table.add_row(Row::new(row));
-        }
-
-        table.printstd();
-    }
-
-    let mut time_metrics = answers
-        .values()
-        .flat_map(|map| {
-            map.iter().filter_map(|(k, v)| match v {
-                FilteredData::Percentiles(_) => Some(k),
-                _ => None,
-            })
-        })
-        .collect::<HashSet<_>>();
-
-    // sort the metrics so they always appear in the same order
-    let mut time_metrics: Vec<_> = time_metrics.drain().collect();
-    time_metrics.sort();
-    //println!("time metrics list: {:?}", time_metrics);
-
-    if !time_metrics.is_empty() {
-        let mut timing_table = Table::new();
-        timing_table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
-
-        let mut row = vec![cell!("Results")];
-        for key in answers.keys() {
-            row.push(cell!(key));
-        }
-        timing_table.set_titles(Row::new(row));
-
-        for metric in time_metrics {
-            let mut row_samples = vec![cell!(format!("{}.samples", metric))];
-            let mut row_p50 = vec![cell!(format!("{}.p50", metric))];
-            let mut row_p90 = vec![cell!(format!("{}.p90", metric))];
-            let mut row_p99 = vec![cell!(format!("{}.p99", metric))];
-            let mut row_p99_9 = vec![cell!(format!("{}.p99.9", metric))];
-            let mut row_p99_99 = vec![cell!(format!("{}.p99.99", metric))];
-            let mut row_p99_999 = vec![cell!(format!("{}.p99.999", metric))];
-            let mut row_p100 = vec![cell!(format!("{}.p100", metric))];
-
-            for worker_data in answers.values() {
-                match worker_data.get(metric) {
-                    Some(FilteredData::Percentiles(p)) => {
-                        row_samples.push(cell!(p.samples));
-                        row_p50.push(cell!(p.p_50));
-                        row_p90.push(cell!(p.p_90));
-                        row_p99.push(cell!(p.p_99));
-                        row_p99_9.push(cell!(p.p_99_9));
-                        row_p99_99.push(cell!(p.p_99_99));
-                        row_p99_999.push(cell!(p.p_99_999));
-                        row_p100.push(cell!(p.p_100));
-                    }
-                    _ => {
-                        row_samples.push(cell!(""));
-                        row_p50.push(cell!(""));
-                        row_p90.push(cell!(""));
-                        row_p99.push(cell!(""));
-                        row_p99_9.push(cell!(""));
-                        row_p99_99.push(cell!(""));
-                        row_p99_999.push(cell!(""));
-                        row_p100.push(cell!(""));
-                    }
-                }
-            }
-            timing_table.add_row(Row::new(row_samples));
-            timing_table.add_row(Row::new(row_p50));
-            timing_table.add_row(Row::new(row_p90));
-            timing_table.add_row(Row::new(row_p99));
-            timing_table.add_row(Row::new(row_p99_9));
-            timing_table.add_row(Row::new(row_p99_99));
-            timing_table.add_row(Row::new(row_p99_999));
-            timing_table.add_row(Row::new(row_p100));
-        }
-
-        timing_table.printstd();
+    for (worker_id, query_answer) in answers.iter() {
+        println!("\nWorker {}\n=========", worker_id);
+        print_worker_metrics(query_answer)?;
     }
     Ok(())
+}
+
+fn print_worker_metrics(query_answer: &QueryAnswer) -> anyhow::Result<()> {
+    let filtered_metrics = match query_answer {
+        QueryAnswer::Metrics(QueryAnswerMetrics::Cluster(m)) => filter_cluster_metrics(m),
+        QueryAnswer::Metrics(QueryAnswerMetrics::Backend(m)) => filter_backend_metrics(m),
+        QueryAnswer::Metrics(QueryAnswerMetrics::All(WorkerMetrics { proxy, clusters })) => {
+            filter_worker_metrics(proxy, clusters)
+        }
+        _ => bail!("The query answer is wrong."),
+    };
+
+    print_gauges_and_counts(&filtered_metrics);
+    print_percentiles(&filtered_metrics);
+    Ok(())
+}
+
+fn filter_cluster_metrics(
+    // cluster_id -> (key, value)
+    cluster_metrics: &BTreeMap<String, BTreeMap<String, FilteredData>>,
+) -> BTreeMap<String, FilteredData> {
+    let mut filtered_metrics = BTreeMap::new();
+    for (cluster_id, filtered_data) in cluster_metrics.iter() {
+        for (metric_key, filtered_value) in filtered_data.iter() {
+            filtered_metrics.insert(
+                format!("{} {}", cluster_id, metric_key.replace("\t", ".")),
+                filtered_value.clone(),
+            );
+        }
+    }
+    filtered_metrics
+}
+
+fn filter_backend_metrics(
+    // cluster_id -> (backend_id -> (key -> metric))
+    backend_metrics: &BTreeMap<String, BTreeMap<String, BTreeMap<String, FilteredData>>>,
+) -> BTreeMap<String, FilteredData> {
+    let mut filtered_metrics = BTreeMap::new();
+    for (cluster_id, cluster_metrics) in backend_metrics.iter() {
+        for (backend_id, backend_metrics) in cluster_metrics.iter() {
+            for (metric_key, filtered_value) in backend_metrics.iter() {
+                filtered_metrics.insert(
+                    format!(
+                        "{}/{} {}",
+                        cluster_id,
+                        backend_id,
+                        metric_key.replace("\t", ".")
+                    ),
+                    filtered_value.clone(),
+                );
+            }
+        }
+    }
+    filtered_metrics
+}
+
+fn filter_worker_metrics(
+    // key -> value
+    proxy_metrics: &BTreeMap<String, FilteredData>,
+    // cluster_id -> cluster+backend metrics
+    cluster_metrics: &BTreeMap<String, ClusterMetricsData>,
+) -> BTreeMap<String, FilteredData> {
+    let mut filtered_metrics = BTreeMap::new();
+
+    for (metric_key, filtered_value) in proxy_metrics.iter() {
+        filtered_metrics.insert(
+            format!("{}", metric_key.replace("\t", ".")),
+            filtered_value.clone(),
+        );
+    }
+    for (cluster_id, cluster_metric_data) in cluster_metrics.iter() {
+        // cluster metrics
+        for (metric_key, filtered_value) in cluster_metric_data.data.iter() {
+            filtered_metrics.insert(
+                format!("{} {}", cluster_id, metric_key.replace("\t", ".")),
+                filtered_value.clone(),
+            );
+        }
+        // backend metrics
+        for (backend_id, backend_metrics) in cluster_metric_data.backends.iter() {
+            for (metric_key, filtered_value) in backend_metrics.iter() {
+                filtered_metrics.insert(
+                    format!(
+                        "{}/{} {}",
+                        cluster_id,
+                        backend_id,
+                        metric_key.replace("\t", ".")
+                    ),
+                    filtered_value.clone(),
+                );
+            }
+        }
+    }
+    filtered_metrics
+}
+
+fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredData>) {
+    let mut titles: Vec<String> = filtered_metrics
+        .iter()
+        .filter_map(|(title, filtered_data)| match filtered_data {
+            FilteredData::Count(_) | FilteredData::Gauge(_) => Some(title.to_owned()),
+            _ => None,
+        })
+        .collect();
+
+    // sort the titles so they always appear in the same order
+    titles.sort();
+
+    if titles.is_empty() {
+        return;
+    }
+
+    let mut table = Table::new();
+    table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+
+    table.set_titles(Row::new(vec![cell!(""), cell!("gauge"), cell!("count")]));
+
+    for title in titles {
+        let mut row = vec![cell!(title)];
+        match filtered_metrics.get(&title) {
+            Some(FilteredData::Count(c)) => {
+                row.push(cell!(""));
+                row.push(cell!(c))
+            }
+            Some(FilteredData::Gauge(c)) => {
+                row.push(cell!(c));
+                row.push(cell!(""))
+            }
+            _ => row.push(cell!("")),
+        }
+        table.add_row(Row::new(row));
+    }
+
+    table.printstd();
+}
+
+fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredData>) {
+    let mut percentile_titles: Vec<String> = filtered_metrics
+        .iter()
+        .filter_map(|(title, filtered_data)| match filtered_data {
+            FilteredData::Percentiles(_) => Some(title.to_owned()),
+            _ => None,
+        })
+        .collect();
+
+    // sort the metrics so they always appear in the same order
+    percentile_titles.sort();
+
+    if percentile_titles.is_empty() {
+        return;
+    }
+
+    let mut percentile_table = Table::new();
+    percentile_table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+
+    percentile_table.set_titles(Row::new(vec![
+        cell!("Percentiles"),
+        cell!("samples"),
+        cell!("p50"),
+        cell!("p90"),
+        cell!("p99"),
+        cell!("p99.9"),
+        cell!("p99.99"),
+        cell!("p99.999"),
+        cell!("p100"),
+    ]));
+
+    for title in percentile_titles {
+        match filtered_metrics.get(&title) {
+            Some(FilteredData::Percentiles(p)) => {
+                percentile_table.add_row(Row::new(vec![
+                    cell!(title),
+                    cell!(p.samples),
+                    cell!(p.p_50),
+                    cell!(p.p_90),
+                    cell!(p.p_99),
+                    cell!(p.p_99_9),
+                    cell!(p.p_99_99),
+                    cell!(p.p_99_999),
+                    cell!(p.p_100),
+                ]));
+            }
+            _ => println!("Something went VERY wrong here"),
+        }
+    }
+
+    percentile_table.printstd();
 }
 
 pub fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), anyhow::Error> {
@@ -565,4 +599,49 @@ fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
             .join(", ")
     })
     .unwrap_or_default()
+}
+
+fn print_available_metrics(answers: &BTreeMap<String, QueryAnswer>) -> anyhow::Result<()> {
+    let mut available_metrics: (HashSet<String>, HashSet<String>) =
+        (HashSet::new(), HashSet::new());
+    for query_answer in answers.values() {
+        match query_answer {
+            QueryAnswer::Metrics(QueryAnswerMetrics::List((
+                proxy_metric_keys,
+                cluster_metric_keys,
+            ))) => {
+                for key in proxy_metric_keys {
+                    available_metrics
+                        .0
+                        .insert(key.replace("\t", ".").to_owned());
+                }
+                for key in cluster_metric_keys {
+                    available_metrics
+                        .1
+                        .insert(key.replace("\t", ".").to_owned());
+                }
+            }
+            _ => bail!("The proxy responded nonsense instead of metric names"),
+        }
+    }
+    let proxy_metrics_names = available_metrics
+        .0
+        .iter()
+        .map(|s| s.to_owned())
+        .collect::<Vec<String>>();
+    let cluster_metrics_names = available_metrics
+        .1
+        .iter()
+        .map(|s| s.to_owned())
+        .collect::<Vec<String>>();
+
+    println!("Available metrics on the proxy level:");
+    for metric_name in proxy_metrics_names {
+        println!("\t{}", metric_name);
+    }
+    println!("Available metrics on the cluster level:");
+    for metric_name in cluster_metrics_names {
+        println!("\t{}", metric_name);
+    }
+    Ok(())
 }

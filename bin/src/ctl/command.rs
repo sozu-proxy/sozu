@@ -18,8 +18,8 @@ use sozu_command_lib::{
         FrontendFilters, RunState, WorkerInfo,
     },
     proxy::{
-        MetricsConfiguration, ProxyRequestData, Query, QueryClusterDomain,
-        QueryClusterType, QueryCertificateType, QueryMetricsType,
+        MetricsConfiguration, ProxyRequestData, Query, QueryCertificateType, QueryClusterDomain,
+        QueryClusterType, QueryMetricsType,
     },
 };
 
@@ -568,11 +568,11 @@ impl CommandManager {
                 println!("Proxy is processing: {}", message.message);
             }
             CommandStatus::Error => {
-                bail!("could not stop the proxy: {}", message.message);
+                bail!("Error with metrics command: {}", message.message);
             }
             CommandStatus::Ok => {
                 if &id == &message.id {
-                    println!("Successfully stopped the proxy");
+                    println!("Successfull metrics command: {}", message.message);
                 }
             }
         }
@@ -792,25 +792,21 @@ impl CommandManager {
         names: Vec<String>,
         cluster_ids: Vec<String>,
         backends: Vec<(String, String)>, // (cluster_id, backend_id)
+                                         // proxy: bool,
     ) -> Result<(), anyhow::Error> {
-        let query = if list {
-            QueryMetricsType::List
-        } else if !cluster_ids.is_empty() && !backends.is_empty() {
-            bail!("Error: Either request a list of clusters or a list of backends");
-        } else {
-            if !cluster_ids.is_empty() {
-                QueryMetricsType::Cluster {
-                    metrics: names,
-                    cluster_ids,
-                    date: None,
-                }
-            } else {
-                QueryMetricsType::Backend {
-                    metrics: names,
-                    backends,
-                    date: None,
-                }
-            }
+        let query = match (list, cluster_ids.is_empty(), backends.is_empty()) {
+            (true, _, _) => QueryMetricsType::List,
+            (false, true, true) => QueryMetricsType::All,
+            (false, false, _) => QueryMetricsType::Cluster {
+                metrics: names,
+                cluster_ids,
+                date: None,
+            },
+            (false, true, false) => QueryMetricsType::Backend {
+                metrics: names,
+                backends,
+                date: None,
+            },
         };
 
         let command = CommandRequestData::Proxy(ProxyRequestData::Query(Query::Metrics(query)));
