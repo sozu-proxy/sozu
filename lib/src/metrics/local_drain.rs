@@ -114,11 +114,16 @@ pub struct LocalDrain {
     /// a prefix to metric keys, usually "sozu-"
     pub prefix: String,
     pub created: Instant,
+    /// should be AggregatedMetric
     pub cluster_tree: BTreeMap<String, u64>,
     pub backend_tree: BTreeMap<String, u64>,
     /// metric_name -> metric value
     pub proxy_metrics: BTreeMap<String, AggregatedMetric>,
-    /// keyTABcluster_id -> (metric meta, metric kind)
+    /// metric_nameTABcluster_id -> (metric meta, metric kind)
+    /// this is messed up, what would be better is:
+    /// BTreeMap<cluster_id or backend_id, BTreeMap<metric_name, (MetricMeta, MetricKind, u64)>>
+    /// and even better:
+    /// BTreeMap<cluster_id or backend_id, BTreeMap<metric_name, AggregatedMetric>>
     cluster_metrics: BTreeMap<String, (MetricMeta, MetricKind)>,
     use_tagged_metrics: bool,
     origin: String,
@@ -182,13 +187,10 @@ impl LocalDrain {
     }
 
     pub fn dump_process_data(&mut self) -> BTreeMap<String, FilteredData> {
-        let data: BTreeMap<String, FilteredData> = self
-            .proxy_metrics
+        self.proxy_metrics
             .iter()
             .map(|(key, value)| (key.to_string(), aggregated_to_filtered(value)))
-            .collect();
-
-        data
+            .collect()
     }
 
     pub fn query(&mut self, q: &QueryMetricsType) -> QueryAnswerMetrics {

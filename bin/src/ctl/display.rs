@@ -207,7 +207,7 @@ fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredData>) {
     }
 
     let mut table = Table::new();
-    table.set_format(*prettytable::format::consts::FORMAT_NO_TITLE);
+    table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
 
     table.set_titles(Row::new(vec![cell!(""), cell!("gauge"), cell!("count")]));
 
@@ -247,7 +247,7 @@ fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredData>) {
     }
 
     let mut percentile_table = Table::new();
-    percentile_table.set_format(*prettytable::format::consts::FORMAT_NO_TITLE);
+    percentile_table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
 
     percentile_table.set_titles(Row::new(vec![
         cell!("Percentiles"),
