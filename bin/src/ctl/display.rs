@@ -166,7 +166,7 @@ fn filter_worker_metrics(
     }
     for (cluster_id, cluster_metric_data) in cluster_metrics.iter() {
         // cluster metrics
-        for (metric_key, filtered_value) in cluster_metric_data.data.iter() {
+        for (metric_key, filtered_value) in cluster_metric_data.cluster.iter() {
             filtered_metrics.insert(
                 format!("{} {}", cluster_id, metric_key.replace("\t", ".")),
                 filtered_value.clone(),

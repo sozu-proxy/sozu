@@ -20,6 +20,7 @@ thread_local! {
   pub static METRICS: RefCell<Aggregator> = RefCell::new(Aggregator::new(String::from("sozu")));
 }
 
+/// We should rename this to MetricValue
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetricData {
     Gauge(usize),
@@ -212,23 +213,12 @@ impl Aggregator {
         }
     }
 
-    /* these are never used here, only at the local drain level
-
-    pub fn dump_metrics_data(&mut self) -> MetricsData {
-        self.local.dump_metrics_data()
-    }
-
-    pub fn dump_process_data(&mut self) -> BTreeMap<String, FilteredData> {
-        self.local.dump_process_data()
-    }
-    */
-
     pub fn query(&mut self, q: &QueryMetricsType) -> QueryAnswerMetrics {
         self.local.query(q)
     }
 
-    pub fn clear_local(&mut self, now: time::OffsetDateTime) {
-        self.local.clear(now);
+    pub fn clear_local(&mut self) {
+        self.local.clear();
     }
 
     pub fn configure(&mut self, config: &MetricsConfiguration) {

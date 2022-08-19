@@ -197,15 +197,9 @@ pub enum SubCmd {
 #[derive(Subcommand, PartialEq, Clone, Debug)]
 pub enum MetricsCmd {
     #[clap(name = "enable", about = "Enables local metrics collection")]
-    Enable {
-        #[clap(long, help = "Enables time metrics collection")]
-        time: bool,
-    },
+    Enable,
     #[clap(name = "disable", about = "Disables local metrics collection")]
-    Disable {
-        #[clap(long, help = "Disables time metrics collection")]
-        time: bool,
-    },
+    Disable,
     #[clap(name = "clear", about = "Deletes local metrics data")]
     Clear,
 }

@@ -574,7 +574,7 @@ mod tests {
                         clusters: [(
                             String::from("cluster_1"),
                             ClusterMetricsData {
-                                data: [(
+                                cluster: [(
                                     String::from("request_time"),
                                     FilteredData::Percentiles(Percentiles {
                                         samples: 42,

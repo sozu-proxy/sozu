@@ -116,16 +116,16 @@ pub struct WorkerMetrics {
 /// the metrics of a given cluster, with several backends
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterMetricsData {
-    /// TO_CHECK: key -> metric
-    pub data: BTreeMap<String, FilteredData>,
-    /// TO_CHECK: backend_id -> (key -> metric)
+    /// metric name -> metric value
+    pub cluster: BTreeMap<String, FilteredData>,
+    /// backend_id -> (metric name-> metric value)
     pub backends: BTreeMap<String, BTreeMap<String, FilteredData>>,
 }
 
 impl ClusterMetricsData {
     pub fn new() -> Self {
         ClusterMetricsData {
-            data: BTreeMap::new(),
+            cluster: BTreeMap::new(),
             backends: BTreeMap::new(),
         }
     }
@@ -782,7 +782,6 @@ pub struct TcpListener {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MetricsConfiguration {
     Enabled(bool),
-    EnabledTimeMetrics(bool),
     Clear,
 }
 
