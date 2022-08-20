@@ -779,10 +779,9 @@ impl CommandManager {
         refresh: Option<u32>,
         names: Vec<String>,
         cluster_ids: Vec<String>,
-        backends: Vec<(String, String)>, // (cluster_id, backend_id)
-                                         // proxy: bool,
+        backend_ids: Vec<String>, 
     ) -> Result<(), anyhow::Error> {
-        let query = match (list, cluster_ids.is_empty(), backends.is_empty()) {
+        let query = match (list, cluster_ids.is_empty(), backend_ids.is_empty()) {
             (true, _, _) => QueryMetricsType::List,
             (false, true, true) => QueryMetricsType::All,
             (false, false, _) => QueryMetricsType::Cluster {
@@ -792,7 +791,7 @@ impl CommandManager {
             },
             (false, true, false) => QueryMetricsType::Backend {
                 metrics: names,
-                backends,
+                backend_ids,
                 date: None,
             },
         };

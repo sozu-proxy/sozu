@@ -159,8 +159,8 @@ mod tests {
     use crate::proxy::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
         ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, WorkerMetrics, PathRule, Percentiles, ProxyRequestData, RemoveBackend,
-        RemoveCertificate, Route, RulePosition, TlsVersion,
+        LoadBalancingParams, PathRule, Percentiles, ProxyRequestData, RemoveBackend,
+        RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
     };
     use hex::FromHex;
     use serde_json;
@@ -563,40 +563,23 @@ mod tests {
                 workers: [(
                     String::from("0"),
                     WorkerMetrics {
-                        proxy: [
-                            (String::from("sozu.gauge"), FilteredData::Gauge(1)),
-                            (String::from("sozu.count"), FilteredData::Count(-2)),
-                            (String::from("sozu.time"), FilteredData::Time(1234)),
-                        ]
-                        .iter()
-                        .cloned()
-                        .collect(),
-                        clusters: [(
-                            String::from("cluster_1"),
-                            ClusterMetricsData {
-                                cluster: [(
-                                    String::from("request_time"),
-                                    FilteredData::Percentiles(Percentiles {
-                                        samples: 42,
-                                        p_50: 1,
-                                        p_90: 2,
-                                        p_99: 10,
-                                        p_99_9: 12,
-                                        p_99_99: 20,
-                                        p_99_999: 22,
-                                        p_100: 30,
-                                    })
-                                )]
-                                .iter()
-                                .cloned()
-                                .collect(),
-                                backends: [(
-                                    String::from("cluster_1-0"),
-                                    [
-                                        (String::from("bytes_in"), FilteredData::Count(256)),
-                                        (String::from("bytes_out"), FilteredData::Count(128)),
-                                        (
-                                            String::from("percentiles"),
+                        proxy: Some(
+                            [
+                                (String::from("sozu.gauge"), FilteredData::Gauge(1)),
+                                (String::from("sozu.count"), FilteredData::Count(-2)),
+                                (String::from("sozu.time"), FilteredData::Time(1234)),
+                            ]
+                            .iter()
+                            .cloned()
+                            .collect()
+                        ),
+                        clusters: Some(
+                            [(
+                                String::from("cluster_1"),
+                                ClusterMetricsData {
+                                    cluster: Some(
+                                        [(
+                                            String::from("request_time"),
                                             FilteredData::Percentiles(Percentiles {
                                                 samples: 42,
                                                 p_50: 1,
@@ -607,20 +590,51 @@ mod tests {
                                                 p_99_999: 22,
                                                 p_100: 30,
                                             })
-                                        )
-                                    ]
-                                    .iter()
-                                    .cloned()
-                                    .collect()
-                                )]
-                                .iter()
-                                .cloned()
-                                .collect(),
-                            }
-                        )]
-                        .iter()
-                        .cloned()
-                        .collect()
+                                        )]
+                                        .iter()
+                                        .cloned()
+                                        .collect()
+                                    ),
+                                    backends: Some(
+                                        [(
+                                            String::from("cluster_1-0"),
+                                            [
+                                                (
+                                                    String::from("bytes_in"),
+                                                    FilteredData::Count(256)
+                                                ),
+                                                (
+                                                    String::from("bytes_out"),
+                                                    FilteredData::Count(128)
+                                                ),
+                                                (
+                                                    String::from("percentiles"),
+                                                    FilteredData::Percentiles(Percentiles {
+                                                        samples: 42,
+                                                        p_50: 1,
+                                                        p_90: 2,
+                                                        p_99: 10,
+                                                        p_99_9: 12,
+                                                        p_99_99: 20,
+                                                        p_99_999: 22,
+                                                        p_100: 30,
+                                                    })
+                                                )
+                                            ]
+                                            .iter()
+                                            .cloned()
+                                            .collect()
+                                        )]
+                                        .iter()
+                                        .cloned()
+                                        .collect()
+                                    ),
+                                }
+                            )]
+                            .iter()
+                            .cloned()
+                            .collect()
+                        )
                     }
                 )]
                 .iter()

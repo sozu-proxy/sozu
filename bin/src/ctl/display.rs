@@ -87,105 +87,68 @@ pub fn print_metrics(
 
     if list {
         return print_available_metrics(&answers);
-    }
-
-    for (worker_id, query_answer) in answers.iter() {
-        println!("\nWorker {}\n=========", worker_id);
-        print_worker_metrics(query_answer)?;
+    } else {
+        for (worker_id, query_answer) in answers.iter() {
+            println!("\nWorker {}\n=========", worker_id);
+            print_worker_metrics(query_answer)?;
+        }
     }
     Ok(())
 }
 
 fn print_worker_metrics(query_answer: &QueryAnswer) -> anyhow::Result<()> {
-    let filtered_metrics = match query_answer {
-        QueryAnswer::Metrics(QueryAnswerMetrics::Cluster(m)) => filter_cluster_metrics(m),
-        QueryAnswer::Metrics(QueryAnswerMetrics::Backend(m)) => filter_backend_metrics(m),
+    match query_answer {
         QueryAnswer::Metrics(QueryAnswerMetrics::All(WorkerMetrics { proxy, clusters })) => {
-            filter_worker_metrics(proxy, clusters)
+            print_proxy_metrics(proxy);
+            print_cluster_metrics(clusters);
         }
+        // TODO: handle and print an error of the form
+        // QueryAnswer::Metrics(QueryAnswerMetrics::Error(String)
         _ => bail!("The query answer is wrong."),
-    };
+    }
 
-    print_gauges_and_counts(&filtered_metrics);
-    print_percentiles(&filtered_metrics);
     Ok(())
 }
 
-fn filter_cluster_metrics(
-    // cluster_id -> (key, value)
-    cluster_metrics: &BTreeMap<String, BTreeMap<String, FilteredData>>,
-) -> BTreeMap<String, FilteredData> {
-    let mut filtered_metrics = BTreeMap::new();
-    for (cluster_id, filtered_data) in cluster_metrics.iter() {
-        for (metric_key, filtered_value) in filtered_data.iter() {
-            filtered_metrics.insert(
-                format!("{} {}", cluster_id, metric_key.replace("\t", ".")),
-                filtered_value.clone(),
-            );
-        }
+fn print_proxy_metrics(proxy_metrics: &Option<BTreeMap<String, FilteredData>>) {
+    if let Some(metrics) = proxy_metrics {
+        let filtered = filter_metrics(metrics);
+        print_gauges_and_counts(&filtered);
+        print_percentiles(&filtered);
     }
-    filtered_metrics
 }
 
-fn filter_backend_metrics(
-    // cluster_id -> (backend_id -> (key -> metric))
-    backend_metrics: &BTreeMap<String, BTreeMap<String, BTreeMap<String, FilteredData>>>,
-) -> BTreeMap<String, FilteredData> {
-    let mut filtered_metrics = BTreeMap::new();
-    for (cluster_id, cluster_metrics) in backend_metrics.iter() {
-        for (backend_id, backend_metrics) in cluster_metrics.iter() {
-            for (metric_key, filtered_value) in backend_metrics.iter() {
-                filtered_metrics.insert(
-                    format!(
-                        "{}/{} {}",
-                        cluster_id,
-                        backend_id,
-                        metric_key.replace("\t", ".")
-                    ),
-                    filtered_value.clone(),
-                );
+fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetricsData>>) {
+    if let Some(cluster_metrics) = cluster_metrics {
+        for (cluster_id, cluster_metrics_data) in cluster_metrics.iter() {
+            println!("\nCluster {}\n--------", cluster_id);
+
+            if let Some(cluster) = &cluster_metrics_data.cluster {
+                let filtered = filter_metrics(&cluster);
+                print_gauges_and_counts(&filtered);
+                print_percentiles(&filtered);
+            }
+
+            if let Some(backends) = &cluster_metrics_data.backends {
+                for (backend_id, backend_metrics) in backends.iter() {
+                    println!("\n{}/{}\n--------", cluster_id, backend_id);
+                    let filtered = filter_metrics(backend_metrics);
+                    print_gauges_and_counts(&filtered);
+                    print_percentiles(&filtered);
+                }
             }
         }
     }
-    filtered_metrics
 }
 
-fn filter_worker_metrics(
-    // key -> value
-    proxy_metrics: &BTreeMap<String, FilteredData>,
-    // cluster_id -> cluster+backend metrics
-    cluster_metrics: &BTreeMap<String, ClusterMetricsData>,
-) -> BTreeMap<String, FilteredData> {
+fn filter_metrics(metrics: &BTreeMap<String, FilteredData>) -> BTreeMap<String, FilteredData> {
     let mut filtered_metrics = BTreeMap::new();
 
-    for (metric_key, filtered_value) in proxy_metrics.iter() {
+    for (metric_key, filtered_value) in metrics.iter() {
         filtered_metrics.insert(
             format!("{}", metric_key.replace("\t", ".")),
             filtered_value.clone(),
         );
-    }
-    for (cluster_id, cluster_metric_data) in cluster_metrics.iter() {
-        // cluster metrics
-        for (metric_key, filtered_value) in cluster_metric_data.cluster.iter() {
-            filtered_metrics.insert(
-                format!("{} {}", cluster_id, metric_key.replace("\t", ".")),
-                filtered_value.clone(),
-            );
-        }
-        // backend metrics
-        for (backend_id, backend_metrics) in cluster_metric_data.backends.iter() {
-            for (metric_key, filtered_value) in backend_metrics.iter() {
-                filtered_metrics.insert(
-                    format!(
-                        "{}/{} {}",
-                        cluster_id,
-                        backend_id,
-                        metric_key.replace("\t", ".")
-                    ),
-                    filtered_value.clone(),
-                );
-            }
-        }
     }
     filtered_metrics
 }

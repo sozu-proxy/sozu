@@ -758,10 +758,11 @@ pub enum QueryCmd {
         #[clap(
             short = 'b',
             long="backends",
-            help="list of backends, in the form 'cluster_id/backend_id, other_cluster/other_backend'",
-            use_delimiter = true,
-            parse(try_from_str = split_slash))]
-        backends: Vec<(String, String)>,
+            help="coma-separated list of backends, 'one_backend_id, other_backend_id'",
+            use_delimiter = true
+            // parse(try_from_str = split_slash)
+        )]
+        backends: Vec<String>,
     },
 }
 

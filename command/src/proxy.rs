@@ -108,33 +108,18 @@ pub struct AggregatedMetricsData {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerMetrics {
     /// key -> value
-    pub proxy: BTreeMap<String, FilteredData>,
+    pub proxy: Option<BTreeMap<String, FilteredData>>,
     /// cluster_id -> cluster_metrics
-    pub clusters: BTreeMap<String, ClusterMetricsData>,
+    pub clusters: Option<BTreeMap<String, ClusterMetricsData>>,
 }
 
 /// the metrics of a given cluster, with several backends
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterMetricsData {
     /// metric name -> metric value
-    pub cluster: BTreeMap<String, FilteredData>,
+    pub cluster: Option<BTreeMap<String, FilteredData>>,
     /// backend_id -> (metric name-> metric value)
-    pub backends: BTreeMap<String, BTreeMap<String, FilteredData>>,
-}
-
-impl ClusterMetricsData {
-    pub fn new() -> Self {
-        ClusterMetricsData {
-            cluster: BTreeMap::new(),
-            backends: BTreeMap::new(),
-        }
-    }
-}
-
-impl Default for ClusterMetricsData {
-    fn default() -> Self {
-        Self::new()
-    }
+    pub backends: Option<BTreeMap<String, BTreeMap<String, FilteredData>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -826,7 +811,7 @@ pub enum QueryMetricsType {
     },
     Backend {
         metrics: Vec<String>,
-        backends: Vec<(String, String)>, // (cluster_id, backend_id)
+        backend_ids: Vec<String>,
         date: Option<i64>,
     },
     All, // dump proxy and cluster metrics
@@ -865,11 +850,7 @@ pub enum QueryAnswerCertificate {
 pub enum QueryAnswerMetrics {
     /// (list of proxy metrics, list of cluster metrics)
     List((Vec<String>, Vec<String>)),
-    /// cluster_id -> (key -> metric)
-    Cluster(BTreeMap<String, BTreeMap<String, FilteredData>>),
-    /// cluster_id -> (backend_id -> (key -> metric))
-    Backend(BTreeMap<String, BTreeMap<String, BTreeMap<String, FilteredData>>>),
-    /// all worker metrics, proxy & clusters
+    /// all worker metrics, proxy & clusters, with Options all around for partial answers
     All(WorkerMetrics),
 }
 
