@@ -744,7 +744,7 @@ pub enum QueryCmd {
         #[clap(
             short = 'n',
             long = "names",
-            help = "metric names",
+            help = "Filter by metric names. Coma-separated list.",
             use_delimiter = true
         )]
         names: Vec<String>,
@@ -764,19 +764,6 @@ pub enum QueryCmd {
         )]
         backends: Vec<String>,
     },
-}
-
-fn split_slash(input: &str) -> Result<(String, String), String> {
-    let mut it = input.split('/').map(|s| s.trim().to_string());
-
-    if let (Some(cluster), Some(backend)) = (it.next(), it.next()) {
-        Ok((cluster, backend))
-    } else {
-        Err(format!(
-            "could not split cluster id and backend id in '{}', they must have the form 'cluster_id/backend_id'",
-            input
-        ))
-    }
 }
 
 #[derive(Subcommand, PartialEq, Clone, Debug)]

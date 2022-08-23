@@ -806,16 +806,17 @@ pub enum QueryCertificateType {
 pub enum QueryMetricsType {
     List,
     Cluster {
-        metrics: Vec<String>,
         cluster_ids: Vec<String>,
-        date: Option<i64>,
+        metric_names: Vec<String>,
     },
     Backend {
-        metrics: Vec<String>,
         backend_ids: Vec<String>,
-        date: Option<i64>,
+        metric_names: Vec<String>,
     },
-    All, // dump proxy and cluster metrics
+    /// dump proxy and cluster metrics
+    All {
+        metric_names: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -184,18 +184,16 @@ impl LocalDrain {
         let worker_metrics = match query_type {
             QueryMetricsType::List => return self.list_all_metric_names(),
             QueryMetricsType::Cluster {
-                metrics,
+                metric_names,
                 cluster_ids,
-                date, // to be removed
-            } => self.query_clusters(metrics, cluster_ids),
+            } => self.query_clusters(cluster_ids, metric_names),
 
             QueryMetricsType::Backend {
-                metrics,
+                metric_names,
                 backend_ids,
-                date, // to be removed
-            } => self.query_backends(metrics, backend_ids),
+            } => self.query_backends(backend_ids, metric_names),
 
-            QueryMetricsType::All => self.dump_all_metrics(),
+            QueryMetricsType::All { metric_names } => self.dump_all_metrics(metric_names),
         };
 
         match worker_metrics {
@@ -217,40 +215,56 @@ impl LocalDrain {
         QueryAnswerMetrics::List((proxy_metrics_names, cluster_metrics_names))
     }
 
-    pub fn dump_all_metrics(&mut self) -> Result<WorkerMetrics, String> {
+    pub fn dump_all_metrics(
+        &mut self,
+        metric_names: &Vec<String>,
+    ) -> Result<WorkerMetrics, String> {
         Ok(WorkerMetrics {
-            proxy: Some(self.dump_proxy_metrics()),
-            clusters: Some(self.dump_cluster_metrics()?),
+            proxy: Some(self.dump_proxy_metrics(metric_names)),
+            clusters: Some(self.dump_cluster_metrics(metric_names)?),
         })
     }
 
-    pub fn dump_proxy_metrics(&mut self) -> BTreeMap<String, FilteredData> {
+    pub fn dump_proxy_metrics(
+        &mut self,
+        metric_names: &Vec<String>,
+    ) -> BTreeMap<String, FilteredData> {
         self.proxy_metrics
             .iter()
+            .filter(|(key, _)| {
+                if metric_names.is_empty() {
+                    true
+                } else {
+                    metric_names.contains(key)
+                }
+            })
             .map(|(key, value)| (key.to_string(), value.to_filtered()))
             .collect()
     }
 
-    pub fn dump_cluster_metrics(&mut self) -> Result<BTreeMap<String, ClusterMetricsData>, String> {
+    pub fn dump_cluster_metrics(
+        &mut self,
+        metric_names: &Vec<String>,
+    ) -> Result<BTreeMap<String, ClusterMetricsData>, String> {
         let mut cluster_data = BTreeMap::new();
 
         for cluster_id in self.get_cluster_ids() {
             cluster_data.insert(
                 cluster_id.to_owned(),
-                self.metrics_of_one_cluster(&cluster_id)?,
+                self.metrics_of_one_cluster(&cluster_id, metric_names)?,
             );
         }
 
         Ok(cluster_data)
     }
 
-    // TODO: filter with metric names
-    fn metrics_of_one_cluster(&self, cluster_id: &str) -> Result<ClusterMetricsData, String> {
-        let cluster: BTreeMap<String, FilteredData> = match self.cluster_metrics.get(cluster_id) {
-            Some(cluster_metrics) => cluster_metrics
-                .iter()
-                .map(|entry| (entry.0.to_owned(), entry.1.to_filtered()))
-                .collect::<BTreeMap<String, FilteredData>>(),
+    fn metrics_of_one_cluster(
+        &self,
+        cluster_id: &str,
+        metric_names: &Vec<String>,
+    ) -> Result<ClusterMetricsData, String> {
+        let raw_metrics = match self.cluster_metrics.get(cluster_id) {
+            Some(raw_metrics) => raw_metrics,
             None => {
                 return Err(format!(
                     "No metrics found for cluster with id {}",
@@ -259,11 +273,23 @@ impl LocalDrain {
             }
         };
 
+        let cluster: BTreeMap<String, FilteredData> = raw_metrics
+            .iter()
+            .filter(|entry| {
+                if metric_names.is_empty() {
+                    true
+                } else {
+                    metric_names.contains(entry.0)
+                }
+            })
+            .map(|entry| (entry.0.to_owned(), entry.1.to_filtered()))
+            .collect::<BTreeMap<String, FilteredData>>();
+
         let mut backends = BTreeMap::new();
         for backend_id in self.get_backend_ids(&cluster_id) {
             backends.insert(
                 backend_id.to_owned(),
-                self.metrics_of_one_backend(&backend_id)?,
+                self.metrics_of_one_backend(&backend_id, metric_names)?,
             );
         }
         Ok(ClusterMetricsData {
@@ -272,14 +298,21 @@ impl LocalDrain {
         })
     }
 
-    // TODO: filter with metric names
     fn metrics_of_one_backend(
         &self,
         backend_id: &str,
+        metric_names: &Vec<String>,
     ) -> Result<BTreeMap<String, FilteredData>, String> {
         match self.cluster_metrics.get(backend_id) {
             Some(backend_metrics) => Ok(backend_metrics
                 .iter()
+                .filter(|entry| {
+                    if metric_names.is_empty() {
+                        true
+                    } else {
+                        metric_names.contains(entry.0)
+                    }
+                })
                 .map(|entry| (entry.0.to_owned(), entry.1.to_filtered()))
                 .collect::<BTreeMap<String, FilteredData>>()),
             None => Err(format!(
@@ -291,17 +324,16 @@ impl LocalDrain {
 
     fn query_clusters(
         &mut self,
-        metric_names: &Vec<String>, // TODO: filter with metric names
         cluster_ids: &Vec<String>,
+        metric_names: &Vec<String>,
     ) -> Result<WorkerMetrics, String> {
         debug!("Querying cluster with ids: {:?}", cluster_ids);
         let mut clusters: BTreeMap<String, ClusterMetricsData> = BTreeMap::new();
 
-        // TODO if metric_names is Some(names), filter. If empty, provide all metrics
         for cluster_id in cluster_ids {
             clusters.insert(
                 cluster_id.to_owned(),
-                self.metrics_of_one_cluster(cluster_id)?,
+                self.metrics_of_one_cluster(cluster_id, metric_names)?,
             );
         }
 
@@ -314,12 +346,11 @@ impl LocalDrain {
 
     fn query_backends(
         &mut self,
-        metric_names: &[String], // TODO: filter with metric names
-        backend_ids: &[String],
+        backend_ids: &Vec<String>,
+        metric_names: &Vec<String>,
     ) -> Result<WorkerMetrics, String> {
         let mut clusters: BTreeMap<String, ClusterMetricsData> = BTreeMap::new();
 
-        // if metric_names is empty, provide all metrics for those backends
         for backend_id in backend_ids {
             let cluster_id = match self.backend_to_cluster.get(backend_id) {
                 Some(id) => id.to_owned(),
@@ -334,7 +365,7 @@ impl LocalDrain {
             let mut backend_map: BTreeMap<String, BTreeMap<String, FilteredData>> = BTreeMap::new();
             backend_map.insert(
                 backend_id.to_owned(),
-                self.metrics_of_one_backend(&backend_id)?,
+                self.metrics_of_one_backend(&backend_id, metric_names)?,
             );
 
             clusters.insert(
@@ -364,8 +395,7 @@ impl LocalDrain {
             return;
         }
 
-        // TODO: make this trace! again
-        debug!(
+        trace!(
             "cluster metric: {} {} {:?} {:?}",
             metric_name, cluster_id, backend_id, metric_value
         );

@@ -777,22 +777,20 @@ impl CommandManager {
         json: bool,
         list: bool,
         refresh: Option<u32>,
-        names: Vec<String>,
+        metric_names: Vec<String>,
         cluster_ids: Vec<String>,
-        backend_ids: Vec<String>, 
+        backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
         let query = match (list, cluster_ids.is_empty(), backend_ids.is_empty()) {
             (true, _, _) => QueryMetricsType::List,
-            (false, true, true) => QueryMetricsType::All,
+            (false, true, true) => QueryMetricsType::All { metric_names },
             (false, false, _) => QueryMetricsType::Cluster {
-                metrics: names,
                 cluster_ids,
-                date: None,
+                metric_names,
             },
             (false, true, false) => QueryMetricsType::Backend {
-                metrics: names,
                 backend_ids,
-                date: None,
+                metric_names,
             },
         };
 
