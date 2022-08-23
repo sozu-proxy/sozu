@@ -104,7 +104,8 @@ pub struct AggregatedMetricsData {
     pub workers: BTreeMap<String, WorkerMetrics>,
 }
 
-/// All metrics of a worker, proxy and clusters
+/// All metrics of a worker: proxy and clusters
+/// Populated by Options so partial results can be sent
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerMetrics {
     /// key -> value
@@ -852,6 +853,8 @@ pub enum QueryAnswerMetrics {
     List((Vec<String>, Vec<String>)),
     /// all worker metrics, proxy & clusters, with Options all around for partial answers
     All(WorkerMetrics),
+    /// Use to trickle up errors to the CLI
+    Error(String),
 }
 
 impl ProxyRequestData {

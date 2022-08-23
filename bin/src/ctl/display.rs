@@ -102,8 +102,9 @@ fn print_worker_metrics(query_answer: &QueryAnswer) -> anyhow::Result<()> {
             print_proxy_metrics(proxy);
             print_cluster_metrics(clusters);
         }
-        // TODO: handle and print an error of the form
-        // QueryAnswer::Metrics(QueryAnswerMetrics::Error(String)
+        QueryAnswer::Metrics(QueryAnswerMetrics::Error(error)) => {
+            println!("Proxy responded with error: {}\nMaybe check your command.", error)
+        }
         _ => bail!("The query answer is wrong."),
     }
 
