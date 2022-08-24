@@ -9,8 +9,8 @@ use prettytable::{Row, Table};
 use sozu_command_lib::{
     command::{CommandResponseData, ListedFrontends},
     proxy::{
-        ClusterMetricsData, FilteredData, QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics,
-        Route, WorkerMetrics,
+        AggregatedMetricsData, ClusterMetricsData, FilteredData, QueryAnswer,
+        QueryAnswerCertificate, QueryAnswerMetrics, Route, WorkerMetrics,
     },
 };
 
@@ -75,34 +75,35 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
 }
 
 pub fn print_metrics(
-    // worker_id -> query answer
-    answers: BTreeMap<String, QueryAnswer>,
+    // main & worker metrics
+    aggregated_metrics: AggregatedMetricsData,
     json: bool,
-    list: bool,
 ) -> anyhow::Result<()> {
     if json {
         println!("Here are the metrics, per worker");
-        return print_json_response(&answers);
+        return print_json_response(&aggregated_metrics);
     }
 
-    if list {
-        return print_available_metrics(&answers);
-    } else {
-        for (worker_id, query_answer) in answers.iter() {
-            println!("\nWorker {}\n=========", worker_id);
-            print_worker_metrics(query_answer)?;
-        }
+    // main process metrics
+    println!("\nMAIN PROCESS\n============");
+
+    print_proxy_metrics(&Some(aggregated_metrics.main));
+
+    // workers
+    for (worker_id, query_answer_metrics) in aggregated_metrics.workers.iter() {
+        println!("\nWorker {}\n=========", worker_id);
+        print_worker_metrics(query_answer_metrics)?;
     }
     Ok(())
 }
 
-fn print_worker_metrics(query_answer: &QueryAnswer) -> anyhow::Result<()> {
-    match query_answer {
-        QueryAnswer::Metrics(QueryAnswerMetrics::All(WorkerMetrics { proxy, clusters })) => {
+fn print_worker_metrics(query_answer_metrics: &QueryAnswerMetrics) -> anyhow::Result<()> {
+    match query_answer_metrics {
+        QueryAnswerMetrics::All(WorkerMetrics { proxy, clusters }) => {
             print_proxy_metrics(proxy);
             print_cluster_metrics(clusters);
         }
-        QueryAnswer::Metrics(QueryAnswerMetrics::Error(error)) => {
+        QueryAnswerMetrics::Error(error) => {
             println!("Error: {}\nMaybe check your command.", error)
         }
         _ => bail!("The query answer is wrong."),
@@ -565,7 +566,7 @@ fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
     .unwrap_or_default()
 }
 
-fn print_available_metrics(answers: &BTreeMap<String, QueryAnswer>) -> anyhow::Result<()> {
+pub fn print_available_metrics(answers: &BTreeMap<String, QueryAnswer>) -> anyhow::Result<()> {
     let mut available_metrics: (HashSet<String>, HashSet<String>) =
         (HashSet::new(), HashSet::new());
     for query_answer in answers.values() {

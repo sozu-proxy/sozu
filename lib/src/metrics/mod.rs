@@ -4,6 +4,7 @@ mod writer;
 
 use std::{
     cell::RefCell,
+    collections::BTreeMap,
     io::{self, Write},
     net::SocketAddr,
     str,
@@ -12,7 +13,9 @@ use std::{
 
 use mio::net::UdpSocket;
 
-use crate::sozu_command::proxy::{MetricsConfiguration, QueryAnswerMetrics, QueryMetricsType};
+use crate::sozu_command::proxy::{
+    FilteredData, MetricsConfiguration, QueryAnswerMetrics, QueryMetricsType,
+};
 
 use self::{local_drain::LocalDrain, network_drain::NetworkDrain};
 
@@ -211,6 +214,10 @@ impl Aggregator {
         if let Some(ref mut net) = self.network.as_mut() {
             net.send_data();
         }
+    }
+
+    pub fn dump_local_proxy_metrics(&mut self) -> BTreeMap<String, FilteredData> {
+        self.local.dump_proxy_metrics(&Vec::new())
     }
 
     pub fn query(&mut self, q: &QueryMetricsType) -> QueryAnswerMetrics {

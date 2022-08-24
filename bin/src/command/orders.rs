@@ -23,12 +23,15 @@ use sozu_command_lib::{
     logging,
     parser::parse_several_commands,
     proxy::{
-        MetricsConfiguration, ProxyRequest, ProxyRequestData, ProxyResponseData,
-        ProxyResponseStatus, Query, QueryAnswer, QueryClusterType, Route, TcpFrontend,
+        AggregatedMetricsData, MetricsConfiguration, ProxyRequest, ProxyRequestData,
+        ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer, QueryAnswerMetrics,
+        QueryClusterType, QueryMetricsType, Route, TcpFrontend,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
 };
+
+use sozu::metrics::METRICS;
 
 use crate::{
     command::{CommandMessage, CommandServer, RequestIdentifier, Response, Success},
@@ -935,7 +938,6 @@ impl CommandServer {
         request_identifier: RequestIdentifier,
         query: Query,
     ) -> anyhow::Result<Option<Success>> {
-
         debug!("Received this query: {:?}", query);
         let (query_tx, mut query_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
@@ -983,6 +985,11 @@ impl CommandServer {
         let prefix = format!("{}-query-", request_identifier.client);
         let command_tx = self.command_tx.clone();
         let cloned_identifier = request_identifier.clone();
+
+        // this may waste resources and time in case of queries others than Metrics
+        let main_metrics =
+            METRICS.with(|metrics| (*metrics.borrow_mut()).dump_local_proxy_metrics());
+
         smol::spawn(async move {
             let mut responses = Vec::new();
             let mut i = 0;
@@ -1026,12 +1033,44 @@ impl CommandServer {
                     Success::Query(CommandResponseData::Query(proxy_responses_map))
                 }
                 &Query::Certificates(_) => {
-                    info!("certificates query answer received: {:?}", proxy_responses_map);
+                    info!(
+                        "certificates query answer received: {:?}",
+                        proxy_responses_map
+                    );
                     Success::Query(CommandResponseData::Query(proxy_responses_map))
                 }
-                &Query::Metrics(_) => {
+                Query::Metrics(query_metrics_type) => {
                     debug!("metrics query answer received: {:?}", proxy_responses_map);
-                    Success::Query(CommandResponseData::Query(proxy_responses_map))
+
+                    match query_metrics_type {
+                        QueryMetricsType::List => {
+                            Success::Query(CommandResponseData::Query(proxy_responses_map))
+                        }
+                        _ => {
+                            let worker_metrics_map = proxy_responses_map
+                                .iter()
+                                .map(|(worker_id, query_answer)| {
+                                    if let QueryAnswer::Metrics(query_answer_metrics) = query_answer
+                                    {
+                                        (worker_id.to_owned(), query_answer_metrics.to_owned())
+                                    } else {
+                                        (
+                                        worker_id.to_owned(),
+                                        QueryAnswerMetrics::Error(
+                                            "This worker answered with the wrong type of answer"
+                                                .to_owned(),
+                                        ),
+                                    )
+                                    }
+                                })
+                                .collect::<BTreeMap<String, QueryAnswerMetrics>>();
+
+                            Success::Query(CommandResponseData::Metrics(AggregatedMetricsData {
+                                main: main_metrics,
+                                workers: worker_metrics_map,
+                            }))
+                        }
+                    }
                 }
             };
 
