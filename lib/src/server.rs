@@ -806,7 +806,7 @@ impl Server {
     }
 
     fn notify(&mut self, message: ProxyRequest) {
-        if let ProxyRequestData::Metrics(configuration) = &message.order {
+        if let ProxyRequestData::ConfigureMetrics(configuration) = &message.order {
             //let id = message.id.clone();
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).configure(configuration);
@@ -875,9 +875,9 @@ impl Server {
                         }
                     }
                 }
-                Query::Metrics(query_metrics_type) => {
+                Query::Metrics(query_metrics_options) => {
                     METRICS.with(|metrics| {
-                        let data = (*metrics.borrow_mut()).query(query_metrics_type);
+                        let data = (*metrics.borrow_mut()).query(query_metrics_options);
 
                         push_queue(ProxyResponse {
                             id: message.id.clone(),

@@ -14,7 +14,7 @@ use std::{
 use mio::net::UdpSocket;
 
 use crate::sozu_command::proxy::{
-    FilteredData, MetricsConfiguration, QueryAnswerMetrics, QueryMetricsType,
+    FilteredData, MetricsConfiguration, QueryAnswerMetrics, QueryMetricsOptions,
 };
 
 use self::{local_drain::LocalDrain, network_drain::NetworkDrain};
@@ -220,7 +220,7 @@ impl Aggregator {
         self.local.dump_proxy_metrics(&Vec::new())
     }
 
-    pub fn query(&mut self, q: &QueryMetricsType) -> QueryAnswerMetrics {
+    pub fn query(&mut self, q: &QueryMetricsOptions) -> QueryAnswerMetrics {
         self.local.query(q)
     }
 

@@ -24,8 +24,8 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proxy::{
         AggregatedMetricsData, MetricsConfiguration, ProxyRequest, ProxyRequestData,
-        ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer, QueryAnswerMetrics,
-        QueryClusterType, QueryMetricsType, Route, TcpFrontend,
+        ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer, QueryClusterType, Route,
+        TcpFrontend,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -73,7 +73,9 @@ impl CommandServer {
                 self.upgrade_worker(request_identifier, worker_id).await
             }
             CommandRequestData::Proxy(proxy_request) => match proxy_request {
-                ProxyRequestData::Metrics(config) => self.metrics(request_identifier, config).await,
+                ProxyRequestData::ConfigureMetrics(config) => {
+                    self.configure_metrics(request_identifier, config).await
+                }
                 ProxyRequestData::Query(query) => self.query(request_identifier, query).await,
                 ProxyRequestData::Logging(logging_filter) => self.set_logging_level(logging_filter),
                 // we should have something like
@@ -857,7 +859,7 @@ impl CommandServer {
 
     // This handles the CLI's "metrics enable", "metrics disable", "metrics clear"
     // To get the proxy's metrics, the cli command is "query metrics", handled by the query() function
-    pub async fn metrics(
+    pub async fn configure_metrics(
         &mut self,
         request_identifier: RequestIdentifier,
         config: MetricsConfiguration,
@@ -871,7 +873,10 @@ impl CommandServer {
         {
             let req_id = format!("{}-metrics-{}", request_identifier.client, worker.id);
             worker
-                .send(req_id.clone(), ProxyRequestData::Metrics(config.clone()))
+                .send(
+                    req_id.clone(),
+                    ProxyRequestData::ConfigureMetrics(config.clone()),
+                )
                 .await;
             count += 1;
             self.in_flight.insert(req_id, (metrics_tx.clone(), 1));
@@ -1039,37 +1044,16 @@ impl CommandServer {
                     );
                     Success::Query(CommandResponseData::Query(proxy_responses_map))
                 }
-                Query::Metrics(query_metrics_type) => {
+                Query::Metrics(options) => {
                     debug!("metrics query answer received: {:?}", proxy_responses_map);
 
-                    match query_metrics_type {
-                        QueryMetricsType::List => {
-                            Success::Query(CommandResponseData::Query(proxy_responses_map))
-                        }
-                        _ => {
-                            let worker_metrics_map = proxy_responses_map
-                                .iter()
-                                .map(|(worker_id, query_answer)| {
-                                    if let QueryAnswer::Metrics(query_answer_metrics) = query_answer
-                                    {
-                                        (worker_id.to_owned(), query_answer_metrics.to_owned())
-                                    } else {
-                                        (
-                                        worker_id.to_owned(),
-                                        QueryAnswerMetrics::Error(
-                                            "This worker answered with the wrong type of answer"
-                                                .to_owned(),
-                                        ),
-                                    )
-                                    }
-                                })
-                                .collect::<BTreeMap<String, QueryAnswerMetrics>>();
-
-                            Success::Query(CommandResponseData::Metrics(AggregatedMetricsData {
-                                main: main_metrics,
-                                workers: worker_metrics_map,
-                            }))
-                        }
+                    if options.list {
+                        Success::Query(CommandResponseData::Query(proxy_responses_map))
+                    } else {
+                        Success::Query(CommandResponseData::Metrics(AggregatedMetricsData {
+                            main: main_metrics,
+                            workers: proxy_responses_map,
+                        }))
                     }
                 }
             };

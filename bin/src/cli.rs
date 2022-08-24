@@ -117,6 +117,13 @@ pub enum SubCmd {
         about = "gets statistics on the main process and its workers"
     )]
     Metrics {
+        #[clap(
+            short = 'j',
+            long = "json",
+            help = "Print the command result in JSON format",
+            global = true
+        )]
+        json: bool,
         #[clap(subcommand)]
         cmd: MetricsCmd,
     },
@@ -202,6 +209,35 @@ pub enum MetricsCmd {
     Disable,
     #[clap(name = "clear", about = "Deletes local metrics data")]
     Clear,
+    #[clap(name = "get", about = "get all or filtered metrics")]
+    Get {
+        #[clap(short, long, help = "list the available metrics on the proxy level")]
+        list: bool,
+        #[clap(short, long, help = "refresh metrics results (in seconds)")]
+        refresh: Option<u32>,
+        #[clap(
+            short = 'n',
+            long = "names",
+            help = "Filter by metric names. Coma-separated list.",
+            use_delimiter = true
+        )]
+        names: Vec<String>,
+        #[clap(
+            short = 'k',
+            long = "clusters",
+            help = "list of cluster ids (= application id)",
+            use_delimiter = true
+        )]
+        clusters: Vec<String>,
+        #[clap(
+            short = 'b',
+            long="backends",
+            help="coma-separated list of backends, 'one_backend_id, other_backend_id'",
+            use_delimiter = true
+            // parse(try_from_str = split_slash)
+        )]
+        backends: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, PartialEq, Clone, Debug)]
@@ -731,38 +767,6 @@ pub enum QueryCmd {
         fingerprint: Option<String>,
         #[clap(short = 'd', long = "domain", help = "domain name")]
         domain: Option<String>,
-    },
-    #[clap(
-        name = "metrics",
-        about = "Query all metrics, or matching a specific filter"
-    )]
-    Metrics {
-        #[clap(short, long, help = "list the available metrics on the proxy level")]
-        list: bool,
-        #[clap(short, long, help = "refresh metrics results (in seconds)")]
-        refresh: Option<u32>,
-        #[clap(
-            short = 'n',
-            long = "names",
-            help = "Filter by metric names. Coma-separated list.",
-            use_delimiter = true
-        )]
-        names: Vec<String>,
-        #[clap(
-            short = 'k',
-            long = "clusters",
-            help = "list of cluster ids (= application id)",
-            use_delimiter = true
-        )]
-        clusters: Vec<String>,
-        #[clap(
-            short = 'b',
-            long="backends",
-            help="coma-separated list of backends, 'one_backend_id, other_backend_id'",
-            use_delimiter = true
-            // parse(try_from_str = split_slash)
-        )]
-        backends: Vec<String>,
     },
 }
 

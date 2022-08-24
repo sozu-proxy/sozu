@@ -94,19 +94,18 @@ pub enum ProxyResponseData {
     Event(ProxyEvent),
 }
 
-/// This was used to aggregate the metrics of the main process and workers,
-/// but it isn't used anywhere here except in a test
+/// Aggregated metrics of main process & workers, for the CLI
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedMetricsData {
     pub main: BTreeMap<String, FilteredData>,
-    pub workers: BTreeMap<String, QueryAnswerMetrics>,
+    pub workers: BTreeMap<String, QueryAnswer>,
 }
 
 /// All metrics of a worker: proxy and clusters
 /// Populated by Options so partial results can be sent
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerMetrics {
-    /// key -> value
+    /// Metrics of the worker process, key -> value
     pub proxy: Option<BTreeMap<String, FilteredData>>,
     /// cluster_id -> cluster_metrics
     pub clusters: Option<BTreeMap<String, ClusterMetricsData>>,
@@ -228,7 +227,7 @@ pub enum ProxyRequestData {
     HardStop,
 
     Status,
-    Metrics(MetricsConfiguration),
+    ConfigureMetrics(MetricsConfiguration),
     Logging(String),
 
     ReturnListenSockets,
@@ -774,7 +773,7 @@ pub enum MetricsConfiguration {
 pub enum Query {
     Clusters(QueryClusterType),
     Certificates(QueryCertificateType),
-    Metrics(QueryMetricsType),
+    Metrics(QueryMetricsOptions),
     ClustersHashes,
 }
 
@@ -799,22 +798,14 @@ pub enum QueryCertificateType {
     Fingerprint(Vec<u8>),
 }
 
+/// Options originating from the command line
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum QueryMetricsType {
-    List,
-    Cluster {
-        cluster_ids: Vec<String>,
-        metric_names: Vec<String>,
-    },
-    Backend {
-        backend_ids: Vec<String>,
-        metric_names: Vec<String>,
-    },
-    /// dump proxy and cluster metrics
-    All {
-        metric_names: Vec<String>,
-    },
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct QueryMetricsOptions {
+    pub list: bool,
+    pub cluster_ids: Vec<String>,
+    pub backend_ids: Vec<String>,
+    pub metric_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -846,6 +837,7 @@ pub enum QueryAnswerCertificate {
     Fingerprint(Option<(String, Vec<String>)>),
 }
 
+/// Returned by the local drain
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryAnswerMetrics {
     /// (list of proxy metrics, list of cluster metrics)
@@ -976,7 +968,7 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::Metrics(_) => HashSet::new(),
+            ProxyRequestData::ConfigureMetrics(_) => HashSet::new(),
             ProxyRequestData::Logging(_) => [
                 Topic::HttpsProxyConfig,
                 Topic::HttpProxyConfig,

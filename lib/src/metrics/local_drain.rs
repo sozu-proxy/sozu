@@ -6,7 +6,7 @@ use hdrhistogram::Histogram;
 
 use crate::sozu_command::proxy::{
     ClusterMetricsData, FilteredData, MetricsConfiguration, Percentiles, QueryAnswerMetrics,
-    QueryMetricsType, WorkerMetrics,
+    QueryMetricsOptions, WorkerMetrics,
 };
 
 use super::{MetricData, Subscriber};
@@ -177,26 +177,27 @@ impl LocalDrain {
             .collect()
     }
 
-    pub fn query(&mut self, query_type: &QueryMetricsType) -> QueryAnswerMetrics {
+    pub fn query(&mut self, options: &QueryMetricsOptions) -> QueryAnswerMetrics {
         trace!(
-            "The local drain received this query: {:?}\n, here is the local drain: {:?}",
-            query_type,
-            self
+            "The local drain received a metrics query with this options: {:?}",
+            options
         );
 
-        let worker_metrics = match query_type {
-            QueryMetricsType::List => return self.list_all_metric_names(),
-            QueryMetricsType::Cluster {
-                metric_names,
-                cluster_ids,
-            } => self.query_clusters(cluster_ids, metric_names),
+        let QueryMetricsOptions {
+            metric_names,
+            cluster_ids,
+            backend_ids,
+            list,
+        } = options;
 
-            QueryMetricsType::Backend {
-                metric_names,
-                backend_ids,
-            } => self.query_backends(backend_ids, metric_names),
+        if *list {
+            return self.list_all_metric_names();
+        }
 
-            QueryMetricsType::All { metric_names } => self.dump_all_metrics(metric_names),
+        let worker_metrics = match (cluster_ids.is_empty(), backend_ids.is_empty()) {
+            (false, _) => self.query_clusters(cluster_ids, metric_names),
+            (true, false) => self.query_backends(backend_ids, metric_names),
+            (true, true) => self.dump_all_metrics(metric_names),
         };
 
         match worker_metrics {

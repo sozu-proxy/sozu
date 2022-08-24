@@ -65,7 +65,16 @@ impl CommandManager {
             SubCmd::Upgrade { worker: None } => self.upgrade_main(),
             SubCmd::Upgrade { worker: Some(id) } => self.upgrade_worker(id),
             SubCmd::Status { json } => self.status(json),
-            SubCmd::Metrics { cmd } => self.metrics(cmd),
+            SubCmd::Metrics { cmd, json } => match cmd {
+                MetricsCmd::Get {
+                    list,
+                    refresh,
+                    names,
+                    clusters,
+                    backends,
+                } => self.get_metrics(json, list, refresh, names, clusters, backends),
+                _ => self.configure_metrics(cmd),
+            },
             SubCmd::Logging { level } => self.logging_filter(&level),
             SubCmd::State { cmd } => match cmd {
                 StateCmd::Save { file } => self.save_state(file),
@@ -130,13 +139,6 @@ impl CommandManager {
                     fingerprint,
                     domain,
                 } => self.query_certificate(json, fingerprint, domain),
-                QueryCmd::Metrics {
-                    list,
-                    refresh,
-                    names,
-                    clusters,
-                    backends,
-                } => self.query_metrics(json, list, refresh, names, clusters, backends),
             },
             SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
             SubCmd::Events => self.events(),

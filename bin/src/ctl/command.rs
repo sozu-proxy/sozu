@@ -19,7 +19,7 @@ use sozu_command_lib::{
     },
     proxy::{
         MetricsConfiguration, ProxyRequestData, Query, QueryCertificateType, QueryClusterDomain,
-        QueryClusterType, QueryMetricsType,
+        QueryClusterType, QueryMetricsOptions,
     },
 };
 
@@ -533,7 +533,7 @@ impl CommandManager {
         Ok(())
     }
 
-    pub fn metrics(&mut self, cmd: MetricsCmd) -> Result<(), anyhow::Error> {
+    pub fn configure_metrics(&mut self, cmd: MetricsCmd) -> Result<(), anyhow::Error> {
         let id = generate_id();
         //println!("will send message for metrics with id {}", id);
 
@@ -541,11 +541,12 @@ impl CommandManager {
             MetricsCmd::Enable => MetricsConfiguration::Enabled(true),
             MetricsCmd::Disable => MetricsConfiguration::Enabled(false),
             MetricsCmd::Clear => MetricsConfiguration::Clear,
+            _ => bail!("The command passed to the configure_metrics function is wrong."),
         };
 
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::Proxy(ProxyRequestData::Metrics(configuration)),
+            CommandRequestData::Proxy(ProxyRequestData::ConfigureMetrics(configuration)),
             None,
         ));
 
@@ -564,6 +565,77 @@ impl CommandManager {
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn get_metrics(
+        &mut self,
+        json: bool,
+        list: bool,
+        refresh: Option<u32>,
+        metric_names: Vec<String>,
+        cluster_ids: Vec<String>,
+        backend_ids: Vec<String>,
+    ) -> Result<(), anyhow::Error> {
+        let command = CommandRequestData::Proxy(ProxyRequestData::Query(Query::Metrics(
+            QueryMetricsOptions {
+                list,
+                cluster_ids,
+                backend_ids,
+                metric_names,
+            },
+        )));
+
+        // a loop to reperform the query every refresh time
+        loop {
+            let id = generate_id();
+            self.channel
+                .write_message(&CommandRequest::new(id.clone(), command.clone(), None));
+            print!("{}", termion::cursor::Save);
+
+            // this functions may bail and escape the loop, should we avoid that?
+            let message = self.read_channel_message_with_timeout()?;
+
+            //println!("received message: {:?}", message);
+            if id != message.id {
+                bail!("received message with invalid id: {:?}", message);
+            }
+            match message.status {
+                CommandStatus::Processing => {
+                    // do nothing here
+                    // for other messages, we would loop over read_message
+                    // until an error or ok message was sent
+                }
+                CommandStatus::Error => {
+                    if json {
+                        return print_json_response(&message.message);
+                    } else {
+                        bail!("could not query proxy state: {}", message.message);
+                    }
+                }
+                CommandStatus::Ok => match message.data {
+                    Some(CommandResponseData::Metrics(aggregated_metrics_data)) => {
+                        print_metrics(aggregated_metrics_data, json)?
+                    }
+                    Some(CommandResponseData::Query(lists_of_metrics)) => {
+                        print_available_metrics(&lists_of_metrics)?;
+                    }
+                    _ => println!("Wrong kind of response here"),
+                },
+            }
+
+            match refresh {
+                None => break,
+                Some(seconds) => std::thread::sleep(std::time::Duration::from_secs(seconds as u64)),
+            }
+
+            print!(
+                "{}{}",
+                termion::cursor::Restore,
+                termion::clear::BeforeCursor
+            );
+        }
+
         Ok(())
     }
 
@@ -769,83 +841,6 @@ impl CommandManager {
                 }
             }
         }
-        Ok(())
-    }
-
-    pub fn query_metrics(
-        &mut self,
-        json: bool,
-        list: bool,
-        refresh: Option<u32>,
-        metric_names: Vec<String>,
-        cluster_ids: Vec<String>,
-        backend_ids: Vec<String>,
-    ) -> Result<(), anyhow::Error> {
-        let query = match (list, cluster_ids.is_empty(), backend_ids.is_empty()) {
-            (true, _, _) => QueryMetricsType::List,
-            (false, true, true) => QueryMetricsType::All { metric_names },
-            (false, false, _) => QueryMetricsType::Cluster {
-                cluster_ids,
-                metric_names,
-            },
-            (false, true, false) => QueryMetricsType::Backend {
-                backend_ids,
-                metric_names,
-            },
-        };
-
-        let command = CommandRequestData::Proxy(ProxyRequestData::Query(Query::Metrics(query)));
-
-        // a loop to reperform the query every refresh time
-        loop {
-            let id = generate_id();
-            self.channel
-                .write_message(&CommandRequest::new(id.clone(), command.clone(), None));
-            print!("{}", termion::cursor::Save);
-
-            // this functions may bail and escape the loop, should we avoid that?
-            let message = self.read_channel_message_with_timeout()?;
-
-            //println!("received message: {:?}", message);
-            if id != message.id {
-                bail!("received message with invalid id: {:?}", message);
-            }
-            match message.status {
-                CommandStatus::Processing => {
-                    // do nothing here
-                    // for other messages, we would loop over read_message
-                    // until an error or ok message was sent
-                }
-                CommandStatus::Error => {
-                    if json {
-                        return print_json_response(&message.message);
-                    } else {
-                        bail!("could not query proxy state: {}", message.message);
-                    }
-                }
-                CommandStatus::Ok => match message.data {
-                    Some(CommandResponseData::Metrics(aggregated_metrics_data)) => {
-                        print_metrics(aggregated_metrics_data, json)?
-                    }
-                    Some(CommandResponseData::Query(lists_of_metrics)) => {
-                        print_available_metrics(&lists_of_metrics)?;
-                    }
-                    _ => println!("Wrong kind of response here"),
-                },
-            }
-
-            match refresh {
-                None => break,
-                Some(seconds) => std::thread::sleep(std::time::Duration::from_secs(seconds as u64)),
-            }
-
-            print!(
-                "{}{}",
-                termion::cursor::Restore,
-                termion::clear::BeforeCursor
-            );
-        }
-
         Ok(())
     }
 

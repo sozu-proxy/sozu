@@ -2,8 +2,7 @@ use std::{collections::BTreeMap, net::SocketAddr};
 
 use crate::{
     proxy::{
-        AggregatedMetricsData, HttpFrontend, ProxyEvent, ProxyRequestData, QueryAnswer,
-        QueryAnswerMetrics, TcpFrontend,
+        AggregatedMetricsData, HttpFrontend, ProxyEvent, ProxyRequestData, QueryAnswer, TcpFrontend,
     },
     state::ConfigState,
 };
@@ -67,8 +66,10 @@ pub enum CommandStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandResponseData {
     Workers(Vec<WorkerInfo>),
+    /// used by the main process to respond to the CLI
     Metrics(AggregatedMetricsData),
-    Query(BTreeMap<String, QueryAnswer>), // worker_id -> query_answer
+    /// worker_id -> query_answer
+    Query(BTreeMap<String, QueryAnswer>),
     State(ConfigState),
     Event(Event),
     FrontendList(ListedFrontends),
@@ -160,8 +161,8 @@ mod tests {
     use crate::proxy::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
         ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Percentiles, ProxyRequestData, RemoveBackend,
-        RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
+        LoadBalancingParams, PathRule, Percentiles, ProxyRequestData, QueryAnswerMetrics,
+        RemoveBackend, RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
     };
     use hex::FromHex;
     use serde_json;
@@ -563,7 +564,7 @@ mod tests {
                 .collect(),
                 workers: [(
                     String::from("0"),
-                    QueryAnswerMetrics::All(WorkerMetrics {
+                    QueryAnswer::Metrics(QueryAnswerMetrics::All(WorkerMetrics {
                         proxy: Some(
                             [
                                 (String::from("sozu.gauge"), FilteredData::Gauge(1)),
@@ -636,7 +637,7 @@ mod tests {
                             .cloned()
                             .collect()
                         )
-                    })
+                    }))
                 )]
                 .iter()
                 .cloned()
