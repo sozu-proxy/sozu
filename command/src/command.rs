@@ -2,7 +2,8 @@ use std::{collections::BTreeMap, net::SocketAddr};
 
 use crate::{
     proxy::{
-        AggregatedMetricsData, HttpFrontend, ProxyEvent, ProxyRequestData, QueryAnswer, TcpFrontend,
+        AggregatedMetricsData, HttpFrontend, ProxyEvent, ProxyRequestData, QueryAnswer,
+        QueryAnswerMetrics, TcpFrontend,
     },
     state::ConfigState,
 };
@@ -66,7 +67,7 @@ pub enum CommandStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandResponseData {
     Workers(Vec<WorkerInfo>),
-    Metrics(AggregatedMetricsData), // this isn't used anywhere except in a test
+    Metrics(AggregatedMetricsData),
     Query(BTreeMap<String, QueryAnswer>), // worker_id -> query_answer
     State(ConfigState),
     Event(Event),
@@ -562,7 +563,7 @@ mod tests {
                 .collect(),
                 workers: [(
                     String::from("0"),
-                    WorkerMetrics {
+                    QueryAnswerMetrics::All(WorkerMetrics {
                         proxy: Some(
                             [
                                 (String::from("sozu.gauge"), FilteredData::Gauge(1)),
@@ -635,7 +636,7 @@ mod tests {
                             .cloned()
                             .collect()
                         )
-                    }
+                    })
                 )]
                 .iter()
                 .cloned()

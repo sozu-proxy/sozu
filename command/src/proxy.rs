@@ -98,10 +98,8 @@ pub enum ProxyResponseData {
 /// but it isn't used anywhere here except in a test
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedMetricsData {
-    /// key -> value
     pub main: BTreeMap<String, FilteredData>,
-    /// worker_id -> proxy & clusters data
-    pub workers: BTreeMap<String, WorkerMetrics>,
+    pub workers: BTreeMap<String, QueryAnswerMetrics>,
 }
 
 /// All metrics of a worker: proxy and clusters

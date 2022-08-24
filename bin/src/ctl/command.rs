@@ -28,8 +28,8 @@ use crate::{
     ctl::{
         create_channel,
         display::{
-            print_certificates, print_frontend_list, print_json_response, print_metrics,
-            print_query_response_data,
+            print_available_metrics, print_certificates, print_frontend_list, print_json_response,
+            print_metrics, print_query_response_data,
         },
         CommandManager,
     },
@@ -823,11 +823,15 @@ impl CommandManager {
                         bail!("could not query proxy state: {}", message.message);
                     }
                 }
-                CommandStatus::Ok => {
-                    if let Some(CommandResponseData::Query(answers)) = message.data {
-                        print_metrics(answers, json, list)?;
+                CommandStatus::Ok => match message.data {
+                    Some(CommandResponseData::Metrics(aggregated_metrics_data)) => {
+                        print_metrics(aggregated_metrics_data, json)?
                     }
-                }
+                    Some(CommandResponseData::Query(lists_of_metrics)) => {
+                        print_available_metrics(&lists_of_metrics)?;
+                    }
+                    _ => println!("Wrong kind of response here"),
+                },
             }
 
             match refresh {
