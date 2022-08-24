@@ -714,8 +714,9 @@ impl Server {
             }
 
             let now = time::OffsetDateTime::now_utc();
-            // clear local metrics every night at 00:00 to prevent memory overuse
-            if now.hour() == 0 && now.minute() == 00 && now.second() == 0 {
+            // clear the local metrics drain every plain hour (01:00, 02:00, etc.) to prevent memory overuse
+            // TODO: have one-hour-lasting metrics instead
+            if now.minute() == 00 && now.second() == 0 {
                 METRICS.with(|metrics| {
                     (*metrics.borrow_mut()).clear_local();
                 });
