@@ -197,15 +197,9 @@ pub enum SubCmd {
 #[derive(Subcommand, PartialEq, Clone, Debug)]
 pub enum MetricsCmd {
     #[clap(name = "enable", about = "Enables local metrics collection")]
-    Enable {
-        #[clap(long, help = "Enables time metrics collection")]
-        time: bool,
-    },
+    Enable,
     #[clap(name = "disable", about = "Disables local metrics collection")]
-    Disable {
-        #[clap(long, help = "Disables time metrics collection")]
-        time: bool,
-    },
+    Disable,
     #[clap(name = "clear", about = "Deletes local metrics data")]
     Clear,
 }
@@ -750,7 +744,7 @@ pub enum QueryCmd {
         #[clap(
             short = 'n',
             long = "names",
-            help = "metric names",
+            help = "Filter by metric names. Coma-separated list.",
             use_delimiter = true
         )]
         names: Vec<String>,
@@ -764,24 +758,12 @@ pub enum QueryCmd {
         #[clap(
             short = 'b',
             long="backends",
-            help="list of backends, in the form 'cluster_id/backend_id, other_cluster/other_backend'",
-            use_delimiter = true,
-            parse(try_from_str = split_slash))]
-        backends: Vec<(String, String)>,
+            help="coma-separated list of backends, 'one_backend_id, other_backend_id'",
+            use_delimiter = true
+            // parse(try_from_str = split_slash)
+        )]
+        backends: Vec<String>,
     },
-}
-
-fn split_slash(input: &str) -> Result<(String, String), String> {
-    let mut it = input.split('/').map(|s| s.trim().to_string());
-
-    if let (Some(cluster), Some(backend)) = (it.next(), it.next()) {
-        Ok((cluster, backend))
-    } else {
-        Err(format!(
-            "could not split cluster id and backend id in '{}', they must have the form 'cluster_id/backend_id'",
-            input
-        ))
-    }
 }
 
 #[derive(Subcommand, PartialEq, Clone, Debug)]

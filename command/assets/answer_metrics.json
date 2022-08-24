@@ -38,7 +38,7 @@
           },
           "clusters": {
             "cluster_1": {
-              "data": {
+              "cluster": {
                 "request_time": {
                   "type": "PERCENTILES",
                   "data": {

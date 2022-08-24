@@ -25,11 +25,11 @@ use crate::{
         proxy::{
             HttpsListener, ListenerType, MessageId, ProxyEvent, ProxyRequest, ProxyRequestData,
             ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
-            QueryAnswerCertificate, QueryClusterType, QueryCertificateType, TlsProvider, Topic,
+            QueryAnswerCertificate, QueryCertificateType, QueryClusterType, TlsProvider, Topic,
         },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
-        state::{get_cluster_ids_by_domain, get_certificate, ConfigState},
+        state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
     },
     tcp,
     timer::Timer,
@@ -713,12 +713,12 @@ impl Server {
                 }
             }
 
-            //FIXME: what if we got no event in a while
             let now = time::OffsetDateTime::now_utc();
-            if now.second() == 0 {
-                // regularly clear local metrics to prevent them from taking too much memory
+            // clear the local metrics drain every plain hour (01:00, 02:00, etc.) to prevent memory overuse
+            // TODO: have one-hour-lasting metrics instead
+            if now.minute() == 00 && now.second() == 0 {
                 METRICS.with(|metrics| {
-                    (*metrics.borrow_mut()).clear_local(now);
+                    (*metrics.borrow_mut()).clear_local();
                 });
             }
 
@@ -831,9 +831,7 @@ impl Server {
                 Query::Clusters(query_type) => {
                     let query_answer = match query_type {
                         QueryClusterType::ClusterId(cluster_id) => {
-                            QueryAnswer::Clusters(vec![self
-                                .config_state
-                                .cluster_state(cluster_id)])
+                            QueryAnswer::Clusters(vec![self.config_state.cluster_state(cluster_id)])
                         }
                         QueryClusterType::Domain(domain) => {
                             let cluster_ids = get_cluster_ids_by_domain(

@@ -538,20 +538,8 @@ impl CommandManager {
         //println!("will send message for metrics with id {}", id);
 
         let configuration = match cmd {
-            MetricsCmd::Enable { time } => {
-                if time {
-                    MetricsConfiguration::EnabledTimeMetrics(true)
-                } else {
-                    MetricsConfiguration::Enabled(true)
-                }
-            }
-            MetricsCmd::Disable { time } => {
-                if time {
-                    MetricsConfiguration::EnabledTimeMetrics(false)
-                } else {
-                    MetricsConfiguration::Enabled(false)
-                }
-            }
+            MetricsCmd::Enable => MetricsConfiguration::Enabled(true),
+            MetricsCmd::Disable => MetricsConfiguration::Enabled(false),
             MetricsCmd::Clear => MetricsConfiguration::Clear,
         };
 
@@ -789,23 +777,20 @@ impl CommandManager {
         json: bool,
         list: bool,
         refresh: Option<u32>,
-        names: Vec<String>,
+        metric_names: Vec<String>,
         cluster_ids: Vec<String>,
-        backends: Vec<(String, String)>, // (cluster_id, backend_id)
-                                         // proxy: bool,
+        backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let query = match (list, cluster_ids.is_empty(), backends.is_empty()) {
+        let query = match (list, cluster_ids.is_empty(), backend_ids.is_empty()) {
             (true, _, _) => QueryMetricsType::List,
-            (false, true, true) => QueryMetricsType::All,
+            (false, true, true) => QueryMetricsType::All { metric_names },
             (false, false, _) => QueryMetricsType::Cluster {
-                metrics: names,
                 cluster_ids,
-                date: None,
+                metric_names,
             },
             (false, true, false) => QueryMetricsType::Backend {
-                metrics: names,
-                backends,
-                date: None,
+                backend_ids,
+                metric_names,
             },
         };
 

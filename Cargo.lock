@@ -1559,6 +1559,7 @@ dependencies = [
 name = "sozu-lib"
 version = "0.13.6"
 dependencies = [
+ "anyhow",
  "cookie-factory",
  "foreign-types-shared",
  "hdrhistogram",
