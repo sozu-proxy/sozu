@@ -46,7 +46,7 @@ impl Router {
             let mut prefix_length = 0;
             let mut res = None;
 
-            for (rule, method_rule, cluster_id) in path_rules.iter() {
+            for (rule, method_rule, cluster_id) in path_rules {
                 match rule.matches(path) {
                     PathRuleResult::Regex | PathRuleResult::Equals => {
                         match method_rule.matches(method) {

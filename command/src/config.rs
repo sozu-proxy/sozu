@@ -346,7 +346,9 @@ pub enum PathRuleType {
 pub struct FileClusterFrontendConfig {
     pub address: SocketAddr,
     pub hostname: Option<String>,
+    /// creates a path routing rule where the request URL path has to match this
     pub path: Option<String>,
+    /// declares wether the path rule is Prefix (default), Regex, or Equals
     pub path_type: Option<PathRuleType>,
     pub method: Option<String>,
     pub certificate: Option<String>,

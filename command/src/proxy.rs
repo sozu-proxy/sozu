@@ -327,12 +327,31 @@ impl Default for RulePosition {
     }
 }
 
+/// A filter for the path of incoming requests
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PathRule {
+    /// filters paths that start with a pattern, typically "/api"
     Prefix(String),
+    /// filters paths that match a regex pattern
     Regex(String),
+    /// filters paths that exactly match a pattern, no more, no less
     Equals(String),
+}
+
+impl PathRule {
+    pub fn from_cli_options(
+        path_prefix: Option<String>,
+        path_regex: Option<String>,
+        path_equals: Option<String>,
+    ) -> Self {
+        match (path_prefix, path_regex, path_equals) {
+            (Some(prefix), _, _) => PathRule::Prefix(prefix),
+            (None, Some(regex), _) => PathRule::Regex(regex),
+            (None, None, Some(equals)) => PathRule::Equals(equals),
+            _ => PathRule::default(),
+        }
+    }
 }
 
 impl Default for PathRule {
@@ -362,8 +381,9 @@ impl std::fmt::Display for PathRule {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Route {
-    // send a 401 default answer
+    /// send a 401 default answer
     Deny,
+    /// Routes to a cluster.
     // TODO: create a custom type `ClusterId`
     ClusterId(String),
 }
