@@ -19,7 +19,8 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
     // HTTP frontends
     if !frontends.http_frontends.is_empty() {
         let mut table = Table::new();
-        table.add_row(row!["HTTP frontends"]);
+        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+        table.add_row(row!["HTTP frontends "]);
         table.add_row(row![
             "route", "address", "hostname", "path", "method", "position", "tags"
         ]);
@@ -40,6 +41,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
     // HTTPS frontends
     if !frontends.https_frontends.is_empty() {
         let mut table = Table::new();
+        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         table.add_row(row!["HTTPS frontends"]);
         table.add_row(row![
             "route", "address", "hostname", "path", "method", "position", "tags"
@@ -61,7 +63,8 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
     // TCP frontends
     if !frontends.tcp_frontends.is_empty() {
         let mut table = Table::new();
-        table.add_row(row!["TCP frontends"]);
+        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+        table.add_row(row!["TCP frontends  "]);
         table.add_row(row!["Cluster ID", "address", "tags"]);
         for tcp_frontend in frontends.tcp_frontends.iter() {
             table.add_row(row!(
@@ -261,6 +264,7 @@ pub fn create_queried_cluster_table(
     data: &BTreeMap<String, QueryAnswer>,
 ) -> Table {
     let mut table = Table::new();
+    table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
     let mut row_header: Vec<_> = headers.iter().map(|h| cell!(h)).collect();
     for ref key in data.keys() {
         row_header.push(cell!(&key));
@@ -461,6 +465,7 @@ pub fn print_query_response_data(
     } else {
         if let Some(CommandResponseData::Query(data)) = &data {
             let mut table = Table::new();
+            table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
             let mut header = vec![cell!("key")];
             for key in data.keys() {
                 header.push(cell!(&key));

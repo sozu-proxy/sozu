@@ -258,6 +258,7 @@ impl CommandManager {
             CommandStatus::Ok => {
                 if let Some(CommandResponseData::Workers(ref workers)) = message.data {
                     let mut table = Table::new();
+                    table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
                     table.add_row(row!["Worker", "pid", "run state"]);
                     for ref worker in workers.iter() {
                         let run_state = format!("{:?}", worker.run_state);
@@ -364,6 +365,8 @@ impl CommandManager {
         Ok(())
     }
 
+    // queries a list of workers and then queries the status for each of them,
+    // this should rather be done on the CommandServer level
     pub fn status(&mut self, json: bool) -> Result<(), anyhow::Error> {
         let id = generate_id();
 
@@ -513,8 +516,9 @@ impl CommandManager {
                         print_json_response(&workers_status)?;
                     } else {
                         let mut table = Table::new();
-
+                        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
                         table.add_row(row!["Worker", "pid", "run state", "answer"]);
+
                         for ref worker in workers.iter() {
                             let run_state = format!("{:?}", worker.run_state);
                             table.add_row(row![
