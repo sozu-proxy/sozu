@@ -65,7 +65,7 @@ fn status_token(i: &[u8]) -> IResult<&[u8], &[u8]> {
     take_while(is_status_token_char)(i)
 }
 
-fn sp(i: &[u8]) -> IResult<&[u8], char> {
+fn space(i: &[u8]) -> IResult<&[u8], char> {
     char(' ')(i)
 }
 
@@ -160,6 +160,7 @@ pub struct RequestLine<'a> {
     pub version: Version,
 }
 
+/// A request line parsed from raw RequestLine
 #[derive(PartialEq, Debug, Clone)]
 pub struct RRequestLine {
     pub method: Method,
@@ -231,11 +232,14 @@ fn http_version(i: &[u8]) -> IResult<&[u8], Version> {
     ))
 }
 
+/// parse first line of HTTP request into raw RequestLine
+///
+/// example: `GET www.clever.cloud.com HTTP/1.1\r\n`
 fn request_line(i: &[u8]) -> IResult<&[u8], RequestLine> {
     let (i, method) = token(i)?;
-    let (i, _) = sp(i)?;
+    let (i, _) = space(i)?;
     let (i, uri) = vchar_1(i)?; // ToDo proper URI parsing?
-    let (i, _) = sp(i)?;
+    let (i, _) = space(i)?;
     let (i, version) = http_version(i)?;
     let (i, _) = crlf(i)?;
 
@@ -251,7 +255,7 @@ fn request_line(i: &[u8]) -> IResult<&[u8], RequestLine> {
 
 fn status_line(i: &[u8]) -> IResult<&[u8], StatusLine> {
     let (i, (version, _, status, _, reason, _)) =
-        tuple((http_version, sp, take(3usize), sp, status_token, crlf))(i)?;
+        tuple((http_version, space, take(3usize), space, status_token, crlf))(i)?;
 
     Ok((
         i,
@@ -289,6 +293,7 @@ fn message_header(i: &[u8]) -> IResult<&[u8], Header> {
     ))
 }
 
+/// parses an HTTP header (including the CRLF)
 #[cfg(not(feature = "tolerant-http1-parser"))]
 fn message_header(i: &[u8]) -> IResult<&[u8], Header> {
     // ToDo handle folding?
@@ -703,7 +708,7 @@ impl Header {
 
                     while !input.is_empty() {
                         match preceded(
-                            tuple((opt(complete(sp)), complete(char(',')), opt(sp))),
+                            tuple((opt(complete(space)), complete(char(',')), opt(space))),
                             single_header_value,
                         )(input)
                         {
@@ -778,7 +783,7 @@ impl Header {
                     } else {
                         while !input.is_empty() {
                             match preceded(
-                                tuple((opt(complete(sp)), complete(char(',')), opt(sp))),
+                                tuple((opt(complete(space)), complete(char(',')), opt(space))),
                                 single_header_value,
                             )(input)
                             {
@@ -998,6 +1003,7 @@ pub struct ForwardedHeaders {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Connection {
+    /// is it sufficient to set it to Some(false) to drop connection?
     pub keep_alive: Option<bool>,
     pub has_upgrade: bool,
     pub upgrade: Option<String>,

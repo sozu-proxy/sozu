@@ -933,7 +933,7 @@ impl Session {
     pub fn extract_route(&self) -> Result<(&str, &str, &Method), ConnectionError> {
         let h = self
             .http()
-            .and_then(|h| h.request.as_ref())
+            .and_then(|h| h.request_state.as_ref())
             .and_then(|r| r.get_host())
             .ok_or(ConnectionError::NoHostGiven)?;
 
@@ -975,7 +975,7 @@ impl Session {
 
         let rl: &RRequestLine = self
             .http()
-            .and_then(|h| h.request.as_ref())
+            .and_then(|h| h.request_state.as_ref())
             .and_then(|r| r.get_request_line())
             .ok_or(ConnectionError::NoRequestLineGiven)?;
 
@@ -1017,7 +1017,7 @@ impl Session {
     ) -> Result<TcpStream, ConnectionError> {
         let sticky_session = self
             .http()
-            .and_then(|http| http.request.as_ref())
+            .and_then(|http| http.request_state.as_ref())
             .and_then(|r| r.get_sticky_session());
 
         let res = match (front_should_stick, sticky_session) {
@@ -1258,7 +1258,7 @@ impl ProxySession for Session {
 
         if let Some(State::Http(ref mut http)) = self.protocol {
             //if the state was initial, the connection was already reset
-            if http.request != Some(RequestState::Initial) {
+            if http.request_state != Some(RequestState::Initial) {
                 gauge_add!("http.active_requests", -1);
                 if let Some(b) = http.backend_data.as_mut() {
                     let mut backend = b.borrow_mut();

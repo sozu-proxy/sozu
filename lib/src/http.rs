@@ -63,6 +63,9 @@ pub enum State {
     WebSocket(Pipe<TcpStream, Listener>),
 }
 
+/// HTTP Session to insert in the SessionManager
+///
+/// 1 session <=> 1 HTTP connection (client to sozu)
 pub struct Session {
     frontend_token: Token,
     backend: Option<Rc<RefCell<Backend>>>,
@@ -331,7 +334,7 @@ impl Session {
         }
     }
 
-    // Read content from the frontend
+    /// Read content from the frontend
     fn readable(&mut self) -> SessionResult {
         let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
             State::Expect(ref mut expect) => {
@@ -349,17 +352,19 @@ impl Session {
         };
 
         if upgrade == ProtocolResult::Continue {
-            result
-        } else if self.upgrade() {
-            match *unwrap_msg!(self.protocol.as_mut()) {
+            return result;
+        }
+
+        if self.upgrade() {
+            return match *unwrap_msg!(self.protocol.as_mut()) {
                 State::Http(ref mut http) => http.readable(&mut self.metrics),
                 _ => result,
-            }
-        } else {
-            // currently, only happens in expect proxy protocol with AF_UNSPEC address
-            //error!("failed protocol upgrade");
-            SessionResult::CloseSession
+            };
         }
+
+        // currently, only happens in expect proxy protocol with AF_UNSPEC address
+        //error!("failed protocol upgrade");
+        SessionResult::CloseSession
     }
 
     // Forward content to the frontend
@@ -660,7 +665,7 @@ impl Session {
 
         let token = self.frontend_token;
         while counter < max_loop_iterations {
-            let front_interest = self.front_readiness().interest & self.front_readiness().event;
+            let front_interest = self.front_readiness().filter_interest();
             let back_interest = self
                 .back_readiness()
                 .map(|r| r.interest & r.event)
@@ -674,7 +679,7 @@ impl Session {
                 self.back_readiness()
             );
 
-            if front_interest == Ready::empty() && back_interest == Ready::empty() {
+            if front_interest.is_empty() && back_interest.is_empty() {
                 break;
             }
 
@@ -888,7 +893,7 @@ impl Session {
     pub fn extract_route(&self) -> Result<(&str, &str, &Method), ConnectionError> {
         let h = self
             .http()
-            .and_then(|h| h.request.as_ref())
+            .and_then(|h| h.request_state.as_ref())
             .and_then(|s| s.get_host())
             .ok_or(ConnectionError::NoHostGiven)?;
 
@@ -918,7 +923,7 @@ impl Session {
 
         let rl = self
             .http()
-            .and_then(|h| h.request.as_ref())
+            .and_then(|h| h.request_state.as_ref())
             .and_then(|s| s.get_request_line())
             .ok_or(ConnectionError::NoRequestLineGiven)?;
 
@@ -980,7 +985,7 @@ impl Session {
     ) -> Result<TcpStream, ConnectionError> {
         let sticky_session = self
             .http()
-            .and_then(|http| http.request.as_ref())
+            .and_then(|http| http.request_state.as_ref())
             .and_then(|r| r.get_sticky_session());
 
         let res = match (front_should_stick, sticky_session) {
@@ -1207,7 +1212,7 @@ impl ProxySession for Session {
 
         if let Some(State::Http(ref mut http)) = self.protocol {
             //if the state was initial, the connection was already reset
-            if http.request != Some(RequestState::Initial) {
+            if http.request_state != Some(RequestState::Initial) {
                 gauge_add!("http.active_requests", -1);
 
                 if let Some(b) = http.backend_data.as_mut() {
@@ -1265,6 +1270,7 @@ impl ProxySession for Session {
         Protocol::HTTP
     }
 
+    /// this seems to update session readiness but it does not process events
     fn process_events(&mut self, token: Token, events: Ready) {
         trace!(
             "token {:?} got event {}",
@@ -1277,21 +1283,21 @@ impl ProxySession for Session {
         if self.frontend_token == token {
             self.front_readiness().event |= events;
         } else if self.back_token() == Some(token) {
-            if let Some(r) = self.back_readiness() {
-                r.event |= events;
+            if let Some(readiness) = self.back_readiness() {
+                readiness.event |= events;
             }
         }
     }
 
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) {
         self.metrics().service_start();
-        let res = self.ready_inner(session);
 
-        if res == SessionResult::CloseSession {
-            self.close();
-        } else if let SessionResult::CloseBackend = res {
-            self.close_backend();
+        match self.ready_inner(session) {
+            SessionResult::CloseSession => self.close(),
+            SessionResult::CloseBackend => self.close_backend(),
+            _ => (),
         }
+
         self.metrics().service_stop();
     }
 
@@ -1753,12 +1759,12 @@ impl ProxyConfiguration<Session> for Proxy {
                     frontend_sock, e
                 );
             }
-            let mut s = self.sessions.borrow_mut();
-            let entry = s.slab.vacant_entry();
-            let session_token = Token(entry.key());
+            let mut session_manager = self.sessions.borrow_mut();
+            let session_entry = session_manager.slab.vacant_entry();
+            let session_token = Token(session_entry.key());
             let owned = listener.borrow();
 
-            if let Some(mut c) = Session::new(
+            if let Some(mut session) = Session::new(
                 frontend_sock,
                 session_token,
                 Rc::downgrade(&self.pool),
@@ -1775,21 +1781,21 @@ impl ProxyConfiguration<Session> for Proxy {
                 listener.clone(),
             ) {
                 if let Err(e) = self.registry.register(
-                    c.front_socket_mut(),
+                    session.front_socket_mut(),
                     session_token,
                     Interest::READABLE | Interest::WRITABLE,
                 ) {
                     error!(
                         "error registering listen socket({:?}): {:?}",
-                        c.front_socket(),
+                        session.front_socket(),
                         e
                     );
                 }
 
-                let session = Rc::new(RefCell::new(c));
-                entry.insert(session);
+                let session = Rc::new(RefCell::new(session));
+                session_entry.insert(session);
 
-                s.incr();
+                session_manager.incr();
                 Ok(())
             } else {
                 error!("max number of session connection reached, flushing the accept queue");

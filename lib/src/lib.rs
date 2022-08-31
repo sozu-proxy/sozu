@@ -222,6 +222,7 @@ use self::retry::RetryPolicy;
 
 pub type ClusterId = String;
 
+/// Anything that can be registered in mio (subscibe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Protocol {
     HTTP,
@@ -558,7 +559,9 @@ impl std::ops::Drop for Backend {
 
 #[derive(Clone)]
 pub struct Readiness {
+    /// the current readiness
     pub event: Ready,
+    /// the readiness we wish to attain
     pub interest: Ready,
 }
 
@@ -579,6 +582,11 @@ impl Readiness {
     pub fn reset(&mut self) {
         self.event = Ready::empty();
         self.interest = Ready::empty();
+    }
+
+    /// filters the readiness we actually want
+    pub fn filter_interest(&self) -> Ready {
+        self.event & self.interest
     }
 }
 

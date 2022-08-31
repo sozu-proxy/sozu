@@ -87,6 +87,9 @@ pub enum TimeoutStatus {
     WaitingForResponse,
 }
 
+/// Http will be contained in State wish itself is contained by Session
+///
+/// TODO: rename me (example: HttpState)
 pub struct Http<Front: SocketHandler, L: ListenerHandler> {
     pub frontend: Front,
     pub backend: Option<TcpStream>,
@@ -106,7 +109,7 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler> {
     pub sticky_name: String,
     pub sticky_session: Option<StickySession>,
     pub protocol: Protocol,
-    pub request: Option<RequestState>,
+    pub request_state: Option<RequestState>,
     pub response: Option<ResponseState>,
     pub req_header_end: Option<usize>,
     pub res_header_end: Option<usize>,
@@ -139,6 +142,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         backend_timeout_duration: Duration,
         listener: Rc<RefCell<L>>,
     ) -> Http<Front, L> {
+        // the variable name is misleading
         let mut session = Http {
             frontend: sock,
             backend: None,
@@ -158,7 +162,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             sticky_name,
             sticky_session: None,
             protocol,
-            request: Some(RequestState::Initial),
+            request_state: Some(RequestState::Initial),
             response: Some(ResponseState::Initial),
             req_header_end: None,
             res_header_end: None,
@@ -185,7 +189,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         //info!("{} RESET TO {}", self.log_ctx, request_id);
         gauge_add!("http.active_requests", -1);
 
-        self.request = Some(RequestState::Initial);
+        self.request_state = Some(RequestState::Initial);
         self.response = Some(ResponseState::Initial);
         self.req_header_end = None;
         self.res_header_end = None;
@@ -236,7 +240,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
     pub fn print_state(&self, prefix: &str) -> String {
         format!("{}: request: {:?}, request header end: {:?}, response: {:?}, response header end: {:?}",
-      prefix, self.request, self.req_header_end, self.response, self.res_header_end)
+      prefix, self.request_state, self.req_header_end, self.response, self.res_header_end)
     }
 
     pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>) {
@@ -390,7 +394,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
     fn must_continue_request(&self) -> bool {
         matches!(
-            self.request
+            self.request_state
                 .as_ref()
                 .and_then(|r| r.get_keep_alive().as_ref().map(|conn| conn.continues)),
             Some(Continue::Expects(_))
@@ -399,7 +403,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
     fn must_continue_response(&self) -> Option<usize> {
         if let Some(Continue::Expects(sz)) = self
-            .request
+            .request_state
             .as_ref()
             .and_then(|r| r.get_keep_alive().map(|conn| conn.continues))
         {
@@ -416,7 +420,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
     }
 
     pub fn timeout_status(&self) -> TimeoutStatus {
-        match self.request.as_ref() {
+        match self.request_state.as_ref() {
             Some(RequestState::Request(_, _, _))
             | Some(RequestState::RequestWithBody(_, _, _, _))
             | Some(RequestState::RequestWithBodyChunks(_, _, _, _)) => {
@@ -496,7 +500,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             SessionResult::Continue
         } else {
             if self
-                .request
+                .request_state
                 .as_ref()
                 .map(|r| r.is_proxying())
                 .unwrap_or(false)
@@ -512,7 +516,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
     pub fn shutting_down(&mut self) -> SessionResult {
         if self
-            .request
+            .request_state
             .as_ref()
             .map(|r| *r == RequestState::Initial)
             .unwrap_or(false)
@@ -532,11 +536,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
     }
 
     pub fn get_host(&self) -> Option<&str> {
-        self.request.as_ref().and_then(|r| r.get_host())
+        self.request_state.as_ref().and_then(|r| r.get_host())
     }
 
     pub fn get_request_line(&self) -> Option<&RRequestLine> {
-        self.request.as_ref().and_then(|r| r.get_request_line())
+        self.request_state
+            .as_ref()
+            .and_then(|r| r.get_request_line())
     }
 
     pub fn get_session_address(&self) -> Option<SocketAddr> {
@@ -807,7 +813,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         );
     }
 
-    // Read content from the session
+    /// Read content from the session
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         if !self.front_timeout.reset() {
             //error!("could not reset front timeout");
@@ -820,15 +826,16 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             return SessionResult::Continue;
         }
 
-        assert!(!unwrap_msg!(self.request.as_ref()).is_front_error());
+        assert!(!unwrap_msg!(self.request_state.as_ref()).is_front_error());
 
         if self.front_buf.is_none() {
-            if let Some(p) = self.pool.upgrade() {
-                if let Some(buf) = p.borrow_mut().checkout() {
-                    self.front_buf = Some(BufferQueue::with_buffer(buf));
-                } else {
-                    error!("cannot get front buffer from pool, closing");
-                    return SessionResult::CloseSession;
+            if let Some(pool) = self.pool.upgrade() {
+                match pool.borrow_mut().checkout() {
+                    Some(buf) => self.front_buf = Some(BufferQueue::with_buffer(buf)),
+                    None => {
+                        error!("cannot get front buffer from pool, closing");
+                        return SessionResult::CloseSession;
+                    }
                 }
             }
         }
@@ -845,18 +852,19 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             return SessionResult::Continue;
         }
 
-        let (sz, res) = self
+        let (size, socket_state) = self
             .frontend
             .socket_read(self.front_buf.as_mut().unwrap().buffer.space());
-        debug!("{}\tFRONT: read {} bytes", self.log_context(), sz);
+        debug!("{}\tFRONT: read {} bytes", self.log_context(), size);
 
-        if sz > 0 {
-            count!("bytes_in", sz as i64);
-            metrics.bin += sz;
+        if size > 0 {
+            count!("bytes_in", size as i64);
+            metrics.bin += size;
 
             if let Some(front_buf) = self.front_buf.as_mut() {
-                front_buf.buffer.fill(sz);
-                front_buf.sliced_input(sz);
+                // synchronize end cursor
+                front_buf.buffer.fill(size);
+                front_buf.sliced_input(size);
                 if front_buf.start_parsing_position > front_buf.parsed_position {
                     let to_consume = min(
                         front_buf.input_data_size(),
@@ -873,10 +881,10 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             self.front_readiness.event.remove(Ready::readable());
         }
 
-        match res {
+        match socket_state {
             SocketResult::Error => {
                 //we were in keep alive but the peer closed the connection
-                if self.request == Some(RequestState::Initial) {
+                if self.request_state == Some(RequestState::Initial) {
                     // count an error if we were waiting for the first request
                     // otherwise, if we already had one completed request and response,
                     // and are waiting for the next one, we do not count a socket
@@ -892,15 +900,19 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                     self.frontend.read_error();
                     let front_readiness = self.front_readiness.clone();
                     let back_readiness = self.back_readiness.clone();
-                    self.log_request_error(metrics,
-            &format!("front socket error, closing the session. Readiness: {:?} -> {:?}, read {} bytes",
-              front_readiness, back_readiness, sz));
+                    self.log_request_error(
+                        metrics,
+                        &format!(
+                            "front socket error, closing the session. Readiness: {:?} -> {:?}, read {} bytes",
+                            front_readiness, back_readiness, size
+                        )
+                    );
                 }
                 return SessionResult::CloseSession;
             }
             SocketResult::Closed => {
                 //we were in keep alive but the peer closed the connection
-                if self.request == Some(RequestState::Initial) {
+                if self.request_state == Some(RequestState::Initial) {
                     // count an error if we were waiting for the first request
                     // otherwise, if we already had one completed request and response,
                     // and are waiting for the next one, we do not count a socket
@@ -916,9 +928,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                     self.frontend.read_error();
                     let front_readiness = self.front_readiness.clone();
                     let back_readiness = self.back_readiness.clone();
-                    self.log_request_error(metrics,
-            &format!("front socket was closed, closing the session. Readiness: {:?} -> {:?}, read {} bytes",
-              front_readiness, back_readiness, sz));
+                    self.log_request_error(
+                        metrics,
+                        &format!(
+                            "front socket was closed, closing the session. Readiness: {:?} -> {:?}, read {} bytes",
+                            front_readiness, back_readiness, size
+                        )
+                    );
                 }
                 return SessionResult::CloseSession;
             }
@@ -932,12 +948,18 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
     }
 
     pub fn readable_parse(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        let is_initial = self.request == Some(RequestState::Initial);
+        let is_initial = self.request_state == Some(RequestState::Initial);
         // if there's no host, continue parsing until we find it
-        let has_host = self.request.as_ref().map(|r| r.has_host()).unwrap_or(false);
+        let has_host = self
+            .request_state
+            .as_ref()
+            .map(|r| r.has_host())
+            .unwrap_or(false);
         if !has_host {
-            let (request_state, header_end) =
-                (self.request.take().unwrap(), self.req_header_end.take());
+            let (request_state, header_end) = (
+                self.request_state.take().unwrap(),
+                self.req_header_end.take(),
+            );
             let (request_state, header_end) = parse_request_until_stop(
                 request_state,
                 header_end,
@@ -946,10 +968,10 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                 &self.sticky_name,
             );
 
-            self.request = Some(request_state);
+            self.request_state = Some(request_state);
             self.req_header_end = header_end;
 
-            if unwrap_msg!(self.request.as_ref()).is_front_error() {
+            if unwrap_msg!(self.request_state.as_ref()).is_front_error() {
                 incr!("http.front_parse_errors");
 
                 self.set_answer(DefaultAnswerStatus::Answer400, None);
@@ -958,13 +980,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                 return SessionResult::Continue;
             }
 
-            let is_now_initial = self.request == Some(RequestState::Initial);
-            if is_initial && !is_now_initial {
+            let is_still_initial = self.request_state == Some(RequestState::Initial);
+            if is_initial && !is_still_initial {
                 gauge_add!("http.active_requests", 1);
                 incr!("http.requests");
             }
 
-            if unwrap_msg!(self.request.as_ref()).has_host() {
+            if unwrap_msg!(self.request_state.as_ref()).has_host() {
                 self.back_readiness.interest.insert(Ready::writable());
                 return SessionResult::ConnectBackend;
             } else {
@@ -974,7 +996,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         }
 
         self.back_readiness.interest.insert(Ready::writable());
-        match self.request {
+        match self.request_state {
             Some(RequestState::Request(_, _, _))
             | Some(RequestState::RequestWithBody(_, _, _, _)) => {
                 if !self.front_buf.as_ref().unwrap().needs_input() {
@@ -1010,8 +1032,10 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                     .set_duration(self.frontend_timeout_duration);
 
                 if !self.front_buf.as_ref().unwrap().needs_input() {
-                    let (request_state, header_end) =
-                        (self.request.take().unwrap(), self.req_header_end.take());
+                    let (request_state, header_end) = (
+                        self.request_state.take().unwrap(),
+                        self.req_header_end.take(),
+                    );
                     let (request_state, header_end) = parse_request_until_stop(
                         request_state,
                         header_end,
@@ -1020,10 +1044,10 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                         &self.sticky_name,
                     );
 
-                    self.request = Some(request_state);
+                    self.request_state = Some(request_state);
                     self.req_header_end = header_end;
 
-                    if unwrap_msg!(self.request.as_ref()).is_front_error() {
+                    if unwrap_msg!(self.request_state.as_ref()).is_front_error() {
                         self.log_request_error(
                             metrics,
                             "front chunk parsing error, closing the connection",
@@ -1032,7 +1056,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                     }
 
                     if let Some(RequestState::RequestWithBodyChunks(_, _, _, Chunk::Ended)) =
-                        self.request
+                        self.request_state
                     {
                         self.front_readiness.interest.remove(Ready::readable());
                     }
@@ -1041,8 +1065,10 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                 SessionResult::Continue
             }
             _ => {
-                let (request_state, header_end) =
-                    (self.request.take().unwrap(), self.req_header_end.take());
+                let (request_state, header_end) = (
+                    self.request_state.take().unwrap(),
+                    self.req_header_end.take(),
+                );
                 let (request_state, header_end) = parse_request_until_stop(
                     request_state,
                     header_end,
@@ -1051,15 +1077,15 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                     &self.sticky_name,
                 );
 
-                self.request = Some(request_state);
+                self.request_state = Some(request_state);
                 self.req_header_end = header_end;
 
-                if unwrap_msg!(self.request.as_ref()).is_front_error() {
+                if unwrap_msg!(self.request_state.as_ref()).is_front_error() {
                     self.set_answer(DefaultAnswerStatus::Answer400, None);
                     return SessionResult::Continue;
                 }
 
-                if let Some(RequestState::Request(_, _, _)) = self.request {
+                if let Some(RequestState::Request(_, _, _)) = self.request_state {
                     self.front_readiness.interest.remove(Ready::readable());
                 }
                 self.back_readiness.interest.insert(Ready::writable());
@@ -1233,7 +1259,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
             self.response = Some(ResponseState::Initial);
             self.res_header_end = None;
-            self.request.as_mut().map(|r| {
+            self.request_state.as_mut().map(|r| {
                 r.get_mut_connection()
                     .map(|conn| conn.continues = Continue::None)
             });
@@ -1247,7 +1273,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             | Some(ResponseState::ResponseWithBody(_, _, _))
             | Some(ResponseState::ResponseWithBodyChunks(_, _, Chunk::Ended)) => {
                 let front_keep_alive = self
-                    .request
+                    .request_state
                     .as_ref()
                     .map(|r| r.should_keep_alive())
                     .unwrap_or(false);
@@ -1435,7 +1461,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
         // FIXME/ should read exactly as much data as needed
         if self.front_buf.as_ref().unwrap().can_restart_parsing() {
-            match self.request {
+            match self.request_state {
                 // the entire request was transmitted
                 Some(RequestState::Request(_, _, _))
                 | Some(RequestState::RequestWithBody(_, _, _, _))
@@ -1608,7 +1634,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                     (ProtocolResult::Continue, SessionResult::Continue)
                 } else {
                     error!("{}\tback read should have stopped on chunk ended\nreq: {:?} res:{:?}\ndata:{}",
-            self.log_context(), self.request, self.response,
+            self.log_context(), self.request_state, self.response,
             self.back_buf.as_ref().unwrap().unparsed_data().to_hex(16));
                     self.log_request_error(metrics, "back read should have stopped on chunk ended");
                     (ProtocolResult::Continue, SessionResult::CloseSession)
@@ -1623,7 +1649,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                     let (response_state, header_end, is_head) = (
                         self.response.take().unwrap(),
                         self.res_header_end.take(),
-                        self.request
+                        self.request_state
                             .as_ref()
                             .map(|request| request.is_head())
                             .unwrap_or(false),
@@ -1721,7 +1747,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                 let (response_state, header_end, is_head) = (
                     self.response.take().unwrap(),
                     self.res_header_end.take(),
-                    self.request
+                    self.request_state
                         .as_ref()
                         .map(|request| request.is_head())
                         .unwrap_or(false),
@@ -1786,7 +1812,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
     // If the connection doesn't have a sticky session header or if it's different
     // from the one we want to set, then it should be set.
     fn should_add_sticky_header(&self, session: &StickySession) -> bool {
-        self.request
+        self.request_state
             .as_ref()
             .and_then(|request| request.get_keep_alive())
             .and_then(|conn| conn.sticky_session.as_ref())
