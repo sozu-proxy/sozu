@@ -26,7 +26,7 @@ use crate::{
 
 use self::parser::{
     compare_no_case, parse_request_until_stop, parse_response_until_stop, Chunk, Continue, Method,
-    RRequestLine, RStatusLine, RequestState, ResponseState,
+    RequestLine, StatusLine, RequestState, ResponseState,
 };
 
 #[derive(Clone)]
@@ -531,7 +531,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
     }
 
     /// Retrieve the response status from the http response state
-    pub fn get_response_status(&self) -> Option<&RStatusLine> {
+    pub fn get_response_status(&self) -> Option<&StatusLine> {
         self.response.as_ref().and_then(|r| r.get_status_line())
     }
 
@@ -539,7 +539,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         self.request_state.as_ref().and_then(|r| r.get_host())
     }
 
-    pub fn get_request_line(&self) -> Option<&RRequestLine> {
+    pub fn get_request_line(&self) -> Option<&RequestLine> {
         self.request_state
             .as_ref()
             .and_then(|r| r.get_request_line())
@@ -1877,7 +1877,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 }
 
 /// Save the backend http response status code metric
-fn save_http_status_metric(rs_status_line: Option<&RStatusLine>) {
+fn save_http_status_metric(rs_status_line: Option<&StatusLine>) {
     if let Some(rs_status_line) = rs_status_line {
         match rs_status_line.status {
             100..=199 => {

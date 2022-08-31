@@ -6,7 +6,7 @@ use crate::{buffer_queue::BufferQueue, protocol::http::StickySession};
 
 use super::{
     crlf, message_header, status_line, BufferMove, Chunk, Connection, Header, HeaderValue,
-    LengthInformation, RStatusLine, TransferEncodingValue, Version,
+    LengthInformation, StatusLine, TransferEncodingValue, Version,
 };
 
 pub type UpgradeProtocol = String;
@@ -15,21 +15,21 @@ pub type UpgradeProtocol = String;
 pub enum ResponseState {
     Initial,
     Error(
-        Option<RStatusLine>,
+        Option<StatusLine>,
         Option<Connection>,
         Option<UpgradeProtocol>,
         Option<LengthInformation>,
         Option<Chunk>,
     ),
-    HasStatusLine(RStatusLine, Connection),
-    HasUpgrade(RStatusLine, Connection, UpgradeProtocol),
-    HasLength(RStatusLine, Connection, LengthInformation),
-    Response(RStatusLine, Connection),
-    ResponseUpgrade(RStatusLine, Connection, UpgradeProtocol),
-    ResponseWithBody(RStatusLine, Connection, usize),
-    ResponseWithBodyChunks(RStatusLine, Connection, Chunk),
+    HasStatusLine(StatusLine, Connection),
+    HasUpgrade(StatusLine, Connection, UpgradeProtocol),
+    HasLength(StatusLine, Connection, LengthInformation),
+    Response(StatusLine, Connection),
+    ResponseUpgrade(StatusLine, Connection, UpgradeProtocol),
+    ResponseWithBody(StatusLine, Connection, usize),
+    ResponseWithBodyChunks(StatusLine, Connection, Chunk),
     // the boolean indicates if the backend connection is closed
-    ResponseWithBodyCloseDelimited(RStatusLine, Connection, bool),
+    ResponseWithBodyCloseDelimited(StatusLine, Connection, bool),
 }
 
 impl ResponseState {
@@ -82,7 +82,7 @@ impl ResponseState {
         matches!(self, ResponseState::Error(_, _, _, _, _))
     }
 
-    pub fn get_status_line(&self) -> Option<&RStatusLine> {
+    pub fn get_status_line(&self) -> Option<&StatusLine> {
         match *self {
             ResponseState::HasStatusLine(ref sl, _)
             | ResponseState::HasLength(ref sl, _, _)
@@ -267,8 +267,8 @@ pub fn parse_response(
     match state {
         ResponseState::Initial => {
             match status_line(buf) {
-                Ok((input, status_line)) => {
-                    if let Some(r_status_line) = RStatusLine::from_status_line(status_line) {
+                Ok((input, raw_status_line)) => {
+                    if let Some(status_line) = StatusLine::from_raw_status_line(raw_status_line) {
                         let conn = Connection::new();
                         /*let conn = if rl.version == "11" {
                           Connection::keep_alive()
@@ -278,7 +278,7 @@ pub fn parse_response(
                         */
                         (
                             BufferMove::Advance(buf.offset(input)),
-                            ResponseState::HasStatusLine(r_status_line, conn),
+                            ResponseState::HasStatusLine(status_line, conn),
                         )
                     } else {
                         (

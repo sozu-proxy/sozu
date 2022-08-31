@@ -19,7 +19,7 @@ use crate::{
     protocol::{
         http::{
             answers::HttpAnswers,
-            parser::{hostname_and_port, Method, RRequestLine, RequestState},
+            parser::{hostname_and_port, Method, RequestLine, RequestState},
             DefaultAnswerStatus,
         },
         proxy_protocol::expect::ExpectProxyProtocol,
@@ -973,7 +973,7 @@ impl Session {
             return Err(ConnectionError::InvalidHost);
         };
 
-        let rl: &RRequestLine = self
+        let rl: &RequestLine = self
             .http()
             .and_then(|h| h.request_state.as_ref())
             .and_then(|r| r.get_request_line())

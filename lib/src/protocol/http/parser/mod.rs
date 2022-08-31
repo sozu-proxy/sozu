@@ -154,24 +154,24 @@ pub enum Version {
 }
 
 #[derive(PartialEq, Debug)]
-pub struct RequestLine<'a> {
+pub struct RawRequestLine<'a> {
     pub method: &'a [u8],
     pub uri: &'a [u8],
     pub version: Version,
 }
 
-/// A request line parsed from raw RequestLine
+/// A request line parsed from RawRequestLine
 #[derive(PartialEq, Debug, Clone)]
-pub struct RRequestLine {
+pub struct RequestLine {
     pub method: Method,
     pub uri: String,
     pub version: Version,
 }
 
-impl RRequestLine {
-    pub fn from_request_line(r: RequestLine) -> Option<RRequestLine> {
+impl RequestLine {
+    pub fn from_raw_request_line(r: RawRequestLine) -> Option<RequestLine> {
         if let Ok(uri) = str::from_utf8(r.uri) {
-            Some(RRequestLine {
+            Some(RequestLine {
                 method: Method::new(r.method),
                 uri: String::from(uri),
                 version: r.version,
@@ -183,25 +183,26 @@ impl RRequestLine {
 }
 
 #[derive(PartialEq, Debug)]
-pub struct StatusLine<'a> {
+pub struct RawStatusLine<'a> {
     pub version: Version,
     pub status: &'a [u8],
     pub reason: &'a [u8],
 }
 
+/// A status line parsed from RawStatusLine
 #[derive(PartialEq, Debug, Clone)]
-pub struct RStatusLine {
+pub struct StatusLine {
     pub version: Version,
     pub status: u16,
     pub reason: String,
 }
 
-impl RStatusLine {
-    pub fn from_status_line(r: StatusLine) -> Option<RStatusLine> {
+impl StatusLine {
+    pub fn from_raw_status_line(r: RawStatusLine) -> Option<StatusLine> {
         if let Ok(status_str) = str::from_utf8(r.status) {
             if let Ok(status) = status_str.parse::<u16>() {
                 if let Ok(reason) = str::from_utf8(r.reason) {
-                    Some(RStatusLine {
+                    Some(StatusLine {
                         version: r.version,
                         status,
                         reason: String::from(reason),
@@ -235,7 +236,7 @@ fn http_version(i: &[u8]) -> IResult<&[u8], Version> {
 /// parse first line of HTTP request into raw RequestLine
 ///
 /// example: `GET www.clever.cloud.com HTTP/1.1\r\n`
-fn request_line(i: &[u8]) -> IResult<&[u8], RequestLine> {
+fn request_line(i: &[u8]) -> IResult<&[u8], RawRequestLine> {
     let (i, method) = token(i)?;
     let (i, _) = space(i)?;
     let (i, uri) = vchar_1(i)?; // ToDo proper URI parsing?
@@ -245,7 +246,7 @@ fn request_line(i: &[u8]) -> IResult<&[u8], RequestLine> {
 
     Ok((
         i,
-        RequestLine {
+        RawRequestLine {
             method,
             uri,
             version,
@@ -253,13 +254,13 @@ fn request_line(i: &[u8]) -> IResult<&[u8], RequestLine> {
     ))
 }
 
-fn status_line(i: &[u8]) -> IResult<&[u8], StatusLine> {
+fn status_line(i: &[u8]) -> IResult<&[u8], RawStatusLine> {
     let (i, (version, _, status, _, reason, _)) =
         tuple((http_version, space, take(3usize), space, status_token, crlf))(i)?;
 
     Ok((
         i,
-        StatusLine {
+        RawStatusLine {
             version,
             status,
             reason,

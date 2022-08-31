@@ -10,26 +10,26 @@ use crate::{
 
 use super::{
     crlf, message_header, request_line, BufferMove, Chunk, Connection, Continue, Header,
-    HeaderValue, Host, LengthInformation, Method, RRequestLine, TransferEncodingValue, Version,
+    HeaderValue, Host, LengthInformation, Method, RequestLine, TransferEncodingValue, Version,
 };
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestState {
     Initial,
     Error(
-        Option<RRequestLine>,
+        Option<RequestLine>,
         Option<Connection>,
         Option<Host>,
         Option<LengthInformation>,
         Option<Chunk>,
     ),
-    HasRequestLine(RRequestLine, Connection),
-    HasHost(RRequestLine, Connection, Host),
-    HasLength(RRequestLine, Connection, LengthInformation),
-    HasHostAndLength(RRequestLine, Connection, Host, LengthInformation),
-    Request(RRequestLine, Connection, Host),
-    RequestWithBody(RRequestLine, Connection, Host, usize),
-    RequestWithBodyChunks(RRequestLine, Connection, Host, Chunk),
+    HasRequestLine(RequestLine, Connection),
+    HasHost(RequestLine, Connection, Host),
+    HasLength(RequestLine, Connection, LengthInformation),
+    HasHostAndLength(RequestLine, Connection, Host, LengthInformation),
+    Request(RequestLine, Connection, Host),
+    RequestWithBody(RequestLine, Connection, Host, usize),
+    RequestWithBodyChunks(RequestLine, Connection, Host, Chunk),
 }
 
 impl RequestState {
@@ -126,7 +126,7 @@ impl RequestState {
         }
     }
 
-    pub fn get_request_line(&self) -> Option<&RRequestLine> {
+    pub fn get_request_line(&self) -> Option<&RequestLine> {
         match *self {
             RequestState::HasRequestLine(ref rl, _)
             | RequestState::HasHost(ref rl, _, _)
@@ -359,7 +359,7 @@ pub fn parse_request(
                 res => return default_request_result(state, res),
             };
 
-            let request_line = match RRequestLine::from_request_line(raw_request_line) {
+            let request_line = match RequestLine::from_raw_request_line(raw_request_line) {
                 Some(request_line) => request_line,
                 None => return (BufferMove::None, (RequestState::Initial).into_error()),
             };
