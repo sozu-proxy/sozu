@@ -4,7 +4,7 @@ use std::{
     io::{Read, Write},
     os::unix::io::{FromRawFd, IntoRawFd},
     os::unix::net::UnixStream,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context};
@@ -883,59 +883,66 @@ impl CommandServer {
         &mut self,
         request_identifier: RequestIdentifier,
     ) -> anyhow::Result<Option<Success>> {
+        info!("I tried so hard and got so far");
+
         let (status_tx, mut status_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
-        let mut count = 0usize;
 
         // create a status list with the available info of the main process
         let mut worker_info_map: BTreeMap<String, WorkerInfo> = BTreeMap::new();
 
+        let prefix = format!("{}-status-", request_identifier.client);
+
+        let mut count = 0usize;
         for ref mut worker in self.workers.iter_mut() {
-            // create request ids even if we don't send request, as keys in the tree map
-            let req_id = format!("{}-status-{}", request_identifier.client, worker.id);
+            // create request ids even if we don't send any request, as keys in the tree map
+            let worker_request_id = format!("{}{}", prefix, worker.id);
             // send a status request to supposedly running workers to update the list afterwards
-            if worker.run_state != RunState::Stopped {
-                worker.send(req_id.clone(), ProxyRequestData::Status).await;
+            if worker.run_state == RunState::Running {
+                info!("Summoning status of worker {}", worker.id);
+                worker
+                    .send(worker_request_id.clone(), ProxyRequestData::Status)
+                    .await;
                 count += 1;
-                self.in_flight.insert(req_id.clone(), (status_tx.clone(), 1));
+                self.in_flight
+                    .insert(worker_request_id.clone(), (status_tx.clone(), 1));
             }
-            worker_info_map.insert(req_id, worker.info());
+            worker_info_map.insert(worker_request_id, worker.info());
         }
 
-        let prefix = format!("{}-status-", request_identifier.client);
         let command_tx = self.command_tx.clone();
         let thread_request_identifier = request_identifier.clone();
 
+        let now = Instant::now();
+
         smol::spawn(async move {
             let mut i = 0;
-            let mut worker_info_vec: Vec<WorkerInfo> = Vec::new();
+
             while let Some(proxy_response) = status_rx.next().await {
-                match proxy_response.status {
-                    ProxyResponseStatus::Ok => {
-                        if let Some(worker_info) = worker_info_map.get(&proxy_response.id) {
-                            worker_info_vec.push(worker_info.to_owned())
-                        }
-                    }
-                    ProxyResponseStatus::Processing => {
-                        //info!("metrics processing");
-                        continue;
-                    }
-                    ProxyResponseStatus::Error(_) => {
-                        if let Some(worker_info) = worker_info_map.get_mut(&proxy_response.id) {
-                            worker_info.run_state = RunState::NotAnswering;
-                            worker_info_vec.push(worker_info.to_owned());
-                        }
-                    }
+                info!("received worker response: {:?}", proxy_response);
+                let new_run_state = match proxy_response.status {
+                    ProxyResponseStatus::Ok => RunState::Running,
+                    ProxyResponseStatus::Processing => continue,
+                    ProxyResponseStatus::Error(_) => RunState::NotAnswering,
                 };
+                worker_info_map
+                    .entry(proxy_response.id)
+                    .and_modify(|worker_info| worker_info.run_state = new_run_state);
 
                 i += 1;
-                if i == count {
+                if i == count || now.elapsed() > Duration::from_secs(10) {
                     break;
                 }
             }
+            
+            let worker_info_vec: Vec<WorkerInfo> = worker_info_map
+                .iter()
+                .map(|(_, worker_info)| worker_info.to_owned())
+                .collect();
+
             return_success(
                 command_tx,
                 thread_request_identifier,
-                Success::Status(worker_info_vec),
+                Success::Status(CommandResponseData::Status(worker_info_vec)),
             )
             .await;
         })
@@ -1393,7 +1400,8 @@ impl CommandServer {
                     Success::DumpState(crd)
                     | Success::ListFrontends(crd)
                     | Success::ListWorkers(crd)
-                    | Success::Query(crd) => Some(crd),
+                    | Success::Query(crd)
+                    | Success::Status(crd) => Some(crd),
                     _ => None,
                 };
 

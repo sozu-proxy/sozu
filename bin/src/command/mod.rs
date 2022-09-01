@@ -130,7 +130,7 @@ pub enum Success {
     Query(CommandResponseData),
     ReloadConfiguration(usize, usize), // ok, errors
     SaveState(usize, String),          // amount of written commands, path of the saved state
-    Status(Vec<WorkerInfo>),
+    Status(CommandResponseData),       // Vec<WorkerInfo>
     SubscribeEvent(String),
     UpgradeMain(i32),         // pid of the new main process
     UpgradeWorker(u32),       // worker id

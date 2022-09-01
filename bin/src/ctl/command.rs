@@ -28,7 +28,7 @@ use crate::{
         create_channel,
         display::{
             print_available_metrics, print_certificates, print_frontend_list, print_json_response,
-            print_metrics, print_query_response_data,
+            print_metrics, print_query_response_data, print_status,
         },
         CommandManager,
     },
@@ -369,7 +369,7 @@ impl CommandManager {
 
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::ListWorkers,
+            CommandRequestData::Status,
             None,
         ));
 
@@ -392,7 +392,15 @@ impl CommandManager {
                 }
                 bail!("could not get the worker list: {}", message.message);
             }
-            CommandStatus::Ok => {}
+            CommandStatus::Ok => match message.data {
+                Some(CommandResponseData::Status(worker_info_vec)) => {
+                    print_status(worker_info_vec);
+                }
+                Some(_) => {
+                    bail!("Received the wrong kind of response data from the command server")
+                }
+                None => bail!("No data in the response"),
+            },
         }
         Ok(())
     }
