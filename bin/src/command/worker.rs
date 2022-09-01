@@ -6,7 +6,7 @@ use nix::{sys::signal::kill, unistd::Pid};
 
 use sozu_command_lib::{
     channel::Channel,
-    command::RunState,
+    command::{RunState, WorkerInfo},
     config::Config,
     proxy::{ProxyRequest, ProxyRequestData, ProxyResponse},
     scm_socket::ScmSocket,
@@ -68,6 +68,14 @@ impl Worker {
         match kill(Pid::from_raw(self.pid), None) {
             Ok(_) => true,
             Err(_) => false,
+        }
+    }
+
+    pub fn info(&self) -> WorkerInfo {
+        WorkerInfo {
+            id: self.id.clone(),
+            pid: self.pid.clone(),
+            run_state: self.run_state.clone(),
         }
     }
 

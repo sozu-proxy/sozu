@@ -364,9 +364,42 @@ impl CommandManager {
         Ok(())
     }
 
+    pub fn status(&mut self, json: bool) -> anyhow::Result<()> {
+        let id = generate_id();
+
+        self.channel.write_message(&CommandRequest::new(
+            id.clone(),
+            CommandRequestData::ListWorkers,
+            None,
+        ));
+
+        let message = self
+            .channel
+            .read_message_blocking_timeout(Some(self.timeout))
+            .unwrap();
+
+        if id != message.id {
+            bail!("received message with invalid id: {:?}", message);
+        }
+
+        match message.status {
+            CommandStatus::Processing => {
+                bail!("should have obtained an answer immediately");
+            }
+            CommandStatus::Error => {
+                if json {
+                    print_json_response(&message.message)?;
+                }
+                bail!("could not get the worker list: {}", message.message);
+            }
+            CommandStatus::Ok => {}
+        }
+        Ok(())
+    }
+
     // queries a list of workers and then queries the status for each of them,
     // this should rather be done on the CommandServer level
-    pub fn status(&mut self, json: bool) -> Result<(), anyhow::Error> {
+    pub fn status_legacy(&mut self, json: bool) -> Result<(), anyhow::Error> {
         let id = generate_id();
 
         // we have to create a new channel here, to pass it into the thread below

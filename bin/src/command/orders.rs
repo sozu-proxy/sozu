@@ -94,6 +94,7 @@ impl CommandServer {
             CommandRequestData::ReloadConfiguration { path } => {
                 self.reload_configuration(request_identifier, path).await
             }
+            CommandRequestData::Status => self.status(request_identifier).await,
         };
 
         // Notify the command server by sending using his command_tx
@@ -875,6 +876,70 @@ impl CommandServer {
         //     "Reloading configuration...",
         // )
         // .await;
+        Ok(None)
+    }
+
+    pub async fn status(
+        &mut self,
+        request_identifier: RequestIdentifier,
+    ) -> anyhow::Result<Option<Success>> {
+        let (status_tx, mut status_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
+        let mut count = 0usize;
+
+        // create a status list with the available info of the main process
+        let mut worker_info_map: BTreeMap<String, WorkerInfo> = BTreeMap::new();
+
+        for ref mut worker in self.workers.iter_mut() {
+            // create request ids even if we don't send request, as keys in the tree map
+            let req_id = format!("{}-status-{}", request_identifier.client, worker.id);
+            // send a status request to supposedly running workers to update the list afterwards
+            if worker.run_state != RunState::Stopped {
+                worker.send(req_id.clone(), ProxyRequestData::Status).await;
+                count += 1;
+                self.in_flight.insert(req_id.clone(), (status_tx.clone(), 1));
+            }
+            worker_info_map.insert(req_id, worker.info());
+        }
+
+        let prefix = format!("{}-status-", request_identifier.client);
+        let command_tx = self.command_tx.clone();
+        let thread_request_identifier = request_identifier.clone();
+
+        smol::spawn(async move {
+            let mut i = 0;
+            let mut worker_info_vec: Vec<WorkerInfo> = Vec::new();
+            while let Some(proxy_response) = status_rx.next().await {
+                match proxy_response.status {
+                    ProxyResponseStatus::Ok => {
+                        if let Some(worker_info) = worker_info_map.get(&proxy_response.id) {
+                            worker_info_vec.push(worker_info.to_owned())
+                        }
+                    }
+                    ProxyResponseStatus::Processing => {
+                        //info!("metrics processing");
+                        continue;
+                    }
+                    ProxyResponseStatus::Error(_) => {
+                        if let Some(worker_info) = worker_info_map.get_mut(&proxy_response.id) {
+                            worker_info.run_state = RunState::NotAnswering;
+                            worker_info_vec.push(worker_info.to_owned());
+                        }
+                    }
+                };
+
+                i += 1;
+                if i == count {
+                    break;
+                }
+            }
+            return_success(
+                command_tx,
+                thread_request_identifier,
+                Success::Status(worker_info_vec),
+            )
+            .await;
+        })
+        .detach();
         Ok(None)
     }
 
