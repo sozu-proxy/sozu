@@ -8,6 +8,7 @@ use std::{
     str::from_utf8,
 };
 
+use anyhow::{bail, Context};
 use mio::net::TcpListener;
 use nix::{cmsg_space, sys::socket, Result as NixResult};
 use serde_json;
@@ -68,43 +69,22 @@ impl ScmSocket {
         self.send_msg(&message, &v)
     }
 
-    // Todo: return anyhow::Result instead of Option
-    pub fn receive_listeners(&self) -> Option<Listeners> {
+    pub fn receive_listeners(&self) -> anyhow::Result<Listeners> {
         let mut buf = vec![0; MAX_BYTES_OUT];
 
         let mut received_fds: [RawFd; MAX_FDS_OUT] = [0; MAX_FDS_OUT];
 
-        let (size, file_descriptor_length) = match self.rcv_msg(&mut buf, &mut received_fds) {
-            Ok((s, f)) => (s, f),
-            Err(e) => {
-                error!("could not receive listeners (from fd {}): {:?}", self.fd, e);
-                return None;
-            }
-        };
+        let (size, file_descriptor_length) = self
+            .rcv_msg(&mut buf, &mut received_fds)
+            .with_context(|| "could not receive listeners")?;
 
-        //println!("{} received :{:?}", self.fd, (sz, fds_len));
+        debug!("{} received :{:?}", self.fd, (size, file_descriptor_length));
 
-        let raw_listener_list = match from_utf8(&buf[..size]) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    "could not parse listeners list (from fd {}): {:?}",
-                    self.fd, e
-                );
-                return None;
-            }
-        };
+        let raw_listener_list =
+            from_utf8(&buf[..size]).with_context(|| "Could not parse utf8 string from buffer")?;
 
-        let mut listeners_count = match serde_json::from_str::<ListenersCount>(raw_listener_list) {
-            Err(e) => {
-                error!(
-                    "could not parse listeners list (from fd {}): {:?}",
-                    self.fd, e
-                );
-                return None;
-            }
-            Ok(lc) => lc,
-        };
+        let mut listeners_count = serde_json::from_str::<ListenersCount>(raw_listener_list)
+            .with_context(|| "Could not deserialize utf8 string into listeners")?;
 
         let mut index = 0;
         let len = listeners_count.http.len();
@@ -136,7 +116,7 @@ impl ScmSocket {
             ),
         );
 
-        Some(Listeners { http, tls, tcp })
+        Ok(Listeners { http, tls, tcp })
     }
 
     pub fn send_msg(&self, buf: &[u8], fds: &[RawFd]) -> NixResult<()> {

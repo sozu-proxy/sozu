@@ -472,7 +472,7 @@ impl Server {
 
         info!("will try to receive listeners");
         server.scm.set_blocking(true);
-        let listeners = server.scm.receive_listeners();
+        let listeners = server.scm.receive_listeners().ok();
         server.scm.set_blocking(false);
         info!("received listeners: {:?}", listeners);
         server.scm_listeners = listeners;

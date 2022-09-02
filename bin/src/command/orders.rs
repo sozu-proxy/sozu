@@ -654,11 +654,15 @@ impl CommandServer {
                 info!("waiting for scm sockets");
                 old_worker.scm.set_blocking(true);
                 match old_worker.scm.receive_listeners() {
-                    Some(l) => {
+                    Ok(l) => {
                         listeners = Some(l);
                         break;
                     }
-                    None => {
+                    Err(error) => {
+                        error!(
+                            "Could not receive listerners from scm socket with file descriptor {}:\n{:?}",
+                            old_worker.scm.fd, error
+                        );
                         counter += 1;
                         if counter == 50 {
                             break;
