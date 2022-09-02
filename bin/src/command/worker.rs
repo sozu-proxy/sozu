@@ -15,6 +15,7 @@ use sozu_command_lib::{
 pub struct Worker {
     pub id: u32,
     pub fd: i32,
+    /// for the worker to receive and respond to the main process
     pub channel: Option<Channel<ProxyRequest, ProxyResponse>>,
     pub pid: pid_t,
     pub run_state: RunState,

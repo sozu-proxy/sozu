@@ -34,7 +34,7 @@ use sozu_command_lib::{
 use sozu::metrics::METRICS;
 
 use crate::{
-    command::{CommandMessage, CommandServer, RequestIdentifier, Response, Success},
+    command::{CommandMessage, CommandServer, RequestIdentifier, Response, Success, Worker},
     upgrade::start_new_main_process,
     worker::start_worker,
 };
@@ -319,23 +319,26 @@ impl CommandServer {
                 };
 
                 // notify the command server
-                if error == 0 {
-                    return_success(
-                        command_tx,
-                        request_identifier,
-                        Success::LoadState(path.to_string(), ok, error),
-                    )
-                    .await;
-                } else {
-                    return_error(
-                        command_tx,
-                        request_identifier,
-                        format!(
-                            "Loading state failed, ok: {}, error: {}, path: {}",
-                            ok, error, path
-                        ),
-                    )
-                    .await;
+                match error {
+                    0 => {
+                        return_success(
+                            command_tx,
+                            request_identifier,
+                            Success::LoadState(path.to_string(), ok, error),
+                        )
+                        .await;
+                    }
+                    _ => {
+                        return_error(
+                            command_tx,
+                            request_identifier,
+                            format!(
+                                "Loading state failed, ok: {}, error: {}, path: {}",
+                                ok, error, path
+                            ),
+                        )
+                        .await;
+                    }
                 }
             })
             .detach();
@@ -519,15 +522,15 @@ impl CommandServer {
                 .with_context(|| "Could not start a new main process")?;
 
         channel.set_blocking(true);
-        let res = channel.read_message();
-        debug!("upgrade channel sent {:?}", res);
+        let received_ok_from_new_process = channel.read_message();
+        debug!("upgrade channel sent {:?}", received_ok_from_new_process);
 
         // signaling the accept loop that it should stop
         if let Err(e) = self.accept_cancel.take().unwrap().send(()) {
             error!("could not close the accept loop: {:?}", e);
         }
 
-        match res {
+        match received_ok_from_new_process {
             Some(true) => {
                 info!("wrote final message, closing");
                 Ok(Some(Success::UpgradeMain(pid)))
@@ -602,7 +605,7 @@ impl CommandServer {
 
         let mut listeners = None;
         {
-            let old_worker = self
+            let old_worker: &mut Worker = self
                 .workers
                 .iter_mut()
                 .filter(|worker| worker.id == id)
@@ -650,15 +653,18 @@ impl CommandServer {
             loop {
                 info!("waiting for scm sockets");
                 old_worker.scm.set_blocking(true);
-                if let Some(l) = old_worker.scm.receive_listeners() {
-                    listeners = Some(l);
-                    break;
-                } else {
-                    counter += 1;
-                    if counter == 50 {
+                match old_worker.scm.receive_listeners() {
+                    Some(l) => {
+                        listeners = Some(l);
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    None => {
+                        counter += 1;
+                        if counter == 50 {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
             }
             info!("got scm sockets");
