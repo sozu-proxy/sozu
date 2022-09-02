@@ -213,7 +213,7 @@ fn update_process_limits(config: &Config) -> Result<(), anyhow::Error> {
         .captures(&f)
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse::<usize>().ok())
-        .expect("Couldn't parse /proc/sys/fs/file-max");
+        .with_context(|| "Couldn't parse /proc/sys/fs/file-max")?;
     if config.max_connections > system_max_fd {
         error!(
             "Proxies total max_connections can't be higher than system's file-max limit. \

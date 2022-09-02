@@ -43,12 +43,12 @@ pub struct ConfigState {
     pub http_listeners: HashMap<SocketAddr, (HttpListener, bool)>,
     pub https_listeners: HashMap<SocketAddr, (HttpsListener, bool)>,
     pub tcp_listeners: HashMap<SocketAddr, (TcpListener, bool)>,
-    // indexed by (address, hostname, path)
+    /// indexed by (address, hostname, path)
     pub http_fronts: BTreeMap<RouteKey, HttpFrontend>,
-    // indexed by (address, hostname, path)
+    /// indexed by (address, hostname, path)
     pub https_fronts: BTreeMap<RouteKey, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
-    // certificate and names
+    /// certificate and names
     pub certificates:
         HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
     //ip, port

@@ -48,11 +48,14 @@ impl SerializedWorker {
     }
 }
 
+/// the data needed to start a new main process
 #[derive(Deserialize, Serialize, Debug)]
 pub struct UpgradeData {
-    pub command: i32,
+    /// file descriptor of the unix command socket
+    pub command_socket_fd: i32,
     //clients: ????
     pub config: Config,
+    /// JSON serialized workers
     pub workers: Vec<SerializedWorker>,
     pub state: ConfigState,
     pub next_id: u32,
@@ -80,21 +83,21 @@ pub fn start_new_main_process(
 
     util::disable_close_on_exec(client.as_raw_fd())?;
 
-    let mut command: Channel<(), bool> = Channel::new(
+    let mut command_channel: Channel<(), bool> = Channel::new(
         server,
         upgrade_data.config.command_buffer_size,
         upgrade_data.config.max_command_buffer_size,
     );
-    command.set_nonblocking(false);
+    command_channel.set_nonblocking(false);
 
     info!("launching new main");
     //FIXME: remove the expect, return a result?
     match unsafe { fork().with_context(|| "fork failed")? } {
         ForkResult::Parent { child } => {
             info!("main launched: {}", child);
-            command.set_nonblocking(true);
+            command_channel.set_nonblocking(true);
 
-            Ok((child.into(), command))
+            Ok((child.into(), command_channel))
         }
         ForkResult::Child => {
             trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
@@ -122,13 +125,13 @@ pub fn begin_new_main_process(
     command_buffer_size: usize,
     max_command_buffer_size: usize,
 ) -> anyhow::Result<()> {
-    let mut command: Channel<bool, ()> = Channel::new(
+    let mut command_channel: Channel<bool, ()> = Channel::new(
         unsafe { UnixStream::from_raw_fd(fd) },
         command_buffer_size,
         max_command_buffer_size,
     );
 
-    command.set_blocking(true);
+    command_channel.set_blocking(true);
 
     let upgrade_file = unsafe { File::from_raw_fd(upgrade_fd) };
     let upgrade_data: UpgradeData =
@@ -144,7 +147,7 @@ pub fn begin_new_main_process(
     info!("starting new main loop");
     match util::write_pid_file(&config) {
         Ok(()) => {
-            command.write_message(&true);
+            command_channel.write_message(&true);
             future::block_on(async {
                 server.run().await;
             });
@@ -152,7 +155,7 @@ pub fn begin_new_main_process(
             Ok(())
         }
         Err(e) => {
-            command.write_message(&false);
+            command_channel.write_message(&false);
             error!("Couldn't write PID file. Error: {:?}", e);
             error!("Couldn't upgrade main process");
             bail!("begin_new_main_process() failed");

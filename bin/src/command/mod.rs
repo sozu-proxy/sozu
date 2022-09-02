@@ -211,18 +211,21 @@ pub struct ProxyConfiguration {
 }
 
 pub struct CommandServer {
-    fd: i32,                              // file descriptor of the unix listener socket
-    command_tx: Sender<CommandMessage>,   // cloned and distributed, to send messages back
-    command_rx: Receiver<CommandMessage>, // where the main loop receives messages
+    /// file descriptor of the unix listener socket
+    fd: i32,
+    /// this sender is cloned and distributed around, to send messages back
+    command_tx: Sender<CommandMessage>,
+    /// where the main loop receives messages
+    command_rx: Receiver<CommandMessage>,
     clients: HashMap<String, Sender<CommandResponse>>, // map of client ids and cloned command_tx's seen above
     workers: Vec<Worker>,
-    // A map of requests sent to workers.
-    // Any function requesting a worker will log the request id in here, associated
-    // with a sender. This sender will be used to notify the function of the worker's
-    // response.
-    // In certain cases, the same response may need to be transmitted several
-    // times over. Therefore, a number is recorded next to the sender in
-    // the hashmap.
+    /// A map of requests sent to workers.
+    /// Any function requesting a worker will log the request id in here, associated
+    /// with a sender. This sender will be used to notify the function of the worker's
+    /// response.
+    /// In certain cases, the same response may need to be transmitted several
+    /// times over. Therefore, a number is recorded next to the sender in
+    /// the hashmap.
     in_flight: HashMap<
         String, // the request id
         (
@@ -233,11 +236,12 @@ pub struct CommandServer {
     event_subscribers: HashSet<String>,
     state: ConfigState,
     config: Config,
-    next_id: u32, // id of the next worker to be spawned
+    /// id of the next worker to be spawned
+    next_id: u32,
     executable_path: String,
-    //caching the number of backends instead of going through the whole state.backends hashmap
+    /// caching the number of backends instead of going through the whole state.backends hashmap
     backends_count: usize,
-    //caching the number of frontends instead of going through the whole state.http/hhtps/tcp_fronts hashmaps
+    /// caching the number of frontends instead of going through the whole state.http/hhtps/tcp_fronts hashmaps
     frontends_count: usize,
     accept_cancel: Option<oneshot::Sender<()>>,
 }
@@ -382,7 +386,7 @@ impl CommandServer {
         let state = self.state.clone();
 
         UpgradeData {
-            command: self.fd,
+            command_socket_fd: self.fd,
             config: self.config.clone(),
             workers,
             state,
@@ -393,7 +397,7 @@ impl CommandServer {
 
     pub fn from_upgrade_data(upgrade_data: UpgradeData) -> anyhow::Result<CommandServer> {
         let UpgradeData {
-            command,
+            command_socket_fd: command,
             config,
             workers,
             state,
@@ -519,7 +523,10 @@ impl CommandServer {
                 });
             }
         }
-        trace!("disabling cloexec on listener: {}", self.fd);
+        trace!(
+            "disabling cloexec on listener with file descriptor: {}",
+            self.fd
+        );
         util::disable_close_on_exec(self.fd)?;
         Ok(())
     }
@@ -618,7 +625,7 @@ impl CommandServer {
         .detach();
     }
 
-    // in case a worker has crashed while Running and automatic_worker_restart is set to true
+    /// in case a worker has crashed while Running and automatic_worker_restart is set to true
     pub async fn restart_worker(&mut self, worker_id: u32) -> anyhow::Result<()> {
         let ref mut worker = self
             .workers
@@ -805,15 +812,16 @@ pub fn start_server(
     command_socket_path: String,
     workers: Vec<Worker>,
 ) -> anyhow::Result<()> {
-    let addr = PathBuf::from(&command_socket_path);
+    let path = PathBuf::from(&command_socket_path);
 
-    if fs::metadata(&addr).is_ok() {
+    if fs::metadata(&path).is_ok() {
         info!("A socket is already present. Deleting...");
-        fs::remove_file(&addr)
-            .with_context(|| format!("could not delete previous socket at {:?}", addr))?;
+        fs::remove_file(&path)
+            .with_context(|| format!("could not delete previous socket at {:?}", path))?;
     }
 
-    let unix_listener = match UnixListener::bind(&addr) {
+    let unix_listener = match UnixListener::bind(&path) {
+        Ok(unix_listener) => unix_listener,
         Err(e) => {
             error!("could not create unix socket: {:?}", e);
             // the workers did not even get the configuration, we can kill them right away
@@ -825,30 +833,28 @@ pub fn start_server(
             }
             bail!("couldn't start server");
         }
-        Ok(unix_listener) => {
-            if let Err(e) = fs::set_permissions(&addr, fs::Permissions::from_mode(0o600)) {
-                error!("could not set the unix socket permissions: {:?}", e);
-                let _ = fs::remove_file(&addr).map_err(|e2| {
-                    error!("could not remove the unix socket: {:?}", e2);
-                });
-                // the workers did not even get the configuration, we can kill them right away
-                for worker in workers {
-                    error!("killing worker n°{} (PID {})", worker.id, worker.pid);
-                    let _ = kill(Pid::from_raw(worker.pid), Signal::SIGKILL).map_err(|e| {
-                        error!("could not kill worker: {:?}", e);
-                    });
-                }
-                bail!("couldn't start server");
-            }
-            unix_listener
-        }
     };
+
+    if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+        error!("could not set the unix socket permissions: {:?}", e);
+        let _ = fs::remove_file(&path).map_err(|e2| {
+            error!("could not remove the unix socket: {:?}", e2);
+        });
+        // the workers did not even get the configuration, we can kill them right away
+        for worker in workers {
+            error!("killing worker n°{} (PID {})", worker.id, worker.pid);
+            let _ = kill(Pid::from_raw(worker.pid), Signal::SIGKILL).map_err(|e| {
+                error!("could not kill worker: {:?}", e);
+            });
+        }
+        bail!("couldn't start server");
+    }
 
     future::block_on(async {
         // Create a listener.
-        let fd = unix_listener.as_raw_fd();
-        let listener = Async::new(unix_listener)?;
-        info!("Listening on {:?}", listener.get_ref().local_addr()?);
+        let listener_fd = unix_listener.as_raw_fd();
+        let async_listener = Async::new(unix_listener)?;
+        info!("Listening on {:?}", async_listener.get_ref().local_addr()?);
 
         let mut counter = 0usize;
         let (accept_cancel_tx, accept_cancel_rx) = oneshot::channel();
@@ -857,7 +863,7 @@ pub fn start_server(
         smol::spawn(async move {
             let mut accept_cancel_rx = Some(accept_cancel_rx);
             loop {
-                let future = listener.accept();
+                let future = async_listener.accept();
                 futures::pin_mut!(future);
                 let (stream, _) =
                     match futures::future::select(accept_cancel_rx.take().unwrap(), future).await {
@@ -894,7 +900,14 @@ pub fn start_server(
 
         let saved_state_path = config.saved_state.clone();
 
-        let mut server = CommandServer::new(fd, config, tx, command_rx, workers, accept_cancel_tx)?;
+        let mut server = CommandServer::new(
+            listener_fd,
+            config,
+            tx,
+            command_rx,
+            workers,
+            accept_cancel_tx,
+        )?;
         server.load_static_cluster_configuration().await;
 
         if let Some(path) = saved_state_path {
@@ -909,6 +922,7 @@ pub fn start_server(
 
         info!("waiting for configuration client connections");
         server.run().await;
+        info!("main process stopped");
         Ok(())
     })
 }
