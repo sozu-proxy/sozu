@@ -190,6 +190,7 @@ pub fn fork_main_into_worker(
 
     serde_json::to_writer(&mut state_file, state)
         .with_context(|| "could not write upgrade data to temporary file")?;
+
     state_file
         .seek(SeekFrom::Start(0))
         .with_context(|| "could not seek to beginning of file")?;

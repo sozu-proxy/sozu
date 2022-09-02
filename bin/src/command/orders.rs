@@ -883,7 +883,7 @@ impl CommandServer {
         &mut self,
         request_identifier: RequestIdentifier,
     ) -> anyhow::Result<Option<Success>> {
-        info!("I tried so hard and got so far");
+        info!("Let's get the status of everyone.");
 
         let (status_tx, mut status_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
 
@@ -894,6 +894,8 @@ impl CommandServer {
 
         let mut count = 0usize;
         for ref mut worker in self.workers.iter_mut() {
+            info!("Worker {} is {}", worker.id, worker.run_state);
+
             // create request ids even if we don't send any request, as keys in the tree map
             let worker_request_id = format!("{}{}", prefix, worker.id);
             // send a status request to supposedly running workers to update the list afterwards
@@ -918,7 +920,10 @@ impl CommandServer {
             let mut i = 0;
 
             while let Some(proxy_response) = status_rx.next().await {
-                info!("received worker response: {:?}", proxy_response);
+                info!(
+                    "received response with id {}: {:?}",
+                    proxy_response.id, proxy_response
+                );
                 let new_run_state = match proxy_response.status {
                     ProxyResponseStatus::Ok => RunState::Running,
                     ProxyResponseStatus::Processing => continue,
@@ -933,7 +938,7 @@ impl CommandServer {
                     break;
                 }
             }
-            
+
             let worker_info_vec: Vec<WorkerInfo> = worker_info_map
                 .iter()
                 .map(|(_, worker_info)| worker_info.to_owned())
