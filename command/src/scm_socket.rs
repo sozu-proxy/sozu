@@ -8,7 +8,7 @@ use std::{
     str::from_utf8,
 };
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use mio::net::TcpListener;
 use nix::{cmsg_space, sys::socket, Result as NixResult};
 use serde_json;

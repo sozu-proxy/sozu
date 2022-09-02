@@ -269,7 +269,7 @@ impl CommandServer {
         let state: ConfigState = Default::default();
 
         for worker in workers.iter_mut() {
-            let sock = worker.channel.take().unwrap().sock;
+            let sock = worker.command_channel.take().unwrap().sock;
             let (worker_tx, worker_rx) = channel(10000);
             worker.sender = Some(worker_tx);
 
@@ -475,14 +475,14 @@ impl CommandServer {
                 .detach();
 
                 Some(Worker {
-                    fd: serialized.fd,
+                    command_channel_fd: serialized.fd,
                     id: serialized.id,
-                    channel: None,
+                    command_channel: None,
                     sender,
                     pid: serialized.pid,
                     run_state: serialized.run_state.clone(),
                     queue: serialized.queue.clone().into(),
-                    scm: ScmSocket::new(serialized.scm),
+                    scm_socket: ScmSocket::new(serialized.scm),
                 })
             })
             .collect();
@@ -515,7 +515,7 @@ impl CommandServer {
     pub fn disable_cloexec_before_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                let _ = util::disable_close_on_exec(worker.fd).map_err(|e| {
+                let _ = util::disable_close_on_exec(worker.command_channel_fd).map_err(|e| {
                     error!(
                         "could not disable close on exec for worker {}: {}",
                         worker.id, e
@@ -534,7 +534,7 @@ impl CommandServer {
     pub fn enable_cloexec_after_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                let _ = util::enable_close_on_exec(worker.fd).map_err(|e| {
+                let _ = util::enable_close_on_exec(worker.command_channel_fd).map_err(|e| {
                     error!(
                         "could not enable close on exec for worker {}: {}",
                         worker.id, e
@@ -673,7 +673,7 @@ impl CommandServer {
         info!("created new worker: {}", id);
         self.next_id += 1;
 
-        let sock = worker.channel.take().unwrap().sock;
+        let sock = worker.command_channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10_000);
         worker.sender = Some(worker_tx);
 

@@ -457,7 +457,7 @@ impl CommandServer {
 
         self.next_id += 1;
 
-        let sock = worker.channel.take().unwrap().sock;
+        let sock = worker.command_channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
         worker.sender = Some(worker_tx);
 
@@ -476,7 +476,7 @@ impl CommandServer {
 
         info!(
             "sending listeners: to the new worker: {:?}",
-            worker.scm.send_listeners(&Listeners {
+            worker.scm_socket.send_listeners(&Listeners {
                 http: Vec::new(),
                 tls: Vec::new(),
                 tcp: Vec::new(),
@@ -588,7 +588,7 @@ impl CommandServer {
 
         self.next_id += 1;
 
-        let sock = worker.channel.take().unwrap().sock;
+        let sock = worker.command_channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
         worker.sender = Some(worker_tx);
 
@@ -652,8 +652,8 @@ impl CommandServer {
             //FIXME: use blocking
             loop {
                 info!("waiting for scm sockets");
-                old_worker.scm.set_blocking(true);
-                match old_worker.scm.receive_listeners() {
+                old_worker.scm_socket.set_blocking(true);
+                match old_worker.scm_socket.receive_listeners() {
                     Ok(l) => {
                         listeners = Some(l);
                         break;
@@ -661,7 +661,7 @@ impl CommandServer {
                     Err(error) => {
                         error!(
                             "Could not receive listerners from scm socket with file descriptor {}:\n{:?}",
-                            old_worker.scm.fd, error
+                            old_worker.scm_socket.fd, error
                         );
                         counter += 1;
                         if counter == 50 {
@@ -720,7 +720,7 @@ impl CommandServer {
             Some(l) => {
                 info!(
                     "sending listeners: to the new worker: {:?}",
-                    worker.scm.send_listeners(&l)
+                    worker.scm_socket.send_listeners(&l)
                 );
                 l.close();
             }

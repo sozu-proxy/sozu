@@ -37,13 +37,13 @@ pub struct SerializedWorker {
 impl SerializedWorker {
     pub fn from_worker(worker: &Worker) -> SerializedWorker {
         SerializedWorker {
-            fd: worker.fd,
+            fd: worker.command_channel_fd,
             pid: worker.pid,
             id: worker.id,
             run_state: worker.run_state,
             //token:      worker.token.clone().map(|Token(t)| t),
             queue: worker.queue.clone().into(),
-            scm: worker.scm.raw_fd(),
+            scm: worker.scm_socket.raw_fd(),
         }
     }
 }

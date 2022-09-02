@@ -14,13 +14,15 @@ use sozu_command_lib::{
 
 pub struct Worker {
     pub id: u32,
-    pub fd: i32,
-    /// for the worker to receive and respond to the main process
-    pub channel: Option<Channel<ProxyRequest, ProxyResponse>>,
+    /// for the worker to receive requests and respond to the main process
+    pub command_channel: Option<Channel<ProxyRequest, ProxyResponse>>,
+    /// file descriptor of the command channel
+    pub command_channel_fd: i32,
     pub pid: pid_t,
     pub run_state: RunState,
     pub queue: VecDeque<ProxyRequest>,
-    pub scm: ScmSocket,
+    /// used to receive listeners
+    pub scm_socket: ScmSocket,
     pub sender: Option<futures::channel::mpsc::Sender<ProxyRequest>>,
 }
 
@@ -28,19 +30,19 @@ impl Worker {
     pub fn new(
         id: u32,
         pid: pid_t,
-        channel: Channel<ProxyRequest, ProxyResponse>,
-        scm: ScmSocket,
+        command_channel: Channel<ProxyRequest, ProxyResponse>,
+        scm_socket: ScmSocket,
         _: &Config,
     ) -> Worker {
         Worker {
             id,
-            fd: channel.sock.as_raw_fd(),
-            channel: Some(channel),
+            command_channel_fd: command_channel.sock.as_raw_fd(),
+            command_channel: Some(command_channel),
             sender: None,
             pid,
             run_state: RunState::Running,
             queue: VecDeque::new(),
-            scm,
+            scm_socket,
         }
     }
 
