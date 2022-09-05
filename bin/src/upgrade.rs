@@ -37,7 +37,7 @@ pub struct SerializedWorker {
 impl SerializedWorker {
     pub fn from_worker(worker: &Worker) -> SerializedWorker {
         SerializedWorker {
-            fd: worker.command_channel_fd,
+            fd: worker.worker_channel_fd,
             pid: worker.pid,
             id: worker.id,
             run_state: worker.run_state,
@@ -62,7 +62,7 @@ pub struct UpgradeData {
     //pub token_count: usize,
 }
 
-pub fn start_new_main_process(
+pub fn fork_main_into_new_main(
     executable_path: String,
     upgrade_data: UpgradeData,
 ) -> Result<(pid_t, Channel<(), bool>), anyhow::Error> {
@@ -79,32 +79,32 @@ pub fn start_new_main_process(
         .seek(SeekFrom::Start(0))
         .with_context(|| "could not seek to beginning of file")?;
 
-    let (server, client) = UnixStream::pair()?;
+    let (old_to_new, new_to_old) = UnixStream::pair()?;
 
-    util::disable_close_on_exec(client.as_raw_fd())?;
+    util::disable_close_on_exec(new_to_old.as_raw_fd())?;
 
-    let mut command_channel: Channel<(), bool> = Channel::new(
-        server,
+    let mut fork_confirmation_channel: Channel<(), bool> = Channel::new(
+        old_to_new,
         upgrade_data.config.command_buffer_size,
         upgrade_data.config.max_command_buffer_size,
     );
-    command_channel.set_nonblocking(false);
+    fork_confirmation_channel.set_nonblocking(false);
 
     info!("launching new main");
     //FIXME: remove the expect, return a result?
     match unsafe { fork().with_context(|| "fork failed")? } {
         ForkResult::Parent { child } => {
             info!("main launched: {}", child);
-            command_channel.set_nonblocking(true);
+            fork_confirmation_channel.set_nonblocking(true);
 
-            Ok((child.into(), command_channel))
+            Ok((child.into(), fork_confirmation_channel))
         }
         ForkResult::Child => {
             trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
             let res = Command::new(executable_path)
                 .arg("main")
                 .arg("--fd")
-                .arg(client.as_raw_fd().to_string())
+                .arg(new_to_old.as_raw_fd().to_string())
                 .arg("--upgrade-fd")
                 .arg(upgrade_file.as_raw_fd().to_string())
                 .arg("--command-buffer-size")
@@ -120,20 +120,20 @@ pub fn start_new_main_process(
 }
 
 pub fn begin_new_main_process(
-    fd: i32,
-    upgrade_fd: i32,
+    new_to_old_channel_fd: i32,
+    upgrade_file_fd: i32,
     command_buffer_size: usize,
     max_command_buffer_size: usize,
 ) -> anyhow::Result<()> {
-    let mut command_channel: Channel<bool, ()> = Channel::new(
-        unsafe { UnixStream::from_raw_fd(fd) },
+    let mut fork_confirmation_channel: Channel<bool, ()> = Channel::new(
+        unsafe { UnixStream::from_raw_fd(new_to_old_channel_fd) },
         command_buffer_size,
         max_command_buffer_size,
     );
 
-    command_channel.set_blocking(true);
+    fork_confirmation_channel.set_blocking(true);
 
-    let upgrade_file = unsafe { File::from_raw_fd(upgrade_fd) };
+    let upgrade_file = unsafe { File::from_raw_fd(upgrade_file_fd) };
     let upgrade_data: UpgradeData =
         serde_json::from_reader(upgrade_file).with_context(|| "could not parse upgrade data")?;
     let config = upgrade_data.config.clone();
@@ -147,7 +147,7 @@ pub fn begin_new_main_process(
     info!("starting new main loop");
     match util::write_pid_file(&config) {
         Ok(()) => {
-            command_channel.write_message(&true);
+            fork_confirmation_channel.write_message(&true);
             future::block_on(async {
                 server.run().await;
             });
@@ -155,7 +155,7 @@ pub fn begin_new_main_process(
             Ok(())
         }
         Err(e) => {
-            command_channel.write_message(&false);
+            fork_confirmation_channel.write_message(&false);
             error!("Couldn't write PID file. Error: {:?}", e);
             error!("Couldn't upgrade main process");
             bail!("begin_new_main_process() failed");

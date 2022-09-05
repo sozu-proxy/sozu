@@ -35,7 +35,7 @@ use sozu::metrics::METRICS;
 
 use crate::{
     command::{CommandMessage, CommandServer, RequestIdentifier, Response, Success, Worker},
-    upgrade::start_new_main_process,
+    upgrade::fork_main_into_new_main,
     worker::start_worker,
 };
 
@@ -457,7 +457,7 @@ impl CommandServer {
 
         self.next_id += 1;
 
-        let sock = worker.command_channel.take().unwrap().sock;
+        let sock = worker.worker_channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
         worker.sender = Some(worker_tx);
 
@@ -517,8 +517,10 @@ impl CommandServer {
         // )
         // .await;
 
-        let (pid, mut channel) =
-            start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data())
+        let upgrade_data = self.generate_upgrade_data();
+
+        let (new_main_pid, mut channel) =
+            fork_main_into_new_main(self.executable_path.clone(), upgrade_data)
                 .with_context(|| "Could not start a new main process")?;
 
         channel.set_blocking(true);
@@ -533,7 +535,7 @@ impl CommandServer {
         match received_ok_from_new_process {
             Some(true) => {
                 info!("wrote final message, closing");
-                Ok(Some(Success::UpgradeMain(pid)))
+                Ok(Some(Success::UpgradeMain(new_main_pid)))
             }
             _ => bail!("could not upgrade main process"),
         }
@@ -588,7 +590,7 @@ impl CommandServer {
 
         self.next_id += 1;
 
-        let sock = worker.command_channel.take().unwrap().sock;
+        let sock = worker.worker_channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
         worker.sender = Some(worker_tx);
 
@@ -1351,8 +1353,8 @@ impl CommandServer {
         );
 
         match self.clients.get_mut(&client_id) {
-            Some(sender) => {
-                sender.send(command_response).await.with_context(|| {
+            Some(client_tx) => {
+                client_tx.send(command_response).await.with_context(|| {
                     format!(
                         "Could not notify client {} about request {}",
                         client_id, request_identifier.request,

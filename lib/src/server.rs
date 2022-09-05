@@ -275,8 +275,8 @@ pub struct Server {
 
 impl Server {
     pub fn new_from_config(
-        channel: ProxyChannel,
-        scm: ScmSocket,
+        worker_to_main_channel: ProxyChannel,
+        worker_to_main_scm: ScmSocket,
         config: Config,
         config_state: ConfigState,
         expects_initial_status: bool,
@@ -336,8 +336,8 @@ impl Server {
 
         Server::new(
             event_loop,
-            channel,
-            scm,
+            worker_to_main_channel,
+            worker_to_main_scm,
             sessions,
             pool,
             backends,

@@ -15,9 +15,9 @@ use sozu_command_lib::{
 pub struct Worker {
     pub id: u32,
     /// for the worker to receive requests and respond to the main process
-    pub command_channel: Option<Channel<ProxyRequest, ProxyResponse>>,
+    pub worker_channel: Option<Channel<ProxyRequest, ProxyResponse>>,
     /// file descriptor of the command channel
-    pub command_channel_fd: i32,
+    pub worker_channel_fd: i32,
     pub pid: pid_t,
     pub run_state: RunState,
     pub queue: VecDeque<ProxyRequest>,
@@ -36,8 +36,8 @@ impl Worker {
     ) -> Worker {
         Worker {
             id,
-            command_channel_fd: command_channel.sock.as_raw_fd(),
-            command_channel: Some(command_channel),
+            worker_channel_fd: command_channel.sock.as_raw_fd(),
+            worker_channel: Some(command_channel),
             sender: None,
             pid,
             run_state: RunState::Running,

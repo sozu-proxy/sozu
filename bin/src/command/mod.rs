@@ -211,13 +211,15 @@ pub struct ProxyConfiguration {
 }
 
 pub struct CommandServer {
-    /// file descriptor of the unix listener socket
-    fd: i32,
+    /// file descriptor of the unix listener socket, usually "sozu.sock"
+    unix_listener_fd: i32,
     /// this sender is cloned and distributed around, to send messages back
     command_tx: Sender<CommandMessage>,
     /// where the main loop receives messages
     command_rx: Receiver<CommandMessage>,
-    clients: HashMap<String, Sender<CommandResponse>>, // map of client ids and cloned command_tx's seen above
+    /// All client loops. id -> cloned command_tx
+    clients: HashMap<String, Sender<CommandResponse>>,
+    /// handles to the workers as seen from the main process
     workers: Vec<Worker>,
     /// A map of requests sent to workers.
     /// Any function requesting a worker will log the request id in here, associated
@@ -269,12 +271,12 @@ impl CommandServer {
         let state: ConfigState = Default::default();
 
         for worker in workers.iter_mut() {
-            let sock = worker.command_channel.take().unwrap().sock;
+            let main_to_worker_channel = worker.worker_channel.take().unwrap().sock;
             let (worker_tx, worker_rx) = channel(10000);
             worker.sender = Some(worker_tx);
 
-            let stream = Async::new(unsafe {
-                let fd = sock.into_raw_fd();
+            let main_to_worker_stream = Async::new(unsafe {
+                let fd = main_to_worker_channel.into_raw_fd();
                 UnixStream::from_raw_fd(fd)
             })
             .with_context(|| "Could not get a unix stream from the file descriptor")?;
@@ -282,7 +284,7 @@ impl CommandServer {
             let id = worker.id;
             let command_tx = command_tx.clone();
             smol::spawn(async move {
-                worker_loop(id, stream, command_tx, worker_rx).await;
+                worker_loop(id, main_to_worker_stream, command_tx, worker_rx).await;
             })
             .detach();
         }
@@ -293,7 +295,7 @@ impl CommandServer {
         let frontends_count = state.count_frontends();
 
         Ok(CommandServer {
-            fd,
+            unix_listener_fd: fd,
             config,
             state,
             command_tx,
@@ -386,7 +388,7 @@ impl CommandServer {
         let state = self.state.clone();
 
         UpgradeData {
-            command_socket_fd: self.fd,
+            command_socket_fd: self.unix_listener_fd,
             config: self.config.clone(),
             workers,
             state,
@@ -475,9 +477,9 @@ impl CommandServer {
                 .detach();
 
                 Some(Worker {
-                    command_channel_fd: serialized.fd,
+                    worker_channel_fd: serialized.fd,
                     id: serialized.id,
-                    command_channel: None,
+                    worker_channel: None,
                     sender,
                     pid: serialized.pid,
                     run_state: serialized.run_state.clone(),
@@ -495,7 +497,7 @@ impl CommandServer {
         let executable_path = unsafe { get_executable_path()? };
 
         Ok(CommandServer {
-            fd: command,
+            unix_listener_fd: command,
             config,
             state,
             command_tx,
@@ -515,7 +517,7 @@ impl CommandServer {
     pub fn disable_cloexec_before_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                let _ = util::disable_close_on_exec(worker.command_channel_fd).map_err(|e| {
+                let _ = util::disable_close_on_exec(worker.worker_channel_fd).map_err(|e| {
                     error!(
                         "could not disable close on exec for worker {}: {}",
                         worker.id, e
@@ -525,16 +527,16 @@ impl CommandServer {
         }
         trace!(
             "disabling cloexec on listener with file descriptor: {}",
-            self.fd
+            self.unix_listener_fd
         );
-        util::disable_close_on_exec(self.fd)?;
+        util::disable_close_on_exec(self.unix_listener_fd)?;
         Ok(())
     }
 
     pub fn enable_cloexec_after_upgrade(&mut self) -> anyhow::Result<()> {
         for ref mut worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
-                let _ = util::enable_close_on_exec(worker.command_channel_fd).map_err(|e| {
+                let _ = util::enable_close_on_exec(worker.worker_channel_fd).map_err(|e| {
                     error!(
                         "could not enable close on exec for worker {}: {}",
                         worker.id, e
@@ -542,7 +544,7 @@ impl CommandServer {
                 });
             }
         }
-        util::enable_close_on_exec(self.fd)?;
+        util::enable_close_on_exec(self.unix_listener_fd)?;
         Ok(())
     }
 
@@ -673,7 +675,7 @@ impl CommandServer {
         info!("created new worker: {}", id);
         self.next_id += 1;
 
-        let sock = worker.command_channel.take().unwrap().sock;
+        let sock = worker.worker_channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10_000);
         worker.sender = Some(worker_tx);
 
@@ -858,22 +860,26 @@ pub fn start_server(
 
         let mut counter = 0usize;
         let (accept_cancel_tx, accept_cancel_rx) = oneshot::channel();
-        let (mut command_tx, command_rx) = channel(10000);
-        let tx = command_tx.clone();
+        let (command_tx, command_rx) = channel(10000);
+        let mut cloned_command_tx = command_tx.clone();
         smol::spawn(async move {
             let mut accept_cancel_rx = Some(accept_cancel_rx);
+
+            // create client loops whenever a client connects to the socket
             loop {
-                let future = async_listener.accept();
-                futures::pin_mut!(future);
+                let accept_client = async_listener.accept();
+                futures::pin_mut!(accept_client);
                 let (stream, _) =
-                    match futures::future::select(accept_cancel_rx.take().unwrap(), future).await {
+                    match futures::future::select(accept_cancel_rx.take().unwrap(), accept_client)
+                        .await
+                    {
                         futures::future::Either::Left((_canceled, _)) => {
                             info!("stopping listener");
                             break;
                         }
-                        futures::future::Either::Right((res, cancel_rx)) => {
+                        futures::future::Either::Right((result, cancel_rx)) => {
                             accept_cancel_rx = Some(cancel_rx);
-                            res.unwrap()
+                            result.unwrap()
                         }
                     };
 
@@ -882,11 +888,11 @@ pub fn start_server(
                 smol::spawn(client_loop(
                     id.clone(),
                     stream,
-                    command_tx.clone(),
+                    cloned_command_tx.clone(),
                     client_rx,
                 ))
                 .detach();
-                command_tx
+                cloned_command_tx
                     .send(CommandMessage::ClientNew {
                         id,
                         sender: client_tx,
@@ -903,7 +909,7 @@ pub fn start_server(
         let mut server = CommandServer::new(
             listener_fd,
             config,
-            tx,
+            command_tx,
             command_rx,
             workers,
             accept_cancel_tx,
