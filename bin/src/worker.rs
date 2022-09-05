@@ -52,7 +52,7 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
             tcp: Vec::new(),
         });
 
-        let (pid, command_channel, scm_socket) = start_worker_process(
+        let (pid, command_channel, scm_socket) = fork_main_into_worker(
             &index.to_string(),
             config,
             executable_path.clone(),
@@ -77,6 +77,7 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
     Ok(workers)
 }
 
+/// called by the CommandServer to start an individual worker
 pub fn start_worker(
     id: u32,
     config: &Config,
@@ -84,12 +85,19 @@ pub fn start_worker(
     state: &ConfigState,
     listeners: Option<Listeners>,
 ) -> anyhow::Result<Worker> {
-    let (pid, command, scm) =
-        start_worker_process(&id.to_string(), config, executable_path, state, listeners)?;
+    let (worker_pid, command_channel, scm_socket) =
+        fork_main_into_worker(&id.to_string(), config, executable_path, state, listeners)?;
 
-    Ok(Worker::new(id, pid, command, scm, config))
+    Ok(Worker::new(
+        id,
+        worker_pid,
+        command_channel,
+        scm_socket,
+        config,
+    ))
 }
 
+/// called within a worker process, this starts the actual proxy
 pub fn begin_worker_process(
     command_socket_fd: i32,
     scm_socket_fd: i32,
@@ -165,7 +173,7 @@ pub fn begin_worker_process(
     Ok(())
 }
 
-pub fn start_worker_process(
+pub fn fork_main_into_worker(
     id: &str,
     config: &Config,
     executable_path: String,
