@@ -445,7 +445,7 @@ impl Subscriber for LocalDrain {
         backend_id: Option<&str>,
         metric: MetricData,
     ) {
-        debug!(
+        trace!(
             "receiving metric with key {}, cluster_id: {:?}, backend_id: {:?}, metric data: {:?}",
             key, cluster_id, backend_id, metric
         );

@@ -426,6 +426,8 @@ impl CommandServer {
             })
             .collect();
 
+        debug!("workers: {:#?}", workers);
+
         Ok(Some(Success::ListWorkers(CommandResponseData::Workers(
             workers,
         ))))
@@ -437,13 +439,13 @@ impl CommandServer {
         _tag: &str,
     ) -> anyhow::Result<Option<Success>> {
         let mut worker = start_worker(
-            self.next_id,
+            self.next_worker_id,
             &self.config,
             self.executable_path.clone(),
             &self.state,
             None,
         )
-        .with_context(|| format!("Failed at creating worker {}", self.next_id))?;
+        .with_context(|| format!("Failed at creating worker {}", self.next_worker_id))?;
 
         // Todo: refactor the CLI, see issue #740
         // return_processing(
@@ -455,7 +457,7 @@ impl CommandServer {
 
         info!("created new worker: {}", worker.id);
 
-        self.next_id += 1;
+        self.next_worker_id += 1;
 
         let sock = worker.worker_channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
@@ -558,6 +560,8 @@ impl CommandServer {
                 worker.id == id
                     && worker.run_state != RunState::Stopping
                     && worker.run_state != RunState::Stopped
+                // should we add this?
+                // && worker.run_state != RunState::NotAnswering
             })
             .is_none()
         {
@@ -568,8 +572,8 @@ impl CommandServer {
         }
 
         // same as launch_worker
-        let next_id = self.next_id;
-        let mut worker = start_worker(
+        let next_id = self.next_worker_id;
+        let mut new_worker = start_worker(
             next_id,
             &self.config,
             self.executable_path.clone(),
@@ -588,13 +592,13 @@ impl CommandServer {
 
         info!("created new worker: {}", next_id);
 
-        self.next_id += 1;
+        self.next_worker_id += 1;
 
-        let sock = worker.worker_channel.take().unwrap().sock;
+        let sock = new_worker.worker_channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
-        worker.sender = Some(worker_tx);
+        new_worker.sender = Some(worker_tx);
 
-        worker
+        new_worker
             .sender
             .as_mut()
             .unwrap()
@@ -603,7 +607,12 @@ impl CommandServer {
                 order: ProxyRequestData::Status,
             })
             .await
-            .with_context(|| format!("could not send status message to worker {:?}", worker.id,))?;
+            .with_context(|| {
+                format!(
+                    "could not send status message to worker {:?}",
+                    new_worker.id,
+                )
+            })?;
 
         let mut listeners = None;
         {
@@ -722,7 +731,7 @@ impl CommandServer {
             Some(l) => {
                 info!(
                     "sending listeners: to the new worker: {:?}",
-                    worker.scm_socket.send_listeners(&l)
+                    new_worker.scm_socket.send_listeners(&l)
                 );
                 l.close();
             }
@@ -734,7 +743,7 @@ impl CommandServer {
             UnixStream::from_raw_fd(fd)
         })?;
 
-        let id = worker.id;
+        let id = new_worker.id;
         let command_tx = self.command_tx.clone();
         smol::spawn(async move {
             super::worker_loop(id, stream, command_tx, worker_rx).await;
@@ -744,7 +753,7 @@ impl CommandServer {
         let activate_orders = self.state.generate_activate_orders();
         let mut count = 0usize;
         for order in activate_orders.into_iter() {
-            worker
+            new_worker
                 .send(
                     format!("{}-ACTIVATE-{}", request_identifier.client, count),
                     order,
@@ -753,7 +762,7 @@ impl CommandServer {
             count += 1;
         }
         info!("sent config messages to the new worker");
-        self.workers.push(worker);
+        self.workers.push(new_worker);
 
         info!("finished upgrade");
         Ok(Some(Success::UpgradeWorker(id)))
@@ -1180,6 +1189,8 @@ impl CommandServer {
                 stopping_workers.insert(worker.id);
             }
 
+            // TODO:
+            // let request_id = request_identifier.to_worker_request_id();
             let req_id = format!("{}-worker-{}", request_identifier.client, worker.id);
             worker.send(req_id.clone(), order.clone()).await;
             self.in_flight.insert(req_id, (worker_order_tx.clone(), 1));

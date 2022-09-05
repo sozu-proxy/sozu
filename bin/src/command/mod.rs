@@ -78,10 +78,14 @@ enum CommandMessage {
     MasterStop,
 }
 
+/// identifies a request only within the command server
+/// the request part does NOT get sent to a worker
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct RequestIdentifier {
-    client: String,  // the client who sent the request (ex: "CL-0")
-    request: String, // the request id (ex: "ID-MAN9QF")
+    /// the client who sent the request (ex: "CL-0")
+    client: String,
+    // the request id (ex: "ID-MAN9QF")
+    request: String,
 }
 
 impl RequestIdentifier {
@@ -239,7 +243,7 @@ pub struct CommandServer {
     state: ConfigState,
     config: Config,
     /// id of the next worker to be spawned
-    next_id: u32,
+    next_worker_id: u32,
     executable_path: String,
     /// caching the number of backends instead of going through the whole state.backends hashmap
     backends_count: usize,
@@ -304,7 +308,7 @@ impl CommandServer {
             workers,
             event_subscribers: HashSet::new(),
             in_flight: HashMap::new(),
-            next_id,
+            next_worker_id: next_id,
             executable_path,
             backends_count,
             frontends_count,
@@ -316,6 +320,7 @@ impl CommandServer {
         while let Some(command) = self.command_rx.next().await {
             let result: anyhow::Result<Success> = match command {
                 CommandMessage::ClientNew { id, sender } => {
+                    // this appears twice, which is weird
                     debug!("adding new client {}", id);
                     self.clients.insert(id.to_owned(), sender);
                     Ok(Success::ClientNew(id))
@@ -392,7 +397,7 @@ impl CommandServer {
             config: self.config.clone(),
             workers,
             state,
-            next_id: self.next_id,
+            next_id: self.next_worker_id,
             //token_count: self.token_count,
         }
     }
@@ -422,10 +427,12 @@ impl CommandServer {
                 listener.read_with(|l| l.accept())
                 ).await {
                 */
-                let future = listener.accept();
-                futures::pin_mut!(future);
+                let accept_client = listener.accept();
+                futures::pin_mut!(accept_client);
                 let (stream, _) =
-                    match futures::future::select(accept_cancel_rx.take().unwrap(), future).await {
+                    match futures::future::select(accept_cancel_rx.take().unwrap(), accept_client)
+                        .await
+                    {
                         futures::future::Either::Left((_canceled, _)) => {
                             info!("stopping listener");
                             break;
@@ -506,7 +513,7 @@ impl CommandServer {
             workers,
             event_subscribers: HashSet::new(),
             in_flight: HashMap::new(),
-            next_id,
+            next_worker_id: next_id,
             executable_path,
             backends_count,
             frontends_count,
@@ -656,7 +663,7 @@ impl CommandServer {
 
         incr!("worker_restart");
 
-        let id = self.next_id;
+        let id = self.next_worker_id;
         let listeners = Some(Listeners {
             http: Vec::new(),
             tls: Vec::new(),
@@ -673,7 +680,7 @@ impl CommandServer {
         .with_context(|| format!("Could not start new worker {}", id))?;
 
         info!("created new worker: {}", id);
-        self.next_id += 1;
+        self.next_worker_id += 1;
 
         let sock = worker.worker_channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10_000);

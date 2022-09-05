@@ -474,7 +474,7 @@ impl CommandManager {
                         send.send(()).unwrap();
                     });
 
-                    let finished = recv.recv_timeout(Duration::from_millis(1000)).is_ok();
+                    let finished = recv.recv_timeout(self.timeout).is_ok();
                     let placeholder = if finished {
                         String::from("")
                     } else {
