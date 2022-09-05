@@ -52,29 +52,33 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
             tcp: Vec::new(),
         });
 
-        let (pid, command, scm) = start_worker_process(
+        let (pid, command_channel, scm_socket) = fork_main_into_worker(
             &index.to_string(),
             config,
             executable_path.clone(),
             &state,
             listeners,
         )?;
-        let mut w = Worker::new(index as u32, pid, command, scm, config);
+        let mut worker = Worker::new(index as u32, pid, command_channel, scm_socket, config);
+
         // the new worker expects a status message at startup
-        if let Some(channel) = w.channel.as_mut() {
-            channel.set_blocking(true);
-            channel.write_message(&ProxyRequest {
+        if let Some(command_channel) = worker.worker_channel.as_mut() {
+            command_channel.set_blocking(true);
+            command_channel.write_message(&ProxyRequest {
                 id: format!("start-status-{}", index),
                 order: ProxyRequestData::Status,
             });
-            channel.set_nonblocking(true);
+            command_channel.set_nonblocking(true);
         }
-        workers.push(w);
+
+        workers.push(worker);
     }
     info!("Created workers");
     Ok(workers)
 }
 
+/// called by the CommandServer to start an individual worker
+/// returns a handle of the worker, with channels to write to it
 pub fn start_worker(
     id: u32,
     config: &Config,
@@ -82,33 +86,40 @@ pub fn start_worker(
     state: &ConfigState,
     listeners: Option<Listeners>,
 ) -> anyhow::Result<Worker> {
-    let (pid, command, scm) =
-        start_worker_process(&id.to_string(), config, executable_path, state, listeners)?;
+    let (worker_pid, main_to_worker_channel, main_to_worker_scm) =
+        fork_main_into_worker(&id.to_string(), config, executable_path, state, listeners)?;
 
-    Ok(Worker::new(id, pid, command, scm, config))
+    Ok(Worker::new(
+        id,
+        worker_pid,
+        main_to_worker_channel,
+        main_to_worker_scm,
+        config,
+    ))
 }
 
+/// called within a worker process, this starts the actual proxy
 pub fn begin_worker_process(
-    fd: i32,
-    scm: i32,
+    worker_to_main_channel_fd: i32,
+    worker_to_main_scm_fd: i32,
     configuration_state_fd: i32,
     id: i32,
     command_buffer_size: usize,
     max_command_buffer_size: usize,
 ) -> Result<(), anyhow::Error> {
-    let mut command: Channel<ProxyResponse, Config> = Channel::new(
-        unsafe { UnixStream::from_raw_fd(fd) },
+    let mut worker_to_main_channel: Channel<ProxyResponse, Config> = Channel::new(
+        unsafe { UnixStream::from_raw_fd(worker_to_main_channel_fd) },
         command_buffer_size,
         max_command_buffer_size,
     );
 
-    command.set_nonblocking(false);
+    worker_to_main_channel.set_nonblocking(false);
 
     let configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
     let config_state: ConfigState = serde_json::from_reader(configuration_state_file)
         .with_context(|| "could not parse configuration state data")?;
 
-    let worker_config = command
+    let worker_config = worker_to_main_channel
         .read_message()
         .with_context(|| "worker could not read configuration from socket")?;
     //println!("got message: {:?}", worker_config);
@@ -136,9 +147,10 @@ pub fn begin_worker_process(
     );
     info!("worker {} starting...", id);
 
-    command.set_nonblocking(true);
-    let mut command: Channel<ProxyResponse, ProxyRequest> = command.into();
-    command.readiness.insert(Ready::readable());
+    worker_to_main_channel.set_nonblocking(true);
+    let mut worker_to_main_channel: Channel<ProxyResponse, ProxyRequest> =
+        worker_to_main_channel.into();
+    worker_to_main_channel.readiness.insert(Ready::readable());
 
     if let Some(metrics) = worker_config.metrics.as_ref() {
         metrics::setup(
@@ -150,8 +162,8 @@ pub fn begin_worker_process(
     }
 
     let mut server = Server::new_from_config(
-        command,
-        ScmSocket::new(scm),
+        worker_to_main_channel,
+        ScmSocket::new(worker_to_main_scm_fd),
         worker_config,
         config_state,
         true,
@@ -163,8 +175,8 @@ pub fn begin_worker_process(
     Ok(())
 }
 
-pub fn start_worker_process(
-    id: &str,
+pub fn fork_main_into_worker(
+    worker_id: &str,
     config: &Config,
     executable_path: String,
     state: &ConfigState,
@@ -182,50 +194,53 @@ pub fn start_worker_process(
         .seek(SeekFrom::Start(0))
         .with_context(|| "could not seek to beginning of file")?;
 
-    let (server, client) = UnixStream::pair()?;
-    let (scm_server_fd, scm_client) = UnixStream::pair()?;
+    let (main_to_worker, worker_to_main) = UnixStream::pair()?;
+    let (main_to_worker_scm, worker_to_main_scm) = UnixStream::pair()?;
 
-    let scm_server = ScmSocket::new(scm_server_fd.into_raw_fd());
+    let main_to_worker_scm = ScmSocket::new(main_to_worker_scm.into_raw_fd());
 
-    util::disable_close_on_exec(client.as_raw_fd())?;
-    util::disable_close_on_exec(scm_client.as_raw_fd())?;
+    util::disable_close_on_exec(worker_to_main.as_raw_fd())?;
+    util::disable_close_on_exec(worker_to_main_scm.as_raw_fd())?;
 
-    let mut command: Channel<Config, ProxyResponse> = Channel::new(
-        server,
+    let mut main_to_worker_channel: Channel<Config, ProxyResponse> = Channel::new(
+        main_to_worker,
         config.command_buffer_size,
         config.max_command_buffer_size,
     );
-    command.set_nonblocking(false);
+    main_to_worker_channel.set_nonblocking(false);
 
-    info!("{} launching worker", id);
+    info!("{} launching worker", worker_id);
     debug!("executable path is {}", executable_path);
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => {
-            info!("{} worker launched: {}", id, child);
-            command.write_message(config);
-            command.set_nonblocking(true);
+            info!("{} worker launched: {}", worker_id, child);
+            main_to_worker_channel.write_message(config);
+            main_to_worker_channel.set_nonblocking(true);
 
-            if let Some(l) = listeners {
-                info!("sending listeners to new worker: {:?}", l);
-                let res = scm_server.send_listeners(&l);
-                info!("sent listeners from main: {:?}", res);
-                l.close();
+            if let Some(listeners) = listeners {
+                info!("sending listeners to new worker: {:?}", listeners);
+                let result = main_to_worker_scm.send_listeners(&listeners);
+                info!("sent listeners from main: {:?}", result);
+                listeners.close();
             };
-            util::disable_close_on_exec(scm_server.fd)?;
+            util::disable_close_on_exec(main_to_worker_scm.fd)?;
 
-            let command: Channel<ProxyRequest, ProxyResponse> = command.into();
-            Ok((child.into(), command, scm_server))
+            Ok((
+                child.into(),
+                main_to_worker_channel.into(),
+                main_to_worker_scm,
+            ))
         }
         Ok(ForkResult::Child) => {
             trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
             Command::new(executable_path)
                 .arg("worker")
                 .arg("--id")
-                .arg(id)
+                .arg(worker_id)
                 .arg("--fd")
-                .arg(client.as_raw_fd().to_string())
+                .arg(worker_to_main.as_raw_fd().to_string())
                 .arg("--scm")
-                .arg(scm_client.as_raw_fd().to_string())
+                .arg(worker_to_main_scm.as_raw_fd().to_string())
                 .arg("--configuration-state-fd")
                 .arg(state_file.as_raw_fd().to_string())
                 .arg("--command-buffer-size")

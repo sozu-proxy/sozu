@@ -34,8 +34,8 @@ use sozu_command_lib::{
 use sozu::metrics::METRICS;
 
 use crate::{
-    command::{CommandMessage, CommandServer, RequestIdentifier, Response, Success},
-    upgrade::start_new_main_process,
+    command::{CommandMessage, CommandServer, RequestIdentifier, Response, Success, Worker},
+    upgrade::fork_main_into_new_main,
     worker::start_worker,
 };
 
@@ -319,23 +319,26 @@ impl CommandServer {
                 };
 
                 // notify the command server
-                if error == 0 {
-                    return_success(
-                        command_tx,
-                        request_identifier,
-                        Success::LoadState(path.to_string(), ok, error),
-                    )
-                    .await;
-                } else {
-                    return_error(
-                        command_tx,
-                        request_identifier,
-                        format!(
-                            "Loading state failed, ok: {}, error: {}, path: {}",
-                            ok, error, path
-                        ),
-                    )
-                    .await;
+                match error {
+                    0 => {
+                        return_success(
+                            command_tx,
+                            request_identifier,
+                            Success::LoadState(path.to_string(), ok, error),
+                        )
+                        .await;
+                    }
+                    _ => {
+                        return_error(
+                            command_tx,
+                            request_identifier,
+                            format!(
+                                "Loading state failed, ok: {}, error: {}, path: {}",
+                                ok, error, path
+                            ),
+                        )
+                        .await;
+                    }
                 }
             })
             .detach();
@@ -423,6 +426,8 @@ impl CommandServer {
             })
             .collect();
 
+        debug!("workers: {:#?}", workers);
+
         Ok(Some(Success::ListWorkers(CommandResponseData::Workers(
             workers,
         ))))
@@ -434,13 +439,13 @@ impl CommandServer {
         _tag: &str,
     ) -> anyhow::Result<Option<Success>> {
         let mut worker = start_worker(
-            self.next_id,
+            self.next_worker_id,
             &self.config,
             self.executable_path.clone(),
             &self.state,
             None,
         )
-        .with_context(|| format!("Failed at creating worker {}", self.next_id))?;
+        .with_context(|| format!("Failed at creating worker {}", self.next_worker_id))?;
 
         // Todo: refactor the CLI, see issue #740
         // return_processing(
@@ -452,9 +457,9 @@ impl CommandServer {
 
         info!("created new worker: {}", worker.id);
 
-        self.next_id += 1;
+        self.next_worker_id += 1;
 
-        let sock = worker.channel.take().unwrap().sock;
+        let sock = worker.worker_channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
         worker.sender = Some(worker_tx);
 
@@ -473,7 +478,7 @@ impl CommandServer {
 
         info!(
             "sending listeners: to the new worker: {:?}",
-            worker.scm.send_listeners(&Listeners {
+            worker.scm_socket.send_listeners(&Listeners {
                 http: Vec::new(),
                 tls: Vec::new(),
                 tcp: Vec::new(),
@@ -514,23 +519,25 @@ impl CommandServer {
         // )
         // .await;
 
-        let (pid, mut channel) =
-            start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data())
+        let upgrade_data = self.generate_upgrade_data();
+
+        let (new_main_pid, mut channel) =
+            fork_main_into_new_main(self.executable_path.clone(), upgrade_data)
                 .with_context(|| "Could not start a new main process")?;
 
         channel.set_blocking(true);
-        let res = channel.read_message();
-        debug!("upgrade channel sent {:?}", res);
+        let received_ok_from_new_process = channel.read_message();
+        debug!("upgrade channel sent {:?}", received_ok_from_new_process);
 
         // signaling the accept loop that it should stop
         if let Err(e) = self.accept_cancel.take().unwrap().send(()) {
             error!("could not close the accept loop: {:?}", e);
         }
 
-        match res {
+        match received_ok_from_new_process {
             Some(true) => {
                 info!("wrote final message, closing");
-                Ok(Some(Success::UpgradeMain(pid)))
+                Ok(Some(Success::UpgradeMain(new_main_pid)))
             }
             _ => bail!("could not upgrade main process"),
         }
@@ -553,6 +560,8 @@ impl CommandServer {
                 worker.id == id
                     && worker.run_state != RunState::Stopping
                     && worker.run_state != RunState::Stopped
+                // should we add this?
+                // && worker.run_state != RunState::NotAnswering
             })
             .is_none()
         {
@@ -563,8 +572,8 @@ impl CommandServer {
         }
 
         // same as launch_worker
-        let next_id = self.next_id;
-        let mut worker = start_worker(
+        let next_id = self.next_worker_id;
+        let mut new_worker = start_worker(
             next_id,
             &self.config,
             self.executable_path.clone(),
@@ -583,13 +592,13 @@ impl CommandServer {
 
         info!("created new worker: {}", next_id);
 
-        self.next_id += 1;
+        self.next_worker_id += 1;
 
-        let sock = worker.channel.take().unwrap().sock;
+        let sock = new_worker.worker_channel.take().unwrap().sock;
         let (worker_tx, worker_rx) = channel(10000);
-        worker.sender = Some(worker_tx);
+        new_worker.sender = Some(worker_tx);
 
-        worker
+        new_worker
             .sender
             .as_mut()
             .unwrap()
@@ -598,11 +607,16 @@ impl CommandServer {
                 order: ProxyRequestData::Status,
             })
             .await
-            .with_context(|| format!("could not send status message to worker {:?}", worker.id,))?;
+            .with_context(|| {
+                format!(
+                    "could not send status message to worker {:?}",
+                    new_worker.id,
+                )
+            })?;
 
         let mut listeners = None;
         {
-            let old_worker = self
+            let old_worker: &mut Worker = self
                 .workers
                 .iter_mut()
                 .filter(|worker| worker.id == id)
@@ -649,16 +663,23 @@ impl CommandServer {
             //FIXME: use blocking
             loop {
                 info!("waiting for scm sockets");
-                old_worker.scm.set_blocking(true);
-                if let Some(l) = old_worker.scm.receive_listeners() {
-                    listeners = Some(l);
-                    break;
-                } else {
-                    counter += 1;
-                    if counter == 50 {
+                old_worker.scm_socket.set_blocking(true);
+                match old_worker.scm_socket.receive_listeners() {
+                    Ok(l) => {
+                        listeners = Some(l);
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    Err(error) => {
+                        error!(
+                            "Could not receive listerners from scm socket with file descriptor {}:\n{:?}",
+                            old_worker.scm_socket.fd, error
+                        );
+                        counter += 1;
+                        if counter == 50 {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                 }
             }
             info!("got scm sockets");
@@ -710,7 +731,7 @@ impl CommandServer {
             Some(l) => {
                 info!(
                     "sending listeners: to the new worker: {:?}",
-                    worker.scm.send_listeners(&l)
+                    new_worker.scm_socket.send_listeners(&l)
                 );
                 l.close();
             }
@@ -722,7 +743,7 @@ impl CommandServer {
             UnixStream::from_raw_fd(fd)
         })?;
 
-        let id = worker.id;
+        let id = new_worker.id;
         let command_tx = self.command_tx.clone();
         smol::spawn(async move {
             super::worker_loop(id, stream, command_tx, worker_rx).await;
@@ -732,7 +753,7 @@ impl CommandServer {
         let activate_orders = self.state.generate_activate_orders();
         let mut count = 0usize;
         for order in activate_orders.into_iter() {
-            worker
+            new_worker
                 .send(
                     format!("{}-ACTIVATE-{}", request_identifier.client, count),
                     order,
@@ -741,7 +762,7 @@ impl CommandServer {
             count += 1;
         }
         info!("sent config messages to the new worker");
-        self.workers.push(worker);
+        self.workers.push(new_worker);
 
         info!("finished upgrade");
         Ok(Some(Success::UpgradeWorker(id)))
@@ -1168,6 +1189,8 @@ impl CommandServer {
                 stopping_workers.insert(worker.id);
             }
 
+            // TODO:
+            // let request_id = request_identifier.to_worker_request_id();
             let req_id = format!("{}-worker-{}", request_identifier.client, worker.id);
             worker.send(req_id.clone(), order.clone()).await;
             self.in_flight.insert(req_id, (worker_order_tx.clone(), 1));
@@ -1341,8 +1364,8 @@ impl CommandServer {
         );
 
         match self.clients.get_mut(&client_id) {
-            Some(sender) => {
-                sender.send(command_response).await.with_context(|| {
+            Some(client_tx) => {
+                client_tx.send(command_response).await.with_context(|| {
                     format!(
                         "Could not notify client {} about request {}",
                         client_id, request_identifier.request,

@@ -8,6 +8,7 @@ use std::{
     str::from_utf8,
 };
 
+use anyhow::Context;
 use mio::net::TcpListener;
 use nix::{cmsg_space, sys::socket, Result as NixResult};
 use serde_json;
@@ -68,70 +69,54 @@ impl ScmSocket {
         self.send_msg(&message, &v)
     }
 
-    pub fn receive_listeners(&self) -> Option<Listeners> {
+    pub fn receive_listeners(&self) -> anyhow::Result<Listeners> {
         let mut buf = vec![0; MAX_BYTES_OUT];
 
         let mut received_fds: [RawFd; MAX_FDS_OUT] = [0; MAX_FDS_OUT];
 
-        match self.rcv_msg(&mut buf, &mut received_fds) {
-            Err(e) => {
-                error!("could not receive listeners (from fd {}): {:?}", self.fd, e);
-                None
-            }
-            Ok((sz, fds_len)) => {
-                //println!("{} received :{:?}", self.fd, (sz, fds_len));
-                match from_utf8(&buf[..sz]) {
-                    Ok(s) => match serde_json::from_str::<ListenersCount>(s) {
-                        Err(e) => {
-                            error!(
-                                "could not parse listeners list (from fd {}): {:?}",
-                                self.fd, e
-                            );
-                            None
-                        }
-                        Ok(mut listeners_count) => {
-                            let mut index = 0;
-                            let len = listeners_count.http.len();
-                            let mut http = Vec::new();
-                            http.extend(
-                                listeners_count
-                                    .http
-                                    .drain(..)
-                                    .zip((&received_fds[index..index + len]).iter().cloned()),
-                            );
+        let (size, file_descriptor_length) = self
+            .rcv_msg(&mut buf, &mut received_fds)
+            .with_context(|| "could not receive listeners")?;
 
-                            index += len;
-                            let len = listeners_count.tls.len();
-                            let mut tls = Vec::new();
-                            tls.extend(
-                                listeners_count
-                                    .tls
-                                    .drain(..)
-                                    .zip((&received_fds[index..index + len]).iter().cloned()),
-                            );
+        debug!("{} received :{:?}", self.fd, (size, file_descriptor_length));
 
-                            index += len;
-                            let mut tcp = Vec::new();
-                            tcp.extend(
-                                listeners_count
-                                    .tcp
-                                    .drain(..)
-                                    .zip((&received_fds[index..fds_len]).iter().cloned()),
-                            );
+        let raw_listener_list =
+            from_utf8(&buf[..size]).with_context(|| "Could not parse utf8 string from buffer")?;
 
-                            Some(Listeners { http, tls, tcp })
-                        }
-                    },
-                    Err(e) => {
-                        error!(
-                            "could not parse listeners list (from fd {}): {:?}",
-                            self.fd, e
-                        );
-                        None
-                    }
-                }
-            }
-        }
+        let mut listeners_count = serde_json::from_str::<ListenersCount>(raw_listener_list)
+            .with_context(|| "Could not deserialize utf8 string into listeners")?;
+
+        let mut index = 0;
+        let len = listeners_count.http.len();
+        let mut http = Vec::new();
+        http.extend(
+            listeners_count
+                .http
+                .drain(..)
+                .zip((&received_fds[index..index + len]).iter().cloned()),
+        );
+
+        index += len;
+        let len = listeners_count.tls.len();
+        let mut tls = Vec::new();
+        tls.extend(
+            listeners_count
+                .tls
+                .drain(..)
+                .zip((&received_fds[index..index + len]).iter().cloned()),
+        );
+
+        index += len;
+        let mut tcp = Vec::new();
+        tcp.extend(
+            listeners_count.tcp.drain(..).zip(
+                (&received_fds[index..file_descriptor_length])
+                    .iter()
+                    .cloned(),
+            ),
+        );
+
+        Ok(Listeners { http, tls, tcp })
     }
 
     pub fn send_msg(&self, buf: &[u8], fds: &[RawFd]) -> NixResult<()> {

@@ -43,9 +43,15 @@ pub enum SubCmd {
     Worker {
         #[clap(long = "id", help = "worker identifier")]
         id: i32,
-        #[clap(long = "fd", help = "IPC file descriptor")]
+        #[clap(
+            long = "fd",
+            help = "IPC file descriptor of the worker to main channel"
+        )]
         fd: i32,
-        #[clap(long = "scm", help = "IPC SCM_RIGHTS file descriptor")]
+        #[clap(
+            long = "scm",
+            help = "IPC SCM_RIGHTS file descriptor of the worker to main scm socket"
+        )]
         scm: i32,
         #[clap(
             long = "configuration-state-fd",

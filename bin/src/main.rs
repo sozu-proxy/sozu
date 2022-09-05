@@ -21,11 +21,17 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 #[macro_use]
 mod logging;
 
+/// the arguments to the sozu command line
 mod cli;
+/// Receives orders from the CLI, transmits to workers
 mod command;
+/// The command line logic
 mod ctl;
+/// Forking & restarting the main process
 mod upgrade;
+/// Some unix helper functions
 mod util;
+/// Start and restart the worker UNIX processes
 mod worker;
 
 use std::panic;
@@ -52,6 +58,7 @@ fn main(args: Args) -> anyhow::Result<()> {
             info!("main process stopped");
             Ok(())
         }
+        // this is used only by the CLI when upgrading
         cli::SubCmd::Worker {
             fd,
             scm,
@@ -71,6 +78,7 @@ fn main(args: Args) -> anyhow::Result<()> {
                 max_command_buffer_size,
             )
         }
+        // this is used only by the CLI when upgrading
         cli::SubCmd::Main {
             fd,
             upgrade_fd,
@@ -205,7 +213,7 @@ fn update_process_limits(config: &Config) -> Result<(), anyhow::Error> {
         .captures(&f)
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse::<usize>().ok())
-        .expect("Couldn't parse /proc/sys/fs/file-max");
+        .with_context(|| "Couldn't parse /proc/sys/fs/file-max")?;
     if config.max_connections > system_max_fd {
         error!(
             "Proxies total max_connections can't be higher than system's file-max limit. \
