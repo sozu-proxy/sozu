@@ -4,7 +4,6 @@ use std::{
     sync::mpsc,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
 };
 
 use anyhow::{self, bail, Context};
@@ -298,8 +297,8 @@ impl CommandManager {
 
                     // Reconnect to the new main
                     println!("Reconnecting to new main process...");
-                    // self.channel = create_channel(&self.config)
-                    //     .with_context(|| "could not reconnect to the command unix socket")?;
+                    self.channel = create_channel(&self.config)
+                        .with_context(|| "could not reconnect to the command unix socket")?;
 
                     // Do a rolling restart of the workers
                     let running_workers = workers

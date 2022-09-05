@@ -346,8 +346,14 @@ impl CommandServer {
                     request_identifier,
                     response,
                 } => {
-                    self.notify_advancement_to_client(request_identifier, response)
-                        .await
+                    let success_result = self.notify_advancement_to_client(request_identifier, response.clone())
+                        .await;
+                    if let Response::Ok(Success::UpgradeMain(_)) = response {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        info!("shutting down old main");
+                        std::process::exit(0);
+                    };
+                    success_result
                 }
                 CommandMessage::MasterStop => {
                     info!("stopping main process");
@@ -361,12 +367,6 @@ impl CommandServer {
 
                     // perform shutdowns
                     match order_success {
-                        Success::UpgradeMain(_) => {
-                            // the main process has to shutdown after the other has launched successfully
-                            //FIXME: should do some cleanup before exiting
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                            std::process::exit(0);
-                        }
                         Success::MasterStop => {
                             // breaking the loop brings run() to return and ends Sōzu
                             // shouldn't we have the same break for both shutdowns?

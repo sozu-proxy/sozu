@@ -521,12 +521,12 @@ impl CommandServer {
 
         let upgrade_data = self.generate_upgrade_data();
 
-        let (new_main_pid, mut channel) =
+        let (new_main_pid, mut fork_confirmation_channel) =
             fork_main_into_new_main(self.executable_path.clone(), upgrade_data)
                 .with_context(|| "Could not start a new main process")?;
 
-        channel.set_blocking(true);
-        let received_ok_from_new_process = channel.read_message();
+        fork_confirmation_channel.set_blocking(true);
+        let received_ok_from_new_process = fork_confirmation_channel.read_message();
         debug!("upgrade channel sent {:?}", received_ok_from_new_process);
 
         // signaling the accept loop that it should stop
