@@ -485,10 +485,9 @@ pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<&[u8]>)> {
     let (i, port) = opt(preceded(bytes::complete::tag(":"), digit_complete))(i)?;
 
     if !i.is_empty() {
-        Err(Err::Error(Error::new(i, ErrorKind::Eof)))
-    } else {
-        Ok((i, (host, port)))
+        return Err(Err::Error(Error::new(i, ErrorKind::Eof)));
     }
+    Ok((i, (host, port)))
 }
 
 pub fn is_hex_digit(chr: u8) -> bool {
@@ -1010,6 +1009,7 @@ pub struct Connection {
     pub upgrade: Option<String>,
     pub to_delete: Option<HashSet<Vec<u8>>>,
     pub continues: Continue,
+    /// ensures that a session always redirects to the same backend
     pub sticky_session: Option<String>,
     pub forwarded: ForwardedHeaders,
 }

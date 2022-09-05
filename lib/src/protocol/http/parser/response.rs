@@ -268,26 +268,31 @@ pub fn parse_response(
         ResponseState::Initial => {
             match status_line(buf) {
                 Ok((input, raw_status_line)) => {
-                    if let Some(status_line) = StatusLine::from_raw_status_line(raw_status_line) {
-                        let conn = Connection::new();
-                        /*let conn = if rl.version == "11" {
-                          Connection::keep_alive()
-                        } else {
-                          Connection::close()
-                        };
-                        */
-                        (
-                            BufferMove::Advance(buf.offset(input)),
-                            ResponseState::HasStatusLine(status_line, conn),
-                        )
-                    } else {
-                        (
+                    match StatusLine::from_raw_status_line(raw_status_line) {
+                        // We may handle 499
+                        // Some(499) => {
+                        //     (BufferMove::None, ResponseState::Error())
+                        // }
+                        Some(status_line) => {
+                            let conn = Connection::new();
+                            /*let conn = if rl.version == "11" {
+                              Connection::keep_alive()
+                            } else {
+                              Connection::close()
+                            };
+                            */
+                            (
+                                BufferMove::Advance(buf.offset(input)),
+                                ResponseState::HasStatusLine(status_line, conn),
+                            )
+                        }
+                        None => (
                             BufferMove::None,
                             ResponseState::Error(None, None, None, None, None),
-                        )
+                        ),
                     }
                 }
-                res => default_response_result(state, res),
+                err => default_response_result(state, err),
             }
         }
         ResponseState::HasStatusLine(sl, conn) => {
