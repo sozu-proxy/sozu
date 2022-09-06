@@ -22,7 +22,7 @@ pub type MessageId = String;
 pub struct ProxyResponse {
     pub id: MessageId,
     pub status: ProxyResponseStatus,
-    pub data: Option<ProxyResponseData>,
+    pub content: Option<ProxyResponseContent>,
 }
 
 impl ProxyResponse {
@@ -33,7 +33,7 @@ impl ProxyResponse {
         Self {
             id: id.to_string(),
             status: ProxyResponseStatus::Ok,
-            data: None,
+            content: None,
         }
     }
 
@@ -45,7 +45,7 @@ impl ProxyResponse {
         Self {
             id: id.to_string(),
             status: ProxyResponseStatus::Error(error.to_string()),
-            data: None,
+            content: None,
         }
     }
 
@@ -56,7 +56,7 @@ impl ProxyResponse {
         Self {
             id: id.to_string(),
             status: ProxyResponseStatus::Processing,
-            data: None,
+            content: None,
         }
     }
 
@@ -67,7 +67,7 @@ impl ProxyResponse {
         Self {
             id: id.to_string(),
             status,
-            data: None,
+            content: None,
         }
     }
 }
@@ -87,7 +87,7 @@ pub enum ProxyResponseStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ProxyResponseData {
+pub enum ProxyResponseContent {
     /// contains proxy & cluster metrics
     Metrics(WorkerMetrics),
     Query(QueryAnswer),
@@ -181,7 +181,7 @@ pub enum ProxyEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequest {
     pub id: MessageId,
-    pub order: ProxyRequestData,
+    pub order: ProxyRequestOrder,
 }
 
 impl fmt::Display for ProxyRequest {
@@ -192,7 +192,7 @@ impl fmt::Display for ProxyRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ProxyRequestData {
+pub enum ProxyRequestOrder {
     AddCluster(Cluster),
     RemoveCluster { cluster_id: String },
 
@@ -871,10 +871,10 @@ pub enum QueryAnswerMetrics {
     Error(String),
 }
 
-impl ProxyRequestData {
+impl ProxyRequestOrder {
     pub fn get_topics(&self) -> HashSet<Topic> {
         match *self {
-            ProxyRequestData::AddCluster(_) => [
+            ProxyRequestOrder::AddCluster(_) => [
                 Topic::HttpProxyConfig,
                 Topic::HttpsProxyConfig,
                 Topic::TcpProxyConfig,
@@ -882,7 +882,7 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::RemoveCluster { cluster_id: _ } => [
+            ProxyRequestOrder::RemoveCluster { cluster_id: _ } => [
                 Topic::HttpProxyConfig,
                 Topic::HttpsProxyConfig,
                 Topic::TcpProxyConfig,
@@ -890,34 +890,34 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::AddHttpFrontend(_) => {
+            ProxyRequestOrder::AddHttpFrontend(_) => {
                 [Topic::HttpProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::RemoveHttpFrontend(_) => {
+            ProxyRequestOrder::RemoveHttpFrontend(_) => {
                 [Topic::HttpProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::AddHttpsFrontend(_) => {
+            ProxyRequestOrder::AddHttpsFrontend(_) => {
                 [Topic::HttpsProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::RemoveHttpsFrontend(_) => {
+            ProxyRequestOrder::RemoveHttpsFrontend(_) => {
                 [Topic::HttpsProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::AddCertificate(_) => {
+            ProxyRequestOrder::AddCertificate(_) => {
                 [Topic::HttpsProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::ReplaceCertificate(_) => {
+            ProxyRequestOrder::ReplaceCertificate(_) => {
                 [Topic::HttpsProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::RemoveCertificate(_) => {
+            ProxyRequestOrder::RemoveCertificate(_) => {
                 [Topic::HttpsProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::AddTcpFrontend(_) => {
+            ProxyRequestOrder::AddTcpFrontend(_) => {
                 [Topic::TcpProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::RemoveTcpFrontend(_) => {
+            ProxyRequestOrder::RemoveTcpFrontend(_) => {
                 [Topic::TcpProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::AddBackend(_) => [
+            ProxyRequestOrder::AddBackend(_) => [
                 Topic::HttpProxyConfig,
                 Topic::HttpsProxyConfig,
                 Topic::TcpProxyConfig,
@@ -925,7 +925,7 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::RemoveBackend(_) => [
+            ProxyRequestOrder::RemoveBackend(_) => [
                 Topic::HttpProxyConfig,
                 Topic::HttpsProxyConfig,
                 Topic::TcpProxyConfig,
@@ -933,16 +933,16 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::AddHttpListener(_) => {
+            ProxyRequestOrder::AddHttpListener(_) => {
                 [Topic::HttpProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::AddHttpsListener(_) => {
+            ProxyRequestOrder::AddHttpsListener(_) => {
                 [Topic::HttpsProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::AddTcpListener(_) => {
+            ProxyRequestOrder::AddTcpListener(_) => {
                 [Topic::TcpProxyConfig].iter().cloned().collect()
             }
-            ProxyRequestData::RemoveListener(_) => [
+            ProxyRequestOrder::RemoveListener(_) => [
                 Topic::HttpProxyConfig,
                 Topic::HttpsProxyConfig,
                 Topic::TcpProxyConfig,
@@ -950,7 +950,7 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::ActivateListener(_) => [
+            ProxyRequestOrder::ActivateListener(_) => [
                 Topic::HttpProxyConfig,
                 Topic::HttpsProxyConfig,
                 Topic::TcpProxyConfig,
@@ -958,7 +958,7 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::DeactivateListener(_) => [
+            ProxyRequestOrder::DeactivateListener(_) => [
                 Topic::HttpProxyConfig,
                 Topic::HttpsProxyConfig,
                 Topic::TcpProxyConfig,
@@ -966,8 +966,8 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::Query(_) => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-            ProxyRequestData::SoftStop => [
+            ProxyRequestOrder::Query(_) => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+            ProxyRequestOrder::SoftStop => [
                 Topic::HttpProxyConfig,
                 Topic::HttpsProxyConfig,
                 Topic::TcpProxyConfig,
@@ -975,7 +975,7 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::HardStop => [
+            ProxyRequestOrder::HardStop => [
                 Topic::HttpProxyConfig,
                 Topic::HttpsProxyConfig,
                 Topic::TcpProxyConfig,
@@ -983,7 +983,7 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::Status => [
+            ProxyRequestOrder::Status => [
                 Topic::HttpProxyConfig,
                 Topic::HttpsProxyConfig,
                 Topic::TcpProxyConfig,
@@ -991,8 +991,8 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::ConfigureMetrics(_) => HashSet::new(),
-            ProxyRequestData::Logging(_) => [
+            ProxyRequestOrder::ConfigureMetrics(_) => HashSet::new(),
+            ProxyRequestOrder::Logging(_) => [
                 Topic::HttpsProxyConfig,
                 Topic::HttpProxyConfig,
                 Topic::TcpProxyConfig,
@@ -1000,7 +1000,7 @@ impl ProxyRequestData {
             .iter()
             .cloned()
             .collect(),
-            ProxyRequestData::ReturnListenSockets => HashSet::new(),
+            ProxyRequestOrder::ReturnListenSockets => HashSet::new(),
         }
     }
 }
@@ -1042,12 +1042,12 @@ mod tests {
     #[test]
     fn add_front_test() {
         let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": { "CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
-        let command: ProxyRequestData =
+        let command: ProxyRequestOrder =
             serde_json::from_str(raw_json).expect("could not parse json");
         println!("{:?}", command);
         assert!(
             command
-                == ProxyRequestData::AddHttpFrontend(HttpFrontend {
+                == ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
                     path: PathRule::Prefix(String::from("xxx")),
@@ -1062,12 +1062,12 @@ mod tests {
     #[test]
     fn remove_front_test() {
         let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
-        let command: ProxyRequestData =
+        let command: ProxyRequestOrder =
             serde_json::from_str(raw_json).expect("could not parse json");
         println!("{:?}", command);
         assert!(
             command
-                == ProxyRequestData::RemoveHttpFrontend(HttpFrontend {
+                == ProxyRequestOrder::RemoveHttpFrontend(HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
                     path: PathRule::Prefix(String::from("xxx")),
@@ -1085,12 +1085,12 @@ mod tests {
     #[test]
     fn add_backend_test() {
         let raw_json = r#"{"type": "ADD_BACKEND", "data": {"cluster_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080", "load_balancing_parameters": { "weight": 0 }}}"#;
-        let command: ProxyRequestData =
+        let command: ProxyRequestOrder =
             serde_json::from_str(raw_json).expect("could not parse json");
         println!("{:?}", command);
         assert!(
             command
-                == ProxyRequestData::AddBackend(Backend {
+                == ProxyRequestOrder::AddBackend(Backend {
                     cluster_id: String::from("xxx"),
                     backend_id: String::from("xxx-0"),
                     address: "0.0.0.0:8080".parse().unwrap(),
@@ -1104,12 +1104,12 @@ mod tests {
     #[test]
     fn remove_backend_test() {
         let raw_json = r#"{"type": "REMOVE_BACKEND", "data": {"cluster_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080"}}"#;
-        let command: ProxyRequestData =
+        let command: ProxyRequestOrder =
             serde_json::from_str(raw_json).expect("could not parse json");
         println!("{:?}", command);
         assert!(
             command
-                == ProxyRequestData::RemoveBackend(RemoveBackend {
+                == ProxyRequestOrder::RemoveBackend(RemoveBackend {
                     cluster_id: String::from("xxx"),
                     backend_id: String::from("xxx-0"),
                     address: "0.0.0.0:8080".parse().unwrap(),
@@ -1120,12 +1120,12 @@ mod tests {
     #[test]
     fn http_front_crash_test() {
         let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
-        let command: ProxyRequestData =
+        let command: ProxyRequestOrder =
             serde_json::from_str(raw_json).expect("could not parse json");
         println!("{:?}", command);
         assert!(
             command
-                == ProxyRequestData::AddHttpFrontend(HttpFrontend {
+                == ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
                     route: Route::ClusterId(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
                     path: PathRule::Prefix(String::from("")),

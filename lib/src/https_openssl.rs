@@ -55,7 +55,7 @@ use crate::{
         logging,
         proxy::{
             CertificateFingerprint, Cluster, HttpFrontend, HttpsListener, ProxyEvent, ProxyRequest,
-            ProxyRequestData, ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query,
+            ProxyRequestOrder, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, Query,
             QueryAnswer, QueryAnswerCertificate, QueryCertificateType, Route, TlsVersion,
         },
         ready::Ready,
@@ -2138,17 +2138,17 @@ impl ProxyConfiguration<Session> for Proxy {
     fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
         //trace!("{} notified", message);
         match message.order {
-            ProxyRequestData::AddCluster(cluster) => {
+            ProxyRequestOrder::AddCluster(cluster) => {
                 debug!("{} add cluster {:?}", message.id, cluster);
                 self.add_cluster(cluster);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::RemoveCluster { cluster_id } => {
+            ProxyRequestOrder::RemoveCluster { cluster_id } => {
                 debug!("{} remove cluster {:?}", message.id, cluster_id);
                 self.remove_cluster(&cluster_id);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::AddHttpsFrontend(front) => {
+            ProxyRequestOrder::AddHttpsFrontend(front) => {
                 //info!("HTTPS\t{} add front {:?}", id, front);
                 if let Some(listener) = self
                     .listeners
@@ -2166,7 +2166,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     )
                 }
             }
-            ProxyRequestData::RemoveHttpsFrontend(front) => {
+            ProxyRequestOrder::RemoveHttpsFrontend(front) => {
                 //info!("HTTPS\t{} remove front {:?}", id, front);
                 if let Some(listener) = self
                     .listeners
@@ -2184,7 +2184,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     )
                 }
             }
-            ProxyRequestData::AddCertificate(add_certificate) => {
+            ProxyRequestOrder::AddCertificate(add_certificate) => {
                 if let Some(listener) = self
                     .listeners
                     .values()
@@ -2200,7 +2200,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     ProxyResponse::error(message.id, "unsupported message")
                 }
             }
-            ProxyRequestData::RemoveCertificate(remove_certificate) => {
+            ProxyRequestOrder::RemoveCertificate(remove_certificate) => {
                 if let Some(listener) = self
                     .listeners
                     .values()
@@ -2218,7 +2218,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     ProxyResponse::error(message.id, "unsupported message")
                 }
             }
-            ProxyRequestData::ReplaceCertificate(replace) => {
+            ProxyRequestOrder::ReplaceCertificate(replace) => {
                 if let Some(listener) = self
                     .listeners
                     .values_mut()
@@ -2233,7 +2233,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     ProxyResponse::error(message.id, "unsupported message")
                 }
             }
-            ProxyRequestData::RemoveListener(remove) => {
+            ProxyRequestOrder::RemoveListener(remove) => {
                 debug!("removing HTTPS listener at address {:?}", remove.address);
                 if !self.remove_listener(remove.address) {
                     ProxyResponse::error(
@@ -2247,7 +2247,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     ProxyResponse::ok(message.id)
                 }
             }
-            ProxyRequestData::SoftStop => {
+            ProxyRequestOrder::SoftStop => {
                 info!("{} processing soft shutdown", message.id);
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, listener) in listeners.iter() {
@@ -2259,7 +2259,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 }
                 ProxyResponse::processing(message.id)
             }
-            ProxyRequestData::HardStop => {
+            ProxyRequestOrder::HardStop => {
                 info!("{} hard shutdown", message.id);
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, listener) in listeners.iter() {
@@ -2271,11 +2271,11 @@ impl ProxyConfiguration<Session> for Proxy {
                 }
                 ProxyResponse::processing(message.id)
             }
-            ProxyRequestData::Status => {
+            ProxyRequestOrder::Status => {
                 debug!("{} status", message.id);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::Logging(logging_filter) => {
+            ProxyRequestOrder::Logging(logging_filter) => {
                 debug!(
                     "{} changing logging filter to {}",
                     message.id, logging_filter
@@ -2286,7 +2286,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 });
                 ProxyResponse::processing(message.id)
             }
-            ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
+            ProxyRequestOrder::Query(Query::Certificates(QueryCertificateType::All)) => {
                 let res = self
                     .listeners
                     .values()
@@ -2309,12 +2309,12 @@ impl ProxyConfiguration<Session> for Proxy {
                 ProxyResponse {
                     id: message.id,
                     status: ProxyResponseStatus::Ok,
-                    data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(
+                    content: Some(ProxyResponseContent::Query(QueryAnswer::Certificates(
                         QueryAnswerCertificate::All(res),
                     ))),
                 }
             }
-            ProxyRequestData::Query(Query::Certificates(QueryCertificateType::Domain(d))) => {
+            ProxyRequestOrder::Query(Query::Certificates(QueryCertificateType::Domain(d))) => {
                 let res = self
                     .listeners
                     .values()
@@ -2338,7 +2338,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 ProxyResponse {
                     id: message.id,
                     status: ProxyResponseStatus::Ok,
-                    data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(
+                    content: Some(ProxyResponseContent::Query(QueryAnswer::Certificates(
                         QueryAnswerCertificate::Domain(res),
                     ))),
                 }

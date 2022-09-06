@@ -13,11 +13,11 @@ use serde::Serialize;
 
 use sozu_command_lib::{
     command::{
-        CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
+        CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent, CommandStatus,
         FrontendFilters, RunState, WorkerInfo,
     },
     proxy::{
-        MetricsConfiguration, ProxyRequestData, Query, QueryCertificateType, QueryClusterDomain,
+        MetricsConfiguration, ProxyRequestOrder, Query, QueryCertificateType, QueryClusterDomain,
         QueryClusterType, QueryMetricsOptions,
     },
 };
@@ -74,7 +74,7 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::SaveState { path },
+            CommandRequestOrder::SaveState { path },
             None,
         ));
 
@@ -104,7 +104,7 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::LoadState { path: path.clone() },
+            CommandRequestOrder::LoadState { path: path.clone() },
             None,
         ));
 
@@ -134,7 +134,7 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::DumpState,
+            CommandRequestOrder::DumpState,
             None,
         ));
 
@@ -156,7 +156,7 @@ impl CommandManager {
                 bail!("could not dump proxy state: {}", message.message);
             }
             CommandStatus::Ok => {
-                if let Some(CommandResponseData::State(state)) = message.data {
+                if let Some(CommandResponseContent::State(state)) = message.content {
                     if json {
                         print_json_response(&state)?;
                     } else {
@@ -175,7 +175,7 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::Proxy(ProxyRequestData::SoftStop),
+            CommandRequestOrder::Proxy(ProxyRequestOrder::SoftStop),
             proxy_id,
         ));
 
@@ -204,7 +204,7 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::Proxy(ProxyRequestData::HardStop),
+            CommandRequestOrder::Proxy(ProxyRequestOrder::HardStop),
             proxy_id,
         ));
 
@@ -235,7 +235,7 @@ impl CommandManager {
         let id = generate_tagged_id("LIST-WORKERS");
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::ListWorkers,
+            CommandRequestOrder::ListWorkers,
             None,
         ));
 
@@ -255,7 +255,7 @@ impl CommandManager {
                 );
             }
             CommandStatus::Ok => {
-                if let Some(CommandResponseData::Workers(ref workers)) = message.data {
+                if let Some(CommandResponseContent::Workers(ref workers)) = message.content {
                     let mut table = Table::new();
                     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
                     table.add_row(row!["Worker", "pid", "run state"]);
@@ -270,7 +270,7 @@ impl CommandManager {
                     let id = generate_tagged_id("UPGRADE-MAIN");
                     self.channel.write_message(&CommandRequest::new(
                         id.clone(),
-                        CommandRequestData::UpgradeMain,
+                        CommandRequestOrder::UpgradeMain,
                         None,
                     ));
                     println!("Upgrading main process");
@@ -331,7 +331,7 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::UpgradeWorker(worker_id),
+            CommandRequestOrder::UpgradeWorker(worker_id),
             //FIXME: we should be able to soft stop one specific worker
             None,
         ));
@@ -369,7 +369,7 @@ impl CommandManager {
 
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::Status,
+            CommandRequestOrder::Status,
             None,
         ));
 
@@ -392,8 +392,8 @@ impl CommandManager {
                 }
                 bail!("could not get the worker list: {}", message.message);
             }
-            CommandStatus::Ok => match message.data {
-                Some(CommandResponseData::Status(worker_info_vec)) => {
+            CommandStatus::Ok => match message.content {
+                Some(CommandResponseContent::Status(worker_info_vec)) => {
                     print_status(worker_info_vec);
                 }
                 Some(_) => {
@@ -415,7 +415,7 @@ impl CommandManager {
 
         channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::ListWorkers,
+            CommandRequestOrder::ListWorkers,
             None,
         ));
 
@@ -438,7 +438,7 @@ impl CommandManager {
             }
             CommandStatus::Ok => {
                 //println!("Worker list:\n{:?}", message.data);
-                if let Some(CommandResponseData::Workers(ref workers)) = message.data {
+                if let Some(CommandResponseContent::Workers(ref workers)) = message.content {
                     let mut expecting: HashSet<String> = HashSet::new();
 
                     let mut h = HashMap::new();
@@ -449,7 +449,7 @@ impl CommandManager {
                         let id = generate_id();
                         let msg = CommandRequest::new(
                             id.clone(),
-                            CommandRequestData::Proxy(ProxyRequestData::Status),
+                            CommandRequestOrder::Proxy(ProxyRequestOrder::Status),
                             Some(worker.id),
                         );
                         //println!("sending message: {:?}", msg);
@@ -590,7 +590,7 @@ impl CommandManager {
 
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::Proxy(ProxyRequestData::ConfigureMetrics(configuration)),
+            CommandRequestOrder::Proxy(ProxyRequestOrder::ConfigureMetrics(configuration)),
             None,
         ));
 
@@ -621,7 +621,7 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = CommandRequestData::Proxy(ProxyRequestData::Query(Query::Metrics(
+        let command = CommandRequestOrder::Proxy(ProxyRequestOrder::Query(Query::Metrics(
             QueryMetricsOptions {
                 list,
                 cluster_ids,
@@ -657,11 +657,11 @@ impl CommandManager {
                         bail!("could not query proxy state: {}", message.message);
                     }
                 }
-                CommandStatus::Ok => match message.data {
-                    Some(CommandResponseData::Metrics(aggregated_metrics_data)) => {
+                CommandStatus::Ok => match message.content {
+                    Some(CommandResponseContent::Metrics(aggregated_metrics_data)) => {
                         print_metrics(aggregated_metrics_data, json)?
                     }
-                    Some(CommandResponseData::Query(lists_of_metrics)) => {
+                    Some(CommandResponseContent::Query(lists_of_metrics)) => {
                         print_available_metrics(&lists_of_metrics)?;
                     }
                     _ => println!("Wrong kind of response here"),
@@ -691,7 +691,7 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::ReloadConfiguration { path },
+            CommandRequestOrder::ReloadConfiguration { path },
             None,
         ));
 
@@ -729,7 +729,7 @@ impl CommandManager {
         tcp: bool,
         domain: Option<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = CommandRequestData::ListFrontends(FrontendFilters {
+        let command = CommandRequestOrder::ListFrontends(FrontendFilters {
             http,
             https,
             tcp,
@@ -751,9 +751,9 @@ impl CommandManager {
                 println!("could not query proxy state: {}", message.message)
             }
             CommandStatus::Ok => {
-                debug!("We received this response: {:?}", message.data);
+                debug!("We received this response: {:?}", message.content);
 
-                if let Some(CommandResponseData::FrontendList(frontends)) = message.data {
+                if let Some(CommandResponseContent::FrontendList(frontends)) = message.content {
                     print_frontend_list(frontends);
                 }
             }
@@ -773,7 +773,7 @@ impl CommandManager {
         }
 
         let command = if let Some(ref cluster_id) = cluster_id {
-            CommandRequestData::Proxy(ProxyRequestData::Query(Query::Clusters(
+            CommandRequestOrder::Proxy(ProxyRequestOrder::Query(Query::Clusters(
                 QueryClusterType::ClusterId(cluster_id.to_string()),
             )))
         } else if let Some(ref domain) = domain {
@@ -792,11 +792,11 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{}", path)), // We add the / again because of the splitn removing it
             };
 
-            CommandRequestData::Proxy(ProxyRequestData::Query(Query::Clusters(
+            CommandRequestOrder::Proxy(ProxyRequestOrder::Query(Query::Clusters(
                 QueryClusterType::Domain(query_domain),
             )))
         } else {
-            CommandRequestData::Proxy(ProxyRequestData::Query(Query::ClustersHashes))
+            CommandRequestOrder::Proxy(ProxyRequestOrder::Query(Query::ClustersHashes))
         };
 
         let id = generate_id();
@@ -824,7 +824,7 @@ impl CommandManager {
                 bail!("could not query proxy state: {}", message.message);
             }
             CommandStatus::Ok => {
-                print_query_response_data(cluster_id, domain, message.data, json)?;
+                print_query_response_data(cluster_id, domain, message.content, json)?;
             }
         }
 
@@ -852,7 +852,7 @@ impl CommandManager {
         };
 
         let command =
-            CommandRequestData::Proxy(ProxyRequestData::Query(Query::Certificates(query)));
+            CommandRequestOrder::Proxy(ProxyRequestOrder::Query(Query::Certificates(query)));
 
         let id = generate_id();
         self.channel
@@ -878,10 +878,10 @@ impl CommandManager {
                 }
             }
             CommandStatus::Ok => {
-                if let Some(CommandResponseData::Query(data)) = message.data {
+                if let Some(CommandResponseContent::Query(data)) = message.content {
                     print_certificates(data, json)?;
                 } else {
-                    bail!("unexpected response: {:?}", message.data);
+                    bail!("unexpected response: {:?}", message.content);
                 }
             }
         }
@@ -892,14 +892,14 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::SubscribeEvents,
+            CommandRequestOrder::SubscribeEvents,
             None,
         ));
 
         let message = self.read_channel_message_with_timeout()?;
         match message.status {
             CommandStatus::Processing => {
-                if let Some(CommandResponseData::Event(event)) = message.data {
+                if let Some(CommandResponseContent::Event(event)) = message.content {
                     println!("got event from worker({}): {:?}", message.message, event);
                 }
             }
@@ -913,11 +913,11 @@ impl CommandManager {
         Ok(())
     }
 
-    pub fn order_command(&mut self, order: ProxyRequestData) -> Result<(), anyhow::Error> {
+    pub fn order_command(&mut self, order: ProxyRequestOrder) -> Result<(), anyhow::Error> {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestData::Proxy(order.clone()),
+            CommandRequestOrder::Proxy(order.clone()),
             None,
         ));
 
@@ -937,14 +937,14 @@ impl CommandManager {
                 //deactivate success messages for now
                 /*
                 match order {
-                  ProxyRequestData::AddCluster(_) => println!("cluster added : {}", message.message),
-                  ProxyRequestData::RemoveCluster(_) => println!("cluster removed : {} ", message.message),
-                  ProxyRequestData::AddBackend(_) => println!("backend added : {}", message.message),
-                  ProxyRequestData::RemoveBackend(_) => println!("backend removed : {} ", message.message),
-                  ProxyRequestData::AddCertificate(_) => println!("certificate added: {}", message.message),
-                  ProxyRequestData::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
-                  ProxyRequestData::AddHttpFrontend(_) => println!("front added: {}", message.message),
-                  ProxyRequestData::RemoveHttpFrontend(_) => println!("front removed: {}", message.message),
+                  ProxyRequestOrder::AddCluster(_) => println!("cluster added : {}", message.message),
+                  ProxyRequestOrder::RemoveCluster(_) => println!("cluster removed : {} ", message.message),
+                  ProxyRequestOrder::AddBackend(_) => println!("backend added : {}", message.message),
+                  ProxyRequestOrder::RemoveBackend(_) => println!("backend removed : {} ", message.message),
+                  ProxyRequestOrder::AddCertificate(_) => println!("certificate added: {}", message.message),
+                  ProxyRequestOrder::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
+                  ProxyRequestOrder::AddHttpFrontend(_) => println!("front added: {}", message.message),
+                  ProxyRequestOrder::RemoveHttpFrontend(_) => println!("front removed: {}", message.message),
                   _ => {
                     // do nothing for now
                   }
