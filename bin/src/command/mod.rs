@@ -26,12 +26,12 @@ use serde_json;
 
 use sozu_command_lib::{
     command::{
-        CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
+        CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent, CommandStatus,
         Event, RunState,
     },
     config::Config,
     proxy::{
-        MetricsConfiguration, ProxyRequest, ProxyRequestData, ProxyResponse, ProxyResponseData,
+        MetricsConfiguration, ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
         ProxyResponseStatus,
     },
     scm_socket::{Listeners, ScmSocket},
@@ -114,10 +114,10 @@ pub enum Response {
 pub enum Success {
     ClientClose(String),            // the client id
     ClientNew(String),              // the client id
-    DumpState(CommandResponseData), // the cloned state
+    DumpState(CommandResponseContent), // the cloned state
     HandledClientRequest,
-    ListFrontends(CommandResponseData), // the list of frontends
-    ListWorkers(CommandResponseData),
+    ListFrontends(CommandResponseContent), // the list of frontends
+    ListWorkers(CommandResponseContent),
     LoadState(String, usize, usize), // state path, oks, errors
     Logging(String),                 // new logging level
     Metrics(MetricsConfiguration),   // enable / disable / clear metrics on the proxy
@@ -127,7 +127,7 @@ pub enum Success {
     // Metrics,
     NotifiedClient(String), // client id
     PropagatedWorkerEvent,
-    Query(CommandResponseData),
+    Query(CommandResponseContent),
     ReloadConfiguration(usize, usize), // ok, errors
     SaveState(usize, String),          // amount of written commands, path of the saved state
     SubscribeEvent(String),
@@ -194,13 +194,12 @@ impl std::fmt::Display for Success {
             }
             Self::WorkerKilled(id) => write!(f, "Successfully killed worker {}", id),
             Self::WorkerLaunched(id) => write!(f, "Successfully launched worker {}", id),
-            Self::WorkerOrder(worker) => {
-                if let Some(worker_id) = worker {
+            Self::WorkerOrder(worker) => match worker {
+                Some(worker_id) => {
                     write!(f, "Successfully executed the order on worker {}", worker_id)
-                } else {
-                    write!(f, "Successfully executed the order on worker")
                 }
-            }
+                None => write!(f, "Successfully executed the order on worker"),
+            },
             Self::WorkerResponse => write!(f, "Successfully handled worker response"),
             Self::WorkerRestarted(id) => write!(f, "Successfully restarted worker {}", id),
             Self::WorkerStopped(id) => write!(f, "Successfully stopped worker {}", id),
@@ -562,10 +561,10 @@ impl CommandServer {
 
         //FIXME: too many loops, this could be cleaner
         for message in self.config.generate_config_messages() {
-            if let CommandRequestData::Proxy(order) = message.data {
+            if let CommandRequestOrder::Proxy(order) = message.order {
                 self.state.handle_order(&order);
 
-                if let &ProxyRequestData::AddCertificate(_) = &order {
+                if let &ProxyRequestOrder::AddCertificate(_) = &order {
                     debug!("config generated AddCertificate( ... )");
                 } else {
                     debug!("config generated {:?}", order);
@@ -708,7 +707,7 @@ impl CommandServer {
         }
 
         worker
-            .send(format!("RESTART-{}-STATUS", id), ProxyRequestData::Status)
+            .send(format!("RESTART-{}-STATUS", id), ProxyRequestOrder::Status)
             .await;
 
         self.workers.push(worker);
@@ -762,15 +761,15 @@ impl CommandServer {
         response: ProxyResponse,
     ) -> anyhow::Result<Success> {
         // Notify the client with Processing in case of a proxy event
-        if let Some(ProxyResponseData::Event(data)) = response.data {
-            let event: Event = data.into();
+        if let Some(ProxyResponseContent::Event(proxy_event)) = response.content {
+            let event: Event = proxy_event.into();
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = CommandResponse::new(
                         response.id.to_string(),
                         CommandStatus::Processing,
                         format!("{}", id),
-                        Some(CommandResponseData::Event(event.clone())),
+                        Some(CommandResponseContent::Event(event.clone())),
                     );
                     client_tx.send(event).await.with_context(|| {
                         format!("could not send message to client {}", client_id)

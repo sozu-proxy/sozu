@@ -56,7 +56,7 @@ fn test() {
 
     command.write_message(&proxy::ProxyRequest {
         id: String::from("ID_Status"),
-        order: proxy::ProxyRequestData::Status,
+        order: proxy::ProxyRequestOrder::Status,
     });
 
     // wait for sozu to start and answer
@@ -89,7 +89,7 @@ fn test() {
 
     command.write_message(&proxy::ProxyRequest {
         id: String::from("ID_ABCD"),
-        order: proxy::ProxyRequestData::AddHttpFrontend(http_frontend),
+        order: proxy::ProxyRequestOrder::AddHttpFrontend(http_frontend),
     });
     println!("HTTP -> {:?}", command.read_message());
 
@@ -112,7 +112,7 @@ fn test() {
 
     command.write_message(&proxy::ProxyRequest {
         id: String::from("ID_EFGH"),
-        order: proxy::ProxyRequestData::AddBackend(http_backend),
+        order: proxy::ProxyRequestOrder::AddBackend(http_backend),
     });
 
     println!("HTTP -> {:?}", command.read_message());
@@ -168,7 +168,7 @@ fn test() {
 
     command.write_message(&proxy::ProxyRequest {
         id: String::from("ID_EFGH-2"),
-        order: proxy::ProxyRequestData::RemoveBackend(proxy::RemoveBackend {
+        order: proxy::ProxyRequestOrder::RemoveBackend(proxy::RemoveBackend {
             cluster_id: String::from("test"),
             backend_id: String::from("test-0"),
             address: "127.0.0.1:2048".parse().unwrap(),
@@ -186,7 +186,7 @@ fn test() {
 
     command.write_message(&proxy::ProxyRequest {
         id: String::from("ID_EFGH-3"),
-        order: proxy::ProxyRequestData::AddBackend(http_backend),
+        order: proxy::ProxyRequestOrder::AddBackend(http_backend),
     });
 
     let barrier2 = barrier.clone();
@@ -245,7 +245,7 @@ fn test() {
 
     command.write_message(&proxy::ProxyRequest {
         id: String::from("ID_EFGH-2"),
-        order: proxy::ProxyRequestData::RemoveBackend(proxy::RemoveBackend {
+        order: proxy::ProxyRequestOrder::RemoveBackend(proxy::RemoveBackend {
             cluster_id: String::from("test"),
             backend_id: String::from("test-0"),
             address: "127.0.0.1:2048".parse().unwrap(),
@@ -263,7 +263,7 @@ fn test() {
 
     command.write_message(&proxy::ProxyRequest {
         id: String::from("ID_EFGH-3"),
-        order: proxy::ProxyRequestData::AddBackend(http_backend),
+        order: proxy::ProxyRequestOrder::AddBackend(http_backend),
     });
 
     let barrier2 = barrier.clone();

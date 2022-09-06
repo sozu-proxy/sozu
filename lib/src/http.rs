@@ -18,7 +18,7 @@ use crate::{
     sozu_command::{
         logging,
         proxy::{
-            Cluster, HttpFrontend, HttpListener, ProxyEvent, ProxyRequest, ProxyRequestData,
+            Cluster, HttpFrontend, HttpListener, ProxyEvent, ProxyRequest, ProxyRequestOrder,
             ProxyResponse, Route,
         },
         ready::Ready,
@@ -1606,17 +1606,17 @@ impl ProxyConfiguration<Session> for Proxy {
         // ToDo temporary
         //trace!("{} notified", message);
         match message.order {
-            ProxyRequestData::AddCluster(cluster) => {
+            ProxyRequestOrder::AddCluster(cluster) => {
                 debug!("{} add cluster {:?}", message.id, cluster);
                 self.add_cluster(cluster);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::RemoveCluster { cluster_id } => {
+            ProxyRequestOrder::RemoveCluster { cluster_id } => {
                 debug!("{} remove cluster {:?}", message.id, cluster_id);
                 self.remove_cluster(&cluster_id);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::AddHttpFrontend(front) => {
+            ProxyRequestOrder::AddHttpFrontend(front) => {
                 debug!("{} add front {:?}", message.id, front);
                 if let Some(listener) = self
                     .listeners
@@ -1646,7 +1646,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     //  self.pool.clone(), None, token: Token) -> (Listener,HashSet<Token>
                 }
             }
-            ProxyRequestData::RemoveHttpFrontend(front) => {
+            ProxyRequestOrder::RemoveHttpFrontend(front) => {
                 debug!("{} front {:?}", message.id, front);
                 if let Some(listener) = self
                     .listeners
@@ -1671,7 +1671,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     )
                 }
             }
-            ProxyRequestData::RemoveListener(remove) => {
+            ProxyRequestOrder::RemoveListener(remove) => {
                 debug!("removing HTTP listener at address {:?}", remove.address);
                 if !self.remove_listener(remove.address) {
                     ProxyResponse::error(
@@ -1682,7 +1682,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     ProxyResponse::ok(message.id)
                 }
             }
-            ProxyRequestData::SoftStop => {
+            ProxyRequestOrder::SoftStop => {
                 info!("{} processing soft shutdown", message.id);
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.iter() {
@@ -1694,7 +1694,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 }
                 ProxyResponse::processing(message.id)
             }
-            ProxyRequestData::HardStop => {
+            ProxyRequestOrder::HardStop => {
                 info!("{} hard shutdown", message.id);
                 let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.drain() {
@@ -1706,11 +1706,11 @@ impl ProxyConfiguration<Session> for Proxy {
                 }
                 ProxyResponse::processing(message.id)
             }
-            ProxyRequestData::Status => {
+            ProxyRequestOrder::Status => {
                 debug!("{} status", message.id);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::Logging(logging_filter) => {
+            ProxyRequestOrder::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     message.id, logging_filter
@@ -1895,7 +1895,7 @@ mod tests {
     use crate::sozu_command::channel::Channel;
     use crate::sozu_command::proxy::{
         Backend, HttpFrontend, HttpListener, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, ProxyRequest, ProxyRequestData, Route, RulePosition,
+        PathRule, ProxyRequest, ProxyRequestOrder, Route, RulePosition,
     };
     use std::io::{Read, Write};
     use std::net::SocketAddr;
@@ -1950,7 +1950,7 @@ mod tests {
         };
         command.write_message(&ProxyRequest {
             id: String::from("ID_ABCD"),
-            order: ProxyRequestData::AddHttpFrontend(front),
+            order: ProxyRequestOrder::AddHttpFrontend(front),
         });
         let backend = Backend {
             cluster_id: String::from("cluster_1"),
@@ -1962,7 +1962,7 @@ mod tests {
         };
         command.write_message(&ProxyRequest {
             id: String::from("ID_EFGH"),
-            order: ProxyRequestData::AddBackend(backend),
+            order: ProxyRequestOrder::AddBackend(backend),
         });
 
         println!("test received: {:?}", command.read_message());
@@ -2034,7 +2034,7 @@ mod tests {
         };
         command.write_message(&ProxyRequest {
             id: String::from("ID_ABCD"),
-            order: ProxyRequestData::AddHttpFrontend(front),
+            order: ProxyRequestOrder::AddHttpFrontend(front),
         });
         let backend = Backend {
             cluster_id: String::from("cluster_1"),
@@ -2046,7 +2046,7 @@ mod tests {
         };
         command.write_message(&ProxyRequest {
             id: String::from("ID_EFGH"),
-            order: ProxyRequestData::AddBackend(backend),
+            order: ProxyRequestOrder::AddBackend(backend),
         });
 
         println!("test received: {:?}", command.read_message());
@@ -2143,7 +2143,7 @@ mod tests {
         };
         command.write_message(&ProxyRequest {
             id: String::from("ID_ABCD"),
-            order: ProxyRequestData::AddCluster(cluster),
+            order: ProxyRequestOrder::AddCluster(cluster),
         });
         let front = HttpFrontend {
             route: Route::ClusterId(String::from("cluster_1")),
@@ -2156,7 +2156,7 @@ mod tests {
         };
         command.write_message(&ProxyRequest {
             id: String::from("ID_EFGH"),
-            order: ProxyRequestData::AddHttpFrontend(front),
+            order: ProxyRequestOrder::AddHttpFrontend(front),
         });
         let backend = Backend {
             cluster_id: String::from("cluster_1"),
@@ -2168,7 +2168,7 @@ mod tests {
         };
         command.write_message(&ProxyRequest {
             id: String::from("ID_IJKL"),
-            order: ProxyRequestData::AddBackend(backend),
+            order: ProxyRequestOrder::AddBackend(backend),
         });
 
         println!("test received: {:?}", command.read_message());

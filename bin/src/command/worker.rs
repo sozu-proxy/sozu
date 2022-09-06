@@ -8,7 +8,7 @@ use sozu_command_lib::{
     channel::Channel,
     command::RunState,
     config::Config,
-    proxy::{ProxyRequest, ProxyRequestData, ProxyResponse},
+    proxy::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
     scm_socket::ScmSocket,
 };
 
@@ -46,7 +46,7 @@ impl Worker {
         }
     }
 
-    pub async fn send(&mut self, request_id: String, data: ProxyRequestData) {
+    pub async fn send(&mut self, request_id: String, data: ProxyRequestOrder) {
         if let Some(worker_tx) = self.sender.as_mut() {
             if let Err(e) = worker_tx
                 .send(ProxyRequest {

@@ -23,8 +23,8 @@ use crate::{
         channel::Channel,
         config::Config,
         proxy::{
-            HttpsListener, ListenerType, MessageId, ProxyEvent, ProxyRequest, ProxyRequestData,
-            ProxyResponse, ProxyResponseData, ProxyResponseStatus, Query, QueryAnswer,
+            HttpsListener, ListenerType, MessageId, ProxyEvent, ProxyRequest, ProxyRequestOrder,
+            ProxyResponse, ProxyResponseContent, ProxyResponseStatus, Query, QueryAnswer,
             QueryAnswerCertificate, QueryCertificateType, QueryClusterType, TlsProvider, Topic,
         },
         ready::Ready,
@@ -60,7 +60,7 @@ pub fn push_event(event: ProxyEvent) {
         (*queue.borrow_mut()).push_back(ProxyResponse {
             id: "EVENT".to_string(),
             status: ProxyResponseStatus::Processing,
-            data: Some(ProxyResponseData::Event(event)),
+            content: Some(ProxyResponseContent::Event(event)),
         });
     });
 }
@@ -602,19 +602,19 @@ impl Server {
                                     let msg = msg.expect("the message should be valid");
 
                                     match msg.order {
-                                        ProxyRequestData::HardStop => {
+                                        ProxyRequestOrder::HardStop => {
                                             let id_msg = msg.id.clone();
                                             self.notify(msg);
                                             self.channel.write_message(&ProxyResponse::ok(id_msg));
                                             self.channel.run();
                                             return;
                                         }
-                                        ProxyRequestData::SoftStop => {
+                                        ProxyRequestOrder::SoftStop => {
                                             self.shutting_down = Some(msg.id.clone());
                                             last_sessions_len = self.sessions.borrow().slab.len();
                                             self.notify(msg);
                                         }
-                                        ProxyRequestData::ReturnListenSockets => {
+                                        ProxyRequestOrder::ReturnListenSockets => {
                                             info!("received ReturnListenSockets order");
                                             self.return_listen_sockets();
                                         }
@@ -761,7 +761,7 @@ impl Server {
                             .take()
                             .expect("should have shut down correctly"),
                         status: ProxyResponseStatus::Ok,
-                        data: None,
+                        content: None,
                     });
                     return;
                 } else if new_sessions_count < last_sessions_len {
@@ -806,7 +806,7 @@ impl Server {
     }
 
     fn notify(&mut self, message: ProxyRequest) {
-        if let ProxyRequestData::ConfigureMetrics(configuration) = &message.order {
+        if let ProxyRequestOrder::ConfigureMetrics(configuration) = &message.order {
             //let id = message.id.clone();
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).configure(configuration);
@@ -816,13 +816,13 @@ impl Server {
             return;
         }
 
-        if let ProxyRequestData::Query(ref query) = message.order {
+        if let ProxyRequestOrder::Query(ref query) = message.order {
             match query {
                 Query::ClustersHashes => {
                     push_queue(ProxyResponse {
                         id: message.id.clone(),
                         status: ProxyResponseStatus::Ok,
-                        data: Some(ProxyResponseData::Query(QueryAnswer::ClustersHashes(
+                        content: Some(ProxyResponseContent::Query(QueryAnswer::ClustersHashes(
                             self.config_state.hash_state(),
                         ))),
                     });
@@ -850,7 +850,7 @@ impl Server {
                     push_queue(ProxyResponse {
                         id: message.id.clone(),
                         status: ProxyResponseStatus::Ok,
-                        data: Some(ProxyResponseData::Query(query_answer)),
+                        content: Some(ProxyResponseContent::Query(query_answer)),
                     });
                     return;
                 }
@@ -864,7 +864,7 @@ impl Server {
                             push_queue(ProxyResponse {
                                 id: message.id.clone(),
                                 status: ProxyResponseStatus::Ok,
-                                data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(
+                                content: Some(ProxyResponseContent::Query(QueryAnswer::Certificates(
                                     QueryAnswerCertificate::Fingerprint(get_certificate(
                                         &self.config_state,
                                         f,
@@ -882,7 +882,7 @@ impl Server {
                         push_queue(ProxyResponse {
                             id: message.id.clone(),
                             status: ProxyResponseStatus::Ok,
-                            data: Some(ProxyResponseData::Query(QueryAnswer::Metrics(data))),
+                            content: Some(ProxyResponseContent::Query(QueryAnswer::Metrics(data))),
                         });
                     });
                     return;
@@ -898,7 +898,7 @@ impl Server {
 
         match message {
             ProxyRequest {
-                order: ProxyRequestData::AddCluster(ref cluster),
+                order: ProxyRequestOrder::AddCluster(ref cluster),
                 ..
             } => {
                 self.backends
@@ -912,7 +912,7 @@ impl Server {
             }
             ProxyRequest {
                 ref id,
-                order: ProxyRequestData::AddBackend(ref backend),
+                order: ProxyRequestOrder::AddBackend(ref backend),
             } => {
                 let new_backend = Backend::new(
                     &backend.backend_id,
@@ -930,7 +930,7 @@ impl Server {
             }
             ProxyRequest {
                 ref id,
-                order: ProxyRequestData::RemoveBackend(ref backend),
+                order: ProxyRequestOrder::RemoveBackend(ref backend),
             } => {
                 self.backends
                     .borrow_mut()
@@ -949,7 +949,7 @@ impl Server {
                 // special case for AddHttpListener because we need to register a listener
                 ProxyRequest {
                     ref id,
-                    order: ProxyRequestData::AddHttpListener(ref listener),
+                    order: ProxyRequestOrder::AddHttpListener(ref listener),
                 } => {
                     debug!("{} add http listener {:?}", id, listener);
 
@@ -985,20 +985,20 @@ impl Server {
                 }
                 ProxyRequest {
                     ref id,
-                    order: ProxyRequestData::RemoveListener(ref remove),
+                    order: ProxyRequestOrder::RemoveListener(ref remove),
                 } => {
                     if remove.proxy == ListenerType::HTTP {
                         debug!("{} remove http listener {:?}", id, remove);
                         self.base_sessions_count -= 1;
                         push_queue(self.http.borrow_mut().notify(ProxyRequest {
                             id: id.to_string(),
-                            order: ProxyRequestData::RemoveListener(remove.clone()),
+                            order: ProxyRequestOrder::RemoveListener(remove.clone()),
                         }));
                     }
                 }
                 ProxyRequest {
                     ref id,
-                    order: ProxyRequestData::ActivateListener(ref activate),
+                    order: ProxyRequestOrder::ActivateListener(ref activate),
                 } => {
                     if activate.proxy == ListenerType::HTTP {
                         debug!("{} activate http listener {:?}", id, activate);
@@ -1029,7 +1029,7 @@ impl Server {
                 }
                 ProxyRequest {
                     ref id,
-                    order: ProxyRequestData::DeactivateListener(ref deactivate),
+                    order: ProxyRequestOrder::DeactivateListener(ref deactivate),
                 } => {
                     if deactivate.proxy == ListenerType::HTTP {
                         debug!("{} deactivate http listener {:?}", id, deactivate);
@@ -1090,7 +1090,7 @@ impl Server {
                 // special case for AddHttpListener because we need to register a listener
                 ProxyRequest {
                     ref id,
-                    order: ProxyRequestData::AddHttpsListener(ref listener),
+                    order: ProxyRequestOrder::AddHttpsListener(ref listener),
                 } => {
                     debug!("{} add https listener {:?}", id, listener);
 
@@ -1121,20 +1121,20 @@ impl Server {
                 }
                 ProxyRequest {
                     ref id,
-                    order: ProxyRequestData::RemoveListener(ref remove),
+                    order: ProxyRequestOrder::RemoveListener(ref remove),
                 } => {
                     if remove.proxy == ListenerType::HTTPS {
                         debug!("{} remove https listener {:?}", id, remove);
                         self.base_sessions_count -= 1;
                         push_queue(self.https.notify(ProxyRequest {
                             id: id.to_string(),
-                            order: ProxyRequestData::RemoveListener(remove.clone()),
+                            order: ProxyRequestOrder::RemoveListener(remove.clone()),
                         }));
                     }
                 }
                 ProxyRequest {
                     ref id,
-                    order: ProxyRequestData::ActivateListener(ref activate),
+                    order: ProxyRequestOrder::ActivateListener(ref activate),
                 } => {
                     if activate.proxy == ListenerType::HTTPS {
                         debug!("{} activate https listener {:?}", id, activate);
@@ -1162,7 +1162,7 @@ impl Server {
                 }
                 ProxyRequest {
                     ref id,
-                    order: ProxyRequestData::DeactivateListener(ref deactivate),
+                    order: ProxyRequestOrder::DeactivateListener(ref deactivate),
                 } => {
                     if deactivate.proxy == ListenerType::HTTPS {
                         debug!("{} deactivate https listener {:?}", id, deactivate);
@@ -1218,7 +1218,7 @@ impl Server {
                 // special case for AddTcpFront because we need to register a listener
                 ProxyRequest {
                     id,
-                    order: ProxyRequestData::AddTcpListener(listener),
+                    order: ProxyRequestOrder::AddTcpListener(listener),
                 } => {
                     debug!("{} add tcp listener {:?}", id, listener);
 
@@ -1254,20 +1254,20 @@ impl Server {
                 }
                 ProxyRequest {
                     ref id,
-                    order: ProxyRequestData::RemoveListener(ref remove),
+                    order: ProxyRequestOrder::RemoveListener(ref remove),
                 } => {
                     if remove.proxy == ListenerType::TCP {
                         debug!("{} remove tcp listener {:?}", id, remove);
                         self.base_sessions_count -= 1;
                         push_queue(self.tcp.borrow_mut().notify(ProxyRequest {
                             id: id.to_string(),
-                            order: ProxyRequestData::RemoveListener(remove.clone()),
+                            order: ProxyRequestOrder::RemoveListener(remove.clone()),
                         }));
                     }
                 }
                 ProxyRequest {
                     ref id,
-                    order: ProxyRequestData::ActivateListener(ref activate),
+                    order: ProxyRequestOrder::ActivateListener(ref activate),
                 } => {
                     if activate.proxy == ListenerType::TCP {
                         debug!("{} activate tcp listener {:?}", id, activate);
@@ -1298,7 +1298,7 @@ impl Server {
                 }
                 ProxyRequest {
                     ref id,
-                    order: ProxyRequestData::DeactivateListener(ref deactivate),
+                    order: ProxyRequestOrder::DeactivateListener(ref deactivate),
                 } => {
                     if deactivate.proxy == ListenerType::TCP {
                         debug!("{} deactivate tcp listener {:?}", id, deactivate);

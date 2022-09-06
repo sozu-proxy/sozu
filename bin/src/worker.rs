@@ -34,7 +34,7 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     logging::target_to_backend,
-    proxy::{ProxyRequest, ProxyRequestData, ProxyResponse},
+    proxy::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -66,7 +66,7 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
             command_channel.set_blocking(true);
             command_channel.write_message(&ProxyRequest {
                 id: format!("start-status-{}", index),
-                order: ProxyRequestData::Status,
+                order: ProxyRequestOrder::Status,
             });
             command_channel.set_nonblocking(true);
         }

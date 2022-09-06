@@ -69,12 +69,12 @@ fn main() {
 
     command.write_message(&proxy::ProxyRequest {
         id: String::from("ID_ABCD"),
-        order: proxy::ProxyRequestData::AddHttpFrontend(http_front),
+        order: proxy::ProxyRequestOrder::AddHttpFrontend(http_front),
     });
 
     command.write_message(&proxy::ProxyRequest {
         id: String::from("ID_EFGH"),
-        order: proxy::ProxyRequestData::AddBackend(http_backend),
+        order: proxy::ProxyRequestOrder::AddBackend(http_backend),
     });
 
     info!("MAIN\tHTTP -> {:?}", command.read_message());
@@ -119,7 +119,7 @@ fn main() {
     };
     command2.write_message(&proxy::ProxyRequest {
         id: String::from("ID_IJKL1"),
-        order: proxy::ProxyRequestData::AddCertificate(proxy::AddCertificate {
+        order: proxy::ProxyRequestOrder::AddCertificate(proxy::AddCertificate {
             address: "127.0.0.1:8443".parse().unwrap(),
             certificate: certificate_and_key,
             names: vec![],
@@ -139,7 +139,7 @@ fn main() {
 
     command2.write_message(&proxy::ProxyRequest {
         id: String::from("ID_IJKL2"),
-        order: proxy::ProxyRequestData::AddHttpsFrontend(tls_front),
+        order: proxy::ProxyRequestOrder::AddHttpsFrontend(tls_front),
     });
     let tls_backend = proxy::Backend {
         cluster_id: String::from("cluster_1"),
@@ -152,7 +152,7 @@ fn main() {
 
     command2.write_message(&proxy::ProxyRequest {
         id: String::from("ID_MNOP"),
-        order: proxy::ProxyRequestData::AddBackend(tls_backend),
+        order: proxy::ProxyRequestOrder::AddBackend(tls_backend),
     });
 
     let cert2 = include_str!("../assets/cert_test.pem");
@@ -167,7 +167,7 @@ fn main() {
 
     command2.write_message(&proxy::ProxyRequest {
         id: String::from("ID_QRST1"),
-        order: proxy::ProxyRequestData::AddCertificate(proxy::AddCertificate {
+        order: proxy::ProxyRequestOrder::AddCertificate(proxy::AddCertificate {
             address: "127.0.0.1:8443".parse().unwrap(),
             certificate: certificate_and_key2,
             names: vec![],
@@ -187,7 +187,7 @@ fn main() {
 
     command2.write_message(&proxy::ProxyRequest {
         id: String::from("ID_QRST2"),
-        order: proxy::ProxyRequestData::AddHttpsFrontend(tls_front2),
+        order: proxy::ProxyRequestOrder::AddHttpsFrontend(tls_front2),
     });
 
     let tls_backend2 = proxy::Backend {
@@ -201,7 +201,7 @@ fn main() {
 
     command2.write_message(&proxy::ProxyRequest {
         id: String::from("ID_UVWX"),
-        order: proxy::ProxyRequestData::AddBackend(tls_backend2),
+        order: proxy::ProxyRequestOrder::AddBackend(tls_backend2),
     });
 
     info!("MAIN\tTLS -> {:?}", command2.read_message());
