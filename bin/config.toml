@@ -17,7 +17,7 @@
 # "trace". For performance reasons, the logs at "debug" or "trace" level are
 # not compiled by default. To activate them, pass the "logs-debug" and
 # "logs-trace" compilation options to cargo
-log_level = "info"
+log_level = "debug"
 
 # where the logs will be sent. It defaults to sending the logs on standard output,
 # but they could be written to a UDP address:
@@ -50,7 +50,7 @@ max_command_buffer_size = 163840
 
 # the number of worker processes that will handle traffic
 # defaults to 2 workers
-worker_count = 2
+worker_count = 1
 
 # indicates if workers should be automatically restarted if they crash / hang
 # should be true for production and false for development
@@ -89,7 +89,7 @@ buffer_size = 16393
 
 # how much time (in milliseconds) sozuctl will wait for a command to complete.
 # Defaults to 1000 milliseconds
-#ctl_command_timeout = 1000
+ctl_command_timeout = 5000
 
 # PID file is a file containing the PID of the main process of sozu.
 # It can be helpful to help systemd or any other service system to keep track

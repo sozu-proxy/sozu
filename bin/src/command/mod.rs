@@ -72,7 +72,7 @@ enum CommandMessage {
         id: u32,
     },
     Advancement {
-        request_identifier: RequestIdentifier,
+        request_summary: RequestSummary,
         response: Response,
     },
     MasterStop,
@@ -575,7 +575,7 @@ impl CommandServer {
                     worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
                 }) {
                     let request_summary =
-                        RequestSummary::new(worker.id, message.id.clone(), None, 1);
+                        RequestSummary::with_request_id(worker.id, message.id.clone(), None, 1);
 
                     worker.send(message.id.clone(), order.clone()).await;
 
@@ -1101,27 +1101,51 @@ async fn worker_loop(
 #[derive(Clone, Debug, Serialize)]
 pub struct RequestSummary {
     /// the worker we send the request to
-    pub worker_id: u32,
+    pub worker_id: Option<u32>,
     /// the request id as sent within ProxyRequest
-    pub request_id: String,
+    pub id: String,
     /// the client who sent the request
     pub client: Option<String>,
     /// In certain cases, the same response may need to be transmitted several times over
-    pub expected_responses: usize,
+    pub expected_responses: Option<usize>,
 }
 
 impl RequestSummary {
-    pub fn new(
-        worker_id: u32,
-        request_id: String,
-        client: Option<String>,
-        expected_responses: usize,
-    ) -> Self {
+    pub fn new_with_request_id(id: &str) -> Self {
         Self {
-            worker_id,
-            request_id,
-            client,
-            expected_responses,
+            worker_id: None,
+            id: id.to_owned(),
+            client: None,
+            expected_responses: None,
         }
+    }
+
+    pub fn with_worker(&mut self, worker_id: &u32) {
+        self.worker_id = Some(worker_id.to_owned());
+    }
+
+    pub fn with_client(&mut self, client_id: &str) {
+        self.client = Some(client_id.to_owned());
+    }
+
+    pub fn with_expected_responses(&mut self, expected_responses: usize) {
+        self.expected_responses = Some(expected_responses);
+    }
+
+    pub fn append_suffix_and_worker_to_id(&self, suffix: Option<&str>, worker_id: &u32) -> Self {
+        let new_id = match suffix {
+            Some(suffix) => format!("{}-{}-{}", self.id, suffix, worker_id),
+            None => format!("{}-{}", self.id, worker_id),
+        };
+        Self {
+            id: new_id,
+            worker_id: Some(worker_id.to_owned()),
+            client: self.client,
+            expected_responses: self.expected_responses,
+        }
+    }
+
+    pub fn id(&self) -> String {
+        self.id.to_owned()
     }
 }

@@ -48,12 +48,15 @@ impl CommandServer {
         request: CommandRequest,
     ) -> anyhow::Result<Success> {
         trace!("Received order {:?}", request);
-        let request_identifier = RequestIdentifier {
-            client: client_id.to_owned(),
-            request: request.id.to_owned(),
-        };
+        // let request_identifier = RequestIdentifier {
+        //     client: client_id.to_owned(),
+        //     request: request.id.to_owned(),
+        // };
 
-        let cloned_identifier = request_identifier.clone();
+        let request_summary =
+            RequestSummary::new_with_request_id(&request.id).with_client_id(&client_id);
+
+        // let cloned_identifier = request_identifier.clone();
 
         let result: anyhow::Result<Option<Success>> = match request.order {
             CommandRequestOrder::SaveState { path } => self.save_state(&path).await,
@@ -186,8 +189,9 @@ impl CommandServer {
 
     pub async fn load_state(
         &mut self,
-        client_id: Option<String>,
-        request_id: String,
+        // client_id: Option<String>,
+        // request_id: String,
+        request_summary: RequestSummary,
         path: &str,
     ) -> anyhow::Result<Option<Success>> {
         let mut file =
@@ -245,18 +249,20 @@ impl CommandServer {
 
                                 let mut found = false;
                                 let request_id =
-                                    format!("LOAD-STATE-{}-{}", request_id, diff_counter);
+                                    format!("LOAD-STATE-{}-{}", request_summary.id, diff_counter);
 
                                 for ref mut worker in self.workers.iter_mut().filter(|worker| {
                                     worker.run_state != RunState::Stopping
                                         && worker.run_state != RunState::Stopped
                                 }) {
-                                    let request_summary =
-                                        RequestSummary::new(worker.id, request_id.clone(), None, 1);
-                                    let request_id = format!("{}-{}", request_id, worker.id);
-                                    worker.send(request_id.clone(), order.clone()).await;
+                                    
+                                    let request_summary = request_summary
+                                        .append_suffix_and_worker_to_id(None, &worker.id);
+
+                                    // let request_id = format!("{}-{}", request_id, worker.id);
+                                    worker.send(request_summary.id(), order.clone()).await;
                                     self.in_flight.insert(
-                                        request_id,
+                                        request_summary.id(),
                                         (load_state_tx.clone(), request_summary),
                                     );
 
@@ -318,15 +324,12 @@ impl CommandServer {
                 }
 
                 // if the request doesn't come from a client, just log the result
-                let request_identifier = match client_id {
-                    Some(client_id) => RequestIdentifier::new(client_id, request_id),
-                    None => {
-                        match error {
-                            0 => info!("loading state: {} ok messages, 0 errors", ok),
-                            _ => error!("loading state: {} ok messages, {} errors", ok, error),
-                        }
-                        return;
+                if request_summary.client.is_none() {
+                    match error {
+                        0 => info!("loading state: {} ok messages, 0 errors", ok),
+                        _ => error!("loading state: {} ok messages, {} errors", ok, error),
                     }
+                    return;
                 };
 
                 // notify the command server
@@ -334,7 +337,7 @@ impl CommandServer {
                     0 => {
                         return_success(
                             command_tx,
-                            request_identifier,
+                            request_summary,
                             Success::LoadState(path.to_string(), ok, error),
                         )
                         .await;
@@ -342,7 +345,7 @@ impl CommandServer {
                     _ => {
                         return_error(
                             command_tx,
-                            request_identifier,
+                            request_summary,
                             format!(
                                 "Loading state failed, ok: {}, error: {}, path: {}",
                                 ok, error, path
@@ -355,10 +358,10 @@ impl CommandServer {
             .detach();
         } else {
             info!("no messages sent to workers: local state already had those messages");
-            if client_id.is_some() {
+            if request_summary.client.is_some() {
                 return_success(
                     self.command_tx.clone(),
-                    RequestIdentifier::new(client_id.unwrap(), request_id),
+                    request_summary,
                     Success::LoadState(path.to_string(), 0, 0),
                 )
                 .await;
@@ -446,7 +449,7 @@ impl CommandServer {
 
     pub async fn launch_worker(
         &mut self,
-        request_identifier: RequestIdentifier,
+        // request_identifier: RequestIdentifier,
         _tag: &str,
     ) -> anyhow::Result<Option<Success>> {
         let mut worker = start_worker(
@@ -643,10 +646,10 @@ impl CommandServer {
             let (sockets_return_tx, mut sockets_return_rx) = futures::channel::mpsc::channel(3);
             let return_sockets_request_id = format!("{}-return-sockets", request_identifier.client);
 
-            let request_summary = RequestSummary::new(
-                worker_id,
-                return_sockets_request_id,
-                Some(request_identifier.client),
+            let request_summary = RequestSummary::with_request_id(
+                worker_id.to_owned(),
+                return_sockets_request_id.to_owned(),
+                Some(request_identifier.client.to_owned()),
                 1,
             );
 
@@ -712,10 +715,19 @@ impl CommandServer {
             old_worker.run_state = RunState::Stopping;
 
             let (softstop_tx, mut softstop_rx) = futures::channel::mpsc::channel(10);
-            let id = format!("{}-softstop", request_identifier.client);
-            self.in_flight.insert(id.clone(), (softstop_tx, 1));
+            let soft_stop_request_id = format!("{}-softstop", request_identifier.client);
+
+            let request_summary = RequestSummary::with_request_id(
+                old_worker.id,
+                soft_stop_request_id.clone(),
+                Some(request_identifier.client),
+                1,
+            );
+
+            self.in_flight
+                .insert(soft_stop_request_id.clone(), (softstop_tx, request_summary));
             old_worker
-                .send(id.clone(), ProxyRequestOrder::SoftStop)
+                .send(soft_stop_request_id.clone(), ProxyRequestOrder::SoftStop)
                 .await;
 
             let mut command_tx = self.command_tx.clone();
@@ -822,11 +834,11 @@ impl CommandServer {
                     }) {
                         let worker_message_id = format!("{}-{}", id, worker.id);
 
-                        let request_summary = RequestSummary::new(
+                        let request_summary = RequestSummary::with_request_id(
                             worker.id.clone(),
                             worker_message_id,
                             request_identifier.client,
-                            1
+                            1,
                         );
 
                         worker.send(worker_message_id.clone(), order.clone()).await;
@@ -1410,13 +1422,13 @@ impl CommandServer {
 // to notify the command server of an order's advancement.
 async fn return_error<T>(
     mut command_tx: Sender<CommandMessage>,
-    request_identifier: RequestIdentifier,
+    request_summary: RequestSummary,
     error_message: T,
 ) where
     T: ToString,
 {
     let error_command_message = CommandMessage::Advancement {
-        request_identifier: request_identifier.to_owned(),
+        request_summary: request_summary.to_owned(),
         response: Response::Error(error_message.to_string()),
     };
 
@@ -1448,11 +1460,11 @@ async fn return_error<T>(
 
 async fn return_success(
     mut command_tx: Sender<CommandMessage>,
-    request_identifier: RequestIdentifier,
+    request_summary: RequestSummary,
     success: Success,
 ) {
     let success_command_message = CommandMessage::Advancement {
-        request_identifier: request_identifier.to_owned(),
+        request_summary: request_summary.to_owned(),
         response: Response::Ok(success),
     };
 
