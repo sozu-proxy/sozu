@@ -1800,6 +1800,10 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                     self.res_header_end = header_end2;
                 };
 
+                // we may check for 499 with get_status_line
+                // here and return (ProtocolResult::Continue, SessionResult::CloseSession)
+                // this should close the connection without sending a response to the client
+
                 if unwrap_msg!(self.response_state.as_ref()).is_back_error() {
                     self.set_answer(DefaultAnswerStatus::Answer502, None);
                     return (ProtocolResult::Continue, self.writable(metrics));

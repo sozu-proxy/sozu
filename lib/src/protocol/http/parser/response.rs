@@ -269,10 +269,6 @@ pub fn parse_response(
             match status_line(buf) {
                 Ok((input, raw_status_line)) => {
                     match StatusLine::from_raw_status_line(raw_status_line) {
-                        // We may handle 499
-                        // Some(499) => {
-                        //     (BufferMove::None, ResponseState::Error())
-                        // }
                         Some(status_line) => {
                             let conn = Connection::new();
                             /*let conn = if rl.version == "11" {
