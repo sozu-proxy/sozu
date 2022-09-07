@@ -46,12 +46,12 @@ impl Worker {
         }
     }
 
-    pub async fn send(&mut self, request_id: String, data: ProxyRequestOrder) {
+    pub async fn send(&mut self, request_id: String, order: ProxyRequestOrder) {
         if let Some(worker_tx) = self.sender.as_mut() {
             if let Err(e) = worker_tx
                 .send(ProxyRequest {
                     id: request_id.clone(),
-                    order: data,
+                    order,
                 })
                 .await
             {

@@ -26,8 +26,8 @@ use serde_json;
 
 use sozu_command_lib::{
     command::{
-        CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent, CommandStatus,
-        Event, RunState,
+        CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
+        CommandStatus, Event, RunState,
     },
     config::Config,
     proxy::{
@@ -112,8 +112,8 @@ pub enum Response {
 // in which case Success caries the response data.
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Success {
-    ClientClose(String),            // the client id
-    ClientNew(String),              // the client id
+    ClientClose(String),               // the client id
+    ClientNew(String),                 // the client id
     DumpState(CommandResponseContent), // the cloned state
     HandledClientRequest,
     ListFrontends(CommandResponseContent), // the list of frontends
@@ -234,8 +234,8 @@ pub struct CommandServer {
     in_flight: HashMap<
         String, // the request id
         (
-            futures::channel::mpsc::Sender<ProxyResponse>, // to notify whoever sent the Request
-            usize,                                         // the number of expected responses
+            futures::channel::mpsc::Sender<(ProxyResponse, RequestSummary)>,
+            RequestSummary,
         ),
     >,
     event_subscribers: HashSet<String>,
@@ -574,7 +574,13 @@ impl CommandServer {
                 for ref mut worker in self.workers.iter_mut().filter(|worker| {
                     worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
                 }) {
+                    let request_summary =
+                        RequestSummary::new(worker.id, message.id.clone(), None, 1);
+
                     worker.send(message.id.clone(), order.clone()).await;
+
+                    self.in_flight
+                        .insert(message.id.clone(), (tx.clone(), request_summary));
                     count += 1;
                 }
 
@@ -582,8 +588,8 @@ impl CommandServer {
                     // FIXME: should send back error here
                     error!("no worker found");
                 } else {
-                    self.in_flight
-                        .insert(message.id.clone(), (tx.clone(), count));
+                    // self.in_flight
+                    //     .insert(message.id.clone(), (tx.clone(), count));
                     total_message_count += count;
                 }
             }
@@ -600,7 +606,7 @@ impl CommandServer {
             let mut error = 0usize;
 
             let mut i = 0;
-            while let Some(proxy_response) = rx.next().await {
+            while let Some((proxy_response, request_summary)) = rx.next().await {
                 match proxy_response.status {
                     ProxyResponseStatus::Ok => {
                         ok += 1;
@@ -758,15 +764,15 @@ impl CommandServer {
     async fn handle_worker_response(
         &mut self,
         id: u32,
-        response: ProxyResponse,
+        proxy_response: ProxyResponse,
     ) -> anyhow::Result<Success> {
         // Notify the client with Processing in case of a proxy event
-        if let Some(ProxyResponseContent::Event(proxy_event)) = response.content {
+        if let Some(ProxyResponseContent::Event(proxy_event)) = proxy_response.content {
             let event: Event = proxy_event.into();
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = CommandResponse::new(
-                        response.id.to_string(),
+                        proxy_response.id.to_string(),
                         CommandStatus::Processing,
                         format!("{}", id),
                         Some(CommandResponseContent::Event(event.clone())),
@@ -782,32 +788,39 @@ impl CommandServer {
         // Notify the function that sent the request to which the worker responded.
         // The in_flight map contains the id of each sent request, together with a sender
         // we use to send the response to.
-        match self.in_flight.remove(&response.id) {
+        match self.in_flight.remove(&proxy_response.id) {
             None => {
                 // FIXME: this messsage happens a lot at startup because AddCluster
                 // messages receive responses from each of the HTTP, HTTPS and TCP
                 // proxys. The clusters list should be merged
-                debug!("unknown message id: {}", response.id);
+                debug!("unknown message id: {}", proxy_response.id);
             }
-            Some((mut requester_tx, mut nb)) => {
-                let response_id = response.id.clone();
+            // Some((mut requester_tx, mut nb)) => {
+            Some((mut sender, mut request_summary)) => {
+                let response_id = proxy_response.id.clone();
 
                 // if a worker returned Ok or Error, we're not expecting any more
                 // messages with this id from it
-                match response.status {
+                match proxy_response.status {
                     ProxyResponseStatus::Ok | ProxyResponseStatus::Error(_) => {
-                        nb -= 1;
+                        request_summary.expected_responses -= 1;
                     }
                     _ => {}
                 };
 
-                if requester_tx.send(response.clone()).await.is_err() {
-                    error!("Failed to send worker response back: {}", response);
+                // send the proxy response to the thread that sent the request
+                if sender
+                    .send((proxy_response.clone(), request_summary.clone()))
+                    .await
+                    .is_err()
+                {
+                    error!("Failed to send worker response back: {}", proxy_response);
                 };
 
                 // reinsert the message_id and sender into the hashmap, for later reuse
-                if nb > 0 {
-                    self.in_flight.insert(response_id, (requester_tx, nb));
+                if request_summary.expected_responses > 0 {
+                    self.in_flight
+                        .insert(response_id, (sender, request_summary));
                 }
             }
         }
@@ -1081,5 +1094,34 @@ async fn worker_loop(
             "The worker loop {} could not send WorkerClose to the CommandServer: {:?}",
             id, send_error
         );
+    }
+}
+
+/// keeps track of a request as handled by the CommandServer
+#[derive(Clone, Debug, Serialize)]
+pub struct RequestSummary {
+    /// the worker we send the request to
+    pub worker_id: u32,
+    /// the request id as sent within ProxyRequest
+    pub request_id: String,
+    /// the client who sent the request
+    pub client: Option<String>,
+    /// In certain cases, the same response may need to be transmitted several times over
+    pub expected_responses: usize,
+}
+
+impl RequestSummary {
+    pub fn new(
+        worker_id: u32,
+        request_id: String,
+        client: Option<String>,
+        expected_responses: usize,
+    ) -> Self {
+        Self {
+            worker_id,
+            request_id,
+            client,
+            expected_responses,
+        }
     }
 }
