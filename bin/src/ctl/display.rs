@@ -7,12 +7,25 @@ use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::{
-    command::{CommandResponseData, ListedFrontends},
+    command::{CommandResponseData, ListedFrontends, WorkerInfo},
     proxy::{
         AggregatedMetricsData, ClusterMetricsData, FilteredData, QueryAnswer,
         QueryAnswerCertificate, QueryAnswerMetrics, Route, WorkerMetrics,
     },
 };
+
+pub fn print_status(worker_info_vec: Vec<WorkerInfo>) {
+    let mut table = Table::new();
+    table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+    table.add_row(row!["worker id", "pid", "run state"]);
+
+    for worker_info in worker_info_vec {
+        let row = row!(worker_info.id, worker_info.pid, worker_info.run_state);
+        table.add_row(row);
+    }
+
+    table.printstd();
+}
 
 pub fn print_frontend_list(frontends: ListedFrontends) {
     trace!(" We received this frontends to display {:#?}", frontends);

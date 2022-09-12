@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::{collections::BTreeMap, fmt, net::SocketAddr};
 
 use crate::{
     proxy::{
@@ -23,6 +23,7 @@ pub enum CommandRequestData {
     UpgradeWorker(u32),
     SubscribeEvents,
     ReloadConfiguration { path: Option<String> },
+    Status,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -65,6 +66,7 @@ pub enum CommandStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandResponseData {
+    // this is old it seems
     Workers(Vec<WorkerInfo>),
     /// used by the main process to respond to the CLI
     Metrics(AggregatedMetricsData),
@@ -73,6 +75,8 @@ pub enum CommandResponseData {
     State(ConfigState),
     Event(Event),
     FrontendList(ListedFrontends),
+    // this is new
+    Status(Vec<WorkerInfo>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -115,6 +119,12 @@ pub enum RunState {
     Stopping,
     Stopped,
     NotAnswering,
+}
+
+impl fmt::Display for RunState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

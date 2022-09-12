@@ -27,7 +27,7 @@ use serde_json;
 use sozu_command_lib::{
     command::{
         CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
-        Event, RunState,
+        Event, RunState, WorkerInfo,
     },
     config::Config,
     proxy::{
@@ -130,6 +130,7 @@ pub enum Success {
     Query(CommandResponseData),
     ReloadConfiguration(usize, usize), // ok, errors
     SaveState(usize, String),          // amount of written commands, path of the saved state
+    Status(CommandResponseData),       // Vec<WorkerInfo>
     SubscribeEvent(String),
     UpgradeMain(i32),         // pid of the new main process
     UpgradeWorker(u32),       // worker id
@@ -180,6 +181,9 @@ impl std::fmt::Display for Success {
             ),
             Self::SaveState(counter, path) => {
                 write!(f, "saved {} config messages to {}", counter, path)
+            }
+            Self::Status(_) => {
+                write!(f, "Sent a status response to client")
             }
             Self::SubscribeEvent(client_id) => {
                 write!(f, "Successfully Added {} to subscribers", client_id)

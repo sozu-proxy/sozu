@@ -28,7 +28,7 @@ use crate::{
         create_channel,
         display::{
             print_available_metrics, print_certificates, print_frontend_list, print_json_response,
-            print_metrics, print_query_response_data,
+            print_metrics, print_query_response_data, print_status,
         },
         CommandManager,
     },
@@ -364,9 +364,50 @@ impl CommandManager {
         Ok(())
     }
 
+    pub fn status(&mut self, json: bool) -> anyhow::Result<()> {
+        let id = generate_id();
+
+        self.channel.write_message(&CommandRequest::new(
+            id.clone(),
+            CommandRequestData::Status,
+            None,
+        ));
+
+        let message = self
+            .channel
+            .read_message_blocking_timeout(Some(self.timeout))
+            .unwrap();
+
+        if id != message.id {
+            bail!("received message with invalid id: {:?}", message);
+        }
+
+        match message.status {
+            CommandStatus::Processing => {
+                bail!("should have obtained an answer immediately");
+            }
+            CommandStatus::Error => {
+                if json {
+                    print_json_response(&message.message)?;
+                }
+                bail!("could not get the worker list: {}", message.message);
+            }
+            CommandStatus::Ok => match message.data {
+                Some(CommandResponseData::Status(worker_info_vec)) => {
+                    print_status(worker_info_vec);
+                }
+                Some(_) => {
+                    bail!("Received the wrong kind of response data from the command server")
+                }
+                None => bail!("No data in the response"),
+            },
+        }
+        Ok(())
+    }
+
     // queries a list of workers and then queries the status for each of them,
     // this should rather be done on the CommandServer level
-    pub fn status(&mut self, json: bool) -> Result<(), anyhow::Error> {
+    pub fn status_legacy(&mut self, json: bool) -> Result<(), anyhow::Error> {
         let id = generate_id();
 
         // we have to create a new channel here, to pass it into the thread below
