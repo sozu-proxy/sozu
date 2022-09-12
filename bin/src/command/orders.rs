@@ -879,7 +879,7 @@ impl CommandServer {
     }
 
     // This handles the CLI's "metrics enable", "metrics disable", "metrics clear"
-    // To get the proxy's metrics, the cli command is "query metrics", handled by the query() function
+    // To get the proxy's metrics, the cli command is "metrics get", handled by the query() function
     pub async fn configure_metrics(
         &mut self,
         request_identifier: RequestIdentifier,

@@ -238,7 +238,7 @@ pub enum MetricsCmd {
         #[clap(
             short = 'b',
             long="backends",
-            help="coma-separated list of backends, 'one_backend_id, other_backend_id'",
+            help="coma-separated list of backends, 'one_backend_id,other_backend_id'",
             use_delimiter = true
             // parse(try_from_str = split_slash)
         )]
@@ -430,8 +430,12 @@ pub enum HttpFrontendCmd {
         route: Route,
         #[clap(long = "hostname", aliases = &["host"])]
         hostname: String,
-        #[clap(short = 'p', long = "path", help = "URL prefix of the frontend")]
-        path_begin: Option<String>,
+        #[clap(short = 'p', long = "path-prefix", help = "URL prefix of the frontend")]
+        path_prefix: Option<String>,
+        #[clap(long = "path-regex", help = "the frontend URL path should match this regex")]
+        path_regex: Option<String>,
+        #[clap(long = "path-equals", help = "the frontend URL path should equal this regex")]
+        path_equals: Option<String>,
         #[clap(short = 'm', long = "method", help = "HTTP method")]
         method: Option<String>,
         #[clap(long = "tags", help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')", parse(try_from_str = parse_tags))]
@@ -449,8 +453,12 @@ pub enum HttpFrontendCmd {
         route: Route,
         #[clap(long = "hostname", aliases = &["host"])]
         hostname: String,
-        #[clap(short = 'p', long = "path", help = "URL prefix of the frontend")]
-        path_begin: Option<String>,
+        #[clap(short = 'p', long = "path-prefix", help = "URL prefix of the frontend")]
+        path_prefix: Option<String>,
+        #[clap(long = "path-regex", help = "the frontend URL path should match this regex")]
+        path_regex: Option<String>,
+        #[clap(long = "path-equals", help = "the frontend URL path should equal this regex")]
+        path_equals: Option<String>,
         #[clap(short = 'm', long = "method", help = "HTTP method")]
         method: Option<String>,
     },
