@@ -15,8 +15,8 @@ use sozu_command_lib::{
 
 use crate::{
     cli::{
-        ClusterCmd, BackendCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd,
-        LoggingLevel, TcpFrontendCmd, TcpListenerCmd,
+        BackendCmd, ClusterCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, LoggingLevel,
+        TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
 };

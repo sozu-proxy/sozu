@@ -288,10 +288,10 @@ impl BackendList {
         }
 
         if backends.is_empty() {
-            None
-        } else {
-            self.load_balancing.next_available_backend(&mut backends)
+            return None;
         }
+        
+        self.load_balancing.next_available_backend(&mut backends)
     }
 
     pub fn set_load_balancing_policy(

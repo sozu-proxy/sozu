@@ -10,26 +10,26 @@ use crate::{
 
 use super::{
     crlf, message_header, request_line, BufferMove, Chunk, Connection, Continue, Header,
-    HeaderValue, Host, LengthInformation, Method, RRequestLine, TransferEncodingValue, Version,
+    HeaderValue, Host, LengthInformation, Method, RequestLine, TransferEncodingValue, Version,
 };
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestState {
     Initial,
     Error(
-        Option<RRequestLine>,
+        Option<RequestLine>,
         Option<Connection>,
         Option<Host>,
         Option<LengthInformation>,
         Option<Chunk>,
     ),
-    HasRequestLine(RRequestLine, Connection),
-    HasHost(RRequestLine, Connection, Host),
-    HasLength(RRequestLine, Connection, LengthInformation),
-    HasHostAndLength(RRequestLine, Connection, Host, LengthInformation),
-    Request(RRequestLine, Connection, Host),
-    RequestWithBody(RRequestLine, Connection, Host, usize),
-    RequestWithBodyChunks(RRequestLine, Connection, Host, Chunk),
+    HasRequestLine(RequestLine, Connection),
+    HasHost(RequestLine, Connection, Host),
+    HasLength(RequestLine, Connection, LengthInformation),
+    HasHostAndLength(RequestLine, Connection, Host, LengthInformation),
+    Request(RequestLine, Connection, Host),
+    RequestWithBody(RequestLine, Connection, Host, usize),
+    RequestWithBodyChunks(RequestLine, Connection, Host, Chunk),
 }
 
 impl RequestState {
@@ -126,7 +126,7 @@ impl RequestState {
         }
     }
 
-    pub fn get_request_line(&self) -> Option<&RRequestLine> {
+    pub fn get_request_line(&self) -> Option<&RequestLine> {
         match *self {
             RequestState::HasRequestLine(ref rl, _)
             | RequestState::HasHost(ref rl, _, _)
@@ -346,6 +346,7 @@ pub fn parse_header<'a>(
     }
 }
 
+/// a request parsing step, depending on the request state
 pub fn parse_request(
     state: RequestState,
     buf: &[u8],
@@ -353,45 +354,41 @@ pub fn parse_request(
 ) -> (BufferMove, RequestState) {
     match state {
         RequestState::Initial => {
-            match request_line(buf) {
-                Ok((i, r)) => {
-                    if let Some(rl) = RRequestLine::from_request_line(r) {
-                        let conn = Connection::new();
-                        //FIXME: what if it's not absolute path or complete URL, but an authority with CONNECT?
-                        if !rl.uri.is_empty() && rl.uri.as_bytes()[0] != b'/' {
-                            if let Some(host) = Url::parse(&rl.uri)
-                                .ok()
-                                .and_then(|u| u.host_str().map(|s| s.to_string()))
-                            {
-                                (
-                                    BufferMove::Advance(buf.offset(i)),
-                                    RequestState::HasHost(rl, conn, host),
-                                )
-                            } else {
-                                (BufferMove::None, (RequestState::Initial).into_error())
-                            }
-                        } else {
-                            /*let conn = if rl.version == "11" {
-                              Connection::keep_alive()
-                            } else {
-                              Connection::close()
-                            };
-                            */
-                            (
-                                BufferMove::Advance(buf.offset(i)),
-                                RequestState::HasRequestLine(rl, conn),
-                            )
-                        }
-                    } else {
-                        (BufferMove::None, (RequestState::Initial).into_error())
-                    }
-                }
-                res => default_request_result(state, res),
+            let (input, raw_request_line) = match request_line(buf) {
+                Ok((i, r)) => (i, r),
+                res => return default_request_result(state, res),
+            };
+
+            let request_line = match RequestLine::from_raw_request_line(raw_request_line) {
+                Some(request_line) => request_line,
+                None => return (BufferMove::None, (RequestState::Initial).into_error()),
+            };
+
+            let conn = Connection::new();
+            //FIXME: what if it's not absolute path or complete URL, but an authority with CONNECT?
+            if request_line.uri.is_empty() || request_line.uri.as_bytes()[0] == b'/' {
+                return (
+                    BufferMove::Advance(buf.offset(input)),
+                    RequestState::HasRequestLine(request_line, conn),
+                );
             }
+
+            let host = match Url::parse(&request_line.uri)
+                .ok()
+                .and_then(|url| url.host_str().map(|s| s.to_string()))
+            {
+                Some(host) => host,
+                None => return (BufferMove::None, (RequestState::Initial).into_error()),
+            };
+
+            (
+                BufferMove::Advance(buf.offset(input)),
+                RequestState::HasHost(request_line, conn, host),
+            )
         }
         RequestState::HasRequestLine(rl, conn) => match message_header(buf) {
             Ok((i, header)) => {
-                let mv = if header.should_delete(&conn, sticky_name) {
+                let buffer_move = if header.should_delete(&conn, sticky_name) {
                     BufferMove::Delete(buf.offset(i))
                 } else if header.must_mutate() {
                     BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name))
@@ -399,7 +396,7 @@ pub fn parse_request(
                     BufferMove::Advance(buf.offset(i))
                 };
                 (
-                    mv,
+                    buffer_move,
                     validate_request_header(
                         RequestState::HasRequestLine(rl, conn),
                         &header,
@@ -412,7 +409,7 @@ pub fn parse_request(
         RequestState::HasHost(rl, conn, h) => {
             match message_header(buf) {
                 Ok((i, header)) => {
-                    let mv = if header.should_delete(&conn, sticky_name) {
+                    let buffer_move = if header.should_delete(&conn, sticky_name) {
                         BufferMove::Delete(buf.offset(i))
                     } else if header.must_mutate() {
                         BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name))
@@ -420,7 +417,7 @@ pub fn parse_request(
                         BufferMove::Advance(buf.offset(i))
                     };
                     (
-                        mv,
+                        buffer_move,
                         validate_request_header(
                             RequestState::HasHost(rl, conn, h),
                             &header,
@@ -445,7 +442,7 @@ pub fn parse_request(
         }
         RequestState::HasLength(rl, conn, l) => match message_header(buf) {
             Ok((i, header)) => {
-                let mv = if header.should_delete(&conn, sticky_name) {
+                let buffer_move = if header.should_delete(&conn, sticky_name) {
                     BufferMove::Delete(buf.offset(i))
                 } else if header.must_mutate() {
                     BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name))
@@ -453,7 +450,7 @@ pub fn parse_request(
                     BufferMove::Advance(buf.offset(i))
                 };
                 (
-                    mv,
+                    buffer_move,
                     validate_request_header(
                         RequestState::HasLength(rl, conn, l),
                         &header,
@@ -465,7 +462,7 @@ pub fn parse_request(
         },
         RequestState::HasHostAndLength(rl, conn, h, l) => match message_header(buf) {
             Ok((i, header)) => {
-                let mv = if header.should_delete(&conn, sticky_name) {
+                let buffer_move = if header.should_delete(&conn, sticky_name) {
                     BufferMove::Delete(buf.offset(i))
                 } else if header.must_mutate() {
                     BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name))
@@ -473,7 +470,7 @@ pub fn parse_request(
                     BufferMove::Advance(buf.offset(i))
                 };
                 (
-                    mv,
+                    buffer_move,
                     validate_request_header(
                         RequestState::HasHostAndLength(rl, conn, h, l),
                         &header,
@@ -523,6 +520,7 @@ pub fn parse_request(
     }
 }
 
+/// it seems this function parse a request until the end of headers (including the delimiting CRLF)
 pub fn parse_request_until_stop(
     mut current_state: RequestState,
     mut header_end: Option<usize>,
@@ -531,17 +529,18 @@ pub fn parse_request_until_stop(
     sticky_name: &str,
 ) -> (RequestState, Option<usize>) {
     loop {
-        let (mv, new_state) = parse_request(current_state, buf.unparsed_data(), sticky_name);
+        let (buffer_move, new_state) =
+            parse_request(current_state, buf.unparsed_data(), sticky_name);
         //println!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
         //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
         //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
         current_state = new_state;
 
-        match mv {
-            BufferMove::Advance(sz) => {
-                assert!(sz != 0, "buffer move should not be 0");
+        match buffer_move {
+            BufferMove::Advance(size) => {
+                assert!(size != 0, "buffer move should not be 0");
                 //FIXME: what if we advance past the buffer's end? Splice?
-                buf.consume_parsed_data(sz);
+                buf.consume_parsed_data(size);
                 if header_end.is_none() {
                     match current_state {
                         RequestState::Request(_, ref conn, _)
@@ -554,7 +553,7 @@ pub fn parse_request_until_stop(
                                 buf.insert_output(s.into_bytes());
                             }
 
-                            buf.slice_output(sz);
+                            buf.slice_output(size);
                         }
                         RequestState::RequestWithBody(_, ref mut conn, _, content_length) => {
                             header_end = Some(buf.start_parsing_position);
@@ -566,19 +565,19 @@ pub fn parse_request_until_stop(
 
                             // If we got "Expects: 100-continue", the body will be sent later
                             if conn.continues == Continue::None {
-                                buf.slice_output(sz + content_length);
+                                buf.slice_output(size + content_length);
                                 buf.consume_parsed_data(content_length);
                             } else {
-                                buf.slice_output(sz);
+                                buf.slice_output(size);
                                 conn.continues = Continue::Expects(content_length);
                             }
                         }
                         _ => {
-                            buf.slice_output(sz);
+                            buf.slice_output(size);
                         }
                     }
                 } else {
-                    buf.slice_output(sz);
+                    buf.slice_output(size);
                 }
             }
             BufferMove::Delete(length) => {

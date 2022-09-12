@@ -25,7 +25,7 @@ fn size_test() {
 fn request_line_test() {
     let input = b"GET /index.html HTTP/1.1\r\n";
     let result = request_line(input);
-    let expected = RequestLine {
+    let expected = RawRequestLine {
         method: b"GET",
         uri: b"/index.html",
         version: Version::V11,
@@ -133,7 +133,7 @@ fn parse_state_host_in_url_test() {
         result,
         (
             RequestState::RequestWithBody(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("http://example.com:8888/index.html"),
                     version: Version::V11
@@ -175,7 +175,7 @@ fn parse_state_host_in_url_conflict_test() {
         result,
         (
             RequestState::Error(
-                Some(RRequestLine {
+                Some(RequestLine {
                     method: Method::Get,
                     uri: String::from("http://example.com:8888/index.html"),
                     version: Version::V11
@@ -225,7 +225,7 @@ fn parse_state_content_length_test() {
         result,
         (
             RequestState::RequestWithBody(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
@@ -248,7 +248,7 @@ fn parse_state_content_length_partial() {
           Content-Length: 200\r\n\
           \r\n";
     let initial = RequestState::HasRequestLine(
-        RRequestLine {
+        RequestLine {
             method: Method::Get,
             uri: String::from("/index.html"),
             version: Version::V11,
@@ -293,7 +293,7 @@ fn parse_state_content_length_partial() {
         result,
         (
             RequestState::RequestWithBody(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
@@ -327,7 +327,7 @@ fn parse_state_chunked_test() {
         result,
         (
             RequestState::RequestWithBodyChunks(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
@@ -362,7 +362,7 @@ fn parse_state_duplicate_content_length_test() {
         result,
         (
             RequestState::Error(
-                Some(RRequestLine {
+                Some(RequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
@@ -399,7 +399,7 @@ fn parse_state_content_length_and_chunked_test() {
         result,
         (
             RequestState::RequestWithBodyChunks(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
@@ -443,7 +443,7 @@ fn parse_request_without_length() {
         result,
         (
             RequestState::Request(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/"),
                     version: Version::V11
@@ -474,7 +474,7 @@ fn parse_request_http_1_0_connection_close() {
         result,
         (
             RequestState::Request(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/"),
                     version: Version::V10
@@ -518,7 +518,7 @@ fn parse_request_http_1_0_connection_keep_alive() {
         result,
         (
             RequestState::Request(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/"),
                     version: Version::V10
@@ -559,7 +559,7 @@ fn parse_request_http_1_1_connection_keep_alive() {
         result,
         (
             RequestState::Request(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/"),
                     version: Version::V11
@@ -602,7 +602,7 @@ fn parse_request_http_1_1_connection_close() {
         result,
         (
             RequestState::Request(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/"),
                     version: Version::V11
@@ -668,7 +668,7 @@ fn parse_request_add_header_test() {
         result,
         (
             RequestState::RequestWithBody(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
@@ -739,7 +739,7 @@ fn parse_request_delete_forwarded_headers() {
         result,
         (
             RequestState::Request(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11
@@ -836,7 +836,7 @@ fn parse_requests_and_chunks_test() {
         result,
         (
             RequestState::RequestWithBodyChunks(
-                RRequestLine {
+                RequestLine {
                     method: Method::Post,
                     uri: String::from("/index.html"),
                     version: Version::V11
@@ -878,7 +878,7 @@ fn parse_requests_and_chunks_partial_test() {
         result,
         (
             RequestState::RequestWithBodyChunks(
-                RRequestLine {
+                RequestLine {
                     method: Method::Post,
                     uri: String::from("/index.html"),
                     version: Version::V11
@@ -902,7 +902,7 @@ fn parse_requests_and_chunks_partial_test() {
         result,
         (
             RequestState::RequestWithBodyChunks(
-                RRequestLine {
+                RequestLine {
                     method: Method::Post,
                     uri: String::from("/index.html"),
                     version: Version::V11
@@ -924,7 +924,7 @@ fn parse_requests_and_chunks_partial_test() {
         result,
         (
             RequestState::RequestWithBodyChunks(
-                RRequestLine {
+                RequestLine {
                     method: Method::Post,
                     uri: String::from("/index.html"),
                     version: Version::V11
@@ -974,7 +974,7 @@ fn parse_response_and_chunks_partial_test() {
         result,
         (
             ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 200,
                     reason: String::from("OK")
@@ -1006,7 +1006,7 @@ fn parse_response_and_chunks_partial_test() {
         result,
         (
             ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 200,
                     reason: String::from("OK")
@@ -1038,7 +1038,7 @@ fn parse_response_and_chunks_partial_test() {
         result,
         (
             ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 200,
                     reason: String::from("OK")
@@ -1069,7 +1069,7 @@ fn parse_response_and_chunks_partial_test() {
         result,
         (
             ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 200,
                     reason: String::from("OK")
@@ -1099,7 +1099,7 @@ fn parse_incomplete_chunk_header_test() {
           0\r\n\
           \r\n";
     let initial = ResponseState::HasLength(
-        RStatusLine {
+        StatusLine {
             version: Version::V11,
             status: 200,
             reason: String::from("OK"),
@@ -1135,7 +1135,7 @@ fn parse_incomplete_chunk_header_test() {
         result,
         (
             ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 200,
                     reason: String::from("OK")
@@ -1166,7 +1166,7 @@ fn parse_incomplete_chunk_header_test() {
         result,
         (
             ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 200,
                     reason: String::from("OK")
@@ -1199,7 +1199,7 @@ fn parse_incomplete_chunk_header_test() {
         result,
         (
             ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 200,
                     reason: String::from("OK")
@@ -1228,7 +1228,7 @@ fn parse_incomplete_chunk_header_test() {
         result,
         (
             ResponseState::ResponseWithBodyChunks(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 200,
                     reason: String::from("OK")
@@ -1286,7 +1286,7 @@ fn parse_response_302() {
         result,
         (
             ResponseState::ResponseWithBody(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 302,
                     reason: String::from("Found")
@@ -1343,7 +1343,7 @@ fn parse_response_303() {
         result,
         (
             ResponseState::ResponseWithBody(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 303,
                     reason: String::from("See Other")
@@ -1398,7 +1398,7 @@ fn parse_response_304() {
         result,
         (
             ResponseState::Response(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 304,
                     reason: String::from("Not Modified")
@@ -1497,7 +1497,7 @@ fn parse_state_head_with_content_length_test() {
         result,
         (
             ResponseState::Response(
-                RStatusLine {
+                StatusLine {
                     version: Version::V11,
                     status: 200,
                     reason: String::from("Ok")
@@ -1546,7 +1546,7 @@ fn parse_connection_upgrade_test() {
         result,
         (
             RequestState::Request(
-                RRequestLine {
+                RequestLine {
                     method: Method::Get,
                     uri: String::from("/index.html"),
                     version: Version::V11

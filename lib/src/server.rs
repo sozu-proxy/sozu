@@ -551,6 +551,7 @@ impl Server {
 
             for event in events.iter() {
                 match event.token() {
+                    // this is the command channel
                     Token(0) => {
                         if event.is_error() {
                             error!("error reading from command channel");
@@ -632,15 +633,19 @@ impl Server {
                             self.send_queue();
                         }
                     }
+                    // timer tick
                     Token(1) => {
                         while let Some(t) = TIMER.with(|timer| timer.borrow_mut().poll()) {
                             self.timeout(t);
                         }
                     }
+                    // metrics socket is writable
                     Token(2) => METRICS.with(|metrics| {
                         (*metrics.borrow_mut()).writable();
                     }),
-                    _ => self.ready(event.token(), Ready::from(event)),
+                    // ListenToken: 1 listener <=> 1 token
+                    // ProtocolToken (HTTP/HTTPS/TCP): 1 connection <=> 1 token
+                    token => self.ready(token, Ready::from(event)),
                 }
             }
 
@@ -1587,8 +1592,7 @@ impl Server {
                 .process_events(token, events);
 
             let session = self.sessions.borrow_mut().slab[session_token].clone();
-            let session2 = session.clone();
-            session.borrow_mut().ready(session2);
+            session.borrow_mut().ready(session.clone());
         }
     }
 

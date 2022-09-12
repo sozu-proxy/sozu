@@ -65,7 +65,7 @@ fn status_token(i: &[u8]) -> IResult<&[u8], &[u8]> {
     take_while(is_status_token_char)(i)
 }
 
-fn sp(i: &[u8]) -> IResult<&[u8], char> {
+fn space(i: &[u8]) -> IResult<&[u8], char> {
     char(' ')(i)
 }
 
@@ -154,23 +154,24 @@ pub enum Version {
 }
 
 #[derive(PartialEq, Debug)]
-pub struct RequestLine<'a> {
+pub struct RawRequestLine<'a> {
     pub method: &'a [u8],
     pub uri: &'a [u8],
     pub version: Version,
 }
 
+/// A request line parsed from RawRequestLine
 #[derive(PartialEq, Debug, Clone)]
-pub struct RRequestLine {
+pub struct RequestLine {
     pub method: Method,
     pub uri: String,
     pub version: Version,
 }
 
-impl RRequestLine {
-    pub fn from_request_line(r: RequestLine) -> Option<RRequestLine> {
+impl RequestLine {
+    pub fn from_raw_request_line(r: RawRequestLine) -> Option<RequestLine> {
         if let Ok(uri) = str::from_utf8(r.uri) {
-            Some(RRequestLine {
+            Some(RequestLine {
                 method: Method::new(r.method),
                 uri: String::from(uri),
                 version: r.version,
@@ -182,25 +183,26 @@ impl RRequestLine {
 }
 
 #[derive(PartialEq, Debug)]
-pub struct StatusLine<'a> {
+pub struct RawStatusLine<'a> {
     pub version: Version,
     pub status: &'a [u8],
     pub reason: &'a [u8],
 }
 
+/// A status line parsed from RawStatusLine
 #[derive(PartialEq, Debug, Clone)]
-pub struct RStatusLine {
+pub struct StatusLine {
     pub version: Version,
     pub status: u16,
     pub reason: String,
 }
 
-impl RStatusLine {
-    pub fn from_status_line(r: StatusLine) -> Option<RStatusLine> {
+impl StatusLine {
+    pub fn from_raw_status_line(r: RawStatusLine) -> Option<StatusLine> {
         if let Ok(status_str) = str::from_utf8(r.status) {
             if let Ok(status) = status_str.parse::<u16>() {
                 if let Ok(reason) = str::from_utf8(r.reason) {
-                    Some(RStatusLine {
+                    Some(StatusLine {
                         version: r.version,
                         status,
                         reason: String::from(reason),
@@ -231,17 +233,20 @@ fn http_version(i: &[u8]) -> IResult<&[u8], Version> {
     ))
 }
 
-fn request_line(i: &[u8]) -> IResult<&[u8], RequestLine> {
+/// parse first line of HTTP request into raw RequestLine
+///
+/// example: `GET www.clever.cloud.com HTTP/1.1\r\n`
+fn request_line(i: &[u8]) -> IResult<&[u8], RawRequestLine> {
     let (i, method) = token(i)?;
-    let (i, _) = sp(i)?;
+    let (i, _) = space(i)?;
     let (i, uri) = vchar_1(i)?; // ToDo proper URI parsing?
-    let (i, _) = sp(i)?;
+    let (i, _) = space(i)?;
     let (i, version) = http_version(i)?;
     let (i, _) = crlf(i)?;
 
     Ok((
         i,
-        RequestLine {
+        RawRequestLine {
             method,
             uri,
             version,
@@ -249,13 +254,13 @@ fn request_line(i: &[u8]) -> IResult<&[u8], RequestLine> {
     ))
 }
 
-fn status_line(i: &[u8]) -> IResult<&[u8], StatusLine> {
+fn status_line(i: &[u8]) -> IResult<&[u8], RawStatusLine> {
     let (i, (version, _, status, _, reason, _)) =
-        tuple((http_version, sp, take(3usize), sp, status_token, crlf))(i)?;
+        tuple((http_version, space, take(3usize), space, status_token, crlf))(i)?;
 
     Ok((
         i,
-        StatusLine {
+        RawStatusLine {
             version,
             status,
             reason,
@@ -289,6 +294,7 @@ fn message_header(i: &[u8]) -> IResult<&[u8], Header> {
     ))
 }
 
+/// parses an HTTP header (including the CRLF)
 #[cfg(not(feature = "tolerant-http1-parser"))]
 fn message_header(i: &[u8]) -> IResult<&[u8], Header> {
     // ToDo handle folding?
@@ -479,10 +485,9 @@ pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<&[u8]>)> {
     let (i, port) = opt(preceded(bytes::complete::tag(":"), digit_complete))(i)?;
 
     if !i.is_empty() {
-        Err(Err::Error(Error::new(i, ErrorKind::Eof)))
-    } else {
-        Ok((i, (host, port)))
+        return Err(Err::Error(Error::new(i, ErrorKind::Eof)));
     }
+    Ok((i, (host, port)))
 }
 
 pub fn is_hex_digit(chr: u8) -> bool {
@@ -703,7 +708,7 @@ impl Header {
 
                     while !input.is_empty() {
                         match preceded(
-                            tuple((opt(complete(sp)), complete(char(',')), opt(sp))),
+                            tuple((opt(complete(space)), complete(char(',')), opt(space))),
                             single_header_value,
                         )(input)
                         {
@@ -778,7 +783,7 @@ impl Header {
                     } else {
                         while !input.is_empty() {
                             match preceded(
-                                tuple((opt(complete(sp)), complete(char(',')), opt(sp))),
+                                tuple((opt(complete(space)), complete(char(',')), opt(space))),
                                 single_header_value,
                             )(input)
                             {
@@ -998,11 +1003,13 @@ pub struct ForwardedHeaders {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Connection {
+    /// is it sufficient to set it to Some(false) to drop connection?
     pub keep_alive: Option<bool>,
     pub has_upgrade: bool,
     pub upgrade: Option<String>,
     pub to_delete: Option<HashSet<Vec<u8>>>,
     pub continues: Continue,
+    /// ensures that a session always redirects to the same backend
     pub sticky_session: Option<String>,
     pub forwarded: ForwardedHeaders,
 }

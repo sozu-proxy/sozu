@@ -359,12 +359,14 @@ impl std::fmt::Display for PathRule {
     }
 }
 
+/// The cluster to which the traffic will be redirected
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Route {
-    // send a 401 default answer
+    /// send a 401 default answer
     Deny,
     // TODO: create a custom type `ClusterId`
+    /// the cluster to which the frontend belongs
     ClusterId(String),
 }
 
@@ -592,6 +594,7 @@ pub struct HttpListener {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_false")]
     pub expect_proxy: bool,
+    // TODO: explain what this does
     #[serde(default = "default_sticky_name")]
     pub sticky_name: String,
     /// client inactive time

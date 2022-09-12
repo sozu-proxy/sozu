@@ -33,7 +33,7 @@ impl Router {
     }
 
     pub fn lookup(&self, hostname: &[u8], path: &[u8], method: &Method) -> Option<Route> {
-        for (domain_rule, path_rule, method_rule, cluster_id) in self.pre.iter() {
+        for (domain_rule, path_rule, method_rule, cluster_id) in &self.pre {
             if domain_rule.matches(hostname)
                 && path_rule.matches(path) != PathRuleResult::None
                 && method_rule.matches(method) != MethodRuleResult::None
@@ -46,7 +46,7 @@ impl Router {
             let mut prefix_length = 0;
             let mut res = None;
 
-            for (rule, method_rule, cluster_id) in path_rules.iter() {
+            for (rule, method_rule, cluster_id) in path_rules {
                 match rule.matches(path) {
                     PathRuleResult::Regex | PathRuleResult::Equals => {
                         match method_rule.matches(method) {
@@ -58,16 +58,16 @@ impl Router {
                             MethodRuleResult::None => {}
                         }
                     }
-                    PathRuleResult::Prefix(sz) => {
-                        if sz >= prefix_length {
+                    PathRuleResult::Prefix(size) => {
+                        if size >= prefix_length {
                             match method_rule.matches(method) {
                                 // FIXME: the rule order will be important here
                                 MethodRuleResult::Equals => {
-                                    prefix_length = sz;
+                                    prefix_length = size;
                                     res = Some(cluster_id);
                                 }
                                 MethodRuleResult::All => {
-                                    prefix_length = sz;
+                                    prefix_length = size;
                                     res = Some(cluster_id);
                                 }
                                 MethodRuleResult::None => {}

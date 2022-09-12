@@ -6,7 +6,7 @@ use crate::{buffer_queue::BufferQueue, protocol::http::StickySession};
 
 use super::{
     crlf, message_header, status_line, BufferMove, Chunk, Connection, Header, HeaderValue,
-    LengthInformation, RStatusLine, TransferEncodingValue, Version,
+    LengthInformation, StatusLine, TransferEncodingValue, Version,
 };
 
 pub type UpgradeProtocol = String;
@@ -15,21 +15,21 @@ pub type UpgradeProtocol = String;
 pub enum ResponseState {
     Initial,
     Error(
-        Option<RStatusLine>,
+        Option<StatusLine>,
         Option<Connection>,
         Option<UpgradeProtocol>,
         Option<LengthInformation>,
         Option<Chunk>,
     ),
-    HasStatusLine(RStatusLine, Connection),
-    HasUpgrade(RStatusLine, Connection, UpgradeProtocol),
-    HasLength(RStatusLine, Connection, LengthInformation),
-    Response(RStatusLine, Connection),
-    ResponseUpgrade(RStatusLine, Connection, UpgradeProtocol),
-    ResponseWithBody(RStatusLine, Connection, usize),
-    ResponseWithBodyChunks(RStatusLine, Connection, Chunk),
+    HasStatusLine(StatusLine, Connection),
+    HasUpgrade(StatusLine, Connection, UpgradeProtocol),
+    HasLength(StatusLine, Connection, LengthInformation),
+    Response(StatusLine, Connection),
+    ResponseUpgrade(StatusLine, Connection, UpgradeProtocol),
+    ResponseWithBody(StatusLine, Connection, usize),
+    ResponseWithBodyChunks(StatusLine, Connection, Chunk),
     // the boolean indicates if the backend connection is closed
-    ResponseWithBodyCloseDelimited(RStatusLine, Connection, bool),
+    ResponseWithBodyCloseDelimited(StatusLine, Connection, bool),
 }
 
 impl ResponseState {
@@ -82,7 +82,7 @@ impl ResponseState {
         matches!(self, ResponseState::Error(_, _, _, _, _))
     }
 
-    pub fn get_status_line(&self) -> Option<&RStatusLine> {
+    pub fn get_status_line(&self) -> Option<&StatusLine> {
         match *self {
             ResponseState::HasStatusLine(ref sl, _)
             | ResponseState::HasLength(ref sl, _, _)
@@ -267,39 +267,40 @@ pub fn parse_response(
     match state {
         ResponseState::Initial => {
             match status_line(buf) {
-                Ok((i, r)) => {
-                    if let Some(rl) = RStatusLine::from_status_line(r) {
-                        let conn = Connection::new();
-                        /*let conn = if rl.version == "11" {
-                          Connection::keep_alive()
-                        } else {
-                          Connection::close()
-                        };
-                        */
-                        (
-                            BufferMove::Advance(buf.offset(i)),
-                            ResponseState::HasStatusLine(rl, conn),
-                        )
-                    } else {
-                        (
+                Ok((input, raw_status_line)) => {
+                    match StatusLine::from_raw_status_line(raw_status_line) {
+                        Some(status_line) => {
+                            let conn = Connection::new();
+                            /*let conn = if rl.version == "11" {
+                              Connection::keep_alive()
+                            } else {
+                              Connection::close()
+                            };
+                            */
+                            (
+                                BufferMove::Advance(buf.offset(input)),
+                                ResponseState::HasStatusLine(status_line, conn),
+                            )
+                        }
+                        None => (
                             BufferMove::None,
                             ResponseState::Error(None, None, None, None, None),
-                        )
+                        ),
                     }
                 }
-                res => default_response_result(state, res),
+                err => default_response_result(state, err),
             }
         }
         ResponseState::HasStatusLine(sl, conn) => {
             match message_header(buf) {
                 Ok((i, header)) => {
-                    let mv = if header.should_delete(&conn, sticky_name) {
+                    let buffer_move = if header.should_delete(&conn, sticky_name) {
                         BufferMove::Delete(buf.offset(i))
                     } else {
                         BufferMove::Advance(buf.offset(i))
                     };
                     (
-                        mv,
+                        buffer_move,
                         validate_response_header(
                             ResponseState::HasStatusLine(sl, conn),
                             &header,
@@ -342,13 +343,13 @@ pub fn parse_response(
         ResponseState::HasLength(sl, conn, length) => {
             match message_header(buf) {
                 Ok((i, header)) => {
-                    let mv = if header.should_delete(&conn, sticky_name) {
+                    let buffer_move = if header.should_delete(&conn, sticky_name) {
                         BufferMove::Delete(buf.offset(i))
                     } else {
                         BufferMove::Advance(buf.offset(i))
                     };
                     (
-                        mv,
+                        buffer_move,
                         validate_response_header(
                             ResponseState::HasLength(sl, conn, length),
                             &header,
@@ -359,38 +360,36 @@ pub fn parse_response(
                 Err(Err::Incomplete(_)) => {
                     (BufferMove::None, ResponseState::HasLength(sl, conn, length))
                 }
-                Err(_) => {
-                    match crlf(buf) {
-                        Ok((i, _)) => {
-                            debug!("PARSER\theaders parsed, stopping");
-                            match length {
-                                LengthInformation::Chunked => (
-                                    BufferMove::Advance(buf.offset(i)),
-                                    ResponseState::ResponseWithBodyChunks(sl, conn, Chunk::Initial),
-                                ),
-                                LengthInformation::Length(sz) => (
-                                    BufferMove::Advance(buf.offset(i)),
-                                    ResponseState::ResponseWithBody(sl, conn, sz),
-                                ),
-                            }
-                        }
-                        res => {
-                            error!("PARSER\tHasLength could not parse header for input(cluster={:?}):\n{}\n", cluster_id, buf.to_hex(16));
-                            default_response_result(ResponseState::HasLength(sl, conn, length), res)
+                Err(_) => match crlf(buf) {
+                    Ok((i, _)) => {
+                        debug!("PARSER\theaders parsed, stopping");
+                        match length {
+                            LengthInformation::Chunked => (
+                                BufferMove::Advance(buf.offset(i)),
+                                ResponseState::ResponseWithBodyChunks(sl, conn, Chunk::Initial),
+                            ),
+                            LengthInformation::Length(sz) => (
+                                BufferMove::Advance(buf.offset(i)),
+                                ResponseState::ResponseWithBody(sl, conn, sz),
+                            ),
                         }
                     }
-                }
+                    res => {
+                        error!("PARSER\tHasLength could not parse header for input(cluster={:?}):\n{}\n", cluster_id, buf.to_hex(16));
+                        default_response_result(ResponseState::HasLength(sl, conn, length), res)
+                    }
+                },
             }
         }
         ResponseState::HasUpgrade(sl, conn, protocol) => match message_header(buf) {
             Ok((i, header)) => {
-                let mv = if header.should_delete(&conn, sticky_name) {
+                let buffer_move = if header.should_delete(&conn, sticky_name) {
                     BufferMove::Delete(buf.offset(i))
                 } else {
                     BufferMove::Advance(buf.offset(i))
                 };
                 (
-                    mv,
+                    buffer_move,
                     validate_response_header(
                         ResponseState::HasUpgrade(sl, conn, protocol),
                         &header,
@@ -450,7 +449,7 @@ pub fn parse_response_until_stop(
 ) -> (ResponseState, Option<usize>) {
     loop {
         //trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
-        let (mv, new_state) = parse_response(
+        let (buffer_move, new_state) = parse_response(
             current_state,
             buf.unparsed_data(),
             is_head,
@@ -461,7 +460,7 @@ pub fn parse_response_until_stop(
         //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
         current_state = new_state;
 
-        match mv {
+        match buffer_move {
             BufferMove::Advance(sz) => {
                 assert!(sz != 0, "buffer move should not be 0");
 

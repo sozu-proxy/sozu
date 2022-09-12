@@ -148,6 +148,7 @@ impl BufferQueue {
         acc
     }
 
+    // same as available_input_data, TODO: delete one of them?
     pub fn input_data_size(&self) -> usize {
         let mut acc = 0usize;
         for el in self.input_queue.iter() {
@@ -316,7 +317,7 @@ impl BufferQueue {
                         delete_ended = true;
                         match el {
                             OutputElement::Slice(sz) => largest_size += *sz,
-                            OutputElement::Insert(v) => return v,
+                            OutputElement::Insert(vec) => return vec,
                             _ => break,
                         }
                     }
