@@ -2,7 +2,7 @@
   "id": "ID_TEST",
   "version": 1,
   "type": "PROXY",
-  "data": {
+  "content": {
     "type": "ADD_BACKEND",
     "data": {
       "cluster_id": "xxx",

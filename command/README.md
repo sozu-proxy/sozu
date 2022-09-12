@@ -17,7 +17,7 @@ You send a `CommandRequest`, defined as follows:
 pub struct CommandRequest {
   pub id:        String,
   pub version:   u8,
-  pub data:      CommandRequestData,
+  pub order:      CommandRequestOrder,
   pub worker_id: Option<String>,
 }
 ```
@@ -29,8 +29,8 @@ When serialized to JSON it looks like this:
     "id":        "ID_TEST",
     "version":   0,
     "worker_id": 0,
-    "type":      "<CommandRequestData enum name>",
-    "data":      { <CommandRequestData wrapped value> }
+    "type":      "<CommandRequestOrder enum name>",
+    "data":      { <CommandRequestOrder wrapped value> }
 }"
 ```
 

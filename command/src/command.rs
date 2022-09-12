@@ -2,7 +2,8 @@ use std::{collections::BTreeMap, fmt, net::SocketAddr};
 
 use crate::{
     proxy::{
-        AggregatedMetricsData, HttpFrontend, ProxyEvent, ProxyRequestData, QueryAnswer, TcpFrontend,
+        AggregatedMetricsData, HttpFrontend, ProxyEvent, ProxyRequestOrder, QueryAnswer,
+        TcpFrontend,
     },
     state::ConfigState,
 };
@@ -11,8 +12,8 @@ pub const PROTOCOL_VERSION: u8 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CommandRequestData {
-    Proxy(ProxyRequestData),
+pub enum CommandRequestOrder {
+    Proxy(ProxyRequestOrder),
     SaveState { path: String },
     LoadState { path: String },
     DumpState,
@@ -41,15 +42,15 @@ pub struct CommandRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<u32>,
     #[serde(flatten)]
-    pub data: CommandRequestData,
+    pub order: CommandRequestOrder,
 }
 
 impl CommandRequest {
-    pub fn new(id: String, data: CommandRequestData, worker_id: Option<u32>) -> CommandRequest {
+    pub fn new(id: String, order: CommandRequestOrder, worker_id: Option<u32>) -> CommandRequest {
         CommandRequest {
             version: PROTOCOL_VERSION,
             id,
-            data,
+            order,
             worker_id,
         }
     }
@@ -65,8 +66,7 @@ pub enum CommandStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CommandResponseData {
-    // this is old it seems
+pub enum CommandResponseContent {
     Workers(Vec<WorkerInfo>),
     /// used by the main process to respond to the CLI
     Metrics(AggregatedMetricsData),
@@ -92,7 +92,7 @@ pub struct CommandResponse {
     pub version: u8,
     pub status: CommandStatus,
     pub message: String,
-    pub data: Option<CommandResponseData>,
+    pub content: Option<CommandResponseContent>,
 }
 
 impl CommandResponse {
@@ -100,14 +100,14 @@ impl CommandResponse {
         id: String,
         status: CommandStatus,
         message: String,
-        data: Option<CommandResponseData>,
+        content: Option<CommandResponseContent>,
     ) -> CommandResponse {
         CommandResponse {
             version: PROTOCOL_VERSION,
             id,
             status,
             message,
-            data,
+            content,
         }
     }
 }
@@ -171,7 +171,7 @@ mod tests {
     use crate::proxy::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
         ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Percentiles, ProxyRequestData, QueryAnswerMetrics,
+        LoadBalancingParams, PathRule, Percentiles, ProxyRequestOrder, QueryAnswerMetrics,
         RemoveBackend, RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
     };
     use hex::FromHex;
@@ -183,8 +183,8 @@ mod tests {
         let message: CommandRequest = serde_json::from_str(raw_json).unwrap();
         println!("{:?}", message);
         assert_eq!(
-            message.data,
-            CommandRequestData::Proxy(ProxyRequestData::AddHttpFrontend(HttpFrontend {
+            message.order,
+            CommandRequestOrder::Proxy(ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
@@ -236,7 +236,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::AddCluster(Cluster {
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddCluster(Cluster {
                 cluster_id: String::from("xxx"),
                 sticky_session: true,
                 https_redirect: true,
@@ -255,7 +255,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::RemoveCluster {
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::RemoveCluster {
                 cluster_id: String::from("xxx")
             }),
             worker_id: None
@@ -268,7 +268,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::AddHttpFrontend(HttpFrontend {
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
@@ -287,21 +287,23 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::RemoveHttpFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
-                hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
-                method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
-                position: RulePosition::Tree,
-                tags: Some(BTreeMap::from([
-                    ("owner".to_owned(), "John".to_owned()),
-                    (
-                        "uuid".to_owned(),
-                        "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
-                    )
-                ]))
-            })),
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::RemoveHttpFrontend(
+                HttpFrontend {
+                    route: Route::ClusterId(String::from("xxx")),
+                    hostname: String::from("yyy"),
+                    path: PathRule::Prefix(String::from("xxx")),
+                    method: None,
+                    address: "0.0.0.0:8080".parse().unwrap(),
+                    position: RulePosition::Tree,
+                    tags: Some(BTreeMap::from([
+                        ("owner".to_owned(), "John".to_owned()),
+                        (
+                            "uuid".to_owned(),
+                            "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
+                        )
+                    ]))
+                }
+            )),
             worker_id: None
         }
     );
@@ -312,7 +314,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::AddHttpsFrontend(HttpFrontend {
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddHttpsFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
@@ -331,21 +333,23 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::RemoveHttpsFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
-                hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
-                method: None,
-                address: "0.0.0.0:8443".parse().unwrap(),
-                position: RulePosition::Tree,
-                tags: Some(BTreeMap::from([
-                    ("owner".to_owned(), "John".to_owned()),
-                    (
-                        "uuid".to_owned(),
-                        "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
-                    )
-                ]))
-            })),
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::RemoveHttpsFrontend(
+                HttpFrontend {
+                    route: Route::ClusterId(String::from("xxx")),
+                    hostname: String::from("yyy"),
+                    path: PathRule::Prefix(String::from("xxx")),
+                    method: None,
+                    address: "0.0.0.0:8443".parse().unwrap(),
+                    position: RulePosition::Tree,
+                    tags: Some(BTreeMap::from([
+                        ("owner".to_owned(), "John".to_owned()),
+                        (
+                            "uuid".to_owned(),
+                            "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
+                        )
+                    ]))
+                }
+            )),
             worker_id: None
         }
     );
@@ -360,7 +364,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::AddCertificate(AddCertificate {
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddCertificate(AddCertificate {
                 address: "0.0.0.0:443".parse().unwrap(),
                 certificate: CertificateAndKey {
                     certificate: String::from(CERTIFICATE),
@@ -381,7 +385,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::RemoveCertificate(
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::RemoveCertificate(
                 RemoveCertificate {
                     address: "0.0.0.0:443".parse().unwrap(),
                     fingerprint: CertificateFingerprint(
@@ -402,7 +406,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::AddBackend(Backend {
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("xxx"),
                 backend_id: String::from("xxx-0"),
                 address: "127.0.0.1:8080".parse().unwrap(),
@@ -420,7 +424,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::RemoveBackend(RemoveBackend {
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("xxx"),
                 backend_id: String::from("xxx-0"),
                 address: "127.0.0.1:8080".parse().unwrap(),
@@ -435,7 +439,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::SoftStop),
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::SoftStop),
             worker_id: Some(0),
         }
     );
@@ -446,7 +450,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::HardStop),
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::HardStop),
             worker_id: Some(0),
         }
     );
@@ -457,7 +461,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::Proxy(ProxyRequestData::Status),
+            order: CommandRequestOrder::Proxy(ProxyRequestOrder::Status),
             worker_id: Some(0),
         }
     );
@@ -468,7 +472,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::LoadState {
+            order: CommandRequestOrder::LoadState {
                 path: String::from("./config_dump.json")
             },
             worker_id: None
@@ -481,7 +485,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::SaveState {
+            order: CommandRequestOrder::SaveState {
                 path: String::from("./config_dump.json")
             },
             worker_id: None
@@ -494,7 +498,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::DumpState,
+            order: CommandRequestOrder::DumpState,
             worker_id: None
         }
     );
@@ -505,7 +509,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::ListWorkers,
+            order: CommandRequestOrder::ListWorkers,
             worker_id: None
         }
     );
@@ -516,7 +520,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::UpgradeMain,
+            order: CommandRequestOrder::UpgradeMain,
             worker_id: None
         }
     );
@@ -527,7 +531,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            data: CommandRequestData::UpgradeWorker(0),
+            order: CommandRequestOrder::UpgradeWorker(0),
             worker_id: None
         }
     );
@@ -540,7 +544,7 @@ mod tests {
             version: 0,
             status: CommandStatus::Ok,
             message: String::from(""),
-            data: Some(CommandResponseData::Workers(vec!(
+            content: Some(CommandResponseContent::Workers(vec!(
                 WorkerInfo {
                     id: 1,
                     pid: 5678,
@@ -563,7 +567,7 @@ mod tests {
             version: 0,
             status: CommandStatus::Ok,
             message: String::from(""),
-            data: Some(CommandResponseData::Metrics(AggregatedMetricsData {
+            content: Some(CommandResponseContent::Metrics(AggregatedMetricsData {
                 main: [
                     (String::from("sozu.gauge"), FilteredData::Gauge(1)),
                     (String::from("sozu.count"), FilteredData::Count(-2)),

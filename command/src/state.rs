@@ -13,7 +13,7 @@ use crate::{
     proxy::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, DeactivateListener, HttpFrontend, HttpListener, HttpsListener, ListenerType,
-        PathRule, ProxyRequestData, QueryAnswerCluster, RemoveBackend, RemoveCertificate,
+        PathRule, ProxyRequestOrder, QueryAnswerCluster, RemoveBackend, RemoveCertificate,
         RemoveListener, Route, TcpFrontend, TcpListener,
     },
 };
@@ -71,17 +71,17 @@ impl ConfigState {
     }
 
     /// returns true if the order modified something
-    pub fn handle_order(&mut self, order: &ProxyRequestData) -> bool {
+    pub fn handle_order(&mut self, order: &ProxyRequestOrder) -> bool {
         match order {
-            &ProxyRequestData::AddCluster(ref cluster) => {
+            &ProxyRequestOrder::AddCluster(ref cluster) => {
                 let cluster = cluster.clone();
                 self.clusters.insert(cluster.cluster_id.clone(), cluster);
                 true
             }
-            &ProxyRequestData::RemoveCluster { ref cluster_id } => {
+            &ProxyRequestOrder::RemoveCluster { ref cluster_id } => {
                 self.clusters.remove(cluster_id).is_some()
             }
-            &ProxyRequestData::AddHttpListener(ref listener) => {
+            &ProxyRequestOrder::AddHttpListener(ref listener) => {
                 if let std::collections::hash_map::Entry::Vacant(e) =
                     self.http_listeners.entry(listener.address)
                 {
@@ -91,7 +91,7 @@ impl ConfigState {
                     false
                 }
             }
-            &ProxyRequestData::AddHttpsListener(ref listener) => {
+            &ProxyRequestOrder::AddHttpsListener(ref listener) => {
                 if let std::collections::hash_map::Entry::Vacant(e) =
                     self.https_listeners.entry(listener.address)
                 {
@@ -101,7 +101,7 @@ impl ConfigState {
                     false
                 }
             }
-            &ProxyRequestData::AddTcpListener(ref listener) => {
+            &ProxyRequestOrder::AddTcpListener(ref listener) => {
                 if let std::collections::hash_map::Entry::Vacant(e) =
                     self.tcp_listeners.entry(listener.address)
                 {
@@ -111,12 +111,12 @@ impl ConfigState {
                     false
                 }
             }
-            &ProxyRequestData::RemoveListener(ref remove) => match remove.proxy {
+            &ProxyRequestOrder::RemoveListener(ref remove) => match remove.proxy {
                 ListenerType::HTTP => self.http_listeners.remove(&remove.address).is_some(),
                 ListenerType::HTTPS => self.https_listeners.remove(&remove.address).is_some(),
                 ListenerType::TCP => self.tcp_listeners.remove(&remove.address).is_some(),
             },
-            &ProxyRequestData::ActivateListener(ref activate) => match activate.proxy {
+            &ProxyRequestOrder::ActivateListener(ref activate) => match activate.proxy {
                 ListenerType::HTTP => self
                     .http_listeners
                     .get_mut(&activate.address)
@@ -133,7 +133,7 @@ impl ConfigState {
                     .map(|t| t.1 = true)
                     .is_some(),
             },
-            &ProxyRequestData::DeactivateListener(ref deactivate) => match deactivate.proxy {
+            &ProxyRequestOrder::DeactivateListener(ref deactivate) => match deactivate.proxy {
                 ListenerType::HTTP => self
                     .http_listeners
                     .get_mut(&deactivate.address)
@@ -150,7 +150,7 @@ impl ConfigState {
                     .map(|t| t.1 = false)
                     .is_some(),
             },
-            &ProxyRequestData::AddHttpFrontend(ref front) => {
+            &ProxyRequestOrder::AddHttpFrontend(ref front) => {
                 if let std::collections::btree_map::Entry::Vacant(e) =
                     self.http_fronts.entry(RouteKey(
                         front.address,
@@ -165,7 +165,7 @@ impl ConfigState {
                     false
                 }
             }
-            &ProxyRequestData::RemoveHttpFrontend(ref front) => self
+            &ProxyRequestOrder::RemoveHttpFrontend(ref front) => self
                 .http_fronts
                 .remove(&RouteKey(
                     front.address,
@@ -174,7 +174,7 @@ impl ConfigState {
                     front.method.clone(),
                 ))
                 .is_some(),
-            &ProxyRequestData::AddCertificate(ref add) => {
+            &ProxyRequestOrder::AddCertificate(ref add) => {
                 let fingerprint =
                     match calculate_fingerprint(add.certificate.certificate.as_bytes()) {
                         Some(f) => CertificateFingerprint(f),
@@ -202,12 +202,12 @@ impl ConfigState {
                     false
                 }
             }
-            &ProxyRequestData::RemoveCertificate(ref remove) => self
+            &ProxyRequestOrder::RemoveCertificate(ref remove) => self
                 .certificates
                 .get_mut(&remove.address)
                 .and_then(|certs| certs.remove(&remove.fingerprint))
                 .is_some(),
-            &ProxyRequestData::ReplaceCertificate(ref replace) => {
+            &ProxyRequestOrder::ReplaceCertificate(ref replace) => {
                 let changed = self
                     .certificates
                     .get_mut(&replace.address)
@@ -241,7 +241,7 @@ impl ConfigState {
                     changed
                 }
             }
-            &ProxyRequestData::AddHttpsFrontend(ref front) => {
+            &ProxyRequestOrder::AddHttpsFrontend(ref front) => {
                 if let std::collections::btree_map::Entry::Vacant(e) =
                     self.https_fronts.entry(RouteKey(
                         front.address,
@@ -256,7 +256,7 @@ impl ConfigState {
                     false
                 }
             }
-            &ProxyRequestData::RemoveHttpsFrontend(ref front) => self
+            &ProxyRequestOrder::RemoveHttpsFrontend(ref front) => self
                 .https_fronts
                 .remove(&RouteKey(
                     front.address,
@@ -265,7 +265,7 @@ impl ConfigState {
                     front.method.clone(),
                 ))
                 .is_some(),
-            &ProxyRequestData::AddTcpFrontend(ref front) => {
+            &ProxyRequestOrder::AddTcpFrontend(ref front) => {
                 let front_vec = self
                     .tcp_fronts
                     .entry(front.cluster_id.clone())
@@ -277,7 +277,7 @@ impl ConfigState {
                     false
                 }
             }
-            &ProxyRequestData::RemoveTcpFrontend(ref front) => {
+            &ProxyRequestOrder::RemoveTcpFrontend(ref front) => {
                 if let Some(front_list) = self.tcp_fronts.get_mut(&front.cluster_id) {
                     let len = front_list.len();
                     front_list.retain(|el| el.address != front.address);
@@ -286,7 +286,7 @@ impl ConfigState {
                     false
                 }
             }
-            &ProxyRequestData::AddBackend(ref backend) => {
+            &ProxyRequestOrder::AddBackend(ref backend) => {
                 let backend_vec = self
                     .backends
                     .entry(backend.cluster_id.clone())
@@ -300,7 +300,7 @@ impl ConfigState {
 
                 true
             }
-            &ProxyRequestData::RemoveBackend(ref backend) => {
+            &ProxyRequestOrder::RemoveBackend(ref backend) => {
                 if let Some(backend_list) = self.backends.get_mut(&backend.cluster_id) {
                     let len = backend_list.len();
                     backend_list.retain(|b| {
@@ -313,9 +313,9 @@ impl ConfigState {
                 }
             }
             // This is to avoid the error message
-            &ProxyRequestData::Logging(_)
-            | &ProxyRequestData::Status
-            | &ProxyRequestData::Query(_) => false,
+            &ProxyRequestOrder::Logging(_)
+            | &ProxyRequestOrder::Status
+            | &ProxyRequestOrder::Query(_) => false,
             o => {
                 error!("state cannot handle order message: {:#?}", o);
                 false
@@ -323,13 +323,13 @@ impl ConfigState {
         }
     }
 
-    pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
+    pub fn generate_orders(&self) -> Vec<ProxyRequestOrder> {
         let mut v = Vec::new();
 
         for &(ref listener, active) in self.http_listeners.values() {
-            v.push(ProxyRequestData::AddHttpListener(listener.clone()));
+            v.push(ProxyRequestOrder::AddHttpListener(listener.clone()));
             if active {
-                v.push(ProxyRequestData::ActivateListener(ActivateListener {
+                v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
@@ -338,9 +338,9 @@ impl ConfigState {
         }
 
         for &(ref listener, active) in self.https_listeners.values() {
-            v.push(ProxyRequestData::AddHttpsListener(listener.clone()));
+            v.push(ProxyRequestOrder::AddHttpsListener(listener.clone()));
             if active {
-                v.push(ProxyRequestData::ActivateListener(ActivateListener {
+                v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
@@ -349,9 +349,9 @@ impl ConfigState {
         }
 
         for &(ref listener, active) in self.tcp_listeners.values() {
-            v.push(ProxyRequestData::AddTcpListener(listener.clone()));
+            v.push(ProxyRequestOrder::AddTcpListener(listener.clone()));
             if active {
-                v.push(ProxyRequestData::ActivateListener(ActivateListener {
+                v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -360,16 +360,16 @@ impl ConfigState {
         }
 
         for cluster in self.clusters.values() {
-            v.push(ProxyRequestData::AddCluster(cluster.clone()));
+            v.push(ProxyRequestOrder::AddCluster(cluster.clone()));
         }
 
         for front in self.http_fronts.values() {
-            v.push(ProxyRequestData::AddHttpFrontend(front.clone()));
+            v.push(ProxyRequestOrder::AddHttpFrontend(front.clone()));
         }
 
         for (front, certs) in self.certificates.iter() {
             for &(ref certificate_and_key, ref names) in certs.values() {
-                v.push(ProxyRequestData::AddCertificate(AddCertificate {
+                v.push(ProxyRequestOrder::AddCertificate(AddCertificate {
                     address: *front,
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
@@ -379,25 +379,25 @@ impl ConfigState {
         }
 
         for front in self.https_fronts.values() {
-            v.push(ProxyRequestData::AddHttpsFrontend(front.clone()));
+            v.push(ProxyRequestOrder::AddHttpsFrontend(front.clone()));
         }
 
         for front_list in self.tcp_fronts.values() {
             for front in front_list {
-                v.push(ProxyRequestData::AddTcpFrontend(front.clone()));
+                v.push(ProxyRequestOrder::AddTcpFrontend(front.clone()));
             }
         }
 
         for backend_list in self.backends.values() {
             for backend in backend_list {
-                v.push(ProxyRequestData::AddBackend(backend.clone()));
+                v.push(ProxyRequestOrder::AddBackend(backend.clone()));
             }
         }
 
         v
     }
 
-    pub fn generate_activate_orders(&self) -> Vec<ProxyRequestData> {
+    pub fn generate_activate_orders(&self) -> Vec<ProxyRequestOrder> {
         let mut v = Vec::new();
         for front in self
             .http_listeners
@@ -405,7 +405,7 @@ impl ConfigState {
             .filter(|(_, t)| t.1)
             .map(|(k, _)| k)
         {
-            v.push(ProxyRequestData::ActivateListener(ActivateListener {
+            v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                 address: *front,
                 proxy: ListenerType::HTTP,
                 from_scm: false,
@@ -418,7 +418,7 @@ impl ConfigState {
             .filter(|(_, t)| t.1)
             .map(|(k, _)| k)
         {
-            v.push(ProxyRequestData::ActivateListener(ActivateListener {
+            v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                 address: *front,
                 proxy: ListenerType::HTTPS,
                 from_scm: false,
@@ -430,7 +430,7 @@ impl ConfigState {
             .filter(|(_, t)| t.1)
             .map(|(k, _)| k)
         {
-            v.push(ProxyRequestData::ActivateListener(ActivateListener {
+            v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                 address: *front,
                 proxy: ListenerType::TCP,
                 from_scm: false,
@@ -440,7 +440,7 @@ impl ConfigState {
         v
     }
 
-    pub fn diff(&self, other: &ConfigState) -> Vec<ProxyRequestData> {
+    pub fn diff(&self, other: &ConfigState) -> Vec<ProxyRequestOrder> {
         //pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
         let my_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
         let their_tcp_listeners: HashSet<&SocketAddr> = other.tcp_listeners.keys().collect();
@@ -461,26 +461,26 @@ impl ConfigState {
 
         for address in removed_tcp_listeners {
             if self.tcp_listeners[address].1 {
-                v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+                v.push(ProxyRequestOrder::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::TCP,
                     to_scm: false,
                 }));
             }
 
-            v.push(ProxyRequestData::RemoveListener(RemoveListener {
+            v.push(ProxyRequestOrder::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::TCP,
             }));
         }
 
         for address in added_tcp_listeners.clone() {
-            v.push(ProxyRequestData::AddTcpListener(
+            v.push(ProxyRequestOrder::AddTcpListener(
                 other.tcp_listeners[address].0.clone(),
             ));
 
             if other.tcp_listeners[address].1 {
-                v.push(ProxyRequestData::ActivateListener(ActivateListener {
+                v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -490,26 +490,26 @@ impl ConfigState {
 
         for address in removed_http_listeners {
             if self.http_listeners[address].1 {
-                v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+                v.push(ProxyRequestOrder::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::HTTP,
                     to_scm: false,
                 }));
             }
 
-            v.push(ProxyRequestData::RemoveListener(RemoveListener {
+            v.push(ProxyRequestOrder::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::HTTP,
             }));
         }
 
         for address in added_http_listeners.clone() {
-            v.push(ProxyRequestData::AddHttpListener(
+            v.push(ProxyRequestOrder::AddHttpListener(
                 other.http_listeners[address].0.clone(),
             ));
 
             if other.http_listeners[address].1 {
-                v.push(ProxyRequestData::ActivateListener(ActivateListener {
+                v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
@@ -519,26 +519,26 @@ impl ConfigState {
 
         for address in removed_https_listeners {
             if self.https_listeners[address].1 {
-                v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+                v.push(ProxyRequestOrder::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::HTTPS,
                     to_scm: false,
                 }));
             }
 
-            v.push(ProxyRequestData::RemoveListener(RemoveListener {
+            v.push(ProxyRequestOrder::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::HTTPS,
             }));
         }
 
         for address in added_https_listeners.clone() {
-            v.push(ProxyRequestData::AddHttpsListener(
+            v.push(ProxyRequestOrder::AddHttpsListener(
                 other.https_listeners[address].0.clone(),
             ));
 
             if other.https_listeners[address].1 {
-                v.push(ProxyRequestData::ActivateListener(ActivateListener {
+                v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
@@ -551,16 +551,16 @@ impl ConfigState {
             let (their_listener, their_active) = &other.tcp_listeners[addr];
 
             if my_listener != their_listener {
-                v.push(ProxyRequestData::RemoveListener(RemoveListener {
+                v.push(ProxyRequestOrder::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                 }));
 
-                v.push(ProxyRequestData::AddTcpListener(their_listener.clone()));
+                v.push(ProxyRequestOrder::AddTcpListener(their_listener.clone()));
             }
 
             if *my_active && !*their_active {
-                v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+                v.push(ProxyRequestOrder::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                     to_scm: false,
@@ -568,7 +568,7 @@ impl ConfigState {
             }
 
             if !*my_active && *their_active {
-                v.push(ProxyRequestData::ActivateListener(ActivateListener {
+                v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -581,16 +581,16 @@ impl ConfigState {
             let (their_listener, their_active) = &other.http_listeners[addr];
 
             if my_listener != their_listener {
-                v.push(ProxyRequestData::RemoveListener(RemoveListener {
+                v.push(ProxyRequestOrder::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                 }));
 
-                v.push(ProxyRequestData::AddHttpListener(their_listener.clone()));
+                v.push(ProxyRequestOrder::AddHttpListener(their_listener.clone()));
             }
 
             if *my_active && !*their_active {
-                v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+                v.push(ProxyRequestOrder::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                     to_scm: false,
@@ -598,7 +598,7 @@ impl ConfigState {
             }
 
             if !*my_active && *their_active {
-                v.push(ProxyRequestData::ActivateListener(ActivateListener {
+                v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
@@ -611,16 +611,16 @@ impl ConfigState {
             let (their_listener, their_active) = &other.https_listeners[addr];
 
             if my_listener != their_listener {
-                v.push(ProxyRequestData::RemoveListener(RemoveListener {
+                v.push(ProxyRequestOrder::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                 }));
 
-                v.push(ProxyRequestData::AddHttpsListener(their_listener.clone()));
+                v.push(ProxyRequestOrder::AddHttpsListener(their_listener.clone()));
             }
 
             if *my_active && !*their_active {
-                v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+                v.push(ProxyRequestOrder::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                     to_scm: false,
@@ -628,7 +628,7 @@ impl ConfigState {
             }
 
             if !*my_active && *their_active {
-                v.push(ProxyRequestData::ActivateListener(ActivateListener {
+                v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
@@ -638,10 +638,10 @@ impl ConfigState {
 
         for (cluster_id, res) in diff_map(self.clusters.iter(), other.clusters.iter()) {
             match res {
-                DiffResult::Added | DiffResult::Changed => v.push(ProxyRequestData::AddCluster(
+                DiffResult::Added | DiffResult::Changed => v.push(ProxyRequestOrder::AddCluster(
                     other.clusters.get(cluster_id).unwrap().clone(),
                 )),
-                DiffResult::Removed => v.push(ProxyRequestData::RemoveCluster {
+                DiffResult::Removed => v.push(ProxyRequestOrder::RemoveCluster {
                     cluster_id: cluster_id.to_string(),
                 }),
             }
@@ -664,7 +664,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(ProxyRequestData::AddBackend(backend.clone()));
+                    v.push(ProxyRequestOrder::AddBackend(backend.clone()));
                 }
                 DiffResult::Removed => {
                     let backend = self
@@ -673,7 +673,7 @@ impl ConfigState {
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
-                    v.push(ProxyRequestData::RemoveBackend(RemoveBackend {
+                    v.push(ProxyRequestOrder::RemoveBackend(RemoveBackend {
                         cluster_id: backend.cluster_id.clone(),
                         backend_id: backend.backend_id.clone(),
                         address: backend.address,
@@ -686,7 +686,7 @@ impl ConfigState {
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
-                    v.push(ProxyRequestData::RemoveBackend(RemoveBackend {
+                    v.push(ProxyRequestOrder::RemoveBackend(RemoveBackend {
                         cluster_id: backend.cluster_id.clone(),
                         backend_id: backend.backend_id.clone(),
                         address: backend.address,
@@ -697,7 +697,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(ProxyRequestData::AddBackend(backend.clone()));
+                    v.push(ProxyRequestOrder::AddBackend(backend.clone()));
                 }
             }
         }
@@ -715,11 +715,11 @@ impl ConfigState {
         let added_http_fronts = their_http_fronts.difference(&my_http_fronts);
 
         for &(_, front) in removed_http_fronts {
-            v.push(ProxyRequestData::RemoveHttpFrontend(front.clone()));
+            v.push(ProxyRequestOrder::RemoveHttpFrontend(front.clone()));
         }
 
         for &(_, front) in added_http_fronts {
-            v.push(ProxyRequestData::AddHttpFrontend(front.clone()));
+            v.push(ProxyRequestOrder::AddHttpFrontend(front.clone()));
         }
 
         let mut my_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
@@ -734,11 +734,11 @@ impl ConfigState {
         let added_https_fronts = their_https_fronts.difference(&my_https_fronts);
 
         for &(_, front) in removed_https_fronts {
-            v.push(ProxyRequestData::RemoveHttpsFrontend(front.clone()));
+            v.push(ProxyRequestOrder::RemoveHttpsFrontend(front.clone()));
         }
 
         for &(_, front) in added_https_fronts {
-            v.push(ProxyRequestData::AddHttpsFrontend(front.clone()));
+            v.push(ProxyRequestOrder::AddHttpsFrontend(front.clone()));
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
@@ -758,11 +758,11 @@ impl ConfigState {
         let added_tcp_fronts = their_tcp_fronts.difference(&my_tcp_fronts);
 
         for &(_, front) in removed_tcp_fronts {
-            v.push(ProxyRequestData::RemoveTcpFrontend(front.clone()));
+            v.push(ProxyRequestOrder::RemoveTcpFrontend(front.clone()));
         }
 
         for &(_, front) in added_tcp_fronts {
-            v.push(ProxyRequestData::AddTcpFrontend(front.clone()));
+            v.push(ProxyRequestOrder::AddTcpFrontend(front.clone()));
         }
 
         //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -782,7 +782,7 @@ impl ConfigState {
         let added_certificates = their_certificates.difference(&my_certificates);
 
         for &(address, fingerprint) in removed_certificates {
-            v.push(ProxyRequestData::RemoveCertificate(RemoveCertificate {
+            v.push(ProxyRequestOrder::RemoveCertificate(RemoveCertificate {
                 address,
                 fingerprint: fingerprint.clone(),
             }));
@@ -794,7 +794,7 @@ impl ConfigState {
                 .get(&address)
                 .and_then(|certs| certs.get(fingerprint))
             {
-                v.push(ProxyRequestData::AddCertificate(AddCertificate {
+                v.push(ProxyRequestOrder::AddCertificate(AddCertificate {
                     address,
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
@@ -806,7 +806,7 @@ impl ConfigState {
         for address in added_tcp_listeners {
             let listener = &other.tcp_listeners[address];
             if listener.1 {
-                v.push(ProxyRequestData::ActivateListener(ActivateListener {
+                v.push(ProxyRequestOrder::ActivateListener(ActivateListener {
                     address: listener.0.address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -1044,13 +1044,13 @@ mod tests {
     use super::*;
     use crate::proxy::{
         Backend, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
-        ProxyRequestData, Route, RulePosition, TlsProvider,
+        ProxyRequestOrder, Route, RulePosition, TlsProvider,
     };
 
     #[test]
     fn serialize() {
         let mut state: ConfigState = Default::default();
-        state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
+        state.handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
             route: Route::ClusterId(String::from("cluster_1")),
             hostname: String::from("lolcatho.st:8080"),
             path: PathRule::Prefix(String::from("/")),
@@ -1059,7 +1059,7 @@ mod tests {
             position: RulePosition::Tree,
             tags: None,
         }));
-        state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
+        state.handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
             route: Route::ClusterId(String::from("cluster_2")),
             hostname: String::from("test.local"),
             path: PathRule::Prefix(String::from("/abc")),
@@ -1068,7 +1068,7 @@ mod tests {
             position: RulePosition::Pre,
             tags: None,
         }));
-        state.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1026".parse().unwrap(),
@@ -1076,7 +1076,7 @@ mod tests {
             sticky_id: None,
             backup: None,
         }));
-        state.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-1"),
             address: "127.0.0.2:1027".parse().unwrap(),
@@ -1084,7 +1084,7 @@ mod tests {
             sticky_id: None,
             backup: None,
         }));
-        state.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_2"),
             backend_id: String::from("cluster_2-0"),
             address: "192.167.1.2:1026".parse().unwrap(),
@@ -1092,7 +1092,7 @@ mod tests {
             sticky_id: None,
             backup: None,
         }));
-        state.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-3"),
             address: "192.168.1.3:1027".parse().unwrap(),
@@ -1100,7 +1100,7 @@ mod tests {
             sticky_id: None,
             backup: None,
         }));
-        state.handle_order(&ProxyRequestData::RemoveBackend(RemoveBackend {
+        state.handle_order(&ProxyRequestOrder::RemoveBackend(RemoveBackend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-3"),
             address: "192.168.1.3:1027".parse().unwrap(),
@@ -1120,7 +1120,7 @@ mod tests {
     #[test]
     fn diff() {
         let mut state: ConfigState = Default::default();
-        state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
+        state.handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
             route: Route::ClusterId(String::from("cluster_1")),
             hostname: String::from("lolcatho.st:8080"),
             path: PathRule::Prefix(String::from("/")),
@@ -1129,7 +1129,7 @@ mod tests {
             position: RulePosition::Post,
             tags: None,
         }));
-        state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
+        state.handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
             route: Route::ClusterId(String::from("cluster_2")),
             hostname: String::from("test.local"),
             path: PathRule::Prefix(String::from("/abc")),
@@ -1138,7 +1138,7 @@ mod tests {
             position: RulePosition::Tree,
             tags: None,
         }));
-        state.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1026".parse().unwrap(),
@@ -1146,7 +1146,7 @@ mod tests {
             sticky_id: None,
             backup: None,
         }));
-        state.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-1"),
             address: "127.0.0.2:1027".parse().unwrap(),
@@ -1154,7 +1154,7 @@ mod tests {
             sticky_id: None,
             backup: None,
         }));
-        state.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_2"),
             backend_id: String::from("cluster_2-0"),
             address: "192.167.1.2:1026".parse().unwrap(),
@@ -1162,7 +1162,7 @@ mod tests {
             sticky_id: None,
             backup: None,
         }));
-        state.handle_order(&ProxyRequestData::AddCluster(Cluster {
+        state.handle_order(&ProxyRequestOrder::AddCluster(Cluster {
             cluster_id: String::from("cluster_2"),
             sticky_session: true,
             https_redirect: true,
@@ -1173,7 +1173,7 @@ mod tests {
         }));
 
         let mut state2: ConfigState = Default::default();
-        state2.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend {
+        state2.handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
             route: Route::ClusterId(String::from("cluster_1")),
             hostname: String::from("lolcatho.st:8080"),
             path: PathRule::Prefix(String::from("/")),
@@ -1182,7 +1182,7 @@ mod tests {
             position: RulePosition::Post,
             tags: None,
         }));
-        state2.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state2.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1026".parse().unwrap(),
@@ -1190,7 +1190,7 @@ mod tests {
             sticky_id: None,
             backup: None,
         }));
-        state2.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state2.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-1"),
             address: "127.0.0.2:1027".parse().unwrap(),
@@ -1198,7 +1198,7 @@ mod tests {
             sticky_id: None,
             backup: None,
         }));
-        state2.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state2.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-2"),
             address: "127.0.0.2:1028".parse().unwrap(),
@@ -1206,7 +1206,7 @@ mod tests {
             sticky_id: None,
             backup: None,
         }));
-        state2.handle_order(&ProxyRequestData::AddCluster(Cluster {
+        state2.handle_order(&ProxyRequestOrder::AddCluster(Cluster {
             cluster_id: String::from("cluster_3"),
             sticky_session: false,
             https_redirect: false,
@@ -1217,7 +1217,7 @@ mod tests {
         }));
 
         let e = vec![
-            ProxyRequestData::RemoveHttpFrontend(HttpFrontend {
+            ProxyRequestOrder::RemoveHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
@@ -1226,12 +1226,12 @@ mod tests {
                 position: RulePosition::Tree,
                 tags: None,
             }),
-            ProxyRequestData::RemoveBackend(RemoveBackend {
+            ProxyRequestOrder::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
             }),
-            ProxyRequestData::AddBackend(Backend {
+            ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1239,10 +1239,10 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }),
-            ProxyRequestData::RemoveCluster {
+            ProxyRequestOrder::RemoveCluster {
                 cluster_id: String::from("cluster_2"),
             },
-            ProxyRequestData::AddCluster(Cluster {
+            ProxyRequestOrder::AddCluster(Cluster {
                 cluster_id: String::from("cluster_3"),
                 sticky_session: false,
                 https_redirect: false,
@@ -1252,7 +1252,7 @@ mod tests {
                 answer_503: None,
             }),
         ];
-        let expected_diff: HashSet<&ProxyRequestData> = HashSet::from_iter(e.iter());
+        let expected_diff: HashSet<&ProxyRequestOrder> = HashSet::from_iter(e.iter());
 
         let d = state.diff(&state2);
         let diff = HashSet::from_iter(d.iter());
@@ -1262,7 +1262,7 @@ mod tests {
         let hash1 = state.hash_state();
         let hash2 = state2.hash_state();
         let mut state3 = state.clone();
-        state3.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state3.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-2"),
             address: "127.0.0.2:1028".parse().unwrap(),
@@ -1321,12 +1321,12 @@ mod tests {
             tags: None,
         };
 
-        let add_http_front_order_cluster1 = ProxyRequestData::AddHttpFrontend(http_front_cluster1);
-        let add_http_front_order_cluster2 = ProxyRequestData::AddHttpFrontend(http_front_cluster2);
+        let add_http_front_order_cluster1 = ProxyRequestOrder::AddHttpFrontend(http_front_cluster1);
+        let add_http_front_order_cluster2 = ProxyRequestOrder::AddHttpFrontend(http_front_cluster2);
         let add_https_front_order_cluster1 =
-            ProxyRequestData::AddHttpsFrontend(https_front_cluster1);
+            ProxyRequestOrder::AddHttpsFrontend(https_front_cluster1);
         let add_https_front_order_cluster2 =
-            ProxyRequestData::AddHttpsFrontend(https_front_cluster2);
+            ProxyRequestOrder::AddHttpsFrontend(https_front_cluster2);
         config.handle_order(&add_http_front_order_cluster1);
         config.handle_order(&add_http_front_order_cluster2);
         config.handle_order(&add_https_front_order_cluster1);
@@ -1369,7 +1369,7 @@ mod tests {
     #[test]
     fn duplicate_backends() {
         let mut state: ConfigState = Default::default();
-        state.handle_order(&ProxyRequestData::AddBackend(Backend {
+        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1026".parse().unwrap(),
@@ -1387,7 +1387,7 @@ mod tests {
             backup: None,
         };
 
-        state.handle_order(&ProxyRequestData::AddBackend(b.clone()));
+        state.handle_order(&ProxyRequestOrder::AddBackend(b.clone()));
 
         assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
     }
@@ -1395,7 +1395,7 @@ mod tests {
     #[test]
     fn listener_diff() {
         let mut state: ConfigState = Default::default();
-        state.handle_order(&ProxyRequestData::AddTcpListener(TcpListener {
+        state.handle_order(&ProxyRequestOrder::AddTcpListener(TcpListener {
             address: "0.0.0.0:1234".parse().unwrap(),
             public_address: None,
             expect_proxy: false,
@@ -1403,12 +1403,12 @@ mod tests {
             back_timeout: 30,
             connect_timeout: 3,
         }));
-        state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
+        state.handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
             address: "0.0.0.0:1234".parse().unwrap(),
             proxy: ListenerType::TCP,
             from_scm: false,
         }));
-        state.handle_order(&ProxyRequestData::AddHttpListener(HttpListener {
+        state.handle_order(&ProxyRequestOrder::AddHttpListener(HttpListener {
             address: "0.0.0.0:8080".parse().unwrap(),
             public_address: None,
             expect_proxy: false,
@@ -1420,7 +1420,7 @@ mod tests {
             back_timeout: 30,
             connect_timeout: 3,
         }));
-        state.handle_order(&ProxyRequestData::AddHttpsListener(HttpsListener {
+        state.handle_order(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
             address: "0.0.0.0:8443".parse().unwrap(),
             public_address: None,
             expect_proxy: false,
@@ -1439,14 +1439,14 @@ mod tests {
             back_timeout: 30,
             connect_timeout: 3,
         }));
-        state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
+        state.handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
             address: "0.0.0.0:8443".parse().unwrap(),
             proxy: ListenerType::HTTPS,
             from_scm: false,
         }));
 
         let mut state2: ConfigState = Default::default();
-        state2.handle_order(&ProxyRequestData::AddTcpListener(TcpListener {
+        state2.handle_order(&ProxyRequestOrder::AddTcpListener(TcpListener {
             address: "0.0.0.0:1234".parse().unwrap(),
             public_address: None,
             expect_proxy: true,
@@ -1454,7 +1454,7 @@ mod tests {
             back_timeout: 30,
             connect_timeout: 3,
         }));
-        state2.handle_order(&ProxyRequestData::AddHttpListener(HttpListener {
+        state2.handle_order(&ProxyRequestOrder::AddHttpListener(HttpListener {
             address: "0.0.0.0:8080".parse().unwrap(),
             public_address: None,
             expect_proxy: false,
@@ -1466,12 +1466,12 @@ mod tests {
             back_timeout: 30,
             connect_timeout: 3,
         }));
-        state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
+        state2.handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
             address: "0.0.0.0:8080".parse().unwrap(),
             proxy: ListenerType::HTTP,
             from_scm: false,
         }));
-        state2.handle_order(&ProxyRequestData::AddHttpsListener(HttpsListener {
+        state2.handle_order(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
             address: "0.0.0.0:8443".parse().unwrap(),
             public_address: None,
             expect_proxy: false,
@@ -1490,18 +1490,18 @@ mod tests {
             back_timeout: 30,
             connect_timeout: 3,
         }));
-        state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
+        state2.handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
             address: "0.0.0.0:8443".parse().unwrap(),
             proxy: ListenerType::HTTPS,
             from_scm: false,
         }));
 
         let e = vec![
-            ProxyRequestData::RemoveListener(RemoveListener {
+            ProxyRequestOrder::RemoveListener(RemoveListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
             }),
-            ProxyRequestData::AddTcpListener(TcpListener {
+            ProxyRequestOrder::AddTcpListener(TcpListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: true,
@@ -1509,16 +1509,16 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }),
-            ProxyRequestData::DeactivateListener(DeactivateListener {
+            ProxyRequestOrder::DeactivateListener(DeactivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
                 to_scm: false,
             }),
-            ProxyRequestData::RemoveListener(RemoveListener {
+            ProxyRequestOrder::RemoveListener(RemoveListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 proxy: ListenerType::HTTP,
             }),
-            ProxyRequestData::AddHttpListener(HttpListener {
+            ProxyRequestOrder::AddHttpListener(HttpListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1530,16 +1530,16 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }),
-            ProxyRequestData::ActivateListener(ActivateListener {
+            ProxyRequestOrder::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 proxy: ListenerType::HTTP,
                 from_scm: false,
             }),
-            ProxyRequestData::RemoveListener(RemoveListener {
+            ProxyRequestOrder::RemoveListener(RemoveListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
             }),
-            ProxyRequestData::AddHttpsListener(HttpsListener {
+            ProxyRequestOrder::AddHttpsListener(HttpsListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1561,7 +1561,7 @@ mod tests {
         ];
 
         let diff = state.diff(&state2);
-        //let diff: HashSet<&ProxyRequestData> = HashSet::from_iter(d.iter());
+        //let diff: HashSet<&ProxyRequestOrder> = HashSet::from_iter(d.iter());
         println!("expected diff orders:\n{:#?}\n", e);
         println!("diff orders:\n{:#?}\n", diff);
 

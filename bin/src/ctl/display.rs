@@ -7,7 +7,7 @@ use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::{
-    command::{CommandResponseData, ListedFrontends, WorkerInfo},
+    command::{CommandResponseContent, ListedFrontends, WorkerInfo},
     proxy::{
         AggregatedMetricsData, ClusterMetricsData, FilteredData, QueryAnswer,
         QueryAnswerCertificate, QueryAnswerMetrics, Route, WorkerMetrics,
@@ -289,11 +289,11 @@ pub fn create_queried_cluster_table(
 pub fn print_query_response_data(
     cluster_id: Option<String>,
     domain: Option<String>,
-    data: Option<CommandResponseData>,
+    data: Option<CommandResponseContent>,
     json: bool,
 ) -> anyhow::Result<()> {
     if let Some(needle) = cluster_id.or_else(|| domain) {
-        if let Some(CommandResponseData::Query(data)) = &data {
+        if let Some(CommandResponseContent::Query(data)) = &data {
             if json {
                 return print_json_response(data);
             }
@@ -476,7 +476,7 @@ pub fn print_query_response_data(
             backend_table.printstd();
         }
     } else {
-        if let Some(CommandResponseData::Query(data)) = &data {
+        if let Some(CommandResponseContent::Query(data)) = &data {
             let mut table = Table::new();
             table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
             let mut header = vec![cell!("key")];

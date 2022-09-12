@@ -68,12 +68,12 @@ fn main() {
 
     command.write_message(&proxy::ProxyRequest {
         id: String::from("ID_ABCD"),
-        order: proxy::ProxyRequestData::AddTcpFrontend(tcp_front),
+        order: proxy::ProxyRequestOrder::AddTcpFrontend(tcp_front),
     });
 
     command.write_message(&proxy::ProxyRequest {
         id: String::from("ID_EFGH"),
-        order: proxy::ProxyRequestData::AddBackend(tcp_backend),
+        order: proxy::ProxyRequestOrder::AddBackend(tcp_backend),
     });
 
     info!("TCP -> {:?}", command.read_message());

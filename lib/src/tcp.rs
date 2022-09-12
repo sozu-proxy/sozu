@@ -31,7 +31,7 @@ use crate::{
         config::ProxyProtocolConfig,
         logging,
         proxy::{
-            ProxyEvent, ProxyRequest, ProxyRequestData, ProxyResponse, TcpFrontend,
+            ProxyEvent, ProxyRequest, ProxyRequestOrder, ProxyResponse, TcpFrontend,
             TcpListener as TcpListenerConfig,
         },
         ready::Ready,
@@ -1266,21 +1266,21 @@ impl Proxy {
 impl ProxyConfiguration<Session> for Proxy {
     fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
         match message.order {
-            ProxyRequestData::AddTcpFrontend(front) => {
+            ProxyRequestOrder::AddTcpFrontend(front) => {
                 if let Err(err) = self.add_tcp_front(front) {
                     return ProxyResponse::error(message.id, err);
                 }
 
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::RemoveTcpFrontend(front) => {
+            ProxyRequestOrder::RemoveTcpFrontend(front) => {
                 if let Err(err) = self.remove_tcp_front(&front) {
                     return ProxyResponse::error(message.id, err);
                 }
 
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::SoftStop => {
+            ProxyRequestOrder::SoftStop => {
                 info!("{} processing soft shutdown", message.id);
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.iter() {
@@ -1291,7 +1291,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 }
                 ProxyResponse::processing(message.id)
             }
-            ProxyRequestData::HardStop => {
+            ProxyRequestOrder::HardStop => {
                 info!("{} hard shutdown", message.id);
                 let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.drain() {
@@ -1302,11 +1302,11 @@ impl ProxyConfiguration<Session> for Proxy {
                 }
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::Status => {
+            ProxyRequestOrder::Status => {
                 info!("{} status", message.id);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::Logging(logging_filter) => {
+            ProxyRequestOrder::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     message.id, logging_filter
@@ -1317,7 +1317,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 });
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::AddCluster(cluster) => {
+            ProxyRequestOrder::AddCluster(cluster) => {
                 let config = ClusterConfiguration {
                     proxy_protocol: cluster.proxy_protocol,
                     //load_balancing: cluster.load_balancing,
@@ -1325,11 +1325,11 @@ impl ProxyConfiguration<Session> for Proxy {
                 self.configs.insert(cluster.cluster_id, config);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::RemoveCluster { cluster_id } => {
+            ProxyRequestOrder::RemoveCluster { cluster_id } => {
                 self.configs.remove(&cluster_id);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestData::RemoveListener(remove) => {
+            ProxyRequestOrder::RemoveListener(remove) => {
                 if !self.remove_listener(remove.address) {
                     ProxyResponse::error(
                         message.id,
@@ -1784,11 +1784,11 @@ mod tests {
 
             command.write_message(&ProxyRequest {
                 id: String::from("ID_YOLO1"),
-                order: ProxyRequestData::AddTcpFrontend(front),
+                order: ProxyRequestOrder::AddTcpFrontend(front),
             });
             command.write_message(&ProxyRequest {
                 id: String::from("ID_YOLO2"),
-                order: ProxyRequestData::AddBackend(backend),
+                order: ProxyRequestOrder::AddBackend(backend),
             });
         }
         {
@@ -1807,11 +1807,11 @@ mod tests {
             };
             command.write_message(&ProxyRequest {
                 id: String::from("ID_YOLO3"),
-                order: ProxyRequestData::AddTcpFrontend(front),
+                order: ProxyRequestOrder::AddTcpFrontend(front),
             });
             command.write_message(&ProxyRequest {
                 id: String::from("ID_YOLO4"),
-                order: ProxyRequestData::AddBackend(backend),
+                order: ProxyRequestOrder::AddBackend(backend),
             });
         }
 
