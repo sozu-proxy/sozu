@@ -923,7 +923,7 @@ impl CommandServer {
         smol::spawn(async move {
             let mut i = 0;
 
-            while let Some((proxy_response, worker_id)) = status_rx.next().await {
+            while let Some((proxy_response, _)) = status_rx.next().await {
                 info!(
                     "received response with id {}: {:?}",
                     proxy_response.id, proxy_response
