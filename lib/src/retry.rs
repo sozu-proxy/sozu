@@ -152,9 +152,11 @@ impl RetryPolicy for RetryPolicyWrapper {
 #[cfg(test)]
 mod tests {
     use super::{ExponentialBackoffPolicy, RetryAction, RetryPolicy};
+    use serial_test::serial;
 
     const MAX_FAILS: usize = 10;
 
+    #[serial]
     #[test]
     fn no_fail() {
         let policy = ExponentialBackoffPolicy::new(MAX_FAILS);
@@ -163,6 +165,7 @@ mod tests {
         assert_eq!(Some(RetryAction::OKAY), can_try)
     }
 
+    #[serial]
     #[test]
     fn single_fail() {
         let mut policy = ExponentialBackoffPolicy::new(MAX_FAILS);
@@ -173,6 +176,7 @@ mod tests {
         assert_eq!(Some(RetryAction::WAIT), can_try)
     }
 
+    #[serial]
     #[test]
     fn max_fails() {
         let mut policy = ExponentialBackoffPolicy::new(MAX_FAILS);
@@ -186,6 +190,7 @@ mod tests {
         assert_eq!(Some(RetryAction::WAIT), can_try)
     }
 
+    #[serial]
     #[test]
     fn recover_from_fail() {
         let mut policy = ExponentialBackoffPolicy::new(MAX_FAILS);

@@ -18,7 +18,6 @@ use std::{
     process::Command,
 };
 
-use std::env;
 use anyhow::{bail, Context};
 use libc::{self, pid_t};
 #[cfg(target_os = "macos")]

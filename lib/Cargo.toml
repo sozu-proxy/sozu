@@ -42,6 +42,7 @@ nom = { version = "^7.1.1", default-features = true, features = ["std"] }
 pool = "^0.1.4"
 poule = "^0.3.2"
 rand = "^0.8.5"
+serial_test = "^0.10.0"
 sha2 = "^0.10.6"
 slab = "^0.4.7"
 socket2 = { version = "^0.4.7", features = ["all"] }

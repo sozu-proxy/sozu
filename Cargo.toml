@@ -1,5 +1,5 @@
 [workspace]
-members = ["lib/", "command/", "bin/"]
+members = ["lib/", "command/", "bin/", "e2e/"]
 
 [profile.release]
 lto = true

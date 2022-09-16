@@ -2321,7 +2321,7 @@ mod tests {
             let r = client.read(&mut buffer[index..]);
             println!("http client read: {:?}", r);
             match r {
-                Err(e) => assert!(false, "client request should not fail. Error: {:?}", e),
+                Err(e) => assert!(false, "Failed to read client stream. Error: {:?}", e),
                 Ok(sz) => {
                     index += sz;
                 }
