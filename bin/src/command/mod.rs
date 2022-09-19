@@ -452,7 +452,7 @@ impl CommandServer {
                     }
                     futures::future::Either::Right((res, cancel_rx)) => {
                         accept_cancel_rx = Some(cancel_rx);
-                        res.map_err(|e| error!("{}", e)).unwrap()
+                        res.expect("Can not get unix stream to create a client loop.")
                     }
                 };
                 debug!("Accepted a client from upgraded");

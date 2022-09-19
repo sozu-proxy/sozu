@@ -214,10 +214,10 @@ impl CommandManager {
                 } else {
                     Some(rustls_cipher_list)
                 };
-                match listener.to_tls(None, None, None) {
-                    Some(conf) => self.order_command(ProxyRequestOrder::AddHttpsListener(conf)),
-                    None => bail!("Error creating HTTPS listener"),
-                }
+                let https_listener = listener
+                    .to_tls(None, None, None)
+                    .with_context(|| "Error creating HTTPS listener")?;
+                self.order_command(ProxyRequestOrder::AddHttpsListener(https_listener))
             }
             HttpsListenerCmd::Remove { address } => {
                 self.remove_listener(address, ListenerType::HTTPS)
@@ -249,10 +249,10 @@ impl CommandManager {
                 if let Some(sticky_name) = sticky_name {
                     listener.sticky_name = sticky_name;
                 }
-                match listener.to_http(None, None, None) {
-                    Some(conf) => self.order_command(ProxyRequestOrder::AddHttpListener(conf)),
-                    None => bail!("Error creating HTTP listener"),
-                }
+                let http_listener = listener
+                    .to_http(None, None, None)
+                    .with_context(|| "Error creating HTTP listener")?;
+                self.order_command(ProxyRequestOrder::AddHttpListener(http_listener))
             }
             HttpListenerCmd::Remove { address } => {
                 self.remove_listener(address, ListenerType::HTTP)
@@ -326,7 +326,9 @@ impl CommandManager {
     }
 
     pub fn logging_filter(&mut self, filter: &LoggingLevel) -> Result<(), anyhow::Error> {
-        self.order_command(ProxyRequestOrder::Logging(filter.to_string().to_lowercase()))
+        self.order_command(ProxyRequestOrder::Logging(
+            filter.to_string().to_lowercase(),
+        ))
     }
 
     pub fn add_certificate(
