@@ -1466,7 +1466,7 @@ pub fn start(
 ) {
     use crate::server;
 
-    let poll = Poll::new().expect("could not create event loop");
+    let poll = Poll::new().expect("could not create event loop");     // we should be able to trickle up this error
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
         1,
         max_buffers,

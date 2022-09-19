@@ -1190,7 +1190,9 @@ impl Config {
                 id: format!("CONFIG-{}", count),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddTcpListener(listener.clone())),
+                order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddTcpListener(
+                    listener.clone(),
+                )),
             });
             count += 1;
         }

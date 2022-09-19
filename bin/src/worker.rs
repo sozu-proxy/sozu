@@ -185,7 +185,7 @@ pub fn fork_main_into_worker(
     trace!("parent({})", unsafe { libc::getpid() });
 
     let mut state_file =
-        tempfile().expect("could not create temporary file for configuration state");
+        tempfile().with_context(|| "could not create temporary file for configuration state")?;
     util::disable_close_on_exec(state_file.as_raw_fd())?;
 
     serde_json::to_writer(&mut state_file, state)

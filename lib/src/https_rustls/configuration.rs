@@ -28,9 +28,9 @@ use crate::{
         logging,
         proxy::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListener,
-            ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent, ProxyResponseStatus,
-            Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType, RemoveCertificate,
-            Route, TlsVersion,
+            ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
+            ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,
+            RemoveCertificate, Route, TlsVersion,
         },
         scm_socket::ScmSocket,
     },
@@ -699,7 +699,7 @@ use crate::server::HttpsProvider;
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
     use crate::server;
 
-    let event_loop = Poll::new().expect("could not create event loop");
+    let event_loop = Poll::new().expect("could not create event loop"); // we should be able to trickle up this error
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
         1,
@@ -746,7 +746,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
     let mut configuration = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     if configuration
         .add_listener(config, token)
-        .expect("failed to create listener")
+        .expect("failed to create listener") // we should be able to trickle up this error
         .is_some()
         && configuration.activate_listener(&address, None).is_some()
     {

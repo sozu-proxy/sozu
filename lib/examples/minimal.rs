@@ -6,6 +6,8 @@ extern crate time;
 
 use std::{collections::BTreeMap, env, io::stdout, thread};
 
+use anyhow::Context;
+
 use crate::sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
@@ -13,11 +15,11 @@ use crate::sozu_command::{
     proxy::{LoadBalancingParams, PathRule, Route, RulePosition},
 };
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     if env::var("RUST_LOG").is_ok() {
         Logger::init(
             "EXAMPLE".to_string(),
-            &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"),
+            &env::var("RUST_LOG").with_context(|| "could not get the RUST_LOG env var")?,
             LoggerBackend::Stdout(stdout()),
             None,
         );
@@ -33,11 +35,14 @@ fn main() {
     info!("starting up");
 
     let config = proxy::HttpListener {
-        address: "127.0.0.1:8080".parse().expect("could not parse address"),
+        address: "127.0.0.1:8080"
+            .parse()
+            .with_context(|| "could not parse address")?,
         ..Default::default()
     };
 
-    let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
+    let (mut command, channel) =
+        Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
 
     let jg = thread::spawn(move || {
         let max_buffers = 500;
@@ -47,7 +52,9 @@ fn main() {
 
     let http_front = proxy::HttpFrontend {
         route: Route::ClusterId(String::from("test")),
-        address: "127.0.0.1:8080".parse().unwrap(),
+        address: "127.0.0.1:8080"
+            .parse()
+            .with_context(|| "could not parse address")?,
         hostname: String::from("example.com"),
         path: PathRule::Prefix(String::from("/")),
         method: None,
@@ -60,7 +67,9 @@ fn main() {
     let http_backend = proxy::Backend {
         cluster_id: String::from("test"),
         backend_id: String::from("test-0"),
-        address: "127.0.0.1:8000".parse().unwrap(),
+        address: "127.0.0.1:8000"
+            .parse()
+            .with_context(|| "could not parse address")?,
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id: None,
         backup: None,
@@ -81,4 +90,5 @@ fn main() {
 
     let _ = jg.join();
     info!("good bye");
+    Ok(())
 }

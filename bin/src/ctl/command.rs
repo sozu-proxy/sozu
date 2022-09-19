@@ -368,7 +368,7 @@ impl CommandManager {
         let message = self
             .channel
             .read_message_blocking_timeout(Some(self.timeout))
-            .unwrap();
+            .with_context(|| "Can not read response from channel")?;
 
         if id != message.id {
             bail!("received message with invalid id: {:?}", message);

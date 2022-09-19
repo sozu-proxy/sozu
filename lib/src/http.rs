@@ -399,7 +399,7 @@ impl Session {
         if upgrade == ProtocolResult::Continue {
             return result;
         }
-        
+
         if self.upgrade() {
             return match *unwrap_msg!(self.protocol.as_mut()) {
                 State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
@@ -1826,6 +1826,8 @@ impl ProxyConfiguration<Session> for Proxy {
 
 pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
     use crate::server;
+
+    // we should be able to trickle up this error
     let event_loop = Poll::new().expect("could not create event loop");
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(

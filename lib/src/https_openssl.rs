@@ -2406,6 +2406,7 @@ use crate::server::HttpsProvider;
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
     use crate::server;
 
+    // we should be able to trickle up this error
     let event_loop = Poll::new().expect("could not create event loop");
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(

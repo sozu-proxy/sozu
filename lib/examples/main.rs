@@ -7,6 +7,8 @@ extern crate time;
 
 use std::{env, io::stdout, thread};
 
+use anyhow::Context;
+
 use crate::sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
@@ -14,11 +16,11 @@ use crate::sozu_command::{
     proxy::{LoadBalancingParams, PathRule, Route, RulePosition},
 };
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     if env::var("RUST_LOG").is_ok() {
         Logger::init(
             "EXAMPLE".to_string(),
-            &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"),
+            &env::var("RUST_LOG").with_context(|| "could not get the RUST_LOG env var")?,
             LoggerBackend::Stdout(stdout()),
             None,
         );
@@ -33,15 +35,25 @@ fn main() {
 
     info!("MAIN\tstarting up");
 
-    sozu::metrics::setup(&"127.0.0.1:8125".parse().unwrap(), "main", false, None);
+    sozu::metrics::setup(
+        &"127.0.0.1:8125"
+            .parse()
+            .with_context(|| "Could not parse address for metrics setup")?,
+        "main",
+        false,
+        None,
+    );
     gauge!("sozu.TEST", 42);
 
     let config = proxy::HttpListener {
-        address: "127.0.0.1:8080".parse().expect("could not parse address"),
+        address: "127.0.0.1:8080"
+            .parse()
+            .with_context(|| "could not parse address")?,
         ..Default::default()
     };
 
-    let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
+    let (mut command, channel) =
+        Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
@@ -50,7 +62,9 @@ fn main() {
 
     let http_front = proxy::HttpFrontend {
         route: Route::ClusterId(String::from("cluster_1")),
-        address: "127.0.0.1:8080".parse().unwrap(),
+        address: "127.0.0.1:8080"
+            .parse()
+            .with_context(|| "Could not parse frontend address")?,
         hostname: String::from("lolcatho.st"),
         path: PathRule::Prefix(String::from("/")),
         method: None,
@@ -62,7 +76,9 @@ fn main() {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026".parse().unwrap(),
+        address: "127.0.0.1:1026"
+            .parse()
+            .with_context(|| "Could not parse backend address")?,
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };
@@ -81,7 +97,9 @@ fn main() {
     info!("MAIN\tHTTP -> {:?}", command.read_message());
 
     let config = proxy::HttpsListener {
-        address: "127.0.0.1:8443".parse().expect("could not parse address"),
+        address: "127.0.0.1:8443"
+            .parse()
+            .with_context(|| "could not parse address")?,
         cipher_list: String::from(
             "ECDHE-ECDSA-CHACHA20-POLY1305:\
     ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:\
@@ -101,7 +119,8 @@ fn main() {
         ..Default::default()
     };
 
-    let (mut command2, channel2) = Channel::generate(1000, 10000).expect("should create a channel");
+    let (mut command2, channel2) =
+        Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
     let jg2 = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
@@ -120,7 +139,9 @@ fn main() {
     command2.write_message(&proxy::ProxyRequest {
         id: String::from("ID_IJKL1"),
         order: proxy::ProxyRequestOrder::AddCertificate(proxy::AddCertificate {
-            address: "127.0.0.1:8443".parse().unwrap(),
+            address: "127.0.0.1:8443"
+                .parse()
+                .with_context(|| "Could not parse certificate address")?,
             certificate: certificate_and_key,
             names: vec![],
             expired_at: None,
@@ -129,7 +150,9 @@ fn main() {
 
     let tls_front = proxy::HttpFrontend {
         route: Route::ClusterId(String::from("cluster_1")),
-        address: "127.0.0.1:8443".parse().unwrap(),
+        address: "127.0.0.1:8443"
+            .parse()
+            .with_context(|| "Could not parse frontend address")?,
         hostname: String::from("lolcatho.st"),
         path: PathRule::Prefix(String::from("/")),
         method: None,
@@ -145,7 +168,9 @@ fn main() {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026".parse().unwrap(),
+        address: "127.0.0.1:1026"
+            .parse()
+            .with_context(|| "Could not parse backend address")?,
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };
@@ -168,7 +193,9 @@ fn main() {
     command2.write_message(&proxy::ProxyRequest {
         id: String::from("ID_QRST1"),
         order: proxy::ProxyRequestOrder::AddCertificate(proxy::AddCertificate {
-            address: "127.0.0.1:8443".parse().unwrap(),
+            address: "127.0.0.1:8443"
+                .parse()
+                .with_context(|| "Could not parse certificate address")?,
             certificate: certificate_and_key2,
             names: vec![],
             expired_at: None,
@@ -177,7 +204,9 @@ fn main() {
 
     let tls_front2 = proxy::HttpFrontend {
         route: Route::ClusterId(String::from("cluster_2")),
-        address: "127.0.0.1:8443".parse().unwrap(),
+        address: "127.0.0.1:8443"
+            .parse()
+            .with_context(|| "Could not parse frontend address")?,
         hostname: String::from("test.local"),
         path: PathRule::Prefix(String::from("/")),
         method: None,
@@ -194,7 +223,9 @@ fn main() {
         cluster_id: String::from("cluster_2"),
         backend_id: String::from("cluster_2-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026".parse().unwrap(),
+        address: "127.0.0.1:1026"
+            .parse()
+            .with_context(|| "Could not parse backend address")?,
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };
@@ -211,4 +242,5 @@ fn main() {
 
     let _ = jg.join();
     info!("MAIN\tgood bye");
+    Ok(())
 }
