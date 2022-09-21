@@ -349,10 +349,10 @@ impl CommandServer {
             .detach();
         } else {
             info!("no messages sent to workers: local state already had those messages");
-            if client_id.is_some() {
+            if let Some(client_id) = client_id {
                 return_success(
                     self.command_tx.clone(),
-                    RequestIdentifier::new(client_id.unwrap(), request_id),
+                    RequestIdentifier::new(client_id, request_id),
                     Success::LoadState(path.to_string(), 0, 0),
                 )
                 .await;
@@ -464,7 +464,11 @@ impl CommandServer {
 
         self.next_worker_id += 1;
 
-        let sock = worker.worker_channel.take().unwrap().sock;
+        let sock = worker
+            .worker_channel
+            .take()
+            .expect("No channel on the worker being launched")
+            .sock;
         let (worker_tx, worker_rx) = channel(10000);
         worker.sender = Some(worker_tx);
 
@@ -535,7 +539,12 @@ impl CommandServer {
         debug!("upgrade channel sent {:?}", received_ok_from_new_process);
 
         // signaling the accept loop that it should stop
-        if let Err(e) = self.accept_cancel.take().unwrap().send(()) {
+        if let Err(e) = self
+            .accept_cancel
+            .take() // we should create a method on Self for this frequent procedure
+            .expect("No channel on the main process")
+            .send(())
+        {
             error!("could not close the accept loop: {:?}", e);
         }
 
@@ -599,14 +608,18 @@ impl CommandServer {
 
         self.next_worker_id += 1;
 
-        let sock = new_worker.worker_channel.take().unwrap().sock;
+        let sock = new_worker
+            .worker_channel
+            .take()
+            .with_context(|| format!("No channel on new worker"))?
+            .sock;
         let (worker_tx, worker_rx) = channel(10000);
         new_worker.sender = Some(worker_tx);
 
         new_worker
             .sender
             .as_mut()
-            .unwrap()
+            .with_context(|| format!("No sender on new worker"))?
             .send(ProxyRequest {
                 id: format!("UPGRADE-{}-STATUS", id),
                 order: ProxyRequestOrder::Status,
@@ -1132,7 +1145,7 @@ impl CommandServer {
 
             let success = match &query {
                 &Query::ClustersHashes | &Query::Clusters(_) => {
-                    let main = main_query_answer.unwrap();
+                    let main = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
                     proxy_responses_map.insert(String::from("main"), main);
                     Success::Query(CommandResponseContent::Query(proxy_responses_map))
                 }

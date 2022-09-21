@@ -51,6 +51,7 @@ macro_rules! log {
     };
 }
 
+// this should return a Result to trickle up errors
 pub fn init(
     tag: String,
     spec: &str,

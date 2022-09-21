@@ -273,6 +273,7 @@ impl Write for MetricSocket {
     }
 }
 
+// this should return a Result and trickle up the errors
 pub fn udp_bind() -> UdpSocket {
     UdpSocket::bind("0.0.0.0:0".parse().unwrap()).expect("could not parse address")
 }

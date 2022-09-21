@@ -281,6 +281,7 @@ impl Server {
         config_state: ConfigState,
         expects_initial_status: bool,
     ) -> Self {
+        // we should be able to trickle up this error
         let event_loop = Poll::new().expect("could not create event loop");
         let pool = Rc::new(RefCell::new(Pool::with_capacity(
             config.min_buffers,
@@ -325,7 +326,8 @@ impl Server {
         let registry = event_loop
             .registry()
             .try_clone()
-            .expect("could not clone the mio Registry");
+            .expect("could not clone the mio Registry"); // we should trickle this up
+
         let https = HttpsProvider::new(
             use_openssl,
             registry,
@@ -374,7 +376,7 @@ impl Server {
                 Token(0),
                 Interest::READABLE | Interest::WRITABLE,
             )
-            .expect("should register the channel");
+            .expect("should register the channel"); // we should be able to trickle up this error
 
         METRICS.with(|metrics| {
             if let Some(sock) = (*metrics.borrow_mut()).socket_mut() {
@@ -600,6 +602,7 @@ impl Server {
                                         }
                                     }
 
+                                    // do we really want to crash the server here?
                                     let msg = msg.expect("the message should be valid");
 
                                     match msg.order {
@@ -764,7 +767,7 @@ impl Server {
                         id: self
                             .shutting_down
                             .take()
-                            .expect("should have shut down correctly"),
+                            .expect("should have shut down correctly"), // this would be better if trickled up and logged properly
                         status: ProxyResponseStatus::Ok,
                         content: None,
                     });
@@ -869,12 +872,11 @@ impl Server {
                             push_queue(ProxyResponse {
                                 id: message.id.clone(),
                                 status: ProxyResponseStatus::Ok,
-                                content: Some(ProxyResponseContent::Query(QueryAnswer::Certificates(
-                                    QueryAnswerCertificate::Fingerprint(get_certificate(
-                                        &self.config_state,
-                                        f,
+                                content: Some(ProxyResponseContent::Query(
+                                    QueryAnswer::Certificates(QueryAnswerCertificate::Fingerprint(
+                                        get_certificate(&self.config_state, f),
                                     )),
-                                ))),
+                                )),
                             });
                             return;
                         }

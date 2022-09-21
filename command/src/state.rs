@@ -177,9 +177,12 @@ impl ConfigState {
             &ProxyRequestOrder::AddCertificate(ref add) => {
                 let fingerprint =
                     match calculate_fingerprint(add.certificate.certificate.as_bytes()) {
-                        Some(f) => CertificateFingerprint(f),
-                        None => {
-                            error!("cannot obtain the certificate's fingerprint");
+                        Ok(f) => CertificateFingerprint(f),
+                        Err(e) => {
+                            error!(
+                                "cannot obtain the certificate's fingerprint: {}",
+                                e.to_string()
+                            );
                             return false;
                         }
                     };
@@ -216,9 +219,12 @@ impl ConfigState {
 
                 let fingerprint =
                     match calculate_fingerprint(replace.new_certificate.certificate.as_bytes()) {
-                        Some(f) => CertificateFingerprint(f),
-                        None => {
-                            error!("cannot obtain the certificate's fingerprint");
+                        Ok(f) => CertificateFingerprint(f),
+                        Err(e) => {
+                            error!(
+                                "cannot obtain the certificate's fingerprint: {}",
+                                e.to_string()
+                            );
                             return changed;
                         }
                     };

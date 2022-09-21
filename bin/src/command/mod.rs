@@ -130,7 +130,7 @@ pub enum Success {
     Query(CommandResponseContent),
     ReloadConfiguration(usize, usize), // ok, errors
     SaveState(usize, String),          // amount of written commands, path of the saved state
-    Status(CommandResponseContent),       // Vec<WorkerInfo>
+    Status(CommandResponseContent),    // Vec<WorkerInfo>
     SubscribeEvent(String),
     UpgradeMain(i32),         // pid of the new main process
     UpgradeWorker(u32),       // worker id
@@ -278,7 +278,11 @@ impl CommandServer {
         let state: ConfigState = Default::default();
 
         for worker in workers.iter_mut() {
-            let main_to_worker_channel = worker.worker_channel.take().unwrap().sock;
+            let main_to_worker_channel = worker
+                .worker_channel
+                .take()
+                .with_context(|| format!("No channel present in worker {}", worker.id))?
+                .sock;
             let (worker_tx, worker_rx) = channel(10000);
             worker.sender = Some(worker_tx);
 
@@ -436,19 +440,21 @@ impl CommandServer {
                 */
                 let accept_client = listener.accept();
                 futures::pin_mut!(accept_client);
-                let (stream, _) =
-                    match futures::future::select(accept_cancel_rx.take().unwrap(), accept_client)
-                        .await
-                    {
-                        futures::future::Either::Left((_canceled, _)) => {
-                            info!("stopping listener");
-                            break;
-                        }
-                        futures::future::Either::Right((res, cancel_rx)) => {
-                            accept_cancel_rx = Some(cancel_rx);
-                            res.unwrap()
-                        }
-                    };
+                let (stream, _) = match futures::future::select(
+                    accept_cancel_rx.take().expect("No channel found"),
+                    accept_client,
+                )
+                .await
+                {
+                    futures::future::Either::Left((_canceled, _)) => {
+                        info!("stopping listener");
+                        break;
+                    }
+                    futures::future::Either::Right((res, cancel_rx)) => {
+                        accept_cancel_rx = Some(cancel_rx);
+                        res.expect("Can not get unix stream to create a client loop.")
+                    }
+                };
                 debug!("Accepted a client from upgraded");
 
                 let (client_tx, client_rx) = channel(10000);
@@ -465,7 +471,7 @@ impl CommandServer {
                     sender: client_tx,
                 })
                 .await
-                .unwrap();
+                .expect("Could not send ClientNew message");
                 counter += 1;
             }
         })
@@ -695,7 +701,16 @@ impl CommandServer {
         info!("created new worker: {}", new_worker_id);
         self.next_worker_id += 1;
 
-        let sock = new_worker.worker_channel.take().unwrap().sock;
+        let sock = new_worker
+            .worker_channel
+            .take()
+            .with_context(|| {
+                format!(
+                    "the new worker with id {} does not have a channel",
+                    new_worker.id
+                )
+            })? // this used to crash with unwrap(), do we still want to crash?
+            .sock;
         let (worker_tx, worker_rx) = channel(10_000);
         new_worker.sender = Some(worker_tx);
 
@@ -929,7 +944,7 @@ pub fn start_server(
                         sender: client_tx,
                     })
                     .await
-                    .unwrap();
+                    .expect("Failed at sending ClientNew message");
                 counter += 1;
             }
         })
