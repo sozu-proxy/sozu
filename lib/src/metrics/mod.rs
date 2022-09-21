@@ -11,6 +11,7 @@ use std::{
     time::Instant,
 };
 
+use anyhow::Context;
 use mio::net::UdpSocket;
 
 use crate::sozu_command::proxy::{
@@ -116,8 +117,8 @@ pub fn setup<O: Into<String>>(
     origin: O,
     use_tagged_metrics: bool,
     prefix: Option<String>,
-) {
-    let metrics_socket = udp_bind();
+) -> anyhow::Result<()> {
+    let metrics_socket = udp_bind()?;
 
     debug!(
         "setting up metrics: local address = {:#?}",
@@ -132,6 +133,7 @@ pub fn setup<O: Into<String>>(
         (*metrics.borrow_mut()).set_up_origin(origin.into());
         (*metrics.borrow_mut()).set_up_tagged_metrics(use_tagged_metrics);
     });
+    Ok(())
 }
 
 pub trait Subscriber {
@@ -273,9 +275,11 @@ impl Write for MetricSocket {
     }
 }
 
-// this should return a Result and trickle up the errors
-pub fn udp_bind() -> UdpSocket {
-    UdpSocket::bind("0.0.0.0:0".parse().unwrap()).expect("could not parse address")
+pub fn udp_bind() -> anyhow::Result<UdpSocket> {
+    let address = "0.0.0.0:0"
+        .parse()
+        .with_context(|| "could not parse 0.0.0.0:0")?;
+    UdpSocket::bind(address).with_context(|| "Could not bind to 0.0.0.0:0 udp socket")
 }
 
 #[macro_export]

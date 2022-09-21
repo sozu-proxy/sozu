@@ -104,7 +104,7 @@ fn start(args: &cli::Args) -> Result<(), anyhow::Error> {
 
     util::setup_logging(&config);
     info!("Starting up");
-    util::setup_metrics(&config);
+    util::setup_metrics(&config).with_context(|| "Could not setup metrics")?;
     util::write_pid_file(&config).with_context(|| "PID file is not writeable")?;
 
     update_process_limits(&config)?;

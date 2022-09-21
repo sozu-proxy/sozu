@@ -158,7 +158,8 @@ pub fn begin_worker_process(
             worker_id,
             metrics.tagged_metrics,
             metrics.prefix.clone(),
-        );
+        )
+        .with_context(|| "Could not setup metrics")?;
     }
 
     let mut server = Server::new_from_config(
