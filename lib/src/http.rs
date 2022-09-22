@@ -8,6 +8,7 @@ use std::{
     str::from_utf8_unchecked,
 };
 
+use anyhow::Context;
 use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
@@ -1824,11 +1825,15 @@ impl ProxyConfiguration<Session> for Proxy {
     }
 }
 
-pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
+pub fn start(
+    config: HttpListener,
+    channel: ProxyChannel,
+    max_buffers: usize,
+    buffer_size: usize,
+) -> anyhow::Result<()> {
     use crate::server;
 
-    // we should be able to trickle up this error
-    let event_loop = Poll::new().expect("could not create event loop");
+    let event_loop = Poll::new().with_context(|| "could not create event loop")?;
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
         1,
@@ -1870,11 +1875,15 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
 
     let address = config.address;
     let sessions = SessionManager::new(sessions, max_buffers);
-    let registry = event_loop.registry().try_clone().unwrap();
+    let registry = event_loop
+        .registry()
+        .try_clone()
+        .with_context(|| "Failed at creating a registry")?;
     let mut proxy = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     let _ = proxy.add_listener(config, token);
     let _ = proxy.activate_listener(&address, None);
-    let (scm_server, scm_client) = UnixStream::pair().unwrap();
+    let (scm_server, scm_client) =
+        UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
     let scm = ScmSocket::new(scm_client.into_raw_fd());
     if let Err(e) = scm.send_listeners(&Listeners {
         http: Vec::new(),
@@ -1907,6 +1916,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
     println!("starting event loop");
     server.run();
     println!("ending event loop");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1957,7 +1967,7 @@ mod tests {
             Channel::generate(1000, 10000).expect("should create a channel");
         let _jg = thread::spawn(move || {
             setup_test_logger!();
-            start(config, channel, 10, 16384);
+            start(config, channel, 10, 16384).expect("could not start the http server");
         });
 
         let front = HttpFrontend {
@@ -2041,7 +2051,7 @@ mod tests {
 
         let _jg = thread::spawn(move || {
             setup_test_logger!();
-            start(config, channel, 10, 16384);
+            start(config, channel, 10, 16384).expect("could not start the http server");
         });
 
         let front = HttpFrontend {
@@ -2150,7 +2160,7 @@ mod tests {
             Channel::generate(1000, 10000).expect("should create a channel");
         let _jg = thread::spawn(move || {
             setup_test_logger!();
-            start(config, channel, 10, 16384);
+            start(config, channel, 10, 16384).expect("could not start the http server");
         });
 
         let cluster = Cluster {
