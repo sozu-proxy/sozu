@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::Context;
 use mio::{net::*, *};
 use rustls::{cipher_suite::*, ServerConfig, ServerConnection};
 use slab::Slab;
@@ -696,10 +697,16 @@ impl ProxyConfiguration<Session> for Proxy {
 }
 
 use crate::server::HttpsProvider;
-pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
+/// This is not directly used by Sōzu but is available for example and testing purposes
+pub fn start(
+    config: HttpsListener,
+    channel: ProxyChannel,
+    max_buffers: usize,
+    buffer_size: usize,
+) -> anyhow::Result<()> {
     use crate::server;
 
-    let event_loop = Poll::new().expect("could not create event loop"); // we should be able to trickle up this error
+    let event_loop = Poll::new().with_context(|| "could not create event loop")?;
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
         1,
@@ -742,11 +749,14 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
 
     let address = config.address;
     let sessions = SessionManager::new(sessions, max_buffers);
-    let registry = event_loop.registry().try_clone().unwrap();
+    let registry = event_loop
+        .registry()
+        .try_clone()
+        .with_context(|| "Could not clone the mio registry")?;
     let mut configuration = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     if configuration
         .add_listener(config, token)
-        .expect("failed to create listener") // we should be able to trickle up this error
+        .with_context(|| "failed to create listener")?
         .is_some()
         && configuration.activate_listener(&address, None).is_some()
     {
@@ -769,10 +779,12 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
             server_config,
             None,
             false,
-        );
+        )
+        .with_context(|| "Failed at creating server")?;
 
         info!("starting event loop");
         server.run();
         info!("ending event loop");
     }
+    Ok(())
 }

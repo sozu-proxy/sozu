@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use anyhow::Context;
 use foreign_types_shared::{ForeignType, ForeignTypeRef};
 use mio::{net::*, unix::SourceFd, *};
 use nom::HexDisplay;
@@ -2403,7 +2404,7 @@ yD0TrUjkXyjV/zczIYiYSROg9OE5UgYqswIBAg==
 }
 
 use crate::server::HttpsProvider;
-// this function is not used anywhere it seems
+/// this function is not used, but is available for example and testing purposes
 pub fn start(
     config: HttpsListener,
     channel: ProxyChannel,
@@ -2457,7 +2458,7 @@ pub fn start(
     let registry = event_loop
         .registry()
         .try_clone()
-        .with_context("Failed at creating a registry")?;
+        .with_context(|| "Failed at creating a registry")?;
     let mut configuration = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     let address = config.address;
     if configuration.add_listener(config, token).is_some()
@@ -2480,7 +2481,8 @@ pub fn start(
             server_config,
             None,
             false,
-        );
+        )
+        .with_context(|| "Failed to create server")?;
 
         info!("starting event loop");
         server.run();

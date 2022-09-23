@@ -8,6 +8,7 @@ use std::{
     rc::Rc,
 };
 
+use anyhow::Context;
 use mio::net::*;
 use mio::*;
 use slab::Slab;
@@ -274,15 +275,14 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn new_from_config(
+    pub fn try_new_from_config(
         worker_to_main_channel: ProxyChannel,
         worker_to_main_scm: ScmSocket,
         config: Config,
         config_state: ConfigState,
         expects_initial_status: bool,
-    ) -> Self {
-        // we should be able to trickle up this error
-        let event_loop = Poll::new().expect("could not create event loop");
+    ) -> anyhow::Result<Self> {
+        let event_loop = Poll::new().with_context(|| "could not create event loop")?;
         let pool = Rc::new(RefCell::new(Pool::with_capacity(
             config.min_buffers,
             config.max_buffers,
@@ -326,7 +326,7 @@ impl Server {
         let registry = event_loop
             .registry()
             .try_clone()
-            .expect("could not clone the mio Registry"); // we should trickle this up
+            .with_context(|| "could not clone the mio Registry")?;
 
         let https = HttpsProvider::new(
             use_openssl,
@@ -365,7 +365,7 @@ impl Server {
         server_config: ServerConfig,
         config_state: Option<ConfigState>,
         expects_initial_status: bool,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         FEATURES.with(|_features| {
             // initializing feature flags
         });
@@ -376,7 +376,7 @@ impl Server {
                 Token(0),
                 Interest::READABLE | Interest::WRITABLE,
             )
-            .expect("should register the channel"); // we should be able to trickle up this error
+            .with_context(|| "should register the channel")?;
 
         METRICS.with(|metrics| {
             if let Some(sock) = (*metrics.borrow_mut()).socket_mut() {
@@ -388,33 +388,44 @@ impl Server {
 
         let base_sessions_count = sessions.borrow().slab.len();
 
-        let http = Rc::new(RefCell::new(http.unwrap_or_else(|| {
-            let registry = poll
-                .registry()
-                .try_clone()
-                .expect("could not clone the mio Registry");
-            http::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
-        })));
-        let https = https.unwrap_or_else(|| {
-            let registry = poll
-                .registry()
-                .try_clone()
-                .expect("could not clone the mio Registry");
-            HttpsProvider::new(
-                false,
-                registry,
-                sessions.clone(),
-                pool.clone(),
-                backends.clone(),
-            )
-        });
-        let tcp = Rc::new(RefCell::new(tcp.unwrap_or_else(|| {
-            let registry = poll
-                .registry()
-                .try_clone()
-                .expect("could not clone the mio Registry");
-            tcp::Proxy::new(registry, sessions.clone(), backends.clone())
-        })));
+        let http = Rc::new(RefCell::new(match http {
+            Some(http) => http,
+            None => {
+                let registry = poll
+                    .registry()
+                    .try_clone()
+                    .with_context(|| "could not clone the mio Registry")?;
+                http::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
+            }
+        }));
+
+        let https = match https {
+            Some(https) => https,
+            None => {
+                let registry = poll
+                    .registry()
+                    .try_clone()
+                    .with_context(|| "could not clone the mio Registry")?;
+                HttpsProvider::new(
+                    false,
+                    registry,
+                    sessions.clone(),
+                    pool.clone(),
+                    backends.clone(),
+                )
+            }
+        };
+        
+        let tcp = Rc::new(RefCell::new(match tcp {
+            Some(tcp) => tcp,
+            None => {
+                let registry = poll
+                    .registry()
+                    .try_clone()
+                    .with_context(|| "could not clone the mio Registry")?;
+                tcp::Proxy::new(registry, sessions.clone(), backends.clone())
+            }
+        }));
 
         let mut server = Server {
             poll,
@@ -479,7 +490,7 @@ impl Server {
         info!("received listeners: {:?}", listeners);
         server.scm_listeners = listeners;
 
-        server
+        Ok(server)
     }
 }
 
@@ -767,7 +778,7 @@ impl Server {
                         id: self
                             .shutting_down
                             .take()
-                            .expect("should have shut down correctly"), // this would be better if trickled up and logged properly
+                            .expect("should have shut down correctly"), // panicking here makes sense actually
                         status: ProxyResponseStatus::Ok,
                         content: None,
                     });

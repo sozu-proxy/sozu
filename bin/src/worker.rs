@@ -162,13 +162,13 @@ pub fn begin_worker_process(
         .with_context(|| "Could not setup metrics")?;
     }
 
-    let mut server = Server::new_from_config(
+    let mut server = Server::try_new_from_config(
         worker_to_main_channel,
         ScmSocket::new(worker_to_main_scm_fd),
         worker_config,
         config_state,
         true,
-    );
+    ).with_context(||"Could not create server from config")?;
 
     info!("starting event loop");
     server.run();

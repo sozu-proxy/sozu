@@ -56,11 +56,11 @@ impl TlsHandshake {
                 let ssl = self
                     .ssl
                     .take()
-                    .expect("TlsHandshake should have a Ssl backend"); // do we really want to crash here?
+                    .expect("TlsHandshake should have a Ssl backend"); // do we really want to panic here?
                 let sock = self
                     .front
                     .take()
-                    .expect("TlsHandshake should have a front socket"); // do we really want to crash here?
+                    .expect("TlsHandshake should have a front socket"); // do we really want to panic here?
                 match ssl.accept(sock) {
                     Ok(stream) => {
                         self.stream = Some(stream);

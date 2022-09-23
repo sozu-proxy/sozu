@@ -1825,6 +1825,7 @@ impl ProxyConfiguration<Session> for Proxy {
     }
 }
 
+/// This is not directly used by Sōzu but is available for example and testing purposes
 pub fn start(
     config: HttpListener,
     channel: ProxyChannel,
@@ -1911,7 +1912,8 @@ pub fn start(
         server_config,
         None,
         false,
-    );
+    )
+    .with_context(|| "Failed at creating server")?;
 
     println!("starting event loop");
     server.run();
