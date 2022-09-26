@@ -4,80 +4,109 @@ In this document, we will explore what happens to a client session, from the
 creation of the socket, to its shutdown, with all the steps describing how the
 HTTP request and response can happen
 
+Before we dive into the creation, lifetime and death of sessions, we need to
+understand two concepts that are entirely segregated in Sozu:
+
+- the socket handling with the [mio](https://docs.rs/mio/0.7.13/mio/) crate
+- the `SessionManager` that keeps track of all sessions
+
+### What does mio do?
+
+Mio allows us to listen on socket events. For instance we may use TCP sockets to
+wait for connection and mio informs us when that socket is readable or when a socket has
+data to read, or was closed by the peer, or a timer triggered...
+
+Mio provides an abstraction over the linux syscall [epoll](https://man7.org/linux/man-pages/man7/epoll.7.html).
+This epoll syscall allows us to register file descriptors, so that the kernel notifies
+us whenever something happens to those file descriptors
+
+At the end of the day, sockets are just raw file descriptors. We use the mio
+`TcpListener`, `TcpStream` wrappers around these file descriptors. A `TcpListener`
+listens for connections on a specific port. For each new connection it creates a
+`TcpStream` on which subsequent trafic will be redirected (both from and to the client).
+
+This is all what we use mio for. "Subscribing" to file descriptors events.
+
+### Keep track of sessions with the SessionManager
+
+Each subscription in mio is associated with a Token (a u64 identifier). The SessionManager's
+job is to link a Token to a `ProxySession` that will make use of the subscription.
+This is done with a [Slab](), a key-value data structure which optimizes memory usage:
+
+- as a key: the Token provided by mio
+- as a value: a reference to a `ProxySession`
+
+That being said let's dive into the lifetime of a session.
+
 ## Accepting a connection
 
 Sozu uses TCP listener sockets to get new connections. It will typically listen
 on ports 80 (HTTP) and 443 (HTTPS), but could have other ports for TCP proxying,
 or even HTTP/HTTPS proxys on other ports.
 
-The session starts when the event loop gets an event that indicates the listen
-socket has new sockets to accept.
+For each frontend, Sozu:
 
-<details>
-<summary>event loop</summary>
-The event loop(https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/server.rs#L310-L342)
-manages sockets: we register a socket with mio(https://docs.rs/mio/0.7.13/mio/)
-a crate that provides an abstraction over epoll(https://man7.org/linux/man-pages/man7/epoll.7.html)
-on Linux.
+1. registers a `TcpListener` with mio
+2. adds a matching `ListenSession` in the `SessionManager`
 
-That syscall allows us to register file descriptors to the kernel, and we will
-be notified if something happens to those file descriptors. Example: a socket
-has data to read, or was closed by the peer, or a timer triggered...
+### An event loop on TCP sockets
 
-Here, the listen socket was registered for events after its creation. We just
-got the "readable" event for this socket, which indicates there are new
-connections to accept. From the event, we get a `Token`, an index in the
-`Slab` structure that holds sessions. One session can be linked to multiple
-sockets and thus have multiple tokens.
-</details>
+Sozu is hot reconfigurable. We can add listeners and frontends at runtime. For each added listener,
+the SessionManager will store a `ListenSession` in its Slab.
 
-We look up the `Listener` associated with that socket and start accepting new
-sockets in a loop and store them in the accept queue, until either there are
-no more connections to accept, or the accept queue is full:
-https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/server.rs#L1204-L1258
+The [event loop]() uses mio to check for any activity, on all sockets.
+Whenever mio detects activity on a socket, it returns an event that is passed to the `SessionManager`.
 
-<details>
-<summary>accept queue</summary>
+Typically we will have a `readable` event which mio will report on with the Token.
+The Sozu server looks up which of its listeners (there can be multiple TCP/HTTP/HTTPS listeners), and calls
+the accept method of the corresponding listener.
+Accepting a connection means to store it as a `TcpStream` in the accept queue, until either:
 
-When we accept a new connection, it might have waited a bit already in the
-listener queue. The kernel might even have some data already available,
-like a HTTP request. If we are too slow in handling that request, by the time
-we send the request to the backend and the backend responds, the client might
-have dropped the connection (timeout).
+- there are no more connections to accept
+- or the accept queue is full: https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/server.rs#L1204-L1258
 
-So when the listen socket can accept new connections, we accept them in a loop
-and store them in a queue, then create sessions from the queue, starting from
+### Consuming the accept queue
+
+We create sessions from the accept queue, starting from
 the most recent session, and dropping sockets that are too old.
 
-If we're already at the maximum number of client connections, new ones stay in
-the queue. And if the queue is full, we drop newly accepted connections.
+When we accept a new connection (`TcpStream`), it might have waited a bit already in the
+listener queue. The kernel might even already have some data available,
+like an HTTP request. If we are too slow in handling that request, the client might
+have dropped the connection (timeout) by the time we forward the request to the
+backend and the backend responds.
+
+If the maximum number of client connections (provided by `max_connections` in the configuration)
+is reached, new ones stay in the queue.
+And if the queue is full, we drop newly accepted connections.
 By specifying a maximum number of concurrent connections, we make sure that the
 server does not get overloaded and keep latencies manageable for existing
 connections.
-</details>
 
-The listener will then create a session, that will hold the data associated with
-the [session](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L65-L83):
+### Creating the Session
+
+The proxy will then create a session that holds the data associated
+[with this session](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L65-L83):
 tokens, current timeout state, protocol state, client address...
 
-<details>
-<summary>event loop</summary>
-The created session is wrapped in a `Rc<RefCell<...>>`(https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1544)
-that is then stored in the event loop's slab. That way, the frontend and backend
-token, that correspond to the front and back sockets, are used to look up the
-same instance of `Session`.
+A session is the core unit of Sozu's business logic: forwarding trafic from a frontend to a backend and vice-versa.
+
+The created session is wrapped in a
+[`Rc<RefCell<...>>`](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1544)
+
+The `TcpStream` is registered in mio with a new Token (called frontend_token).
+The Session is added in the SessionManager with the same Token.
+
+### Check for zombie sessions
 
 Since there can be bugs in how sessions are created and removed, and some of them
-could be "forgotten", there's a regular task called ["zombie checker"](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/server.rs#L446-L496)
-that verifies the sessions in the list and kills those that are stuck or too old.
-
-The frontend socket will be registered to `Poll` and we will wait for an event
-telling us that it is readable.
-</details>
+could be "forgotten", there's a regular task called
+["zombie checker"](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/server.rs#L446-L496)
+that checks on the sessions in the list and kills those that are stuck or too old.
 
 ## Reading data from the front socket
 
-When data comes from the network on the TCP connection, it is stored in a kernel
+When data comes from the network on the TcpStream, it is stored in a kernel
 buffer, and the kernel notifies the event loop that the socket is readable.
 
 <details>
