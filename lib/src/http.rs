@@ -77,7 +77,7 @@ pub struct Session {
     metrics: SessionMetrics,
     pub cluster_id: Option<String>,
     sticky_name: String,
-    pub listen_token: Token,
+    pub listener_token: Token,
     connection_attempt: u8,
     answers: Rc<RefCell<HttpAnswers>>,
     last_event: Instant,
@@ -97,7 +97,7 @@ impl Session {
         expect_proxy: bool,
         sticky_name: String,
         answers: Rc<RefCell<HttpAnswers>>,
-        listen_token: Token,
+        listener_token: Token,
         wait_time: Duration,
         frontend_timeout_duration: Duration,
         backend_timeout_duration: Duration,
@@ -149,7 +149,7 @@ impl Session {
                 sticky_name,
                 last_event: Instant::now(),
                 front_timeout,
-                listen_token,
+                listener_token: listener_token,
                 connection_attempt: 0,
                 answers,
                 frontend_timeout_duration,
@@ -950,7 +950,7 @@ impl Session {
             .proxy
             .borrow()
             .listeners
-            .get(&self.listen_token)
+            .get(&self.listener_token)
             .as_ref()
             .and_then(|listener| listener.borrow().frontend_from_request(host, uri, method));
 
@@ -1026,9 +1026,9 @@ impl Session {
             }
         };
 
-        let listen_token = self.listen_token;
+        let listener_token = self.listener_token;
         if front_should_stick {
-            let sticky_name = &self.proxy.borrow().listeners[&listen_token]
+            let sticky_name = &self.proxy.borrow().listeners[&listener_token]
                 .borrow()
                 .config
                 .sticky_name
@@ -1138,7 +1138,7 @@ impl Session {
             self.proxy
                 .borrow()
                 .listeners
-                .get(&self.listen_token)
+                .get(&self.listener_token)
                 .as_ref()
                 .map(|listener| listener.borrow().config.connect_timeout)
                 .unwrap(),
@@ -1768,11 +1768,11 @@ impl ProxyConfiguration<Session> for Proxy {
     fn create_session(
         &mut self,
         frontend_sock: TcpStream,
-        listen_token: ListenToken,
+        listener_token: ListenToken,
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
-        if let Some(listener) = self.listeners.get(&Token(listen_token.0)).map(Clone::clone) {
+        if let Some(listener) = self.listeners.get(&Token(listener_token.0)).map(Clone::clone) {
             if let Err(e) = frontend_sock.set_nodelay(true) {
                 error!(
                     "error setting nodelay on front socket({:?}): {:?}",

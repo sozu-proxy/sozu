@@ -38,6 +38,17 @@ This is done with a [Slab](), a key-value data structure which optimizes memory 
 
 That being said let's dive into the lifetime of a session.
 
+### What are Proxys?
+
+A Sozu worker internally has 3 proxys, one for each supported protocol:
+
+- TCP
+- HTTP
+- HTTPS
+
+A proxy manages listeners, frontends, backends and the business logic associated
+with each protocol (buffering, parsing, error handling...).
+
 ## Accepting a connection
 
 Sozu uses TCP listener sockets to get new connections. It will typically listen
@@ -46,8 +57,10 @@ or even HTTP/HTTPS proxys on other ports.
 
 For each frontend, Sozu:
 
-1. registers a `TcpListener` with mio
-2. adds a matching `ListenSession` in the `SessionManager`
+1. generate a new Token *token*
+2. uses mio to register a `TcpListener` as *token*
+3. adds a matching `ListenSession` in the `SessionManager` with key *token*
+4. stores the `TcpListener` in the appropriate Proxy (TCP/HTTP/HTTPS) with key *token*
 
 ### An event loop on TCP sockets
 
@@ -57,9 +70,15 @@ the SessionManager will store a `ListenSession` in its Slab.
 The [event loop]() uses mio to check for any activity, on all sockets.
 Whenever mio detects activity on a socket, it returns an event that is passed to the `SessionManager`.
 
-Typically we will have a `readable` event which mio will report on with the Token.
-The Sozu server looks up which of its listeners (there can be multiple TCP/HTTP/HTTPS listeners), and calls
-the accept method of the corresponding listener.
+Whenever a client connects to a frontend:
+1. it reaches a listener
+2. Sozu is notified by mio that a `readable` event was received on a specific Token
+3. using the SessionManager, Sozu gets the corresponding `ListenSession`
+4. Sozu determines the protocol that was used
+5. the Token is passed down to the appropriate proxy (TCP/HTTP/HTTPS)
+6. using the Token, the proxy determines which `TcpListener` triggered the event
+7. the proxy starts accepting new connections from it in a loop (as their might be more than one)
+
 Accepting a connection means to store it as a `TcpStream` in the accept queue, until either:
 
 - there are no more connections to accept
@@ -85,61 +104,69 @@ connections.
 
 ### Creating the Session
 
-The proxy will then create a session that holds the data associated
+A session is the core unit of Sozu's business logic: forwarding trafic from a frontend to a backend and vice-versa.
+It holds the data associated
 [with this session](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L65-L83):
 tokens, current timeout state, protocol state, client address...
-
-A session is the core unit of Sozu's business logic: forwarding trafic from a frontend to a backend and vice-versa.
-
 The created session is wrapped in a
 [`Rc<RefCell<...>>`](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1544)
 
+The proxies create one session for each item of the accept queue,
+using the `TcpStream` provided in the item.
 The `TcpStream` is registered in mio with a new Token (called frontend_token).
 The Session is added in the SessionManager with the same Token.
 
 ### Check for zombie sessions
 
-Since there can be bugs in how sessions are created and removed, and some of them
+Because bugs can occur when sessions are created and removed, and some of them
 could be "forgotten", there's a regular task called
 ["zombie checker"](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/server.rs#L446-L496)
 that checks on the sessions in the list and kills those that are stuck or too old.
 
-## Reading data from the front socket
+## How a Session reads data from the front socket
 
-When data comes from the network on the TcpStream, it is stored in a kernel
+When data arrives from the network on the `TcpStream`, it is stored in a kernel
 buffer, and the kernel notifies the event loop that the socket is readable.
-
-<details>
-<summary>event loop</summary>
 
 As with listen sockets, the token associated with the TCP socket will get a
 "readable" event, and we will use the token to lookup which session it is
-associated with. We then call its `process_events` method (https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/server.rs#L1431) to notify it of the new
-socket state(https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L810-L820).
+associated with. We then call
+[`Session::process_events`](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/server.rs#L1431)
+to notify it of the new
+[socket state](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L810-L820).
 
-Then we call its `ready()` method (https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L822-L827) to let it read data, parse, etc.
+Then we call
+[`Session::ready`](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L822-L827)
+to let it read data, parse, etc.
 That method will run in a loop (https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L548-L692),
-looking at which sockets are readable or writable, which ones we want to read
-or write, and call the `readable()`, `writable()` (for the front socket) and
-`back_readable()`, `back_writable()` (for the back socket) methods, until there
-is no more work to do in this session.
-</details>
 
-The [`readable()` method](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L309-L339)
+### Bring in the state machine
+
+The [`Session::readable` method](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L309-L339)
 of the session is called. It will then call that same method of the underlying
 [state machine](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L58-L63).
 
 The state machine is where the protocols are implemented. A session might need
 to recognize different protocols over its lifetime, depending on its configuration,
 and [upgrade](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L165) between them. They are all in the [protocol directory](https://github.com/sozu-proxy/sozu/tree/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol).
+
 Example:
-- a HTTPS session could start in Expect proxy protocol (a TCP proxy adds data at the beginning of the TCP stream to indicate the client's IP address)
-- once the expect protocol has run its course, we upgrade to the TLS handshake
-- once the handshake is done, we have a TLS stream, and we upgrade to a HTTP session
-- if required by the client, we can then switch to a WebSocket connection
+- an HTTPS session could start in a state called `ExpectProxyProtocol`
+- once the expect protocol has run its course, the session upgrades to the TLS handshake state: `HandShake`
+- once the handshake is done, we have a TLS stream, and the session upgrades to the `HTTP` state
+- if required by the client, the session can then switch to a WebSocket connection: `WebSocket`
 
 Now, let's assume we are currently using the HTTP 1 protocol. The session called
 the [`readable()` method](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L609).
+
+### Find the backend
+
+We need to parse the HTTP request to find out its:
+
+1. hostname
+2. path
+3. HTTP verb
+
 We will first try to [read data from the socket](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L646-L667) in the front buffer.
 If there were no errors (closed socket, etc), we will then handle that data
 in [`readable_parse()`](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L728).
@@ -154,14 +181,25 @@ until we reach a request state where the headers are entirely parsed. If there
 was not enough data, we'll wait for more data to come on the socket and restart
 parsing.
 
-Once we're done parsing the headers, and we have a hostname, we will [return SessionResult::ConnectBackend](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L751-L759) to the session to notify it that it should find a backend server to send the data.
+Once we're done parsing the headers, and find what we were looking for, we will
+[return SessionResult::ConnectBackend](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L751-L759)
+to notify the session that it should find a backend server to send the data.
 
 ## Connecting to backend servers
 
-<details>
-<summary>event loop</summary>
-the `ConnectBackend` result is returned all the way up to the event loop, to ask it for a token for the new socket, then it calls the Listener's `connect_to_backend` method.
-</details>
+The Session:
+1. finds which cluster to connect to
+2. asks the SessionManager for a new valid Token named back_token
+3. asks for a connection to the cluster
+   - the appropriate Proxy finds a backend
+4. registers the new `TcpStream` in mio with back_token
+5. inserts itself in the SessionManager with back_token
+
+The same session is now stored twice in the SessionManager:
+
+1. once with the front token as key
+2. secondly with the back token as key
+
 
 [The Listener handles the backend connection](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1577).
 It will first check if the session has triggered its circuit breaker (it will
@@ -214,3 +252,9 @@ we will retry a connection to a backend server.
 
 TODO
 
+
+looking at which sockets are readable or writable, which ones we want to read
+or write, and call the `readable()`, `writable()` (for the front socket) and
+`back_readable()`, `back_writable()` (for the back socket) methods, until there
+is no more work to do in this session.
+</details>
