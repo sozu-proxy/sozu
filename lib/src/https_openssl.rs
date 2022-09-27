@@ -11,6 +11,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use anyhow::Context;
 use foreign_types_shared::{ForeignType, ForeignTypeRef};
 use mio::{net::*, unix::SourceFd, *};
 use nom::HexDisplay;
@@ -2403,11 +2404,16 @@ yD0TrUjkXyjV/zczIYiYSROg9OE5UgYqswIBAg==
 }
 
 use crate::server::HttpsProvider;
-pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
+/// this function is not used, but is available for example and testing purposes
+pub fn start(
+    config: HttpsListener,
+    channel: ProxyChannel,
+    max_buffers: usize,
+    buffer_size: usize,
+) -> anyhow::Result<()> {
     use crate::server;
 
-    // we should be able to trickle up this error
-    let event_loop = Poll::new().expect("could not create event loop");
+    let event_loop = Poll::new().with_context(|| "could not create event loop")?;
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
         1,
@@ -2449,13 +2455,17 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
     };
 
     let sessions = SessionManager::new(sessions, max_buffers);
-    let registry = event_loop.registry().try_clone().unwrap();
+    let registry = event_loop
+        .registry()
+        .try_clone()
+        .with_context(|| "Failed at creating a registry")?;
     let mut configuration = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     let address = config.address;
     if configuration.add_listener(config, token).is_some()
         && configuration.activate_listener(&address, None).is_some()
     {
-        let (scm_server, _scm_client) = UnixStream::pair().unwrap();
+        let (scm_server, _scm_client) =
+            UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
         let mut server_config: server::ServerConfig = Default::default();
         server_config.max_connections = max_buffers;
         let mut server = Server::new(
@@ -2471,12 +2481,14 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
             server_config,
             None,
             false,
-        );
+        )
+        .with_context(|| "Failed to create server")?;
 
         info!("starting event loop");
         server.run();
         info!("ending event loop");
     }
+    Ok(())
 }
 
 #[cfg(test)]

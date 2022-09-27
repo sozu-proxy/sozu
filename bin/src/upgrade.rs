@@ -139,7 +139,7 @@ pub fn begin_new_main_process(
     let config = upgrade_data.config.clone();
 
     util::setup_logging(&config);
-    util::setup_metrics(&config);
+    util::setup_metrics(&config).with_context(|| "Could not setup metrics")?;
     //info!("new main got upgrade data: {:?}", upgrade_data);
 
     let mut server = CommandServer::from_upgrade_data(upgrade_data)?;

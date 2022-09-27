@@ -310,7 +310,7 @@ pub fn validate_request_header(
         HeaderValue::Upgrade(s) => {
             let mut st = state;
             if let Some(conn) = st.get_mut_connection() {
-                // do we really want to crash here?
+                // do we really want to panic here?
                 conn.upgrade = Some(str::from_utf8(s).expect("should be ascii").to_string())
             }
             st

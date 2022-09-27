@@ -227,7 +227,7 @@ pub fn validate_response_header(
         }
         HeaderValue::Upgrade(protocol) => {
             let proto = str::from_utf8(protocol)
-                .expect("the parsed protocol should be a valid utf8 string") // do we really want to crash here?
+                .expect("the parsed protocol should be a valid utf8 string") // do we really want to panic here?
                 .to_string();
             trace!("parsed a protocol: {:?}", proto);
             trace!("state is {:?}", state);

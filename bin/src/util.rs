@@ -46,15 +46,16 @@ pub fn setup_logging(config: &Config) {
     );
 }
 
-pub fn setup_metrics(config: &Config) {
+pub fn setup_metrics(config: &Config) -> anyhow::Result<()> {
     if let Some(metrics) = config.metrics.as_ref() {
-        metrics::setup(
+        return metrics::setup(
             &metrics.address,
             "MAIN",
             metrics.tagged_metrics,
             metrics.prefix.clone(),
         );
     }
+    Ok(())
 }
 
 pub fn write_pid_file(config: &Config) -> Result<(), anyhow::Error> {

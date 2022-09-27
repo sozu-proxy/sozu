@@ -7,6 +7,7 @@ use std::{
     rc::Rc,
 };
 
+use anyhow::Context;
 use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
@@ -1458,15 +1459,16 @@ impl ProxyConfiguration<Session> for Proxy {
     }
 }
 
+/// This is not directly used by Sōzu but is available for example and testing purposes
 pub fn start(
     config: TcpListenerConfig,
     max_buffers: usize,
     buffer_size: usize,
     channel: ProxyChannel,
-) {
+) -> anyhow::Result<()> {
     use crate::server;
 
-    let poll = Poll::new().expect("could not create event loop");     // we should be able to trickle up this error
+    let poll = Poll::new().with_context(|| "could not create event loop")?;
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
         1,
         max_buffers,
@@ -1508,11 +1510,15 @@ pub fn start(
 
     let sessions = SessionManager::new(sessions, max_buffers);
     let address = config.address;
-    let registry = poll.registry().try_clone().unwrap();
+    let registry = poll
+        .registry()
+        .try_clone()
+        .with_context(|| "Failed at creating a registry")?;
     let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
     let _ = configuration.add_listener(config, pool.clone(), token);
     let _ = configuration.activate_listener(&address, None);
-    let (scm_server, _scm_client) = UnixStream::pair().unwrap();
+    let (scm_server, _scm_client) =
+        UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
 
     let server_config = server::ServerConfig {
         max_connections: max_buffers,
@@ -1532,11 +1538,13 @@ pub fn start(
         server_config,
         None,
         false,
-    );
+    )
+    .with_context(|| "Could not create tcp server")?;
 
     info!("starting event loop");
     server.run();
     info!("ending event loop");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1571,7 +1579,7 @@ mod tests {
         setup_test_logger!();
         let barrier = Arc::new(Barrier::new(2));
         start_server(barrier.clone());
-        let _tx = start_proxy();
+        let _tx = start_proxy().expect("Could not start proxy");
         barrier.wait();
 
         let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
@@ -1667,12 +1675,16 @@ mod tests {
         });
     }
 
-    pub fn start_proxy() -> Channel<ProxyRequest, ProxyResponse> {
+    /// used in tests only
+    pub fn start_proxy() -> anyhow::Result<Channel<ProxyRequest, ProxyResponse>> {
         use crate::server;
 
         info!("listen for connections");
         let (mut command, channel) =
-            Channel::generate(1000, 10000).expect("should create a channel");
+            Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
+
+        // this thread should call a start() function that performs the same logic and returns Result<()>
+        // any error coming from this start() would be mapped and logged within the tread
         thread::spawn(move || {
             setup_test_logger!();
             info!("starting event loop");
@@ -1747,7 +1759,7 @@ mod tests {
                 max_connections,
                 ..Default::default()
             };
-            let mut s = Server::new(
+            let mut server = Server::new(
                 poll,
                 channel,
                 ScmSocket::new(scm_server.into_raw_fd()),
@@ -1760,9 +1772,10 @@ mod tests {
                 server_config,
                 None,
                 false,
-            );
+            )
+            .expect("Failed at creating the server");
             info!("will run");
-            s.run();
+            server.run();
             info!("ending event loop");
         });
 
@@ -1770,13 +1783,17 @@ mod tests {
         {
             let front = TcpFrontend {
                 cluster_id: String::from("yolo"),
-                address: "127.0.0.1:1234".parse().unwrap(),
+                address: "127.0.0.1:1234"
+                    .parse()
+                    .with_context(|| "Could not parse address")?,
                 tags: None,
             };
             let backend = proxy::Backend {
                 cluster_id: String::from("yolo"),
                 backend_id: String::from("yolo-0"),
-                address: "127.0.0.1:5678".parse().unwrap(),
+                address: "127.0.0.1:5678"
+                    .parse()
+                    .with_context(|| "Could not parse address")?,
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
@@ -1794,13 +1811,17 @@ mod tests {
         {
             let front = TcpFrontend {
                 cluster_id: String::from("yolo"),
-                address: "127.0.0.1:1235".parse().unwrap(),
+                address: "127.0.0.1:1235"
+                    .parse()
+                    .with_context(|| "Could not parse address")?,
                 tags: None,
             };
             let backend = proxy::Backend {
                 cluster_id: String::from("yolo"),
                 backend_id: String::from("yolo-0"),
-                address: "127.0.0.1:5678".parse().unwrap(),
+                address: "127.0.0.1:5678"
+                    .parse()
+                    .with_context(|| "Could not parse address")?,
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
@@ -1815,11 +1836,16 @@ mod tests {
             });
         }
 
-        println!("read_message: {:?}", command.read_message().unwrap());
-        println!("read_message: {:?}", command.read_message().unwrap());
-        println!("read_message: {:?}", command.read_message().unwrap());
-        println!("read_message: {:?}", command.read_message().unwrap());
+        // not sure why four times
+        for _ in 0..4 {
+            println!(
+                "read_message: {:?}",
+                command
+                    .read_message()
+                    .with_context(|| "could not read message")?
+            );
+        }
 
-        command
+        Ok(command)
     }
 }
