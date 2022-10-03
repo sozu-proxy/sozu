@@ -1401,6 +1401,7 @@ impl ProxySession for Session {
 
         if res == SessionResult::CloseSession {
             self.close();
+            self.proxy.borrow().sessions.borrow_mut().slab.try_remove(self.frontend_token.0);
         }
     }
 

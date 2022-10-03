@@ -710,7 +710,24 @@ impl Server {
 
                 for tk in frontend_tokens.iter() {
                     let cl = self.to_session(*tk);
-                    self.sessions.borrow_mut().close_session(cl);
+                    if self.sessions.borrow().slab.contains(cl.0) {
+                        let session = { self.sessions.borrow_mut().slab.remove(cl.0) };
+                        session.borrow_mut().close();
+
+                        let mut sessions = self.sessions.borrow_mut();
+                        assert!(sessions.nb_connections != 0);
+                        sessions.nb_connections -= 1;
+                        gauge!("client.connections", sessions.nb_connections);
+                        // do not be ready to accept right away, wait until we get back to 10% capacity
+                        if !sessions.can_accept && sessions.nb_connections < sessions.max_connections * 90 / 100 {
+                            debug!(
+                                "nb_connections = {}, max_connections = {}, starting to accept again",
+                                sessions.nb_connections, sessions.max_connections
+                            );
+                            gauge!("accept_queue.backpressure", 0);
+                            sessions.can_accept = true;
+                        }
+                    }
                 }
 
                 if count > 0 {
@@ -749,7 +766,8 @@ impl Server {
 
             if self.shutting_down.is_some() {
                 let sessions_count = self.sessions.borrow().slab.len();
-                for session in self.sessions.borrow_mut().slab.iter_mut() {
+                let slab = { self.sessions.borrow_mut().slab.clone() };
+                for session in slab {
                     session.1.borrow_mut().shutting_down();
                 }
 
