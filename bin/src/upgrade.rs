@@ -12,7 +12,7 @@ use libc::{self, pid_t};
 use mio::net::UnixStream;
 use nix::unistd::*;
 use serde::{Deserialize, Serialize};
-use serde_json;
+
 use tempfile::tempfile;
 
 use sozu_command_lib::{

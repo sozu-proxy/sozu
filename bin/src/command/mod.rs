@@ -22,7 +22,6 @@ use nix::{
     unistd::Pid,
 };
 use serde::{Deserialize, Serialize};
-use serde_json;
 
 use sozu_command_lib::{
     command::{
@@ -377,13 +376,10 @@ impl CommandServer {
                     trace!("Order OK: {}", order_success);
 
                     // perform shutdowns
-                    match order_success {
-                        Success::MasterStop => {
-                            // breaking the loop brings run() to return and ends Sōzu
-                            // shouldn't we have the same break for both shutdowns?
-                            break;
-                        }
-                        _ => {}
+                    if order_success == Success::MasterStop {
+                        // breaking the loop brings run() to return and ends Sōzu
+                        // shouldn't we have the same break for both shutdowns?
+                        break;
                     }
                 }
                 Err(error) => {
@@ -398,7 +394,7 @@ impl CommandServer {
         let workers: Vec<SerializedWorker> = self
             .workers
             .iter()
-            .map(|ref worker| SerializedWorker::from_worker(worker))
+            .map(SerializedWorker::from_worker)
             .collect();
         //FIXME: ensure there's at least one worker
         let state = self.state.clone();
@@ -508,7 +504,7 @@ impl CommandServer {
                     worker_channel: None,
                     sender,
                     pid: serialized.pid,
-                    run_state: serialized.run_state.clone(),
+                    run_state: serialized.run_state,
                     queue: serialized.queue.clone().into(),
                     scm_socket: ScmSocket::new(serialized.scm),
                 })
@@ -655,10 +651,10 @@ impl CommandServer {
 
     /// in case a worker has crashed while Running and automatic_worker_restart is set to true
     pub async fn restart_worker(&mut self, worker_id: u32) -> anyhow::Result<()> {
-        let ref mut worker_to_upgrade = self
+        let worker_to_upgrade = &mut (self
             .workers
             .get_mut(worker_id as usize)
-            .with_context(|| "there should be a worker at that token")?;
+            .with_context(|| "there should be a worker at that token")?);
 
         match kill(Pid::from_raw(worker_to_upgrade.pid), None) {
             Ok(_) => {
@@ -726,16 +722,14 @@ impl CommandServer {
         })
         .detach();
 
-        let mut count = 0usize;
         let mut orders = self.state.generate_activate_orders();
-        for order in orders.drain(..) {
+        for (count, order) in orders.drain(..).enumerate() {
             new_worker
                 .send(
                     format!("RESTART-{}-ACTIVATE-{}", new_worker_id, count),
                     order,
                 )
                 .await;
-            count += 1;
         }
 
         new_worker
@@ -753,7 +747,7 @@ impl CommandServer {
     async fn handle_worker_close(&mut self, id: u32) -> anyhow::Result<Success> {
         info!("removing worker {}", id);
 
-        if let Some(worker) = self.workers.iter_mut().filter(|w| w.id == id).next() {
+        if let Some(worker) = self.workers.iter_mut().find(|w| w.id == id) {
             // In case a worker crashes and should be restarted
             if self.config.worker_automatic_restart && worker.run_state == RunState::Running {
                 info!("Automatically restarting worker {}", id);
@@ -837,7 +831,7 @@ impl CommandServer {
                 };
 
                 if requester_tx
-                    .send((response.clone(), worker_id.clone()))
+                    .send((response.clone(), worker_id))
                     .await
                     .is_err()
                 {
@@ -1100,7 +1094,7 @@ async fn worker_loop(
             }
             Ok(proxy_response) => {
                 debug!("worker {} replied message: {:?}", worker_id, proxy_response);
-                let worker_id = worker_id.clone();
+                let worker_id = worker_id;
                 if let Err(e) = command_tx
                     .send(CommandMessage::WorkerResponse {
                         worker_id,

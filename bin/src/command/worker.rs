@@ -73,9 +73,9 @@ impl Worker {
 
     pub fn info(&self) -> WorkerInfo {
         WorkerInfo {
-            id: self.id.clone(),
-            pid: self.pid.clone(),
-            run_state: self.run_state.clone(),
+            id: self.id,
+            pid: self.pid,
+            run_state: self.run_state,
         }
     }
 

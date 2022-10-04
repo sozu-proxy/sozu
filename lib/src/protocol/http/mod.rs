@@ -42,14 +42,14 @@ impl StickySession {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
     Normal,
     /// status, HTTP answer, index in HTTP answer
     DefaultAnswer(DefaultAnswerStatus, Rc<Vec<u8>>, usize),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefaultAnswerStatus {
     Answer301,
     Answer400,
@@ -79,7 +79,7 @@ impl Into<u16> for DefaultAnswerStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutStatus {
     Request,
     Response,

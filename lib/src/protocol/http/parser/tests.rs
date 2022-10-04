@@ -257,7 +257,7 @@ fn parse_state_content_length_partial() {
     );
 
     let (_pool, mut buf) = buf_with_capacity(2048);
-    println!("skipping input:\n{}", (&input[..26]).to_hex(16));
+    println!("skipping input:\n{}", input[..26].to_hex(16));
     buf.write(&input[..]).unwrap();
     println!("unparsed data:\n{}", buf.unparsed_data().to_hex(16));
     println!("buffer output: {:?}", buf.output_queue);
@@ -797,13 +797,13 @@ fn parse_chunk_partial() {
 
     let initial = Chunk::Initial;
 
-    println!("parsing input:\n{}", (&input[..12]).to_hex(16));
+    println!("parsing input:\n{}", input[..12].to_hex(16));
     let res = initial.parse(&input[..12]);
     println!("result: {:?}", res);
     assert_eq!(res, (BufferMove::Advance(17), Chunk::Copying));
 
-    println!("consuming input:\n{}", (&input[..17]).to_hex(16));
-    println!("parsing input:\n{}", (&input[17..]).to_hex(16));
+    println!("consuming input:\n{}", input[..17].to_hex(16));
+    println!("parsing input:\n{}", input[17..].to_hex(16));
     let res2 = res.1.parse(&input[17..]);
     assert_eq!(res2, (BufferMove::Advance(26), Chunk::Ended));
 }

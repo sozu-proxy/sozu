@@ -642,8 +642,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     .iter()
                     .map(|(_addr, listener)| {
                         let owned = listener.borrow();
-                        let mut domains =
-                            (&unwrap_msg!(owned.resolver.0.lock()).domains).to_hashmap();
+                        let mut domains = unwrap_msg!(owned.resolver.0.lock()).domains.to_hashmap();
                         let res = domains
                             .drain()
                             .map(|(k, v)| (String::from_utf8(k).unwrap(), v.0))

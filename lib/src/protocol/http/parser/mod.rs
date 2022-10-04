@@ -94,7 +94,7 @@ fn vchar_1(i: &[u8]) -> IResult<&[u8], &[u8]> {
     take_while(is_vchar)(i)
 }
 
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub enum Method {
     Get,
     Post,
@@ -147,13 +147,13 @@ impl fmt::Display for Method {
     }
 }
 
-#[derive(PartialEq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum Version {
     V10,
     V11,
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct RawRequestLine<'a> {
     pub method: &'a [u8],
     pub uri: &'a [u8],
@@ -161,7 +161,7 @@ pub struct RawRequestLine<'a> {
 }
 
 /// A request line parsed from RawRequestLine
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub struct RequestLine {
     pub method: Method,
     pub uri: String,
@@ -182,7 +182,7 @@ impl RequestLine {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct RawStatusLine<'a> {
     pub version: Version,
     pub status: &'a [u8],
@@ -190,7 +190,7 @@ pub struct RawStatusLine<'a> {
 }
 
 /// A status line parsed from RawStatusLine
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub struct StatusLine {
     pub version: Version,
     pub status: u16,
@@ -268,7 +268,7 @@ fn status_line(i: &[u8]) -> IResult<&[u8], RawStatusLine> {
     ))
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Header {
     pub name: Vec<u8>,
     pub value: Vec<u8>,
@@ -521,7 +521,7 @@ fn trailer_line(i: &[u8]) -> IResult<&[u8], &[u8]> {
 }
 */
 
-#[derive(PartialEq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum Chunk {
     Initial,
     Copying,
@@ -629,7 +629,7 @@ impl Chunk {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum TransferEncodingValue {
     Chunked,
     Compress,
@@ -639,7 +639,7 @@ pub enum TransferEncodingValue {
     Unknown,
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct ConnectionValue {
     pub has_close: bool,
     pub has_keep_alive: bool,
@@ -647,7 +647,7 @@ pub struct ConnectionValue {
     pub to_delete: Option<HashSet<Vec<u8>>>,
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum HeaderResult<T> {
     Value(T),
     None,
@@ -940,7 +940,7 @@ impl Header {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardedProtocol {
     HTTP,
     HTTPS,
@@ -971,14 +971,14 @@ pub enum HeaderValue<'a> {
 
 pub type Host = String;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LengthInformation {
     Length(usize),
     Chunked,
     //Compressed
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Continue {
     None,
     Expects(usize),
@@ -992,7 +992,7 @@ pub enum Connection {
 }
 */
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ForwardedHeaders {
     pub x_proto: bool,
     pub x_host: bool,
@@ -1001,7 +1001,7 @@ pub struct ForwardedHeaders {
     pub forwarded: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connection {
     /// is it sufficient to set it to Some(false) to drop connection?
     pub keep_alive: Option<bool>,

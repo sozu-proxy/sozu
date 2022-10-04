@@ -1,7 +1,7 @@
 use std::{fs::File, io::Write, os::unix::io::RawFd};
 
 use anyhow::Context;
-use libc;
+
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 
 use sozu::metrics;

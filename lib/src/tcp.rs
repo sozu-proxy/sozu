@@ -1211,7 +1211,7 @@ impl Proxy {
         self.listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .map(|listener| {
+            .and_then(|listener| {
                 let mut owned = listener.borrow_mut();
 
                 owned
@@ -1219,7 +1219,6 @@ impl Proxy {
                     .take()
                     .map(|listener| (owned.token, listener))
             })
-            .flatten()
     }
 
     pub fn add_tcp_front(&mut self, front: TcpFrontend) -> Result<(), io::Error> {

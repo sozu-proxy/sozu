@@ -288,7 +288,7 @@ impl LocalDrain {
             .collect::<BTreeMap<String, FilteredData>>();
 
         let mut backends = BTreeMap::new();
-        for backend_id in self.get_backend_ids(&cluster_id) {
+        for backend_id in self.get_backend_ids(cluster_id) {
             let backend_metrics = self
                 .metrics_of_one_backend(&backend_id, metric_names)
                 .context(format!(
@@ -370,7 +370,7 @@ impl LocalDrain {
             let mut backend_map: BTreeMap<String, BTreeMap<String, FilteredData>> = BTreeMap::new();
             backend_map.insert(
                 backend_id.to_owned(),
-                self.metrics_of_one_backend(&backend_id, metric_names)?,
+                self.metrics_of_one_backend(backend_id, metric_names)?,
             );
 
             clusters.insert(
@@ -447,7 +447,10 @@ impl Subscriber for LocalDrain {
     ) {
         trace!(
             "receiving metric with key {}, cluster_id: {:?}, backend_id: {:?}, metric data: {:?}",
-            key, cluster_id, backend_id, metric
+            key,
+            cluster_id,
+            backend_id,
+            metric
         );
 
         // cluster metrics

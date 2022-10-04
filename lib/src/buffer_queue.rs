@@ -10,14 +10,14 @@ use crate::{
     pool_crate::Reset,
 };
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum InputElement {
     /// length in the stream
     Slice(usize),
     Splice(usize), // x bytes copied in kernel
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum OutputElement {
     /// length in the stream
     Slice(usize),

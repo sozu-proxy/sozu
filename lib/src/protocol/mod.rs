@@ -67,7 +67,7 @@ pub use self::proxy_protocol::send::SendProxyProtocol;
 #[cfg(not(feature = "use-openssl"))]
 pub use self::rustls::TlsHandshake;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolResult {
     Upgrade,
     Continue,

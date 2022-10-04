@@ -25,7 +25,7 @@ thread_local! {
 }
 
 /// We should rename this to MetricValue
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricData {
     Gauge(usize),
     GaugeAdd(i64),
@@ -251,7 +251,7 @@ impl Subscriber for Aggregator {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricLine {
     label: &'static str,
     cluster_id: Option<String>,

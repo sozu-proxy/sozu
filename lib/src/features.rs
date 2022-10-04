@@ -36,7 +36,7 @@ impl FeatureFlags {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Feature {
     Boolean(bool),
     String(String),

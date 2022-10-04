@@ -142,7 +142,7 @@ fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetric
             println!("\nCluster {}\n--------", cluster_id);
 
             if let Some(cluster) = &cluster_metrics_data.cluster {
-                let filtered = filter_metrics(&cluster);
+                let filtered = filter_metrics(cluster);
                 print_gauges_and_counts(&filtered);
                 print_percentiles(&filtered);
             }
@@ -164,7 +164,7 @@ fn filter_metrics(metrics: &BTreeMap<String, FilteredData>) -> BTreeMap<String, 
 
     for (metric_key, filtered_value) in metrics.iter() {
         filtered_metrics.insert(
-            format!("{}", metric_key.replace("\t", ".")),
+            metric_key.replace('\t', ".").to_string(),
             filtered_value.clone(),
         );
     }
@@ -292,7 +292,7 @@ pub fn print_query_response_data(
     data: Option<CommandResponseContent>,
     json: bool,
 ) -> anyhow::Result<()> {
-    if let Some(needle) = cluster_id.or_else(|| domain) {
+    if let Some(needle) = cluster_id.or(domain) {
         if let Some(CommandResponseContent::Query(data)) = &data {
             if json {
                 return print_json_response(data);
@@ -475,46 +475,44 @@ pub fn print_query_response_data(
 
             backend_table.printstd();
         }
-    } else {
-        if let Some(CommandResponseContent::Query(data)) = &data {
-            let mut table = Table::new();
-            table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
-            let mut header = vec![cell!("key")];
-            for key in data.keys() {
-                header.push(cell!(&key));
-            }
-            header.push(cell!("desynchronized"));
-            table.add_row(Row::new(header));
-
-            let mut query_data = HashMap::new();
-
-            for metrics in data.values() {
-                //let m: u8 = metrics;
-                if let QueryAnswer::ClustersHashes(clusters) = metrics {
-                    for (key, value) in clusters.iter() {
-                        query_data.entry(key).or_insert(Vec::new()).push(value);
-                    }
-                }
-            }
-
-            for (key, values) in query_data.iter() {
-                let mut row = vec![cell!(key)];
-                for val in values.iter() {
-                    row.push(cell!(format!("{}", val)));
-                }
-
-                let hs: HashSet<&u64> = values.iter().cloned().collect();
-                if hs.len() > 1 {
-                    row.push(cell!("X"));
-                } else {
-                    row.push(cell!(""));
-                }
-
-                table.add_row(Row::new(row));
-            }
-
-            table.printstd();
+    } else if let Some(CommandResponseContent::Query(data)) = &data {
+        let mut table = Table::new();
+        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+        let mut header = vec![cell!("key")];
+        for key in data.keys() {
+            header.push(cell!(&key));
         }
+        header.push(cell!("desynchronized"));
+        table.add_row(Row::new(header));
+
+        let mut query_data = HashMap::new();
+
+        for metrics in data.values() {
+            //let m: u8 = metrics;
+            if let QueryAnswer::ClustersHashes(clusters) = metrics {
+                for (key, value) in clusters.iter() {
+                    query_data.entry(key).or_insert(Vec::new()).push(value);
+                }
+            }
+        }
+
+        for (key, values) in query_data.iter() {
+            let mut row = vec![cell!(key)];
+            for val in values.iter() {
+                row.push(cell!(format!("{}", val)));
+            }
+
+            let hs: HashSet<&u64> = values.iter().cloned().collect();
+            if hs.len() > 1 {
+                row.push(cell!("X"));
+            } else {
+                row.push(cell!(""));
+            }
+
+            table.add_row(Row::new(row));
+        }
+
+        table.printstd();
     }
     Ok(())
 }
@@ -546,7 +544,7 @@ pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> an
                         println!("\t\t{}:\t{}", domain, hex::encode(fingerprint));
                     }
 
-                    println!("");
+                    println!();
                 }
             }
             QueryAnswerCertificate::Domain(h) => {
@@ -558,7 +556,7 @@ pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> an
                         println!("\t\tnot found");
                     }
 
-                    println!("");
+                    println!();
                 }
             }
             QueryAnswerCertificate::Fingerprint(opt) => {
@@ -569,7 +567,7 @@ pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> an
                 }
             }
         }
-        println!("");
+        println!();
     }
     Ok(())
 }
@@ -596,12 +594,12 @@ pub fn print_available_metrics(answers: &BTreeMap<String, QueryAnswer>) -> anyho
                 for key in proxy_metric_keys {
                     available_metrics
                         .0
-                        .insert(key.replace("\t", ".").to_owned());
+                        .insert(key.replace('\t', ".").to_owned());
                 }
                 for key in cluster_metric_keys {
                     available_metrics
                         .1
-                        .insert(key.replace("\t", ".").to_owned());
+                        .insert(key.replace('\t', ".").to_owned());
                 }
             }
             _ => bail!("The proxy responded nonsense instead of metric names"),

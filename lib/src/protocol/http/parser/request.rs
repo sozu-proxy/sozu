@@ -13,7 +13,7 @@ use super::{
     HeaderValue, Host, LengthInformation, Method, RequestLine, TransferEncodingValue, Version,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestState {
     Initial,
     Error(
