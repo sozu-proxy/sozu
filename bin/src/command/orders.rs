@@ -11,7 +11,6 @@ use anyhow::{bail, Context};
 use async_io::Async;
 use futures::{channel::mpsc::*, SinkExt, StreamExt};
 use nom::{Err, HexDisplay, Offset};
-use serde_json;
 
 use sozu_command_lib::{
     buffer::fixed::Buffer,
@@ -146,7 +145,7 @@ impl CommandServer {
                 file.write_all(
                     &serde_json::to_string(&message)
                         .map(|s| s.into_bytes())
-                        .unwrap_or(vec![]),
+                        .unwrap_or_default(),
                 )
                 .with_context(|| {
                     format!(
@@ -171,7 +170,7 @@ impl CommandServer {
             Ok(counter)
         })();
 
-        Ok(result.with_context(|| "Could not write the state onto the state file")?)
+        result.with_context(|| "Could not write the state onto the state file")
     }
 
     pub async fn dump_state(&mut self) -> anyhow::Result<Option<Success>> {
@@ -217,7 +216,7 @@ impl CommandServer {
             let mut offset = 0usize;
             match parse_several_commands::<CommandRequest>(buffer.data()) {
                 Ok((i, requests)) => {
-                    if i.len() > 0 {
+                    if !i.is_empty() {
                         debug!("could not parse {} bytes", i.len());
                         if previous == buffer.available_data() {
                             bail!("error consuming load state message");
@@ -409,8 +408,8 @@ impl CommandServer {
             }
         }
 
-        if (filters.tcp || list_all) && !filters.domain.is_some() {
-            for tcp_frontend in self.state.tcp_fronts.values().map(|v| v.iter()).flatten() {
+        if (filters.tcp || list_all) && filters.domain.is_none() {
+            for tcp_frontend in self.state.tcp_fronts.values().flat_map(|v| v.iter()) {
                 listed_frontends.tcp_frontends.push(tcp_frontend.to_owned())
             }
         }
@@ -424,10 +423,10 @@ impl CommandServer {
         let workers: Vec<WorkerInfo> = self
             .workers
             .iter()
-            .map(|ref worker| WorkerInfo {
+            .map(|worker| WorkerInfo {
                 id: worker.id,
                 pid: worker.pid,
-                run_state: worker.run_state.clone(),
+                run_state: worker.run_state,
             })
             .collect();
 
@@ -611,7 +610,7 @@ impl CommandServer {
         let sock = new_worker
             .worker_channel
             .take()
-            .with_context(|| format!("No channel on new worker"))?
+            .with_context(|| "No channel on new worker".to_string())?
             .sock;
         let (worker_tx, worker_rx) = channel(10000);
         new_worker.sender = Some(worker_tx);
@@ -619,7 +618,7 @@ impl CommandServer {
         new_worker
             .sender
             .as_mut()
-            .with_context(|| format!("No sender on new worker"))?
+            .with_context(|| "No sender on new worker".to_string())?
             .send(ProxyRequest {
                 id: format!("UPGRADE-{}-STATUS", id),
                 order: ProxyRequestOrder::Status,
@@ -637,8 +636,7 @@ impl CommandServer {
             let old_worker: &mut Worker = self
                 .workers
                 .iter_mut()
-                .filter(|worker| worker.id == id)
-                .next()
+                .find(|worker| worker.id == id)
                 .unwrap();
 
             /*
@@ -719,9 +717,7 @@ impl CommandServer {
                         ProxyResponseStatus::Ok => {
                             info!("softstop OK"); // this doesn't display :-(
                             if let Err(e) = command_tx
-                                .send(CommandMessage::WorkerClose {
-                                    worker_id: worker_id.clone(),
-                                })
+                                .send(CommandMessage::WorkerClose { worker_id })
                                 .await
                             {
                                 error!(
@@ -1092,7 +1088,7 @@ impl CommandServer {
                         );
                         cluster_ids
                             .iter()
-                            .map(|ref cluster_id| self.state.cluster_state(cluster_id))
+                            .map(|cluster_id| self.state.cluster_state(cluster_id))
                             .collect()
                     }
                 }));
@@ -1192,7 +1188,7 @@ impl CommandServer {
         });
         // also change / set the content of RUST_LOG so future workers / main thread
         // will have the new logging filter value
-        ::std::env::set_var("RUST_LOG", logging_filter.to_owned());
+        ::std::env::set_var("RUST_LOG", &logging_filter);
         debug!("Logging level now: {}", ::std::env::var("RUST_LOG")?);
         Ok(Some(Success::Logging(logging_filter)))
     }
@@ -1303,13 +1299,11 @@ impl CommandServer {
             while let Some((proxy_response, worker_id)) = worker_order_rx.next().await {
                 match proxy_response.status {
                     ProxyResponseStatus::Ok => {
-                        responses.push((worker_id.clone(), proxy_response));
+                        responses.push((worker_id, proxy_response));
 
                         if stopping_workers.contains(&worker_id) {
                             if let Err(e) = command_tx
-                                .send(CommandMessage::WorkerClose {
-                                    worker_id: worker_id.clone(),
-                                })
+                                .send(CommandMessage::WorkerClose { worker_id })
                                 .await
                             {
                                 error!(

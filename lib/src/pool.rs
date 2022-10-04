@@ -71,7 +71,7 @@ impl ops::DerefMut for Pool {
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct BufferMetadata {
     position: usize,
     end: usize,
@@ -178,8 +178,8 @@ impl Checkout {
             unsafe {
                 let length = end - pos;
                 ptr::copy(
-                    (&self.inner.extra()[pos..end]).as_ptr(),
-                    (&mut self.inner.extra_mut()[..length]).as_mut_ptr(),
+                    self.inner.extra()[pos..end].as_ptr(),
+                    self.inner.extra_mut()[..length].as_mut_ptr(),
                     length,
                 );
                 self.inner.position = 0;
@@ -197,8 +197,8 @@ impl Checkout {
             let begin = self.inner.position + start;
             let next_end = self.inner.end - length;
             ptr::copy(
-                (&self.inner.extra()[begin + length..self.inner.end]).as_ptr(),
-                (&mut self.inner.extra_mut()[begin..next_end]).as_mut_ptr(),
+                self.inner.extra()[begin + length..self.inner.end].as_ptr(),
+                self.inner.extra_mut()[begin..next_end].as_mut_ptr(),
                 self.inner.end - (begin + length),
             );
             self.inner.end = next_end;
@@ -221,13 +221,13 @@ impl Checkout {
             if data_len < length {
                 ptr::copy(
                     data.as_ptr(),
-                    (&mut self.inner.extra_mut()[begin..slice_end]).as_mut_ptr(),
+                    self.inner.extra_mut()[begin..slice_end].as_mut_ptr(),
                     data_len,
                 );
 
                 ptr::copy(
-                    (&self.inner.extra()[start + length..self.inner.end]).as_ptr(),
-                    (&mut self.inner.extra_mut()[slice_end..]).as_mut_ptr(),
+                    self.inner.extra()[start + length..self.inner.end].as_ptr(),
+                    self.inner.extra_mut()[slice_end..].as_mut_ptr(),
                     self.inner.end - (start + length),
                 );
                 self.inner.end -= length - data_len;
@@ -235,13 +235,13 @@ impl Checkout {
             // we put more data in the buffer
             } else {
                 ptr::copy(
-                    (&self.inner.extra()[start + length..self.inner.end]).as_ptr(),
-                    (&mut self.inner.extra_mut()[start + data_len..]).as_mut_ptr(),
+                    self.inner.extra()[start + length..self.inner.end].as_ptr(),
+                    self.inner.extra_mut()[start + data_len..].as_mut_ptr(),
                     self.inner.end - (start + length),
                 );
                 ptr::copy(
                     data.as_ptr(),
-                    (&mut self.inner.extra_mut()[begin..slice_end]).as_mut_ptr(),
+                    self.inner.extra_mut()[begin..slice_end].as_mut_ptr(),
                     data_len,
                 );
                 self.inner.end += data_len - length;
@@ -262,13 +262,13 @@ impl Checkout {
             let begin = self.inner.position + start;
             let slice_end = begin + data_len;
             ptr::copy(
-                (&self.inner.extra()[start..self.inner.end]).as_ptr(),
-                (&mut self.inner.extra_mut()[start + data_len..]).as_mut_ptr(),
+                self.inner.extra()[start..self.inner.end].as_ptr(),
+                self.inner.extra_mut()[start + data_len..].as_mut_ptr(),
                 self.inner.end - start,
             );
             ptr::copy(
                 data.as_ptr(),
-                (&mut self.inner.extra_mut()[begin..slice_end]).as_mut_ptr(),
+                self.inner.extra_mut()[begin..slice_end].as_mut_ptr(),
                 data_len,
             );
             self.inner.end += data_len;
@@ -298,7 +298,7 @@ impl Read for Checkout {
         let len = cmp::min(self.available_data(), buf.len());
         unsafe {
             ptr::copy(
-                (&self.inner.extra()[self.inner.position..self.inner.position + len]).as_ptr(),
+                self.inner.extra()[self.inner.position..self.inner.position + len].as_ptr(),
                 buf.as_mut_ptr(),
                 len,
             );

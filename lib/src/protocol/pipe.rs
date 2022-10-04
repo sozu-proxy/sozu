@@ -13,7 +13,7 @@ use crate::{
     ListenerHandler, LogDuration, Protocol, {Readiness, SessionMetrics, SessionResult},
 };
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum SessionStatus {
     Normal,
     DefaultAnswer,

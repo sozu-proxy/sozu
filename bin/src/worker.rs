@@ -26,7 +26,7 @@ use libc::{c_char, PATH_MAX};
 use libc::{sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
 use mio::net::UnixStream;
 use nix::{self, unistd::*};
-use serde_json;
+
 use tempfile::tempfile;
 
 use sozu::{metrics, server::Server};
@@ -168,7 +168,8 @@ pub fn begin_worker_process(
         worker_config,
         config_state,
         true,
-    ).with_context(||"Could not create server from config")?;
+    )
+    .with_context(|| "Could not create server from config")?;
 
     info!("starting event loop");
     server.run();

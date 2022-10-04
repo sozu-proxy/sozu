@@ -5,14 +5,14 @@ use regex::bytes::Regex;
 pub type Key = Vec<u8>;
 pub type KeyValue<K, V> = (K, V);
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum InsertResult {
     Ok,
     Existing,
     Failed,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum RemoveResult {
     Ok,
     NotFound,
@@ -20,26 +20,12 @@ pub enum RemoveResult {
 
 fn find_last_dot(input: &[u8]) -> Option<usize> {
     //println!("find_last_dot: input = {}", from_utf8(input).unwrap());
-    for i in (0..input.len()).rev() {
-        //println!("input[{}] -> {}", i, input[i] as char);
-        if input[i] == b'.' {
-            return Some(i);
-        }
-    }
-
-    None
+    (0..input.len()).rev().find(|&i| input[i] == b'.')
 }
 
 fn find_last_slash(input: &[u8]) -> Option<usize> {
     //println!("find_last_dot: input = {}", from_utf8(input).unwrap());
-    for i in (0..input.len()).rev() {
-        //println!("input[{}] -> {}", i, input[i] as char);
-        if input[i] == b'/' {
-            return Some(i);
-        }
-    }
-
-    None
+    (0..input.len()).rev().find(|&i| input[i] == b'/')
 }
 
 #[derive(Debug)]
@@ -182,7 +168,7 @@ impl<V: Debug + Clone> TrieNode<V> {
                 let res = node.insert_recursive(&partial_key[..pos], key, value);
 
                 if res == InsertResult::Ok {
-                    self.children.insert((&partial_key[pos..]).to_vec(), node);
+                    self.children.insert(partial_key[pos..].to_vec(), node);
                 }
 
                 res
@@ -462,7 +448,7 @@ mod tests {
 
         assert_eq!(
             root.domain_lookup(&b"abce"[..], true),
-            Some(&((&b"abce"[..]).to_vec(), 2))
+            Some(&(b"abce"[..].to_vec(), 2))
         );
         //assert!(false);
     }
@@ -611,35 +597,35 @@ mod tests {
         );
         assert_eq!(
             root.domain_lookup(&b"www.example.com"[..], true),
-            Some(&((&b"www.example.com"[..]).to_vec(), 1))
+            Some(&(b"www.example.com"[..].to_vec(), 1))
         );
         assert_eq!(
             root.domain_lookup(&b"alldomains.org"[..], true),
-            Some(&((&b"alldomains.org"[..]).to_vec(), 4))
+            Some(&(b"alldomains.org"[..].to_vec(), 4))
         );
         assert_eq!(
             root.domain_lookup(&b"test.hello.com"[..], true),
-            Some(&((&b"*.hello.com"[..]).to_vec(), 7))
+            Some(&(b"*.hello.com"[..].to_vec(), 7))
         );
         assert_eq!(
             root.domain_lookup(&b"images.cdn10.hello.com"[..], true),
-            Some(&((&b"images./cdn[0-9]+/.hello.com"[..]).to_vec(), 8))
+            Some(&(b"images./cdn[0-9]+/.hello.com"[..].to_vec(), 8))
         );
         assert_eq!(
             root.domain_lookup(&b"test42.www.hello.com"[..], true),
-            Some(&((&b"/test[0-9]+/.www.hello.com"[..]).to_vec(), 9))
+            Some(&(b"/test[0-9]+/.www.hello.com"[..].to_vec(), 9))
         );
         assert_eq!(
             root.domain_lookup(&b"test.alldomains.org"[..], true),
-            Some(&((&b"*.alldomains.org"[..]).to_vec(), 3))
+            Some(&(b"*.alldomains.org"[..].to_vec(), 3))
         );
         assert_eq!(
             root.domain_lookup(&b"hello.alldomains.org"[..], true),
-            Some(&((&b"*.alldomains.org"[..]).to_vec(), 3))
+            Some(&(b"*.alldomains.org"[..].to_vec(), 3))
         );
         assert_eq!(
             root.domain_lookup(&b"pouet.alldomains.org"[..], true),
-            Some(&((&b"pouet.alldomains.org"[..]).to_vec(), 5))
+            Some(&(b"pouet.alldomains.org"[..].to_vec(), 5))
         );
         assert_eq!(
             root.domain_lookup(&b"blah.test.alldomains.org"[..], true),
@@ -655,19 +641,19 @@ mod tests {
         assert_eq!(root.domain_lookup(&b"alldomains.org"[..], true), None);
         assert_eq!(
             root.domain_lookup(&b"test.alldomains.org"[..], true),
-            Some(&((&b"*.alldomains.org"[..]).to_vec(), 3))
+            Some(&(b"*.alldomains.org"[..].to_vec(), 3))
         );
         assert_eq!(
             root.domain_lookup(&b"hello.alldomains.org"[..], true),
-            Some(&((&b"*.alldomains.org"[..]).to_vec(), 3))
+            Some(&(b"*.alldomains.org"[..].to_vec(), 3))
         );
         assert_eq!(
             root.domain_lookup(&b"pouet.alldomains.org"[..], true),
-            Some(&((&b"pouet.alldomains.org"[..]).to_vec(), 5))
+            Some(&(b"pouet.alldomains.org"[..].to_vec(), 5))
         );
         assert_eq!(
             root.domain_lookup(&b"test.hello.com"[..], true),
-            Some(&((&b"*.hello.com"[..]).to_vec(), 7))
+            Some(&(b"*.hello.com"[..].to_vec(), 7))
         );
         assert_eq!(
             root.domain_lookup(&b"blah.test.alldomains.org"[..], true),

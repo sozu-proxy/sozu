@@ -438,7 +438,7 @@ pub enum PathRule {
     Equals(String),
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum PathRuleResult {
     Regex,
     Prefix(usize),
@@ -509,12 +509,12 @@ impl std::str::FromStr for PathRule {
 }
 */
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MethodRule {
     pub inner: Option<Method>,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum MethodRuleResult {
     All,
     Equals,

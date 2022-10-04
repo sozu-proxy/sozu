@@ -93,7 +93,7 @@ impl ScmSocket {
             listeners_count
                 .http
                 .drain(..)
-                .zip((&received_fds[index..index + len]).iter().cloned()),
+                .zip(received_fds[index..index + len].iter().cloned()),
         );
 
         index += len;
@@ -103,17 +103,16 @@ impl ScmSocket {
             listeners_count
                 .tls
                 .drain(..)
-                .zip((&received_fds[index..index + len]).iter().cloned()),
+                .zip(received_fds[index..index + len].iter().cloned()),
         );
 
         index += len;
         let mut tcp = Vec::new();
         tcp.extend(
-            listeners_count.tcp.drain(..).zip(
-                (&received_fds[index..file_descriptor_length])
-                    .iter()
-                    .cloned(),
-            ),
+            listeners_count
+                .tcp
+                .drain(..)
+                .zip(received_fds[index..file_descriptor_length].iter().cloned()),
         );
 
         Ok(Listeners { http, tls, tcp })

@@ -6,7 +6,7 @@ use std::{
 
 use pool::Reset;
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Buffer {
     memory: Vec<u8>,
     capacity: usize,
@@ -98,8 +98,8 @@ impl Buffer {
             unsafe {
                 let length = self.end - self.position;
                 ptr::copy(
-                    (&self.memory[self.position..self.end]).as_ptr(),
-                    (&mut self.memory[..length]).as_mut_ptr(),
+                    self.memory[self.position..self.end].as_ptr(),
+                    self.memory[..length].as_mut_ptr(),
                     length,
                 );
                 self.position = 0;
@@ -117,8 +117,8 @@ impl Buffer {
             let begin = self.position + start;
             let next_end = self.end - length;
             ptr::copy(
-                (&self.memory[begin + length..self.end]).as_ptr(),
-                (&mut self.memory[begin..next_end]).as_mut_ptr(),
+                self.memory[begin + length..self.end].as_ptr(),
+                self.memory[begin..next_end].as_mut_ptr(),
                 self.end - (begin + length),
             );
             self.end = next_end;
@@ -141,13 +141,13 @@ impl Buffer {
             if data_len < length {
                 ptr::copy(
                     data.as_ptr(),
-                    (&mut self.memory[begin..slice_end]).as_mut_ptr(),
+                    self.memory[begin..slice_end].as_mut_ptr(),
                     data_len,
                 );
 
                 ptr::copy(
-                    (&self.memory[start + length..self.end]).as_ptr(),
-                    (&mut self.memory[slice_end..]).as_mut_ptr(),
+                    self.memory[start + length..self.end].as_ptr(),
+                    self.memory[slice_end..].as_mut_ptr(),
                     self.end - (start + length),
                 );
                 self.end -= length - data_len;
@@ -155,13 +155,13 @@ impl Buffer {
             // we put more data in the buffer
             } else {
                 ptr::copy(
-                    (&self.memory[start + length..self.end]).as_ptr(),
-                    (&mut self.memory[start + data_len..]).as_mut_ptr(),
+                    self.memory[start + length..self.end].as_ptr(),
+                    self.memory[start + data_len..].as_mut_ptr(),
                     self.end - (start + length),
                 );
                 ptr::copy(
                     data.as_ptr(),
-                    (&mut self.memory[begin..slice_end]).as_mut_ptr(),
+                    self.memory[begin..slice_end].as_mut_ptr(),
                     data_len,
                 );
                 self.end += data_len - length;
@@ -180,13 +180,13 @@ impl Buffer {
             let begin = self.position + start;
             let slice_end = begin + data_len;
             ptr::copy(
-                (&self.memory[start..self.end]).as_ptr(),
-                (&mut self.memory[start + data_len..]).as_mut_ptr(),
+                self.memory[start..self.end].as_ptr(),
+                self.memory[start + data_len..].as_mut_ptr(),
                 self.end - start,
             );
             ptr::copy(
                 data.as_ptr(),
-                (&mut self.memory[begin..slice_end]).as_mut_ptr(),
+                self.memory[begin..slice_end].as_mut_ptr(),
                 data_len,
             );
             self.end += data_len;
@@ -216,7 +216,7 @@ impl Read for Buffer {
         let len = cmp::min(self.available_data(), buf.len());
         unsafe {
             ptr::copy(
-                (&self.memory[self.position..self.position + len]).as_ptr(),
+                self.memory[self.position..self.position + len].as_ptr(),
                 buf.as_mut_ptr(),
                 len,
             );

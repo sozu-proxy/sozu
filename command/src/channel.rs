@@ -18,7 +18,7 @@ use serde_json;
 
 use crate::{buffer::growable::Buffer, ready::Ready};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ConnError {
     Continue,
     ParseError,

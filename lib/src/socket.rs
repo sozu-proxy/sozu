@@ -9,7 +9,7 @@ use openssl::ssl::{ErrorCode, SslStream, SslVersion};
 use rustls::{ProtocolVersion, ServerConnection};
 use socket2::{Domain, Protocol, Socket, Type};
 
-#[derive(Debug, PartialEq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum SocketResult {
     Continue,
     Closed,
@@ -17,7 +17,7 @@ pub enum SocketResult {
     Error,
 }
 
-#[derive(Debug, PartialEq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum TransportProtocol {
     Tcp,
     Ssl2,

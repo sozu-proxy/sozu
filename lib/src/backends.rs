@@ -290,7 +290,7 @@ impl BackendList {
         if backends.is_empty() {
             return None;
         }
-        
+
         self.load_balancing.next_available_backend(&mut backends)
     }
 

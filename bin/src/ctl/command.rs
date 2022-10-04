@@ -173,9 +173,10 @@ impl CommandManager {
 
         let message = self.read_channel_message_with_timeout()?;
 
-        if &id != &message.id {
+        if id != message.id {
             bail!("received message with invalid id: {:?}", message);
         }
+
         match message.status {
             CommandStatus::Processing => {
                 println!("Proxy is processing: {}", message.message);
@@ -210,7 +211,7 @@ impl CommandManager {
                 bail!("could not stop the proxy: {}", message.message);
             }
             CommandStatus::Ok => {
-                if &id == &message.id {
+                if id == message.id {
                     println!("Proxy shut down: {}", message.message);
                 }
             }
@@ -251,13 +252,13 @@ impl CommandManager {
                     let mut table = Table::new();
                     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
                     table.add_row(row!["Worker", "pid", "run state"]);
-                    for ref worker in workers.iter() {
+                    for worker in workers.iter() {
                         let run_state = format!("{:?}", worker.run_state);
                         table.add_row(row![worker.id, worker.pid, run_state]);
                     }
-                    println!("");
+                    println!();
                     table.printstd();
-                    println!("");
+                    println!();
 
                     let id = generate_tagged_id("UPGRADE-MAIN");
                     self.channel.write_message(&CommandRequest::new(
@@ -270,9 +271,10 @@ impl CommandManager {
                     loop {
                         let message = self.read_channel_message_with_timeout()?;
 
-                        if &id != &message.id {
+                        if id != message.id {
                             bail!("Error: received unexpected message: {:?}", message);
                         }
+
                         match message.status {
                             CommandStatus::Processing => {
                                 println!("Main process is upgrading");
@@ -298,7 +300,7 @@ impl CommandManager {
                         .filter(|worker| worker.run_state == RunState::Running)
                         .collect::<Vec<_>>();
                     let running_count = running_workers.len();
-                    for (i, ref worker) in running_workers.iter().enumerate() {
+                    for (i, worker) in running_workers.iter().enumerate() {
                         println!(
                             "Upgrading worker {} (#{} out of {})",
                             worker.id,
@@ -347,7 +349,7 @@ impl CommandManager {
                     message.message
                 ),
                 CommandStatus::Ok => {
-                    if &id == &message.id {
+                    if id == message.id {
                         info!("Worker {} shut down: {}", worker_id, message.message);
                     }
                 }
@@ -424,7 +426,7 @@ impl CommandManager {
                 bail!("Error with metrics command: {}", message.message);
             }
             CommandStatus::Ok => {
-                if &id == &message.id {
+                if id == message.id {
                     println!("Successfull metrics command: {}", message.message);
                 }
             }
@@ -598,9 +600,9 @@ impl CommandManager {
             )))
         } else if let Some(ref domain) = domain {
             let splitted: Vec<String> =
-                domain.splitn(2, "/").map(|elem| elem.to_string()).collect();
+                domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
 
-            if splitted.len() == 0 {
+            if splitted.is_empty() {
                 bail!("Domain can't be empty");
             }
 
@@ -711,7 +713,7 @@ impl CommandManager {
     pub fn events(&mut self) -> Result<(), anyhow::Error> {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
-            id.clone(),
+            id,
             CommandRequestOrder::SubscribeEvents,
             None,
         ));
@@ -737,7 +739,7 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestOrder::Proxy(order.clone()),
+            CommandRequestOrder::Proxy(order),
             None,
         ));
 

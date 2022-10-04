@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, net::SocketAddr};
 use clap::{Parser, Subcommand};
 use sozu_command_lib::proxy::{LoadBalancingAlgorithms, TlsVersion};
 
-#[derive(Parser, PartialEq, Clone, Debug)]
+#[derive(Parser, PartialEq, Eq, Clone, Debug)]
 #[clap(author, version, about)]
 pub struct Args {
     #[clap(
@@ -32,7 +32,7 @@ impl paw::ParseArgs for Args {
     }
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum SubCmd {
     #[clap(name = "start", about = "launch the main process")]
     Start,
@@ -207,7 +207,7 @@ pub enum SubCmd {
     Events,
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum MetricsCmd {
     #[clap(name = "enable", about = "Enables local metrics collection")]
     Enable,
@@ -225,28 +225,28 @@ pub enum MetricsCmd {
             short = 'n',
             long = "names",
             help = "Filter by metric names. Coma-separated list.",
-            use_delimiter = true
+            use_value_delimiter = true
         )]
         names: Vec<String>,
         #[clap(
             short = 'k',
             long = "clusters",
             help = "list of cluster ids (= application id)",
-            use_delimiter = true
+            use_value_delimiter = true
         )]
         clusters: Vec<String>,
         #[clap(
             short = 'b',
             long="backends",
             help="coma-separated list of backends, 'one_backend_id,other_backend_id'",
-            use_delimiter = true
+            use_value_delimiter = true
             // parse(try_from_str = split_slash)
         )]
         backends: Vec<String>,
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum LoggingLevel {
     #[clap(name = "trace", about = "Displays a LOT of logs")]
     Trace,
@@ -268,7 +268,7 @@ impl std::fmt::Display for LoggingLevel {
     }
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum StateCmd {
     #[clap(name = "save", about = "Save state to that file")]
     Save {
@@ -291,7 +291,7 @@ pub enum StateCmd {
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum ClusterCmd {
     #[clap(name = "remove", about = "Remove a cluster")]
     Remove {
@@ -324,7 +324,7 @@ pub enum ClusterCmd {
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum BackendCmd {
     #[clap(name = "remove", about = "Remove a backend")]
     Remove {
@@ -362,7 +362,7 @@ pub enum BackendCmd {
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum FrontendCmd {
     #[clap(name = "http", about = "HTTP frontend management")]
     Http {
@@ -396,7 +396,7 @@ pub enum FrontendCmd {
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum Route {
     /// traffic will go to the backend servers with this cluster id
     Id {
@@ -416,7 +416,7 @@ impl std::convert::Into<sozu_command_lib::proxy::Route> for Route {
     }
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum HttpFrontendCmd {
     #[clap(name = "add")]
     Add {
@@ -432,13 +432,19 @@ pub enum HttpFrontendCmd {
         hostname: String,
         #[clap(short = 'p', long = "path-prefix", help = "URL prefix of the frontend")]
         path_prefix: Option<String>,
-        #[clap(long = "path-regex", help = "the frontend URL path should match this regex")]
+        #[clap(
+            long = "path-regex",
+            help = "the frontend URL path should match this regex"
+        )]
         path_regex: Option<String>,
-        #[clap(long = "path-equals", help = "the frontend URL path should equal this regex")]
+        #[clap(
+            long = "path-equals",
+            help = "the frontend URL path should equal this regex"
+        )]
         path_equals: Option<String>,
         #[clap(short = 'm', long = "method", help = "HTTP method")]
         method: Option<String>,
-        #[clap(long = "tags", help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')", parse(try_from_str = parse_tags))]
+        #[clap(long = "tags", help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')", value_parser = parse_tags)]
         tags: Option<BTreeMap<String, String>>,
     },
     #[clap(name = "remove")]
@@ -455,16 +461,22 @@ pub enum HttpFrontendCmd {
         hostname: String,
         #[clap(short = 'p', long = "path-prefix", help = "URL prefix of the frontend")]
         path_prefix: Option<String>,
-        #[clap(long = "path-regex", help = "the frontend URL path should match this regex")]
+        #[clap(
+            long = "path-regex",
+            help = "the frontend URL path should match this regex"
+        )]
         path_regex: Option<String>,
-        #[clap(long = "path-equals", help = "the frontend URL path should equal this regex")]
+        #[clap(
+            long = "path-equals",
+            help = "the frontend URL path should equal this regex"
+        )]
         path_equals: Option<String>,
         #[clap(short = 'm', long = "method", help = "HTTP method")]
         method: Option<String>,
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum TcpFrontendCmd {
     #[clap(name = "add")]
     Add {
@@ -483,7 +495,7 @@ pub enum TcpFrontendCmd {
         #[clap(
             long = "tags",
             help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')",
-            parse(try_from_str = parse_tags)
+            value_parser = parse_tags
         )]
         tags: Option<BTreeMap<String, String>>,
     },
@@ -504,7 +516,7 @@ pub enum TcpFrontendCmd {
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum ListenerCmd {
     #[clap(name = "http", about = "HTTP listener management")]
     Http {
@@ -523,7 +535,7 @@ pub enum ListenerCmd {
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum HttpListenerCmd {
     #[clap(name = "add")]
     Add {
@@ -581,7 +593,7 @@ pub enum HttpListenerCmd {
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum HttpsListenerCmd {
     #[clap(name = "add")]
     Add {
@@ -645,7 +657,7 @@ pub enum HttpsListenerCmd {
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum TcpListenerCmd {
     #[clap(name = "add")]
     Add {
@@ -695,7 +707,7 @@ pub enum TcpListenerCmd {
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum CertificateCmd {
     #[clap(name = "add", about = "Add a certificate")]
     Add {
@@ -712,7 +724,7 @@ pub enum CertificateCmd {
         #[clap(long = "key", help = "path to the key")]
         key: String,
         #[clap(long = "tls-versions", help = "accepted TLS versions for this certificate",
-                parse(try_from_str = parse_tls_versions))]
+                value_parser = parse_tls_versions)]
         tls_versions: Vec<TlsVersion>,
     },
     #[clap(name = "remove", about = "Remove a certificate")]
@@ -758,12 +770,12 @@ pub enum CertificateCmd {
         )]
         old_fingerprint: Option<String>,
         #[clap(long = "tls-versions", help = "accepted TLS versions for this certificate",
-                parse(try_from_str = parse_tls_versions))]
+                value_parser = parse_tls_versions)]
         tls_versions: Vec<TlsVersion>,
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum QueryCmd {
     #[clap(name = "clusters", about = "Query clusters matching a specific filter")]
     Clusters {
@@ -784,7 +796,7 @@ pub enum QueryCmd {
     },
 }
 
-#[derive(Subcommand, PartialEq, Clone, Debug)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum ConfigCmd {
     #[clap(name = "check", about = "check configuration file syntax and exit")]
     Check {},
@@ -796,15 +808,15 @@ fn parse_tls_versions(i: &str) -> Result<TlsVersion, String> {
         "TLSv1.1" => Ok(TlsVersion::TLSv1_1),
         "TLSv1.2" => Ok(TlsVersion::TLSv1_2),
         "TLSv1.3" => Ok(TlsVersion::TLSv1_2),
-        s => return Err(format!("unrecognized TLS version: {}", s)),
+        s => Err(format!("unrecognized TLS version: {}", s)),
     }
 }
 
 fn parse_tags(string_to_parse: &str) -> Result<BTreeMap<String, String>, String> {
     let mut tags: BTreeMap<String, String> = BTreeMap::new();
 
-    for s in string_to_parse.split(",") {
-        if let Some((key, value)) = s.trim().split_once("=") {
+    for s in string_to_parse.split(',') {
+        if let Some((key, value)) = s.trim().split_once('=') {
             tags.insert(key.to_owned(), value.to_owned());
         } else {
             return Err(format!(

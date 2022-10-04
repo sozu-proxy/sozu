@@ -15,7 +15,7 @@ use super::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricLine {
     label: &'static str,
     cluster_id: Option<String>,

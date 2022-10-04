@@ -415,7 +415,7 @@ impl Server {
                 )
             }
         };
-        
+
         let tcp = Rc::new(RefCell::new(match tcp {
             Some(tcp) => tcp,
             None => {
@@ -719,7 +719,9 @@ impl Server {
                         sessions.nb_connections -= 1;
                         gauge!("client.connections", sessions.nb_connections);
                         // do not be ready to accept right away, wait until we get back to 10% capacity
-                        if !sessions.can_accept && sessions.nb_connections < sessions.max_connections * 90 / 100 {
+                        if !sessions.can_accept
+                            && sessions.nb_connections < sessions.max_connections * 90 / 100
+                        {
                             debug!(
                                 "nb_connections = {}, max_connections = {}, starting to accept again",
                                 sessions.nb_connections, sessions.max_connections
