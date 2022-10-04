@@ -321,7 +321,9 @@ impl ConfigState {
             // This is to avoid the error message
             &ProxyRequestOrder::Logging(_)
             | &ProxyRequestOrder::Status
-            | &ProxyRequestOrder::Query(_) => false,
+            | &ProxyRequestOrder::Query(_)
+            | &ProxyRequestOrder::SoftStop
+            | &ProxyRequestOrder::HardStop => false,
             o => {
                 error!("state cannot handle order message: {:#?}", o);
                 false

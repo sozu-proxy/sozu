@@ -833,21 +833,20 @@ impl Session {
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
     ) -> Result<BackendConnectAction, ConnectionError> {
-        if self.proxy.borrow().listeners[&self.accept_token]
+        let cluster_id = if let Some(cluster_id) = self
+            .proxy
             .borrow()
-            .cluster_id
-            .is_none()
+            .listeners
+            .get(&self.accept_token)
+            .and_then(|listener| listener.borrow().cluster_id.clone())
         {
+            cluster_id
+        } else {
             error!("no TCP cluster corresponds to that front address");
             return Err(ConnectionError::HostNotFound);
-        }
+        };
 
-        let cluster_id = self.proxy.borrow().listeners[&self.accept_token]
-            .borrow()
-            .cluster_id
-            .clone();
-        self.cluster_id = cluster_id.clone();
-        let cluster_id = cluster_id.unwrap();
+        self.cluster_id = Some(cluster_id.clone());
 
         if self.connection_attempt == CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
@@ -1003,7 +1002,13 @@ impl ProxySession for Session {
     }
 
     fn shutting_down(&mut self) {
-        self.close()
+        self.close();
+        self.proxy
+            .borrow()
+            .sessions
+            .borrow_mut()
+            .slab
+            .try_remove(self.frontend_token.0);
     }
 
     fn last_event(&self) -> Instant {
