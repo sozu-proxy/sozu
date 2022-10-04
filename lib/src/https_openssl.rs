@@ -1401,7 +1401,12 @@ impl ProxySession for Session {
 
         if res == SessionResult::CloseSession {
             self.close();
-            self.proxy.borrow().sessions.borrow_mut().slab.try_remove(self.frontend_token.0);
+            self.proxy
+                .borrow()
+                .sessions
+                .borrow_mut()
+                .slab
+                .try_remove(self.frontend_token.0);
         }
     }
 
@@ -2066,11 +2071,11 @@ impl Proxy {
 
 impl ProxyConfiguration<Session> for Proxy {
     fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
-        self.listeners
-            .get(&Token(token.0))
-            .unwrap()
-            .borrow_mut()
-            .accept()
+        if let Some(listener) = self.listeners.get(&Token(token.0)) {
+            listener.borrow_mut().accept()
+        } else {
+            Err(AcceptError::IoError)
+        }
     }
 
     fn create_session(
