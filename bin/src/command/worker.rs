@@ -1,26 +1,28 @@
+use std::{collections::VecDeque, fmt, os::unix::io::AsRawFd};
+
 use futures::SinkExt;
 use libc::pid_t;
-use std::collections::VecDeque;
-use std::fmt;
-use std::os::unix::io::AsRawFd;
-use nix::sys::signal::kill;
-use nix::unistd::Pid;
+use nix::{sys::signal::kill, unistd::Pid};
 
-use sozu_command::channel::Channel;
-use sozu_command::command::RunState;
-use sozu_command::config::Config;
-use sozu_command::proxy::{ProxyRequest, ProxyRequestData, ProxyResponse};
-use sozu_command::scm_socket::ScmSocket;
+use sozu_command_lib::{
+    channel::Channel,
+    command::{RunState, WorkerInfo},
+    config::Config,
+    proxy::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
+    scm_socket::ScmSocket,
+};
 
 pub struct Worker {
     pub id: u32,
-    pub fd: i32,
-    pub channel: Option<Channel<ProxyRequest, ProxyResponse>>,
-    //pub token:         Option<Token>,
+    /// for the worker to receive requests and respond to the main process
+    pub worker_channel: Option<Channel<ProxyRequest, ProxyResponse>>,
+    /// file descriptor of the command channel
+    pub worker_channel_fd: i32,
     pub pid: pid_t,
     pub run_state: RunState,
     pub queue: VecDeque<ProxyRequest>,
-    pub scm: ScmSocket,
+    /// used to receive listeners
+    pub scm_socket: ScmSocket,
     pub sender: Option<futures::channel::mpsc::Sender<ProxyRequest>>,
 }
 
@@ -28,30 +30,35 @@ impl Worker {
     pub fn new(
         id: u32,
         pid: pid_t,
-        channel: Channel<ProxyRequest, ProxyResponse>,
-        scm: ScmSocket,
+        command_channel: Channel<ProxyRequest, ProxyResponse>,
+        scm_socket: ScmSocket,
         _: &Config,
     ) -> Worker {
         Worker {
             id,
-            fd: channel.sock.as_raw_fd(),
-            channel: Some(channel),
+            worker_channel_fd: command_channel.sock.as_raw_fd(),
+            worker_channel: Some(command_channel),
             sender: None,
             pid,
             run_state: RunState::Running,
             queue: VecDeque::new(),
-            scm,
+            scm_socket,
         }
     }
 
-    pub async fn send(&mut self, request_id: String, data: ProxyRequestData) {
-        if let Some(tx) = self.sender.as_mut() {
-            if let Err(e) = tx.send(ProxyRequest {
-                id: request_id,
-                order: data,
-            })
-            .await {
-                error!("error sending message to worker {:?}: {:?}", self.id, e);
+    pub async fn send(&mut self, request_id: String, data: ProxyRequestOrder) {
+        if let Some(worker_tx) = self.sender.as_mut() {
+            if let Err(e) = worker_tx
+                .send(ProxyRequest {
+                    id: request_id.clone(),
+                    order: data,
+                })
+                .await
+            {
+                error!(
+                    "error sending message {} to worker {:?}: {:?}",
+                    request_id, self.id, e
+                );
             }
         }
     }
@@ -61,6 +68,14 @@ impl Worker {
         match kill(Pid::from_raw(self.pid), None) {
             Ok(_) => true,
             Err(_) => false,
+        }
+    }
+
+    pub fn info(&self) -> WorkerInfo {
+        WorkerInfo {
+            id: self.id,
+            pid: self.pid,
+            run_state: self.run_state,
         }
     }
 

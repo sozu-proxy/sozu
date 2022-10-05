@@ -1,0 +1,11 @@
+{
+  "id": "ID_TEST",
+  "version": 0,
+  "type": "PROXY",
+  "data": {
+    "type": "REMOVE_CLUSTER",
+    "data": {
+      "cluster_id": "xxx"
+    }
+  }
+}

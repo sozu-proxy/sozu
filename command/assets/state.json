@@ -1,0 +1,2 @@
+This file is here only to check that this line in config.toml will be parsed:
+saved_state = './state.json'

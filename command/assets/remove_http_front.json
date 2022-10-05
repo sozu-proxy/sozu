@@ -3,12 +3,21 @@
   "version": 0,
   "type": "PROXY",
   "data": {
-    "type": "REMOVE_HTTP_FRONT",
+    "type": "REMOVE_HTTP_FRONTEND",
     "data": {
-      "app_id": "xxx",
+      "route": {
+        "CLUSTER_ID": "xxx"
+      },
       "address": "0.0.0.0:8080",
       "hostname": "yyy",
-      "path_begin": "xxx"
+      "path": {
+        "PREFIX": "xxx"
+      },
+      "position": "TREE",
+      "tags": {
+        "owner": "John",
+        "uuid": "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83"
+      }
     }
   }
 }

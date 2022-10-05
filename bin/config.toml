@@ -5,7 +5,8 @@
 # path to a file sozu can use to load an initial configuration state for its
 # routing. You can generate this file from sozu's current routing by running
 # the command `sozuctl state save -f state.json`
-saved_state = "./state.json"
+# this must be RELATIVE to config.toml
+# saved_state = "./state.json"
 
 # save the configuration to the saved_state file every time we receive a
 # configuration message on the configuration socket
@@ -26,7 +27,7 @@ log_level = "info"
 # to a unix socket
 # log_target = "unix:///var/sozu/logs
 # to a file
-# log_target = "file:///var/logs/sozu.log"
+# log_target = "file:///var/log/sozu.log"
 # to_stdout
 log_target = "stdout"
 
@@ -36,7 +37,7 @@ log_target = "stdout"
 
 # path to the unix socket file used to send commands to sozu
 # default value points to "sozu.sock" file in the current directory
-command_socket = "./command_folder/sock"
+command_socket = "./sozu.sock"
 
 # size in bytes of the buffer used by the command socket protocol. If the message
 # sent to sozu is too large, or the data that sozu must return is too large, the
@@ -83,8 +84,8 @@ max_connections = 500
 # memory usage. If you plan to use sozu's runtime upgrade feature, you should
 # leave enough memory for one more worker (also for the kernel, etc), so total
 # RAM should be larger than (worker count + 1) * max_buffers * 2 * buffer_size bytes
-# defaults to 16384
-buffer_size = 16384
+# defaults to 16393 (minimum size for HTTP/2 is a 16384 bytes frame + 9 bytes of header
+buffer_size = 16393
 
 # how much time (in milliseconds) sozuctl will wait for a command to complete.
 # Defaults to 1000 milliseconds
@@ -128,7 +129,7 @@ tls_provider = "rustls"
 # by default, all listeners start a TCP listen socket o startup
 # if set to false, this option will prevent them from listening. You can then add
 # the complete configuration, and send an ActivateListener message afterwards
-activate_listeners= true
+activate_listeners = true
 
 # various statistics can be sent to a server that supports the statsd protocol
 # You can see those statistics with sozuctl, like this: `sozuctl metrics` or
@@ -161,7 +162,7 @@ address = "0.0.0.0:8080"
 #answer_503 = "../lib/assets/503.html"
 
 # defines the sticky session cookie's name, if `sticky_session` is activated for
-# an application. Defaults to "SOZUBALANCEID"
+# a cluster. Defaults to "SOZUBALANCEID"
 # sticky_name = "SOZUBALANCEID"
 #
 # Configures the client socket to receive a PROXY protocol header
@@ -218,56 +219,59 @@ tls_versions = ["TLSv1.3"]
 # this option is incompatible with public_address
 # expect_proxy = false
 
-# static configuration for applications
+# static configuration for cluster
 #
-# those applications will be routed by sozu directly from start
-[applications]
+# A cluster is a set of frontends, routing rules, and backends.
+# These clusters will be routed by sozu directly from start
+[clusters]
 
-# every application has an "application id", here it is "MyApp"
+# every cluster has a "cluster id", here it is "MyCluster"
 # this is an example of a routing configuration for the HTTP and HTTPS proxies
-[applications.MyApp]
+[clusters.MyCluster]
 
 # the protocol option indicates if we will use HTTP or TCP proxying
 # possible options are "http" or "tcp"
 protocol = "http"
 
-# per application load balancing algorithm. The possible values are
+# per cluster load balancing algorithm. The possible values are
 # "round_robin", "random", "least_loaded" and "power_of_two". Defaults to "round_robin"
 load_balancing = "round_robin"
 # metric evaluating the load on the backend. available options: connections, requests, connection_time
 # load_metric = "connections"
 
 # frontends configuration
-# this specifies which listeners; domains, certificates that will be configured for an application
+# this specifies which listeners; domains, certificates that will be configured for a cluster
 # each element of the array must be specified on one line (toml format limitation)
 # possible frontend options:
 # - address: TCP listener
-# - hostname: host name of the application
-# - path_begin = "/api" # optional. an application can receive requests going to a hostname and path prefix
-# - sticky_session = false # activates sticky sessions for this application
-# - https_redirect = false #  activates automatic redirection to HTTPS for this application
+# - hostname: host name of the cluster
+# - path = "/api" # optional. A routing rule for incoming requests. The path of the request must match it. Can be a prefix (default), a regex, or a strictly equal path.
+# - path_type = PREFIX | REGEX | EQUALS # defaults to PREFIX
+# - sticky_session = false # activates sticky sessions for this cluster
+# - https_redirect = false #  activates automatic redirection to HTTPS for this cluster
+# - custom_tag: a tag to retrieve a frontend with the CLI or in the logs
 frontends = [
-  { address = "0.0.0.0:8080", hostname = "lolcatho.st" },
+  { address = "0.0.0.0:8080", hostname = "lolcatho.st", tags = { key = "value" }, path = "/api" },
   # HTTPS frontends also have an optional `tls_versions` key like the HTTPS listeners
-  { address = "0.0.0.0:8443", hostname = "lolcatho.st", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" }
+  { address = "0.0.0.0:8443", hostname = "lolcatho.st", tags = { key = "value" }, certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" },
 ]
 
 # backends configuration
-# this indicates the backend servers used by the application
+# this indicates the backend servers used by the cluster
 # possible options:
 # - address: IP and port of the backend server
 # - weight: weight used by the load balancing algorithm
 # - sticky-id: sticky session identifier
 backends = [
-  { address = "127.0.0.1:1026" }
+  { address = "127.0.0.1:1026", backend_id = "the-backend-to-my-app" }
 ]
 
 # this is an example of a routing configuration for the TCP proxy
-[applications.TcpTest]
+[clusters.TcpTest]
 protocol = "tcp"
 
 frontends = [
-  { address = "0.0.0.0:8081" }
+  { address = "0.0.0.0:8081", tags = { owner = "John", uuid = "3f740af1-45fd-45ce-b61f-17bf1a51505f" } }
 ]
 
 # activates the proxy protocol to send IP information to the backend

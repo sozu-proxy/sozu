@@ -10,7 +10,7 @@ Sōzu configuration process involves 3 major sources of parameters:
 
 - The `global` section, which sets process-wide parameters.
 - The definition of the protocols like `https`, `http`, `tcp`.
-- The applications sections under: `[applications]`.
+- The clusters sections under: `[clusters]`.
 
 ### Global parameters
 
@@ -84,7 +84,7 @@ answer_404 = "../lib/assets/404.html"
 answer_503 = "../lib/assets/503.html"
 
 # defines the sticky session cookie's name, if `sticky_session` is activated format
-# an application. Defaults to "SOZUBALANCEID"
+# a cluster. Defaults to "SOZUBALANCEID"
 sticky_name = "SOZUBALANCEID"
 ```
 
@@ -110,26 +110,26 @@ cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-E
 rustls_cipher_list = ["TLS13_CHACHA20_POLY1305_SHA256"]
 ```
 
-### Applications
+### Clusters
 
-You can declare the list of your _applications_ under the `[applications]` section.
+You can declare the list of your _clusters_ under the `[clusters]` section.
 They follow the format:
 
 _Mandatories parameters:_
 
 ```toml
-[applications]
+[clusters]
 
-[applications.NameOfYourApp]
+[clusters.NameOfYourCluster]
 # possible values are http or tcp
 # https proxies will use http here
 protocol = "http"
 
-# per application load balancing algorithm. The possible values are
+# per cluster load balancing algorithm. The possible values are
 # "roundrobin" and "random". Defaults to "roundrobin"
 # load_balancing_policy="roundrobin"
 
-# force application to redirect http traffic to https
+# force cluster to redirect http traffic to https
 # https_redirect = true
 
 frontends = [
@@ -214,7 +214,7 @@ expect_proxy = true
 
 ### Configuring Sōzu to _send_ a PROXY Protocol header to an upstream backend
 
-Send a PROXY protocol header over any connection established to the backends declared in the application.
+Send a PROXY protocol header over any connection established to the backends declared in the cluster.
 
 ```txt
                            send PROXY
@@ -232,15 +232,15 @@ _Configuration:_
 [[listeners]]
 address = "0.0.0.0:81"
 
-[applications]
-[applications.NameOfYourTcpApp]
+[clusters]
+[clusters.NameOfYourTcpCluster]
 send_proxy = true
 frontends = [
   { address = "0.0.0.0:81" }
 ]
 ```
 
-NOTE: Only for TCP applications (HTTP and HTTPS proxies will use the forwarding headers).
+NOTE: Only for TCP clusters (HTTP and HTTPS proxies will use the forwarding headers).
 
 ### Configuring Sōzu to _relay_ a PROXY Protocol header to an upstream
 
@@ -259,16 +259,16 @@ Sōzu will receive a PROXY protocol header from the client connection, check its
 
 _Configuration:_
 
-This only concerns TCP applications (HTTP and HTTPS proxies can work directly in expect mode, and will use the forwarding headers).
+This only concerns TCP clusters (HTTP and HTTPS proxies can work directly in expect mode, and will use the forwarding headers).
 
 ```toml
 [[listeners]]
 address = "0.0.0.0:80"
 expect_proxy = true
 
-[applications]
+[clusters]
 
-[applications.NameOfYourApp]
+[clusters.NameOfYourCluster]
 send_proxy = true
 frontends = [
   { address = "0.0.0.0:80" }

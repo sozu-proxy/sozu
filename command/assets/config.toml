@@ -31,8 +31,8 @@ address = "0.0.0.0:1234"
 protocol = "tcp"
 expect_proxy = true
 
-[applications]
-[applications.MyApp]
+[clusters]
+[clusters.MyCluster]
 protocol = "http"
 #sticky_session = false
 #https_redirect = false
@@ -45,7 +45,7 @@ backends = [
   { address = "127.0.0.1:1027", weight = 100, sticky_id = "backend-1027" }
 ]
 
-[applications.example_com]
+[clusters.example_com]
 protocol = "http"
 frontends = [
   { address = "0.0.0.0:81", hostname = "example.com" }
@@ -54,7 +54,7 @@ backends = [
   { address = "127.0.0.1:1028", weight = 100 }
 ]
 
-[applications.TcpApp]
+[clusters.TcpCluster]
 protocol = "tcp"
 #send_proxy = false
 frontends = [

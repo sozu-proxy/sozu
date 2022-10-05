@@ -50,24 +50,25 @@ macro_rules! empty (
   );
 );
 
+pub mod h2;
 pub mod http;
-pub mod pipe;
 #[cfg(feature = "use-openssl")]
 pub mod openssl;
-pub mod rustls;
+pub mod pipe;
 pub mod proxy_protocol;
+pub mod rustls;
 
+pub use self::http::{Http, StickySession};
 #[cfg(feature = "use-openssl")]
 pub use self::openssl::TlsHandshake;
 pub use self::pipe::Pipe;
-pub use self::http::{Http,StickySession};
 pub use self::proxy_protocol::send::SendProxyProtocol;
 
 #[cfg(not(feature = "use-openssl"))]
 pub use self::rustls::TlsHandshake;
 
-#[derive(Debug,Clone,Copy,PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolResult {
-  Upgrade,
-  Continue,
+    Upgrade,
+    Continue,
 }

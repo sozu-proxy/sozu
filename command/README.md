@@ -17,7 +17,7 @@ You send a `CommandRequest`, defined as follows:
 pub struct CommandRequest {
   pub id:        String,
   pub version:   u8,
-  pub data:      CommandRequestData,
+  pub order:      CommandRequestOrder,
   pub worker_id: Option<String>,
 }
 ```
@@ -29,8 +29,8 @@ When serialized to JSON it looks like this:
     "id":        "ID_TEST",
     "version":   0,
     "worker_id": 0,
-    "type":      "<CommandRequestData enum name>",
-    "data":      { <CommandRequestData wrapped value> }
+    "type":      "<CommandRequestOrder enum name>",
+    "data":      { <CommandRequestOrder wrapped value> }
 }"
 ```
 
@@ -196,7 +196,7 @@ The data attribute will contain one of the proxy orders.
   "data": {
     "type": "ADD_HTTP_FRONT",
     "data": {
-      "app_id":     "xxx",
+      "cluster_id":     "xxx",
       "hostname":   "example.com",
       "path_begin": "/hello"
     }
@@ -213,7 +213,7 @@ The data attribute will contain one of the proxy orders.
   "data": {
     "type": "ADD_HTTPS_FRONT",
     "data": {
-      "app_id":      "xxx",
+      "cluster_id":      "xxx",
       "hostname":    "example.com",
       "path_begin":  "/hello",
       "fingerprint": "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
@@ -233,7 +233,7 @@ The fingerprint is the hexadecimal representation of the SHA256 hash of the cert
   "data":{
     "type": "ADD_BACKEND",
     "data": {
-      "app_id": "xxx",
+      "cluster_id": "xxx",
       "ip_address": "127.0.0.1",
       "port": 8080
     }
@@ -249,7 +249,7 @@ The fingerprint is the hexadecimal representation of the SHA256 hash of the cert
   "version":  0,
   "data": {
     "type": "REMOVE_HTTP_FRONT",
-    "app_id": "xxx",
+    "cluster_id": "xxx",
     "hostname": "yyy",
     "path_begin": "xxx",
     "port": 4242
@@ -266,7 +266,7 @@ The fingerprint is the hexadecimal representation of the SHA256 hash of the cert
   "data": {
     "type": "REMOVE_HTTPS_FRONT",
     "data": {
-      "app_id":      "xxx",
+      "cluster_id":      "xxx",
       "hostname":    "yyy",
       "path_begin":  "xxx",
       "fingerprint": "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
@@ -284,7 +284,7 @@ The fingerprint is the hexadecimal representation of the SHA256 hash of the cert
   "data": {
     "type": "REMOVE_BACKEND",
     "data": {
-      "app_id": "xxx",
+      "cluster_id": "xxx",
       "ip_address": "127.0.0.1",
       "port": 8080
     }

@@ -1,11 +1,13 @@
 use std::fmt;
 
+/// Binary representation of a file descriptor readiness (obtained through epoll)
 #[derive(Copy, PartialEq, Eq, Clone, PartialOrd, Ord)]
 pub struct Ready(pub u16);
 
 const READABLE: u16 = 0b00001;
 const WRITABLE: u16 = 0b00010;
 const ERROR: u16 = 0b00100;
+/// Hang UP (see EPOLLHUP in epoll_ctl man page)
 const HUP: u16 = 0b01000;
 
 impl Ready {
@@ -39,7 +41,7 @@ impl Ready {
     }
 
     #[inline]
-    pub fn is_none(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0 == 0
     }
 
@@ -115,11 +117,14 @@ impl fmt::Debug for Ready {
             (Ready::readable(), "Readable"),
             (Ready::writable(), "Writable"),
             (Ready(ERROR), "Error"),
-            (Ready(HUP), "Hup")];
+            (Ready(HUP), "Hup"),
+        ];
 
         for &(flag, msg) in &flags {
             if self.contains(flag) {
-                if one { write!(fmt, " | ")? }
+                if one {
+                    write!(fmt, " | ")?
+                }
                 write!(fmt, "{}", msg)?;
 
                 one = true

@@ -2,11 +2,13 @@
 //!
 //! code imported from mio-extras
 //! License: MIT or Apache 2.0
+use std::{cmp, iter, u64, usize};
+
 use mio::Token;
 use slab::Slab;
 use time::{Duration, Instant};
-use std::{cmp, iter, u64, usize};
-use server::TIMER;
+
+use crate::server::TIMER;
 
 // Conversion utilities
 mod convert {
@@ -83,102 +85,98 @@ pub struct TimeoutContainer {
 }
 
 impl TimeoutContainer {
-  pub fn new(duration: Duration, token: Token) -> TimeoutContainer {
-    let timeout = TIMER.with(|timer| {
-        timer.borrow_mut().set_timeout(duration, token)
-    });
-    TimeoutContainer { timeout: Some(timeout), duration, token: Some(token) }
-  }
-
-  pub fn new_empty(duration: Duration) -> TimeoutContainer {
-    TimeoutContainer { timeout: None, duration, token: None }
-  }
-
-  pub fn take(&mut self) -> TimeoutContainer {
-    TimeoutContainer {
-        timeout: self.timeout.take(),
-        duration: self.duration,
-        token: self.token.take(),
+    pub fn new(duration: Duration, token: Token) -> TimeoutContainer {
+        let timeout = TIMER.with(|timer| timer.borrow_mut().set_timeout(duration, token));
+        TimeoutContainer {
+            timeout: Some(timeout),
+            duration,
+            token: Some(token),
+        }
     }
-  }
 
-  /// must be called when a timeout was triggered, to prevent errors when canceling
-  pub fn triggered(&mut self) {
-      let _ = self.timeout.take();
-  }
+    pub fn new_empty(duration: Duration) -> TimeoutContainer {
+        TimeoutContainer {
+            timeout: None,
+            duration,
+            token: None,
+        }
+    }
 
-  pub fn set(&mut self, token: Token) {
-      if let Some(timeout) = self.timeout.take() {
-          TIMER.with(|timer| {
-              timer.borrow_mut().cancel_timeout(&timeout)
-          });
-      }
+    pub fn take(&mut self) -> TimeoutContainer {
+        TimeoutContainer {
+            timeout: self.timeout.take(),
+            duration: self.duration,
+            token: self.token.take(),
+        }
+    }
 
-      let timeout = TIMER.with(|timer| {
-          timer.borrow_mut().set_timeout(self.duration, token)
-      });
+    /// must be called when a timeout was triggered, to prevent errors when canceling
+    pub fn triggered(&mut self) {
+        let _ = self.timeout.take();
+    }
 
-      self.timeout = Some(timeout);
-      self.token = Some(token);
-  }
+    pub fn set(&mut self, token: Token) {
+        if let Some(timeout) = self.timeout.take() {
+            TIMER.with(|timer| timer.borrow_mut().cancel_timeout(&timeout));
+        }
 
-  /// warning: this does not reset the timer
-  pub fn set_duration(&mut self, duration: Duration) {
-      self.duration = duration;
+        let timeout = TIMER.with(|timer| timer.borrow_mut().set_timeout(self.duration, token));
 
-      if let Some(timeout) = self.timeout.take() {
-          TIMER.with(|timer| {
-              timer.borrow_mut().cancel_timeout(&timeout)
-          });
-      }
+        self.timeout = Some(timeout);
+        self.token = Some(token);
+    }
 
-      if let Some(token) = self.token {
-          self.timeout = Some(TIMER.with(|timer| {
-              timer.borrow_mut().set_timeout(self.duration, token)
-          }));
-      }
-  }
+    /// warning: this does not reset the timer
+    pub fn set_duration(&mut self, duration: Duration) {
+        self.duration = duration;
 
-  pub fn duration(&mut self) -> Duration {
-      self.duration
-  }
+        if let Some(timeout) = self.timeout.take() {
+            TIMER.with(|timer| timer.borrow_mut().cancel_timeout(&timeout));
+        }
 
-  pub fn cancel(&mut self) -> bool {
-      match self.timeout.take() {
-        None => {
-            //error!("cannot cancel non existing timeout");
-            //error!("self.duration was {:?}", self.duration);
-            false
-        },
-        Some(timeout) => {
-            TIMER.with(|timer| {
-                timer.borrow_mut().cancel_timeout(&timeout)
-            });
-            true
-        },
-      }
-  }
+        if let Some(token) = self.token {
+            self.timeout =
+                Some(TIMER.with(|timer| timer.borrow_mut().set_timeout(self.duration, token)));
+        }
+    }
 
-  pub fn reset(&mut self) -> bool {
-      match self.timeout.take() {
-        None => {
-            if let Some(token) = self.token {
-                self.timeout = Some(TIMER.with(|timer| {
-                    timer.borrow_mut().set_timeout(self.duration, token)
-                }));
-            } else {
-                //error!("cannot reset non existing timeout");
-                return false;
+    pub fn duration(&mut self) -> Duration {
+        self.duration
+    }
+
+    pub fn cancel(&mut self) -> bool {
+        match self.timeout.take() {
+            None => {
+                //error!("cannot cancel non existing timeout");
+                //error!("self.duration was {:?}", self.duration);
+                false
             }
-        },
-        Some(timeout) => {
-            self.timeout = TIMER.with(|timer| {
-                timer.borrow_mut().reset_timeout(&timeout, self.duration)
-            });
-        },
-      };
-      self.timeout.is_some()
-  }
+            Some(timeout) => {
+                TIMER.with(|timer| timer.borrow_mut().cancel_timeout(&timeout));
+                true
+            }
+        }
+    }
+
+    pub fn reset(&mut self) -> bool {
+        match self.timeout.take() {
+            None => {
+                if let Some(token) = self.token {
+                    self.timeout = Some(
+                        TIMER.with(|timer| timer.borrow_mut().set_timeout(self.duration, token)),
+                    );
+                } else {
+                    //error!("cannot reset non existing timeout");
+                    return false;
+                }
+            }
+            Some(timeout) => {
+                self.timeout =
+                    TIMER.with(|timer| timer.borrow_mut().reset_timeout(&timeout, self.duration));
+            }
+        };
+        self.timeout.is_some()
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -322,11 +320,13 @@ impl<T> Timer<T> {
 
     /// Resets a timeout.
     ///
-    pub fn reset_timeout(&mut self, timeout: &Timeout, delay_from_now: Duration) -> Option<Timeout> {
-        match self.cancel_timeout(timeout) {
-            None => None,
-            Some(state) => Some(self.set_timeout(delay_from_now, state))
-        }
+    pub fn reset_timeout(
+        &mut self,
+        timeout: &Timeout,
+        delay_from_now: Duration,
+    ) -> Option<Timeout> {
+        self.cancel_timeout(timeout)
+            .map(|state| self.set_timeout(delay_from_now, state))
     }
 
     /// Cancel a timeout.
@@ -338,8 +338,8 @@ impl<T> Timer<T> {
             Some(e) => e.links,
             None => {
                 debug!("timeout token {:?} not found", timeout.token);
-                return None
-            },
+                return None;
+            }
         };
 
         // Sanity check
@@ -458,7 +458,9 @@ impl<T> Timer<T> {
     }
 
     pub fn next_poll_date(&self) -> Option<Instant> {
-        self.next_tick().map(|tick| self.start + Duration::milliseconds(self.tick_ms.saturating_mul(tick) as i64))
+        self.next_tick().map(|tick| {
+            self.start + Duration::milliseconds(self.tick_ms.saturating_mul(tick) as i64)
+        })
     }
 
     fn slot_for(&self, tick: Tick) -> usize {
@@ -503,11 +505,10 @@ mod test {
     #[test]
     pub fn test_timeout_next_tick() {
         let mut t = timer();
-        let mut tick;
 
         t.set_timeout_at(Duration::milliseconds(100), "a");
 
-        tick = ms_to_tick(&t, 50);
+        let mut tick = ms_to_tick(&t, 50);
         assert_eq!(None, t.poll_to(tick));
 
         tick = ms_to_tick(&t, 100);
@@ -526,12 +527,11 @@ mod test {
     #[test]
     pub fn test_clearing_timeout() {
         let mut t = timer();
-        let mut tick;
 
         let to = t.set_timeout_at(Duration::milliseconds(100), "a");
         assert_eq!("a", t.cancel_timeout(&to).unwrap());
 
-        tick = ms_to_tick(&t, 100);
+        let mut tick = ms_to_tick(&t, 100);
         assert_eq!(None, t.poll_to(tick));
 
         tick = ms_to_tick(&t, 200);
@@ -543,20 +543,19 @@ mod test {
     #[test]
     pub fn test_multiple_timeouts_same_tick() {
         let mut t = timer();
-        let mut tick;
 
         t.set_timeout_at(Duration::milliseconds(100), "a");
         t.set_timeout_at(Duration::milliseconds(100), "b");
 
         let mut rcv = vec![];
 
-        tick = ms_to_tick(&t, 100);
+        let mut tick = ms_to_tick(&t, 100);
         rcv.push(t.poll_to(tick).unwrap());
         rcv.push(t.poll_to(tick).unwrap());
 
         assert_eq!(None, t.poll_to(tick));
 
-        rcv.sort();
+        rcv.sort_unstable();
         assert!(rcv == ["a", "b"], "actual={:?}", rcv);
 
         tick = ms_to_tick(&t, 200);
@@ -568,7 +567,6 @@ mod test {
     #[test]
     pub fn test_multiple_timeouts_diff_tick() {
         let mut t = timer();
-        let mut tick;
 
         t.set_timeout_at(Duration::milliseconds(110), "a");
         t.set_timeout_at(Duration::milliseconds(220), "b");
@@ -576,7 +574,7 @@ mod test {
         t.set_timeout_at(Duration::milliseconds(440), "d");
         t.set_timeout_at(Duration::milliseconds(560), "e");
 
-        tick = ms_to_tick(&t, 100);
+        let mut tick = ms_to_tick(&t, 100);
         assert_eq!(Some("a"), t.poll_to(tick));
         assert_eq!(None, t.poll_to(tick));
 
@@ -620,12 +618,14 @@ mod test {
     #[test]
     pub fn test_timeout_hash_collision() {
         let mut t = timer();
-        let mut tick;
 
         t.set_timeout_at(Duration::milliseconds(100), "a");
-        t.set_timeout_at(Duration::milliseconds((100 + TICK * SLOTS as u64) as i64), "b");
+        t.set_timeout_at(
+            Duration::milliseconds((100 + TICK * SLOTS as u64) as i64),
+            "b",
+        );
 
-        tick = ms_to_tick(&t, 100);
+        let mut tick = ms_to_tick(&t, 100);
         assert_eq!(Some("a"), t.poll_to(tick));
         assert_eq!(1, count(&t));
 
@@ -641,13 +641,12 @@ mod test {
     #[test]
     pub fn test_clearing_timeout_between_triggers() {
         let mut t = timer();
-        let mut tick;
 
         let a = t.set_timeout_at(Duration::milliseconds(100), "a");
         let _ = t.set_timeout_at(Duration::milliseconds(100), "b");
         let _ = t.set_timeout_at(Duration::milliseconds(200), "c");
 
-        tick = ms_to_tick(&t, 100);
+        let mut tick = ms_to_tick(&t, 100);
         assert_eq!(Some("b"), t.poll_to(tick));
         assert_eq!(2, count(&t));
 
