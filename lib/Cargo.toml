@@ -5,11 +5,14 @@ repository = "https://github.com/sozu-proxy/sozu"
 readme = "README.md"
 documentation = "https://docs.rs/sozu-lib"
 homepage = "http://sozu.io"
-version = "0.13.6"
+version = "0.14.0"
 license = "AGPL-3.0"
 authors = [
   "Clément Delafargue <clement@delafargue.name>",
   "Geoffroy Couprie <geo.couprie@gmail.com>",
+  "Eloi Demolis <eloi.demolis@clever-cloud.com>",
+  "Emmanuel Bosquet <emmanuel.bosquet@clever-cloud.com>",
+  "Florentin Dubois <florentin.dubois@clever-cloud.com>"
 ]
 categories = ["network-programming"]
 edition = "2018"
