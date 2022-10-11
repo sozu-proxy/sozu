@@ -5,7 +5,7 @@ creation of the socket, to its shutdown, with all the steps describing how the
 HTTP request and response can happen
 
 Before we dive into the creation, lifetime and death of sessions, we need to
-understand two concepts that are entirely segregated in Sozu:
+understand two concepts that are entirely segregated in Sōzu:
 
 - the socket handling with the [mio](https://docs.rs/mio/0.7.13/mio/) crate
 - the `SessionManager` that keeps track of all sessions
@@ -40,7 +40,7 @@ That being said let's dive into the lifetime of a session.
 
 ### What are Proxys?
 
-A Sozu worker internally has 3 proxys, one for each supported protocol:
+A Sōzu worker internally has 3 proxys, one for each supported protocol:
 
 - TCP
 - HTTP
@@ -51,11 +51,11 @@ with each protocol (buffering, parsing, error handling...).
 
 ## Accepting a connection
 
-Sozu uses TCP listener sockets to get new connections. It will typically listen
+Sōzu uses TCP listener sockets to get new connections. It will typically listen
 on ports 80 (HTTP) and 443 (HTTPS), but could have other ports for TCP proxying,
 or even HTTP/HTTPS proxys on other ports.
 
-For each frontend, Sozu:
+For each frontend, Sōzu:
 
 1. generate a new Token *token*
 2. uses mio to register a `TcpListener` as *token*
@@ -64,7 +64,7 @@ For each frontend, Sozu:
 
 ### An event loop on TCP sockets
 
-Sozu is hot reconfigurable. We can add listeners and frontends at runtime. For each added listener,
+Sōzu is hot reconfigurable. We can add listeners and frontends at runtime. For each added listener,
 the SessionManager will store a `ListenSession` in its Slab.
 
 The [event loop]() uses mio to check for any activity, on all sockets.
@@ -72,9 +72,9 @@ Whenever mio detects activity on a socket, it returns an event that is passed to
 
 Whenever a client connects to a frontend:
 1. it reaches a listener
-2. Sozu is notified by mio that a `readable` event was received on a specific Token
-3. using the SessionManager, Sozu gets the corresponding `ListenSession`
-4. Sozu determines the protocol that was used
+2. Sōzu is notified by mio that a `readable` event was received on a specific Token
+3. using the SessionManager, Sōzu gets the corresponding `ListenSession`
+4. Sōzu determines the protocol that was used
 5. the Token is passed down to the appropriate proxy (TCP/HTTP/HTTPS)
 6. using the Token, the proxy determines which `TcpListener` triggered the event
 7. the proxy starts accepting new connections from it in a loop (as their might be more than one)
@@ -104,7 +104,7 @@ connections.
 
 ### Creating the Session
 
-A session is the core unit of Sozu's business logic: forwarding trafic from a frontend to a backend and vice-versa.
+A session is the core unit of Sōzu's business logic: forwarding trafic from a frontend to a backend and vice-versa.
 It holds the data associated
 [with this session](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L65-L83):
 tokens, current timeout state, protocol state, client address...
@@ -189,40 +189,48 @@ to notify the session that it should find a backend server to send the data.
 
 The Session:
 1. finds which cluster to connect to
-2. asks the SessionManager for a new valid Token named back_token
+2. asks the SessionManager for a new valid Token named `back_token`
 3. asks for a connection to the cluster
-   - the appropriate Proxy finds a backend
-4. registers the new `TcpStream` in mio with back_token
-5. inserts itself in the SessionManager with back_token
+   - the appropriate Proxy finds a backend (add details)
+4. registers the new `TcpStream` in mio with `back_token`
+5. inserts itself in the SessionManager with `back_token`
 
 The same session is now stored twice in the SessionManager:
 
 1. once with the front token as key
 2. secondly with the back token as key
 
+If Sōzu can't find a cluster it responds with a default HTTP 404 Not Found response to the client.
+A session can try to connect to a backend 3 times. If all attempts fail, Sōzu responds with a default
+HTTP 503 Service Unavailable response. This happens if Sōzu found a cluster, but all corresponding
+backends are down (or not responding).
 
-[The Listener handles the backend connection](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1577).
-It will first check if the session has triggered its circuit breaker (it will
-then refuse to connect and send back an error to the client). Then it will
-[extract the hostname and URL from the request](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1472-L1524)
-and [find a cluster](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1297-L1332)
-that can handle that request. If we do not find a cluster, we will send a
-HTTP 404 Not Found response to the client.
-
-Once we know the cluster id, if this is the first request (not a follow up
-request in keep-alive), we must find a backend server for this cluster.
-
-<details>
-<summary>keep-alive</summary>
-In HTTP keep-alive, a TCP connection can be kept after receiving the response,
-to send more requests. Since sozu supports routing on the URL along with the
+In case an HTTP request comes with the Connection header set at Keep-Alive,
+the underlying TCP connection can be kept after receiving the response,
+to send more requests. Since Sōzu supports routing on the URL along with the
 hostname, the next request might go to a different cluster.
-
 So when we get the cluster id from the request, we check if it is the same
 as the previous one, and if it is the same, we test if the back socket is still
 valid. If it is, we can reuse it. Otherwise, we will replace the back socket
 with a new one.
-</details>
+
+
+## Sending data to the back socket
+
+Then we wait for a writable event from the backend connection, then we can start
+to forward the pending request to it.
+In case of an error, we retry to connect to another backend server in the same Cluster.
+
+## Receiving data from the back socket
+
+
+## Let's go the other way around
+
+
+## Session reset
+
+
+## details about backend selection (sticky session, keep alive...)
 
 We [look up the backends list](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1428-L1470)
 for the cluster, depending on a sticky session if needed.
@@ -238,23 +246,3 @@ considered valid (if they're answering properly) and on the load balancing
 policies configured for the cluster.
 If a backend was found, we open a TCP connection to the backend server,
 otherwise we return a HTTP 503 response.
-
-<details>
-<summary>event loop</summary>
-We register the back socket to the event loop and allocate an entry in the slab,
-in which we store a copy of the refcounted session.
-</details>
-
-Then we wait for an event from the backend connection. If there was an error,
-we will retry a connection to a backend server.
-
-## Sending data to the back socket
-
-TODO
-
-
-looking at which sockets are readable or writable, which ones we want to read
-or write, and call the `readable()`, `writable()` (for the front socket) and
-`back_readable()`, `back_writable()` (for the back socket) methods, until there
-is no more work to do in this session.
-</details>
