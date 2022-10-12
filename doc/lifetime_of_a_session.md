@@ -1,5 +1,8 @@
 # Lifetime of a session
 
+A session is the core unit of Sōzu's business logic: forwarding traffic from a
+frontend to a backend and vice-versa.
+
 In this document, we will explore what happens to a client session, from the
 creation of the socket, to its shutdown, with all the steps describing how the
 HTTP request and response can happen
@@ -102,11 +105,11 @@ By specifying a maximum number of concurrent connections, we make sure that the
 server does not get overloaded and keep latencies manageable for existing
 connections.
 
-### Creating the Session
+### Creating sessions
 
-A session is the core unit of Sōzu's business logic: forwarding trafic from a frontend to a backend and vice-versa.
-It holds the data associated
-[with this session](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L65-L83):
+A session's goal is to forward traffic from a frontend to a backend and vice-versa.
+The `Session` struct holds the data associated
+[with a session](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L65-L83):
 tokens, current timeout state, protocol state, client address...
 The created session is wrapped in a
 [`Rc<RefCell<...>>`](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1544)
@@ -167,11 +170,13 @@ We need to parse the HTTP request to find out its:
 2. path
 3. HTTP verb
 
-We will first try to [read data from the socket](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L646-L667) in the front buffer.
-If there were no errors (closed socket, etc), we will then handle that data
-in [`readable_parse()`](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L728).
+We will first try to
+[read data from the socket](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L646-L667)
+in the front buffer. If there were no errors (closed socket, etc), we will then handle that data in
+[`readable_parse()`](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L728).
 
-The HTTP implementation holds [two smaller state machines](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L86-L87),
+The HTTP implementation holds
+[two smaller state machines](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L86-L87),
 `RequestState` and `ResponseState`, that indicate where we are in parsing the
 request or response, and store data about them.
 
@@ -185,7 +190,7 @@ Once we're done parsing the headers, and find what we were looking for, we will
 [return SessionResult::ConnectBackend](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/protocol/http/mod.rs#L751-L759)
 to notify the session that it should find a backend server to send the data.
 
-## Connecting to backend servers
+## Connect to the backend servers
 
 The Session:
 1. finds which cluster to connect to
@@ -205,6 +210,8 @@ A session can try to connect to a backend 3 times. If all attempts fail, Sōzu r
 HTTP 503 Service Unavailable response. This happens if Sōzu found a cluster, but all corresponding
 backends are down (or not responding).
 
+### Keep a session alive
+
 In case an HTTP request comes with the Connection header set at Keep-Alive,
 the underlying TCP connection can be kept after receiving the response,
 to send more requests. Since Sōzu supports routing on the URL along with the
@@ -214,6 +221,16 @@ as the previous one, and if it is the same, we test if the back socket is still
 valid. If it is, we can reuse it. Otherwise, we will replace the back socket
 with a new one.
 
+### Sticky session: stick a front to one backend only
+
+This is a routing mechanism where we look at a cookie in the request. All requests
+coming with the same id in that cookie will be sent to the same backend server.
+
+That look up will return a result depending on which backend server are
+considered valid (if they're answering properly) and on the load balancing
+policies configured for the cluster.
+If a backend was found, we open a TCP connection to the backend server,
+otherwise we return a HTTP 503 response.
 
 ## Sending data to the back socket
 
@@ -221,28 +238,20 @@ Then we wait for a writable event from the backend connection, then we can start
 to forward the pending request to it.
 In case of an error, we retry to connect to another backend server in the same Cluster.
 
-## Receiving data from the back socket
+## The big U-turn: forwarding from backend to frontend
 
+As explained above, we have a small state machine called `ResponseState` in order to
+parse the traffic from the backend. The whole logic is basically the same.
 
-## Let's go the other way around
+We monitor backend readability and frontend writability, and transfer traffic from
+one to the other.
 
+## The end of a session
 
-## Session reset
+Once the `ResponseState` reaches a "completed" state and every byte has been sent
+back to the client, the full life cycle of a request ends. The session
+reaches the `CloseSession` state and is removed from the `SessionManager`'s slab
+and its sockets are deregistered from mio.
 
-
-## details about backend selection (sticky session, keep alive...)
-
-We [look up the backends list](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L1428-L1470)
-for the cluster, depending on a sticky session if needed.
-
-<details>
-<summary>sticky session</summary>
-This is a routing mechanism where we look at a cookie in the request. All requests
-coming with the same id in that cookie will be sent to the same backend server.
-</details>
-
-That look up will return a result depending on which backend server are
-considered valid (if they're answering properly) and on the load balancing
-policies configured for the cluster.
-If a backend was found, we open a TCP connection to the backend server,
-otherwise we return a HTTP 503 response.
+If the request had a Keep-Alive header, however, the session will be reused
+and await a new request. This is the "reset" of a session.
