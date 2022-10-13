@@ -60,7 +60,7 @@ pub struct Session {
     pub cluster_id: Option<String>,
     sticky_name: String,
     last_event: Instant,
-    pub listen_token: Token,
+    pub listener_token: Token,
     pub connection_attempt: u8,
     peer_address: Option<SocketAddr>,
     answers: Rc<RefCell<HttpAnswers>>,
@@ -81,7 +81,7 @@ impl Session {
         expect_proxy: bool,
         sticky_name: String,
         answers: Rc<RefCell<HttpAnswers>>,
-        listen_token: Token,
+        listener_token: Token,
         wait_time: Duration,
         frontend_timeout_duration: Duration,
         backend_timeout_duration: Duration,
@@ -124,7 +124,7 @@ impl Session {
             cluster_id: None,
             sticky_name,
             last_event: Instant::now(),
-            listen_token,
+            listener_token,
             connection_attempt: 0,
             peer_address,
             answers,
@@ -1049,7 +1049,7 @@ impl Session {
             }
             Ok((backend, conn)) => {
                 if front_should_stick {
-                    let sticky_name = self.proxy.borrow().listeners[&self.listen_token]
+                    let sticky_name = self.proxy.borrow().listeners[&self.listener_token]
                         .borrow()
                         .config
                         .sticky_name
@@ -1078,7 +1078,7 @@ impl Session {
     }
 
     fn cluster_id_from_request(&mut self) -> Result<String, ConnectionError> {
-        let listen_token = self.listen_token;
+        let listener_token = self.listener_token;
         let (host, uri, method) = match self.extract_route() {
             Ok(t) => t,
             Err(e) => {
@@ -1090,7 +1090,7 @@ impl Session {
             .proxy
             .borrow()
             .listeners
-            .get(&listen_token)
+            .get(&listener_token)
             .as_ref()
             .and_then(|l| l.borrow().frontend_from_request(host, uri, method));
 
@@ -1181,7 +1181,7 @@ impl Session {
             self.proxy
                 .borrow()
                 .listeners
-                .get(&self.listen_token)
+                .get(&self.listener_token)
                 .as_ref()
                 .map(|l| l.borrow().config.connect_timeout)
                 .unwrap(),

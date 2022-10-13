@@ -109,7 +109,7 @@ pub struct Session {
     metrics: SessionMetrics,
     pub cluster_id: Option<String>,
     last_event: Instant,
-    pub listen_token: Token,
+    pub listener_token: Token,
     connection_attempt: u8,
     peer_address: Option<SocketAddr>,
     answers: Rc<RefCell<HttpAnswers>>,
@@ -130,7 +130,7 @@ impl Session {
         expect_proxy: bool,
         sticky_name: String,
         answers: Rc<RefCell<HttpAnswers>>,
-        listen_token: Token,
+        listener_token: Token,
         wait_time: Duration,
         frontend_timeout_duration: Duration,
         backend_timeout_duration: Duration,
@@ -177,7 +177,7 @@ impl Session {
             metrics,
             cluster_id: None,
             last_event: Instant::now(),
-            listen_token,
+            listener_token,
             connection_attempt: 0,
             peer_address,
             answers,
@@ -1086,7 +1086,7 @@ impl Session {
             }
             Ok((backend, conn)) => {
                 if front_should_stick {
-                    let sticky_name = self.proxy.borrow().listeners[&self.listen_token]
+                    let sticky_name = self.proxy.borrow().listeners[&self.listener_token]
                         .borrow()
                         .config
                         .sticky_name
@@ -1127,7 +1127,7 @@ impl Session {
             .proxy
             .borrow()
             .listeners
-            .get(&self.listen_token)
+            .get(&self.listener_token)
             .as_ref()
             .and_then(|l| l.borrow().frontend_from_request(host, uri, method));
         match route_res {
@@ -1220,7 +1220,7 @@ impl Session {
             self.proxy
                 .borrow()
                 .listeners
-                .get(&self.listen_token)
+                .get(&self.listener_token)
                 .as_ref()
                 .map(|l| l.borrow().config.connect_timeout)
                 .unwrap(),
