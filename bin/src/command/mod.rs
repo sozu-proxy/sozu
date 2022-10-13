@@ -580,7 +580,7 @@ impl CommandServer {
             if let CommandRequestOrder::Proxy(order) = message.order {
                 self.state.handle_order(&order);
 
-                if let &ProxyRequestOrder::AddCertificate(_) = &order {
+                if let &ProxyRequestOrder::AddCertificate(_) = &*order {
                     debug!("config generated AddCertificate( ... )");
                 } else {
                     debug!("config generated {:?}", order);
@@ -590,7 +590,7 @@ impl CommandServer {
                 for ref mut worker in self.workers.iter_mut().filter(|worker| {
                     worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
                 }) {
-                    worker.send(message.id.clone(), order.clone()).await;
+                    worker.send(message.id.clone(), *order.clone()).await;
                     count += 1;
                 }
 

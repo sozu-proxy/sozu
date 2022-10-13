@@ -1159,9 +1159,9 @@ impl Config {
                 id: format!("CONFIG-{}", count),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddHttpListener(
+                order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpListener(
                     listener.clone(),
-                )),
+                ))),
             });
             count += 1;
         }
@@ -1171,9 +1171,9 @@ impl Config {
                 id: format!("CONFIG-{}", count),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddHttpsListener(
+                order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpsListener(
                     listener.clone(),
-                )),
+                ))),
             });
             count += 1;
         }
@@ -1183,9 +1183,9 @@ impl Config {
                 id: format!("CONFIG-{}", count),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddTcpListener(
+                order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddTcpListener(
                     listener.clone(),
-                )),
+                ))),
             });
             count += 1;
         }
@@ -1197,7 +1197,7 @@ impl Config {
                     id: format!("CONFIG-{}", count),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Proxy(order),
+                    order: CommandRequestOrder::Proxy(Box::new(order)),
                 });
                 count += 1;
             }
@@ -1209,12 +1209,12 @@ impl Config {
                     id: format!("CONFIG-{}", count),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Proxy(ProxyRequestOrder::ActivateListener(
-                        ActivateListener {
+                    order: CommandRequestOrder::Proxy(Box::new(
+                        ProxyRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::HTTP,
                             from_scm: false,
-                        },
+                        }),
                     )),
                 });
                 count += 1;
@@ -1225,12 +1225,12 @@ impl Config {
                     id: format!("CONFIG-{}", count),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Proxy(ProxyRequestOrder::ActivateListener(
-                        ActivateListener {
+                    order: CommandRequestOrder::Proxy(Box::new(
+                        ProxyRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::HTTPS,
                             from_scm: false,
-                        },
+                        }),
                     )),
                 });
                 count += 1;
@@ -1241,12 +1241,12 @@ impl Config {
                     id: format!("CONFIG-{}", count),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Proxy(ProxyRequestOrder::ActivateListener(
-                        ActivateListener {
+                    order: CommandRequestOrder::Proxy(Box::new(
+                        ProxyRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::TCP,
                             from_scm: false,
-                        },
+                        }),
                     )),
                 });
                 count += 1;

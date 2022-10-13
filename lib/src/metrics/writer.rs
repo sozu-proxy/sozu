@@ -203,16 +203,11 @@ impl MetricsWriter {
             self.buf.drain(..written);
         }
 
-        if flush_entire_buffer {
+        if flush_entire_buffer || written > self.last_newline {
             self.last_newline = 0;
-            self.last_packet_start = 0;
-        } else if written > self.last_newline {
-            self.last_newline = 0;
-            //FIXME
             self.last_packet_start = 0;
         } else {
             self.last_newline -= written;
-            //FIXME
             self.last_packet_start = 0;
         }
 

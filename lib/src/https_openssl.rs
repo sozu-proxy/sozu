@@ -2032,7 +2032,7 @@ impl Proxy {
         self.listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .map(|listener| {
+            .and_then(|listener| {
                 let mut owned = listener.borrow_mut();
 
                 owned
@@ -2040,7 +2040,6 @@ impl Proxy {
                     .take()
                     .map(|listener| (owned.token, listener))
             })
-            .flatten()
     }
 
     pub fn add_cluster(&mut self, mut cluster: Cluster) {

@@ -13,7 +13,7 @@ pub const PROTOCOL_VERSION: u8 = 0;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandRequestOrder {
-    Proxy(ProxyRequestOrder),
+    Proxy(Box<ProxyRequestOrder>),
     SaveState { path: String },
     LoadState { path: String },
     DumpState,
@@ -72,7 +72,7 @@ pub enum CommandResponseContent {
     Metrics(AggregatedMetricsData),
     /// worker_id -> query_answer
     Query(BTreeMap<String, QueryAnswer>),
-    State(ConfigState),
+    State(Box<ConfigState>),
     Event(Event),
     FrontendList(ListedFrontends),
     // this is new
@@ -184,15 +184,17 @@ mod tests {
         println!("{:?}", message);
         assert_eq!(
             message.order,
-            CommandRequestOrder::Proxy(ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
-                hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
-                method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
-                position: RulePosition::Tree,
-                tags: None,
-            }))
+            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpFrontend(
+                HttpFrontend {
+                    route: Route::ClusterId(String::from("xxx")),
+                    hostname: String::from("yyy"),
+                    path: PathRule::Prefix(String::from("xxx")),
+                    method: None,
+                    address: "0.0.0.0:8080".parse().unwrap(),
+                    position: RulePosition::Tree,
+                    tags: None,
+                }
+            )))
         );
     }
 
@@ -236,7 +238,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddCluster(Cluster {
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddCluster(Cluster {
                 cluster_id: String::from("xxx"),
                 sticky_session: true,
                 https_redirect: true,
@@ -244,7 +246,7 @@ mod tests {
                 load_balancing: LoadBalancingAlgorithms::RoundRobin,
                 load_metric: None,
                 answer_503: None,
-            })),
+            }))),
             worker_id: None
         }
     );
@@ -255,9 +257,9 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::RemoveCluster {
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::RemoveCluster {
                 cluster_id: String::from("xxx")
-            }),
+            })),
             worker_id: None
         }
     );
@@ -268,15 +270,17 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
-                hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
-                method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
-                position: RulePosition::Tree,
-                tags: None,
-            })),
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpFrontend(
+                HttpFrontend {
+                    route: Route::ClusterId(String::from("xxx")),
+                    hostname: String::from("yyy"),
+                    path: PathRule::Prefix(String::from("xxx")),
+                    method: None,
+                    address: "0.0.0.0:8080".parse().unwrap(),
+                    position: RulePosition::Tree,
+                    tags: None,
+                }
+            ))),
             worker_id: None
         }
     );
@@ -287,7 +291,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::RemoveHttpFrontend(
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::RemoveHttpFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -303,7 +307,7 @@ mod tests {
                         )
                     ]))
                 }
-            )),
+            ))),
             worker_id: None
         }
     );
@@ -314,15 +318,17 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddHttpsFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
-                hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
-                method: None,
-                address: "0.0.0.0:8443".parse().unwrap(),
-                position: RulePosition::Tree,
-                tags: None,
-            })),
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpsFrontend(
+                HttpFrontend {
+                    route: Route::ClusterId(String::from("xxx")),
+                    hostname: String::from("yyy"),
+                    path: PathRule::Prefix(String::from("xxx")),
+                    method: None,
+                    address: "0.0.0.0:8443".parse().unwrap(),
+                    position: RulePosition::Tree,
+                    tags: None,
+                }
+            ))),
             worker_id: None
         }
     );
@@ -333,7 +339,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::RemoveHttpsFrontend(
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::RemoveHttpsFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -349,7 +355,7 @@ mod tests {
                         )
                     ]))
                 }
-            )),
+            ))),
             worker_id: None
         }
     );
@@ -364,17 +370,19 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddCertificate(AddCertificate {
-                address: "0.0.0.0:443".parse().unwrap(),
-                certificate: CertificateAndKey {
-                    certificate: String::from(CERTIFICATE),
-                    certificate_chain: split_certificate_chain(String::from(CHAIN)),
-                    key: String::from(KEY),
-                    versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
-                },
-                names: vec![],
-                expired_at: None,
-            })),
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddCertificate(
+                AddCertificate {
+                    address: "0.0.0.0:443".parse().unwrap(),
+                    certificate: CertificateAndKey {
+                        certificate: String::from(CERTIFICATE),
+                        certificate_chain: split_certificate_chain(String::from(CHAIN)),
+                        key: String::from(KEY),
+                        versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
+                    },
+                    names: vec![],
+                    expired_at: None,
+                }
+            ))),
             worker_id: None
         }
     );
@@ -385,7 +393,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::RemoveCertificate(
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::RemoveCertificate(
                 RemoveCertificate {
                     address: "0.0.0.0:443".parse().unwrap(),
                     fingerprint: CertificateFingerprint(
@@ -395,7 +403,7 @@ mod tests {
                         .unwrap()
                     ),
                 }
-            )),
+            ))),
             worker_id: None
         }
     );
@@ -406,14 +414,14 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::AddBackend(Backend {
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("xxx"),
                 backend_id: String::from("xxx-0"),
                 address: "127.0.0.1:8080".parse().unwrap(),
                 load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
                 sticky_id: Some(String::from("xxx-0")),
                 backup: Some(false),
-            })),
+            }))),
             worker_id: None
         }
     );
@@ -424,11 +432,13 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::RemoveBackend(RemoveBackend {
-                cluster_id: String::from("xxx"),
-                backend_id: String::from("xxx-0"),
-                address: "127.0.0.1:8080".parse().unwrap(),
-            })),
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::RemoveBackend(
+                RemoveBackend {
+                    cluster_id: String::from("xxx"),
+                    backend_id: String::from("xxx-0"),
+                    address: "127.0.0.1:8080".parse().unwrap(),
+                }
+            ))),
             worker_id: None
         }
     );
@@ -439,7 +449,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::SoftStop),
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::SoftStop)),
             worker_id: Some(0),
         }
     );
@@ -450,7 +460,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::HardStop),
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::HardStop)),
             worker_id: Some(0),
         }
     );
@@ -461,7 +471,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(ProxyRequestOrder::Status),
+            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Status)),
             worker_id: Some(0),
         }
     );

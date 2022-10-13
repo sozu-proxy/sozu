@@ -71,7 +71,7 @@ impl CommandServer {
             CommandRequestOrder::UpgradeWorker(worker_id) => {
                 self.upgrade_worker(request_identifier, worker_id).await
             }
-            CommandRequestOrder::Proxy(proxy_request_order) => match proxy_request_order {
+            CommandRequestOrder::Proxy(proxy_request_order) => match *proxy_request_order {
                 ProxyRequestOrder::ConfigureMetrics(config) => {
                     self.configure_metrics(request_identifier, config).await
                 }
@@ -138,7 +138,7 @@ impl CommandServer {
             for command in orders {
                 let message = CommandRequest::new(
                     format!("SAVE-{}", counter),
-                    CommandRequestOrder::Proxy(command),
+                    CommandRequestOrder::Proxy(Box::new(command)),
                     None,
                 );
 
@@ -177,7 +177,7 @@ impl CommandServer {
         let state = self.state.clone();
 
         Ok(Some(Success::DumpState(CommandResponseContent::State(
-            state,
+            Box::new(state),
         ))))
     }
 
@@ -224,14 +224,14 @@ impl CommandServer {
                     }
                     offset = buffer.data().offset(i);
 
-                    if requests.iter().find(|o| {
+                    if requests.iter().any(|o| {
                         if o.version > PROTOCOL_VERSION {
                             error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, o.version);
                             true
                         } else {
                             false
                         }
-                    }).is_some() {
+                    }) {
                         break;
                     }
 
@@ -250,7 +250,7 @@ impl CommandServer {
                                         && worker.run_state != RunState::Stopped
                                 }) {
                                     let worker_message_id = format!("{}-{}", id, worker.id);
-                                    worker.send(worker_message_id.clone(), order.clone()).await;
+                                    worker.send(worker_message_id.clone(), *order.clone()).await;
                                     self.in_flight
                                         .insert(worker_message_id, (load_state_tx.clone(), 1));
 
@@ -494,12 +494,10 @@ impl CommandServer {
         );
 
         let activate_orders = self.state.generate_activate_orders();
-        let mut count = 0usize;
-        for order in activate_orders.into_iter() {
+        for (count, order) in activate_orders.into_iter().enumerate() {
             worker
                 .send(format!("{}-ACTIVATE-{}", id, count), order)
                 .await;
-            count += 1;
         }
 
         self.workers.push(worker);
@@ -566,18 +564,13 @@ impl CommandServer {
             request_identifier.client, request_identifier.request, id
         );
 
-        if self
-            .workers
-            .iter()
-            .find(|worker| {
-                worker.id == id
-                    && worker.run_state != RunState::Stopping
-                    && worker.run_state != RunState::Stopped
-                // should we add this?
-                // && worker.run_state != RunState::NotAnswering
-            })
-            .is_none()
-        {
+        if !self.workers.iter().any(|worker| {
+            worker.id == id
+                && worker.run_state != RunState::Stopping
+                && worker.run_state != RunState::Stopped
+            // should we add this?
+            // && worker.run_state != RunState::NotAnswering
+        }) {
             bail!(format!(
                 "The worker {} does not exist, or is stopped / stopping.",
                 &id
@@ -765,16 +758,15 @@ impl CommandServer {
         .detach();
 
         let activate_orders = self.state.generate_activate_orders();
-        let mut count = 0usize;
-        for order in activate_orders.into_iter() {
+        for (count, order) in activate_orders.into_iter().enumerate() {
             new_worker
                 .send(
                     format!("{}-ACTIVATE-{}", request_identifier.client, count),
                     order,
                 )
                 .await;
-            count += 1;
         }
+
         info!("sent config messages to the new worker");
         self.workers.push(new_worker);
 
@@ -809,7 +801,7 @@ impl CommandServer {
                             && worker.run_state != RunState::Stopped
                     }) {
                         let worker_message_id = format!("{}-{}", id, worker.id);
-                        worker.send(worker_message_id.clone(), order.clone()).await;
+                        worker.send(worker_message_id.clone(), *order.clone()).await;
                         self.in_flight
                             .insert(worker_message_id, (load_state_tx.clone(), 1));
 
@@ -1072,15 +1064,15 @@ impl CommandServer {
 
         let mut main_query_answer = None;
         match &query {
-            &Query::ClustersHashes => {
+            Query::ClustersHashes => {
                 main_query_answer = Some(QueryAnswer::ClustersHashes(self.state.hash_state()));
             }
-            &Query::Clusters(ref query_type) => {
+            Query::Clusters(query_type) => {
                 main_query_answer = Some(QueryAnswer::Clusters(match query_type {
-                    QueryClusterType::ClusterId(ref cluster_id) => {
+                    QueryClusterType::ClusterId(cluster_id) => {
                         vec![self.state.cluster_state(cluster_id)]
                     }
-                    QueryClusterType::Domain(ref domain) => {
+                    QueryClusterType::Domain(domain) => {
                         let cluster_ids = get_cluster_ids_by_domain(
                             &self.state,
                             domain.hostname.clone(),
@@ -1093,8 +1085,8 @@ impl CommandServer {
                     }
                 }));
             }
-            &Query::Certificates(_) => {}
-            &Query::Metrics(_) => {}
+            Query::Certificates(_) => {}
+            Query::Metrics(_) => {}
         };
 
         // all theses are passed to the thread

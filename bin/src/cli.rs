@@ -407,6 +407,7 @@ pub enum Route {
     Deny,
 }
 
+#[allow(clippy::from_over_into)]
 impl std::convert::Into<sozu_command_lib::proxy::Route> for Route {
     fn into(self) -> sozu_command_lib::proxy::Route {
         match self {
