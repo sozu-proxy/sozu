@@ -564,7 +564,7 @@ impl CommandServer {
             request_identifier.client, request_identifier.request, id
         );
 
-        if self.workers.iter().any(|worker| {
+        if !self.workers.iter().any(|worker| {
             worker.id == id
                 && worker.run_state != RunState::Stopping
                 && worker.run_state != RunState::Stopped
