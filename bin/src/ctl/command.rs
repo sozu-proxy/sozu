@@ -167,7 +167,7 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestOrder::Proxy(ProxyRequestOrder::SoftStop),
+            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::SoftStop)),
             proxy_id,
         ));
 
@@ -197,7 +197,7 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestOrder::Proxy(ProxyRequestOrder::HardStop),
+            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::HardStop)),
             proxy_id,
         ));
 
@@ -412,7 +412,9 @@ impl CommandManager {
 
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestOrder::Proxy(ProxyRequestOrder::ConfigureMetrics(configuration)),
+            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::ConfigureMetrics(
+                configuration,
+            ))),
             None,
         ));
 
@@ -443,13 +445,13 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = CommandRequestOrder::Proxy(ProxyRequestOrder::Query(Query::Metrics(
-            QueryMetricsOptions {
+        let command = CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(
+            Query::Metrics(QueryMetricsOptions {
                 list,
                 cluster_ids,
                 backend_ids,
                 metric_names,
-            },
+            }),
         )));
 
         // a loop to reperform the query every refresh time
@@ -595,9 +597,9 @@ impl CommandManager {
         }
 
         let command = if let Some(ref cluster_id) = cluster_id {
-            CommandRequestOrder::Proxy(ProxyRequestOrder::Query(Query::Clusters(
+            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(Query::Clusters(
                 QueryClusterType::ClusterId(cluster_id.to_string()),
-            )))
+            ))))
         } else if let Some(ref domain) = domain {
             let splitted: Vec<String> =
                 domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
@@ -614,11 +616,11 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{}", path)), // We add the / again because of the splitn removing it
             };
 
-            CommandRequestOrder::Proxy(ProxyRequestOrder::Query(Query::Clusters(
+            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(Query::Clusters(
                 QueryClusterType::Domain(query_domain),
-            )))
+            ))))
         } else {
-            CommandRequestOrder::Proxy(ProxyRequestOrder::Query(Query::ClustersHashes))
+            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(Query::ClustersHashes)))
         };
 
         let id = generate_id();
@@ -673,8 +675,9 @@ impl CommandManager {
             }
         };
 
-        let command =
-            CommandRequestOrder::Proxy(ProxyRequestOrder::Query(Query::Certificates(query)));
+        let command = CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(
+            Query::Certificates(query),
+        )));
 
         let id = generate_id();
         self.channel
@@ -739,7 +742,7 @@ impl CommandManager {
         let id = generate_id();
         self.channel.write_message(&CommandRequest::new(
             id.clone(),
-            CommandRequestOrder::Proxy(order),
+            CommandRequestOrder::Proxy(Box::new(order)),
             None,
         ));
 
