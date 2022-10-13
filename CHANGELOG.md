@@ -4,6 +4,39 @@
 
 See milestone [`v0.15.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av0.15.0)
 
+## 0.14.1 - 2022-10-13
+
+### 🔖 Documentation
+
+- 💪 Improve documentation about the lifecycle of a session, see [`7e223ee`](https://github.com/sozu-proxy/sozu/commit/7e223eee09b848f599b560f5a6d0dc918e94d20e), [`50a940a`](https://github.com/sozu-proxy/sozu/commit/50a940acad497358c9e60e28d0fed6310d26d290), [`a13eb35`](https://github.com/sozu-proxy/sozu/commit/a13eb3571853f9d1468e6d6a385df2a8d8cb7235) and [`2b6706c`](https://github.com/sozu-proxy/sozu/commit/2b6706c8e3d8ab4c94eefe8d7653cdbd918fc772)
+- 🔑 Update TLS cipher suites, see [`3af39a6`](https://github.com/sozu-proxy/sozu/commit/3af39a6fff29d95e0baeccd3a6abfa63354607ce)
+
+### ✍️ Changed
+
+- 🔧 Use Rust edition 2021 and update dependencies, see [`693bc84`](https://github.com/sozu-proxy/sozu/commit/693bc84f0130a7fd6b6f5de3a294ac587bdb26d7), [`8f4449c`](https://github.com/sozu-proxy/sozu/commit/8f4449cd66b85cfa7c7684817115ba13a8762f61), [`e14109b`](https://github.com/sozu-proxy/sozu/commit/e14109bf208e912bfcd8f344b1538cfb02b02c4b), [`339ed21`](https://github.com/sozu-proxy/sozu/commit/339ed2126cf61d79fcb328675a93f14fed9b4b03), [`f064d8b`](https://github.com/sozu-proxy/sozu/commit/f064d8babdab23bb3f64ab7bc400abefa0015358) and [`0e3fffe`](https://github.com/sozu-proxy/sozu/commit/0e3fffeefe2a201c85255eda25b2b85babd65252)
+
+### 📖 Changelog
+
+- [ [`07ccff3`](https://github.com/sozu-proxy/sozu/commit/07ccff35a2176171c3f6d218bdd1622ef2554146) ] Update changelog to add version v0.14.0 [`Florentin Dubois`] (`2022-10-06`)
+- [ [`7e223ee`](https://github.com/sozu-proxy/sozu/commit/7e223eee09b848f599b560f5a6d0dc918e94d20e) ] Rewrite session creation in lifetime_of_a_session.md [`Eloi DEMOLIS`] (`2022-10-11`)
+- [ [`50a940a`](https://github.com/sozu-proxy/sozu/commit/50a940acad497358c9e60e28d0fed6310d26d290) ] Continue work on the documentation, rename listen_token to listener_token [`Eloi DEMOLIS`] (`2022-10-11`)
+- [ [`a13eb35`](https://github.com/sozu-proxy/sozu/commit/a13eb3571853f9d1468e6d6a385df2a8d8cb7235) ] Finish rewriting existing parts [`Eloi DEMOLIS`] (`2022-10-11`)
+- [ [`2b6706c`](https://github.com/sozu-proxy/sozu/commit/2b6706c8e3d8ab4c94eefe8d7653cdbd918fc772) ] Finish the lifetime of a session documentation [`Eloi DEMOLIS`] (`2022-10-12`)
+- [ [`3af39a6`](https://github.com/sozu-proxy/sozu/commit/3af39a6fff29d95e0baeccd3a6abfa63354607ce) ] Update TLS cipher suites [`Florentin Dubois`] (`2022-10-12`)
+- [ [`693bc84`](https://github.com/sozu-proxy/sozu/commit/693bc84f0130a7fd6b6f5de3a294ac587bdb26d7) ] Update rust edition to 2021 [`Florentin Dubois`] (`2022-10-13`)
+- [ [`8f4449c`](https://github.com/sozu-proxy/sozu/commit/8f4449cd66b85cfa7c7684817115ba13a8762f61) ] Update command dependencies [`Florentin Dubois`] (`2022-10-13`)
+- [ [`e14109b`](https://github.com/sozu-proxy/sozu/commit/e14109bf208e912bfcd8f344b1538cfb02b02c4b) ] Update rust edition to 2021 [`Florentin Dubois`] (`2022-10-13`)
+- [ [`339ed21`](https://github.com/sozu-proxy/sozu/commit/339ed2126cf61d79fcb328675a93f14fed9b4b03) ] Update rust edition to 2021 [`Florentin Dubois`] (`2022-10-13`)
+- [ [`f064d8b`](https://github.com/sozu-proxy/sozu/commit/f064d8babdab23bb3f64ab7bc400abefa0015358) ] Update binary dependencies [`Florentin Dubois`] (`2022-10-13`)
+- [ [`0e3fffe`](https://github.com/sozu-proxy/sozu/commit/0e3fffeefe2a201c85255eda25b2b85babd65252) ] Fix a blocking clippy suggestion [`Florentin Dubois`] (`2022-10-13`)
+
+### 🥹 Contributors
+* @Wonshtrum
+* @Keksoj
+* @FlorentinDUBOIS
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/v0.14.0...0.14.1
+
 ## 0.14.0 - 2022-10-06
 
 ### 🌟 Features
