@@ -1553,7 +1553,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "hex",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "anyhow",
  "cookie-factory",

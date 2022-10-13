@@ -5,7 +5,7 @@ repository = "https://github.com/sozu-proxy/sozu"
 readme = "README.md"
 documentation = "https://docs.rs/sozu-lib"
 homepage = "http://sozu.io"
-version = "0.14.0"
+version = "0.14.1"
 license = "AGPL-3.0"
 authors = [
   "Clément Delafargue <clement@delafargue.name>",
@@ -47,7 +47,7 @@ rand = "^0.8.5"
 sha2 = "^0.10.6"
 slab = "^0.4.7"
 socket2 = { version = "^0.4.7", features = ["all"] }
-sozu-command-lib = { path = "../command" }
+sozu-command-lib = "0.14.1"
 regex = "^1.6.0"
 rustls = "^0.20.6"
 rustls-pemfile = "^1.0.1"

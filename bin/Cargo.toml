@@ -5,7 +5,7 @@ repository = "https://github.com/sozu-proxy/sozu"
 readme = "README.md"
 documentation = "https://docs.rs/sozu"
 homepage = "http://sozu.io"
-version = "0.14.0"
+version = "0.14.1"
 license = "AGPL-3.0"
 authors = [
   "Geoffroy Couprie <geo.couprie@gmail.com>",
@@ -51,8 +51,8 @@ smol = "^1.2.5"
 tempfile = "^3.3.0"
 termion = "^1.5.6"
 
-sozu-command-lib = { path = "../command" }
-sozu-lib = { path = "../lib"  }
+sozu-command-lib = "^0.14.1"
+sozu-lib = "^0.14.1"
 
 [target.'cfg(target_os="linux")'.dependencies]
 num_cpus = "^1.13.1"
