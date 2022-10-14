@@ -12,7 +12,7 @@ authors = [
   "Geoffroy Couprie <geo.couprie@gmail.com>",
   "Eloi Demolis <eloi.demolis@clever-cloud.com>",
   "Emmanuel Bosquet <emmanuel.bosquet@clever-cloud.com>",
-  "Florentin Dubois <florentin.dubois@clever-cloud.com>"
+  "Florentin Dubois <florentin.dubois@clever-cloud.com>",
 ]
 categories = ["network-programming"]
 edition = "2021"
@@ -47,11 +47,13 @@ rand = "^0.8.5"
 sha2 = "^0.10.6"
 slab = "^0.4.7"
 socket2 = { version = "^0.4.7", features = ["all"] }
-sozu-command-lib = "0.14.1"
+sozu-command-lib = { path = "../command" }
 regex = "^1.6.0"
 rustls = "^0.20.6"
 rustls-pemfile = "^1.0.1"
-rusty_ulid = { version = "^1.0.0", default-features = true, features = ["ulid-generation"] }
+rusty_ulid = { version = "^1.0.0", default-features = true, features = [
+  "ulid-generation",
+] }
 thiserror = "^1.0.37"
 time = "^0.3.15"
 url = "^2.3.1"

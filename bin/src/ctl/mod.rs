@@ -157,6 +157,6 @@ pub fn create_channel(config: &Config) -> anyhow::Result<Channel<CommandRequest,
     )
     .with_context(|| "Could not create Channel from the given path")?;
 
-    channel.set_nonblocking(false);
+    channel.blocking();
     Ok(channel)
 }

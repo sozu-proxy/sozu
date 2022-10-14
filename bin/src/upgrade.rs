@@ -88,14 +88,14 @@ pub fn fork_main_into_new_main(
         upgrade_data.config.command_buffer_size,
         upgrade_data.config.max_command_buffer_size,
     );
-    fork_confirmation_channel.set_nonblocking(false);
+    fork_confirmation_channel.blocking();
 
     info!("launching new main");
     //FIXME: remove the expect, return a result?
     match unsafe { fork().with_context(|| "fork failed")? } {
         ForkResult::Parent { child } => {
             info!("main launched: {}", child);
-            fork_confirmation_channel.set_nonblocking(true);
+            fork_confirmation_channel.nonblocking();
 
             Ok((child.into(), fork_confirmation_channel))
         }
@@ -131,7 +131,7 @@ pub fn begin_new_main_process(
         max_command_buffer_size,
     );
 
-    fork_confirmation_channel.set_blocking(true);
+    fork_confirmation_channel.blocking();
 
     let upgrade_file = unsafe { File::from_raw_fd(upgrade_file_fd) };
     let upgrade_data: UpgradeData =

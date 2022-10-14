@@ -69,6 +69,7 @@ impl Buffer {
         cnt
     }
 
+    /// displaces the end pointer to the right
     pub fn fill(&mut self, count: usize) -> usize {
         let cnt = cmp::min(count, self.available_space());
         self.end += cnt;

@@ -471,7 +471,7 @@ impl Server {
         if expects_initial_status {
             // the main process sends a Status message, so we can notify it
             // when the initial state is loaded
-            server.channel.set_nonblocking(false);
+            server.channel.blocking();
             let msg = server.channel.read_message();
             debug!("got message: {:?}", msg);
 
@@ -480,7 +480,7 @@ impl Server {
             if let Some(msg) = msg {
                 server.channel.write_message(&ProxyResponse::ok(msg.id));
             }
-            server.channel.set_nonblocking(true);
+            server.channel.nonblocking();
         }
 
         info!("will try to receive listeners");
@@ -793,7 +793,7 @@ impl Server {
                 if new_sessions_count <= self.base_sessions_count {
                     info!("last session stopped, shutting down!");
                     self.channel.run();
-                    self.channel.set_blocking(true);
+                    self.channel.blocking();
                     self.channel.write_message(&ProxyResponse {
                         id: self
                             .shutting_down

@@ -1783,7 +1783,7 @@ mod tests {
             info!("ending event loop");
         });
 
-        command.set_blocking(true);
+        command.blocking();
         {
             let front = TcpFrontend {
                 cluster_id: String::from("yolo"),
