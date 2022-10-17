@@ -13,9 +13,9 @@ To get started check out our [documentation](./doc/README.md) !
 
 ## Exploring the source
 
-- `lib/`: the `sozu_lib` reverse proxy library contains the event loop management, the parsers and protocols
+- `lib/`: the `sozu-lib` reverse proxy library contains the event loop management, the parsers and protocols
 - `bin/`: the `sozu` executable wraps the library in worker processes, and handle dynamic configuration
-- `ctl/`: the `sozuctl` executable can send commands to the reverse proxy
+- `command`: the `sozu-command-lib` contains all structures to interact with Sōzu
 
 ## License
 
