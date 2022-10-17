@@ -2360,15 +2360,6 @@ impl ProxyConfiguration<Session> for Proxy {
     }
 }
 
-#[cfg(ossl101)]
-pub fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
-    use openssl::ec::EcKey;
-    use openssl::nid;
-
-    let curve = EcKey::from_curve_name(nid::X9_62_PRIME256V1)?;
-    ctx.set_tmp_ecdh(&curve)
-}
-
 #[cfg(ossl102)]
 fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     match Dh::get_2048_256() {
@@ -2378,7 +2369,7 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     ctx.set_ecdh_auto(true)
 }
 
-#[cfg(ossl11x)]
+#[cfg(any(ossl101, ossl11x, ossl30x))]
 fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     use openssl::ec::EcKey;
 
@@ -2386,7 +2377,7 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     ctx.set_tmp_ecdh(&curve)
 }
 
-#[cfg(all(not(ossl101), not(ossl102), not(ossl11x)))]
+#[cfg(all(not(ossl101), not(ossl102), not(ossl11x), not(ossl30x)))]
 fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
     compile_error!("unsupported openssl version, please open an issue");
     Ok(())
