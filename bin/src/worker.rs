@@ -63,12 +63,12 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
 
         // the new worker expects a status message at startup
         if let Some(command_channel) = worker.worker_channel.as_mut() {
-            command_channel.set_blocking(true);
+            command_channel.blocking();
             command_channel.write_message(&ProxyRequest {
                 id: format!("start-status-{}", index),
                 order: ProxyRequestOrder::Status,
             });
-            command_channel.set_nonblocking(true);
+            command_channel.nonblocking();
         }
 
         workers.push(worker);
@@ -113,7 +113,7 @@ pub fn begin_worker_process(
         max_command_buffer_size,
     );
 
-    worker_to_main_channel.set_nonblocking(false);
+    worker_to_main_channel.blocking();
 
     let configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
     let config_state: ConfigState = serde_json::from_reader(configuration_state_file)
@@ -147,7 +147,7 @@ pub fn begin_worker_process(
     );
     info!("worker {} starting...", id);
 
-    worker_to_main_channel.set_nonblocking(true);
+    worker_to_main_channel.nonblocking();
     let mut worker_to_main_channel: Channel<ProxyResponse, ProxyRequest> =
         worker_to_main_channel.into();
     worker_to_main_channel.readiness.insert(Ready::readable());
@@ -210,7 +210,7 @@ pub fn fork_main_into_worker(
         config.command_buffer_size,
         config.max_command_buffer_size,
     );
-    main_to_worker_channel.set_nonblocking(false);
+    main_to_worker_channel.blocking();
 
     info!("{} launching worker", worker_id);
     debug!("executable path is {}", executable_path);
@@ -218,7 +218,7 @@ pub fn fork_main_into_worker(
         Ok(ForkResult::Parent { child }) => {
             info!("{} worker launched: {}", worker_id, child);
             main_to_worker_channel.write_message(config);
-            main_to_worker_channel.set_nonblocking(true);
+            main_to_worker_channel.nonblocking();
 
             if let Some(listeners) = listeners {
                 info!("sending listeners to new worker: {:?}", listeners);

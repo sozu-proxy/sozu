@@ -11,15 +11,11 @@ authors = [
   "Geoffroy Couprie <geo.couprie@gmail.com>",
   "Eloi Demolis <eloi.demolis@clever-cloud.com>",
   "Emmanuel Bosquet <emmanuel.bosquet@clever-cloud.com>",
-  "Florentin Dubois <florentin.dubois@clever-cloud.com>"
+  "Florentin Dubois <florentin.dubois@clever-cloud.com>",
 ]
 categories = ["network-programming"]
-edition="2021"
-include = [
-  "README.md",
-  "Cargo.toml",
-  "src/**/*",
-]
+edition = "2021"
+include = ["README.md", "Cargo.toml", "src/**/*"]
 
 [[bin]]
 name = "sozu"
@@ -36,8 +32,8 @@ jemallocator = { version = "^0.5.0", optional = true }
 lazy_static = "^1.4.0"
 libc = "^0.2.135"
 log = "^0.4.17"
-mio = { version = "^0.8.4", features = [ "os-poll", "net" ] }
-nix  = "^0.25.0"
+mio = { version = "^0.8.4", features = ["os-poll", "net"] }
+nix = "^0.25.0"
 nom = "^7.1.1"
 paw = "^1.0.0"
 prettytable-rs = { version = "^0.9.0", default-features = false }
@@ -51,14 +47,14 @@ smol = "^1.2.5"
 tempfile = "^3.3.0"
 termion = "^1.5.6"
 
-sozu-command-lib = "^0.14.1"
-sozu-lib = "^0.14.1"
+sozu-command-lib = { path = "../command" }
+sozu-lib = { path = "../lib" }
 
 [target.'cfg(target_os="linux")'.dependencies]
 num_cpus = "^1.13.1"
 
 [features]
-default = [ "jemallocator" ]
+default = ["jemallocator"]
 unstable = []
 logs-debug = ["sozu-lib/logs-debug", "sozu-command-lib/logs-debug"]
 logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]

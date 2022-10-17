@@ -531,7 +531,7 @@ impl CommandServer {
             fork_main_into_new_main(self.executable_path.clone(), upgrade_data)
                 .with_context(|| "Could not start a new main process")?;
 
-        fork_confirmation_channel.set_blocking(true);
+        fork_confirmation_channel.blocking();
         let received_ok_from_new_process = fork_confirmation_channel.read_message();
         debug!("upgrade channel sent {:?}", received_ok_from_new_process);
 
