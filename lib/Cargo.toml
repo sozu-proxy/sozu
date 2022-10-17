@@ -25,6 +25,7 @@ include = [
   "assets/certificate.pem",
   "assets/key.pem",
 ]
+build = "build.rs"
 
 [dependencies]
 anyhow = "^1.0.65"
