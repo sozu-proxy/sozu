@@ -14,8 +14,12 @@ authors = [
   "Florentin Dubois <florentin.dubois@clever-cloud.com>",
 ]
 categories = ["network-programming"]
-edition = "2021"
-include = ["README.md", "Cargo.toml", "src/**/*"]
+edition="2021"
+include = [
+  "README.md",
+  "Cargo.toml",
+  "src/**/*",
+]
 
 [[bin]]
 name = "sozu"

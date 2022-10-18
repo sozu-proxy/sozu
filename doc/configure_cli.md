@@ -9,7 +9,7 @@ You can specify its path by adding to your `config.toml`:
 command_socket = "path/to/your/command_folder/sock"
 ```
 
-## Add a cluster with an http frontend
+## Add a cluster with an http and https frontends
 
 First you need to create a new cluster with an id and a load balancing policy (roundrobin or random):
 
@@ -29,16 +29,32 @@ Then you need to add a backend:
 sozu --config /etc/sozu/config.toml backend add --address 127.0.0.1:3000 --backend-id <my_backend_id> --id <my_cluster_id>
 ```
 
+### Add http frontend
+
 And an http listener:
 
 ```bash
-sozu --config /etc/sozu/config.toml listener http add --address 0.0.0.0:80
+sozu --config /etc/sozu/config.toml listener http add --address 0.0.0.0:80 --tls-versions TLSv1.2 --tls-cipher-list ECDHE-ECDSA-AES256-GCM-SHA384 --tls-cipher-suites TLS_AES_256_GCM_SHA384 --tls-signature-algorithms ECDSA+SHA512 --tls-groups-list x25519 --expect-proxy
 ```
 
 Finally you have to create a frontend to allow sozu to send traffic from the listener to your backend:
 
 ```bash
-sozu --config /etc/sozu/config.toml frontend http add --address 0.0.0.0:80 --hostname <my_cluster_hostname> --id <my_cluster_id>
+sozu --config /etc/sozu/config.toml frontend http add --address 0.0.0.0:80 --hostname <my_cluster_hostname> id <my_cluster_id>
+```
+
+### Add https frontend
+
+And an https listener:
+
+```bash
+sozu --config /etc/sozu/config.toml listener https add --address 0.0.0.0:443
+```
+
+Finally you have to create a frontend to allow sozu to send traffic from the listener to your backend:
+
+```bash
+sozu --config /etc/sozu/config.toml frontend https add --address 0.0.0.0:443 --hostname <my_cluster_hostname> id <my_cluster_id>
 ```
 
 ## Check the status of sozu

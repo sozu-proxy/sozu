@@ -16,26 +16,30 @@ Sōzu configuration process involves 3 major sources of parameters:
 
 Parameters in the global section allow you to define the global settings shared by the main process and workers (like the log level):
 
-| parameter                  | description                                                                         | possible values                           |
-| -------------------------- | :---------------------------------------------------------------------------------- | ----------------------------------------- |
-| `command_socket`           | path to the unix socket command (see sozuctl for more information)                  |                                           |
-| `saved_state`              | path from which sozu tries to load its state at startup                             |                                           |
-| `log_level`                | possible values are                                                                 | `debug`, `trace`, `error`, `warn`, `info` |
-| `log_target`               | possible values are                                                                 | `stdout, tcp or udp address`              |
-| `log_access_target`        | possible values are (if activated, sends access logs to a separate target)          | `stdout`, `tcp` or `udp address`          |
-| `command_buffer_size`      | size, in bytes, of the buffer used by the main process to handle commands.          |                                           |
-| `max_command_buffer_size`  | maximum size of the buffer used by the main process to handle commands.             |                                           |
-| `worker_count`             | number of workers                                                                   |                                           |
-| `worker_automatic_restart` | if activated, workers that panicked or crashed are restarted (activated by default) |                                           |
-| `handle_process_affinity`  | bind workers to cpu cores.                                                          |                                           |
-| `max_connections`          | maximum number of simultaneous / opened connections                                 |                                           |
-| `max_buffers`              | maximum number of buffers use to proxying                                           |                                           |
-| `buffer_size`              | size, in bytes, of requests buffer use by the workers                               |                                           |
-| `ctl_command_timeout`      | maximum time sozuctl will wait for a command to complete                            |                                           |
-| `pid_file_path`            | stores the pid in a specific file location                                          |                                           |
-| `tls_provider`             | specifies which TLS implementation to use (openssl or rustls)                       |                                           |
-| `front_timeout`            | maximum time of inactivity for a front socket                                       |                                           |
-| `zombie_check_interval`    | duration between checks for zombie sessions                                         |                                           |
+| parameter                  | description                                                                         | possible values                          |
+|----------------------------|:------------------------------------------------------------------------------------|------------------------------------------|
+| `saved_state`              | path from which sozu tries to load its state at startup                             |                                          |
+| `log_level`                | possible values are                                                                 | `debug`, `trace`, `error`, `warn`, `info`|
+| `log_target`               | possible values are                                                                 | `stdout, tcp or udp address`             |
+| `log_access_target`        | possible values are (if activated, sends access logs to a separate target)          | `stdout`, `tcp` or `udp address`         |
+| `command_socket`           | path to the unix socket command (see sozuctl for more information)                  |                                          |
+| `command_buffer_size`      | size, in bytes, of the buffer used by the main process to handle commands.          |                                          |
+| `max_command_buffer_size`  | maximum size of the buffer used by the main process to handle commands.             |                                          |
+| `worker_count`             | number of workers                                                                   |                                          |
+| `worker_automatic_restart` | if activated, workers that panicked or crashed are restarted (activated by default) |                                          |
+| `handle_process_affinity`  | bind workers to cpu cores.                                                          |                                          |
+| `max_connections`          | maximum number of simultaneous / opened connections                                 |                                          |
+| `max_buffers`              | maximum number of buffers use to proxying                                           |                                          |
+| `min_buffers`              | minimum number of buffers preallocated for proxying                                 |                                          |
+| `buffer_size`              | size, in bytes, of requests buffer use by the workers                               |                                          |
+| `ctl_command_timeout`      | maximum time sozuctl will wait for a command to complete                            |                                          |
+| `pid_file_path`            | stores the pid in a specific file location                                          |                                          |
+| `tls_provider`             | specifies which TLS implementation to use                                           | `rustls` or `openssl`                    |
+| `front_timeout`            | maximum time of inactivity for a front socket                                       |                                          |
+| `connect_timeout`          | maximum time of inactivity for a request to connect                                 |                                          |
+| `request_timeout`          | maximum time of inactivity for a request                                            |                                          |
+| `zombie_check_interval`    | duration between checks for zombie sessions                                         |                                          |
+| `activate_listeners`       | automatically start listeners                                                       |                                          |
 
 _Example:_
 
@@ -50,6 +54,7 @@ handle_process_affinity = false
 max_connections = 500
 max_buffers = 500
 buffer_size = 16384
+activate_listeners = true
 ```
 
 ### Listeners
@@ -92,22 +97,67 @@ sticky_name = "SOZUBALANCEID"
 
 ```toml
 # supported TLS versions. Possible values are "SSLv2", "SSLv3", "TLSv1",
-# "TLSv1.1", "TLSv1.2", "TLSv1.3". Defaults to "TLSv1.2"
-tls_versions = ["TLSv1.2"]
+# "TLSv1.1", "TLSv1.2", "TLSv1.3". Defaults to "TLSv1.2" and "TLSv1.3"
+tls_versions = ["TLSv1.2", "TLSv1.3"]
 ```
 
-#### Options specific to Openssl based HTTPS listeners
+#### Options specific to OpenSSL based HTTPS listeners
 
 ```toml
-#option specific to Openssl based HTTPS listeners
-cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"
+# Options specific to Openssl based HTTPS listeners for TLSv1.2
+cipher_list = [
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES256-CCM",
+    "ECDHE-ECDSA-AES128-CCM",
+    "ECDHE-ECDSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-CHACHA20-POLY1305",
+]
+
+# Options specific to OpenSSL based HTTPS listeners for TLSv1.3
+cipher_suites = [
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_128_CCM_SHA256",
+    "TLS_CHACHA20_POLY1305_SHA256",
+]
+
+# Set OpenSSL signature algorithms allowed
+signature_algorithms = [
+    "ECDSA+SHA512",
+    "ECDSA+SHA384",
+    "ECDSA+SHA256",
+    "RSA+SHA512",
+    "RSA+SHA384",
+    "RSA+SHA256",
+    "RSA-PSS+SHA512",
+    "RSA-PSS+SHA256",
+    "RSA-PSS+SHA384",
+]
+
+# Set OpenSSL group list allowed
+groups_list = ["P-521", "P-384", "P-256", "x25519"]
 ```
 
 #### Options specific to Rustls based HTTPS listeners
 
 ```toml
-#option specific to rustls based HTTPS listeners
-rustls_cipher_list = ["TLS13_CHACHA20_POLY1305_SHA256"]
+# option specific to rustls based HTTPS listeners
+cipher_list = [
+    # TLS 1.3 cipher suites
+    "TLS13_AES_256_GCM_SHA384",
+    "TLS13_AES_128_GCM_SHA256",
+    "TLS13_CHACHA20_POLY1305_SHA256",
+    # TLS 1.2 cipher suites
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+]
 ```
 
 ### Clusters

@@ -1216,7 +1216,7 @@ impl Session {
             r.interest = Ready::writable() | Ready::hup() | Ready::error();
         }
 
-        let connect_timeout = time::Duration::seconds(i64::from(
+        let connect_timeout = Duration::seconds(i64::from(
             self.proxy
                 .borrow()
                 .listeners
@@ -1552,6 +1552,9 @@ impl CertificateResolver for Listener {
         let (context, _) = Self::create_context(
             versions,
             &self.config.cipher_list,
+            &self.config.cipher_suites,
+            &self.config.signature_algorithms,
+            &self.config.groups_list,
             &certificate,
             &key,
             &chain,
@@ -1689,6 +1692,9 @@ impl Listener {
         Self::create_context(
             &config.versions,
             &config.cipher_list,
+            &config.cipher_suites,
+            &config.signature_algorithms,
+            &config.groups_list,
             &certificate,
             &key,
             &chain[..],
@@ -1699,7 +1705,10 @@ impl Listener {
 
     pub fn create_context(
         tls_versions: &[TlsVersion],
-        cipher_list: &str,
+        cipher_list: &Vec<String>,
+        cipher_suites: &Vec<String>,
+        signature_algorithms: &Vec<String>,
+        groups_list: &Vec<String>,
         cert: &X509,
         key: &PKey<Private>,
         cert_chain: &[X509],
@@ -1709,29 +1718,37 @@ impl Listener {
         let mut context = SslContext::builder(SslMethod::tls())
             .map_err(|err| ListenerError::BuildOpenSslError(err.to_string()))?;
 
-        let mut mode = ssl::SslMode::ENABLE_PARTIAL_WRITE;
-        mode.insert(ssl::SslMode::ACCEPT_MOVING_WRITE_BUFFER);
-        //FIXME: maybe activate ssl::SslMode::RELEASE_BUFFERS to save some memory?
+        // FIXME: maybe activate ssl::SslMode::RELEASE_BUFFERS to save some memory?
+        let mode = ssl::SslMode::ENABLE_PARTIAL_WRITE | ssl::SslMode::ACCEPT_MOVING_WRITE_BUFFER;
+
         context.set_mode(mode);
 
-        let mut ssl_options = ssl::SslOptions::CIPHER_SERVER_PREFERENCE
-            | ssl::SslOptions::NO_COMPRESSION
-            | ssl::SslOptions::NO_TICKET;
-        let mut versions = ssl::SslOptions::NO_SSLV2 | ssl::SslOptions::NO_SSLV3 |
-      ssl::SslOptions::NO_TLSV1 | ssl::SslOptions::NO_TLSV1_1 |
-      ssl::SslOptions::NO_TLSV1_2
-      //FIXME: the value will not be available if openssl-sys does not find an OpenSSL v1.1
-      /*| ssl::SslOptions::NO_TLSV1_3*/;
+        let mut ssl_options = SslOptions::CIPHER_SERVER_PREFERENCE
+            | SslOptions::NO_COMPRESSION
+            | SslOptions::NO_TICKET;
+
+        let mut versions = SslOptions::NO_SSLV2
+            | SslOptions::NO_SSLV3
+            | SslOptions::NO_TLSV1
+            | SslOptions::NO_TLSV1_1
+            | SslOptions::NO_TLSV1_2;
+
+        // TLSv1.3 is not implemented before OpenSSL v1.1.0
+        if cfg!(any(ossl11x, ossl30x)) {
+            versions |= SslOptions::NO_TLSV1_3;
+        }
 
         for version in tls_versions.iter() {
             match version {
-                TlsVersion::SSLv2 => versions.remove(ssl::SslOptions::NO_SSLV2),
-                TlsVersion::SSLv3 => versions.remove(ssl::SslOptions::NO_SSLV3),
-                TlsVersion::TLSv1_0 => versions.remove(ssl::SslOptions::NO_TLSV1),
-                TlsVersion::TLSv1_1 => versions.remove(ssl::SslOptions::NO_TLSV1_1),
-                TlsVersion::TLSv1_2 => versions.remove(ssl::SslOptions::NO_TLSV1_2),
-                //TlsVersion::TLSv1_3 => versions.remove(ssl::SslOptions::NO_TLSV1_3),
-                TlsVersion::TLSv1_3 => {} //s         => error!("unrecognized TLS version: {:?}", s)
+                TlsVersion::SSLv2 => versions.remove(SslOptions::NO_SSLV2),
+                TlsVersion::SSLv3 => versions.remove(SslOptions::NO_SSLV3),
+                TlsVersion::TLSv1_0 => versions.remove(SslOptions::NO_TLSV1),
+                TlsVersion::TLSv1_1 => versions.remove(SslOptions::NO_TLSV1_1),
+                TlsVersion::TLSv1_2 => versions.remove(SslOptions::NO_TLSV1_2),
+                #[cfg(any(ossl11x, ossl30x))]
+                TlsVersion::TLSv1_3 => versions.remove(SslOptions::NO_TLSV1_3),
+                #[cfg(ssl10x)]
+                TlsVersion::TLSv1_3 => {}
             };
         }
 
@@ -1752,19 +1769,40 @@ impl Listener {
             return Err(ListenerError::BuildOpenSslError(e.to_string()));
         }
 
-        if let Err(e) = context.set_cipher_list(cipher_list) {
+        if let Err(e) = context.set_cipher_list(&cipher_list.join(":")) {
             error!("could not set context cipher list: {:?}", e);
             return Err(ListenerError::BuildOpenSslError(e.to_string()));
+        }
+
+        if cfg!(any(ossl11x, ossl30x)) {
+            if let Err(e) = context.set_ciphersuites(&cipher_suites.join(":")) {
+                error!("could not set context cipher suites: {:?}", e);
+                return Err(ListenerError::BuildOpenSslError(e.to_string()));
+            }
+
+            if let Err(e) = context.set_groups_list(&groups_list.join(":")) {
+                error!("could not set context groups list: {:?}", e);
+                return Err(ListenerError::BuildOpenSslError(e.to_string()));
+            }
+        }
+
+        if cfg!(any(ossl102, ossl11x, ossl30x)) {
+            if let Err(e) = context.set_sigalgs_list(&signature_algorithms.join(":")) {
+                error!("could not set context signature algorithms: {:?}", e);
+                return Err(ListenerError::BuildOpenSslError(e.to_string()));
+            }
         }
 
         if let Err(e) = context.set_certificate(cert) {
             error!("error adding certificate to context: {:?}", e);
             return Err(ListenerError::BuildOpenSslError(e.to_string()));
         }
+
         if let Err(e) = context.set_private_key(key) {
             error!("error adding private key to context: {:?}", e);
             return Err(ListenerError::BuildOpenSslError(e.to_string()));
         }
+
         if let Err(e) = context.set_alpn_protos(SERVER_PROTOS) {
             error!("could not set ALPN protocols: {:?}", e);
             return Err(ListenerError::BuildOpenSslError(e.to_string()));
@@ -2569,13 +2607,13 @@ mod tests {
                 "HTTP/1.1 503 Service Unavailable\r\n\r\n",
             ))),
             config: Default::default(),
-            _ssl_options: ssl::SslOptions::CIPHER_SERVER_PREFERENCE
-                | ssl::SslOptions::NO_COMPRESSION
-                | ssl::SslOptions::NO_TICKET
-                | ssl::SslOptions::NO_SSLV2
-                | ssl::SslOptions::NO_SSLV3
-                | ssl::SslOptions::NO_TLSV1
-                | ssl::SslOptions::NO_TLSV1_1,
+            _ssl_options: SslOptions::CIPHER_SERVER_PREFERENCE
+                | SslOptions::NO_COMPRESSION
+                | SslOptions::NO_TICKET
+                | SslOptions::NO_SSLV2
+                | SslOptions::NO_SSLV3
+                | SslOptions::NO_TLSV1
+                | SslOptions::NO_TLSV1_1,
             token: Token(0),
             active: true,
             tags: BTreeMap::new(),

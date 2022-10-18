@@ -23,7 +23,10 @@ use crate::{
         parser::{hostname_and_port, Method},
     },
     router::Router,
-    server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
+    server::{
+        self, HttpsProvider, ListenSession, ListenToken, ProxyChannel, Server, SessionManager,
+        SessionToken,
+    },
     socket::server_bind,
     sozu_command::{
         logging,
@@ -141,9 +144,9 @@ impl CertificateResolver for Listener {
 impl Listener {
     pub fn new(config: HttpsListener, token: Token) -> Result<Listener, rustls::Error> {
         let server_config = ServerConfig::builder();
-        let server_config = if !config.rustls_cipher_list.is_empty() {
+        let server_config = if !config.cipher_list.is_empty() {
             let mut ciphers = Vec::new();
-            for cipher in config.rustls_cipher_list.iter() {
+            for cipher in config.cipher_list.iter() {
                 match cipher.as_str() {
                     "TLS13_CHACHA20_POLY1305_SHA256" => {
                         ciphers.push(TLS13_CHACHA20_POLY1305_SHA256)
@@ -175,7 +178,6 @@ impl Listener {
         } else {
             server_config.with_safe_default_cipher_suites()
         };
-
         let server_config = server_config.with_safe_default_kx_groups();
         let mut versions = Vec::new();
         for version in config.versions.iter() {
@@ -695,7 +697,6 @@ impl ProxyConfiguration<Session> for Proxy {
     }
 }
 
-use crate::server::HttpsProvider;
 /// This is not directly used by Sōzu but is available for example and testing purposes
 pub fn start(
     config: HttpsListener,
@@ -703,8 +704,6 @@ pub fn start(
     max_buffers: usize,
     buffer_size: usize,
 ) -> anyhow::Result<()> {
-    use crate::server;
-
     let event_loop = Poll::new().with_context(|| "could not create event loop")?;
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(

@@ -1772,7 +1772,11 @@ impl ProxyConfiguration<Session> for Proxy {
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
-        if let Some(listener) = self.listeners.get(&Token(listener_token.0)).map(Clone::clone) {
+        if let Some(listener) = self
+            .listeners
+            .get(&Token(listener_token.0))
+            .map(Clone::clone)
+        {
             if let Err(e) = frontend_sock.set_nodelay(true) {
                 error!(
                     "error setting nodelay on front socket({:?}): {:?}",
