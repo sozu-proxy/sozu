@@ -102,8 +102,7 @@ impl RequestIdentifier {
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Response {
     Error(String),
-    // Todo: refactor the CLI, see issue #740
-    // Processing(String),
+    Processing(String),
     Ok(Success),
 }
 
@@ -987,7 +986,7 @@ async fn client_loop(
 
     smol::spawn(async move {
         while let Some(response) = client_rx.next().await {
-            //info!("sending back message to client: {:?}", msg);
+            trace!("sending back message to client: {:?}", response);
             let mut message: Vec<u8> = serde_json::to_string(&response)
                 .map(|string| string.into_bytes())
                 .unwrap_or_else(|_| Vec::new());
