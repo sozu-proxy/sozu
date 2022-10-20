@@ -8,6 +8,7 @@ extern crate time;
 use std::{env, io::stdout, thread};
 
 use anyhow::Context;
+use sozu_command::config::DEFAULT_RUSTLS_CIPHER_LIST;
 
 use crate::sozu_command::{
     channel::Channel,
@@ -100,22 +101,10 @@ fn main() -> anyhow::Result<()> {
         address: "127.0.0.1:8443"
             .parse()
             .with_context(|| "could not parse address")?,
-        cipher_list: String::from(
-            "ECDHE-ECDSA-CHACHA20-POLY1305:\
-    ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:\
-    ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:\
-    ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:\
-    DHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-SHA256:\
-    ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA:\
-    ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA:\
-    ECDHE-ECDSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA:\
-    ECDHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:\
-    DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:ECDHE-ECDSA-DES-CBC3-SHA:\
-    ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:\
-    AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256:AES128-SHA:\
-    AES256-SHA:DES-CBC3-SHA:!DSS",
-        ),
-
+        cipher_list: DEFAULT_RUSTLS_CIPHER_LIST
+            .into_iter()
+            .map(String::from)
+            .collect(),
         ..Default::default()
     };
 

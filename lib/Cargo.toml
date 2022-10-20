@@ -50,7 +50,7 @@ slab = "^0.4.7"
 socket2 = { version = "^0.4.7", features = ["all"] }
 sozu-command-lib = { path = "../command" }
 regex = "^1.6.0"
-rustls = "^0.20.6"
+rustls = "^0.20.7"
 rustls-pemfile = "^1.0.1"
 rusty_ulid = { version = "^1.0.0", default-features = true, features = [
   "ulid-generation",

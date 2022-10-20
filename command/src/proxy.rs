@@ -14,7 +14,13 @@ use serde::{
     de::{self, Visitor},
 };
 
-use crate::{config::ProxyProtocolConfig, state::RouteKey};
+use crate::{
+    config::{
+        ProxyProtocolConfig, DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST,
+        DEFAULT_RUSTLS_CIPHER_LIST, DEFAULT_SIGNATURE_ALGORITHMS,
+    },
+    state::RouteKey,
+};
 
 pub type MessageId = String;
 
@@ -627,31 +633,26 @@ pub struct HttpListener {
 impl Default for HttpListener {
     fn default() -> HttpListener {
         HttpListener {
-      address:           "127.0.0.1:8080".parse().expect("could not parse address"),
-      public_address:  None,
-      answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-      answer_503:      String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-      expect_proxy:    false,
-      sticky_name:     String::from("SOZUBALANCEID"),
-      front_timeout:   60,
-      back_timeout:    30,
-      connect_timeout: 3,
-      request_timeout: 10,
-    }
+            address:           "127.0.0.1:8080".parse().expect("could not parse address"),
+              public_address:  None,
+              answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+              answer_503:      String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+              expect_proxy:    false,
+              sticky_name:     String::from("SOZUBALANCEID"),
+              front_timeout:   60,
+              back_timeout:    30,
+              connect_timeout: 3,
+              request_timeout: 10,
+        }
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TlsProvider {
     Openssl,
+    #[default]
     Rustls,
-}
-
-impl Default for TlsProvider {
-    fn default() -> TlsProvider {
-        TlsProvider::Rustls
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -710,9 +711,14 @@ pub struct HttpsListener {
     pub answer_404: String,
     pub answer_503: String,
     pub versions: Vec<TlsVersion>,
-    pub cipher_list: String,
-    pub rustls_cipher_list: Vec<String>,
+    pub cipher_list: Vec<String>,
     #[serde(default)]
+    pub cipher_suites: Vec<String>,
+    #[serde(default)]
+    pub signature_algorithms: Vec<String>,
+    #[serde(default)]
+    pub groups_list: Vec<String>,
+    #[serde(skip, default)]
     pub tls_provider: TlsProvider,
     #[serde(default)]
     pub expect_proxy: bool,
@@ -738,21 +744,18 @@ impl Default for HttpsListener {
       public_address:  None,
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       answer_503:      String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-      cipher_list:     String::from(
-        "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
-        ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
-        ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
-        DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:\
-        ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:\
-        ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:\
-        ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:\
-        ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:\
-        DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:\
-        DHE-RSA-AES256-SHA:ECDHE-ECDSA-DES-CBC3-SHA:\
-        ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:\
-        AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:\
-        AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS"),
-      rustls_cipher_list:  vec!(),
+      cipher_list:     DEFAULT_RUSTLS_CIPHER_LIST.into_iter()
+          .map(String::from)
+          .collect(),
+      cipher_suites:  DEFAULT_CIPHER_SUITES.into_iter()
+          .map(String::from)
+          .collect(),
+      signature_algorithms: DEFAULT_SIGNATURE_ALGORITHMS.into_iter()
+          .map(String::from)
+          .collect(),
+      groups_list: DEFAULT_GROUPS_LIST.into_iter()
+          .map(String::from)
+          .collect(),
       versions:            vec!(TlsVersion::TLSv1_2),
       tls_provider:        TlsProvider::Rustls,
       expect_proxy:        false,

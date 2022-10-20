@@ -191,9 +191,15 @@ impl CommandManager {
                 answer_503,
                 tls_versions,
                 cipher_list,
-                rustls_cipher_list,
+                cipher_suites,
+                signature_algorithms,
+                groups_list,
                 expect_proxy,
                 sticky_name,
+                front_timeout,
+                back_timeout,
+                request_timeout,
+                connect_timeout,
             } => {
                 let mut listener = Listener::new(address, FileListenerProtocolConfig::Https);
                 listener.public_address = public_address;
@@ -209,13 +215,16 @@ impl CommandManager {
                 } else {
                     Some(tls_versions)
                 };
-                listener.rustls_cipher_list = if rustls_cipher_list.is_empty() {
-                    None
-                } else {
-                    Some(rustls_cipher_list)
-                };
+                listener.cipher_suites = cipher_suites;
+                listener.signature_algorithms = signature_algorithms;
+                listener.groups_list = groups_list;
                 let https_listener = listener
-                    .to_tls(None, None, None)
+                    .to_tls(
+                        front_timeout,
+                        back_timeout,
+                        connect_timeout,
+                        request_timeout,
+                    )
                     .with_context(|| "Error creating HTTPS listener")?;
                 self.order_command(ProxyRequestOrder::AddHttpsListener(https_listener))
             }
@@ -240,6 +249,10 @@ impl CommandManager {
                 answer_503,
                 expect_proxy,
                 sticky_name,
+                front_timeout,
+                back_timeout,
+                request_timeout,
+                connect_timeout,
             } => {
                 let mut listener = Listener::new(address, FileListenerProtocolConfig::Http);
                 listener.public_address = public_address;
@@ -249,8 +262,14 @@ impl CommandManager {
                 if let Some(sticky_name) = sticky_name {
                     listener.sticky_name = sticky_name;
                 }
+
                 let http_listener = listener
-                    .to_http(None, None, None)
+                    .to_http(
+                        front_timeout,
+                        back_timeout,
+                        connect_timeout,
+                        request_timeout,
+                    )
                     .with_context(|| "Error creating HTTP listener")?;
                 self.order_command(ProxyRequestOrder::AddHttpListener(http_listener))
             }

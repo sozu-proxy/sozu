@@ -22,6 +22,68 @@ use crate::{
     },
 };
 
+// -------------------------------------------------------------------------------------------------
+// Constants
+
+// [`DEFAULT_OPENSSL_CIPHER_LIST`] provides all cipher suites considered as secure and that OpenSSL
+// TLS provider support.
+//
+// See:
+// - https://ciphersuite.info/cs/?security=secure
+pub const DEFAULT_OPENSSL_CIPHER_LIST: [&'static str; 8] = [
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES256-CCM",
+    "ECDHE-ECDSA-AES128-CCM",
+    "ECDHE-ECDSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-CHACHA20-POLY1305",
+];
+
+// [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS
+// provider as it support only strongly secure ones.
+//
+// See:
+// - https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html
+pub const DEFAULT_RUSTLS_CIPHER_LIST: [&'static str; 9] = [
+    // TLS 1.3 cipher suites
+    "TLS13_AES_256_GCM_SHA384",
+    "TLS13_AES_128_GCM_SHA256",
+    "TLS13_CHACHA20_POLY1305_SHA256",
+    // TLS 1.2 cipher suites
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+];
+
+pub const DEFAULT_CIPHER_SUITES: [&'static str; 4] = [
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_128_CCM_SHA256",
+    "TLS_CHACHA20_POLY1305_SHA256",
+];
+
+pub const DEFAULT_SIGNATURE_ALGORITHMS: [&'static str; 9] = [
+    "ECDSA+SHA256",
+    "ECDSA+SHA384",
+    "ECDSA+SHA512",
+    "RSA+SHA256",
+    "RSA+SHA384",
+    "RSA+SHA512",
+    "RSA-PSS+SHA256",
+    "RSA-PSS+SHA384",
+    "RSA-PSS+SHA512",
+];
+
+pub const DEFAULT_GROUPS_LIST: [&'static str; 4] = ["P-521", "P-384", "P-256", "x25519"];
+
+// -------------------------------------------------------------------------------------------------
+// Listener structure
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
@@ -30,9 +92,13 @@ pub struct Listener {
     pub public_address: Option<SocketAddr>,
     pub answer_404: Option<String>,
     pub answer_503: Option<String>,
-    pub cipher_list: Option<String>,
-    pub rustls_cipher_list: Option<Vec<String>>,
+    #[serde(default)]
+    pub tls_provider: TlsProvider,
     pub tls_versions: Option<Vec<TlsVersion>>,
+    pub cipher_list: Option<Vec<String>>,
+    pub cipher_suites: Option<Vec<String>>,
+    pub signature_algorithms: Option<Vec<String>>,
+    pub groups_list: Option<Vec<String>>,
     pub expect_proxy: Option<bool>,
     #[serde(default = "default_sticky_name")]
     pub sticky_name: String,
@@ -42,6 +108,7 @@ pub struct Listener {
     pub front_timeout: Option<u32>,
     pub back_timeout: Option<u32>,
     pub connect_timeout: Option<u32>,
+    pub request_timeout: Option<u32>,
 }
 
 fn default_sticky_name() -> String {
@@ -56,9 +123,12 @@ impl Listener {
             public_address: None,
             answer_404: None,
             answer_503: None,
-            cipher_list: None,
-            rustls_cipher_list: None,
+            tls_provider: TlsProvider::default(),
             tls_versions: None,
+            cipher_list: None,
+            cipher_suites: None,
+            signature_algorithms: None,
+            groups_list: None,
             expect_proxy: None,
             sticky_name: String::from("SOZUBALANCEID"),
             certificate: None,
@@ -67,6 +137,7 @@ impl Listener {
             front_timeout: None,
             back_timeout: None,
             connect_timeout: None,
+            request_timeout: None,
         }
     }
 
@@ -75,6 +146,7 @@ impl Listener {
         front_timeout: Option<u32>,
         back_timeout: Option<u32>,
         connect_timeout: Option<u32>,
+        request_timeout: Option<u32>,
     ) -> anyhow::Result<HttpListener> {
         if self.protocol != FileListenerProtocolConfig::Http {
             bail!("cannot convert listener to HTTP");
@@ -103,6 +175,7 @@ impl Listener {
             front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
             back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
             connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
+            request_timeout: self.request_timeout.or(request_timeout).unwrap_or(10),
             ..Default::default()
         };
 
@@ -140,53 +213,42 @@ impl Listener {
         front_timeout: Option<u32>,
         back_timeout: Option<u32>,
         connect_timeout: Option<u32>,
+        request_timeout: Option<u32>,
     ) -> anyhow::Result<HttpsListener> {
         if self.protocol != FileListenerProtocolConfig::Https {
             bail!("cannot convert listener to HTTPS");
         }
 
-        let cipher_list: String = self.cipher_list.clone().unwrap_or_else(|| {
-            String::from(
-                "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
-        ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
-        ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
-        DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:\
-        ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:\
-        ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:\
-        ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:\
-        ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:\
-        DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:\
-        DHE-RSA-AES256-SHA:ECDHE-ECDSA-DES-CBC3-SHA:\
-        ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:\
-        AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:\
-        AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS",
-            )
+        let default_cipher_list = match self.tls_provider {
+            TlsProvider::Rustls => DEFAULT_RUSTLS_CIPHER_LIST
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            TlsProvider::Openssl => DEFAULT_OPENSSL_CIPHER_LIST
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        };
+
+        let cipher_list = self.cipher_list.clone().unwrap_or(default_cipher_list);
+        let signature_algorithms = self.signature_algorithms.clone().unwrap_or_else(|| {
+            DEFAULT_SIGNATURE_ALGORITHMS
+                .into_iter()
+                .map(String::from)
+                .collect()
         });
 
-        let supported_ciphersuites: HashSet<&str> = [
-            "TLS13_CHACHA20_POLY1305_SHA256",
-            "TLS13_AES_256_GCM_SHA384",
-            "TLS13_AES_128_GCM_SHA256",
-            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-        ]
-        .iter()
-        .cloned()
-        .collect();
+        let cipher_suites = self.cipher_suites.clone().unwrap_or_else(|| {
+            DEFAULT_CIPHER_SUITES
+                .into_iter()
+                .map(String::from)
+                .collect()
+        });
 
-        if let Some(ref list) = self.rustls_cipher_list {
-            for cipher in list.iter() {
-                if !supported_ciphersuites.contains(cipher.as_str()) {
-                    error!("unknown rustls ciphersuite: {}", cipher);
-                }
-            }
-        }
-
-        let rustls_cipher_list = self.rustls_cipher_list.clone().unwrap_or_default();
+        let groups_list = self
+            .groups_list
+            .clone()
+            .unwrap_or_else(|| DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect());
 
         //FIXME => done. This seems useless now
         // let tls_proxy_configuration = Some(self.address);
@@ -232,16 +294,20 @@ impl Listener {
             address: self.address,
             sticky_name: self.sticky_name.clone(),
             public_address: self.public_address,
+            tls_provider: self.tls_provider.clone(),
             cipher_list,
+            cipher_suites,
+            signature_algorithms,
+            groups_list,
             versions,
             expect_proxy,
-            rustls_cipher_list,
             key,
             certificate,
             certificate_chain,
             front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
             back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
             connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
+            request_timeout: self.request_timeout.or(request_timeout).unwrap_or(10),
             ..Default::default()
         };
 
@@ -773,6 +839,7 @@ pub struct FileConfig {
     pub handle_process_affinity: Option<bool>,
     pub ctl_command_timeout: Option<u64>,
     pub pid_file_path: Option<String>,
+    #[serde(default)]
     pub tls_provider: Option<TlsProvider>,
     pub activate_listeners: Option<bool>,
     #[serde(default)]
@@ -785,6 +852,8 @@ pub struct FileConfig {
     pub zombie_check_interval: Option<u32>,
     #[serde(default)]
     pub accept_queue_timeout: Option<u32>,
+    #[serde(default)]
+    pub request_timeout: Option<u32>,
 }
 
 impl FileConfig {
@@ -873,7 +942,7 @@ impl FileConfig {
 
                 if listener.public_address.is_some() && listener.expect_proxy == Some(true) {
                     bail!(format!(
-                        "the listener on {} has incompatible options: it cannot use the expect proxy protocol and have a public_address field at the same time", 
+                        "the listener on {} has incompatible options: it cannot use the expect proxy protocol and have a public_address field at the same time",
                         &listener.address
                     ));
                 }
@@ -881,13 +950,23 @@ impl FileConfig {
                 match listener.protocol {
                     FileListenerProtocolConfig::Https => {
                         let listener = listener
-                            .to_tls(self.front_timeout, self.back_timeout, self.connect_timeout)
+                            .to_tls(
+                                self.front_timeout,
+                                self.back_timeout,
+                                self.connect_timeout,
+                                self.request_timeout,
+                            )
                             .with_context(|| "invalid listener")?;
                         https_listeners.push(listener);
                     }
                     FileListenerProtocolConfig::Http => {
                         let listener = listener
-                            .to_http(self.front_timeout, self.back_timeout, self.connect_timeout)
+                            .to_http(
+                                self.front_timeout,
+                                self.back_timeout,
+                                self.connect_timeout,
+                                self.request_timeout,
+                            )
                             .with_context(|| "invalid listener")?;
                         http_listeners.push(listener);
                     }
@@ -943,6 +1022,7 @@ impl FileConfig {
                                                     self.front_timeout,
                                                     self.back_timeout,
                                                     self.connect_timeout,
+                                                    self.request_timeout,
                                                 )
                                                 .with_context(|| {
                                                     "Cannot convert listener to TLS"
@@ -961,6 +1041,7 @@ impl FileConfig {
                                                     self.front_timeout,
                                                     self.back_timeout,
                                                     self.connect_timeout,
+                                                    self.request_timeout,
                                                 )
                                                 .with_context(|| {
                                                     "Cannot convert listener to HTTP"
@@ -1011,12 +1092,6 @@ impl FileConfig {
             }
         }
 
-        let tls_provider = self.tls_provider.unwrap_or(if cfg!(use_openssl) {
-            TlsProvider::Openssl
-        } else {
-            TlsProvider::Rustls
-        });
-
         let command_socket_path = self.command_socket.unwrap_or({
             let mut path = env::current_dir().with_context(|| "env path not found")?;
             path.push("sozu.sock");
@@ -1059,7 +1134,7 @@ impl FileConfig {
             handle_process_affinity: self.handle_process_affinity.unwrap_or(false),
             ctl_command_timeout: self.ctl_command_timeout.unwrap_or(1_000),
             pid_file_path: self.pid_file_path,
-            tls_provider,
+            tls_provider: self.tls_provider.clone().unwrap_or_default(),
             activate_listeners: self.activate_listeners.unwrap_or(true),
             front_timeout: self.front_timeout.unwrap_or(60),
             back_timeout: self.front_timeout.unwrap_or(30),
@@ -1098,6 +1173,7 @@ pub struct Config {
     pub handle_process_affinity: bool,
     pub ctl_command_timeout: u64,
     pub pid_file_path: Option<String>,
+    #[serde(default)]
     pub tls_provider: TlsProvider,
     pub activate_listeners: bool,
     #[serde(default = "default_front_timeout")]
@@ -1358,9 +1434,12 @@ mod tests {
             answer_404: Some(String::from("404.html")),
             answer_503: None,
             public_address: None,
+            tls_provider: TlsProvider::default(),
             tls_versions: None,
             cipher_list: None,
-            rustls_cipher_list: None,
+            cipher_suites: None,
+            signature_algorithms: None,
+            groups_list: None,
             expect_proxy: None,
             sticky_name: "SOZUBALANCEID".to_string(),
             certificate: None,
@@ -1369,6 +1448,7 @@ mod tests {
             front_timeout: None,
             back_timeout: None,
             connect_timeout: None,
+            request_timeout: None,
         };
         println!("http: {:?}", to_string(&http));
         let https = Listener {
@@ -1377,9 +1457,12 @@ mod tests {
             answer_404: Some(String::from("404.html")),
             answer_503: None,
             public_address: None,
+            tls_provider: TlsProvider::default(),
             tls_versions: None,
             cipher_list: None,
-            rustls_cipher_list: None,
+            cipher_suites: None,
+            signature_algorithms: None,
+            groups_list: None,
             expect_proxy: None,
             sticky_name: "SOZUBALANCEID".to_string(),
             certificate: None,
@@ -1388,6 +1471,7 @@ mod tests {
             front_timeout: None,
             back_timeout: None,
             connect_timeout: None,
+            request_timeout: None,
         };
         println!("https: {:?}", to_string(&https));
 
@@ -1424,6 +1508,7 @@ mod tests {
             connect_timeout: None,
             zombie_check_interval: None,
             accept_queue_timeout: None,
+            request_timeout: None,
         };
 
         println!("config: {:?}", to_string(&config));
