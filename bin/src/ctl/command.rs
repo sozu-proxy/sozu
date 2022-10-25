@@ -749,7 +749,9 @@ impl CommandManager {
     pub fn order_command(&mut self, order: ProxyRequestOrder) -> Result<(), anyhow::Error> {
         let id = generate_id();
 
-        self.send_request(&id, CommandRequestOrder::Proxy(Box::new(order)))?;
+        let request_order = CommandRequestOrder::Proxy(Box::new(order));
+        println!("Sending request order: {:?}", request_order);
+        self.send_request(&id, request_order)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -761,24 +763,8 @@ impl CommandManager {
                 CommandStatus::Processing => println!("Proxy is processing: {}", response.message),
                 CommandStatus::Error => bail!("could not execute order: {}", response.message),
                 CommandStatus::Ok => {
-                    println!("Success (but nothing to print)");
+                    println!("Success: {}", response.message);
                     break;
-                    // TODO: reactivate success messages
-                    /*
-                    match order {
-                      ProxyRequestOrder::AddCluster(_) => println!("cluster added : {}", message.message),
-                      ProxyRequestOrder::RemoveCluster(_) => println!("cluster removed : {} ", message.message),
-                      ProxyRequestOrder::AddBackend(_) => println!("backend added : {}", message.message),
-                      ProxyRequestOrder::RemoveBackend(_) => println!("backend removed : {} ", message.message),
-                      ProxyRequestOrder::AddCertificate(_) => println!("certificate added: {}", message.message),
-                      ProxyRequestOrder::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
-                      ProxyRequestOrder::AddHttpFrontend(_) => println!("front added: {}", message.message),
-                      ProxyRequestOrder::RemoveHttpFrontend(_) => println!("front removed: {}", message.message),
-                      _ => {
-                        // do nothing for now
-                      }
-                    }
-                    */
                 }
             }
         }
