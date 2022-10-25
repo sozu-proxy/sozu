@@ -89,7 +89,7 @@ buffer_size = 16393
 
 # how much time (in milliseconds) sozuctl will wait for a command to complete.
 # Defaults to 1000 milliseconds
-#ctl_command_timeout = 1000
+# ctl_command_timeout = 1000
 
 # PID file is a file containing the PID of the main process of sozu.
 # It can be helpful to help systemd or any other service system to keep track

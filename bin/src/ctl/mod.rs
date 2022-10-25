@@ -149,6 +149,7 @@ impl CommandManager {
     }
 }
 
+/// creates a blocking channel
 pub fn create_channel(config: &Config) -> anyhow::Result<Channel<CommandRequest, CommandResponse>> {
     let mut channel = Channel::from_path(
         &config.command_socket_path()?,

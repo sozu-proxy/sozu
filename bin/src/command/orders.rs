@@ -451,13 +451,12 @@ impl CommandServer {
         )
         .with_context(|| format!("Failed at creating worker {}", self.next_worker_id))?;
 
-        // Todo: refactor the CLI, see issue #740
-        // return_processing(
-        //     self.command_tx.clone(),
-        //     request_identifier.clone(),
-        //     "Sending configuration orders",
-        // )
-        // .await;
+        return_processing(
+            self.command_tx.clone(),
+            request_identifier.clone(),
+            "Sending configuration orders to the new worker...",
+        )
+        .await;
 
         info!("created new worker: {}", worker.id);
 
@@ -513,17 +512,16 @@ impl CommandServer {
 
     pub async fn upgrade_main(
         &mut self,
-        _request_identifier: RequestIdentifier,
+        request_identifier: RequestIdentifier,
     ) -> anyhow::Result<Option<Success>> {
         self.disable_cloexec_before_upgrade()?;
 
-        // Todo: refactor the CLI, see issue #740
-        // return_processing(
-        //     self.command_tx.clone(),
-        //     request_identifier,
-        //     "The proxy is processing the upgrade command.",
-        // )
-        // .await;
+        return_processing(
+            self.command_tx.clone(),
+            request_identifier,
+            "The proxy is processing the upgrade command.",
+        )
+        .await;
 
         let upgrade_data = self.generate_upgrade_data();
 
@@ -588,13 +586,12 @@ impl CommandServer {
         )
         .with_context(|| "failed at creating worker")?;
 
-        // Todo: refactor the CLI, see issue #740
-        // return_processing(
-        //     self.command_tx.clone(),
-        //     request_identifier.clone(),
-        //     "sending configuration orders",
-        // )
-        // .await;
+        return_processing(
+            self.command_tx.clone(),
+            request_identifier.clone(),
+            "Sending configuration orders to the worker",
+        )
+        .await;
 
         info!("created new worker: {}", next_id);
 
@@ -702,6 +699,7 @@ impl CommandServer {
                 .await;
 
             let mut command_tx = self.command_tx.clone();
+            let cloned_request_identifier = request_identifier.clone();
             let worker_id = old_worker.id;
             smol::spawn(async move {
                 while let Some((proxy_response, _)) = softstop_rx.next().await {
@@ -729,7 +727,12 @@ impl CommandServer {
                         }
                     };
                 }
-                // The best would be to return Processing here. See issue #740
+                return_processing(
+                    command_tx.clone(),
+                    cloned_request_identifier,
+                    "Processing softstop responses from the workers...",
+                )
+                .await;
             })
             .detach();
         }
@@ -788,13 +791,24 @@ impl CommandServer {
 
         let (load_state_tx, mut load_state_rx) = futures::channel::mpsc::channel(10000);
 
+        return_processing(
+            self.command_tx.clone(),
+            request_identifier.clone(),
+            "Reloading configuration, sending config messages to workers...",
+        )
+        .await;
+
         for message in new_config.generate_config_messages() {
             if let CommandRequestOrder::Proxy(order) = message.order {
                 if self.state.handle_order(&order) {
                     diff_counter += 1;
 
                     let mut found = false;
-                    let id = format!("LOAD-STATE-{}-{}", request_identifier.request, diff_counter);
+                    let id = format!(
+                        "LOAD-STATE-{}-{}",
+                        &request_identifier.request,
+                        diff_counter
+                    );
 
                     for ref mut worker in self.workers.iter_mut().filter(|worker| {
                         worker.run_state != RunState::Stopping
@@ -874,13 +888,6 @@ impl CommandServer {
 
         self.config = new_config;
 
-        // Todo: refactor the CLI to accept processing, see issue #740
-        // return_processing(
-        //     self.command_tx.clone(),
-        //     request_identifier,
-        //     "Reloading configuration...",
-        // )
-        // .await;
         Ok(None)
     }
 
@@ -888,7 +895,7 @@ impl CommandServer {
         &mut self,
         request_identifier: RequestIdentifier,
     ) -> anyhow::Result<Option<Success>> {
-        info!("Let's get the status of everyone.");
+        info!("Requesting the status of all workers.");
 
         let (status_tx, mut status_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
 
@@ -896,6 +903,13 @@ impl CommandServer {
         let mut worker_info_map: BTreeMap<String, WorkerInfo> = BTreeMap::new();
 
         let prefix = format!("{}-status-", request_identifier.client);
+
+        return_processing(
+            self.command_tx.clone(),
+            request_identifier.clone(),
+            "Sending status requests to workers...",
+        )
+        .await;
 
         let mut count = 0usize;
         for ref mut worker in self.workers.iter_mut() {
@@ -1062,6 +1076,13 @@ impl CommandServer {
             self.in_flight.insert(req_id, (query_tx.clone(), 1));
         }
 
+        return_processing(
+            self.command_tx.clone(),
+            request_identifier.clone(),
+            "Query was sent to the workers...",
+        )
+        .await;
+
         let mut main_query_answer = None;
         match &query {
             Query::ClustersHashes => {
@@ -1162,13 +1183,6 @@ impl CommandServer {
         })
         .detach();
 
-        // Todo: refactor the CLI to accept processing, see issue #740
-        // return_processing(
-        //     self.command_tx.clone(),
-        //     request_identifier,
-        //     "Processing the query…",
-        // )
-        // .await;
         Ok(None)
     }
 
@@ -1237,6 +1251,12 @@ impl CommandServer {
             & (order != ProxyRequestOrder::SoftStop || order != ProxyRequestOrder::HardStop)
         {
             if let Some(path) = self.config.saved_state.clone() {
+                return_processing(
+                    self.command_tx.clone(),
+                    request_identifier.clone(),
+                    "Saving state to file",
+                )
+                .await;
                 let mut file = File::create(&path)
                     .with_context(|| "Could not create file to automatically save the state")?;
 
@@ -1245,7 +1265,13 @@ impl CommandServer {
             }
         }
 
-        // sent out the order to all workers
+        return_processing(
+            self.command_tx.clone(),
+            request_identifier.clone(),
+            "Sending the order to the worker...",
+        )
+        .await;
+
         let (worker_order_tx, mut worker_order_rx) =
             futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut found = false;
@@ -1377,14 +1403,6 @@ impl CommandServer {
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
 
-        // Todo: refactor the CLI, see issue #740
-        // return_processing(
-        //     self.command_tx.clone(),
-        //     request_identifier,
-        //     "Processing worker order",
-        // )
-        // .await;
-
         Ok(None)
     }
 
@@ -1419,15 +1437,12 @@ impl CommandServer {
                     command_response_data,
                 )
             }
-            // Todo: refactor the CLI to accept processing, see issue #740
-            // Response::Processing(_) => {
-            //     command_response = CommandResponse::new(
-            //         request_id.clone(),
-            //         CommandStatus::Processing,
-            //         processing_message,
-            //         None,
-            //     );
-            // }
+            Response::Processing(processing_message) => CommandResponse::new(
+                request_id.clone(),
+                CommandStatus::Processing,
+                processing_message,
+                None,
+            ),
             Response::Error(error_message) => CommandResponse::new(
                 request_id.clone(),
                 CommandStatus::Error,
@@ -1445,6 +1460,7 @@ impl CommandServer {
 
         match self.clients.get_mut(&client_id) {
             Some(client_tx) => {
+                trace!("sending from main process to client loop");
                 client_tx.send(command_response).await.with_context(|| {
                     format!(
                         "Could not notify client {} about request {}",
@@ -1469,35 +1485,36 @@ async fn return_error<T>(
     T: ToString,
 {
     let error_command_message = CommandMessage::Advancement {
-        request_identifier: request_identifier.to_owned(),
+        request_identifier,
         response: Response::Error(error_message.to_string()),
     };
 
+    trace!("return_error: sending event to the command server");
     if let Err(e) = command_tx.send(error_command_message).await {
         error!("Error while return error to the command server: {}", e)
     }
 }
 
-// Todo: refactor the CLI, see issue #740
-// async fn return_processing<T>(
-//     mut command_tx: Sender<CommandMessage>,
-//     request_identifier: RequestIdentifier,
-//     processing_message: T,
-// ) where
-//     T: ToString,
-// {
-//     let processing_command_message = CommandMessage::Advancement {
-//         request_identifier: request_identifier.to_owned(),
-//         response: Response::Processing(processing_message.to_string()),
-//     };
-//
-//     if let Err(e) = command_tx.send(processing_command_message).await {
-//         error!(
-//             "Error while returning processing to the command server: {}",
-//             e
-//         )
-//     }
-// }
+async fn return_processing<T>(
+    mut command_tx: Sender<CommandMessage>,
+    request_identifier: RequestIdentifier,
+    processing_message: T,
+) where
+    T: ToString,
+{
+    let processing_command_message = CommandMessage::Advancement {
+        request_identifier,
+        response: Response::Processing(processing_message.to_string()),
+    };
+
+    trace!("return_processing: sending event to the command server");
+    if let Err(e) = command_tx.send(processing_command_message).await {
+        error!(
+            "Error while returning processing to the command server: {}",
+            e
+        )
+    }
+}
 
 async fn return_success(
     mut command_tx: Sender<CommandMessage>,
@@ -1505,10 +1522,10 @@ async fn return_success(
     success: Success,
 ) {
     let success_command_message = CommandMessage::Advancement {
-        request_identifier: request_identifier.to_owned(),
+        request_identifier,
         response: Response::Ok(success),
     };
-
+    trace!("return_success: sending event to the command server");
     if let Err(e) = command_tx.send(success_command_message).await {
         error!("Error while returning success to the command server: {}", e)
     }
