@@ -298,6 +298,7 @@ impl CommandManager {
                 front_timeout: 60,
                 back_timeout: 30,
                 connect_timeout: 3,
+                tls: None,
             })),
             TcpListenerCmd::Remove { address } => self.remove_listener(address, ListenerType::TCP),
             TcpListenerCmd::Activate { address } => {

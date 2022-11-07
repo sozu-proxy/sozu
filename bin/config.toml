@@ -299,6 +299,15 @@ groups_list = ["P-521", "P-384", "P-256", "x25519"]
 # this option is incompatible with public_address
 # expect_proxy = false
 
+[[listeners]]
+protocol = "tcp"
+# listening address
+address = "0.0.0.0:8043"
+tls_versions = ["TLSv1.3"]
+certificate = "../lib/assets/cert_test.pem"
+key = "../lib/assets/key_test.pem"
+certificate_chain = "../lib/assets/certificate_chain.pem"
+
 # static configuration for cluster
 #
 # A cluster is a set of frontends, routing rules, and backends.
@@ -360,4 +369,15 @@ frontends = [
 backends = [
     { address = "127.0.0.1:4000", weight = 100 },
     { address = "127.0.0.1:4001", weight = 50 }
+]
+
+[clusters.TcpTls]
+protocol = "tcp"
+
+frontends = [
+  { address = "0.0.0.0:8043", tags = { key = "value" }},
+]
+
+backends = [
+  { address = "127.0.0.1:4000" },
 ]

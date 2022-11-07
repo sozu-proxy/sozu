@@ -1,16 +1,27 @@
 use std::{
     cell::RefCell,
     collections::{hash_map::Entry, BTreeMap, HashMap},
-    io::{self, ErrorKind},
+    io::{self, BufReader, ErrorKind},
     net::{Shutdown, SocketAddr},
     os::unix::io::AsRawFd,
     rc::Rc,
+    sync::Arc,
 };
 
 use anyhow::Context;
 use mio::{net::*, unix::SourceFd, *};
+use rustls::{
+    cipher_suite::{
+        TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
+        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    },
+    ServerConfig, ServerConnection,
+};
 use rusty_ulid::Ulid;
 use slab::Slab;
+use sozu_command::proxy::TlsVersion;
 use time::{Duration, Instant};
 
 use crate::{
@@ -20,6 +31,7 @@ use crate::{
         proxy_protocol::{
             expect::ExpectProxyProtocol, relay::RelayProxyProtocol, send::SendProxyProtocol,
         },
+        rustls::TlsHandshake,
         {Pipe, ProtocolResult},
     },
     retry::RetryPolicy,
@@ -27,7 +39,7 @@ use crate::{
         push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, CONN_RETRIES,
         TIMER,
     },
-    socket::server_bind,
+    socket::{server_bind, FrontRustls},
     sozu_command::{
         config::ProxyProtocolConfig,
         logging,
@@ -39,10 +51,21 @@ use crate::{
         scm_socket::ScmSocket,
     },
     timer::TimeoutContainer,
+    // tls::MutexWrappedCertificateResolver,
     util::UnwrapLog,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
-    ConnectionError, ListenerHandler, Protocol, ProxyConfiguration, ProxySession, Readiness,
-    SessionMetrics, SessionResult,
+    AcceptError,
+    Backend,
+    BackendConnectAction,
+    BackendConnectionStatus,
+    ClusterId,
+    ConnectionError,
+    ListenerHandler,
+    Protocol,
+    ProxyConfiguration,
+    ProxySession,
+    Readiness,
+    SessionMetrics,
+    SessionResult,
 };
 
 pub enum UpgradeResult {
@@ -52,7 +75,9 @@ pub enum UpgradeResult {
 }
 
 pub enum State {
+    Handshake(TlsHandshake),
     Pipe(Pipe<TcpStream, Listener>),
+    PipeTls(Pipe<FrontRustls, Listener>),
     SendProxyProtocol(SendProxyProtocol<TcpStream>),
     RelayProxyProtocol(RelayProxyProtocol<TcpStream>),
     ExpectProxyProtocol(ExpectProxyProtocol<TcpStream>),
@@ -95,7 +120,7 @@ impl Session {
         front_timeout_duration: Duration,
         backend_timeout_duration: Duration,
         listener: Rc<RefCell<Listener>>,
-    ) -> Session {
+    ) -> Result<Session, AcceptError> {
         let frontend_address = sock.peer_addr().ok();
         let mut frontend_buffer = None;
         let mut backend_buffer = None;
@@ -138,30 +163,47 @@ impl Session {
                 )))
             }
             None => {
-                gauge_add!("protocol.tcp", 1);
-                let mut pipe = Pipe::new(
-                    sock,
-                    frontend_token,
-                    request_id,
-                    cluster_id.clone(),
-                    backend_id.clone(),
-                    None,
-                    None,
-                    front_buf,
-                    back_buf,
-                    frontend_address,
-                    Protocol::TCP,
-                    listener.clone(),
-                );
-                pipe.set_cluster_id(cluster_id.clone());
-                Some(State::Pipe(pipe))
+                let owned = listener.borrow();
+                if let Some(ssl) = &owned.ssl_config {
+                    gauge_add!("protocol.tcp.tls", 1);
+                    frontend_buffer = Some(front_buf);
+                    backend_buffer = Some(back_buf);
+                    let request_id = Ulid::generate();
+                    let ssl = match ServerConnection::new(ssl.clone()) {
+                        Ok(session) => session,
+                        Err(e) => {
+                            error!("failed to create server session: {:?}", e);
+                            return Err(AcceptError::IoError);
+                        }
+                    };
+                    let handshake = TlsHandshake::new(ssl, sock, request_id);
+                    Some(State::Handshake(handshake))
+                } else {
+                    gauge_add!("protocol.tcp", 1);
+                    let mut pipe = Pipe::new(
+                        sock,
+                        frontend_token,
+                        request_id,
+                        cluster_id.clone(),
+                        backend_id.clone(),
+                        None,
+                        None,
+                        front_buf,
+                        back_buf,
+                        frontend_address,
+                        Protocol::TCP,
+                        listener.clone(),
+                    );
+                    pipe.set_cluster_id(cluster_id.clone());
+                    Some(State::Pipe(pipe))
+                }
             }
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
         //FIXME: timeout usage
 
-        Session {
+        Ok(Session {
             backend: None,
             frontend_token,
             backend_token: None,
@@ -181,7 +223,7 @@ impl Session {
             back_timeout,
             proxy,
             listener,
-        }
+        })
     }
 
     fn log_request(&self) {
@@ -236,6 +278,11 @@ impl Session {
     fn front_hup(&mut self) -> SessionResult {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.front_hup(&mut self.metrics),
+            Some(State::PipeTls(ref mut pipe)) => pipe.front_hup(&mut self.metrics),
+            Some(State::Handshake(_)) => {
+                self.log_request();
+                SessionResult::CloseSession
+            }
             _ => {
                 self.log_request();
                 SessionResult::CloseSession
@@ -246,6 +293,11 @@ impl Session {
     fn back_hup(&mut self) -> SessionResult {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.back_hup(&mut self.metrics),
+            Some(State::PipeTls(ref mut pipe)) => pipe.back_hup(&mut self.metrics),
+            Some(State::Handshake(_)) => {
+                self.log_request();
+                SessionResult::CloseSession
+            }
             _ => {
                 self.log_request();
                 SessionResult::CloseSession
@@ -271,6 +323,15 @@ impl Session {
 
         let res = match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.readable(&mut self.metrics),
+            Some(State::PipeTls(ref mut pipe)) => pipe.readable(&mut self.metrics),
+            Some(State::Handshake(ref mut handshake)) => {
+                if !self.front_timeout.reset() {
+                    error!("could not reset front timeout");
+                }
+                let res = handshake.readable();
+                should_upgrade_protocol = res.0;
+                res.1
+            }
             Some(State::RelayProxyProtocol(ref mut pp)) => pp.readable(&mut self.metrics),
             Some(State::ExpectProxyProtocol(ref mut pp)) => {
                 let res = pp.readable(&mut self.metrics);
@@ -294,6 +355,19 @@ impl Session {
     fn writable(&mut self) -> SessionResult {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.writable(&mut self.metrics),
+            Some(State::PipeTls(ref mut pipe)) => pipe.writable(&mut self.metrics),
+            Some(State::Handshake(ref mut handshake)) => {
+                let (upgrade, result) = handshake.writable();
+                if upgrade == ProtocolResult::Continue {
+                    result
+                } else {
+                    match self.upgrade() {
+                        UpgradeResult::Continue => SessionResult::Continue,
+                        UpgradeResult::Close => SessionResult::CloseSession,
+                        UpgradeResult::ConnectBackend => SessionResult::ConnectBackend,
+                    }
+                }
+            }
             _ => SessionResult::Continue,
         }
     }
@@ -305,6 +379,7 @@ impl Session {
 
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.back_readable(&mut self.metrics),
+            Some(State::PipeTls(_)) => SessionResult::CloseSession,
             _ => SessionResult::Continue,
         }
     }
@@ -314,6 +389,10 @@ impl Session {
 
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => res.1 = pipe.back_writable(&mut self.metrics),
+            Some(State::PipeTls(ref mut pipe)) => res.1 = pipe.back_writable(&mut self.metrics),
+            Some(State::Handshake(_)) => {
+                res = (ProtocolResult::Continue, SessionResult::CloseSession)
+            }
             Some(State::RelayProxyProtocol(ref mut pp)) => {
                 res = pp.back_writable(&mut self.metrics);
             }
@@ -333,6 +412,8 @@ impl Session {
     fn front_socket(&self) -> &TcpStream {
         match self.protocol {
             Some(State::Pipe(ref pipe)) => pipe.front_socket(),
+            Some(State::PipeTls(ref pipe)) => pipe.front_socket(),
+            Some(State::Handshake(ref handshake)) => &handshake.stream,
             Some(State::SendProxyProtocol(ref pp)) => pp.front_socket(),
             Some(State::RelayProxyProtocol(ref pp)) => pp.front_socket(),
             Some(State::ExpectProxyProtocol(ref pp)) => pp.front_socket(),
@@ -343,6 +424,8 @@ impl Session {
     fn front_socket_mut(&mut self) -> &mut TcpStream {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.front_socket_mut(),
+            Some(State::PipeTls(ref mut pipe)) => pipe.front_socket_mut(),
+            Some(State::Handshake(ref mut handshake)) => &mut handshake.stream,
             Some(State::SendProxyProtocol(ref mut pp)) => pp.front_socket_mut(),
             Some(State::RelayProxyProtocol(ref mut pp)) => pp.front_socket_mut(),
             Some(State::ExpectProxyProtocol(ref mut pp)) => pp.front_socket_mut(),
@@ -353,6 +436,8 @@ impl Session {
     fn back_socket_mut(&mut self) -> Option<&mut TcpStream> {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.back_socket_mut(),
+            Some(State::PipeTls(ref mut pipe)) => pipe.back_socket_mut(),
+            Some(State::Handshake(_)) => None,
             Some(State::SendProxyProtocol(ref mut pp)) => pp.back_socket_mut(),
             Some(State::RelayProxyProtocol(ref mut pp)) => pp.back_socket_mut(),
             Some(State::ExpectProxyProtocol(_)) => None,
@@ -363,60 +448,99 @@ impl Session {
     pub fn upgrade(&mut self) -> UpgradeResult {
         let protocol = self.protocol.take();
 
-        if let Some(State::SendProxyProtocol(pp)) = protocol {
-            if self.back_buf.is_some() && self.front_buf.is_some() {
-                let mut pipe = pp.into_pipe(
-                    self.front_buf.take().unwrap(),
-                    self.back_buf.take().unwrap(),
-                    self.listener.clone(),
-                );
-                pipe.set_cluster_id(self.cluster_id.clone());
-                self.protocol = Some(State::Pipe(pipe));
-                gauge_add!("protocol.proxy.send", -1);
-                gauge_add!("protocol.tcp", 1);
-                UpgradeResult::Continue
-            } else {
-                error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
-                UpgradeResult::Close
-            }
-        } else if let Some(State::RelayProxyProtocol(pp)) = protocol {
-            if self.back_buf.is_some() {
-                let mut pipe = pp.into_pipe(self.back_buf.take().unwrap(), self.listener.clone());
-                pipe.set_cluster_id(self.cluster_id.clone());
-                self.protocol = Some(State::Pipe(pipe));
-                gauge_add!("protocol.proxy.relay", -1);
-                gauge_add!("protocol.tcp", 1);
-                UpgradeResult::Continue
-            } else {
-                error!("Missing the backend buffer queue, we can't switch to a pipe");
-                UpgradeResult::Close
-            }
-        } else if let Some(State::ExpectProxyProtocol(pp)) = protocol {
-            if self.front_buf.is_some() && self.back_buf.is_some() {
-                let mut pipe = pp.into_pipe(
-                    self.front_buf.take().unwrap(),
-                    self.back_buf.take().unwrap(),
+        match protocol {
+            Some(State::Handshake(handshake)) => {
+                // if let Some(version) = handshake.session.protocol_version() {
+                //     incr!(version_str(version));
+                // };
+                // if let Some(cipher) = handshake.session.negotiated_cipher_suite() {
+                //     incr!(ciphersuite_str(cipher));
+                // };
+
+                let front_stream = FrontRustls {
+                    stream: handshake.stream,
+                    session: handshake.session,
+                };
+
+                let pipe = Pipe::new(
+                    front_stream,
+                    self.frontend_token,
+                    handshake.request_id,
+                    self.cluster_id.clone(),
+                    self.backend_id.clone(),
                     None,
                     None,
+                    self.front_buf.take().unwrap(),
+                    self.back_buf.take().unwrap(),
+                    self.frontend_address,
+                    Protocol::TCP,
                     self.listener.clone(),
                 );
-                pipe.set_cluster_id(self.cluster_id.clone());
-                self.protocol = Some(State::Pipe(pipe));
-                gauge_add!("protocol.proxy.expect", -1);
-                gauge_add!("protocol.tcp", 1);
-                UpgradeResult::ConnectBackend
-            } else {
-                error!("Missing the backend buffer queue, we can't switch to a pipe");
-                UpgradeResult::Close
+                self.protocol = Some(State::PipeTls(pipe));
+                UpgradeResult::Continue
             }
-        } else {
-            UpgradeResult::Close
+            Some(State::SendProxyProtocol(pp)) => {
+                if self.back_buf.is_some() && self.front_buf.is_some() {
+                    let mut pipe = pp.into_pipe(
+                        self.front_buf.take().unwrap(),
+                        self.back_buf.take().unwrap(),
+                        self.listener.clone(),
+                    );
+                    pipe.set_cluster_id(self.cluster_id.clone());
+                    self.protocol = Some(State::Pipe(pipe));
+                    gauge_add!("protocol.proxy.send", -1);
+                    gauge_add!("protocol.tcp", 1);
+                    UpgradeResult::Continue
+                } else {
+                    error!(
+                        "Missing the frontend or backend buffer queue, we can't switch to a pipe"
+                    );
+                    UpgradeResult::Close
+                }
+            }
+            Some(State::RelayProxyProtocol(pp)) => {
+                if self.back_buf.is_some() {
+                    let mut pipe =
+                        pp.into_pipe(self.back_buf.take().unwrap(), self.listener.clone());
+                    pipe.set_cluster_id(self.cluster_id.clone());
+                    self.protocol = Some(State::Pipe(pipe));
+                    gauge_add!("protocol.proxy.relay", -1);
+                    gauge_add!("protocol.tcp", 1);
+                    UpgradeResult::Continue
+                } else {
+                    error!("Missing the backend buffer queue, we can't switch to a pipe");
+                    UpgradeResult::Close
+                }
+            }
+            Some(State::ExpectProxyProtocol(pp)) => {
+                if self.front_buf.is_some() && self.back_buf.is_some() {
+                    let mut pipe = pp.into_pipe(
+                        self.front_buf.take().unwrap(),
+                        self.back_buf.take().unwrap(),
+                        None,
+                        None,
+                        self.listener.clone(),
+                    );
+                    pipe.set_cluster_id(self.cluster_id.clone());
+                    self.protocol = Some(State::Pipe(pipe));
+                    gauge_add!("protocol.proxy.expect", -1);
+                    gauge_add!("protocol.tcp", 1);
+                    UpgradeResult::ConnectBackend
+                } else {
+                    error!("Missing the backend buffer queue, we can't switch to a pipe");
+                    UpgradeResult::Close
+                }
+            }
+            Some(State::Pipe(_)) | Some(State::PipeTls(_)) => UpgradeResult::Close,
+            None => UpgradeResult::Close,
         }
     }
 
     fn front_readiness(&mut self) -> &mut Readiness {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.front_readiness(),
+            Some(State::PipeTls(ref mut pipe)) => pipe.front_readiness(),
+            Some(State::Handshake(ref mut handshake)) => &mut handshake.readiness,
             Some(State::SendProxyProtocol(ref mut pp)) => pp.front_readiness(),
             Some(State::RelayProxyProtocol(ref mut pp)) => pp.front_readiness(),
             Some(State::ExpectProxyProtocol(ref mut pp)) => pp.readiness(),
@@ -427,6 +551,7 @@ impl Session {
     fn back_readiness(&mut self) -> Option<&mut Readiness> {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => Some(pipe.back_readiness()),
+            Some(State::PipeTls(ref mut pipe)) => Some(pipe.back_readiness()),
             Some(State::SendProxyProtocol(ref mut pp)) => Some(pp.back_readiness()),
             Some(State::RelayProxyProtocol(ref mut pp)) => Some(pp.back_readiness()),
             _ => None,
@@ -436,6 +561,8 @@ impl Session {
     fn back_token(&self) -> Option<Token> {
         match self.protocol {
             Some(State::Pipe(ref pipe)) => pipe.back_token(),
+            Some(State::PipeTls(ref pipe)) => pipe.back_token(),
+            Some(State::Handshake(_)) => self.backend_token,
             Some(State::SendProxyProtocol(ref pp)) => pp.back_token(),
             Some(State::RelayProxyProtocol(ref pp)) => pp.back_token(),
             Some(State::ExpectProxyProtocol(_)) => None,
@@ -446,6 +573,7 @@ impl Session {
     fn set_back_socket(&mut self, socket: TcpStream) {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.set_back_socket(socket),
+            Some(State::PipeTls(ref mut pipe)) => pipe.set_back_socket(socket),
             Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
             Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
             Some(State::ExpectProxyProtocol(_)) => {
@@ -460,9 +588,11 @@ impl Session {
 
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.set_back_token(token),
+            Some(State::PipeTls(ref mut pipe)) => pipe.set_back_token(token),
+            Some(State::Handshake(_)) => {}
             Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_token(token),
             Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_token(token),
-            Some(State::ExpectProxyProtocol(_)) => self.backend_token = Some(token),
+            Some(State::ExpectProxyProtocol(_)) => {}
             _ => unreachable!(),
         }
     }
@@ -622,11 +752,14 @@ impl Session {
                 self.set_back_connected(BackendConnectionStatus::Connected);
             }
         } else if back_connected == BackendConnectionStatus::NotConnected {
-            match self.connect_to_backend(session.clone()) {
-                // reuse connection or error we can continue
-                Ok(BackendConnectAction::Reuse) | Err(_) => {}
-                // New or Replace: stop here, we must wait for an event
-                _ => return SessionResult::Continue,
+            if let Some(State::Handshake(_)) = self.protocol {
+            } else {
+                match self.connect_to_backend(session.clone()) {
+                    // reuse connection or error we can continue
+                    Ok(BackendConnectAction::Reuse) | Err(_) => {}
+                    // New or Replace: stop here, we must wait for an event
+                    _ => return SessionResult::Continue,
+                }
             }
         }
 
@@ -937,6 +1070,8 @@ impl ProxySession for Session {
 
         match self.protocol {
             Some(State::Pipe(_)) => gauge_add!("protocol.tcp", -1),
+            Some(State::PipeTls(_)) => gauge_add!("protocol.tcp.tls", -1),
+            Some(State::Handshake(_)) => gauge_add!("protocol.tcp.handshake", -1),
             Some(State::SendProxyProtocol(_)) => gauge_add!("protocol.proxy.send", -1),
             Some(State::RelayProxyProtocol(_)) => gauge_add!("protocol.proxy.relay", -1),
             Some(State::ExpectProxyProtocol(_)) => gauge_add!("protocol.proxy.expect", -1),
@@ -1020,6 +1155,8 @@ impl ProxySession for Session {
             Some(State::ExpectProxyProtocol(_)) => String::from("Expect"),
             Some(State::SendProxyProtocol(_)) => String::from("Send"),
             Some(State::RelayProxyProtocol(_)) => String::from("Relay"),
+            Some(State::Handshake(_)) => String::from("TCP TLS Handshake"),
+            Some(State::PipeTls(_)) => String::from("TCP TLS"),
             Some(State::Pipe(_)) => String::from("TCP"),
             None => String::from("None"),
         };
@@ -1028,6 +1165,8 @@ impl ProxySession for Session {
             State::ExpectProxyProtocol(ref expect) => &expect.readiness,
             State::SendProxyProtocol(ref send) => &send.front_readiness,
             State::RelayProxyProtocol(ref relay) => &relay.front_readiness,
+            State::Handshake(ref handshake) => &handshake.readiness,
+            State::PipeTls(ref pipe) => &pipe.front_readiness,
             State::Pipe(ref pipe) => &pipe.front_readiness,
         };
 
@@ -1059,6 +1198,7 @@ pub struct Listener {
     address: SocketAddr,
     pool: Rc<RefCell<Pool>>,
     config: TcpListenerConfig,
+    ssl_config: Option<Arc<ServerConfig>>,
     active: bool,
     tags: BTreeMap<String, BTreeMap<String, String>>,
 }
@@ -1081,17 +1221,111 @@ impl ListenerHandler for Listener {
 }
 
 impl Listener {
-    fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool>>, token: Token) -> Listener {
-        Listener {
+    fn new(
+        config: TcpListenerConfig,
+        pool: Rc<RefCell<Pool>>,
+        token: Token,
+    ) -> Result<Listener, rustls::Error> {
+        let server_config = ServerConfig::builder();
+        let ssl_config = if let Some(ref tls) = config.tls {
+            let server_config = if !tls.cipher_list.is_empty() {
+                let mut ciphers = Vec::new();
+                for cipher in tls.cipher_list.iter() {
+                    match cipher.as_str() {
+                        "TLS13_CHACHA20_POLY1305_SHA256" => {
+                            ciphers.push(TLS13_CHACHA20_POLY1305_SHA256)
+                        }
+                        "TLS13_AES_256_GCM_SHA384" => ciphers.push(TLS13_AES_256_GCM_SHA384),
+                        "TLS13_AES_128_GCM_SHA256" => ciphers.push(TLS13_AES_128_GCM_SHA256),
+                        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
+                            ciphers.push(TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
+                        }
+                        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
+                            ciphers.push(TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256)
+                        }
+                        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => {
+                            ciphers.push(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)
+                        }
+                        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => {
+                            ciphers.push(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
+                        }
+                        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => {
+                            ciphers.push(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384)
+                        }
+                        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => {
+                            ciphers.push(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
+                        }
+                        s => error!("unknown cipher: {:?}", s),
+                    }
+                }
+                server_config.with_cipher_suites(&ciphers[..])
+            } else {
+                server_config.with_safe_default_cipher_suites()
+            };
+
+            let server_config = server_config.with_safe_default_kx_groups();
+            let mut versions = Vec::new();
+            for version in tls.versions.iter() {
+                match version {
+                    TlsVersion::TLSv1_2 => versions.push(&rustls::version::TLS12),
+                    TlsVersion::TLSv1_3 => versions.push(&rustls::version::TLS13),
+                    s => error!("unsupported TLS version: {:?}", s),
+                }
+            }
+            let server_config = server_config.with_protocol_versions(&versions[..])?;
+            let server_config = server_config.with_no_client_auth();
+
+            let mut certs_reader = BufReader::new(tls.certificate.as_ref().unwrap().as_bytes());
+            let certs = rustls_pemfile::certs(&mut certs_reader)
+                .unwrap()
+                .into_iter()
+                .map(rustls::Certificate)
+                .collect();
+
+            let mut key_reader = BufReader::new(tls.key.as_ref().unwrap().as_bytes());
+            let mut key_res = None;
+            let parsed_keys = rustls_pemfile::rsa_private_keys(&mut key_reader);
+            if let Ok(mut keys) = parsed_keys {
+                if !keys.is_empty() {
+                    let key = rustls::PrivateKey(keys.swap_remove(0));
+                    if rustls::sign::RsaSigningKey::new(&key).is_ok() {
+                        let _ = key_res.insert(key);
+                    }
+                }
+            } else {
+                let mut key_reader = BufReader::new(tls.key.as_ref().unwrap().as_bytes());
+                let parsed_keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader);
+                if let Ok(mut keys) = parsed_keys {
+                    if !keys.is_empty() {
+                        let key = rustls::PrivateKey(keys.swap_remove(0));
+                        // try to read as rsa private key
+                        if rustls::sign::RsaSigningKey::new(&key).is_ok() {
+                            let _ = key_res.insert(key);
+                        } else if rustls::sign::any_ecdsa_type(&key).is_ok() {
+                            let _ = key_res.insert(key);
+                        }
+                    }
+                }
+            }
+            let key = key_res.ok_or(rustls::Error::General("bad key".to_string()))?;
+
+            let server_config = server_config.with_single_cert(certs, key)?;
+            Some(Arc::new(server_config))
+        } else {
+            None
+        };
+
+        Ok(Listener {
             cluster_id: None,
             listener: None,
             token,
             address: config.address,
             pool,
             config,
+            ssl_config,
             active: false,
             tags: BTreeMap::new(),
-        }
+        })
     }
 
     pub fn activate(
@@ -1165,13 +1399,13 @@ impl Proxy {
         config: TcpListenerConfig,
         pool: Rc<RefCell<Pool>>,
         token: Token,
-    ) -> Option<Token> {
+    ) -> Result<Option<Token>, rustls::Error> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                entry.insert(Rc::new(RefCell::new(Listener::new(config, pool, token))));
-                Some(token)
+                entry.insert(Rc::new(RefCell::new(Listener::new(config, pool, token)?)));
+                Ok(Some(token))
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 
@@ -1428,7 +1662,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     Duration::seconds(owned.config.front_timeout as i64),
                     Duration::seconds(owned.config.back_timeout as i64),
                     listener.clone(),
-                );
+                )?;
                 incr!("tcp.requests");
 
                 if let Err(e) = self.registry.register(
@@ -1736,6 +1970,7 @@ mod tests {
                 front_timeout: 60,
                 back_timeout: 30,
                 connect_timeout: 3,
+                tls: None,
             };
 
             {

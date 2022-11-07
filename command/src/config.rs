@@ -18,7 +18,7 @@ use crate::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListener, HttpsListener, ListenerType, LoadBalancingAlgorithms, LoadBalancingParams,
         LoadMetric, PathRule, ProxyRequestOrder, Route, RulePosition, TcpFrontend, TcpListener,
-        TlsProvider, TlsVersion,
+        TcpTlsConfig, TlsProvider, TlsVersion,
     },
 };
 
@@ -366,9 +366,96 @@ impl Listener {
         let addr = addr_parsed;
         */
 
+        if self.protocol != FileListenerProtocolConfig::Tcp {
+            bail!("cannot convert listener to TCP");
+        }
+
+        let default_cipher_list = match self.tls_provider {
+            TlsProvider::Rustls => DEFAULT_RUSTLS_CIPHER_LIST
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            TlsProvider::Openssl => DEFAULT_OPENSSL_CIPHER_LIST
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        };
+
+        let cipher_list = self.cipher_list.clone().unwrap_or(default_cipher_list);
+        let signature_algorithms = self.signature_algorithms.clone().unwrap_or_else(|| {
+            DEFAULT_SIGNATURE_ALGORITHMS
+                .into_iter()
+                .map(String::from)
+                .collect()
+        });
+
+        let cipher_suites = self.cipher_suites.clone().unwrap_or_else(|| {
+            DEFAULT_CIPHER_SUITES
+                .into_iter()
+                .map(String::from)
+                .collect()
+        });
+
+        let groups_list = self
+            .groups_list
+            .clone()
+            .unwrap_or_else(|| DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect());
+
+        let versions = match self.tls_versions {
+            None => vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
+            Some(ref v) => v.clone(),
+        };
+
+        let key = self.key.as_ref().and_then(|path| {
+            Config::load_file(path)
+                .map_err(|e| {
+                    error!("cannot load key at path '{}': {:?}", path, e);
+                    e
+                })
+                .ok()
+        });
+        let certificate = self.certificate.as_ref().and_then(|path| {
+            Config::load_file(path)
+                .map_err(|e| {
+                    error!("cannot load certificate at path '{}': {:?}", path, e);
+                    e
+                })
+                .ok()
+        });
+        let certificate_chain = self
+            .certificate_chain
+            .as_ref()
+            .and_then(|path| {
+                Config::load_file(path)
+                    .map_err(|e| {
+                        error!("cannot load certificate chain at path '{}': {:?}", path, e);
+                        e
+                    })
+                    .ok()
+            })
+            .map(split_certificate_chain)
+            .unwrap_or_else(Vec::new);
+
+        let tls = if key.is_none() || certificate.is_none() || certificate_chain.is_empty() {
+            None
+        } else {
+            Some(TcpTlsConfig {
+                tls_provider: self.tls_provider.clone(),
+                cipher_list,
+                cipher_suites,
+                signature_algorithms,
+                groups_list,
+                versions,
+                key,
+                certificate,
+                certificate_chain,
+            })
+        };
+
         Ok(TcpListener {
             address: self.address,
             public_address: self.public_address,
+            tls,
             expect_proxy: self.expect_proxy.unwrap_or(false),
             front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
             back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
@@ -433,11 +520,14 @@ impl FileClusterFrontendConfig {
         if self.path.is_some() {
             bail!("invalid 'path_prefix' field for TCP frontend");
         }
-        if self.certificate.is_some() {
-            bail!("invalid 'certificate' field for TCP frontend");
-        }
         if self.hostname.is_some() {
-            bail!("invalid 'key' field for TCP frontend");
+            bail!("invalid 'hostname' field for TCP frontend");
+        }
+        if self.key.is_some() {
+            bail!("invalid 'key' field for TCP frontend",);
+        }
+        if self.certificate.is_some() {
+            bail!("invalid 'certificate' field for TCP frontend",);
         }
         if self.certificate_chain.is_some() {
             bail!("invalid 'certificate_chain' field for TCP frontend",);

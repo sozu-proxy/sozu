@@ -68,7 +68,7 @@ tiny_http = "^0.12.0"
 ureq = "^2.5.0"
 
 [features]
-default = []
+default = ["use-openssl"]
 splice = []
 unstable = []
 logs-debug = []

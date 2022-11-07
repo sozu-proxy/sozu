@@ -780,9 +780,32 @@ pub struct TcpListener {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_false")]
     pub expect_proxy: bool,
+    pub tls: Option<TcpTlsConfig>,
     pub front_timeout: u32,
     pub back_timeout: u32,
     pub connect_timeout: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TcpTlsConfig {
+    pub versions: Vec<TlsVersion>,
+
+    pub cipher_list: Vec<String>,
+    #[serde(default)]
+    pub cipher_suites: Vec<String>,
+    #[serde(default)]
+    pub signature_algorithms: Vec<String>,
+    #[serde(default)]
+    pub groups_list: Vec<String>,
+    #[serde(skip, default)]
+    pub tls_provider: TlsProvider,
+
+    #[serde(default)]
+    pub certificate: Option<String>,
+    #[serde(default)]
+    pub certificate_chain: Vec<String>,
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

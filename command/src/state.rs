@@ -1410,6 +1410,7 @@ mod tests {
             front_timeout: 60,
             back_timeout: 30,
             connect_timeout: 3,
+            tls: None,
         }));
         state.handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
             address: "0.0.0.0:1234".parse().unwrap(),
@@ -1463,6 +1464,7 @@ mod tests {
             front_timeout: 60,
             back_timeout: 30,
             connect_timeout: 3,
+            tls: None,
         }));
         state2.handle_order(&ProxyRequestOrder::AddHttpListener(HttpListener {
             address: "0.0.0.0:8080".parse().unwrap(),
@@ -1520,6 +1522,7 @@ mod tests {
                 front_timeout: 60,
                 back_timeout: 30,
                 connect_timeout: 3,
+                tls: None,
             }),
             ProxyRequestOrder::DeactivateListener(DeactivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),

@@ -1771,6 +1771,7 @@ impl Listener {
 
         if let Err(e) = context.set_cipher_list(&cipher_list.join(":")) {
             error!("could not set context cipher list: {:?}", e);
+            // verify the cipher_list and tls_provider are compatible
             return Err(ListenerError::BuildOpenSslError(e.to_string()));
         }
 

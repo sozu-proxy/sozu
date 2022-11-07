@@ -1276,6 +1276,8 @@ impl Server {
                         .tcp
                         .borrow_mut()
                         .add_listener(listener, self.pool.clone(), token)
+                        .ok()
+                        .flatten()
                         .is_some()
                     {
                         entry.insert(Rc::new(RefCell::new(ListenSession {

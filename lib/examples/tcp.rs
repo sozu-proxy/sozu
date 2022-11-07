@@ -45,6 +45,7 @@ fn main() -> anyhow::Result<()> {
             front_timeout: 60,
             back_timeout: 30,
             connect_timeout: 3,
+            tls: None,
         };
         Logger::init(
             "TCP".to_string(),
