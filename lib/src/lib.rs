@@ -301,6 +301,7 @@ pub enum AcceptError {
     IoError,
     TooManySessions,
     WouldBlock,
+    RegisterError,
 }
 
 use self::server::ListenToken;
