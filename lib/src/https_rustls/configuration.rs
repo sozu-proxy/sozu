@@ -432,29 +432,30 @@ impl ProxyConfiguration<Session> for Proxy {
             );
         }
 
-        let mut s = self.sessions.borrow_mut();
-        let entry = s.slab.vacant_entry();
+        let mut session_manager = self.sessions.borrow_mut();
+        let entry = session_manager.slab.vacant_entry();
         let session_token = Token(entry.key());
 
-        if let Err(e) = self.registry.register(
-            &mut frontend_sock,
-            session_token,
-            Interest::READABLE | Interest::WRITABLE,
-        ) {
-            error!(
-                "error registering fron socket({:?}): {:?}",
-                frontend_sock, e
-            );
-        }
+        self.registry
+            .register(
+                &mut frontend_sock,
+                session_token,
+                Interest::READABLE | Interest::WRITABLE,
+            )
+            .map_err(|register_error| {
+                error!(
+                    "error registering fron socket({:?}): {:?}",
+                    frontend_sock, register_error
+                );
+                AcceptError::RegisterError
+            })?;
 
-        let session = match ServerConnection::new(owned.ssl_config.clone()) {
-            Ok(session) => session,
-            Err(e) => {
-                error!("failed to create server session: {:?}", e);
-                return Err(AcceptError::IoError);
-            }
-        };
-        let c = Session::new(
+        let session = ServerConnection::new(owned.ssl_config.clone()).map_err(|e| {
+            error!("failed to create server session: {:?}", e);
+            AcceptError::IoError
+        })?;
+
+        let session = Rc::new(RefCell::new(Session::new(
             session,
             frontend_sock,
             session_token,
@@ -470,12 +471,10 @@ impl ProxyConfiguration<Session> for Proxy {
             Duration::seconds(owned.config.back_timeout as i64),
             Duration::seconds(owned.config.request_timeout as i64),
             listener.clone(),
-        );
-
-        let session = Rc::new(RefCell::new(c));
+        )));
         entry.insert(session);
 
-        s.incr();
+        session_manager.incr();
         Ok(())
     }
 
