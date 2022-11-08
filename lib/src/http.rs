@@ -103,7 +103,7 @@ impl Session {
         backend_timeout_duration: Duration,
         request_timeout_duration: Duration,
         listener: Rc<RefCell<Listener>>,
-    ) -> Option<Session> {
+    ) -> Self {
         let request_id = Ulid::generate();
         let mut front_timeout = TimeoutContainer::new_empty(request_timeout_duration);
         let state = if expect_proxy {
@@ -111,14 +111,12 @@ impl Session {
             gauge_add!("protocol.proxy.expect", 1);
             front_timeout.set(token);
 
-            Some(State::Expect(ExpectProxyProtocol::new(
-                sock, token, request_id,
-            )))
+            State::Expect(ExpectProxyProtocol::new(sock, token, request_id))
         } else {
             gauge_add!("protocol.http", 1);
             let session_address = sock.peer_addr().ok();
             let timeout = TimeoutContainer::new(request_timeout_duration, token);
-            Some(State::Http(Http::new(
+            State::Http(Http::new(
                 sock,
                 token,
                 request_id,
@@ -132,36 +130,32 @@ impl Session {
                 frontend_timeout_duration,
                 backend_timeout_duration,
                 listener.clone(),
-            )))
+            ))
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
-        if let Some(state) = state {
-            let mut session = Session {
-                backend: None,
-                back_connected: BackendConnectionStatus::NotConnected,
-                protocol: Some(state),
-                proxy,
-                frontend_token: token,
-                pool,
-                metrics,
-                cluster_id: None,
-                sticky_name,
-                last_event: Instant::now(),
-                front_timeout,
-                listener_token: listener_token,
-                connection_attempt: 0,
-                answers,
-                frontend_timeout_duration,
-                backend_timeout_duration,
-                listener,
-            };
+        let mut session = Session {
+            backend: None,
+            back_connected: BackendConnectionStatus::NotConnected,
+            protocol: Some(state),
+            proxy,
+            frontend_token: token,
+            pool,
+            metrics,
+            cluster_id: None,
+            sticky_name,
+            last_event: Instant::now(),
+            front_timeout,
+            listener_token: listener_token,
+            connection_attempt: 0,
+            answers,
+            frontend_timeout_duration,
+            backend_timeout_duration,
+            listener,
+        };
 
-            session.front_readiness().interest = Ready::readable() | Ready::hup() | Ready::error();
-            return Some(session);
-        }
-
-        None
+        session.front_readiness().interest = Ready::readable() | Ready::hup() | Ready::error();
+        session
     }
 
     pub fn upgrade(&mut self) -> bool {
@@ -417,14 +411,6 @@ impl Session {
             State::Http(ref http) => http.front_socket(),
             State::WebSocket(ref pipe) => pipe.front_socket(),
             State::Expect(ref expect) => expect.front_socket(),
-        }
-    }
-
-    fn front_socket_mut(&mut self) -> &mut TcpStream {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => http.front_socket_mut(),
-            State::WebSocket(ref mut pipe) => pipe.front_socket_mut(),
-            State::Expect(ref mut expect) => expect.front_socket_mut(),
         }
     }
 
@@ -1767,71 +1753,62 @@ impl ProxyConfiguration<Session> for Proxy {
 
     fn create_session(
         &mut self,
-        frontend_sock: TcpStream,
+        mut frontend_sock: TcpStream,
         listener_token: ListenToken,
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
-        if let Some(listener) = self
+        let listener = self
             .listeners
             .get(&Token(listener_token.0))
             .map(Clone::clone)
-        {
-            if let Err(e) = frontend_sock.set_nodelay(true) {
-                error!(
-                    "error setting nodelay on front socket({:?}): {:?}",
-                    frontend_sock, e
-                );
-            }
-            let mut session_manager = self.sessions.borrow_mut();
-            let session_entry = session_manager.slab.vacant_entry();
-            let session_token = Token(session_entry.key());
-            let owned = listener.borrow();
+            .ok_or_else(|| AcceptError::IoError)?;
 
-            if let Some(mut session) = Session::new(
-                frontend_sock,
-                session_token,
-                Rc::downgrade(&self.pool),
-                proxy,
-                owned.config.public_address.unwrap_or(owned.config.address),
-                owned.config.expect_proxy,
-                owned.config.sticky_name.clone(),
-                owned.answers.clone(),
-                owned.token,
-                wait_time,
-                Duration::seconds(owned.config.front_timeout as i64),
-                Duration::seconds(owned.config.back_timeout as i64),
-                Duration::seconds(owned.config.request_timeout as i64),
-                listener.clone(),
-            ) {
-                if let Err(e) = self.registry.register(
-                    session.front_socket_mut(),
-                    session_token,
-                    Interest::READABLE | Interest::WRITABLE,
-                ) {
-                    error!(
-                        "error registering listen socket({:?}): {:?}",
-                        session.front_socket(),
-                        e
-                    );
-                }
-
-                let session = Rc::new(RefCell::new(session));
-                session_entry.insert(session);
-
-                session_manager.incr();
-                Ok(())
-            } else {
-                error!("max number of session connection reached, flushing the accept queue");
-                gauge!("accept_queue.backpressure", 1);
-                self.sessions.borrow_mut().can_accept = false;
-
-                Err(AcceptError::TooManySessions)
-            }
-        } else {
-            //FIXME
-            Err(AcceptError::IoError)
+        if let Err(e) = frontend_sock.set_nodelay(true) {
+            error!(
+                "error setting nodelay on front socket({:?}): {:?}",
+                frontend_sock, e
+            );
         }
+        let mut session_manager = self.sessions.borrow_mut();
+        let session_entry = session_manager.slab.vacant_entry();
+        let session_token = Token(session_entry.key());
+        let owned = listener.borrow();
+
+        if let Err(register_error) = self.registry.register(
+            &mut frontend_sock,
+            session_token,
+            Interest::READABLE | Interest::WRITABLE,
+        ) {
+            error!(
+                "error registering listen socket({:?}): {:?}",
+                frontend_sock, register_error
+            );
+            return Err(AcceptError::RegisterError);
+        }
+
+        let session = Session::new(
+            frontend_sock,
+            session_token,
+            Rc::downgrade(&self.pool),
+            proxy,
+            owned.config.public_address.unwrap_or(owned.config.address),
+            owned.config.expect_proxy,
+            owned.config.sticky_name.clone(),
+            owned.answers.clone(),
+            owned.token,
+            wait_time,
+            Duration::seconds(owned.config.front_timeout as i64),
+            Duration::seconds(owned.config.back_timeout as i64),
+            Duration::seconds(owned.config.request_timeout as i64),
+            listener.clone(),
+        );
+
+        let session = Rc::new(RefCell::new(session));
+        session_entry.insert(session);
+
+        session_manager.incr();
+        Ok(())
     }
 }
 

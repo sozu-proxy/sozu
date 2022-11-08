@@ -159,6 +159,7 @@ impl SessionManager {
     }
 
     pub fn check_limits(&mut self) -> bool {
+        // this should be self.nb_connections >= self.max_connections 
         if self.nb_connections == self.max_connections {
             error!("max number of session connection reached, flushing the accept queue");
             gauge!("accept_queue.backpressure", 1);
