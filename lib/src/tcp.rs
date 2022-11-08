@@ -340,16 +340,6 @@ impl Session {
         }
     }
 
-    fn front_socket_mut(&mut self) -> &mut TcpStream {
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.front_socket_mut(),
-            Some(State::SendProxyProtocol(ref mut pp)) => pp.front_socket_mut(),
-            Some(State::RelayProxyProtocol(ref mut pp)) => pp.front_socket_mut(),
-            Some(State::ExpectProxyProtocol(ref mut pp)) => pp.front_socket_mut(),
-            _ => unreachable!(),
-        }
-    }
-
     fn back_socket_mut(&mut self) -> Option<&mut TcpStream> {
         match self.protocol {
             Some(State::Pipe(ref mut pipe)) => pipe.back_socket_mut(),

@@ -414,14 +414,6 @@ impl Session {
         }
     }
 
-    fn front_socket_mut(&mut self) -> &mut TcpStream {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-            State::Http(ref mut http) => http.front_socket_mut(),
-            State::WebSocket(ref mut pipe) => pipe.front_socket_mut(),
-            State::Expect(ref mut expect) => expect.front_socket_mut(),
-        }
-    }
-
     fn back_socket_mut(&mut self) -> Option<&mut TcpStream> {
         match *unwrap_msg!(self.protocol.as_mut()) {
             State::Http(ref mut http) => http.back_socket_mut(),
