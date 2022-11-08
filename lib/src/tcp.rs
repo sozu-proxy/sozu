@@ -1378,88 +1378,92 @@ impl ProxyConfiguration<Session> for Proxy {
 
     fn create_session(
         &mut self,
-        frontend_sock: TcpStream,
+        mut frontend_sock: TcpStream,
         token: ListenToken,
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
         let internal_token = Token(token.0);
 
-        if let Some(listener) = self.listeners.get(&internal_token) {
-            let owned = listener.borrow();
-            let mut p = owned.pool.borrow_mut();
+        let listener = self
+            .listeners
+            .get(&internal_token)
+            .ok_or_else(|| AcceptError::IoError)?;
 
-            if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-                if owned.cluster_id.is_none() {
-                    error!(
-                        "listener at address {:?} has no linked cluster",
-                        owned.address
-                    );
-                    return Err(AcceptError::IoError);
-                }
+        let owned = listener.borrow();
+        let mut pool = owned.pool.borrow_mut();
 
-                let proxy_protocol = self
-                    .configs
-                    .get(owned.cluster_id.as_ref().unwrap())
-                    .and_then(|c| c.proxy_protocol.clone());
-
-                if let Err(e) = frontend_sock.set_nodelay(true) {
-                    error!(
-                        "error setting nodelay on front socket({:?}): {:?}",
-                        frontend_sock, e
-                    );
-                }
-
-                let mut s = self.sessions.borrow_mut();
-                let entry = s.slab.vacant_entry();
-                let session_token = Token(entry.key());
-
-                let mut c = Session::new(
-                    frontend_sock,
-                    session_token,
-                    internal_token,
-                    proxy,
-                    front_buf,
-                    back_buf,
-                    owned.cluster_id.clone(),
-                    None,
-                    proxy_protocol,
-                    wait_time,
-                    Duration::seconds(owned.config.front_timeout as i64),
-                    Duration::seconds(owned.config.back_timeout as i64),
-                    listener.clone(),
-                );
-                incr!("tcp.requests");
-
-                if let Err(e) = self.registry.register(
-                    c.front_socket_mut(),
-                    session_token,
-                    Interest::READABLE | Interest::WRITABLE,
-                ) {
-                    error!(
-                        "error registering front socket({:?}): {:?}",
-                        c.front_socket(),
-                        e
-                    );
-                }
-
-                let session = Rc::new(RefCell::new(c));
-                entry.insert(session);
-
-                s.incr();
-
-                Ok(())
-            } else {
+        let (front_buffer, back_buffer) = match (pool.checkout(), pool.checkout()) {
+            (Some(fb), Some(bb)) => (fb, bb),
+            _ => {
                 error!("could not get buffers from pool");
                 error!("max number of session connection reached, flushing the accept queue");
                 gauge!("accept_queue.backpressure", 1);
                 self.sessions.borrow_mut().can_accept = false;
 
-                Err(AcceptError::TooManySessions)
+                return Err(AcceptError::TooManySessions);
             }
-        } else {
-            Err(AcceptError::IoError)
+        };
+
+        if owned.cluster_id.is_none() {
+            error!(
+                "listener at address {:?} has no linked cluster",
+                owned.address
+            );
+            return Err(AcceptError::IoError);
         }
+
+        let proxy_protocol = self
+            .configs
+            .get(owned.cluster_id.as_ref().unwrap())
+            .and_then(|c| c.proxy_protocol.clone());
+
+        if let Err(e) = frontend_sock.set_nodelay(true) {
+            error!(
+                "error setting nodelay on front socket({:?}): {:?}",
+                frontend_sock, e
+            );
+        }
+
+        let mut session_manager = self.sessions.borrow_mut();
+        let entry = session_manager.slab.vacant_entry();
+        let session_token = Token(entry.key());
+
+        if let Err(register_error) = self.registry.register(
+            &mut frontend_sock,
+            session_token,
+            Interest::READABLE | Interest::WRITABLE,
+        ) {
+            error!(
+                "error registering front socket({:?}): {:?}",
+                frontend_sock, register_error
+            );
+            return Err(AcceptError::RegisterError);
+        }
+
+        let session = Session::new(
+            frontend_sock,
+            session_token,
+            internal_token,
+            proxy,
+            front_buffer,
+            back_buffer,
+            owned.cluster_id.clone(),
+            None,
+            proxy_protocol,
+            wait_time,
+            Duration::seconds(owned.config.front_timeout as i64),
+            Duration::seconds(owned.config.back_timeout as i64),
+            listener.clone(),
+        );
+        incr!("tcp.requests");
+
+        let session = Rc::new(RefCell::new(session));
+        entry.insert(session);
+
+        session_manager.incr();
+
+        Ok(())
     }
 }
 
