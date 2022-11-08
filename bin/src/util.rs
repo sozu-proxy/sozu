@@ -21,9 +21,9 @@ pub fn enable_close_on_exec(fd: RawFd) -> Result<i32, anyhow::Error> {
     fcntl(fd, FcntlArg::F_SETFD(new_flags)).with_context(|| "could not set file descriptor flags")
 }
 
-// FD_CLOEXEC is set by default on every fd in Rust standard lib,
-// so we need to remove the flag on the client, otherwise
-// it won't be accessible
+/// FD_CLOEXEC is set by default on every fd in Rust standard lib,
+/// so we need to remove the flag on the client, otherwise
+/// it won't be accessible
 pub fn disable_close_on_exec(fd: RawFd) -> Result<i32, anyhow::Error> {
     let old_flags =
         fcntl(fd, FcntlArg::F_GETFD).with_context(|| "could not get file descriptor flags")?;

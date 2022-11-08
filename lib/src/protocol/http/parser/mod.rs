@@ -169,6 +169,7 @@ pub struct RequestLine {
 }
 
 impl RequestLine {
+    // TODO: respond Result<RequestLine, ParseError
     pub fn from_raw_request_line(r: RawRequestLine) -> Option<RequestLine> {
         if let Ok(uri) = str::from_utf8(r.uri) {
             Some(RequestLine {

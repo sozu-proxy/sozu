@@ -11,10 +11,10 @@ authors = [
   "Geoffroy Couprie <geo.couprie@gmail.com>",
   "Eloi Demolis <eloi.demolis@clever-cloud.com>",
   "Emmanuel Bosquet <emmanuel.bosquet@clever-cloud.com>",
-  "Florentin Dubois <florentin.dubois@clever-cloud.com>"
+  "Florentin Dubois <florentin.dubois@clever-cloud.com>",
 ]
 categories = ["network-programming"]
-edition="2021"
+edition = "2021"
 include = [
   "./README.md",
   "Cargo.toml",
@@ -22,7 +22,7 @@ include = [
   "assets/certificate.pem",
   "assets/key.pem",
   "assets/404.html",
-  "assets/503.html"
+  "assets/503.html",
 ]
 
 [dependencies]
@@ -33,7 +33,7 @@ log = "^0.4.17"
 time = "^0.3.15"
 toml = "^0.5.9"
 memchr = "^2.5.0"
-mio = { version = "^0.8.4", features = [ "os-poll", "net" ] }
+mio = { version = "^0.8.4", features = ["os-poll", "net"] }
 nix = "^0.25.0"
 nom = "^7.1.1"
 pem = "^1.1.0"

@@ -393,7 +393,6 @@ impl FileClusterFrontendConfig {
         })
     }
 
-    // TODO log the error with error! upstream
     pub fn to_http_front(&self, _cluster_id: &str) -> anyhow::Result<HttpFrontendConfig> {
         let hostname = match &self.hostname {
             Some(hostname) => hostname.to_owned(),
@@ -547,7 +546,9 @@ impl FileClusterConfig {
             FileClusterProtocolConfig::Http => {
                 let mut frontends = Vec::new();
                 for frontend in self.frontends {
-                    let http_frontend = frontend.to_http_front(cluster_id)?;
+                    let http_frontend = frontend
+                        .to_http_front(cluster_id)
+                        .with_context(|| "Could not convert frontend config to http frontend")?;
                     frontends.push(http_frontend);
                 }
 

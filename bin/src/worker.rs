@@ -62,13 +62,21 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
         let mut worker = Worker::new(index as u32, pid, command_channel, scm_socket, config);
 
         // the new worker expects a status message at startup
-        if let Some(command_channel) = worker.worker_channel.as_mut() {
-            command_channel.blocking();
-            command_channel.write_message(&ProxyRequest {
-                id: format!("start-status-{}", index),
-                order: ProxyRequestOrder::Status,
-            });
-            command_channel.nonblocking();
+        if let Some(worker_channel) = worker.worker_channel.as_mut() {
+            if let Err(e) = worker_channel.blocking() {
+                error!("Could not block the worker channel: {}", e);
+            }
+
+            worker_channel
+                .write_message(&ProxyRequest {
+                    id: format!("start-status-{}", index),
+                    order: ProxyRequestOrder::Status,
+                })
+                .with_context(|| "Could not send status request to the worker")?;
+
+            if let Err(e) = worker_channel.nonblocking() {
+                error!("Could not unblock the worker channel: {}", e);
+            }
         }
 
         workers.push(worker);
@@ -113,7 +121,9 @@ pub fn begin_worker_process(
         max_command_buffer_size,
     );
 
-    worker_to_main_channel.blocking();
+    if let Err(e) = worker_to_main_channel.blocking() {
+        error!("Could not block the worker-to-main channel: {}", e);
+    }
 
     let configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
     let config_state: ConfigState = serde_json::from_reader(configuration_state_file)
@@ -122,7 +132,6 @@ pub fn begin_worker_process(
     let worker_config = worker_to_main_channel
         .read_message()
         .with_context(|| "worker could not read configuration from socket")?;
-    //println!("got message: {:?}", worker_config);
 
     let worker_id = format!("{}-{:02}", "WRK", id);
     logging::setup(
@@ -132,7 +141,7 @@ pub fn begin_worker_process(
         worker_config.log_access_target.as_deref(),
     );
 
-    // debug!("Creating worker {} with config: {:#?}", worker_id, worker_config);
+    trace!("Creating worker {} with config: {:#?}", worker_id, worker_config);
 
     let backend = target_to_backend(&worker_config.log_target);
     let access_backend = worker_config
@@ -147,7 +156,10 @@ pub fn begin_worker_process(
     );
     info!("worker {} starting...", id);
 
-    worker_to_main_channel.nonblocking();
+    if let Err(e) = worker_to_main_channel.nonblocking() {
+        error!("Could not unblock the worker-to-main channel: {}", e);
+    }
+
     let mut worker_to_main_channel: Channel<ProxyResponse, ProxyRequest> =
         worker_to_main_channel.into();
     worker_to_main_channel.readiness.insert(Ready::readable());
@@ -161,10 +173,12 @@ pub fn begin_worker_process(
         )
         .with_context(|| "Could not setup metrics")?;
     }
+    let worker_to_main_scm_socket = ScmSocket::new(worker_to_main_scm_fd)
+        .with_context(|| "could not create worker-to-main scm socket")?;
 
     let mut server = Server::try_new_from_config(
         worker_to_main_channel,
-        ScmSocket::new(worker_to_main_scm_fd),
+        worker_to_main_scm_socket,
         worker_config,
         config_state,
         true,
@@ -200,7 +214,8 @@ pub fn fork_main_into_worker(
     let (main_to_worker, worker_to_main) = UnixStream::pair()?;
     let (main_to_worker_scm, worker_to_main_scm) = UnixStream::pair()?;
 
-    let main_to_worker_scm = ScmSocket::new(main_to_worker_scm.into_raw_fd());
+    let main_to_worker_scm = ScmSocket::new(main_to_worker_scm.into_raw_fd())
+        .with_context(|| "Could not create main-to-worker scm socket")?;
 
     util::disable_close_on_exec(worker_to_main.as_raw_fd())?;
     util::disable_close_on_exec(worker_to_main_scm.as_raw_fd())?;
@@ -210,15 +225,24 @@ pub fn fork_main_into_worker(
         config.command_buffer_size,
         config.max_command_buffer_size,
     );
-    main_to_worker_channel.blocking();
+
+    // DISCUSS: should we really block the channel just to write on it?
+    if let Err(e) = main_to_worker_channel.blocking() {
+        error!("Could not block the main-to-worker channel: {}", e);
+    }
 
     info!("{} launching worker", worker_id);
     debug!("executable path is {}", executable_path);
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => {
             info!("{} worker launched: {}", worker_id, child);
-            main_to_worker_channel.write_message(config);
-            main_to_worker_channel.nonblocking();
+            main_to_worker_channel
+                .write_message(config)
+                .with_context(|| "Could not send config to the new worker using the channel")?;
+
+            if let Err(e) = main_to_worker_channel.nonblocking() {
+                error!("Could not unblock the main-to-worker channel: {}", e);
+            }
 
             if let Some(listeners) = listeners {
                 info!("sending listeners to new worker: {:?}", listeners);

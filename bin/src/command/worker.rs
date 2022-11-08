@@ -21,7 +21,7 @@ pub struct Worker {
     pub pid: pid_t,
     pub run_state: RunState,
     pub queue: VecDeque<ProxyRequest>,
-    /// used to receive listeners
+    /// Used to send and receive listeners (socket addresses and file descriptors)
     pub scm_socket: ScmSocket,
     pub sender: Option<futures::channel::mpsc::Sender<ProxyRequest>>,
 }
@@ -46,6 +46,7 @@ impl Worker {
         }
     }
 
+    /// send proxy request to the worker, via the mpsc sender
     pub async fn send(&mut self, request_id: String, data: ProxyRequestOrder) {
         if let Some(worker_tx) = self.sender.as_mut() {
             if let Err(e) = worker_tx

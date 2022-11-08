@@ -158,6 +158,8 @@ pub fn create_channel(config: &Config) -> anyhow::Result<Channel<CommandRequest,
     )
     .with_context(|| "Could not create Channel from the given path")?;
 
-    channel.blocking();
+    channel
+        .blocking()
+        .with_context(|| "Could not block the channel used to communicate with Sōzu")?;
     Ok(channel)
 }

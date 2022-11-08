@@ -1784,6 +1784,7 @@ impl Listener {
         self.fronts.remove_http_front(tls_front)
     }
 
+    // TODO: return Result with context
     // ToDo factor out with http.rs
     pub fn frontend_from_request(&self, host: &str, uri: &str, method: &Method) -> Option<Route> {
         let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
@@ -1896,6 +1897,7 @@ impl Proxy {
             .collect()
     }
 
+    // TODO: return Result with context
     pub fn give_back_listener(
         &mut self,
         address: StdSocketAddr,
@@ -2345,7 +2347,7 @@ pub fn start(
         let mut server = Server::new(
             event_loop,
             channel,
-            ScmSocket::new(scm_server.as_raw_fd()),
+            ScmSocket::new(scm_server.as_raw_fd()).unwrap(),
             sessions,
             pool,
             backends,

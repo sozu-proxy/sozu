@@ -60,8 +60,8 @@ fn main(args: Args) -> anyhow::Result<()> {
         }
         // this is used only by the CLI when upgrading
         cli::SubCmd::Worker {
-            fd,
-            scm,
+            fd: worker_to_main_channel_fd,
+            scm: worker_to_main_scm_fd,
             configuration_state_fd,
             id,
             command_buffer_size,
@@ -70,8 +70,8 @@ fn main(args: Args) -> anyhow::Result<()> {
             let max_command_buffer_size =
                 max_command_buffer_size.unwrap_or(command_buffer_size * 2);
             worker::begin_worker_process(
-                fd,
-                scm,
+                worker_to_main_channel_fd,
+                worker_to_main_scm_fd,
                 configuration_state_fd,
                 id,
                 command_buffer_size,

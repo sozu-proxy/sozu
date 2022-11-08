@@ -327,12 +327,7 @@ impl Server {
             .try_clone()
             .with_context(|| "could not clone the mio Registry")?;
 
-        let https = https::Proxy::new(
-            registry,
-            sessions.clone(),
-            pool.clone(),
-            backends.clone(),
-        );
+        let https = https::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
 
         Server::new(
             event_loop,
@@ -405,12 +400,7 @@ impl Server {
                     .try_clone()
                     .with_context(|| "could not clone the mio Registry")?;
 
-                https::Proxy::new(
-                    registry,
-                    sessions.clone(),
-                    pool.clone(),
-                    backends.clone(),
-                )
+                https::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
             }
         }));
 
@@ -469,30 +459,40 @@ impl Server {
         if expects_initial_status {
             // the main process sends a Status message, so we can notify it
             // when the initial state is loaded
-            server.channel.blocking();
+            server.block_channel();
             let msg = server.channel.read_message();
             debug!("got message: {:?}", msg);
 
+            // TODO: check if this is still true
             // it so happens that trying to upgrade a dead worker will bring no message
             // which brings the whole main process to crash because it unwraps a None
-            if let Some(msg) = msg {
-                server.channel.write_message(&ProxyResponse::ok(msg.id));
+            if let Ok(msg) = msg {
+                if let Err(e) = server.channel.write_message(&ProxyResponse::ok(msg.id)) {
+                    error!("Could not send an ok to the main process: {}", e);
+                }
             }
-            server.channel.nonblocking();
+            server.unblock_channel();
         }
 
         info!("will try to receive listeners");
-        server.scm.set_blocking(true);
-        let listeners = server.scm.receive_listeners().ok();
-        server.scm.set_blocking(false);
+        server
+            .scm
+            .set_blocking(true)
+            .with_context(|| "Could not set the scm socket to blocking")?;
+        let listeners = server
+            .scm
+            .receive_listeners()
+            .with_context(|| "could not receive listeners from the scm socket")?;
+        server
+            .scm
+            .set_blocking(false)
+            .with_context(|| "Could not set the scm socket to unblocking")?;
         info!("received listeners: {:?}", listeners);
-        server.scm_listeners = listeners;
+        server.scm_listeners = Some(listeners);
 
         Ok(server)
     }
-}
 
-impl Server {
     pub fn run(&mut self) {
         //FIXME: make those parameters configurable?
         let mut events = Events::with_capacity(1024);
@@ -598,7 +598,7 @@ impl Server {
                                     let msg = self.channel.read_message();
 
                                     // if the message was too large, we grow the buffer and retry to read if possible
-                                    if msg.is_none() {
+                                    if msg.is_err() {
                                         if (self.channel.interest & self.channel.readiness)
                                             .is_readable()
                                         {
@@ -618,8 +618,21 @@ impl Server {
                                         ProxyRequestOrder::HardStop => {
                                             let id_msg = msg.id.clone();
                                             self.notify(msg);
-                                            self.channel.write_message(&ProxyResponse::ok(id_msg));
-                                            self.channel.run();
+                                            if let Err(e) = self
+                                                .channel
+                                                .write_message(&ProxyResponse::ok(id_msg))
+                                            {
+                                                error!(
+                                                    "Could not send ok response to the main process: {}",
+                                                    e
+                                                );
+                                            }
+                                            if let Err(e) = self.channel.run() {
+                                                error!(
+                                                    "Error while running the server channel: {}",
+                                                    e
+                                                );
+                                            }
                                             return;
                                         }
                                         ProxyRequestOrder::SoftStop => {
@@ -788,16 +801,21 @@ impl Server {
 
                 if new_sessions_count <= self.base_sessions_count {
                     info!("last session stopped, shutting down!");
-                    self.channel.run();
-                    self.channel.blocking();
-                    self.channel.write_message(&ProxyResponse {
+                    if let Err(e) = self.channel.run() {
+                        error!("Error while running the server channel: {}", e);
+                    }
+                    self.block_channel();
+                    let proxy_response = ProxyResponse {
                         id: self
                             .shutting_down
                             .take()
                             .expect("should have shut down correctly"), // panicking here makes sense actually
                         status: ProxyResponseStatus::Ok,
                         content: None,
-                    });
+                    };
+                    if let Err(e) = self.channel.write_message(&proxy_response) {
+                        error!("Could not write response to the main process: {}", e);
+                    }
                     return;
                 } else if new_sessions_count < last_sessions_len {
                     info!(
@@ -817,7 +835,8 @@ impl Server {
                 let mut queue = q.borrow_mut();
                 loop {
                     if let Some(msg) = queue.pop_front() {
-                        if !self.channel.write_message(&msg) {
+                        if let Err(e) = self.channel.write_message(&msg) {
+                            error!("Could not write message {} on the channel: {}", msg, e);
                             queue.push_front(msg);
                         }
                     }
@@ -1088,7 +1107,7 @@ impl Server {
                                 }
 
                                 if deactivate.to_scm {
-                                    self.scm.set_blocking(false);
+                                    self.unblock_scm_socket();
                                     let listeners = Listeners {
                                         http: vec![(deactivate.address, listener.as_raw_fd())],
                                         tls: vec![],
@@ -1097,7 +1116,7 @@ impl Server {
                                     info!("sending HTTP listener: {:?}", listeners);
                                     let res = self.scm.send_listeners(&listeners);
 
-                                    self.scm.set_blocking(true);
+                                    self.block_scm_socket();
 
                                     info!("sent HTTP listener: {:?}", res);
                                 }
@@ -1210,47 +1229,50 @@ impl Server {
                 } => {
                     if deactivate.proxy == ListenerType::HTTPS {
                         debug!("{} deactivate https listener {:?}", id, deactivate);
-                        let status =
-                            match self.https.borrow_mut().give_back_listener(deactivate.address) {
-                                Some((token, mut listener)) => {
-                                    if let Err(e) = self.poll.registry().deregister(&mut listener) {
-                                        error!(
-                                            "error deregistering HTTPS listen socket({:?}): {:?}",
-                                            deactivate, e
-                                        );
-                                    }
-                                    if self.sessions.borrow().slab.contains(token.0) {
-                                        self.sessions.borrow_mut().slab.remove(token.0);
-                                        info!("removed listen token {:?}", token);
-                                    }
-
-                                    if deactivate.to_scm {
-                                        self.scm.set_blocking(false);
-                                        let listeners = Listeners {
-                                            http: vec![],
-                                            tls: vec![(deactivate.address, listener.as_raw_fd())],
-                                            tcp: vec![],
-                                        };
-                                        info!("sending HTTPS listener: {:?}", listeners);
-                                        let res = self.scm.send_listeners(&listeners);
-
-                                        self.scm.set_blocking(true);
-
-                                        info!("sent HTTPS listener: {:?}", res);
-                                    }
-                                    ProxyResponseStatus::Ok
-                                }
-                                None => {
+                        let status = match self
+                            .https
+                            .borrow_mut()
+                            .give_back_listener(deactivate.address)
+                        {
+                            Some((token, mut listener)) => {
+                                if let Err(e) = self.poll.registry().deregister(&mut listener) {
                                     error!(
-                                        "Couldn't deactivate HTTPS listener at address {:?}",
-                                        deactivate.address
+                                        "error deregistering HTTPS listen socket({:?}): {:?}",
+                                        deactivate, e
                                     );
-                                    ProxyResponseStatus::Error(format!(
-                                        "cannot deactivate HTTPS listener at address {:?}",
-                                        deactivate.address
-                                    ))
                                 }
-                            };
+                                if self.sessions.borrow().slab.contains(token.0) {
+                                    self.sessions.borrow_mut().slab.remove(token.0);
+                                    info!("removed listen token {:?}", token);
+                                }
+
+                                if deactivate.to_scm {
+                                    self.scm.set_blocking(false);
+                                    let listeners = Listeners {
+                                        http: vec![],
+                                        tls: vec![(deactivate.address, listener.as_raw_fd())],
+                                        tcp: vec![],
+                                    };
+                                    info!("sending HTTPS listener: {:?}", listeners);
+                                    let res = self.scm.send_listeners(&listeners);
+
+                                    self.scm.set_blocking(true);
+
+                                    info!("sent HTTPS listener: {:?}", res);
+                                }
+                                ProxyResponseStatus::Ok
+                            }
+                            None => {
+                                error!(
+                                    "Couldn't deactivate HTTPS listener at address {:?}",
+                                    deactivate.address
+                                );
+                                ProxyResponseStatus::Error(format!(
+                                    "cannot deactivate HTTPS listener at address {:?}",
+                                    deactivate.address
+                                ))
+                            }
+                        };
 
                         push_queue(ProxyResponse::status(id.to_string(), status));
                     }
@@ -1362,7 +1384,7 @@ impl Server {
                                     }
 
                                     if deactivate.to_scm {
-                                        self.scm.set_blocking(false);
+                                        self.unblock_scm_socket();
                                         let listeners = Listeners {
                                             http: vec![],
                                             tls: vec![],
@@ -1371,7 +1393,7 @@ impl Server {
                                         info!("sending TCP listener: {:?}", listeners);
                                         let res = self.scm.send_listeners(&listeners);
 
-                                        self.scm.set_blocking(true);
+                                        self.block_scm_socket();
 
                                         info!("sent TCP listener: {:?}", res);
                                     }
@@ -1397,8 +1419,9 @@ impl Server {
         }
     }
 
+    /// Send all socket addresses and file descriptors of all proxies, via the scm socket
     pub fn return_listen_sockets(&mut self) {
-        self.scm.set_blocking(false);
+        self.unblock_scm_socket();
 
         let mut http_listeners = self.http.borrow_mut().give_back_listeners();
         for &mut (_, ref mut sock) in http_listeners.iter_mut() {
@@ -1445,9 +1468,21 @@ impl Server {
         info!("sending default listeners: {:?}", listeners);
         let res = self.scm.send_listeners(&listeners);
 
-        self.scm.set_blocking(true);
+        self.block_scm_socket();
 
         info!("sent default listeners: {:?}", res);
+    }
+
+    fn block_scm_socket(&self) {
+        if let Err(e) = self.scm.set_blocking(true) {
+            error!("Could not block scm socket: {}", e);
+        }
+    }
+
+    fn unblock_scm_socket(&self) {
+        if let Err(e) = self.scm.set_blocking(false) {
+            error!("Could not unblock scm socket: {}", e);
+        }
     }
 
     pub fn to_session(&self, token: Token) -> SessionToken {
@@ -1651,6 +1686,16 @@ impl Server {
                     break;
                 }
             }
+        }
+    }
+    fn block_channel(&mut self) {
+        if let Err(e) = self.channel.blocking() {
+            error!("Could not block channel: {}", e);
+        }
+    }
+    fn unblock_channel(&mut self) {
+        if let Err(e) = self.channel.nonblocking() {
+            error!("Could not block channel: {}", e);
         }
     }
 }

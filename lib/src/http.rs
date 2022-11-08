@@ -641,6 +641,7 @@ impl Session {
 
         if self.front_readiness().event.is_hup() {
             let order = self.front_hup();
+            // TODO: rewrite with if order != SessionResult::CloseSession { front_readiness()... } return order
             match order {
                 SessionResult::CloseSession => {
                     return order;
@@ -1547,8 +1548,8 @@ impl Listener {
         Some(self.token)
     }
 
+    // TODO: return Result with context
     pub fn add_http_front(&mut self, http_front: HttpFrontend) -> Result<(), String> {
-        //FIXME: proper error reporting
         if self.fronts.add_http_front(http_front) {
             Ok(())
         } else {
@@ -1556,6 +1557,7 @@ impl Listener {
         }
     }
 
+    // TODO: return Result with context
     pub fn remove_http_front(&mut self, http_front: HttpFrontend) -> Result<(), String> {
         debug!("removing http_front {:?}", http_front);
         //FIXME: proper error reporting
@@ -1565,6 +1567,7 @@ impl Listener {
         Ok(())
     }
 
+    // TODO: return Result with context
     pub fn frontend_from_request(&self, host: &str, uri: &str, method: &Method) -> Option<Route> {
         // redundant
         // already called once in extract_route
@@ -1872,8 +1875,12 @@ pub fn start(
     let _ = proxy.activate_listener(&address, None);
     let (scm_server, scm_client) =
         UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
-    let scm = ScmSocket::new(scm_client.into_raw_fd());
-    if let Err(e) = scm.send_listeners(&Listeners {
+    let client_scm_socket =
+        ScmSocket::new(scm_client.into_raw_fd()).with_context(|| "Could not create scm socket")?;
+    let server_scm_socket =
+        ScmSocket::new(scm_server.as_raw_fd()).with_context(|| "Could not create scm socket")?;
+
+    if let Err(e) = client_scm_socket.send_listeners(&Listeners {
         http: Vec::new(),
         tls: Vec::new(),
         tcp: Vec::new(),
@@ -1889,7 +1896,7 @@ pub fn start(
     let mut server = Server::new(
         event_loop,
         channel,
-        ScmSocket::new(scm_server.into_raw_fd()),
+        server_scm_socket,
         sessions,
         pool,
         backends,
@@ -1968,10 +1975,12 @@ mod tests {
             position: RulePosition::Tree,
             tags: None,
         };
-        command.write_message(&ProxyRequest {
-            id: String::from("ID_ABCD"),
-            order: ProxyRequestOrder::AddHttpFrontend(front),
-        });
+        command
+            .write_message(&ProxyRequest {
+                id: String::from("ID_ABCD"),
+                order: ProxyRequestOrder::AddHttpFrontend(front),
+            })
+            .unwrap();
         let backend = Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-0"),
@@ -1980,10 +1989,12 @@ mod tests {
             sticky_id: None,
             backup: None,
         };
-        command.write_message(&ProxyRequest {
-            id: String::from("ID_EFGH"),
-            order: ProxyRequestOrder::AddBackend(backend),
-        });
+        command
+            .write_message(&ProxyRequest {
+                id: String::from("ID_EFGH"),
+                order: ProxyRequestOrder::AddBackend(backend),
+            })
+            .unwrap();
 
         println!("test received: {:?}", command.read_message());
         println!("test received: {:?}", command.read_message());
@@ -2052,10 +2063,12 @@ mod tests {
             position: RulePosition::Tree,
             tags: None,
         };
-        command.write_message(&ProxyRequest {
-            id: String::from("ID_ABCD"),
-            order: ProxyRequestOrder::AddHttpFrontend(front),
-        });
+        command
+            .write_message(&ProxyRequest {
+                id: String::from("ID_ABCD"),
+                order: ProxyRequestOrder::AddHttpFrontend(front),
+            })
+            .unwrap();
         let backend = Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-0"),
@@ -2064,10 +2077,12 @@ mod tests {
             sticky_id: None,
             backup: None,
         };
-        command.write_message(&ProxyRequest {
-            id: String::from("ID_EFGH"),
-            order: ProxyRequestOrder::AddBackend(backend),
-        });
+        command
+            .write_message(&ProxyRequest {
+                id: String::from("ID_EFGH"),
+                order: ProxyRequestOrder::AddBackend(backend),
+            })
+            .unwrap();
 
         println!("test received: {:?}", command.read_message());
         println!("test received: {:?}", command.read_message());
@@ -2161,10 +2176,12 @@ mod tests {
             load_metric: None,
             answer_503: None,
         };
-        command.write_message(&ProxyRequest {
-            id: String::from("ID_ABCD"),
-            order: ProxyRequestOrder::AddCluster(cluster),
-        });
+        command
+            .write_message(&ProxyRequest {
+                id: String::from("ID_ABCD"),
+                order: ProxyRequestOrder::AddCluster(cluster),
+            })
+            .unwrap();
         let front = HttpFrontend {
             route: Route::ClusterId(String::from("cluster_1")),
             address: "127.0.0.1:1041".parse().unwrap(),
@@ -2174,10 +2191,12 @@ mod tests {
             position: RulePosition::Tree,
             tags: None,
         };
-        command.write_message(&ProxyRequest {
-            id: String::from("ID_EFGH"),
-            order: ProxyRequestOrder::AddHttpFrontend(front),
-        });
+        command
+            .write_message(&ProxyRequest {
+                id: String::from("ID_EFGH"),
+                order: ProxyRequestOrder::AddHttpFrontend(front),
+            })
+            .unwrap();
         let backend = Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-0"),
@@ -2186,10 +2205,12 @@ mod tests {
             sticky_id: None,
             backup: None,
         };
-        command.write_message(&ProxyRequest {
-            id: String::from("ID_IJKL"),
-            order: ProxyRequestOrder::AddBackend(backend),
-        });
+        command
+            .write_message(&ProxyRequest {
+                id: String::from("ID_IJKL"),
+                order: ProxyRequestOrder::AddBackend(backend),
+            })
+            .unwrap();
 
         println!("test received: {:?}", command.read_message());
         println!("test received: {:?}", command.read_message());

@@ -32,6 +32,7 @@ impl Router {
         }
     }
 
+    // TODO: return Result<Route> with context
     pub fn lookup(&self, hostname: &[u8], path: &[u8], method: &Method) -> Option<Route> {
         for (domain_rule, path_rule, method_rule, cluster_id) in &self.pre {
             if domain_rule.matches(hostname)
