@@ -562,7 +562,7 @@ impl ResolvesServerCert for MutexWrappedCertificateResolver {
             sigschemes
         );
         if let Ok(ref mut resolver) = self.0.try_lock() {
-            //resolver.domains.print();
+            resolver.domains.print();
             if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
                 trace!(
                     "looking for certificate for {:?} with fingerprint {:?}",

@@ -521,6 +521,10 @@ impl Session {
                 //     incr!(ciphersuite_str(cipher));
                 // };
 
+                println!(
+                    "Finished handshake with SNI: {:?}",
+                    handshake.session.sni_hostname()
+                );
                 let front_stream = FrontRustls {
                     stream: handshake.stream,
                     session: handshake.session,
@@ -1680,7 +1684,9 @@ impl Proxy {
             .insert(front.cluster_id.to_string(), listener.token);
 
         listener.set_tags(front.address.to_string(), front.tags);
-        listener.cluster_id = Some(front.cluster_id.to_string());
+        if !listener.flavor.has_tls() {
+            listener.cluster_id = Some(front.cluster_id.to_string());
+        }
         Ok(())
     }
 

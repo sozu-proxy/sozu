@@ -371,13 +371,24 @@ backends = [
     { address = "127.0.0.1:4001", weight = 50 }
 ]
 
-[clusters.TcpTls]
+[clusters.TcpTls1]
 protocol = "tcp"
 
 frontends = [
-  { address = "0.0.0.0:8043", tags = { key = "value" }, hostname = "yolo", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem"},
+  { address = "0.0.0.0:8043", tags = { key = "value" }, hostname = "yolo1", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem"},
 ]
 
 backends = [
   { address = "127.0.0.1:4000" },
+]
+
+[clusters.TcpTls2]
+protocol = "tcp"
+
+frontends = [
+  { address = "0.0.0.0:8043", tags = { key = "value" }, hostname = "yolo2", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem"},
+]
+
+backends = [
+  { address = "127.0.0.1:4001" },
 ]
