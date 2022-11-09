@@ -467,6 +467,7 @@ pub struct ReplaceCertificate {
 pub struct TcpFrontend {
     pub cluster_id: String,
     pub address: SocketAddr,
+    pub hostname: Option<String>,
     pub tags: Option<BTreeMap<String, String>>,
 }
 
@@ -718,8 +719,8 @@ pub struct HttpsListener {
     pub signature_algorithms: Vec<String>,
     #[serde(default)]
     pub groups_list: Vec<String>,
-    #[serde(skip, default)]
-    pub tls_provider: TlsProvider,
+    // #[serde(skip, default)]
+    // pub tls_provider: TlsProvider,
     #[serde(default)]
     pub expect_proxy: bool,
     #[serde(default = "default_sticky_name")]
@@ -757,7 +758,7 @@ impl Default for HttpsListener {
           .map(String::from)
           .collect(),
       versions:            vec!(TlsVersion::TLSv1_2),
-      tls_provider:        TlsProvider::Rustls,
+    //   tls_provider:        TlsProvider::Rustls,
       expect_proxy:        false,
       sticky_name:         String::from("SOZUBALANCEID"),
       certificate:         None,
@@ -797,7 +798,7 @@ pub struct TcpTlsConfig {
     pub signature_algorithms: Vec<String>,
     #[serde(default)]
     pub groups_list: Vec<String>,
-    #[serde(skip, default)]
+    #[serde(default)]
     pub tls_provider: TlsProvider,
 
     #[serde(default)]
@@ -926,13 +927,22 @@ impl ProxyRequestOrder {
                 [Topic::HttpsProxyConfig].iter().cloned().collect()
             }
             ProxyRequestOrder::AddCertificate(_) => {
-                [Topic::HttpsProxyConfig].iter().cloned().collect()
+                [Topic::HttpsProxyConfig, Topic::TcpProxyConfig]
+                    .iter()
+                    .cloned()
+                    .collect()
             }
             ProxyRequestOrder::ReplaceCertificate(_) => {
-                [Topic::HttpsProxyConfig].iter().cloned().collect()
+                [Topic::HttpsProxyConfig, Topic::TcpProxyConfig]
+                    .iter()
+                    .cloned()
+                    .collect()
             }
             ProxyRequestOrder::RemoveCertificate(_) => {
-                [Topic::HttpsProxyConfig].iter().cloned().collect()
+                [Topic::HttpsProxyConfig, Topic::TcpProxyConfig]
+                    .iter()
+                    .cloned()
+                    .collect()
             }
             ProxyRequestOrder::AddTcpFrontend(_) => {
                 [Topic::TcpProxyConfig].iter().cloned().collect()

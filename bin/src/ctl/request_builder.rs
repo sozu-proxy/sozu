@@ -88,6 +88,7 @@ impl CommandManager {
                 self.order_command(ProxyRequestOrder::AddTcpFrontend(TcpFrontend {
                     cluster_id: id,
                     address,
+                    hostname: None,
                     tags,
                 }))
             }
@@ -95,6 +96,7 @@ impl CommandManager {
                 self.order_command(ProxyRequestOrder::RemoveTcpFrontend(TcpFrontend {
                     cluster_id: id,
                     address,
+                    hostname: None,
                     tags: None,
                 }))
             }
@@ -220,6 +222,7 @@ impl CommandManager {
                 listener.groups_list = groups_list;
                 let https_listener = listener
                     .to_tls(
+                        None,
                         front_timeout,
                         back_timeout,
                         connect_timeout,

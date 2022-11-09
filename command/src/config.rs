@@ -92,8 +92,8 @@ pub struct Listener {
     pub public_address: Option<SocketAddr>,
     pub answer_404: Option<String>,
     pub answer_503: Option<String>,
-    #[serde(default)]
-    pub tls_provider: TlsProvider,
+    // #[serde(default)]
+    // pub tls_provider: TlsProvider,
     pub tls_versions: Option<Vec<TlsVersion>>,
     pub cipher_list: Option<Vec<String>>,
     pub cipher_suites: Option<Vec<String>>,
@@ -123,7 +123,7 @@ impl Listener {
             public_address: None,
             answer_404: None,
             answer_503: None,
-            tls_provider: TlsProvider::default(),
+            // tls_provider: TlsProvider::default(),
             tls_versions: None,
             cipher_list: None,
             cipher_suites: None,
@@ -210,6 +210,7 @@ impl Listener {
 
     pub fn to_tls(
         &self,
+        tls_provider: Option<TlsProvider>,
         front_timeout: Option<u32>,
         back_timeout: Option<u32>,
         connect_timeout: Option<u32>,
@@ -219,7 +220,8 @@ impl Listener {
             bail!("cannot convert listener to HTTPS");
         }
 
-        let default_cipher_list = match self.tls_provider {
+        let tls_provider = tls_provider.unwrap_or_default();
+        let default_cipher_list = match tls_provider {
             TlsProvider::Rustls => DEFAULT_RUSTLS_CIPHER_LIST
                 .into_iter()
                 .map(String::from)
@@ -294,7 +296,7 @@ impl Listener {
             address: self.address,
             sticky_name: self.sticky_name.clone(),
             public_address: self.public_address,
-            tls_provider: self.tls_provider.clone(),
+            // tls_provider,
             cipher_list,
             cipher_suites,
             signature_algorithms,
@@ -349,28 +351,35 @@ impl Listener {
         back_timeout: Option<u32>,
         connect_timeout: Option<u32>,
     ) -> anyhow::Result<TcpListener> {
-        // what does this code do? should we remove it?
-        /*let mut address = self.address.clone();
-        address.push(':');
-        address.push_str(&self.port.to_string());
-        */
-
-        /*let addr_parsed = match address.parse() {
-          Ok(addr) => Some(addr),
-          Err(err) => {
-            error!("Couldn't parse address of HTTP proxy: {}", err);
-            None
-          }
-        };
-
-        let addr = addr_parsed;
-        */
-
         if self.protocol != FileListenerProtocolConfig::Tcp {
             bail!("cannot convert listener to TCP");
         }
 
-        let default_cipher_list = match self.tls_provider {
+        Ok(TcpListener {
+            address: self.address,
+            public_address: self.public_address,
+            tls: None,
+            expect_proxy: self.expect_proxy.unwrap_or(false),
+            front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
+            back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
+            connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
+        })
+
+    }
+
+    pub fn to_tcps(
+        &self,
+        tls_provider: Option<TlsProvider>,
+        front_timeout: Option<u32>,
+        back_timeout: Option<u32>,
+        connect_timeout: Option<u32>,
+    ) -> anyhow::Result<TcpListener> {
+        if self.protocol != FileListenerProtocolConfig::Tcps {
+            bail!("cannot convert listener to TCPS");
+        }
+
+        let tls_provider = tls_provider.unwrap_or_default();
+        let default_cipher_list = match tls_provider {
             TlsProvider::Rustls => DEFAULT_RUSTLS_CIPHER_LIST
                 .into_iter()
                 .map(String::from)
@@ -436,11 +445,11 @@ impl Listener {
             .map(split_certificate_chain)
             .unwrap_or_else(Vec::new);
 
-        let tls = if key.is_none() || certificate.is_none() || certificate_chain.is_empty() {
+        let tls = if key.is_none() || certificate.is_none() {
             None
         } else {
             Some(TcpTlsConfig {
-                tls_provider: self.tls_provider.clone(),
+                tls_provider,
                 cipher_list,
                 cipher_suites,
                 signature_algorithms,
@@ -514,27 +523,44 @@ pub struct FileClusterFrontendConfig {
 
 impl FileClusterFrontendConfig {
     pub fn to_tcp_front(&self) -> anyhow::Result<TcpFrontendConfig> {
-        if self.hostname.is_some() {
-            bail!("invalid 'hostname' field for TCP frontend");
-        }
         if self.path.is_some() {
             bail!("invalid 'path_prefix' field for TCP frontend");
         }
-        if self.hostname.is_some() {
-            bail!("invalid 'hostname' field for TCP frontend");
-        }
-        if self.key.is_some() {
-            bail!("invalid 'key' field for TCP frontend",);
-        }
-        if self.certificate.is_some() {
-            bail!("invalid 'certificate' field for TCP frontend",);
-        }
-        if self.certificate_chain.is_some() {
-            bail!("invalid 'certificate_chain' field for TCP frontend",);
-        }
+
+        let key_opt = match self.key.as_ref() {
+            None => None,
+            Some(path) => {
+                let key = Config::load_file(path)
+                    .with_context(|| format!("cannot load key at path '{}'", path))?;
+                Some(key)
+            }
+        };
+
+        let certificate_opt = match self.certificate.as_ref() {
+            None => None,
+            Some(path) => {
+                let certificate = Config::load_file(path)
+                    .with_context(|| format!("cannot load certificate at path '{}'", path))?;
+                Some(certificate)
+            }
+        };
+
+        let chain_opt = match self.certificate_chain.as_ref() {
+            None => None,
+            Some(path) => {
+                let certificate_chain = Config::load_file(path)
+                    .with_context(|| format!("cannot load certificate chain at path {}", path))?;
+                Some(split_certificate_chain(certificate_chain))
+            }
+        };
 
         Ok(TcpFrontendConfig {
             address: self.address,
+            hostname: self.hostname.clone(),
+            certificate: certificate_opt,
+            key: key_opt,
+            certificate_chain: chain_opt,
+            tls_versions: self.tls_versions.clone(),
             tags: self.tags.clone(),
         })
     }
@@ -602,6 +628,7 @@ pub enum FileListenerProtocolConfig {
     Http,
     Https,
     Tcp,
+    Tcps,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -835,7 +862,49 @@ impl HttpClusterConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TcpFrontendConfig {
     pub address: SocketAddr,
+    pub hostname: Option<String>,
+    pub certificate: Option<String>,
+    pub key: Option<String>,
+    pub certificate_chain: Option<Vec<String>>,
+    #[serde(default)]
+    pub tls_versions: Vec<TlsVersion>,
     pub tags: Option<BTreeMap<String, String>>,
+}
+
+impl TcpFrontendConfig {
+    pub fn generate_orders(&self, cluster_id: &str) -> Vec<ProxyRequestOrder> {
+        let mut v = Vec::new();
+
+        if self.key.is_some() && self.certificate.is_some() && self.hostname.is_some() {
+            v.push(ProxyRequestOrder::AddCertificate(AddCertificate {
+                address: self.address,
+                certificate: CertificateAndKey {
+                    key: self.key.clone().unwrap(),
+                    certificate: self.certificate.clone().unwrap(),
+                    certificate_chain: self.certificate_chain.clone().unwrap_or_default(),
+                    versions: self.tls_versions.clone(),
+                },
+                names: vec![self.hostname.clone().unwrap()],
+                expired_at: None,
+            }));
+
+            v.push(ProxyRequestOrder::AddTcpFrontend(TcpFrontend {
+                cluster_id: cluster_id.to_string(),
+                address: self.address,
+                hostname: self.hostname.clone(),
+                tags: self.tags.clone(),
+            }));
+        } else {
+            v.push(ProxyRequestOrder::AddTcpFrontend(TcpFrontend {
+                cluster_id: cluster_id.to_string(),
+                address: self.address,
+                hostname: None,
+                tags: self.tags.clone(),
+            }));
+        }
+
+        v
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -862,11 +931,8 @@ impl TcpClusterConfig {
         })];
 
         for frontend in &self.frontends {
-            v.push(ProxyRequestOrder::AddTcpFrontend(TcpFrontend {
-                cluster_id: self.cluster_id.clone(),
-                address: frontend.address,
-                tags: frontend.tags.clone(),
-            }));
+            let mut orders = frontend.generate_orders(&self.cluster_id);
+            v.append(&mut orders);
         }
 
         for (backend_count, backend) in self.backends.iter().enumerate() {
@@ -1041,6 +1107,7 @@ impl FileConfig {
                     FileListenerProtocolConfig::Https => {
                         let listener = listener
                             .to_tls(
+                                self.tls_provider,
                                 self.front_timeout,
                                 self.back_timeout,
                                 self.connect_timeout,
@@ -1059,6 +1126,17 @@ impl FileConfig {
                             )
                             .with_context(|| "invalid listener")?;
                         http_listeners.push(listener);
+                    }
+                    FileListenerProtocolConfig::Tcps => {
+                        let listener = listener
+                            .to_tcps(
+                                self.tls_provider,
+                                self.front_timeout,
+                                self.back_timeout,
+                                self.connect_timeout,
+                            )
+                            .with_context(|| "invalid listener")?;
+                        tcp_listeners.push(listener);
                     }
                     FileListenerProtocolConfig::Tcp => {
                         let listener = listener
@@ -1087,6 +1165,11 @@ impl FileConfig {
                                         "cannot set up a HTTP or HTTPS frontend on a TCP listener"
                                     );
                                 }
+                                Some(FileListenerProtocolConfig::Tcps) => {
+                                    bail!(
+                                        "cannot set up a HTTP or HTTPS frontend on a TCP listener"
+                                    );
+                                }
                                 Some(FileListenerProtocolConfig::Http) => {
                                     if frontend.certificate.is_some() {
                                         bail!("cannot set up a HTTPS frontend on a HTTP listener");
@@ -1109,6 +1192,7 @@ impl FileConfig {
                                         https_listeners.push(
                                             listener
                                                 .to_tls(
+                                                    self.tls_provider,
                                                     self.front_timeout,
                                                     self.back_timeout,
                                                     self.connect_timeout,
@@ -1154,7 +1238,8 @@ impl FileConfig {
                                 | Some(FileListenerProtocolConfig::Https) => {
                                     bail!("cannot set up a TCP frontend on a HTTP listener");
                                 }
-                                Some(FileListenerProtocolConfig::Tcp) => {}
+                                Some(FileListenerProtocolConfig::Tcp)
+                                | Some(FileListenerProtocolConfig::Tcps) => {}
                                 None => {
                                     // create a default listener for that front
                                     let listener = Listener::new(
@@ -1524,7 +1609,7 @@ mod tests {
             answer_404: Some(String::from("404.html")),
             answer_503: None,
             public_address: None,
-            tls_provider: TlsProvider::default(),
+            // tls_provider: TlsProvider::default(),
             tls_versions: None,
             cipher_list: None,
             cipher_suites: None,
@@ -1547,7 +1632,7 @@ mod tests {
             answer_404: Some(String::from("404.html")),
             answer_503: None,
             public_address: None,
-            tls_provider: TlsProvider::default(),
+            // tls_provider: TlsProvider::default(),
             tls_versions: None,
             cipher_list: None,
             cipher_suites: None,

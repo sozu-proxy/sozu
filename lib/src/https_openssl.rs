@@ -1782,8 +1782,10 @@ impl Listener {
             }
 
             if let Err(e) = context.set_groups_list(&groups_list.join(":")) {
-                error!("could not set context groups list: {:?}", e);
-                return Err(ListenerError::BuildOpenSslError(e.to_string()));
+                if !e.errors().is_empty() {
+                    error!("could not set context groups list: {:?}", e);
+                    return Err(ListenerError::BuildOpenSslError(e.to_string()));
+                }
             }
         }
 

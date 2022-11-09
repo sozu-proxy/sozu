@@ -11,13 +11,6 @@ use super::{
 };
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum St {
-    Init,
-    ClientPrefaceReceived,
-    ServerPrefaceSent,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct Stream {
     pub id: u32,
     pub state: StreamState,

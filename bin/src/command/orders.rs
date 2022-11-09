@@ -1235,6 +1235,7 @@ impl CommandServer {
                     ProxyRequestOrder::RemoveTcpFrontend(TcpFrontend {
                         ref cluster_id,
                         ref address,
+                        hostname: _,
                         ref tags,
                     }) => {
                         bail!(format!(

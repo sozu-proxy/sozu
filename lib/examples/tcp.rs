@@ -61,6 +61,7 @@ fn main() -> anyhow::Result<()> {
         address: "127.0.0.1:8080"
             .parse()
             .with_context(|| "could not parse address")?,
+        hostname: None,
         tags: None,
     };
     let tcp_backend = proxy::Backend {
