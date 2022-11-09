@@ -806,8 +806,7 @@ impl CommandServer {
                     let mut found = false;
                     let id = format!(
                         "LOAD-STATE-{}-{}",
-                        &request_identifier.request,
-                        diff_counter
+                        &request_identifier.request, diff_counter
                     );
 
                     for ref mut worker in self.workers.iter_mut().filter(|worker| {
@@ -1268,7 +1267,10 @@ impl CommandServer {
         return_processing(
             self.command_tx.clone(),
             request_identifier.clone(),
-            "Sending the order to the worker...",
+            match worker_id {
+                Some(id) => format!("Sending the order to worker {}", id),
+                None => "Sending the order to all workers".to_owned(),
+            },
         )
         .await;
 

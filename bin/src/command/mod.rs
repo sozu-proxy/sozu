@@ -200,7 +200,7 @@ impl std::fmt::Display for Success {
                 Some(worker_id) => {
                     write!(f, "Successfully executed the order on worker {}", worker_id)
                 }
-                None => write!(f, "Successfully executed the order on worker"),
+                None => write!(f, "Successfully executed the order on all workers"),
             },
             Self::WorkerResponse => write!(f, "Successfully handled worker response"),
             Self::WorkerRestarted(id) => write!(f, "Successfully restarted worker {}", id),
