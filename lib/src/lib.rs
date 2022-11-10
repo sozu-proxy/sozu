@@ -204,9 +204,9 @@ pub mod server;
 pub mod tcp;
 
 #[cfg(feature = "use-openssl")]
-pub mod https_openssl;
-
-pub mod https_rustls;
+// pub mod https_openssl;
+// pub mod https_rustls;
+pub mod https_merge;
 
 use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
 

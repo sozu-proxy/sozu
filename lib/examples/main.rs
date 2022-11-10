@@ -113,7 +113,7 @@ fn main() -> anyhow::Result<()> {
     let jg2 = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::https_rustls::configuration::start(config, channel2, max_buffers, buffer_size);
+        sozu::https_merge::start(config, channel2, max_buffers, buffer_size, proxy::TlsProvider::Rustls)
     });
 
     let cert1 = include_str!("../assets/certificate.pem");

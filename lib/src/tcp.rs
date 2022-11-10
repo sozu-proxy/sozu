@@ -11,6 +11,7 @@ use anyhow::Context;
 use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
+use sozu_command::proxy::TlsProvider;
 use time::{Duration, Instant};
 
 use crate::{
@@ -1536,6 +1537,7 @@ pub fn start(
         server_config,
         None,
         false,
+        TlsProvider::Rustls,
     )
     .with_context(|| "Could not create tcp server")?;
 
@@ -1770,6 +1772,7 @@ mod tests {
                 server_config,
                 None,
                 false,
+                TlsProvider::Rustls,
             )
             .expect("Failed at creating the server");
             info!("will run");
