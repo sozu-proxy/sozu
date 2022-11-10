@@ -230,7 +230,7 @@ mod send_test {
     }
 
     // Get connection from the session and connect to the backend
-    // When connections are etablish we send the proxy protocol header
+    // When connections are establish we send the proxy protocol header
     fn start_middleware(addr_client: SocketAddr, addr_backend: SocketAddr, barrier: Arc<Barrier>) {
         let listener = TcpListener::bind(addr_client).expect("could not accept session connection");
 

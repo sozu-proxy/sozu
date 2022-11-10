@@ -1121,7 +1121,7 @@ impl Listener {
 #[derive(Debug)]
 pub struct ClusterConfiguration {
     proxy_protocol: Option<ProxyProtocolConfig>,
-    // Uncomment this when implementing new load balancing algorythms
+    // Uncomment this when implementing new load balancing algorithms
     // load_balancing: LoadBalancingAlgorithms,
 }
 
@@ -1682,7 +1682,7 @@ mod tests {
             Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
 
         // this thread should call a start() function that performs the same logic and returns Result<()>
-        // any error coming from this start() would be mapped and logged within the tread
+        // any error coming from this start() would be mapped and logged within the thread
         thread::spawn(move || {
             setup_test_logger!();
             info!("starting event loop");

@@ -1109,7 +1109,7 @@ impl CommandServer {
             Query::Metrics(_) => {}
         };
 
-        // all theses are passed to the thread
+        // all these are passed to the thread
         let command_tx = self.command_tx.clone();
         let cloned_identifier = request_identifier.clone();
 
@@ -1282,7 +1282,7 @@ impl CommandServer {
         for ref mut worker in self.workers.iter_mut().filter(|worker| {
             worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
         }) {
-            // sort out the specificly targeted worker, if provided
+            // sort out the specifically targeted worker, if provided
             if let Some(id) = worker_id {
                 if id != worker.id {
                     continue;

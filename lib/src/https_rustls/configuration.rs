@@ -444,7 +444,7 @@ impl ProxyConfiguration<Session> for Proxy {
             )
             .map_err(|register_error| {
                 error!(
-                    "error registering fron socket({:?}): {:?}",
+                    "error registering from socket({:?}): {:?}",
                     frontend_sock, register_error
                 );
                 AcceptError::RegisterError

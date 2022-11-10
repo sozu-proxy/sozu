@@ -14,7 +14,7 @@ However, if you built the project from source, `sozu` and `sozuctl` are placed i
 
 > `cargo build --release` puts the resulting binary in `target/release` instead of `target/debug`.
 
-You can find a working `config.toml` exemple [here][cfg].
+You can find a working `config.toml` example [here][cfg].
 
 To start the reverse proxy:
 
@@ -28,7 +28,7 @@ You can edit the reverse proxy's configuration with the `config.toml` file. You 
 
 You can use `sozuctl` to interact with the reverse proxy.
 
-Checkout sozuctl [documentation](../ctl/README.md) for more informations.
+Checkout sozuctl [documentation](../ctl/README.md) for more information.
 
 ## Logging
 

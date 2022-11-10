@@ -771,7 +771,7 @@ impl CommandServer {
 
             match kill(Pid::from_raw(worker.pid), Signal::SIGKILL) {
                 Ok(()) => {
-                    info!("Worker {} was successfuly killed", id);
+                    info!("Worker {} was successfully killed", id);
                     worker.run_state = RunState::Stopped;
                     return Ok(Success::WorkerKilled(id));
                 }
@@ -812,7 +812,7 @@ impl CommandServer {
         // we use to send the response to.
         match self.in_flight.remove(&response.id) {
             None => {
-                // FIXME: this messsage happens a lot at startup because AddCluster
+                // FIXME: this message happens a lot at startup because AddCluster
                 // messages receive responses from each of the HTTP, HTTPS and TCP
                 // proxys. The clusters list should be merged
                 debug!("unknown response id: {}", response.id);

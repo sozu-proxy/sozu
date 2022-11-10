@@ -222,7 +222,7 @@ use self::retry::RetryPolicy;
 
 pub type ClusterId = String;
 
-/// Anything that can be registered in mio (subscibe to kernel events)
+/// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     HTTP,

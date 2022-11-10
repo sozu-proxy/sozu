@@ -173,7 +173,7 @@ mod test {
             0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54,
             0x0A, // MAGIC header
             0x20, // Version 2 and command LOCAL
-            0x00, // family AF_UNSPEC and transport protocol unknow
+            0x00, // family AF_UNSPEC and transport protocol unknown
             0x00, 0x00, // address sizes = 0
         ];
 

@@ -412,7 +412,7 @@ pub struct FileClusterFrontendConfig {
     pub hostname: Option<String>,
     /// creates a path routing rule where the request URL path has to match this
     pub path: Option<String>,
-    /// declares wether the path rule is Prefix (default), Regex, or Equals
+    /// declares whether the path rule is Prefix (default), Regex, or Equals
     pub path_type: Option<PathRuleType>,
     pub method: Option<String>,
     pub certificate: Option<String>,
@@ -1397,7 +1397,7 @@ impl Config {
 
         let stringified_path = saved_state_path_raw
             .to_str()
-            .ok_or_else(|| anyhow::Error::msg("Unvalid character format, expected UTF8"))?
+            .ok_or_else(|| anyhow::Error::msg("Invalid character format, expected UTF8"))?
             .to_string();
 
         Ok(Some(stringified_path))

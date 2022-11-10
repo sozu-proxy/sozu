@@ -460,7 +460,7 @@ fn is_hostname_char(i: u8) -> bool {
   // but is it important here, since we will match this to
   // the list of accepted clusters?
   // BTW each label between dots has a max of 63 chars,
-  // and the whole domain shuld not be larger than 253 chars
+  // and the whole domain should not be larger than 253 chars
   //
   // this tolerant parser also allows underscore, which is wrong
   // in domain names but accepted by some proxies and web servers
@@ -475,7 +475,7 @@ fn is_hostname_char(i: u8) -> bool {
   // but is it important here, since we will match this to
   // the list of accepted clusters?
   // BTW each label between dots has a max of 63 chars,
-  // and the whole domain shuld not be larger than 253 chars
+  // and the whole domain should not be larger than 253 chars
   b"-.".contains(&i)
 }
 
@@ -902,7 +902,7 @@ impl Header {
                         Some(cookie) => {
                             let cookie_length = cookie.get_full_length();
                             // We already know the position of the cookie in the chain, so we avoid
-                            // a string comparision and directly check against where we are in the cookies
+                            // a string comparison and directly check against where we are in the cookies
                             if current_cookie == sozu_balance_position {
                                 moves.push(BufferMove::Delete(cookie_length));
                             } else if sozu_balance_is_last {

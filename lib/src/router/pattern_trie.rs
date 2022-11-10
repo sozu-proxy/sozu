@@ -207,7 +207,7 @@ impl<V: Debug + Clone> TrieNode<V> {
             if let Some(pos) = pos {
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
                     let len = self.regexps.len();
-                    // FIXME: we might have multipe entries with the same regex
+                    // FIXME: we might have multiple entries with the same regex
                     self.regexps.retain(|(r, _)| r.as_str() != s);
                     if len > self.regexps.len() {
                         return RemoveResult::Ok;
