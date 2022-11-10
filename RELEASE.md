@@ -1,6 +1,6 @@
 # Release process
 
-Sozu has a lot of moving pieces and some dependant projects, so
+Sozu has a lot of moving pieces and some dependent projects, so
 
 ## Checklist
 

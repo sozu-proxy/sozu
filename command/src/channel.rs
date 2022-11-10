@@ -115,7 +115,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         self.readiness & self.interest
     }
 
-    /// Checks wether we want and can read or write, and calls the appropriate handler.
+    /// Checks whether we want and can read or write, and calls the appropriate handler.
     pub fn run(&mut self) {
         let interest = self.interest & self.readiness;
 
@@ -331,7 +331,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         }
     }
 
-    /// Checks wether the channel is blocking or nonblocking, writes the message.
+    /// Checks whether the channel is blocking or nonblocking, writes the message.
     ///
     /// If the channel is nonblocking, you have to flush using `channel.run()` afterwards
     pub fn write_message(&mut self, message: &Tx) -> bool {

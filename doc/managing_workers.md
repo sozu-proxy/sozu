@@ -1,7 +1,7 @@
 # How are Sōzu's workers managed?
 
 Sōzu's main process starts and manages _workers_, which are subinstances of itself.
-This core feature makes Sōzu pretty efficient, but raises the question of managing state accross a whole cluster of processes.
+This core feature makes Sōzu pretty efficient, but raises the question of managing state across a whole cluster of processes.
 
 How do we solve this challenge? Unix sockets and channels.
 

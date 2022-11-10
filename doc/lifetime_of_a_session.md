@@ -26,7 +26,7 @@ us whenever something happens to those file descriptors
 At the end of the day, sockets are just raw file descriptors. We use the mio
 `TcpListener`, `TcpStream` wrappers around these file descriptors. A `TcpListener`
 listens for connections on a specific port. For each new connection it creates a
-`TcpStream` on which subsequent trafic will be redirected (both from and to the client).
+`TcpStream` on which subsequent traffic will be redirected (both from and to the client).
 
 This is all what we use mio for. "Subscribing" to file descriptors events.
 

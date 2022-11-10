@@ -59,7 +59,7 @@ sozu --config /etc/sozu/config.toml frontend https add --address 0.0.0.0:443 --h
 
 ## Check the status of sozu
 
-It shows a list of workers and show informations about their statuses.
+It shows a list of workers and show information about their statuses.
 
 ```bash
 sozu --config /etc/sozu/config.toml status

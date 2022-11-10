@@ -1,6 +1,6 @@
 //! # Tls module
 //!
-//! This module p certificate: (), certificate_chain: (), key: (), versions: ()  certificate: (), certificate_chain: (), key: (), versions: () rovides traits and structures to handle tls. It provides a unified
+//! This module p certificate: (), certificate_chain: (), key: (), versions: ()  certificate: (), certificate_chain: (), key: (), versions: () provides traits and structures to handle tls. It provides a unified
 //! certificate resolver for rustls and openssl.
 use std::{
     borrow::ToOwned,

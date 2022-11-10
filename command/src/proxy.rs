@@ -413,7 +413,7 @@ pub struct HttpFrontend {
 }
 
 impl HttpFrontend {
-    /// `is_cluster_id` chech if the frontend is dedicated to the given cluster_id
+    /// `is_cluster_id` check if the frontend is dedicated to the given cluster_id
     pub fn is_cluster_id(&self, cluster_id: &str) -> bool {
         matches!(&self.route, Route::ClusterId(id) if id == cluster_id)
     }

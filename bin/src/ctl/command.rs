@@ -427,7 +427,7 @@ impl CommandManager {
                 }
                 CommandStatus::Ok => {
                     if id == response.id {
-                        println!("Successfull metrics command: {}", response.message);
+                        println!("Successful metrics command: {}", response.message);
                     }
                     break;
                 }
