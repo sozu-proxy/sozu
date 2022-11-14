@@ -11,7 +11,6 @@ After you did that, `Rust` should be fully installed.
 
 ### Required dependencies
 
-- openssl 1.0.1 or above
 - libssl-dev
 
 ### Install
@@ -26,7 +25,7 @@ They will be built and available in the `~/.cargo/bin` folder.
 
 Build the sozu executable:
 
-`cd bin && cargo build --release --features use-openssl`
+`cd bin && cargo build --release`
 
 > The `--release` parameter inform cargo to compile sozu with optimizations turned on.
 > Only use `--release` to make a production version.
@@ -39,19 +38,3 @@ This will create the `sozu` executable for the reverse proxy, and `sozuctl` to c
 
 [ru]: https://rustup.rs
 [cr]: https://crates.io/
-
-#### For OSX build
-
-Mac OS uses an old version of openssl, so we need to use one from Homebrew:
-
-```bash
-brew install openssl
-brew link --force openssl
-```
-
-If this does not work, set the following environment variables before building:
-
-```bash
-export OPENSSL_LIB_DIR=/usr/local/opt/openssl/lib/
-export OPENSSL_INCLUDE_DIR=/usr/local/opt/openssl/include/
-```

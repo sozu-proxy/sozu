@@ -25,7 +25,7 @@ use crate::{
         proxy::{
             ListenerType, MessageId, ProxyEvent, ProxyRequest, ProxyRequestOrder, ProxyResponse,
             ProxyResponseContent, ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate,
-            QueryCertificateType, QueryClusterType, TlsProvider, Topic,
+            QueryCertificateType, QueryClusterType, Topic,
         },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
@@ -332,7 +332,6 @@ impl Server {
             sessions.clone(),
             pool.clone(),
             backends.clone(),
-            config.tls_provider,
         );
 
         Server::new(
@@ -348,7 +347,6 @@ impl Server {
             server_config,
             Some(config_state),
             expects_initial_status,
-            config.tls_provider,
         )
     }
 
@@ -365,7 +363,6 @@ impl Server {
         server_config: ServerConfig,
         config_state: Option<ConfigState>,
         expects_initial_status: bool,
-        tls_provider: TlsProvider,
     ) -> anyhow::Result<Self> {
         FEATURES.with(|_features| {
             // initializing feature flags
@@ -413,7 +410,6 @@ impl Server {
                     sessions.clone(),
                     pool.clone(),
                     backends.clone(),
-                    tls_provider,
                 )
             }
         }));
@@ -682,8 +678,6 @@ impl Server {
             if now - last_zombie_check > self.zombie_check_interval {
                 info!("zombie check");
                 last_zombie_check = now;
-
-                clear_ssl_error();
 
                 let mut tokens = HashSet::new();
                 let mut frontend_tokens = HashSet::new();
@@ -1695,11 +1689,3 @@ impl ProxySession for ListenSession {
         );
     }
 }
-
-#[cfg(feature = "use-openssl")]
-fn clear_ssl_error() {
-    unsafe { ::openssl_sys::ERR_clear_error() };
-}
-
-#[cfg(not(feature = "use-openssl"))]
-fn clear_ssl_error() {}

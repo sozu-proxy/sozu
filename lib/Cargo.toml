@@ -25,7 +25,6 @@ include = [
   "assets/certificate.pem",
   "assets/key.pem",
 ]
-build = "build.rs"
 
 [dependencies]
 anyhow = "^1.0.65"
@@ -40,8 +39,6 @@ log = "^0.4.17"
 memchr = "^2.5.0"
 mio = { version = "^0.8.4", features = ["os-poll", "os-ext", "net"] }
 nom = { version = "^7.1.1", default-features = true, features = ["std"] }
-openssl = { version = "^0.10.42", optional = true }
-openssl-sys = { version = "^0.9.76", optional = true }
 pool = "^0.1.4"
 poule = "^0.3.2"
 rand = "^0.8.5"
@@ -73,7 +70,6 @@ splice = []
 unstable = []
 logs-debug = []
 logs-trace = []
-use-openssl = ["openssl", "openssl-sys"]
 tolerant-http1-parser = []
 
 [badges]

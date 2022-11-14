@@ -8,8 +8,6 @@ worker_count = 1
 max_connections = 20000
 max_buffers = 1000
 buffer_size = 16384
-#tls_provider = "rustls"
-tls_provider = "openssl"
 
 [[listeners]]
 address = "0.0.0.0:80"
@@ -22,9 +20,6 @@ address = "0.0.0.0:443"
 protocol = "https"
 answer_404 = "./404.html"
 tls_versions = ["TLSv1.2"]
-# cipher combinations used by OpenSSL
-#cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"
-#expect_proxy = true
 
 [[listeners]]
 address = "0.0.0.0:1234"

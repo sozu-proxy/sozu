@@ -65,7 +65,7 @@ round robin (default), random, least_loaded, and power of two.
 
 ## SSL
 
-Sōzu is an SSL endpoint, powered by either openssl or rustls.
+Sōzu is an SSL endpoint, powered by rustls.
 It decrypts the traffic using the SSL key and certificate, and forwards it, unencrypted, to the backends.
 
 ## Deep dive

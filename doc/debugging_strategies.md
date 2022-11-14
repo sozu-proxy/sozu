@@ -210,12 +210,6 @@ TLS version counter:
 * `sozu.tls.version.TLSv1_3`
 * `sozu.tls.version.Unknown`
 
-OpenSSL specific:
-
-* `sozu.openssl.sni.error`: counts SNI requests that did not find the corresponding certificate
-* `sozu.openssl.wrong_version_number.error`: invalid TLS version
-* `sozu.openssl.unknown_protocol.error`: most likely, someone tried plaintext HTTP instead of HTTPS
-
 Rustls specific, negotiated ciphersuite:
 
 * `sozu.tls.cipher.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`
@@ -268,10 +262,6 @@ the same. The slab count will then drop when the zombie checker activates.
 if the slab count and active requests stay the same but `sozu.client.connections` and/or `sozu.backend.connections`
 are increasing, it means sessions are not properly closed by sozu, please open an issue for this.
 (if the slab count stays constant, sockets should still be closed properly, though)
-
-### Openssl.sni.error increases
-
-Handshakes are failing because sozu does not have the certificate that is required by clients
 
 ### accept queue filling up
 

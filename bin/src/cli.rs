@@ -627,24 +627,9 @@ pub enum HttpsListenerCmd {
         tls_versions: Vec<TlsVersion>,
         #[clap(
             long = "tls-cipher-list",
-            help = "List of TLS cipher list to use (TLSv1.2 and below for OpenSSL, TLSv1.2 and TLS1.3 for Rustls)"
+            help = "List of TLS cipher list to use (TLSv1.2 and TLSv1.3)"
         )]
         cipher_list: Option<Vec<String>>,
-        #[clap(
-            long = "tls-cipher-suites",
-            help = "List of TLS cipher suites to use (TLSv1.3 and OpenSSL only)"
-        )]
-        cipher_suites: Option<Vec<String>>,
-        #[clap(
-            long = "tls-signature-algorithms",
-            help = "List of TLS signature algorithms to use (OpenSSL only)"
-        )]
-        signature_algorithms: Option<Vec<String>>,
-        #[clap(
-            long = "tls-groups-list",
-            help = "List of TLS groups list to use (OpenSSL only)"
-        )]
-        groups_list: Option<Vec<String>>,
         #[clap(
             long = "expect-proxy",
             help = "Configures the client socket to receive a PROXY protocol header"

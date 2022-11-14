@@ -191,9 +191,6 @@ impl CommandManager {
                 answer_503,
                 tls_versions,
                 cipher_list,
-                cipher_suites,
-                signature_algorithms,
-                groups_list,
                 expect_proxy,
                 sticky_name,
                 front_timeout,
@@ -215,9 +212,6 @@ impl CommandManager {
                 } else {
                     Some(tls_versions)
                 };
-                listener.cipher_suites = cipher_suites;
-                listener.signature_algorithms = signature_algorithms;
-                listener.groups_list = groups_list;
                 let https_listener = listener
                     .to_tls(
                         front_timeout,

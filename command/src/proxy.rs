@@ -647,14 +647,6 @@ impl Default for HttpListener {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum TlsProvider {
-    Openssl,
-    #[default]
-    Rustls,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TlsVersion {
     SSLv2,
@@ -718,8 +710,6 @@ pub struct HttpsListener {
     pub signature_algorithms: Vec<String>,
     #[serde(default)]
     pub groups_list: Vec<String>,
-    #[serde(skip, default)]
-    pub tls_provider: TlsProvider,
     #[serde(default)]
     pub expect_proxy: bool,
     #[serde(default = "default_sticky_name")]
@@ -757,7 +747,6 @@ impl Default for HttpsListener {
           .map(String::from)
           .collect(),
       versions:            vec!(TlsVersion::TLSv1_2),
-      tls_provider:        TlsProvider::Rustls,
       expect_proxy:        false,
       sticky_name:         String::from("SOZUBALANCEID"),
       certificate:         None,

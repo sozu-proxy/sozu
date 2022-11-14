@@ -1192,7 +1192,7 @@ mod tests {
     use super::*;
     use crate::proxy::{
         Backend, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
-        ProxyRequestOrder, Route, RulePosition, TlsProvider,
+        ProxyRequestOrder, Route, RulePosition,
     };
 
     #[test]
@@ -1637,7 +1637,6 @@ mod tests {
                 cipher_suites: vec![],
                 signature_algorithms: vec![],
                 groups_list: vec![],
-                tls_provider: TlsProvider::Openssl,
                 certificate: None,
                 certificate_chain: vec![],
                 key: None,
@@ -1700,7 +1699,6 @@ mod tests {
                 cipher_suites: vec![],
                 signature_algorithms: vec![],
                 groups_list: vec![],
-                tls_provider: TlsProvider::Openssl,
                 certificate: None,
                 certificate_chain: vec![],
                 key: None,
@@ -1773,7 +1771,6 @@ mod tests {
                 cipher_suites: vec![],
                 signature_algorithms: vec![],
                 groups_list: vec![],
-                tls_provider: TlsProvider::Openssl,
                 certificate: None,
                 certificate_chain: vec![],
                 key: None,

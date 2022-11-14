@@ -34,7 +34,6 @@ Parameters in the global section allow you to define the global settings shared 
 | `buffer_size`              | size, in bytes, of requests buffer use by the workers                               |                                          |
 | `ctl_command_timeout`      | maximum time sozuctl will wait for a command to complete                            |                                          |
 | `pid_file_path`            | stores the pid in a specific file location                                          |                                          |
-| `tls_provider`             | specifies which TLS implementation to use                                           | `rustls` or `openssl`                    |
 | `front_timeout`            | maximum time of inactivity for a front socket                                       |                                          |
 | `connect_timeout`          | maximum time of inactivity for a request to connect                                 |                                          |
 | `request_timeout`          | maximum time of inactivity for a request                                            |                                          |
@@ -96,49 +95,9 @@ sticky_name = "SOZUBALANCEID"
 #### Options specific to HTTPS listeners
 
 ```toml
-# supported TLS versions. Possible values are "SSLv2", "SSLv3", "TLSv1",
-# "TLSv1.1", "TLSv1.2", "TLSv1.3". Defaults to "TLSv1.2" and "TLSv1.3"
+# supported TLS versions. Possible values are "SSLv2", "SSLv3",
+# "TLSv1.2", "TLSv1.3". Defaults to "TLSv1.2" and "TLSv1.3"
 tls_versions = ["TLSv1.2", "TLSv1.3"]
-```
-
-#### Options specific to OpenSSL based HTTPS listeners
-
-```toml
-# Options specific to Openssl based HTTPS listeners for TLSv1.2
-cipher_list = [
-    "ECDHE-ECDSA-AES256-GCM-SHA384",
-    "ECDHE-ECDSA-AES128-GCM-SHA256",
-    "ECDHE-ECDSA-AES256-CCM",
-    "ECDHE-ECDSA-AES128-CCM",
-    "ECDHE-ECDSA-CHACHA20-POLY1305",
-    "ECDHE-RSA-AES256-GCM-SHA384",
-    "ECDHE-RSA-AES128-GCM-SHA256",
-    "ECDHE-RSA-CHACHA20-POLY1305",
-]
-
-# Options specific to OpenSSL based HTTPS listeners for TLSv1.3
-cipher_suites = [
-    "TLS_AES_256_GCM_SHA384",
-    "TLS_AES_128_GCM_SHA256",
-    "TLS_AES_128_CCM_SHA256",
-    "TLS_CHACHA20_POLY1305_SHA256",
-]
-
-# Set OpenSSL signature algorithms allowed
-signature_algorithms = [
-    "ECDSA+SHA512",
-    "ECDSA+SHA384",
-    "ECDSA+SHA256",
-    "RSA+SHA512",
-    "RSA+SHA384",
-    "RSA+SHA256",
-    "RSA-PSS+SHA512",
-    "RSA-PSS+SHA256",
-    "RSA-PSS+SHA384",
-]
-
-# Set OpenSSL group list allowed
-groups_list = ["P-521", "P-384", "P-256", "x25519"]
 ```
 
 #### Options specific to Rustls based HTTPS listeners

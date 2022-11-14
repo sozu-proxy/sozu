@@ -18,28 +18,9 @@ use crate::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListener, HttpsListener, ListenerType, LoadBalancingAlgorithms, LoadBalancingParams,
         LoadMetric, PathRule, ProxyRequestOrder, Route, RulePosition, TcpFrontend, TcpListener,
-        TlsProvider, TlsVersion,
+        TlsVersion,
     },
 };
-
-// -------------------------------------------------------------------------------------------------
-// Constants
-
-// [`DEFAULT_OPENSSL_CIPHER_LIST`] provides all cipher suites considered as secure and that OpenSSL
-// TLS provider support.
-//
-// See:
-// - https://ciphersuite.info/cs/?security=secure
-pub const DEFAULT_OPENSSL_CIPHER_LIST: [&'static str; 8] = [
-    "ECDHE-ECDSA-AES256-GCM-SHA384",
-    "ECDHE-ECDSA-AES128-GCM-SHA256",
-    "ECDHE-ECDSA-AES256-CCM",
-    "ECDHE-ECDSA-AES128-CCM",
-    "ECDHE-ECDSA-CHACHA20-POLY1305",
-    "ECDHE-RSA-AES256-GCM-SHA384",
-    "ECDHE-RSA-AES128-GCM-SHA256",
-    "ECDHE-RSA-CHACHA20-POLY1305",
-];
 
 // [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS
 // provider as it support only strongly secure ones.
@@ -92,13 +73,8 @@ pub struct Listener {
     pub public_address: Option<SocketAddr>,
     pub answer_404: Option<String>,
     pub answer_503: Option<String>,
-    #[serde(default)]
-    pub tls_provider: TlsProvider,
     pub tls_versions: Option<Vec<TlsVersion>>,
     pub cipher_list: Option<Vec<String>>,
-    pub cipher_suites: Option<Vec<String>>,
-    pub signature_algorithms: Option<Vec<String>>,
-    pub groups_list: Option<Vec<String>>,
     pub expect_proxy: Option<bool>,
     #[serde(default = "default_sticky_name")]
     pub sticky_name: String,
@@ -123,12 +99,8 @@ impl Listener {
             public_address: None,
             answer_404: None,
             answer_503: None,
-            tls_provider: TlsProvider::default(),
             tls_versions: None,
             cipher_list: None,
-            cipher_suites: None,
-            signature_algorithms: None,
-            groups_list: None,
             expect_proxy: None,
             sticky_name: String::from("SOZUBALANCEID"),
             certificate: None,
@@ -219,36 +191,12 @@ impl Listener {
             bail!("cannot convert listener to HTTPS");
         }
 
-        let default_cipher_list = match self.tls_provider {
-            TlsProvider::Rustls => DEFAULT_RUSTLS_CIPHER_LIST
-                .into_iter()
-                .map(String::from)
-                .collect(),
-            TlsProvider::Openssl => DEFAULT_OPENSSL_CIPHER_LIST
-                .into_iter()
-                .map(String::from)
-                .collect(),
-        };
+        let default_cipher_list = DEFAULT_RUSTLS_CIPHER_LIST
+            .into_iter()
+            .map(String::from)
+            .collect();
 
         let cipher_list = self.cipher_list.clone().unwrap_or(default_cipher_list);
-        let signature_algorithms = self.signature_algorithms.clone().unwrap_or_else(|| {
-            DEFAULT_SIGNATURE_ALGORITHMS
-                .into_iter()
-                .map(String::from)
-                .collect()
-        });
-
-        let cipher_suites = self.cipher_suites.clone().unwrap_or_else(|| {
-            DEFAULT_CIPHER_SUITES
-                .into_iter()
-                .map(String::from)
-                .collect()
-        });
-
-        let groups_list = self
-            .groups_list
-            .clone()
-            .unwrap_or_else(|| DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect());
 
         //FIXME => done. This seems useless now
         // let tls_proxy_configuration = Some(self.address);
@@ -294,11 +242,7 @@ impl Listener {
             address: self.address,
             sticky_name: self.sticky_name.clone(),
             public_address: self.public_address,
-            tls_provider: self.tls_provider.clone(),
             cipher_list,
-            cipher_suites,
-            signature_algorithms,
-            groups_list,
             versions,
             expect_proxy,
             key,
@@ -839,8 +783,6 @@ pub struct FileConfig {
     pub handle_process_affinity: Option<bool>,
     pub ctl_command_timeout: Option<u64>,
     pub pid_file_path: Option<String>,
-    #[serde(default)]
-    pub tls_provider: Option<TlsProvider>,
     pub activate_listeners: Option<bool>,
     #[serde(default)]
     pub front_timeout: Option<u32>,
@@ -1134,7 +1076,6 @@ impl FileConfig {
             handle_process_affinity: self.handle_process_affinity.unwrap_or(false),
             ctl_command_timeout: self.ctl_command_timeout.unwrap_or(1_000),
             pid_file_path: self.pid_file_path,
-            tls_provider: self.tls_provider.clone().unwrap_or_default(),
             activate_listeners: self.activate_listeners.unwrap_or(true),
             front_timeout: self.front_timeout.unwrap_or(60),
             back_timeout: self.front_timeout.unwrap_or(30),
@@ -1173,8 +1114,6 @@ pub struct Config {
     pub handle_process_affinity: bool,
     pub ctl_command_timeout: u64,
     pub pid_file_path: Option<String>,
-    #[serde(default)]
-    pub tls_provider: TlsProvider,
     pub activate_listeners: bool,
     #[serde(default = "default_front_timeout")]
     pub front_timeout: u32,
@@ -1434,12 +1373,8 @@ mod tests {
             answer_404: Some(String::from("404.html")),
             answer_503: None,
             public_address: None,
-            tls_provider: TlsProvider::default(),
             tls_versions: None,
             cipher_list: None,
-            cipher_suites: None,
-            signature_algorithms: None,
-            groups_list: None,
             expect_proxy: None,
             sticky_name: "SOZUBALANCEID".to_string(),
             certificate: None,
@@ -1457,12 +1392,8 @@ mod tests {
             answer_404: Some(String::from("404.html")),
             answer_503: None,
             public_address: None,
-            tls_provider: TlsProvider::default(),
             tls_versions: None,
             cipher_list: None,
-            cipher_suites: None,
-            signature_algorithms: None,
-            groups_list: None,
             expect_proxy: None,
             sticky_name: "SOZUBALANCEID".to_string(),
             certificate: None,
@@ -1501,7 +1432,6 @@ mod tests {
             clusters: None,
             ctl_command_timeout: None,
             pid_file_path: None,
-            tls_provider: None,
             activate_listeners: None,
             front_timeout: None,
             back_timeout: None,
