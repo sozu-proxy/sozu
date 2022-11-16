@@ -1109,6 +1109,8 @@ async fn worker_loop(
         }
     }
 
+    error!("worker loop stopped, will close the worker {}", worker_id);
+
     // if the loop breaks, order the command server to close the worker
     if let Err(send_error) = command_tx
         .send(CommandMessage::WorkerClose {

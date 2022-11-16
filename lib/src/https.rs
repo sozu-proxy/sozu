@@ -5,7 +5,7 @@ use std::{
     net::{Shutdown, SocketAddr as StdSocketAddr},
     os::unix::{io::AsRawFd, net::UnixStream},
     rc::{Rc, Weak},
-    str::from_utf8_unchecked,
+    str::{from_utf8, from_utf8_unchecked},
     sync::Arc,
 };
 
@@ -26,6 +26,7 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
+use sozu_command::config::DEFAULT_CIPHER_SUITES;
 use time::{Duration, Instant};
 
 use crate::{
@@ -41,7 +42,10 @@ use crate::{
         },
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake as RustlsHandshake,
-        Http, Pipe, ProtocolResult, StickySession,
+        Http,
+        Pipe,
+        ProtocolResult,
+        StickySession,
     },
     retry::RetryPolicy,
     router::Router,
@@ -71,9 +75,7 @@ use crate::{
     SessionMetrics, SessionResult,
 };
 
-//const SERVER_PROTOS: &'static [u8] = b"\x02h2\x08http/1.1";
-//const SERVER_PROTOS: &'static [u8] = b"\x08http/1.1\x02h2";
-// const SERVER_PROTOS: &[u8] = b"\x08http/1.1";
+const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsCluster {
@@ -88,6 +90,9 @@ pub enum State {
     Http(Http<FrontRustls, Listener>),
     WebSocket(Pipe<FrontRustls, Listener>),
     Http2,
+    /// Temporary state used to extract and take ownership over the previous state.
+    /// It should always be replaced by the next valid state and thus never be encountered.
+    Invalid,
 }
 
 pub enum AlpnProtocols {
@@ -186,6 +191,7 @@ impl Session {
 
     pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>) {
         match &mut self.state {
+            State::Invalid => unreachable!(),
             State::Http(http) => {
                 http.set_answer(answer, buf);
             }
@@ -194,196 +200,223 @@ impl Session {
     }
 
     pub fn upgrade(&mut self) -> bool {
-        let mut owned_state: State = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-        // we have to swap this for borrowing reasons
+        // We swap an Invalid state to take ownership over the current state
+        let mut owned_state = State::Invalid;
         std::mem::swap(&mut owned_state, &mut self.state);
-        match owned_state {
-            State::Expect(expect, ssl) => {
-                debug!("switching to TLS handshake");
-                if let Some(ref addresses) = expect.addresses {
-                    if let (Some(public_address), Some(session_address)) =
-                        (addresses.destination(), addresses.source())
-                    {
-                        self.public_address = public_address;
-                        self.peer_address = Some(session_address);
+        let new_state = match owned_state {
+            State::Invalid => unreachable!(),
+            State::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
+            State::Handshake(handshake) => self.upgrade_handshake(handshake),
+            State::Http(http) => self.upgrade_http(http),
+            State::Http2 => self.upgrade_http2(),
+            State::WebSocket(websocket) => self.upgrade_websocket(websocket),
+        };
 
-                        let ExpectProxyProtocol {
-                            frontend,
-                            readiness,
-                            request_id,
-                            ..
-                        } = expect;
-
-                        let mut tls = RustlsHandshake::new(ssl, frontend, request_id);
-                        tls.readiness.event = readiness.event;
-                        tls.readiness.event.insert(Ready::readable());
-
-                        gauge_add!("protocol.proxy.expect", -1);
-                        gauge_add!("protocol.tls.handshake", 1);
-                        self.state = State::Handshake(tls);
-                        return true;
-                    }
-                }
-
-                // currently, only happens in expect proxy protocol with AF_UNSPEC address
-                //error!("failed to upgrade from expect");
-                self.state = State::Expect(expect, ssl);
+        match new_state {
+            Some(state) => {
+                self.state = state;
+                true
+            }
+            None => {
+                // The state stays Invalid, but the Session should be closed right after
                 false
             }
-            State::Handshake(handshake) => {
-                // Add 1st routing phase
-                // - get SNI
-                // - get ALPN
-                // - find corresponding listener
-                // - determine next protocol (tcps, https ,http2)
+        }
+    }
 
-                let front_buf = self.pool.upgrade().and_then(|p| p.borrow_mut().checkout());
-                if front_buf.is_none() {
-                    self.state = State::Handshake(handshake);
-                    return false;
-                }
+    fn upgrade_expect(
+        &mut self,
+        expect: ExpectProxyProtocol<MioTcpStream>,
+        ssl: ServerConnection,
+    ) -> Option<State> {
+        if let Some(ref addresses) = expect.addresses {
+            if let (Some(public_address), Some(session_address)) =
+                (addresses.destination(), addresses.source())
+            {
+                self.public_address = public_address;
+                self.peer_address = Some(session_address);
 
-                // let sni = handshake.session.sni_hostname();
-                // let alpn = handshake.session.alpn_protocol();
+                let ExpectProxyProtocol {
+                    frontend,
+                    readiness,
+                    request_id,
+                    ..
+                } = expect;
 
-                let mut front_buf = front_buf.unwrap();
-                if let Some(version) = handshake.session.protocol_version() {
-                    incr!(rustls_version_str(version));
-                };
-                if let Some(cipher) = handshake.session.negotiated_cipher_suite() {
-                    incr!(rustls_ciphersuite_str(cipher));
-                };
+                let mut tls = RustlsHandshake::new(ssl, frontend, request_id);
+                tls.readiness.event = readiness.event;
+                tls.readiness.event.insert(Ready::readable());
 
-                let front_stream = FrontRustls {
-                    stream: handshake.stream,
-                    session: handshake.session,
-                };
-
-                let readiness = handshake.readiness.clone();
-                let mut http = Http::new(
-                    front_stream,
-                    self.frontend_token,
-                    handshake.request_id,
-                    self.pool.clone(),
-                    self.public_address,
-                    self.peer_address,
-                    self.sticky_name.clone(),
-                    Protocol::HTTPS,
-                    self.answers.clone(),
-                    self.front_timeout.take(),
-                    self.frontend_timeout_duration,
-                    self.backend_timeout_duration,
-                    self.listener.clone(),
-                );
-
-                let res = http.frontend.session.reader().read(front_buf.space());
-                match res {
-                    Ok(sz) => {
-                        //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-                        front_buf.fill(sz);
-                        count!("bytes_in", sz as i64);
-                        self.metrics.bin += sz;
-                    }
-                    Err(e) => {
-                        error!("read error: {:?}", e);
-                    }
-                }
-
-                let sz = front_buf.available_data();
-                let mut buf = BufferQueue::with_buffer(front_buf);
-                buf.sliced_input(sz);
-
-                gauge_add!("protocol.tls.handshake", -1);
-                gauge_add!("protocol.https", 1);
-                http.front_buf = Some(buf);
-                http.front_readiness = readiness;
-                http.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
-
-                self.state = State::Http(http);
-                true
+                gauge_add!("protocol.proxy.expect", -1);
+                gauge_add!("protocol.tls.handshake", 1);
+                return Some(State::Handshake(tls));
             }
-            State::Http(mut http) => {
-                debug!("https switching to wss");
-                let front_token = self.frontend_token;
-                let back_token = unwrap_msg!(http.back_token());
-                let ws_context = http.websocket_context();
+        }
 
-                let front_buf = match http.front_buf {
-                    Some(buf) => buf.buffer,
-                    None => {
-                        let pool = match self.pool.upgrade() {
-                            Some(p) => p,
-                            None => return false,
-                        };
+        // currently, only happens in expect proxy protocol with AF_UNSPEC address
+        // error!("failed to upgrade from expect");
+        None
+    }
 
-                        let buffer = match pool.borrow_mut().checkout() {
-                            Some(buf) => buf,
-                            None => return false,
-                        };
-                        buffer
-                    }
-                };
-                let back_buf = match http.back_buf {
-                    Some(buf) => buf.buffer,
-                    None => {
-                        let pool = match self.pool.upgrade() {
-                            Some(p) => p,
-                            None => return false,
-                        };
+    fn upgrade_handshake(&mut self, handshake: RustlsHandshake) -> Option<State> {
+        // Add 1st routing phase
+        // - get SNI
+        // - get ALPN
+        // - find corresponding listener
+        // - determine next protocol (tcps, https ,http2)
 
-                        let buffer = match pool.borrow_mut().checkout() {
-                            Some(buf) => buf,
-                            None => return false,
-                        };
-                        buffer
-                    }
-                };
+        let front_buf = self.pool.upgrade().and_then(|p| p.borrow_mut().checkout());
+        if front_buf.is_none() {
+            return None;
+        }
 
-                let mut pipe = Pipe::new(
-                    http.frontend,
-                    front_token,
-                    http.request_id,
-                    http.cluster_id,
-                    http.backend_id,
-                    Some(ws_context),
-                    http.backend,
-                    front_buf,
-                    back_buf,
-                    http.session_address,
-                    Protocol::HTTPS,
-                    self.listener.clone(),
-                );
+        let sni = handshake.session.sni_hostname();
+        let alpn = handshake.session.alpn_protocol();
+        info!(
+            "Successful TLS Handshake with, received: {:?} {:?}",
+            sni,
+            alpn.and_then(|alpn| from_utf8(alpn).ok())
+        );
 
-                pipe.front_readiness.event = http.front_readiness.event;
-                pipe.back_readiness.event = http.back_readiness.event;
-                http.front_timeout
-                    .set_duration(self.frontend_timeout_duration);
-                http.back_timeout
-                    .set_duration(self.backend_timeout_duration);
-                pipe.front_timeout = Some(http.front_timeout);
-                pipe.back_timeout = Some(http.back_timeout);
-                pipe.set_back_token(back_token);
-                pipe.set_cluster_id(self.cluster_id.clone());
+        let mut front_buf = front_buf.unwrap();
+        if let Some(version) = handshake.session.protocol_version() {
+            incr!(rustls_version_str(version));
+        };
+        if let Some(cipher) = handshake.session.negotiated_cipher_suite() {
+            incr!(rustls_ciphersuite_str(cipher));
+        };
 
-                gauge_add!("protocol.https", -1);
-                gauge_add!("protocol.wss", 1);
-                gauge_add!("websocket.active_requests", 1);
-                gauge_add!("http.active_requests", -1);
-                self.state = State::WebSocket(pipe);
-                true
+        let front_stream = FrontRustls {
+            stream: handshake.stream,
+            session: handshake.session,
+        };
+
+        let readiness = handshake.readiness.clone();
+        let mut http = Http::new(
+            front_stream,
+            self.frontend_token,
+            handshake.request_id,
+            self.pool.clone(),
+            self.public_address,
+            self.peer_address,
+            self.sticky_name.clone(),
+            Protocol::HTTPS,
+            self.answers.clone(),
+            self.front_timeout.take(),
+            self.frontend_timeout_duration,
+            self.backend_timeout_duration,
+            self.listener.clone(),
+        );
+
+        let res = http.frontend.session.reader().read(front_buf.space());
+        match res {
+            Ok(sz) => {
+                //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
+                front_buf.fill(sz);
+                count!("bytes_in", sz as i64);
+                self.metrics.bin += sz;
             }
-            State::Http2 => todo!(),
-            State::WebSocket(_) => {
-                error!("Upgrade called on WSS, this should not happen");
-                true
+            Err(e) => {
+                error!("read error: {:?}", e);
+            }
+        }
+
+        let sz = front_buf.available_data();
+        let mut buf = BufferQueue::with_buffer(front_buf);
+        buf.sliced_input(sz);
+
+        gauge_add!("protocol.tls.handshake", -1);
+        gauge_add!("protocol.https", 1);
+        http.front_buf = Some(buf);
+        http.front_readiness = readiness;
+        http.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
+
+        Some(State::Http(http))
+    }
+
+    fn upgrade_http(&self, mut http: Http<FrontRustls, Listener>) -> Option<State> {
+        debug!("https switching to wss");
+        let front_token = self.frontend_token;
+        let back_token = unwrap_msg!(http.back_token());
+        let ws_context = http.websocket_context();
+
+        let front_buf = match http.front_buf {
+            Some(buf) => buf.buffer,
+            None => {
+                let pool = match self.pool.upgrade() {
+                    Some(p) => p,
+                    None => return None,
+                };
+
+                let buffer = match pool.borrow_mut().checkout() {
+                    Some(buf) => buf,
+                    None => return None,
+                };
+                buffer
             }
         };
-        self.state = State::Http2;
-        true
+        let back_buf = match http.back_buf {
+            Some(buf) => buf.buffer,
+            None => {
+                let pool = match self.pool.upgrade() {
+                    Some(p) => p,
+                    None => return None,
+                };
+
+                let buffer = match pool.borrow_mut().checkout() {
+                    Some(buf) => buf,
+                    None => return None,
+                };
+                buffer
+            }
+        };
+
+        let mut pipe = Pipe::new(
+            http.frontend,
+            front_token,
+            http.request_id,
+            http.cluster_id,
+            http.backend_id,
+            Some(ws_context),
+            http.backend,
+            front_buf,
+            back_buf,
+            http.session_address,
+            Protocol::HTTPS,
+            self.listener.clone(),
+        );
+
+        pipe.front_readiness.event = http.front_readiness.event;
+        pipe.back_readiness.event = http.back_readiness.event;
+        http.front_timeout
+            .set_duration(self.frontend_timeout_duration);
+        http.back_timeout
+            .set_duration(self.backend_timeout_duration);
+        pipe.front_timeout = Some(http.front_timeout);
+        pipe.back_timeout = Some(http.back_timeout);
+        pipe.set_back_token(back_token);
+        pipe.set_cluster_id(self.cluster_id.clone());
+
+        gauge_add!("protocol.https", -1);
+        gauge_add!("protocol.wss", 1);
+        gauge_add!("websocket.active_requests", 1);
+        gauge_add!("http.active_requests", -1);
+        Some(State::WebSocket(pipe))
+    }
+
+    fn upgrade_http2(&self) -> Option<State> {
+        todo!()
+    }
+
+    fn upgrade_websocket(&self, websocket: Pipe<FrontRustls, Listener>) -> Option<State> {
+        // what do we do here?
+        error!("Upgrade called on WSS, this should not happen");
+        Some(State::WebSocket(websocket))
     }
 
     fn front_hup(&mut self) -> SessionResult {
         match &mut self.state {
+            State::Invalid => unreachable!(),
             State::Http(http) => http.front_hup(),
             State::WebSocket(pipe) => pipe.front_hup(&mut self.metrics),
             State::Handshake(_) => SessionResult::CloseSession,
@@ -394,6 +427,7 @@ impl Session {
 
     fn back_hup(&mut self) -> SessionResult {
         match &mut self.state {
+            State::Invalid => unreachable!(),
             State::Http(http) => http.back_hup(),
             State::WebSocket(pipe) => pipe.back_hup(&mut self.metrics),
             State::Handshake(_) => {
@@ -410,6 +444,7 @@ impl Session {
 
     fn log_context(&self) -> String {
         match &self.state {
+            State::Invalid => unreachable!(),
             State::Http(http) => http.log_context().to_string(),
             _ => "".to_string(),
         }
@@ -417,6 +452,7 @@ impl Session {
 
     fn readable(&mut self) -> SessionResult {
         let (upgrade, session_result) = match &mut self.state {
+            State::Invalid => unreachable!(),
             State::Expect(expect, _) => {
                 if !self.front_timeout.reset() {
                     error!("could not reset front timeout");
@@ -438,6 +474,7 @@ impl Session {
             session_result
         } else if self.upgrade() {
             match &mut self.state {
+                State::Invalid => unreachable!(),
                 State::Http(http) => http.readable(&mut self.metrics),
                 State::Http2 => todo!(),
                 _ => session_result,
@@ -449,6 +486,7 @@ impl Session {
 
     fn writable(&mut self) -> SessionResult {
         let (upgrade, session_result) = match self.state {
+            State::Invalid => unreachable!(),
             State::Expect(_, _) => return SessionResult::CloseSession,
             State::Handshake(ref mut handshake) => handshake.writable(),
             State::Http(ref mut http) => {
@@ -474,6 +512,7 @@ impl Session {
 
     fn back_readable(&mut self) -> SessionResult {
         let (upgrade, session_result) = match self.state {
+            State::Invalid => unreachable!(),
             State::Expect(_, _) => return SessionResult::CloseSession,
             State::Http(ref mut http) => http.back_readable(&mut self.metrics),
             State::Handshake(_) => (ProtocolResult::Continue, SessionResult::CloseSession),
@@ -491,6 +530,7 @@ impl Session {
             return SessionResult::CloseSession;
         }
         match self.state {
+            State::Invalid => unreachable!(),
             State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
             _ => session_result,
         }
@@ -498,6 +538,7 @@ impl Session {
 
     fn back_writable(&mut self) -> SessionResult {
         match self.state {
+            State::Invalid => unreachable!(),
             State::Expect(_, _) | State::Handshake(_) => SessionResult::CloseSession,
             State::Http(ref mut http) => http.back_writable(&mut self.metrics),
             State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics),
@@ -507,6 +548,7 @@ impl Session {
 
     fn front_socket(&self) -> Option<&MioTcpStream> {
         match &self.state {
+            State::Invalid => unreachable!(),
             State::Expect(expect, _) => Some(expect.front_socket()),
             State::Handshake(handshake) => Some(&handshake.stream),
             State::Http(http) => Some(http.front_socket()),
@@ -517,6 +559,7 @@ impl Session {
 
     fn back_socket(&self) -> Option<&MioTcpStream> {
         match self.state {
+            State::Invalid => unreachable!(),
             State::Expect(_, _) => None,
             State::Handshake(_) => None,
             State::Http(ref http) => http.back_socket(),
@@ -527,6 +570,7 @@ impl Session {
 
     fn back_token(&self) -> Option<Token> {
         match self.state {
+            State::Invalid => unreachable!(),
             State::Expect(_, _) => None,
             State::Handshake(_) => None,
             State::Http(ref http) => http.back_token(),
@@ -538,6 +582,7 @@ impl Session {
     fn set_back_socket(&mut self, sock: MioTcpStream) {
         let backend = self.backend.clone();
         match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref mut http) => http.set_back_socket(sock, backend),
             _ => {
                 // what to do when set_back_socket is called on the other states?
@@ -548,6 +593,7 @@ impl Session {
 
     fn set_back_token(&mut self, token: Token) {
         match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref mut http) => http.set_back_token(token),
             State::Http2 => todo!(),
             State::WebSocket(ref mut pipe) => pipe.set_back_token(token),
@@ -579,6 +625,7 @@ impl Session {
         // now that we're connected, move to backend_timeout duration
         let timeout = self.backend_timeout_duration;
         match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref mut http) => {
                 http.set_back_timeout(timeout);
                 http.cancel_backend_timeout();
@@ -624,6 +671,7 @@ impl Session {
     fn remove_backend(&mut self) {
         if let Some(backend) = self.backend.take() {
             match self.state {
+                State::Invalid => unreachable!(),
                 State::Http(ref mut http) => http.clear_back_token(),
                 _ => {}
             }
@@ -634,6 +682,7 @@ impl Session {
 
     fn front_readiness(&mut self) -> &mut Readiness {
         match self.state {
+            State::Invalid => unreachable!(),
             State::Expect(ref mut expect, _) => &mut expect.readiness,
             State::Handshake(ref mut handshake) => &mut handshake.readiness,
             State::Http(ref mut http) => http.front_readiness(),
@@ -644,6 +693,7 @@ impl Session {
 
     fn back_readiness(&mut self) -> Option<&mut Readiness> {
         match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref mut http) => Some(http.back_readiness()),
             State::Http2 => todo!(),
             State::WebSocket(ref mut pipe) => Some(&mut pipe.back_readiness),
@@ -690,6 +740,7 @@ impl Session {
         self.front_timeout.cancel();
 
         match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref mut http) => http.cancel_timeouts(),
             State::WebSocket(ref mut pipe) => pipe.cancel_timeouts(),
             _ => {}
@@ -698,6 +749,7 @@ impl Session {
 
     fn cancel_backend_timeout(&mut self) {
         match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref mut http) => http.cancel_backend_timeout(),
             _ => {}
         }
@@ -720,6 +772,7 @@ impl Session {
                 .map(|r| r.event.is_hup())
                 .unwrap_or(false);
             let back_is_alive = match self.state {
+                State::Invalid => unreachable!(),
                 State::Http(ref mut http) => http.test_back_socket(),
                 _ => false,
             };
@@ -941,6 +994,7 @@ impl Session {
             self.set_back_connected(BackendConnectionStatus::NotConnected);
 
             match self.state {
+                State::Invalid => unreachable!(),
                 State::Http(ref mut http) => {
                     http.clear_back_token();
                     http.remove_backend();
@@ -961,6 +1015,7 @@ impl Session {
 
     fn check_backend_connection(&mut self) -> bool {
         let is_valid_backend_socket = match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref http) => http.is_valid_backend_socket(),
             _ => false,
         };
@@ -971,6 +1026,7 @@ impl Session {
             self.metrics.backend_start();
 
             let backend = match self.state {
+                State::Invalid => unreachable!(),
                 State::Http(ref mut http) => http.backend_data.as_mut(),
                 _ => None,
             };
@@ -982,6 +1038,7 @@ impl Session {
 
     pub fn extract_route(&self) -> Result<(&str, &str, &Method), ConnectionError> {
         let request_state = match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref http) => http.request_state.as_ref(),
             _ => None,
         };
@@ -1007,6 +1064,7 @@ impl Session {
 
                 //FIXME: what if we don't use SNI?
                 let servername = match self.state {
+                    State::Invalid => unreachable!(),
                     State::Http(ref http) => http.frontend.session.sni_hostname(),
                     _ => None,
                 };
@@ -1051,6 +1109,7 @@ impl Session {
         front_should_stick: bool,
     ) -> Result<MioTcpStream, ConnectionError> {
         let request_state = match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref mut http) => http.request_state.as_ref(),
             _ => None,
         };
@@ -1101,6 +1160,7 @@ impl Session {
                     ));
 
                     match self.state {
+                        State::Invalid => unreachable!(),
                         State::Http(ref mut http) => {
                             http.sticky_session = sticky_session;
                             http.sticky_name = sticky_name;
@@ -1112,6 +1172,7 @@ impl Session {
                 self.metrics.backend_start();
 
                 match self.state {
+                    State::Invalid => unreachable!(),
                     State::Http(ref mut http) => {
                         http.set_backend_id(backend.borrow().backend_id.clone())
                     }
@@ -1159,6 +1220,7 @@ impl Session {
         session_rc: Rc<RefCell<dyn ProxySession>>,
     ) -> Result<BackendConnectAction, ConnectionError> {
         let old_cluster_id = match &self.state {
+            State::Invalid => unreachable!(),
             State::Http(http) => http.cluster_id.clone(),
             _ => None,
         };
@@ -1208,6 +1270,7 @@ impl Session {
 
         self.cluster_id = Some(requested_cluster_id.clone());
         match &mut self.state {
+            State::Invalid => unreachable!(),
             State::Http(http) => http.cluster_id = Some(requested_cluster_id.clone()),
             _ => {}
         }
@@ -1290,6 +1353,7 @@ impl Session {
 
         self.set_back_socket(socket);
         match &mut self.state {
+            State::Invalid => unreachable!(),
             State::Http(http) => http.set_back_timeout(connect_timeout),
             _ => {}
         }
@@ -1301,6 +1365,7 @@ impl ProxySession for Session {
     fn close(&mut self) {
         //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.frontend_token, *self.temp.front_buf, *self.temp.back_buf);
         match &mut self.state {
+            State::Invalid => unreachable!(),
             State::Http(http) => http.close(),
             _ => (),
         }
@@ -1318,6 +1383,7 @@ impl ProxySession for Session {
         self.close_backend();
 
         match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref mut http) => {
                 //if the state was initial, the connection was already reset
                 if http.request_state != Some(RequestState::Initial) {
@@ -1350,6 +1416,7 @@ impl ProxySession for Session {
 
     fn timeout(&mut self, token: Token) {
         let session_result = match self.state {
+            State::Invalid => unreachable!(),
             State::Expect(_, _) => {
                 if token == self.frontend_token {
                     self.front_timeout.triggered();
@@ -1406,6 +1473,7 @@ impl ProxySession for Session {
 
     fn shutting_down(&mut self) {
         let session_result = match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref mut http) => http.shutting_down(),
             State::Handshake(_) => SessionResult::Continue,
             _ => SessionResult::CloseSession,
@@ -1428,6 +1496,7 @@ impl ProxySession for Session {
 
     fn print_state(&self) {
         let protocol: String = match &self.state {
+            State::Invalid => unreachable!(),
             State::Expect(_, _) => String::from("Expect"),
             State::Handshake(_) => String::from("Handshake"),
             State::Http(h) => h.print_state("HTTPS"),
@@ -1436,6 +1505,7 @@ impl ProxySession for Session {
         };
 
         let front_readiness = match self.state {
+            State::Invalid => unreachable!(),
             State::Expect(ref expect, _) => &expect.readiness,
             State::Handshake(ref handshake) => &handshake.readiness,
             State::Http(ref http) => &http.front_readiness,
@@ -1443,6 +1513,7 @@ impl ProxySession for Session {
             State::WebSocket(ref pipe) => &pipe.front_readiness,
         };
         let back_readiness = match self.state {
+            State::Invalid => unreachable!(),
             State::Http(ref http) => Some(&http.back_readiness),
             State::Http2 => todo!(),
             State::WebSocket(ref pipe) => Some(&pipe.back_readiness),
@@ -1618,55 +1689,64 @@ impl Listener {
         config: &HttpsListener,
         resolver: Arc<MutexWrappedCertificateResolver>,
     ) -> Result<ServerConfig, ListenerError> {
-        let server_config = ServerConfig::builder();
-        let server_config = if !config.cipher_list.is_empty() {
-            let mut ciphers = Vec::new();
-            for cipher in config.cipher_list.iter() {
-                match cipher.as_str() {
-                    "TLS13_CHACHA20_POLY1305_SHA256" => {
-                        ciphers.push(TLS13_CHACHA20_POLY1305_SHA256)
-                    }
-                    "TLS13_AES_256_GCM_SHA384" => ciphers.push(TLS13_AES_256_GCM_SHA384),
-                    "TLS13_AES_128_GCM_SHA256" => ciphers.push(TLS13_AES_128_GCM_SHA256),
-                    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => {
-                        ciphers.push(TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
-                    }
-                    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => {
-                        ciphers.push(TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256)
-                    }
-                    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => {
-                        ciphers.push(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384)
-                    }
-                    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => {
-                        ciphers.push(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
-                    }
-                    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => {
-                        ciphers.push(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384)
-                    }
-                    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => {
-                        ciphers.push(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256)
-                    }
-                    s => error!("unknown cipher: {:?}", s),
-                }
-            }
-            server_config.with_cipher_suites(&ciphers[..])
+        let cipher_names = if config.cipher_list.is_empty() {
+            DEFAULT_CIPHER_SUITES.to_vec()
         } else {
-            server_config.with_safe_default_cipher_suites()
+            config
+                .cipher_list
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
         };
-        let server_config = server_config.with_safe_default_kx_groups();
-        let mut versions = Vec::new();
-        for version in config.versions.iter() {
-            match version {
-                TlsVersion::TLSv1_2 => versions.push(&rustls::version::TLS12),
-                TlsVersion::TLSv1_3 => versions.push(&rustls::version::TLS13),
-                s => error!("unsupported TLS version: {:?}", s),
-            }
-        }
-        let server_config = server_config
+
+        #[cfg_attr(rustfmt, rustfmt_skip)]
+        let ciphers = cipher_names
+            .into_iter()
+            .filter_map(|cipher| match cipher {
+                "TLS13_CHACHA20_POLY1305_SHA256" => Some(TLS13_CHACHA20_POLY1305_SHA256),
+                "TLS13_AES_256_GCM_SHA384" => Some(TLS13_AES_256_GCM_SHA384),
+                "TLS13_AES_128_GCM_SHA256" => Some(TLS13_AES_128_GCM_SHA256),
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256" => Some(TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256),
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256" => Some(TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256),
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384" => Some(TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384),
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" => Some(TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384" => Some(TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" => Some(TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
+                other_cipher => {
+                    error!("unknown cipher: {:?}", other_cipher);
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let versions = config
+            .versions
+            .iter()
+            .filter_map(|version| match version {
+                TlsVersion::TLSv1_2 => Some(&rustls::version::TLS12),
+                TlsVersion::TLSv1_3 => Some(&rustls::version::TLS13),
+                other_version => {
+                    error!("unsupported TLS version: {:?}", other_version);
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut server_config = ServerConfig::builder()
+            .with_cipher_suites(&ciphers[..])
+            .with_safe_default_kx_groups()
             .with_protocol_versions(&versions[..])
-            .map_err(|err| ListenerError::BuildRustlsError(err.to_string()))?;
-        let server_config = server_config.with_no_client_auth();
-        Ok(server_config.with_cert_resolver(resolver))
+            .map_err(|err| ListenerError::BuildRustlsError(err.to_string()))?
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+
+        let mut protocols = SERVER_PROTOS
+            .iter()
+            .map(|proto| proto.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        server_config.alpn_protocols.append(&mut protocols);
+
+        Ok(server_config)
     }
 
     pub fn add_https_front(&mut self, tls_front: HttpFrontend) -> bool {
