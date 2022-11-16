@@ -16,7 +16,7 @@ use time::{Duration, Instant};
 use crate::{
     backends::BackendMap,
     features::FEATURES,
-    http, https_merge,
+    http, https,
     metrics::METRICS,
     pool::Pool,
     sozu_command::{
@@ -260,7 +260,7 @@ pub struct Server {
     accept_ready: HashSet<ListenToken>,
     channel: ProxyChannel,
     http: Rc<RefCell<http::Proxy>>,
-    https: Rc<RefCell<https_merge::Proxy>>,
+    https: Rc<RefCell<https::Proxy>>,
     tcp: Rc<RefCell<tcp::Proxy>>,
     config_state: ConfigState,
     scm: ScmSocket,
@@ -327,7 +327,7 @@ impl Server {
             .try_clone()
             .with_context(|| "could not clone the mio Registry")?;
 
-        let https = https_merge::Proxy::new(
+        let https = https::Proxy::new(
             registry,
             sessions.clone(),
             pool.clone(),
@@ -358,7 +358,7 @@ impl Server {
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
         http: Option<http::Proxy>,
-        https: Option<https_merge::Proxy>,
+        https: Option<https::Proxy>,
         tcp: Option<tcp::Proxy>,
         server_config: ServerConfig,
         config_state: Option<ConfigState>,
@@ -405,7 +405,7 @@ impl Server {
                     .try_clone()
                     .with_context(|| "could not clone the mio Registry")?;
 
-                https_merge::Proxy::new(
+                https::Proxy::new(
                     registry,
                     sessions.clone(),
                     pool.clone(),

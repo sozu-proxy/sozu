@@ -113,7 +113,7 @@ fn main() -> anyhow::Result<()> {
     let jg2 = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::https_merge::start(
+        sozu::https::start(
             config,
             channel2,
             max_buffers,

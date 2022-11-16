@@ -199,7 +199,7 @@ mod splice;
 pub mod server;
 pub mod tcp;
 
-pub mod https_merge;
+pub mod https;
 
 use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
 
@@ -566,7 +566,7 @@ impl Default for Readiness {
 }
 
 impl Readiness {
-    pub fn new() -> Readiness {
+    pub const fn new() -> Readiness {
         Readiness {
             event: Ready::empty(),
             interest: Ready::empty(),
