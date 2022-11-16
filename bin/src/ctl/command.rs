@@ -761,7 +761,7 @@ impl CommandManager {
             }
             match response.status {
                 CommandStatus::Processing => println!("Proxy is processing: {}", response.message),
-                CommandStatus::Error => bail!("could not execute order: {}", response.message),
+                CommandStatus::Error => bail!("Order failed: {}", response.message),
                 CommandStatus::Ok => {
                     println!("Success: {}", response.message);
                     break;
