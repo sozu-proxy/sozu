@@ -37,12 +37,13 @@ use crate::{
         },
         ready::Ready,
         scm_socket::ScmSocket,
+        state::ClusterId,
     },
     timer::TimeoutContainer,
     util::UnwrapLog,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
-    ConnectionError, ListenerHandler, Protocol, ProxyConfiguration, ProxySession, Readiness,
-    SessionMetrics, SessionResult,
+    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ConnectionError,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
+    SessionResult,
 };
 
 pub enum UpgradeResult {
@@ -1199,7 +1200,7 @@ impl Proxy {
             })
             .collect()
     }
-    
+
     // TODO: return Result with context
     pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, TcpListener)> {
         self.listeners

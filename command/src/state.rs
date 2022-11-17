@@ -23,6 +23,7 @@ use crate::{
     },
 };
 
+/// To use throughout Sōzu
 pub type ClusterId = String;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

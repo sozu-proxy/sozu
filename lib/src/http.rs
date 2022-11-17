@@ -47,9 +47,9 @@ use super::{
         push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, CONN_RETRIES,
     },
     socket::server_bind,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
-    ConnectionError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
-    SessionResult,
+    sozu_command::state::ClusterId,
+    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ConnectionError, Protocol,
+    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult,
 };
 
 #[derive(PartialEq, Eq)]

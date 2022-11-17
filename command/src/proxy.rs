@@ -19,7 +19,7 @@ use crate::{
         ProxyProtocolConfig, DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST,
         DEFAULT_RUSTLS_CIPHER_LIST, DEFAULT_SIGNATURE_ALGORITHMS,
     },
-    state::RouteKey,
+    state::{ClusterId, RouteKey},
 };
 
 pub type MessageId = String;
@@ -294,7 +294,7 @@ impl<'de> serde::Deserialize<'de> for CertificateFingerprint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Cluster {
-    pub cluster_id: String,
+    pub cluster_id: ClusterId,
     #[serde(default)]
     #[serde(skip_serializing_if = "is_false")]
     pub sticky_session: bool,
@@ -390,10 +390,8 @@ impl std::fmt::Display for PathRule {
 pub enum Route {
     /// send a 401 default answer
     Deny,
-    /// Routes to a cluster.
-    // TODO: create a custom type `ClusterId`
     /// the cluster to which the frontend belongs
-    ClusterId(String),
+    ClusterId(ClusterId),
 }
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]

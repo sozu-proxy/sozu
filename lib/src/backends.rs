@@ -4,10 +4,13 @@ use mio::net::TcpStream;
 
 use crate::{
     server::push_event,
-    sozu_command::proxy::{self, LoadBalancingAlgorithms},
+    sozu_command::{
+        proxy::{self, LoadBalancingAlgorithms},
+        state::ClusterId,
+    },
 };
 
-use super::{load_balancing::*, Backend, ClusterId, ConnectionError};
+use super::{load_balancing::*, Backend, ConnectionError};
 
 #[derive(Debug)]
 pub struct BackendMap {
