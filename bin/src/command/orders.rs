@@ -23,8 +23,7 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proxy::{
         AggregatedMetricsData, MetricsConfiguration, ProxyRequest, ProxyRequestOrder,
-        ProxyResponseContent, ProxyResponseStatus, Query, QueryAnswer, QueryClusterType, Route,
-        TcpFrontend,
+        ProxyResponseContent, ProxyResponseStatus, Query, QueryAnswer, QueryClusterType,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -104,9 +103,10 @@ impl CommandServer {
                 info!("{}", success);
                 return_success(self.command_tx.clone(), cloned_identifier, success).await;
             }
-            Err(error_message) => {
-                error!("{}", error_message);
-                return_error(self.command_tx.clone(), cloned_identifier, error_message).await;
+            Err(anyhow_error) => {
+                let formatted = format!("{:#}", anyhow_error);
+                error!("{:#}", formatted);
+                return_error(self.command_tx.clone(), cloned_identifier, formatted).await;
             }
             Ok(None) => {
                 // do nothing here. Ok(None) means the function has already returned its result
@@ -239,7 +239,7 @@ impl CommandServer {
                         if let CommandRequestOrder::Proxy(order) = request.order {
                             message_counter += 1;
 
-                            if self.state.handle_order(&order) {
+                            if self.state.handle_order(&order).is_ok() {
                                 diff_counter += 1;
 
                                 let mut found = false;
@@ -800,7 +800,7 @@ impl CommandServer {
 
         for message in new_config.generate_config_messages() {
             if let CommandRequestOrder::Proxy(order) = message.order {
-                if self.state.handle_order(&order) {
+                if self.state.handle_order(&order).is_ok() {
                     diff_counter += 1;
 
                     let mut found = false;
@@ -1210,41 +1210,9 @@ impl CommandServer {
             debug!("workerconfig client order {:?}", order);
         }
 
-        if !self.state.handle_order(&order) {
-            // Check if the backend or frontend exist before deleting it
-            if worker_id.is_none() {
-                match order {
-                    ProxyRequestOrder::RemoveBackend(ref backend) => {
-                        bail!(format!(
-                            "cannot remove backend: cluster {} has no backends {} at {}",
-                            backend.cluster_id, backend.backend_id, backend.address,
-                        ));
-                    }
-                    ProxyRequestOrder::RemoveHttpFrontend(h)
-                    | ProxyRequestOrder::RemoveHttpsFrontend(h) => {
-                        let msg = match h.route {
-                            Route::ClusterId(cluster_id) => format!(
-                                "No such frontend at {} for the cluster {}",
-                                h.address, cluster_id
-                            ),
-                            Route::Deny => format!("No such frontend at {}", h.address),
-                        };
-                        bail!(msg);
-                    }
-                    ProxyRequestOrder::RemoveTcpFrontend(TcpFrontend {
-                        ref cluster_id,
-                        ref address,
-                        ref tags,
-                    }) => {
-                        bail!(format!(
-                            "cannot remove TCP frontend: cluster {} has no frontends at {} (custom tags: {:?})",
-                            cluster_id, address, tags
-                        ));
-                    }
-                    _ => {}
-                };
-            }
-        }
+        self.state
+            .handle_order(&order)
+            .with_context(|| "Could not execute order on the state")?;
 
         if self.config.automatic_state_save
             & (order != ProxyRequestOrder::SoftStop || order != ProxyRequestOrder::HardStop)

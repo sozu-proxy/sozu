@@ -1,11 +1,16 @@
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{
+        btree_map::Entry as BTreeMapEntry,
+        hash_map::{DefaultHasher, Entry as HashMapEntry},
+        BTreeMap, BTreeSet, HashMap, HashSet,
+    },
     fmt,
     hash::{Hash, Hasher},
     iter::{repeat, FromIterator},
     net::SocketAddr,
 };
 
+use anyhow::{bail, Context};
 use serde::de::{self, Visitor};
 
 use crate::{
@@ -14,7 +19,7 @@ use crate::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, DeactivateListener, HttpFrontend, HttpListener, HttpsListener, ListenerType,
         PathRule, ProxyRequestOrder, QueryAnswerCluster, RemoveBackend, RemoveCertificate,
-        RemoveListener, Route, TcpFrontend, TcpListener,
+        RemoveListener, ReplaceCertificate, Route, TcpFrontend, TcpListener,
     },
 };
 
@@ -70,265 +75,400 @@ impl ConfigState {
         self.https_addresses.push(address)
     }
 
-    /// returns true if the order modified something
-    pub fn handle_order(&mut self, order: &ProxyRequestOrder) -> bool {
+    pub fn handle_order(&mut self, order: &ProxyRequestOrder) -> anyhow::Result<()> {
         match order {
-            &ProxyRequestOrder::AddCluster(ref cluster) => {
-                let cluster = cluster.clone();
-                self.clusters.insert(cluster.cluster_id.clone(), cluster);
-                true
-            }
-            &ProxyRequestOrder::RemoveCluster { ref cluster_id } => {
-                self.clusters.remove(cluster_id).is_some()
-            }
-            &ProxyRequestOrder::AddHttpListener(ref listener) => {
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    self.http_listeners.entry(listener.address)
-                {
-                    e.insert((listener.clone(), false));
-                    true
-                } else {
-                    false
-                }
-            }
-            &ProxyRequestOrder::AddHttpsListener(ref listener) => {
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    self.https_listeners.entry(listener.address)
-                {
-                    e.insert((listener.clone(), false));
-                    true
-                } else {
-                    false
-                }
-            }
-            &ProxyRequestOrder::AddTcpListener(ref listener) => {
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    self.tcp_listeners.entry(listener.address)
-                {
-                    e.insert((listener.clone(), false));
-                    true
-                } else {
-                    false
-                }
-            }
-            &ProxyRequestOrder::RemoveListener(ref remove) => match remove.proxy {
-                ListenerType::HTTP => self.http_listeners.remove(&remove.address).is_some(),
-                ListenerType::HTTPS => self.https_listeners.remove(&remove.address).is_some(),
-                ListenerType::TCP => self.tcp_listeners.remove(&remove.address).is_some(),
-            },
-            &ProxyRequestOrder::ActivateListener(ref activate) => match activate.proxy {
-                ListenerType::HTTP => self
-                    .http_listeners
-                    .get_mut(&activate.address)
-                    .map(|t| t.1 = true)
-                    .is_some(),
-                ListenerType::HTTPS => self
-                    .https_listeners
-                    .get_mut(&activate.address)
-                    .map(|t| t.1 = true)
-                    .is_some(),
-                ListenerType::TCP => self
-                    .tcp_listeners
-                    .get_mut(&activate.address)
-                    .map(|t| t.1 = true)
-                    .is_some(),
-            },
-            &ProxyRequestOrder::DeactivateListener(ref deactivate) => match deactivate.proxy {
-                ListenerType::HTTP => self
-                    .http_listeners
-                    .get_mut(&deactivate.address)
-                    .map(|t| t.1 = false)
-                    .is_some(),
-                ListenerType::HTTPS => self
-                    .https_listeners
-                    .get_mut(&deactivate.address)
-                    .map(|t| t.1 = false)
-                    .is_some(),
-                ListenerType::TCP => self
-                    .tcp_listeners
-                    .get_mut(&deactivate.address)
-                    .map(|t| t.1 = false)
-                    .is_some(),
-            },
-            &ProxyRequestOrder::AddHttpFrontend(ref front) => {
-                if let std::collections::btree_map::Entry::Vacant(e) =
-                    self.http_fronts.entry(RouteKey(
-                        front.address,
-                        front.hostname.to_string(),
-                        front.path.clone(),
-                        front.method.clone(),
-                    ))
-                {
-                    e.insert(front.clone());
-                    true
-                } else {
-                    false
-                }
-            }
+            &ProxyRequestOrder::AddCluster(ref cluster) => self
+                .add_cluster(cluster)
+                .with_context(|| "Could not add cluster"),
+            &ProxyRequestOrder::RemoveCluster { ref cluster_id } => self
+                .remove_cluster(cluster_id)
+                .with_context(|| "Could not remove cluster"),
+            &ProxyRequestOrder::AddHttpListener(ref listener) => self
+                .add_http_listener(listener)
+                .with_context(|| "Could not add HTTP listener"),
+            &ProxyRequestOrder::AddHttpsListener(ref listener) => self
+                .add_https_listener(listener)
+                .with_context(|| "Could not add HTTPS listener"),
+            &ProxyRequestOrder::AddTcpListener(ref listener) => self
+                .add_tcp_listener(listener)
+                .with_context(|| "Could not add TCP listener"),
+            &ProxyRequestOrder::RemoveListener(ref remove) => self
+                .remove_listener(remove)
+                .with_context(|| "Could not remove listener"),
+            &ProxyRequestOrder::ActivateListener(ref activate) => self
+                .activate_listener(activate)
+                .with_context(|| "Could not activate listener"),
+            &ProxyRequestOrder::DeactivateListener(ref deactivate) => self
+                .deactivate_listener(deactivate)
+                .with_context(|| "Could not deactivate listener"),
+            &ProxyRequestOrder::AddHttpFrontend(ref front) => self
+                .add_http_frontend(front)
+                .with_context(|| "Could not add HTTP frontend"),
             &ProxyRequestOrder::RemoveHttpFrontend(ref front) => self
-                .http_fronts
-                .remove(&RouteKey(
-                    front.address,
-                    front.hostname.to_string(),
-                    front.path.clone(),
-                    front.method.clone(),
-                ))
-                .is_some(),
-            &ProxyRequestOrder::AddCertificate(ref add) => {
-                let fingerprint =
-                    match calculate_fingerprint(add.certificate.certificate.as_bytes()) {
-                        Ok(f) => CertificateFingerprint(f),
-                        Err(e) => {
-                            error!(
-                                "cannot obtain the certificate's fingerprint: {}",
-                                e.to_string()
-                            );
-                            return false;
-                        }
-                    };
-
-                self.certificates
-                    .entry(add.address)
-                    .or_insert_with(HashMap::new);
-                if !self
-                    .certificates
-                    .get(&add.address)
-                    .unwrap()
-                    .contains_key(&fingerprint)
-                {
-                    self.certificates
-                        .get_mut(&add.address)
-                        .unwrap()
-                        .insert(fingerprint, (add.certificate.clone(), add.names.clone()));
-                    true
-                } else {
-                    false
-                }
-            }
+                .remove_http_frontend(front)
+                .with_context(|| "Could not remove HTTP frontend"),
+            &ProxyRequestOrder::AddCertificate(ref add) => self
+                .add_certificate(add)
+                .with_context(|| "Could not add certificate"),
             &ProxyRequestOrder::RemoveCertificate(ref remove) => self
-                .certificates
-                .get_mut(&remove.address)
-                .and_then(|certs| certs.remove(&remove.fingerprint))
-                .is_some(),
-            &ProxyRequestOrder::ReplaceCertificate(ref replace) => {
-                let changed = self
-                    .certificates
-                    .get_mut(&replace.address)
-                    .and_then(|certs| certs.remove(&replace.old_fingerprint))
-                    .is_some();
-
-                let fingerprint =
-                    match calculate_fingerprint(replace.new_certificate.certificate.as_bytes()) {
-                        Ok(f) => CertificateFingerprint(f),
-                        Err(e) => {
-                            error!(
-                                "cannot obtain the certificate's fingerprint: {}",
-                                e.to_string()
-                            );
-                            return changed;
-                        }
-                    };
-
-                if !self
-                    .certificates
-                    .get(&replace.address)
-                    .unwrap()
-                    .contains_key(&fingerprint)
-                {
-                    self.certificates.get_mut(&replace.address).map(|certs| {
-                        certs.insert(
-                            fingerprint.clone(),
-                            (replace.new_certificate.clone(), replace.new_names.clone()),
-                        )
-                    });
-
-                    true
-                } else {
-                    changed
-                }
-            }
-            &ProxyRequestOrder::AddHttpsFrontend(ref front) => {
-                if let std::collections::btree_map::Entry::Vacant(e) =
-                    self.https_fronts.entry(RouteKey(
-                        front.address,
-                        front.hostname.to_string(),
-                        front.path.clone(),
-                        front.method.clone(),
-                    ))
-                {
-                    e.insert(front.clone());
-                    true
-                } else {
-                    false
-                }
-            }
+                .remove_certificate(remove)
+                .with_context(|| "Could not remove certificate"),
+            &ProxyRequestOrder::ReplaceCertificate(ref replace) => self
+                .replace_certificate(replace)
+                .with_context(|| "Could not replace certificate"),
+            &ProxyRequestOrder::AddHttpsFrontend(ref front) => self
+                .add_http_frontend(front)
+                .with_context(|| "Could not add HTTPS frontend"),
             &ProxyRequestOrder::RemoveHttpsFrontend(ref front) => self
-                .https_fronts
-                .remove(&RouteKey(
-                    front.address,
-                    front.hostname.to_string(),
-                    front.path.clone(),
-                    front.method.clone(),
-                ))
-                .is_some(),
-            &ProxyRequestOrder::AddTcpFrontend(ref front) => {
-                let front_vec = self
-                    .tcp_fronts
-                    .entry(front.cluster_id.clone())
-                    .or_insert_with(Vec::new);
-                if !front_vec.contains(front) {
-                    front_vec.push(front.clone());
-                    true
-                } else {
-                    false
-                }
-            }
-            &ProxyRequestOrder::RemoveTcpFrontend(ref front) => {
-                if let Some(front_list) = self.tcp_fronts.get_mut(&front.cluster_id) {
-                    let len = front_list.len();
-                    front_list.retain(|el| el.address != front.address);
-                    front_list.len() != len
-                } else {
-                    false
-                }
-            }
-            &ProxyRequestOrder::AddBackend(ref backend) => {
-                let backend_vec = self
-                    .backends
-                    .entry(backend.cluster_id.clone())
-                    .or_insert_with(Vec::new);
-
-                // we might be modifying the sticky id or load balancing parameters
-                backend_vec
-                    .retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
-                backend_vec.push(backend.clone());
-                backend_vec.sort();
-
-                true
-            }
-            &ProxyRequestOrder::RemoveBackend(ref backend) => {
-                if let Some(backend_list) = self.backends.get_mut(&backend.cluster_id) {
-                    let len = backend_list.len();
-                    backend_list.retain(|b| {
-                        b.backend_id != backend.backend_id || b.address != backend.address
-                    });
-                    backend_list.sort();
-                    backend_list.len() != len
-                } else {
-                    false
-                }
-            }
+                .remove_http_frontend(front)
+                .with_context(|| "Could not remove HTTPS frontend"),
+            &ProxyRequestOrder::AddTcpFrontend(ref front) => self
+                .add_tcp_frontend(front)
+                .with_context(|| "Could not add TCP frontend"),
+            &ProxyRequestOrder::RemoveTcpFrontend(ref front) => self
+                .remove_tcp_frontend(front)
+                .with_context(|| "Could not remove TCP frontend"),
+            &ProxyRequestOrder::AddBackend(ref backend) => self
+                .add_backend(backend)
+                .with_context(|| "Could not add backend"),
+            &ProxyRequestOrder::RemoveBackend(ref backend) => self
+                .remove_backend(backend)
+                .with_context(|| "Could not remove backend"),
             // This is to avoid the error message
             &ProxyRequestOrder::Logging(_)
             | &ProxyRequestOrder::Status
             | &ProxyRequestOrder::Query(_)
             | &ProxyRequestOrder::SoftStop
-            | &ProxyRequestOrder::HardStop => false,
-            o => {
-                error!("state cannot handle order message: {:#?}", o);
-                false
+            | &ProxyRequestOrder::HardStop => Ok(()),
+            other_order => {
+                bail!("state cannot handle order message: {:#?}", other_order);
             }
         }
+    }
+
+    fn add_cluster(&mut self, cluster: &Cluster) -> anyhow::Result<()> {
+        let cluster = cluster.clone();
+        self.clusters.insert(cluster.cluster_id.clone(), cluster);
+        Ok(())
+    }
+
+    fn remove_cluster(&mut self, cluster_id: &str) -> anyhow::Result<()> {
+        match self.clusters.remove(cluster_id) {
+            Some(_) => Ok(()),
+            None => bail!("No cluster found with this id"),
+        }
+    }
+
+    fn add_http_listener(&mut self, listener: &HttpListener) -> anyhow::Result<()> {
+        match self.http_listeners.entry(listener.address) {
+            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
+            HashMapEntry::Occupied(_) => {
+                bail!("The entry is occupied for address {}", listener.address)
+            }
+        };
+        Ok(())
+    }
+
+    fn add_https_listener(&mut self, listener: &HttpsListener) -> anyhow::Result<()> {
+        match self.https_listeners.entry(listener.address) {
+            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
+            HashMapEntry::Occupied(_) => {
+                bail!("The entry is occupied for address {}", listener.address)
+            }
+        };
+        Ok(())
+    }
+
+    fn add_tcp_listener(&mut self, listener: &TcpListener) -> anyhow::Result<()> {
+        match self.tcp_listeners.entry(listener.address) {
+            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
+            HashMapEntry::Occupied(_) => {
+                bail!("The entry is occupied for address {}", listener.address)
+            }
+        };
+        Ok(())
+    }
+
+    fn remove_listener(&mut self, remove: &RemoveListener) -> anyhow::Result<()> {
+        match remove.proxy {
+            ListenerType::HTTP => self.remove_http_listener(&remove.address),
+            ListenerType::HTTPS => self.remove_https_listener(&remove.address),
+            ListenerType::TCP => self.remove_tcp_listener(&remove.address),
+        }
+    }
+
+    fn remove_http_listener(&mut self, address: &SocketAddr) -> anyhow::Result<()> {
+        if self.http_listeners.remove(address).is_none() {
+            bail!("No http listener to remove at address {}", address);
+        }
+        Ok(())
+    }
+
+    fn remove_https_listener(&mut self, address: &SocketAddr) -> anyhow::Result<()> {
+        if self.https_listeners.remove(address).is_none() {
+            bail!("No https listener to remove at address {}", address);
+        }
+        Ok(())
+    }
+
+    fn remove_tcp_listener(&mut self, address: &SocketAddr) -> anyhow::Result<()> {
+        if self.tcp_listeners.remove(address).is_none() {
+            bail!("No tcp listener to remove at address {}", address);
+        }
+        Ok(())
+    }
+
+    fn activate_listener(&mut self, activate: &ActivateListener) -> anyhow::Result<()> {
+        match activate.proxy {
+            ListenerType::HTTP => {
+                if self
+                    .http_listeners
+                    .get_mut(&activate.address)
+                    .map(|t| t.1 = true)
+                    .is_none()
+                {
+                    bail!("No http listener found with address {}", activate.address)
+                }
+            }
+            ListenerType::HTTPS => {
+                if self
+                    .https_listeners
+                    .get_mut(&activate.address)
+                    .map(|t| t.1 = true)
+                    .is_none()
+                {
+                    bail!("No https listener found with address {}", activate.address)
+                }
+            }
+            ListenerType::TCP => {
+                if self
+                    .tcp_listeners
+                    .get_mut(&activate.address)
+                    .map(|t| t.1 = true)
+                    .is_none()
+                {
+                    bail!("No tcp listener found with address {}", activate.address)
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn deactivate_listener(&mut self, deactivate: &DeactivateListener) -> anyhow::Result<()> {
+        match deactivate.proxy {
+            ListenerType::HTTP => {
+                if self
+                    .http_listeners
+                    .get_mut(&deactivate.address)
+                    .map(|t| t.1 = false)
+                    .is_none()
+                {
+                    bail!("No http listener found with address {}", deactivate.address)
+                }
+            }
+            ListenerType::HTTPS => {
+                if self
+                    .https_listeners
+                    .get_mut(&deactivate.address)
+                    .map(|t| t.1 = false)
+                    .is_none()
+                {
+                    bail!(
+                        "No https listener found with address {}",
+                        deactivate.address
+                    )
+                }
+            }
+            ListenerType::TCP => {
+                if self
+                    .tcp_listeners
+                    .get_mut(&deactivate.address)
+                    .map(|t| t.1 = false)
+                    .is_none()
+                {
+                    bail!("No tcp listener found with address {}", deactivate.address)
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn add_http_frontend(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
+        match self.http_fronts.entry(RouteKey(
+            front.address,
+            front.hostname.to_string(),
+            front.path.clone(),
+            front.method.clone(),
+        )) {
+            BTreeMapEntry::Vacant(e) => e.insert(front.clone()),
+            BTreeMapEntry::Occupied(_) => bail!("This frontend is already present: {:?}", front),
+        };
+        Ok(())
+    }
+
+    fn remove_http_frontend(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
+        if self
+            .http_fronts
+            .remove(&RouteKey(
+                front.address,
+                front.hostname.to_string(),
+                front.path.clone(),
+                front.method.clone(),
+            ))
+            .is_none()
+        {
+            let error_msg = match &front.route {
+                Route::ClusterId(cluster_id) => format!(
+                    "No such frontend at {} for the cluster {}",
+                    front.address, cluster_id
+                ),
+                Route::Deny => format!("No such frontend at {}", front.address),
+            };
+            bail!(error_msg);
+        }
+        Ok(())
+    }
+
+    fn add_certificate(&mut self, add: &AddCertificate) -> anyhow::Result<()> {
+        let fingerprint = CertificateFingerprint(
+            calculate_fingerprint(add.certificate.certificate.as_bytes())
+                .with_context(|| "cannot calculate the certificate's fingerprint")?,
+        );
+
+        self.certificates
+            .entry(add.address)
+            .or_insert_with(HashMap::new);
+
+        if self
+            .certificates
+            .get(&add.address)
+            .unwrap() // is guaranted not to happen because filled with HashMap::new
+            .contains_key(&fingerprint)
+        {
+            bail!(
+                "A certificate is already present for address {}",
+                add.address
+            );
+        }
+
+        self.certificates
+            .get_mut(&add.address)
+            .unwrap() // is guaranted not to happen because filled with HashMap::new
+            .insert(fingerprint, (add.certificate.clone(), add.names.clone()));
+
+        Ok(())
+    }
+
+    fn remove_certificate(&mut self, remove: &RemoveCertificate) -> anyhow::Result<()> {
+        self.certificates
+            .get_mut(&remove.address)
+            .with_context(|| format!("No certificate to remove for address {}", remove.address))?
+            .remove(&remove.fingerprint);
+
+        Ok(())
+    }
+
+    /// - Remove old certificate from certificates, using the old fingerprint
+    /// - calculate the new fingerprint
+    /// - insert the new certificate with the new fingerprint as key
+    /// - check that the new entry is present in the certificates hashmap
+    fn replace_certificate(&mut self, replace: &ReplaceCertificate) -> anyhow::Result<()> {
+        self.certificates
+            .get_mut(&replace.address)
+            .with_context(|| format!("No certificate to replace for address {}", replace.address))?
+            .remove(&replace.old_fingerprint);
+
+        let new_fingerprint = CertificateFingerprint(
+            calculate_fingerprint(replace.new_certificate.certificate.as_bytes())
+                .with_context(|| "cannot obtain the certificate's fingerprint")?,
+        );
+
+        self.certificates.get_mut(&replace.address).map(|certs| {
+            certs.insert(
+                new_fingerprint.clone(),
+                (replace.new_certificate.clone(), replace.new_names.clone()),
+            )
+        });
+
+        if !self
+            .certificates
+            .get(&replace.address)
+            .with_context(|| {
+                "Unlikely error. This entry in the certificate hashmap should be present"
+            })?
+            .contains_key(&new_fingerprint)
+        {
+            bail!(format!(
+                "Failed to insert the new certificate for address {}",
+                replace.address
+            ))
+        }
+        Ok(())
+    }
+
+    fn add_tcp_frontend(&mut self, front: &TcpFrontend) -> anyhow::Result<()> {
+        let tcp_frontends = self
+            .tcp_fronts
+            .entry(front.cluster_id.clone())
+            .or_insert_with(Vec::new);
+        if tcp_frontends.contains(front) {
+            bail!("This tcp frontend is already present: {:?}", front);
+        }
+        tcp_frontends.push(front.clone());
+        Ok(())
+    }
+
+    fn remove_tcp_frontend(&mut self, front_to_remove: &TcpFrontend) -> anyhow::Result<()> {
+        let tcp_frontends = self
+            .tcp_fronts
+            .get_mut(&front_to_remove.cluster_id)
+            .with_context(|| {
+                format!(
+                    "cluster {} has no frontends at {} (custom tags: {:?})",
+                    front_to_remove.cluster_id, front_to_remove.address, front_to_remove.tags
+                )
+            })?;
+
+        let len = tcp_frontends.len();
+        tcp_frontends.retain(|front| front.address != front_to_remove.address);
+        if tcp_frontends.len() == len {
+            bail!("Removed no frontend");
+        }
+        Ok(())
+    }
+
+    fn add_backend(&mut self, backend: &Backend) -> anyhow::Result<()> {
+        let backends = self
+            .backends
+            .entry(backend.cluster_id.clone())
+            .or_insert_with(Vec::new);
+
+        // we might be modifying the sticky id or load balancing parameters
+        backends.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
+        backends.push(backend.clone());
+        backends.sort();
+
+        Ok(())
+    }
+
+    fn remove_backend(&mut self, backend: &RemoveBackend) -> anyhow::Result<()> {
+        let backend_list = self
+            .backends
+            .get_mut(&backend.cluster_id)
+            .with_context(|| {
+                format!(
+                    "cluster {} has no backends {} at {}",
+                    backend.cluster_id, backend.backend_id, backend.address,
+                )
+            })?;
+
+        let len = backend_list.len();
+        backend_list.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
+        backend_list.sort();
+        if backend_list.len() == len {
+            bail!("Removed no backend");
+        }
+        Ok(())
     }
 
     pub fn generate_orders(&self) -> Vec<ProxyRequestOrder> {
@@ -1058,61 +1198,75 @@ mod tests {
     #[test]
     fn serialize() {
         let mut state: ConfigState = Default::default();
-        state.handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
-            route: Route::ClusterId(String::from("cluster_1")),
-            hostname: String::from("lolcatho.st:8080"),
-            path: PathRule::Prefix(String::from("/")),
-            method: None,
-            address: "0.0.0.0:8080".parse().unwrap(),
-            position: RulePosition::Tree,
-            tags: None,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
-            route: Route::ClusterId(String::from("cluster_2")),
-            hostname: String::from("test.local"),
-            path: PathRule::Prefix(String::from("/abc")),
-            method: None,
-            address: "0.0.0.0:8080".parse().unwrap(),
-            position: RulePosition::Pre,
-            tags: None,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-0"),
-            address: "127.0.0.1:1026".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-1"),
-            address: "127.0.0.2:1027".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_2"),
-            backend_id: String::from("cluster_2-0"),
-            address: "192.167.1.2:1026".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-3"),
-            address: "192.168.1.3:1027".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
-        state.handle_order(&ProxyRequestOrder::RemoveBackend(RemoveBackend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-3"),
-            address: "192.168.1.3:1027".parse().unwrap(),
-        }));
+        state
+            .handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("cluster_1")),
+                hostname: String::from("lolcatho.st:8080"),
+                path: PathRule::Prefix(String::from("/")),
+                method: None,
+                address: "0.0.0.0:8080".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: None,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("cluster_2")),
+                hostname: String::from("test.local"),
+                path: PathRule::Prefix(String::from("/abc")),
+                method: None,
+                address: "0.0.0.0:8080".parse().unwrap(),
+                position: RulePosition::Pre,
+                tags: None,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-0"),
+                address: "127.0.0.1:1026".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-1"),
+                address: "127.0.0.2:1027".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_2"),
+                backend_id: String::from("cluster_2-0"),
+                address: "192.167.1.2:1026".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-3"),
+                address: "192.168.1.3:1027".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::RemoveBackend(RemoveBackend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-3"),
+                address: "192.168.1.3:1027".parse().unwrap(),
+            }))
+            .expect("Could not execute order");
 
         /*
         let encoded = state.encode();
@@ -1128,101 +1282,123 @@ mod tests {
     #[test]
     fn diff() {
         let mut state: ConfigState = Default::default();
-        state.handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
-            route: Route::ClusterId(String::from("cluster_1")),
-            hostname: String::from("lolcatho.st:8080"),
-            path: PathRule::Prefix(String::from("/")),
-            method: None,
-            address: "0.0.0.0:8080".parse().unwrap(),
-            position: RulePosition::Post,
-            tags: None,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
-            route: Route::ClusterId(String::from("cluster_2")),
-            hostname: String::from("test.local"),
-            path: PathRule::Prefix(String::from("/abc")),
-            method: None,
-            address: "0.0.0.0:8080".parse().unwrap(),
-            position: RulePosition::Tree,
-            tags: None,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-0"),
-            address: "127.0.0.1:1026".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-1"),
-            address: "127.0.0.2:1027".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_2"),
-            backend_id: String::from("cluster_2-0"),
-            address: "192.167.1.2:1026".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddCluster(Cluster {
-            cluster_id: String::from("cluster_2"),
-            sticky_session: true,
-            https_redirect: true,
-            proxy_protocol: None,
-            load_balancing: LoadBalancingAlgorithms::RoundRobin,
-            load_metric: None,
-            answer_503: None,
-        }));
+        state
+            .handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("cluster_1")),
+                hostname: String::from("lolcatho.st:8080"),
+                path: PathRule::Prefix(String::from("/")),
+                method: None,
+                address: "0.0.0.0:8080".parse().unwrap(),
+                position: RulePosition::Post,
+                tags: None,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("cluster_2")),
+                hostname: String::from("test.local"),
+                path: PathRule::Prefix(String::from("/abc")),
+                method: None,
+                address: "0.0.0.0:8080".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: None,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-0"),
+                address: "127.0.0.1:1026".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-1"),
+                address: "127.0.0.2:1027".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_2"),
+                backend_id: String::from("cluster_2-0"),
+                address: "192.167.1.2:1026".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddCluster(Cluster {
+                cluster_id: String::from("cluster_2"),
+                sticky_session: true,
+                https_redirect: true,
+                proxy_protocol: None,
+                load_balancing: LoadBalancingAlgorithms::RoundRobin,
+                load_metric: None,
+                answer_503: None,
+            }))
+            .expect("Could not execute order");
 
         let mut state2: ConfigState = Default::default();
-        state2.handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
-            route: Route::ClusterId(String::from("cluster_1")),
-            hostname: String::from("lolcatho.st:8080"),
-            path: PathRule::Prefix(String::from("/")),
-            address: "0.0.0.0:8080".parse().unwrap(),
-            method: None,
-            position: RulePosition::Post,
-            tags: None,
-        }));
-        state2.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-0"),
-            address: "127.0.0.1:1026".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
-        state2.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-1"),
-            address: "127.0.0.2:1027".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
-        state2.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-2"),
-            address: "127.0.0.2:1028".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
-        state2.handle_order(&ProxyRequestOrder::AddCluster(Cluster {
-            cluster_id: String::from("cluster_3"),
-            sticky_session: false,
-            https_redirect: false,
-            proxy_protocol: None,
-            load_balancing: LoadBalancingAlgorithms::RoundRobin,
-            load_metric: None,
-            answer_503: None,
-        }));
+        state2
+            .handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("cluster_1")),
+                hostname: String::from("lolcatho.st:8080"),
+                path: PathRule::Prefix(String::from("/")),
+                address: "0.0.0.0:8080".parse().unwrap(),
+                method: None,
+                position: RulePosition::Post,
+                tags: None,
+            }))
+            .expect("Could not execute order");
+        state2
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-0"),
+                address: "127.0.0.1:1026".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
+        state2
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-1"),
+                address: "127.0.0.2:1027".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
+        state2
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-2"),
+                address: "127.0.0.2:1028".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
+        state2
+            .handle_order(&ProxyRequestOrder::AddCluster(Cluster {
+                cluster_id: String::from("cluster_3"),
+                sticky_session: false,
+                https_redirect: false,
+                proxy_protocol: None,
+                load_balancing: LoadBalancingAlgorithms::RoundRobin,
+                load_metric: None,
+                answer_503: None,
+            }))
+            .expect("Could not execute order");
 
         let e = vec![
             ProxyRequestOrder::RemoveHttpFrontend(HttpFrontend {
@@ -1270,14 +1446,16 @@ mod tests {
         let hash1 = state.hash_state();
         let hash2 = state2.hash_state();
         let mut state3 = state.clone();
-        state3.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-2"),
-            address: "127.0.0.2:1028".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
+        state3
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-2"),
+                address: "127.0.0.2:1028".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
         let hash3 = state3.hash_state();
         println!("state 1 hashes: {:#?}", hash1);
         println!("state 2 hashes: {:#?}", hash2);
@@ -1335,10 +1513,18 @@ mod tests {
             ProxyRequestOrder::AddHttpsFrontend(https_front_cluster1);
         let add_https_front_order_cluster2 =
             ProxyRequestOrder::AddHttpsFrontend(https_front_cluster2);
-        config.handle_order(&add_http_front_order_cluster1);
-        config.handle_order(&add_http_front_order_cluster2);
-        config.handle_order(&add_https_front_order_cluster1);
-        config.handle_order(&add_https_front_order_cluster2);
+        config
+            .handle_order(&add_http_front_order_cluster1)
+            .expect("Could not execute order");
+        config
+            .handle_order(&add_http_front_order_cluster2)
+            .expect("Could not execute order");
+        config
+            .handle_order(&add_https_front_order_cluster1)
+            .expect("Could not execute order");
+        config
+            .handle_order(&add_https_front_order_cluster2)
+            .expect("Could not execute order");
 
         let mut cluster1_cluster2: HashSet<ClusterId> = HashSet::new();
         cluster1_cluster2.insert(String::from("MyCluster_1"));
@@ -1377,14 +1563,16 @@ mod tests {
     #[test]
     fn duplicate_backends() {
         let mut state: ConfigState = Default::default();
-        state.handle_order(&ProxyRequestOrder::AddBackend(Backend {
-            cluster_id: String::from("cluster_1"),
-            backend_id: String::from("cluster_1-0"),
-            address: "127.0.0.1:1026".parse().unwrap(),
-            load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
-        }));
+        state
+            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+                cluster_id: String::from("cluster_1"),
+                backend_id: String::from("cluster_1-0"),
+                address: "127.0.0.1:1026".parse().unwrap(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            }))
+            .expect("Could not execute order");
 
         let b = Backend {
             cluster_id: String::from("cluster_1"),
@@ -1395,7 +1583,9 @@ mod tests {
             backup: None,
         };
 
-        state.handle_order(&ProxyRequestOrder::AddBackend(b.clone()));
+        state
+            .handle_order(&ProxyRequestOrder::AddBackend(b.clone()))
+            .expect("Could not execute order");
 
         assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
     }
@@ -1403,110 +1593,130 @@ mod tests {
     #[test]
     fn listener_diff() {
         let mut state: ConfigState = Default::default();
-        state.handle_order(&ProxyRequestOrder::AddTcpListener(TcpListener {
-            address: "0.0.0.0:1234".parse().unwrap(),
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-        }));
-        state.handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
-            address: "0.0.0.0:1234".parse().unwrap(),
-            proxy: ListenerType::TCP,
-            from_scm: false,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddHttpListener(HttpListener {
-            address: "0.0.0.0:8080".parse().unwrap(),
-            public_address: None,
-            expect_proxy: false,
-            answer_404: String::new(),
-            answer_503: String::new(),
-            sticky_name: String::new(),
-            front_timeout: 60,
-            request_timeout: 10,
-            back_timeout: 30,
-            connect_timeout: 3,
-        }));
-        state.handle_order(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
-            address: "0.0.0.0:8443".parse().unwrap(),
-            public_address: None,
-            expect_proxy: false,
-            answer_404: String::new(),
-            answer_503: String::new(),
-            sticky_name: String::new(),
-            versions: vec![],
-            cipher_list: vec![],
-            cipher_suites: vec![],
-            signature_algorithms: vec![],
-            groups_list: vec![],
-            tls_provider: TlsProvider::Openssl,
-            certificate: None,
-            certificate_chain: vec![],
-            key: None,
-            front_timeout: 60,
-            request_timeout: 10,
-            back_timeout: 30,
-            connect_timeout: 3,
-        }));
-        state.handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
-            address: "0.0.0.0:8443".parse().unwrap(),
-            proxy: ListenerType::HTTPS,
-            from_scm: false,
-        }));
+        state
+            .handle_order(&ProxyRequestOrder::AddTcpListener(TcpListener {
+                address: "0.0.0.0:1234".parse().unwrap(),
+                public_address: None,
+                expect_proxy: false,
+                front_timeout: 60,
+                back_timeout: 30,
+                connect_timeout: 3,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
+                address: "0.0.0.0:1234".parse().unwrap(),
+                proxy: ListenerType::TCP,
+                from_scm: false,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddHttpListener(HttpListener {
+                address: "0.0.0.0:8080".parse().unwrap(),
+                public_address: None,
+                expect_proxy: false,
+                answer_404: String::new(),
+                answer_503: String::new(),
+                sticky_name: String::new(),
+                front_timeout: 60,
+                request_timeout: 10,
+                back_timeout: 30,
+                connect_timeout: 3,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
+                address: "0.0.0.0:8443".parse().unwrap(),
+                public_address: None,
+                expect_proxy: false,
+                answer_404: String::new(),
+                answer_503: String::new(),
+                sticky_name: String::new(),
+                versions: vec![],
+                cipher_list: vec![],
+                cipher_suites: vec![],
+                signature_algorithms: vec![],
+                groups_list: vec![],
+                tls_provider: TlsProvider::Openssl,
+                certificate: None,
+                certificate_chain: vec![],
+                key: None,
+                front_timeout: 60,
+                request_timeout: 10,
+                back_timeout: 30,
+                connect_timeout: 3,
+            }))
+            .expect("Could not execute order");
+        state
+            .handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
+                address: "0.0.0.0:8443".parse().unwrap(),
+                proxy: ListenerType::HTTPS,
+                from_scm: false,
+            }))
+            .expect("Could not execute order");
 
         let mut state2: ConfigState = Default::default();
-        state2.handle_order(&ProxyRequestOrder::AddTcpListener(TcpListener {
-            address: "0.0.0.0:1234".parse().unwrap(),
-            public_address: None,
-            expect_proxy: true,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-        }));
-        state2.handle_order(&ProxyRequestOrder::AddHttpListener(HttpListener {
-            address: "0.0.0.0:8080".parse().unwrap(),
-            public_address: None,
-            expect_proxy: false,
-            answer_404: "test".to_string(),
-            answer_503: String::new(),
-            sticky_name: String::new(),
-            front_timeout: 60,
-            request_timeout: 10,
-            back_timeout: 30,
-            connect_timeout: 3,
-        }));
-        state2.handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
-            address: "0.0.0.0:8080".parse().unwrap(),
-            proxy: ListenerType::HTTP,
-            from_scm: false,
-        }));
-        state2.handle_order(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
-            address: "0.0.0.0:8443".parse().unwrap(),
-            public_address: None,
-            expect_proxy: false,
-            answer_404: String::from("test"),
-            answer_503: String::new(),
-            sticky_name: String::new(),
-            versions: vec![],
-            cipher_list: vec![],
-            cipher_suites: vec![],
-            signature_algorithms: vec![],
-            groups_list: vec![],
-            tls_provider: TlsProvider::Openssl,
-            certificate: None,
-            certificate_chain: vec![],
-            key: None,
-            front_timeout: 60,
-            request_timeout: 10,
-            back_timeout: 30,
-            connect_timeout: 3,
-        }));
-        state2.handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
-            address: "0.0.0.0:8443".parse().unwrap(),
-            proxy: ListenerType::HTTPS,
-            from_scm: false,
-        }));
+        state2
+            .handle_order(&ProxyRequestOrder::AddTcpListener(TcpListener {
+                address: "0.0.0.0:1234".parse().unwrap(),
+                public_address: None,
+                expect_proxy: true,
+                front_timeout: 60,
+                back_timeout: 30,
+                connect_timeout: 3,
+            }))
+            .expect("Could not execute order");
+        state2
+            .handle_order(&ProxyRequestOrder::AddHttpListener(HttpListener {
+                address: "0.0.0.0:8080".parse().unwrap(),
+                public_address: None,
+                expect_proxy: false,
+                answer_404: "test".to_string(),
+                answer_503: String::new(),
+                sticky_name: String::new(),
+                front_timeout: 60,
+                request_timeout: 10,
+                back_timeout: 30,
+                connect_timeout: 3,
+            }))
+            .expect("Could not execute order");
+        state2
+            .handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
+                address: "0.0.0.0:8080".parse().unwrap(),
+                proxy: ListenerType::HTTP,
+                from_scm: false,
+            }))
+            .expect("Could not execute order");
+        state2
+            .handle_order(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
+                address: "0.0.0.0:8443".parse().unwrap(),
+                public_address: None,
+                expect_proxy: false,
+                answer_404: String::from("test"),
+                answer_503: String::new(),
+                sticky_name: String::new(),
+                versions: vec![],
+                cipher_list: vec![],
+                cipher_suites: vec![],
+                signature_algorithms: vec![],
+                groups_list: vec![],
+                tls_provider: TlsProvider::Openssl,
+                certificate: None,
+                certificate_chain: vec![],
+                key: None,
+                front_timeout: 60,
+                request_timeout: 10,
+                back_timeout: 30,
+                connect_timeout: 3,
+            }))
+            .expect("Could not execute order");
+        state2
+            .handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
+                address: "0.0.0.0:8443".parse().unwrap(),
+                proxy: ListenerType::HTTPS,
+                from_scm: false,
+            }))
+            .expect("Could not execute order");
 
         let e = vec![
             ProxyRequestOrder::RemoveListener(RemoveListener {

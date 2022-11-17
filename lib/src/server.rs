@@ -159,7 +159,7 @@ impl SessionManager {
     }
 
     pub fn check_limits(&mut self) -> bool {
-        // this should be self.nb_connections >= self.max_connections 
+        // this should be self.nb_connections >= self.max_connections
         if self.nb_connections == self.max_connections {
             error!("max number of session connection reached, flushing the accept queue");
             gauge!("accept_queue.backpressure", 1);
@@ -933,7 +933,9 @@ impl Server {
     }
 
     pub fn notify_proxys(&mut self, message: ProxyRequest) {
-        self.config_state.handle_order(&message.order);
+        if let Err(e) = self.config_state.handle_order(&message.order) {
+            error!("Could not execute order on config state: {:#}", e);
+        }
 
         match message {
             ProxyRequest {
