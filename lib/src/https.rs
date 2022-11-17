@@ -34,7 +34,7 @@ use crate::{
     buffer_queue::BufferQueue,
     pool::Pool,
     protocol::{
-        // h2::Http2,
+        h2::Http2,
         http::{
             answers::HttpAnswers,
             parser::{hostname_and_port, Method, RequestState},
@@ -42,10 +42,7 @@ use crate::{
         },
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake as RustlsHandshake,
-        Http,
-        Pipe,
-        ProtocolResult,
-        StickySession,
+        Http, Pipe, ProtocolResult, StickySession,
     },
     retry::RetryPolicy,
     router::Router,
@@ -75,7 +72,8 @@ use crate::{
     SessionMetrics, SessionResult,
 };
 
-const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
+// const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
+const SERVER_PROTOS: &[&str] = &["http/1.1"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsCluster {
@@ -89,7 +87,7 @@ pub enum State {
     Handshake(RustlsHandshake),
     Http(Http<FrontRustls, Listener>),
     WebSocket(Pipe<FrontRustls, Listener>),
-    Http2,
+    Http2(Http2<FrontRustls>),
     /// Temporary state used to extract and take ownership over the previous state.
     /// It should always be replaced by the next valid state and thus never be encountered.
     Invalid,
@@ -208,7 +206,7 @@ impl Session {
             State::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
             State::Handshake(handshake) => self.upgrade_handshake(handshake),
             State::Http(http) => self.upgrade_http(http),
-            State::Http2 => self.upgrade_http2(),
+            State::Http2(_) => self.upgrade_http2(),
             State::WebSocket(websocket) => self.upgrade_websocket(websocket),
         };
 
@@ -272,11 +270,17 @@ impl Session {
 
         let sni = handshake.session.sni_hostname();
         let alpn = handshake.session.alpn_protocol();
+        let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
         info!(
             "Successful TLS Handshake with, received: {:?} {:?}",
-            sni,
-            alpn.and_then(|alpn| from_utf8(alpn).ok())
+            sni, alpn
         );
+
+        let alpn = match alpn {
+            Some("http/1.1") => AlpnProtocols::Http11,
+            Some("h2") => AlpnProtocols::H2,
+            _ => todo!(),
+        };
 
         let mut front_buf = front_buf.unwrap();
         if let Some(version) = handshake.session.protocol_version() {
@@ -292,46 +296,68 @@ impl Session {
         };
 
         let readiness = handshake.readiness.clone();
-        let mut http = Http::new(
-            front_stream,
-            self.frontend_token,
-            handshake.request_id,
-            self.pool.clone(),
-            self.public_address,
-            self.peer_address,
-            self.sticky_name.clone(),
-            Protocol::HTTPS,
-            self.answers.clone(),
-            self.front_timeout.take(),
-            self.frontend_timeout_duration,
-            self.backend_timeout_duration,
-            self.listener.clone(),
-        );
-
-        let res = http.frontend.session.reader().read(front_buf.space());
-        match res {
-            Ok(sz) => {
-                //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-                front_buf.fill(sz);
-                count!("bytes_in", sz as i64);
-                self.metrics.bin += sz;
-            }
-            Err(e) => {
-                error!("read error: {:?}", e);
-            }
-        }
-
-        let sz = front_buf.available_data();
-        let mut buf = BufferQueue::with_buffer(front_buf);
-        buf.sliced_input(sz);
 
         gauge_add!("protocol.tls.handshake", -1);
-        gauge_add!("protocol.https", 1);
-        http.front_buf = Some(buf);
-        http.front_readiness = readiness;
-        http.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
+        match alpn {
+            AlpnProtocols::Http11 => {
+                let mut http = Http::new(
+                    front_stream,
+                    self.frontend_token,
+                    handshake.request_id,
+                    self.pool.clone(),
+                    self.public_address,
+                    self.peer_address,
+                    self.sticky_name.clone(),
+                    Protocol::HTTPS,
+                    self.answers.clone(),
+                    self.front_timeout.take(),
+                    self.frontend_timeout_duration,
+                    self.backend_timeout_duration,
+                    self.listener.clone(),
+                );
 
-        Some(State::Http(http))
+                let res = http.frontend.session.reader().read(front_buf.space());
+                match res {
+                    Ok(sz) => {
+                        //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
+                        front_buf.fill(sz);
+                        count!("bytes_in", sz as i64);
+                        self.metrics.bin += sz;
+                    }
+                    Err(e) => {
+                        error!("read error: {:?}", e);
+                    }
+                }
+
+                let sz = front_buf.available_data();
+                let mut buf = BufferQueue::with_buffer(front_buf);
+                buf.sliced_input(sz);
+
+                http.front_buf = Some(buf);
+                http.front_readiness = readiness;
+                http.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
+
+                gauge_add!("protocol.https", 1);
+                Some(State::Http(http))
+            }
+            AlpnProtocols::H2 => {
+                let mut http = Http2::new(
+                    front_stream,
+                    self.frontend_token,
+                    self.pool.clone(),
+                    Some(self.public_address),
+                    None,
+                    self.sticky_name.clone(),
+                );
+
+                http.frontend.readiness = readiness;
+                http.frontend.readiness.interest =
+                    Ready::readable() | Ready::hup() | Ready::error();
+
+                gauge_add!("protocol.http2", 1);
+                Some(State::Http2(http))
+            }
+        }
     }
 
     fn upgrade_http(&self, mut http: Http<FrontRustls, Listener>) -> Option<State> {
@@ -421,7 +447,7 @@ impl Session {
             State::WebSocket(pipe) => pipe.front_hup(&mut self.metrics),
             State::Handshake(_) => SessionResult::CloseSession,
             State::Expect(_, _) => SessionResult::CloseSession,
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         }
     }
 
@@ -438,7 +464,7 @@ impl Session {
                 error!("why a backend HUP event while still in frontend proxy protocol expect?");
                 SessionResult::CloseSession
             }
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         }
     }
 
@@ -467,7 +493,7 @@ impl Session {
             }
             State::Http(http) => (ProtocolResult::Continue, http.readable(&mut self.metrics)),
             State::WebSocket(pipe) => (ProtocolResult::Continue, pipe.readable(&mut self.metrics)),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         };
 
         if upgrade == ProtocolResult::Continue {
@@ -476,7 +502,7 @@ impl Session {
             match &mut self.state {
                 State::Invalid => unreachable!(),
                 State::Http(http) => http.readable(&mut self.metrics),
-                State::Http2 => todo!(),
+                State::Http2(_) => todo!(),
                 _ => session_result,
             }
         } else {
@@ -495,7 +521,7 @@ impl Session {
             State::WebSocket(ref mut pipe) => {
                 (ProtocolResult::Continue, pipe.writable(&mut self.metrics))
             }
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         };
 
         if upgrade == ProtocolResult::Continue {
@@ -520,7 +546,7 @@ impl Session {
                 ProtocolResult::Continue,
                 pipe.back_readable(&mut self.metrics),
             ),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         };
 
         if upgrade == ProtocolResult::Continue {
@@ -542,7 +568,7 @@ impl Session {
             State::Expect(_, _) | State::Handshake(_) => SessionResult::CloseSession,
             State::Http(ref mut http) => http.back_writable(&mut self.metrics),
             State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         }
     }
 
@@ -553,7 +579,7 @@ impl Session {
             State::Handshake(handshake) => Some(&handshake.stream),
             State::Http(http) => Some(http.front_socket()),
             State::WebSocket(pipe) => Some(pipe.front_socket()),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         }
     }
 
@@ -564,7 +590,7 @@ impl Session {
             State::Handshake(_) => None,
             State::Http(ref http) => http.back_socket(),
             State::WebSocket(ref pipe) => pipe.back_socket(),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         }
     }
 
@@ -575,7 +601,7 @@ impl Session {
             State::Handshake(_) => None,
             State::Http(ref http) => http.back_token(),
             State::WebSocket(ref pipe) => pipe.back_token(),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         }
     }
 
@@ -595,7 +621,7 @@ impl Session {
         match self.state {
             State::Invalid => unreachable!(),
             State::Http(ref mut http) => http.set_back_token(token),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
             State::WebSocket(ref mut pipe) => pipe.set_back_token(token),
             _ => {}
         }
@@ -687,7 +713,7 @@ impl Session {
             State::Handshake(ref mut handshake) => &mut handshake.readiness,
             State::Http(ref mut http) => http.front_readiness(),
             State::WebSocket(ref mut pipe) => &mut pipe.front_readiness,
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         }
     }
 
@@ -695,7 +721,7 @@ impl Session {
         match self.state {
             State::Invalid => unreachable!(),
             State::Http(ref mut http) => Some(http.back_readiness()),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
             State::WebSocket(ref mut pipe) => Some(&mut pipe.back_readiness),
             _ => None,
         }
@@ -1403,7 +1429,7 @@ impl ProxySession for Session {
             }
             State::Expect(_, _) => gauge_add!("protocol.proxy.expect", -1),
             State::Handshake(_) => gauge_add!("protocol.tls.handshake", -1),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         }
 
         if let Some(fd) = self.front_socket().map(|stream| stream.as_raw_fd()) {
@@ -1431,7 +1457,7 @@ impl ProxySession for Session {
             }
             State::WebSocket(ref mut pipe) => pipe.timeout(token, &mut self.metrics),
             State::Http(ref mut http) => http.timeout(token, &mut self.metrics),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
         };
 
         if session_result == SessionResult::CloseSession {
@@ -1500,7 +1526,7 @@ impl ProxySession for Session {
             State::Expect(_, _) => String::from("Expect"),
             State::Handshake(_) => String::from("Handshake"),
             State::Http(h) => h.print_state("HTTPS"),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
             State::WebSocket(_) => String::from("WSS"),
         };
 
@@ -1509,13 +1535,13 @@ impl ProxySession for Session {
             State::Expect(ref expect, _) => &expect.readiness,
             State::Handshake(ref handshake) => &handshake.readiness,
             State::Http(ref http) => &http.front_readiness,
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
             State::WebSocket(ref pipe) => &pipe.front_readiness,
         };
         let back_readiness = match self.state {
             State::Invalid => unreachable!(),
             State::Http(ref http) => Some(&http.back_readiness),
-            State::Http2 => todo!(),
+            State::Http2(_) => todo!(),
             State::WebSocket(ref pipe) => Some(&pipe.back_readiness),
             _ => None,
         };

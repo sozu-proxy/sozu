@@ -49,7 +49,6 @@ impl<Front: SocketHandler> Http2<Front> {
         public_address: Option<SocketAddr>,
         client_address: Option<SocketAddr>,
         sticky_name: String,
-        protocol: Protocol,
     ) -> Http2<Front> {
         let request_id = Ulid::generate();
         let log_ctx = format!("{}\tunknown\t", &request_id);
