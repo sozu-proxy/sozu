@@ -151,32 +151,12 @@ impl Listener {
             ..Default::default()
         };
 
-        //FIXME: error messages if file not found?
-        // sure, this sounds good, that's a TODO
-        let mut answer_404 = String::new();
-        if self
-            .answer_404
-            .as_ref()
-            .and_then(|path| File::open(path).ok())
-            .and_then(|mut file| file.read_to_string(&mut answer_404).ok())
-            .is_some()
-        {
-            configuration.answer_404 = answer_404;
-        } else {
-            configuration.answer_404 = String::from(include_str!("../assets/404.html"));
-        }
-        let mut answer_503 = String::new();
-        if self
-            .answer_503
-            .as_ref()
-            .and_then(|path| File::open(path).ok())
-            .and_then(|mut file| file.read_to_string(&mut answer_503).ok())
-            .is_some()
-        {
-            configuration.answer_503 = answer_503;
-        } else {
-            configuration.answer_503 = String::from(include_str!("../assets/503.html"));
-        }
+        let (answer_404, answer_503) = self
+            .get_404_503_answers()
+            .with_context(|| "Could not get 404 and 503 answers from file system")?;
+        configuration.answer_404 = answer_404;
+        configuration.answer_503 = answer_503;
+
         Ok(configuration)
     }
 
@@ -255,31 +235,12 @@ impl Listener {
             ..Default::default()
         };
 
-        let mut answer_404 = String::new();
-        if self
-            .answer_404
-            .as_ref()
-            .and_then(|path| File::open(path).ok())
-            .and_then(|mut file| file.read_to_string(&mut answer_404).ok())
-            .is_some()
-        {
-            configuration.answer_404 = answer_404;
-        } else {
-            configuration.answer_404 = String::from(include_str!("../assets/404.html"));
-        }
+        let (answer_404, answer_503) = self
+            .get_404_503_answers()
+            .with_context(|| "Could not get 404 and 503 answers from file system")?;
+        configuration.answer_404 = answer_404;
+        configuration.answer_503 = answer_503;
 
-        let mut answer_503 = String::new();
-        if self
-            .answer_503
-            .as_ref()
-            .and_then(|path| File::open(path).ok())
-            .and_then(|mut file| file.read_to_string(&mut answer_503).ok())
-            .is_some()
-        {
-            configuration.answer_503 = answer_503;
-        } else {
-            configuration.answer_503 = String::from(include_str!("../assets/503.html"));
-        }
         if let Some(cipher_list) = self.cipher_list.as_ref() {
             configuration.cipher_list = cipher_list.clone();
         }
@@ -318,6 +279,47 @@ impl Listener {
             back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
             connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
         })
+    }
+
+    fn get_404_503_answers(&self) -> anyhow::Result<(String, String)> {
+        let answer_404 = match &self.answer_404 {
+            Some(a_404_path) => {
+                let mut a_404 = String::new();
+                let mut file = File::open(a_404_path).with_context(|| {
+                    format!(
+                        "Could not open 404 answer file on path {}, current dir {:?}",
+                        a_404_path,
+                        std::env::current_dir().ok()
+                    )
+                })?;
+
+                file.read_to_string(&mut a_404).with_context(|| {
+                    format!(
+                        "Could not read 404 answer file on path {}, current dir {:?}",
+                        a_404_path,
+                        std::env::current_dir().ok()
+                    )
+                })?;
+                a_404
+            }
+            None => String::from(include_str!("../assets/404.html")),
+        };
+
+        let answer_503 = match &self.answer_503 {
+            Some(a_503_path) => {
+                let mut a_503 = String::new();
+                let mut file = File::open(a_503_path).with_context(|| {
+                    format!("Could not open 503 answer file on path {}", a_503_path)
+                })?;
+
+                file.read_to_string(&mut a_503).with_context(|| {
+                    format!("Could not read 503 answer file on path {}", a_503_path)
+                })?;
+                a_503
+            }
+            None => String::from(include_str!("../assets/503.html")),
+        };
+        Ok((answer_404, answer_503))
     }
 }
 
@@ -1450,8 +1452,9 @@ mod tests {
     #[test]
     fn parse() {
         let path = "assets/config.toml";
-        let config = Config::load_from_path(path)
-            .unwrap_or_else(|_| panic!("Cannot load config from path {}", path));
+        let config = Config::load_from_path(path).unwrap_or_else(|load_error| {
+            panic!("Cannot load config from path {}: {:?}", path, load_error)
+        });
         println!("config: {:#?}", config);
         //panic!();
     }
