@@ -294,12 +294,7 @@ impl ConfigState {
     }
 
     fn add_http_frontend(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
-        match self.http_fronts.entry(RouteKey(
-            front.address,
-            front.hostname.to_string(),
-            front.path.clone(),
-            front.method.clone(),
-        )) {
+        match self.http_fronts.entry(front.route_key()) {
             BTreeMapEntry::Vacant(e) => e.insert(front.clone()),
             BTreeMapEntry::Occupied(_) => bail!("This frontend is already present: {:?}", front),
         };
@@ -307,16 +302,7 @@ impl ConfigState {
     }
 
     fn remove_http_frontend(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
-        if self
-            .http_fronts
-            .remove(&RouteKey(
-                front.address,
-                front.hostname.to_string(),
-                front.path.clone(),
-                front.method.clone(),
-            ))
-            .is_none()
-        {
+        if self.http_fronts.remove(&front.route_key()).is_none() {
             let error_msg = match &front.route {
                 Route::ClusterId(cluster_id) => format!(
                     "No such frontend at {} for the cluster {}",
@@ -1793,24 +1779,28 @@ mod tests {
     }
 }
 
-/// `RouteKey` is a the routing key built from the following tuple.
-/// The tuple is made of (socket address, hostname, path, method).
+/// `RouteKey` is the routing key built from the following tuple.
 // TODO: Create a custom type for the hostname and use a common type for the method.
 #[derive(PartialOrd, Ord, Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RouteKey(pub SocketAddr, pub String, pub PathRule, pub Option<String>);
+pub struct RouteKey {
+    pub address: SocketAddr,
+    hostname: String,
+    pub path_rule: PathRule,
+    pub method: Option<String>,
+}
 
 impl serde::Serialize for RouteKey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let mut s = match &self.2 {
-            PathRule::Prefix(prefix) => format!("{};{};P{}", self.0, self.1, prefix),
-            PathRule::Regex(regex) => format!("{};{};R{}", self.0, self.1, regex),
-            PathRule::Equals(path) => format!("{};{};={}", self.0, self.1, path),
+        let mut s = match &self.path_rule {
+            PathRule::Prefix(prefix) => format!("{};{};P{}", self.address, self.hostname, prefix),
+            PathRule::Regex(regex) => format!("{};{};R{}", self.address, self.hostname, regex),
+            PathRule::Equals(path) => format!("{};{};={}", self.address, self.hostname, path),
         };
 
-        if let Some(method) = &self.3 {
+        if let Some(method) = &self.method {
             s = format!("{};{}", s, method);
         }
 
@@ -1820,12 +1810,23 @@ impl serde::Serialize for RouteKey {
 
 impl From<HttpFrontend> for RouteKey {
     fn from(frontend: HttpFrontend) -> Self {
-        Self(
-            frontend.address,
-            frontend.hostname,
-            frontend.path,
-            frontend.method,
-        )
+        Self {
+            address: frontend.address,
+            hostname: frontend.hostname,
+            path_rule: frontend.path,
+            method: frontend.method,
+        }
+    }
+}
+
+impl From<&HttpFrontend> for RouteKey {
+    fn from(frontend: &HttpFrontend) -> Self {
+        Self {
+            address: frontend.address,
+            hostname: frontend.hostname.clone(),
+            path_rule: frontend.path.clone(),
+            method: frontend.method.clone(),
+        }
     }
 }
 
@@ -1868,7 +1869,12 @@ impl<'de> Visitor<'de> for RouteKeyVisitor {
 
         let method = it.next().map(String::from);
 
-        Ok(RouteKey(address, hostname.to_string(), path_rule, method))
+        Ok(RouteKey {
+            address,
+            hostname: hostname.to_string(),
+            path_rule,
+            method,
+        })
     }
 }
 

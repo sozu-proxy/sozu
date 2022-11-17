@@ -419,7 +419,7 @@ impl HttpFrontend {
     }
 
     /// `route_key` returns a representation of the frontend as a route key
-    pub fn route_key(self) -> RouteKey {
+    pub fn route_key(&self) -> RouteKey {
         self.into()
     }
 }
