@@ -412,7 +412,7 @@ impl CommandServer {
         let UpgradeData {
             command_socket_fd: command,
             config,
-            workers,
+            workers: serialized_workers,
             state,
             next_id,
         } = upgrade_data;
@@ -474,41 +474,45 @@ impl CommandServer {
 
         let tx = command_tx.clone();
 
-        let workers: Vec<Worker> = workers
-            .iter()
-            .filter_map(move |serialized| {
-                if serialized.run_state == RunState::Stopped
-                    || serialized.run_state == RunState::Stopping
-                {
-                    return None;
-                }
+        let mut workers: Vec<Worker> = Vec::new();
 
-                let (worker_tx, worker_rx) = channel(10000);
-                let sender = Some(worker_tx);
+        for serialized in serialized_workers.iter() {
+            if serialized.run_state == RunState::Stopped
+                || serialized.run_state == RunState::Stopping
+            {
+                continue;
+            }
 
-                debug!("deserializing worker: {:?}", serialized);
-                let stream = Async::new(unsafe { UnixStream::from_raw_fd(serialized.fd) }).unwrap();
+            let (worker_tx, worker_rx) = channel(10000);
+            let sender = Some(worker_tx);
 
-                let id = serialized.id;
-                let command_tx = tx.clone();
-                //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
-                smol::spawn(async move {
-                    worker_loop(id, stream, command_tx, worker_rx).await;
-                })
-                .detach();
+            debug!("deserializing worker: {:?}", serialized);
+            let worker_stream = Async::new(unsafe { UnixStream::from_raw_fd(serialized.fd) })
+                .with_context(|| "Could not create an async unix stream to spawn the worker")?;
 
-                Some(Worker {
-                    worker_channel_fd: serialized.fd,
-                    id: serialized.id,
-                    worker_channel: None,
-                    sender,
-                    pid: serialized.pid,
-                    run_state: serialized.run_state,
-                    queue: serialized.queue.clone().into(),
-                    scm_socket: ScmSocket::new(serialized.scm),
-                })
+            let id = serialized.id;
+            let command_tx = tx.clone();
+            //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
+            smol::spawn(async move {
+                worker_loop(id, worker_stream, command_tx, worker_rx).await;
             })
-            .collect();
+            .detach();
+
+            let scm_socket = ScmSocket::new(serialized.scm)
+                .with_context(|| "Could not get scm to create worker")?;
+
+            let worker = Worker {
+                worker_channel_fd: serialized.fd,
+                id: serialized.id,
+                worker_channel: None,
+                sender,
+                pid: serialized.pid,
+                run_state: serialized.run_state,
+                queue: serialized.queue.clone().into(),
+                scm_socket,
+            };
+            workers.push(worker);
+        }
 
         let config_state = state.clone();
 

@@ -398,6 +398,7 @@ pub enum SessionResult {
     ConnectBackend,
 }
 
+// TODO: enrich with thiserror
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConnectionError {
     NoHostGiven,

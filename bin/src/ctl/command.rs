@@ -59,10 +59,9 @@ impl CommandManager {
     ) -> anyhow::Result<()> {
         let command_request = CommandRequest::new(id.to_string(), command_request_order, None);
 
-        if !self.channel.write_message(&command_request) {
-            bail!("Could not write the request");
-        }
-        Ok(())
+        self.channel
+            .write_message(&command_request)
+            .with_context(|| "Could not write the request")
     }
 
     fn read_channel_message_with_timeout(&mut self) -> anyhow::Result<CommandResponse> {
@@ -167,11 +166,13 @@ impl CommandManager {
         println!("shutting down proxy");
         let id = generate_id();
 
-        self.channel.write_message(&CommandRequest::new(
-            id.clone(),
-            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::SoftStop)),
-            proxy_id,
-        ));
+        self.channel
+            .write_message(&CommandRequest::new(
+                id.clone(),
+                CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::SoftStop)),
+                proxy_id,
+            ))
+            .with_context(|| "Could not send the request using the channel")?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -200,11 +201,14 @@ impl CommandManager {
     pub fn hard_stop(&mut self, proxy_id: Option<u32>) -> Result<(), anyhow::Error> {
         println!("shutting down proxy");
         let id = generate_id();
-        self.channel.write_message(&CommandRequest::new(
-            id.clone(),
-            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::HardStop)),
-            proxy_id,
-        ));
+        self.channel
+            .write_message(&CommandRequest::new(
+                id.clone(),
+                CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::HardStop)),
+                proxy_id,
+            ))
+            .with_context(|| "Could not send the request using the channel")?;
+
         loop {
             let response = self.read_channel_message_with_timeout()?;
 

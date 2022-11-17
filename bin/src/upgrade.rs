@@ -88,14 +88,25 @@ pub fn fork_main_into_new_main(
         upgrade_data.config.command_buffer_size,
         upgrade_data.config.max_command_buffer_size,
     );
-    fork_confirmation_channel.blocking();
+
+    if let Err(e) = fork_confirmation_channel.blocking() {
+        error!(
+            "Could not block the fork confirmation channel: {}. This is not normal, you may need to restart sozu",
+            e
+        );
+    }
 
     info!("launching new main");
-    //FIXME: remove the expect, return a result?
     match unsafe { fork().with_context(|| "fork failed")? } {
         ForkResult::Parent { child } => {
             info!("main launched: {}", child);
-            fork_confirmation_channel.nonblocking();
+
+            if let Err(e) = fork_confirmation_channel.nonblocking() {
+                error!(
+                    "Could not unblock the fork confirmation channel: {}. This is not normal, you may need to restart sozu", 
+                    e
+                );
+            }
 
             Ok((child.into(), fork_confirmation_channel))
         }
@@ -131,7 +142,10 @@ pub fn begin_new_main_process(
         max_command_buffer_size,
     );
 
-    fork_confirmation_channel.blocking();
+    // DISCUSS: should we propagate the error instead of printing it?
+    if let Err(e) = fork_confirmation_channel.blocking() {
+        error!("Could not block the fork confirmation channel: {}", e);
+    }
 
     let upgrade_file = unsafe { File::from_raw_fd(upgrade_file_fd) };
     let upgrade_data: UpgradeData =
@@ -147,7 +161,9 @@ pub fn begin_new_main_process(
     info!("starting new main loop");
     match util::write_pid_file(&config) {
         Ok(()) => {
-            fork_confirmation_channel.write_message(&true);
+            fork_confirmation_channel
+                .write_message(&true)
+                .with_context(|| "Could not send confirmation of fork using the channel")?;
             future::block_on(async {
                 server.run().await;
             });
@@ -155,7 +171,9 @@ pub fn begin_new_main_process(
             Ok(())
         }
         Err(e) => {
-            fork_confirmation_channel.write_message(&false);
+            fork_confirmation_channel
+                .write_message(&false)
+                .with_context(|| "Could not send fork failure message using the channel")?;
             error!("Couldn't write PID file. Error: {:?}", e);
             error!("Couldn't upgrade main process");
             bail!("begin_new_main_process() failed");

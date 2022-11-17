@@ -51,6 +51,7 @@ impl BackendMap {
             .add_backend(backend);
     }
 
+    // TODO: return anyhow::Result with context, log the error downstream
     pub fn remove_backend(&mut self, cluster_id: &str, backend_address: &SocketAddr) {
         if let Some(backends) = self.backends.get_mut(cluster_id) {
             backends.remove_backend(backend_address);
@@ -62,6 +63,7 @@ impl BackendMap {
         }
     }
 
+    // TODO: return anyhow::Result with context, log the error downstream
     pub fn close_backend_connection(&mut self, cluster_id: &str, addr: &SocketAddr) {
         if let Some(cluster_backends) = self.backends.get_mut(cluster_id) {
             if let Some(ref mut backend) = cluster_backends.find_backend(addr) {
@@ -77,6 +79,8 @@ impl BackendMap {
             .unwrap_or(false)
     }
 
+    // TODO: remove if lets
+    // TODO: return anyhow::Result with context, log the error downstream
     pub fn backend_from_cluster_id(
         &mut self,
         cluster_id: &str,
@@ -130,6 +134,7 @@ impl BackendMap {
         }
     }
 
+    // TODO: return anyhow::Result with context, log the error downstream
     pub fn backend_from_sticky_session(
         &mut self,
         cluster_id: &str,

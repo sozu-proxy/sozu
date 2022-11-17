@@ -529,7 +529,12 @@ impl CommandServer {
             fork_main_into_new_main(self.executable_path.clone(), upgrade_data)
                 .with_context(|| "Could not start a new main process")?;
 
-        fork_confirmation_channel.blocking();
+        if let Err(e) = fork_confirmation_channel.blocking() {
+            error!(
+                "Could not block the fork confirmation channel: {}. This is not normal, you may need to restart sozu",
+                e
+            );
+        }
         let received_ok_from_new_process = fork_confirmation_channel.read_message();
         debug!("upgrade channel sent {:?}", received_ok_from_new_process);
 
@@ -543,13 +548,13 @@ impl CommandServer {
             error!("could not close the accept loop: {:?}", e);
         }
 
-        match received_ok_from_new_process {
-            Some(true) => {
-                info!("wrote final message, closing");
-                Ok(Some(Success::UpgradeMain(new_main_pid)))
-            }
-            _ => bail!("could not upgrade main process"),
+        if !received_ok_from_new_process
+            .with_context(|| "Did not receive fork confirmation from new worker")?
+        {
+            bail!("forking the new worker failed")
         }
+        info!("wrote final message, closing");
+        Ok(Some(Success::UpgradeMain(new_main_pid)))
     }
 
     pub async fn upgrade_worker(
@@ -644,7 +649,8 @@ impl CommandServer {
 
             info!("sent ReturnListenSockets to old worker");
 
-            // should we notify the command server here?
+            let cloned_command_tx = self.command_tx.clone();
+            let cloned_req_id = request_identifier.clone();
             smol::spawn(async move {
                 while let Some((proxy_response, _)) = sockets_return_rx.next().await {
                     match proxy_response.status {
@@ -656,7 +662,7 @@ impl CommandServer {
                             info!("returnsockets processing");
                         }
                         ProxyResponseStatus::Error(message) => {
-                            info!("return sockets error: {:?}", message);
+                            return_error(cloned_command_tx, cloned_req_id, message).await;
                             break;
                         }
                     };
@@ -666,10 +672,11 @@ impl CommandServer {
 
             let mut counter = 0usize;
 
-            //FIXME: use blocking
             loop {
-                info!("waiting for scm sockets");
-                old_worker.scm_socket.set_blocking(true);
+                info!("waiting for listen sockets from the old worker");
+                if let Err(e) = old_worker.scm_socket.set_blocking(true) {
+                    error!("Could not set the old worker socket to blocking: {}", e);
+                };
                 match old_worker.scm_socket.receive_listeners() {
                     Ok(l) => {
                         listeners = Some(l);
@@ -688,14 +695,14 @@ impl CommandServer {
                     }
                 }
             }
-            info!("got scm sockets");
+            info!("got the listen sockets from the old worker");
             old_worker.run_state = RunState::Stopping;
 
             let (softstop_tx, mut softstop_rx) = futures::channel::mpsc::channel(10);
-            let id = format!("{}-softstop", request_identifier.client);
-            self.in_flight.insert(id.clone(), (softstop_tx, 1));
+            let softstop_id = format!("{}-softstop", request_identifier.client);
+            self.in_flight.insert(softstop_id.clone(), (softstop_tx, 1));
             old_worker
-                .send(id.clone(), ProxyRequestOrder::SoftStop)
+                .send(softstop_id.clone(), ProxyRequestOrder::SoftStop)
                 .await;
 
             let mut command_tx = self.command_tx.clone();
@@ -1264,7 +1271,6 @@ impl CommandServer {
                 stopping_workers.insert(worker.id);
             }
 
-            // TODO:
             // let request_id = request_identifier.to_worker_request_id();
             let req_id = format!("{}-worker-{}", request_identifier.client, worker.id);
             worker.send(req_id.clone(), order.clone()).await;

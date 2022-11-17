@@ -83,6 +83,7 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
             self.readiness.event.remove(Ready::readable());
         }
 
+        // TODO: rename to socket_result, pattern match
         if res == SocketResult::Error {
             error!("[{:?}] (expect proxy) front socket error, closing the connection(read {}, wrote {})", self.frontend_token, metrics.bin, metrics.bout);
             metrics.service_stop();

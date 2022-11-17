@@ -1084,6 +1084,7 @@ impl Listener {
         }
     }
 
+    // TODO: return Result with context
     pub fn activate(
         &mut self,
         registry: &Registry,
@@ -1150,6 +1151,7 @@ impl Proxy {
         }
     }
 
+    // TODO: return Result with context
     pub fn add_listener(
         &mut self,
         config: TcpListenerConfig,
@@ -1172,6 +1174,7 @@ impl Proxy {
         self.listeners.len() < len
     }
 
+    // TODO: return Result with context
     pub fn activate_listener(
         &self,
         addr: &SocketAddr,
@@ -1196,7 +1199,8 @@ impl Proxy {
             })
             .collect()
     }
-
+    
+    // TODO: return Result with context
     pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, TcpListener)> {
         self.listeners
             .values()
@@ -1517,7 +1521,8 @@ pub fn start(
     let _ = configuration.activate_listener(&address, None);
     let (scm_server, _scm_client) =
         UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
-
+    let scm_socket =
+        ScmSocket::new(scm_server.as_raw_fd()).with_context(|| "Could not create scm socket")?;
     let server_config = server::ServerConfig {
         max_connections: max_buffers,
         ..Default::default()
@@ -1526,7 +1531,7 @@ pub fn start(
     let mut server = Server::new(
         poll,
         channel,
-        ScmSocket::new(scm_server.as_raw_fd()),
+        scm_socket,
         sessions,
         pool,
         backends,
@@ -1745,13 +1750,17 @@ mod tests {
             }
 
             let (scm_server, scm_client) = UnixStream::pair().unwrap();
-            let scm = ScmSocket::new(scm_client.into_raw_fd());
-            scm.send_listeners(&Listeners {
-                http: Vec::new(),
-                tls: Vec::new(),
-                tcp: Vec::new(),
-            })
-            .unwrap();
+            let client_scm_socket =
+                ScmSocket::new(scm_client.into_raw_fd()).expect("Could not create scm socket");
+            let server_scm_socket =
+                ScmSocket::new(scm_server.as_raw_fd()).expect("Could not create scm socket");
+            client_scm_socket
+                .send_listeners(&Listeners {
+                    http: Vec::new(),
+                    tls: Vec::new(),
+                    tcp: Vec::new(),
+                })
+                .unwrap();
 
             let server_config = server::ServerConfig {
                 max_connections,
@@ -1760,7 +1769,7 @@ mod tests {
             let mut server = Server::new(
                 poll,
                 channel,
-                ScmSocket::new(scm_server.into_raw_fd()),
+                server_scm_socket,
                 sessions,
                 pool,
                 backends,
@@ -1777,7 +1786,7 @@ mod tests {
             info!("ending event loop");
         });
 
-        command.blocking();
+        command.blocking().unwrap();
         {
             let front = TcpFrontend {
                 cluster_id: String::from("yolo"),
@@ -1797,14 +1806,18 @@ mod tests {
                 backup: None,
             };
 
-            command.write_message(&ProxyRequest {
-                id: String::from("ID_YOLO1"),
-                order: ProxyRequestOrder::AddTcpFrontend(front),
-            });
-            command.write_message(&ProxyRequest {
-                id: String::from("ID_YOLO2"),
-                order: ProxyRequestOrder::AddBackend(backend),
-            });
+            command
+                .write_message(&ProxyRequest {
+                    id: String::from("ID_YOLO1"),
+                    order: ProxyRequestOrder::AddTcpFrontend(front),
+                })
+                .unwrap();
+            command
+                .write_message(&ProxyRequest {
+                    id: String::from("ID_YOLO2"),
+                    order: ProxyRequestOrder::AddBackend(backend),
+                })
+                .unwrap();
         }
         {
             let front = TcpFrontend {
@@ -1824,14 +1837,18 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             };
-            command.write_message(&ProxyRequest {
-                id: String::from("ID_YOLO3"),
-                order: ProxyRequestOrder::AddTcpFrontend(front),
-            });
-            command.write_message(&ProxyRequest {
-                id: String::from("ID_YOLO4"),
-                order: ProxyRequestOrder::AddBackend(backend),
-            });
+            command
+                .write_message(&ProxyRequest {
+                    id: String::from("ID_YOLO3"),
+                    order: ProxyRequestOrder::AddTcpFrontend(front),
+                })
+                .unwrap();
+            command
+                .write_message(&ProxyRequest {
+                    id: String::from("ID_YOLO4"),
+                    order: ProxyRequestOrder::AddBackend(backend),
+                })
+                .unwrap();
         }
 
         // not sure why four times
