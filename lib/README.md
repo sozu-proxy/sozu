@@ -21,8 +21,8 @@ to force that connection to close if too many of those are lingering.
 ## Exploring the source
 
 - `parser/`: only the HTTP 1.1 parser for now
-- `network/buffer_queue.rs`: data buffering implementation
-- `network/protocol/`: the HTTP, TLS handshake and piping proxies
-- `network/{{http|https_openssl|tcp}.rs|https_rustls}`: proxies for HTTP, HTTPS and TCP
-- `network/server.rs`: the main event loop shared by all proxies
-- `network/socket.rs`: abstraction over normal sockets and `SslStream`
+- `lib/src/buffer_queue.rs`: data buffering implementation
+- `lib/src/protocol/`: the HTTP, HTTP2, TLS handshake and piping proxies
+- `lib/src/{http|https|tcp}.rs`: proxies for HTTP, HTTPS and TCP
+- `lib/src/server.rs`: the main event loop shared by all proxies
+- `lib/src/socket.rs`: abstraction over normal sockets

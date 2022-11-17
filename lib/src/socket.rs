@@ -4,8 +4,6 @@ use std::{
 };
 
 use mio::net::{TcpListener, TcpStream};
-#[cfg(feature = "use-openssl")]
-use openssl::ssl::{ErrorCode, SslStream, SslVersion};
 use rustls::{ProtocolVersion, ServerConnection};
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -141,108 +139,6 @@ impl SocketHandler for TcpStream {
 
     fn write_error(&self) {
         incr!("tcp.write.error");
-    }
-}
-
-#[cfg(feature = "use-openssl")]
-impl SocketHandler for SslStream<TcpStream> {
-    fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
-        let mut size = 0usize;
-        loop {
-            if size == buf.len() {
-                return (size, SocketResult::Continue);
-            }
-            match self.ssl_read(&mut buf[size..]) {
-                Ok(0) => return (size, SocketResult::Continue),
-                Ok(sz) => size += sz,
-                Err(e) => match e.code() {
-                    ErrorCode::WANT_READ => return (size, SocketResult::WouldBlock),
-                    ErrorCode::WANT_WRITE => return (size, SocketResult::WouldBlock),
-                    ErrorCode::SSL => {
-                        debug!(
-                            "SOCKET-TLS\treadable TLS socket SSL error: {:?} -> {:?}",
-                            e,
-                            e.ssl_error()
-                        );
-                        return (size, SocketResult::Error);
-                    }
-                    ErrorCode::SYSCALL => return (size, SocketResult::Error),
-                    ErrorCode::ZERO_RETURN => return (size, SocketResult::Closed),
-                    _ => {
-                        debug!(
-                            "SOCKET-TLS\treadable TLS socket error={:?} -> {:?}",
-                            e,
-                            e.ssl_error()
-                        );
-                        return (size, SocketResult::Error);
-                    }
-                },
-            }
-        }
-    }
-
-    fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
-        let mut size = 0usize;
-        loop {
-            if size == buf.len() {
-                return (size, SocketResult::Continue);
-            }
-            match self.ssl_write(&buf[size..]) {
-                Ok(0) => return (size, SocketResult::Continue),
-                Ok(sz) => size += sz,
-                Err(e) => match e.code() {
-                    ErrorCode::WANT_READ => return (size, SocketResult::WouldBlock),
-                    ErrorCode::WANT_WRITE => return (size, SocketResult::WouldBlock),
-                    ErrorCode::SSL => {
-                        debug!(
-                            "SOCKET-TLS\twritable TLS socket SSL error: {:?} -> {:?}",
-                            e,
-                            e.ssl_error()
-                        );
-                        return (size, SocketResult::Error);
-                    }
-                    ErrorCode::SYSCALL => return (size, SocketResult::Error),
-                    ErrorCode::ZERO_RETURN => return (size, SocketResult::Closed),
-                    _ => {
-                        debug!(
-                            "SOCKET-TLS\twritable TLS socket error={:?} -> {:?}",
-                            e,
-                            e.ssl_error()
-                        );
-                        return (size, SocketResult::Error);
-                    }
-                },
-            }
-        }
-    }
-
-    fn socket_ref(&self) -> &TcpStream {
-        self.get_ref()
-    }
-
-    fn socket_mut(&mut self) -> &mut TcpStream {
-        self.get_mut()
-    }
-
-    fn protocol(&self) -> TransportProtocol {
-        self.ssl()
-            .version2()
-            .map(|version| match version {
-                SslVersion::SSL3 => TransportProtocol::Ssl3,
-                SslVersion::TLS1 => TransportProtocol::Tls1_0,
-                SslVersion::TLS1_1 => TransportProtocol::Tls1_1,
-                SslVersion::TLS1_2 => TransportProtocol::Tls1_2,
-                _ => TransportProtocol::Tls1_3,
-            })
-            .unwrap_or(TransportProtocol::Tcp)
-    }
-
-    fn read_error(&self) {
-        incr!("openssl.read.error");
-    }
-
-    fn write_error(&self) {
-        incr!("openssl.write.error");
     }
 }
 

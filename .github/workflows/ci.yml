@@ -14,9 +14,6 @@ jobs:
           - beta
           - nightly
 
-        features:
-          - '--features "use-openssl"'
-
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
@@ -59,7 +56,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: doc
-          args: --verbose --features "use-openssl"
+          args: --verbose
 
   coverage:
     name: Coverage
@@ -88,4 +85,4 @@ jobs:
           TOKEN: ${{ secrets.COVERALLS_TOKEN }}
         with:
           command: tarpaulin
-          args: --features use-openssl --coveralls $TOKEN --avoid-cfg-tarpaulin # @TODO restore to normal (https://github.com/xd009642/tarpaulin/issues/756#issuecomment-838769320)
+          args: --coveralls $TOKEN --avoid-cfg-tarpaulin # @TODO restore to normal (https://github.com/xd009642/tarpaulin/issues/756#issuecomment-838769320)

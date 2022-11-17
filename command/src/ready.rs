@@ -11,32 +11,33 @@ const ERROR: u16 = 0b00100;
 const HUP: u16 = 0b01000;
 
 impl Ready {
-    pub fn empty() -> Ready {
+    #[inline]
+    pub const fn empty() -> Ready {
         Ready(0)
     }
 
     #[inline]
-    pub fn readable() -> Ready {
+    pub const fn readable() -> Ready {
         Ready(READABLE)
     }
 
     #[inline]
-    pub fn writable() -> Ready {
+    pub const fn writable() -> Ready {
         Ready(WRITABLE)
     }
 
     #[inline]
-    pub fn error() -> Ready {
+    pub const fn error() -> Ready {
         Ready(ERROR)
     }
 
     #[inline]
-    pub fn hup() -> Ready {
+    pub const fn hup() -> Ready {
         Ready(HUP)
     }
 
     #[inline]
-    pub fn all() -> Ready {
+    pub const fn all() -> Ready {
         Ready(READABLE | WRITABLE)
     }
 

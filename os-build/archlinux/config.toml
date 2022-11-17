@@ -81,11 +81,6 @@ buffer_size = 16384
 # is set or if SOZU_PID_FILE_PATH environment variable was defined at build time.
 # pid_file_path = "/run/sozu/sozu.pid"
 
-# defines how the TLS protocol will be handled by sozu. Possible values
-# are "openssl" or "rustls". The "openssl" option will only work if sozu
-# was built with the "use-openssl" feature.
-tls_provider = "rustls"
-
 # maximum time of inactivity for a frontend socket, in seconds
 # defaults to 60 seconds
 # front_timeout = 60
@@ -134,7 +129,7 @@ address = "0.0.0.0:80"
 # Configures the client socket to receive a PROXY protocol header
 # expect_proxy = false
 
-# Example for a HTTPS (OpenSSL based or rustls based) listener
+# Example for a HTTPS listener
 [[listeners]]
 protocol = "https"
 # listening address
@@ -150,17 +145,14 @@ address = "0.0.0.0:443"
 # Configures the client socket to receive a PROXY protocol header
 # expect_proxy = false
 
-# supported TLS versions. Possible values are "SSLv2", "SSLv3", "TLSv1",
-# "TLSv1.1", "TLSv1.2", "TLSv1.3". Defaults to "TLSv1.2"
+# supported TLS versions. Possible values are "SSLv2", "SSLv3",
+# "TLSv1.2", "TLSv1.3". Defaults to ["TLSv1.2", "TLSv1.3"]
 tls_versions = ["TLSv1.2", "TLSv1.3"]
-
-# cipher combinations used by OpenSSL
-#cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"
 
 # cipher combinations used by rustls
 # ciphersuites names, specified in https://docs.rs/rustls/0.13.0/rustls/static.ALL_CIPHERSUITES.html
 # defaults to all supported ciphersuites
-#rustls_cipher_list = ["TLS13_CHACHA20_POLY1305_SHA256"]
+#cipher_list = ["TLS13_CHACHA20_POLY1305_SHA256"]
 
 
 # options specific to a TCP proxy listener

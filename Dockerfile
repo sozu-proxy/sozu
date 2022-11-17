@@ -14,7 +14,7 @@ RUN apk add --no-cache openssl-dev \
 
 COPY . /source/
 WORKDIR /source/bin
-RUN cargo build --release --features use-openssl
+RUN cargo build --release
 
 
 

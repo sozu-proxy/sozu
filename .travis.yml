@@ -29,7 +29,7 @@ matrix:
       before_script:
         - which cargo-tarpaulin || `RUSTFLAGS="--cfg procmacro2_semver_exempt" cargo install cargo-tarpaulin`
       script:
-        cd $ROOT_PATH && cargo +nightly tarpaulin --all --features use-openssl --ciserver travis-ci --coveralls $TRAVIS_JOB_ID
+        cd $ROOT_PATH && cargo +nightly tarpaulin --all --ciserver travis-ci --coveralls $TRAVIS_JOB_ID
   allow_failures:
     - rust: nightly
       env: CODECOV=1
@@ -38,7 +38,7 @@ matrix:
 addons:
   apt:
     packages:
-      - libcurl4-openssl-dev
+      - libcurl4-openssl-dev # should we delete this?
       - libelf-dev
       - libdw-dev
       - binutils-dev
@@ -51,16 +51,16 @@ addons:
       - kalakris-cmake
   homebrew:
     packages:
-      - openssl
+      - openssl # should we delete this?
       - cmake
       - pkg-config
 
 
 script:
-  - cd $ROOT_PATH/lib     && cargo test  --verbose --features "use-openssl"
+  - cd $ROOT_PATH/lib     && cargo test  --verbose
   - cd $ROOT_PATH/command && cargo test  --verbose
   - cd $ROOT_PATH/futures && cargo test  --verbose
-  - cd $ROOT_PATH/bin     && cargo build --verbose --features "use-openssl"
+  - cd $ROOT_PATH/bin     && cargo build --verbose
   - cd $ROOT_PATH/ctl     && cargo build --verbose
 
 cache:

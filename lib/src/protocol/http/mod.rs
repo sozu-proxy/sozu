@@ -314,9 +314,9 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         self.backend_token
     }
 
-    pub fn test_back_socket(&mut self) -> bool {
+    pub fn test_back_socket(&self) -> bool {
         match self.backend {
-            Some(ref mut s) => {
+            Some(ref s) => {
                 let mut tmp = [0u8; 1];
                 let res = s.peek(&mut tmp[..]);
 
@@ -331,7 +331,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         }
     }
 
-    pub fn is_valid_backend_socket(&mut self) -> bool {
+    pub fn is_valid_backend_socket(&self) -> bool {
         // if socket was not used in the last second, test it
         if self
             .backend_stop

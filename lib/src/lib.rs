@@ -153,8 +153,6 @@ extern crate hdrhistogram;
 extern crate libc;
 extern crate log;
 extern crate mio;
-#[cfg(feature = "use-openssl")]
-extern crate openssl;
 extern crate pool as pool_crate;
 extern crate rand;
 extern crate rustls;
@@ -176,8 +174,6 @@ extern crate webpki;
 #[macro_use]
 extern crate quickcheck;
 extern crate foreign_types_shared;
-#[cfg(feature = "use-openssl")]
-extern crate openssl_sys;
 
 #[macro_use]
 pub mod util;
@@ -203,10 +199,7 @@ mod splice;
 pub mod server;
 pub mod tcp;
 
-#[cfg(feature = "use-openssl")]
-pub mod https_openssl;
-
-pub mod https_rustls;
+pub mod https;
 
 use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
 
@@ -573,7 +566,7 @@ impl Default for Readiness {
 }
 
 impl Readiness {
-    pub fn new() -> Readiness {
+    pub const fn new() -> Readiness {
         Readiness {
             event: Ready::empty(),
             interest: Ready::empty(),
