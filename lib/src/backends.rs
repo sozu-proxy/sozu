@@ -82,46 +82,24 @@ impl BackendMap {
             .unwrap_or(false)
     }
 
-    // TODO: remove if lets
     // TODO: return anyhow::Result with context, log the error downstream
     pub fn backend_from_cluster_id(
         &mut self,
         cluster_id: &str,
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), ConnectionError> {
-        if let Some(ref mut cluster_backends) = self.backends.get_mut(cluster_id) {
-            if cluster_backends.backends.is_empty() {
-                self.available = false;
-                return Err(ConnectionError::NoBackendAvailable);
-            }
+        let cluster_backends = match self.backends.get_mut(cluster_id) {
+            Some(backends) => backends,
+            None => return Err(ConnectionError::NoBackendAvailable),
+        };
 
-            if let Some(ref mut b) = cluster_backends.next_available_backend() {
-                let mut backend = b.borrow_mut();
+        if cluster_backends.backends.is_empty() {
+            self.available = false;
+            return Err(ConnectionError::NoBackendAvailable);
+        }
 
-                debug!(
-                    "Connecting {} -> {:?}",
-                    cluster_id,
-                    (
-                        backend.address,
-                        backend.active_connections,
-                        backend.failures
-                    )
-                );
-
-                let conn = backend.try_connect();
-                let res = conn.map(|c| (b.clone(), c)).map_err(|e| {
-                    error!(
-                        "could not connect {} to {:?} ({} failures)",
-                        cluster_id, backend.address, backend.failures
-                    );
-                    e
-                });
-
-                if res.is_ok() {
-                    self.available = true;
-                }
-
-                res
-            } else {
+        let next_backend = match cluster_backends.next_available_backend() {
+            Some(nb) => nb,
+            None => {
                 if self.available {
                     error!("no more available backends for cluster {}", cluster_id);
                     self.available = false;
@@ -130,10 +108,34 @@ impl BackendMap {
                         cluster_id.to_string(),
                     ));
                 }
-                Err(ConnectionError::NoBackendAvailable)
+                return Err(ConnectionError::NoBackendAvailable);
             }
-        } else {
-            Err(ConnectionError::NoBackendAvailable)
+        };
+
+        let mut borrowed_backend = next_backend.borrow_mut();
+
+        debug!(
+            "Connecting {} -> {:?}",
+            cluster_id,
+            (
+                borrowed_backend.address,
+                borrowed_backend.active_connections,
+                borrowed_backend.failures
+            )
+        );
+
+        match borrowed_backend.try_connect() {
+            Ok(tcp_stream) => {
+                self.available = true;
+                Ok((next_backend.clone(), tcp_stream))
+            }
+            Err(connection_error) => {
+                error!(
+                    "could not connect {} to {:?} ({} failures)",
+                    cluster_id, borrowed_backend.address, borrowed_backend.failures
+                );
+                Err(connection_error)
+            }
         }
     }
 

@@ -1781,7 +1781,6 @@ mod tests {
 }
 
 /// `RouteKey` is the routing key built from the following tuple.
-// TODO: Create a custom type for the hostname and use a common type for the method.
 #[derive(PartialOrd, Ord, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteKey {
     pub address: SocketAddr,

@@ -158,7 +158,7 @@ impl TimeoutContainer {
         }
     }
 
-    // TODO: write a documenting comment
+    // Reset the timeout to its optional timeout, or to its defined duration
     pub fn reset(&mut self) -> bool {
         match self.timeout.take() {
             None => {
