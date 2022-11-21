@@ -213,8 +213,6 @@ use crate::sozu_command::{
 
 use self::retry::RetryPolicy;
 
-pub type ClusterId = String;
-
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {

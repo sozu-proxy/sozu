@@ -96,7 +96,6 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         self.set_nonblocking(false)
     }
 
-    // TODO: return anyhow::Result with context, log the error downstream
     /// set the channel to be nonblocking
     pub fn nonblocking(&mut self) -> anyhow::Result<()> {
         self.set_nonblocking(true)

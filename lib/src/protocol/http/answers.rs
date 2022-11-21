@@ -1,4 +1,4 @@
-use crate::ClusterId;
+use crate::sozu_command::state::ClusterId;
 use std::{collections::HashMap, rc::Rc};
 
 use super::DefaultAnswerStatus;

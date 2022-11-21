@@ -58,14 +58,14 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
             HeaderLen::Unix => 232,
         };
 
-        let (sz, res) = self
+        let (sz, socket_result) = self
             .frontend
             .socket_read(&mut self.buf[self.index..total_len]);
         trace!(
             "FRONT proxy protocol [{:?}]: read {} bytes and res={:?}, index = {}, total_len = {}",
             self.frontend_token,
             sz,
-            res,
+            socket_result,
             self.index,
             total_len
         );
@@ -83,17 +83,18 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
             self.readiness.event.remove(Ready::readable());
         }
 
-        // TODO: rename to socket_result, pattern match
-        if res == SocketResult::Error {
-            error!("[{:?}] (expect proxy) front socket error, closing the connection(read {}, wrote {})", self.frontend_token, metrics.bin, metrics.bout);
-            metrics.service_stop();
-            incr!("proxy_protocol.errors");
-            self.readiness.reset();
-            return (ProtocolResult::Continue, SessionResult::CloseSession);
-        }
-
-        if res == SocketResult::WouldBlock {
-            self.readiness.event.remove(Ready::readable());
+        match socket_result {
+            SocketResult::Error => {
+                error!("[{:?}] (expect proxy) front socket error, closing the connection(read {}, wrote {})", self.frontend_token, metrics.bin, metrics.bout);
+                metrics.service_stop();
+                incr!("proxy_protocol.errors");
+                self.readiness.reset();
+                return (ProtocolResult::Continue, SessionResult::CloseSession);
+            }
+            SocketResult::WouldBlock => {
+                self.readiness.event.remove(Ready::readable());
+            }
+            SocketResult::Closed | SocketResult::Continue => {}
         }
 
         match parse_v2_header(&self.buf[..self.index]) {

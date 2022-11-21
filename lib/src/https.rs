@@ -60,6 +60,7 @@ use crate::{
         },
         ready::Ready,
         scm_socket::ScmSocket,
+        state::ClusterId,
     },
     timer::TimeoutContainer,
     tls::{
@@ -67,9 +68,9 @@ use crate::{
         ParsedCertificateAndKey,
     },
     util::UnwrapLog,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
-    ConnectionError, ListenerHandler, Protocol, ProxyConfiguration, ProxySession, Readiness,
-    SessionMetrics, SessionResult,
+    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ConnectionError,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
+    SessionResult,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];

@@ -463,9 +463,6 @@ impl Server {
             let msg = server.channel.read_message();
             debug!("got message: {:?}", msg);
 
-            // TODO: check if this is still true
-            // it so happens that trying to upgrade a dead worker will bring no message
-            // which brings the whole main process to crash because it unwraps a None
             if let Ok(msg) = msg {
                 if let Err(e) = server.channel.write_message(&ProxyResponse::ok(msg.id)) {
                     error!("Could not send an ok to the main process: {}", e);

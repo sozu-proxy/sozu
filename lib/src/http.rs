@@ -47,9 +47,9 @@ use super::{
         push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, CONN_RETRIES,
     },
     socket::server_bind,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ClusterId,
-    ConnectionError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
-    SessionResult,
+    sozu_command::state::ClusterId,
+    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ConnectionError, Protocol,
+    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult,
 };
 
 #[derive(PartialEq, Eq)]
@@ -641,16 +641,10 @@ impl Session {
 
         if self.front_readiness().event.is_hup() {
             let order = self.front_hup();
-            // TODO: rewrite with if order != SessionResult::CloseSession { front_readiness()... } return order
-            match order {
-                SessionResult::CloseSession => {
-                    return order;
-                }
-                _ => {
-                    self.front_readiness().event.remove(Ready::hup());
-                    return order;
-                }
+            if order != SessionResult::CloseSession {
+                self.front_readiness().event.remove(Ready::hup());
             }
+            return order;
         }
 
         let token = self.frontend_token;

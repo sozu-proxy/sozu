@@ -12,13 +12,13 @@ buffer_size = 16384
 [[listeners]]
 address = "0.0.0.0:80"
 protocol = "http"
-answer_404 = "./404.html"
+answer_404 = "./assets/404.html"
 #expect_proxy = true
 
 [[listeners]]
 address = "0.0.0.0:443"
 protocol = "https"
-answer_404 = "./404.html"
+answer_404 = "./assets/404.html"
 tls_versions = ["TLSv1.2"]
 
 [[listeners]]
