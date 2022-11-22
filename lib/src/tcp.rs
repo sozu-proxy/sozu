@@ -600,9 +600,12 @@ impl Session {
                 self.close_backend();
                 match self.connect_to_backend(session.clone()) {
                     // reuse connection or send a default answer, we can continue
-                    Ok(BackendConnectAction::Reuse) | Err(_) => {}
-                    // New or Replace: stop here, we must wait for an event
-                    _ => return SessionResult::Continue,
+                    Ok(BackendConnectAction::Reuse) => {}
+                    Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
+                        // stop here, we must wait for an event
+                        return SessionResult::Continue;
+                    }
+                    Err(connection_error) => error!("{}", connection_error),
                 }
             } else if self.back_readiness().unwrap().event != Ready::empty() {
                 self.reset_connection_attempt();
@@ -614,10 +617,13 @@ impl Session {
             }
         } else if back_connected == BackendConnectionStatus::NotConnected {
             match self.connect_to_backend(session.clone()) {
-                // reuse connection or error we can continue
-                Ok(BackendConnectAction::Reuse) | Err(_) => {}
-                // New or Replace: stop here, we must wait for an event
-                _ => return SessionResult::Continue,
+                // reuse connection or send a default answer, we can continue
+                Ok(BackendConnectAction::Reuse) => {}
+                Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
+                    // we must wait for an event
+                    return SessionResult::Continue;
+                }
+                Err(connection_error) => error!("{}", connection_error),
             }
         }
 
@@ -672,9 +678,12 @@ impl Session {
                     SessionResult::ConnectBackend => {
                         match self.connect_to_backend(session.clone()) {
                             // reuse connection or send a default answer, we can continue
-                            Ok(BackendConnectAction::Reuse) | Err(_) => {}
-                            // New or Replace: stop here, we must wait for an event
-                            _ => return SessionResult::Continue,
+                            Ok(BackendConnectAction::Reuse) => {}
+                            Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
+                                // we must wait for an event
+                                return SessionResult::Continue;
+                            }
+                            Err(connection_error) => error!("{}", connection_error),
                         }
                     }
                     SessionResult::Continue => {}
@@ -834,21 +843,23 @@ impl Session {
             cluster_id
         } else {
             error!("no TCP cluster corresponds to that front address");
-            return Err(ConnectionError::HostNotFound);
+            return Err(ConnectionError::HostNotFound(
+                "no host given (TCP)".to_string(),
+            ));
         };
 
         self.cluster_id = Some(cluster_id.clone());
 
         if self.connection_attempt == CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
-            return Err(ConnectionError::NoBackendAvailable);
+            return Err(ConnectionError::NoBackendAvailable(Some(cluster_id)));
         }
 
         if self.proxy.borrow().sessions.borrow().slab.len()
             >= self.proxy.borrow().sessions.borrow().slab_capacity()
         {
             error!("not enough memory, cannot connect to backend");
-            return Err(ConnectionError::TooManyConnections);
+            return Err(ConnectionError::TooManyConnections(None));
         }
 
         let conn = self
@@ -902,7 +913,9 @@ impl Session {
 
                 Ok(BackendConnectAction::New)
             }
-            Err(ConnectionError::NoBackendAvailable) => Err(ConnectionError::NoBackendAvailable),
+            Err(ConnectionError::NoBackendAvailable(c_id)) => {
+                Err(ConnectionError::NoBackendAvailable(c_id))
+            }
             Err(e) => {
                 panic!("tcp connect_to_backend: unexpected error: {:?}", e);
             }

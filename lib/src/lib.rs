@@ -204,6 +204,7 @@ pub mod https;
 use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
 
 use mio::{net::TcpStream, Token};
+use thiserror::Error as ThisError;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
@@ -397,17 +398,27 @@ pub enum SessionResult {
 }
 
 // TODO: enrich with thiserror
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, ThisError)]
 pub enum ConnectionError {
+    #[error("No host given for the backend")]
     NoHostGiven,
+    #[error("Connect to backend failed. No request line to extract a route.")]
     NoRequestLineGiven,
-    InvalidHost,
-    HostNotFound,
-    NoBackendAvailable,
+    #[error("Connect to backend failed. {message:?}. host: {hostname:?}")]
+    InvalidHost { message: String, hostname: String },
+    #[error("Connect to backend failed. Host not found: {0}")]
+    HostNotFound(String),
+    #[error("Connect to backend failed. No backend available for cluster {0:?}")]
+    NoBackendAvailable(Option<String>),
+    #[error("unimplemented error")]
     ToBeDefined,
-    HttpsRedirect,
+    #[error("Connect to backend failed. Cluster {0} should redirect HTTPS")]
+    HttpsRedirect(String),
+    #[error("Connect to backend failed. Route is unauthorized")]
     Unauthorized,
-    TooManyConnections,
+    #[error("Connect to backend failed. Too many connections. Host {0:?}")]
+    TooManyConnections(Option<String>),
+    // SocketIsNonblocking // for the EINPROGRESS fail of mio::net::TcpStream::connect(socket_addr)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -520,12 +531,14 @@ impl Backend {
 
     pub fn try_connect(&mut self) -> Result<mio::net::TcpStream, ConnectionError> {
         if self.status != BackendStatus::Normal {
-            return Err(ConnectionError::NoBackendAvailable);
+            return Err(ConnectionError::NoBackendAvailable(None));
         }
 
         //FIXME: what happens if the connect() call fails with EINPROGRESS?
+        // How about we map EINPROGRESS to a new variant of ConnectionError,
+        // for instance SocketIsNonblocking?
         let conn = mio::net::TcpStream::connect(self.address)
-            .map_err(|_| ConnectionError::NoBackendAvailable);
+            .map_err(|_| ConnectionError::NoBackendAvailable(None));
         if conn.is_ok() {
             //self.retry_policy.succeed();
             self.inc_connections();
