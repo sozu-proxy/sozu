@@ -273,6 +273,7 @@ pub struct Server {
     accept_queue_timeout: Duration,
     base_sessions_count: usize,
     loop_start: Instant,
+    last_sessions_len: usize,
 }
 
 impl Server {
@@ -437,6 +438,7 @@ impl Server {
             accept_queue_timeout: Duration::seconds(i64::from(server_config.accept_queue_timeout)),
             base_sessions_count,
             loop_start: Instant::now(), // to be reset on server run
+            last_sessions_len: 0,       // to be reset on server run
         };
 
         // initialize the worker with the state we got from a file
@@ -499,7 +501,7 @@ impl Server {
         let max_poll_errors = 10000;
         let mut current_poll_errors = 0;
         let mut last_zombie_check = Instant::now();
-        let mut last_sessions_len = self.sessions.borrow().slab.len();
+        self.last_sessions_len = self.sessions.borrow().slab.len();
         let mut should_poll_at: Option<Instant> = None;
         let mut last_shutting_down_message = None;
 
@@ -562,65 +564,7 @@ impl Server {
                                 break;
                             }
 
-                            if self.channel.readiness().is_readable() {
-                                if let Err(e) = self.channel.readable() {
-                                    error!("error reading from channel: {:?}", e);
-                                }
-
-                                loop {
-                                    let msg = self.channel.read_message();
-
-                                    // if the message was too large, we grow the buffer and retry to read if possible
-                                    if msg.is_err() {
-                                        if (self.channel.interest & self.channel.readiness)
-                                            .is_readable()
-                                        {
-                                            if let Err(e) = self.channel.readable() {
-                                                error!("error reading from channel: {:?}", e);
-                                            }
-                                            continue;
-                                        } else {
-                                            break;
-                                        }
-                                    }
-
-                                    // do we really want to crash the server here?
-                                    let msg = msg.expect("the message should be valid");
-
-                                    match msg.order {
-                                        ProxyRequestOrder::HardStop => {
-                                            let id_msg = msg.id.clone();
-                                            self.notify(msg);
-                                            if let Err(e) = self
-                                                .channel
-                                                .write_message(&ProxyResponse::ok(id_msg))
-                                            {
-                                                error!(
-                                                    "Could not send ok response to the main process: {}",
-                                                    e
-                                                );
-                                            }
-                                            if let Err(e) = self.channel.run() {
-                                                error!(
-                                                    "Error while running the server channel: {}",
-                                                    e
-                                                );
-                                            }
-                                            return;
-                                        }
-                                        ProxyRequestOrder::SoftStop => {
-                                            self.shutting_down = Some(msg.id.clone());
-                                            last_sessions_len = self.sessions.borrow().slab.len();
-                                            self.notify(msg);
-                                        }
-                                        ProxyRequestOrder::ReturnListenSockets => {
-                                            info!("received ReturnListenSockets order");
-                                            self.return_listen_sockets();
-                                        }
-                                        _ => self.notify(msg),
-                                    }
-                                }
-                            }
+                            self.read_channel_messages_and_notify();
 
                             QUEUE.with(|queue| {
                                 if !(*queue.borrow()).is_empty() {
@@ -790,13 +734,13 @@ impl Server {
                         error!("Could not write response to the main process: {}", e);
                     }
                     return;
-                } else if new_sessions_count < last_sessions_len {
+                } else if new_sessions_count < self.last_sessions_len {
                     info!(
                         "shutting down, {} slab elements remaining (base: {})",
                         new_sessions_count - self.base_sessions_count,
                         self.base_sessions_count
                     );
-                    last_sessions_len = new_sessions_count;
+                    self.last_sessions_len = new_sessions_count;
                 }
             }
         }
@@ -836,6 +780,59 @@ impl Server {
 
         self.loop_start = now;
         timeout.and_then(|t| std::time::Duration::try_from(t).ok())
+    }
+
+    fn read_channel_messages_and_notify(&mut self) {
+        if !self.channel.readiness().is_readable() {
+            return;
+        }
+
+        if let Err(e) = self.channel.readable() {
+            error!("error reading from channel: {:?}", e);
+        }
+
+        loop {
+            let request = self.channel.read_message();
+
+            // if the message was too large, we grow the buffer and retry to read if possible
+            if request.is_err() {
+                if (self.channel.interest & self.channel.readiness).is_readable() {
+                    if let Err(e) = self.channel.readable() {
+                        error!("error reading from channel: {:?}", e);
+                    }
+                    continue;
+                } else {
+                    break;
+                }
+            }
+
+            // do we really want to crash the server here?
+            let request = request.expect("the message should be valid");
+
+            match request.order {
+                ProxyRequestOrder::HardStop => {
+                    let req_id = request.id.clone();
+                    self.notify(request);
+                    if let Err(e) = self.channel.write_message(&ProxyResponse::ok(req_id)) {
+                        error!("Could not send ok response to the main process: {}", e);
+                    }
+                    if let Err(e) = self.channel.run() {
+                        error!("Error while running the server channel: {}", e);
+                    }
+                    return;
+                }
+                ProxyRequestOrder::SoftStop => {
+                    self.shutting_down = Some(request.id.clone());
+                    self.last_sessions_len = self.sessions.borrow().slab.len();
+                    self.notify(request);
+                }
+                ProxyRequestOrder::ReturnListenSockets => {
+                    info!("received ReturnListenSockets order");
+                    self.return_listen_sockets();
+                }
+                _ => self.notify(request),
+            }
+        }
     }
 
     fn send_queue(&mut self) {
