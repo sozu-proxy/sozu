@@ -276,6 +276,10 @@ pub struct Server {
     last_sessions_len: usize,
     last_zombie_check: Instant,
     last_shutting_down_message: Option<Instant>,
+    max_poll_errors: i32, // TODO: make this configurable? this defaults to 10000 for now
+    current_poll_errors: i32,
+    should_poll_at: Option<Instant>,
+    poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
 }
 
 impl Server {
@@ -443,6 +447,10 @@ impl Server {
             last_sessions_len: 0,              // to be reset on server run
             last_zombie_check: Instant::now(), // to be reset on server run
             last_shutting_down_message: None,
+            max_poll_errors: 10000, // TODO: make it configurable?
+            current_poll_errors: 0,
+            should_poll_at: None,
+            poll_timeout: Some(Duration::milliseconds(1000)), // TODO: make it configurable?
         };
 
         // initialize the worker with the state we got from a file
@@ -499,32 +507,23 @@ impl Server {
     }
 
     pub fn run(&mut self) {
-        //FIXME: make those parameters configurable?
-        let mut events = Events::with_capacity(1024);
-        let poll_timeout = Some(Duration::milliseconds(1000));
-        let max_poll_errors = 10000;
-        let mut current_poll_errors = 0;
-        self.last_zombie_check = Instant::now();
+        let mut events = Events::with_capacity(1024); // TODO: make event capacity configurable?
         self.last_sessions_len = self.sessions.borrow().slab.len();
-        let mut should_poll_at: Option<Instant> = None;
 
+        self.current_poll_errors = 0;
+        self.last_zombie_check = Instant::now();
         self.loop_start = Instant::now();
-        loop {
-            if current_poll_errors == max_poll_errors {
-                error!(
-                    "Something is going very wrong. Last {} poll() calls failed, crashing..",
-                    current_poll_errors
-                );
-                panic!("poll() calls failed {} times in a row", current_poll_errors);
-            }
 
-            let timeout = self.reset_loop_time_and_get_timeout(should_poll_at, poll_timeout);
+        loop {
+            self.check_for_poll_errors();
+
+            let timeout = self.reset_loop_time_and_get_timeout();
 
             match self.poll.poll(&mut events, timeout) {
-                Ok(_) => current_poll_errors = 0,
+                Ok(_) => self.current_poll_errors = 0,
                 Err(error) => {
                     error!("Error while polling events: {:?}", error);
-                    current_poll_errors += 1;
+                    self.current_poll_errors += 1;
                     continue;
                 }
             }
@@ -594,7 +593,7 @@ impl Server {
                 }
             }
 
-            if let Some(t) = should_poll_at.as_ref() {
+            if let Some(t) = self.should_poll_at.as_ref() {
                 if *t <= Instant::now() {
                     while let Some(t) = TIMER.with(|timer| timer.borrow_mut().poll()) {
                         //info!("polled for timeout: {:?}", t);
@@ -605,7 +604,7 @@ impl Server {
             self.handle_remaining_readiness();
             self.create_sessions();
 
-            should_poll_at = TIMER.with(|timer| timer.borrow().next_poll_date());
+            self.should_poll_at = TIMER.with(|timer| timer.borrow().next_poll_date());
 
             self.zombie_check();
 
@@ -632,25 +631,34 @@ impl Server {
         }
     }
 
-    fn reset_loop_time_and_get_timeout(
-        &mut self,
-        should_poll_at: Option<Instant>,
-        poll_timeout: Option<Duration>,
-    ) -> Option<std::time::Duration> {
+    fn check_for_poll_errors(&mut self) {
+        if self.current_poll_errors == self.max_poll_errors {
+            error!(
+                "Something is going very wrong. Last {} poll() calls failed, crashing..",
+                self.current_poll_errors
+            );
+            panic!(
+                "poll() calls failed {} times in a row",
+                self.current_poll_errors
+            );
+        }
+    }
+
+    fn reset_loop_time_and_get_timeout(&mut self) -> Option<std::time::Duration> {
         let now = Instant::now();
         time!(
             "event_loop_time",
             (now - self.loop_start).whole_milliseconds()
         );
 
-        let timeout = match should_poll_at.as_ref() {
-            None => poll_timeout,
+        let timeout = match self.should_poll_at.as_ref() {
+            None => self.poll_timeout,
             Some(i) => {
                 if *i <= now {
-                    poll_timeout
+                    self.poll_timeout
                 } else {
                     let dur = *i - now;
-                    match poll_timeout {
+                    match self.poll_timeout {
                         None => Some(dur),
                         Some(t) => {
                             if t < dur {
