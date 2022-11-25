@@ -12,13 +12,13 @@ use anyhow::{bail, Context};
 use toml;
 
 use crate::{
-    certificate::split_certificate_chain,
+    certificate::{split_certificate_chain, calculate_fingerprint},
     command::{CommandRequest, CommandRequestOrder, PROTOCOL_VERSION},
     proxy::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListener, HttpsListener, ListenerType, LoadBalancingAlgorithms, LoadBalancingParams,
         LoadMetric, PathRule, ProxyRequestOrder, Route, RulePosition, TcpFrontend, TcpListener,
-        TlsVersion,
+        TlsVersion, CertificateFingerprint,
     },
 };
 
@@ -1227,6 +1227,42 @@ impl Config {
                     order: CommandRequestOrder::Proxy(Box::new(order)),
                 });
                 count += 1;
+            }
+        }
+        
+        //Merge certificate names that match fingerprint
+        let mut cert_names: HashMap<CertificateFingerprint, HashSet<String>> = HashMap::new();
+        let mut certs_indexes = HashMap::new();
+        for idx in 0..v.len() {
+            if let CommandRequestOrder::Proxy(ref mut order) = v[idx].order {
+                if let ProxyRequestOrder::AddCertificate(add) = order.as_mut() {
+                    let fingerprint = match calculate_fingerprint(add.certificate.certificate.as_bytes()) {
+                        Ok(f) => CertificateFingerprint(f),
+                        Err(e) => {
+                            error!(
+                                "cannot obtain the certificate's fingerprint: {}",
+                                e.to_string()
+                            );
+                            continue;
+                        }
+                    };
+                    
+                    certs_indexes.insert(idx, fingerprint.clone());
+                    
+                    if let Some(names) = cert_names.get_mut(&fingerprint) {
+                        names.extend(add.names.clone());
+                    } else {
+                        cert_names.insert(fingerprint, HashSet::from_iter(add.names.clone()));
+                    }
+                }
+            }
+        }
+        for ci in certs_indexes {
+            if let CommandRequestOrder::Proxy(ref mut order) = v[ci.0].order {
+                if let ProxyRequestOrder::AddCertificate(add) = order.as_mut() {
+                    add.names.clear();
+                    add.names.extend(cert_names[&ci.1].clone());
+                }
             }
         }
 
