@@ -418,7 +418,8 @@ pub enum ConnectionError {
     Unauthorized,
     #[error("Connect to backend failed. Too many connections. Host {0:?}")]
     TooManyConnections(Option<String>),
-    // SocketIsNonblocking // for the EINPROGRESS fail of mio::net::TcpStream::connect(socket_addr)
+    // #[error("Connect to backend failed. EINPROGRESS, the socket is probably nonblocing")]
+    // SocketIsNonblocking,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -534,20 +535,22 @@ impl Backend {
             return Err(ConnectionError::NoBackendAvailable(None));
         }
 
-        //FIXME: what happens if the connect() call fails with EINPROGRESS?
-        // How about we map EINPROGRESS to a new variant of ConnectionError,
-        // for instance SocketIsNonblocking?
-        let conn = mio::net::TcpStream::connect(self.address)
-            .map_err(|_| ConnectionError::NoBackendAvailable(None));
-        if conn.is_ok() {
-            //self.retry_policy.succeed();
-            self.inc_connections();
-        } else {
-            self.retry_policy.fail();
-            self.failures += 1;
+        match mio::net::TcpStream::connect(self.address) {
+            Ok(tcp_stream) => {
+                //self.retry_policy.succeed();
+                self.inc_connections();
+                Ok(tcp_stream)
+            }
+            Err(_connection_error) => {
+                self.retry_policy.fail();
+                self.failures += 1;
+                // TODO: handle EINPROGRESS. It is difficult. It is discussed here:
+                // https://docs.rs/mio/latest/mio/net/struct.TcpStream.html#method.connect
+                // with an example code here:
+                // https://github.com/Thomasdezeeuw/heph/blob/0c4f1ab3eaf08bea1d65776528bfd6114c9f8374/src/net/tcp/stream.rs#L560-L622
+                Err(ConnectionError::NoBackendAvailable(None))
+            }
         }
-
-        conn
     }
 }
 
