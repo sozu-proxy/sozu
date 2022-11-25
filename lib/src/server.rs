@@ -272,6 +272,7 @@ pub struct Server {
     accept_queue: VecDeque<(TcpStream, ListenToken, Protocol, Instant)>,
     accept_queue_timeout: Duration,
     base_sessions_count: usize,
+    loop_start: Instant,
 }
 
 impl Server {
@@ -435,6 +436,7 @@ impl Server {
             accept_queue: VecDeque::new(),
             accept_queue_timeout: Duration::seconds(i64::from(server_config.accept_queue_timeout)),
             base_sessions_count,
+            loop_start: Instant::now(), // to be reset on server run
         };
 
         // initialize the worker with the state we got from a file
@@ -501,12 +503,8 @@ impl Server {
         let mut should_poll_at: Option<Instant> = None;
         let mut last_shutting_down_message = None;
 
-        let mut loop_start = Instant::now();
+        self.loop_start = Instant::now();
         loop {
-            let now = Instant::now();
-            time!("event_loop_time", (now - loop_start).whole_milliseconds());
-            loop_start = now;
-
             if current_poll_errors == max_poll_errors {
                 error!(
                     "Something is going very wrong. Last {} poll() calls failed, crashing..",
@@ -515,31 +513,9 @@ impl Server {
                 panic!("poll() calls failed {} times in a row", current_poll_errors);
             }
 
-            let timeout = match should_poll_at.as_ref() {
-                None => poll_timeout,
-                Some(i) => {
-                    if *i <= now {
-                        poll_timeout
-                    } else {
-                        let dur = *i - now;
-                        match poll_timeout {
-                            None => Some(dur),
-                            Some(t) => {
-                                if t < dur {
-                                    Some(t)
-                                } else {
-                                    Some(dur)
-                                }
-                            }
-                        }
-                    }
-                }
-            };
+            let timeout = self.reset_loop_time_and_get_timeout(should_poll_at, poll_timeout);
 
-            match self.poll.poll(
-                &mut events,
-                timeout.and_then(|t| std::time::Duration::try_from(t).ok()),
-            ) {
+            match self.poll.poll(&mut events, timeout) {
                 Ok(_) => current_poll_errors = 0,
                 Err(error) => {
                     error!("Error while polling events: {:?}", error);
@@ -551,9 +527,9 @@ impl Server {
             let after_epoll = Instant::now();
             time!(
                 "epoll_time",
-                (after_epoll - loop_start).whole_milliseconds()
+                (after_epoll - self.loop_start).whole_milliseconds()
             );
-            loop_start = after_epoll;
+            self.loop_start = after_epoll;
 
             self.send_queue();
 
@@ -824,6 +800,42 @@ impl Server {
                 }
             }
         }
+    }
+
+    fn reset_loop_time_and_get_timeout(
+        &mut self,
+        should_poll_at: Option<Instant>,
+        poll_timeout: Option<Duration>,
+    ) -> Option<std::time::Duration> {
+        let now = Instant::now();
+        time!(
+            "event_loop_time",
+            (now - self.loop_start).whole_milliseconds()
+        );
+
+        let timeout = match should_poll_at.as_ref() {
+            None => poll_timeout,
+            Some(i) => {
+                if *i <= now {
+                    poll_timeout
+                } else {
+                    let dur = *i - now;
+                    match poll_timeout {
+                        None => Some(dur),
+                        Some(t) => {
+                            if t < dur {
+                                Some(t)
+                            } else {
+                                Some(dur)
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        self.loop_start = now;
+        timeout.and_then(|t| std::time::Duration::try_from(t).ok())
     }
 
     fn send_queue(&mut self) {
