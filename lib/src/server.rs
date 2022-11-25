@@ -510,7 +510,6 @@ impl Server {
         let mut events = Events::with_capacity(1024); // TODO: make event capacity configurable?
         self.last_sessions_len = self.sessions.borrow().slab.len();
 
-        self.current_poll_errors = 0;
         self.last_zombie_check = Instant::now();
         self.loop_start = Instant::now();
 
@@ -624,7 +623,7 @@ impl Server {
             });
 
             if self.shutting_down.is_some() {
-                if self.shutting_down_complete() {
+                if self.shut_down_sessions() {
                     return;
                 }
             }
@@ -632,7 +631,7 @@ impl Server {
     }
 
     fn check_for_poll_errors(&mut self) {
-        if self.current_poll_errors == self.max_poll_errors {
+        if self.current_poll_errors >= self.max_poll_errors {
             error!(
                 "Something is going very wrong. Last {} poll() calls failed, crashing..",
                 self.current_poll_errors
@@ -686,45 +685,41 @@ impl Server {
         }
 
         loop {
-            let request = self.channel.read_message();
-
-            // if the message was too large, we grow the buffer and retry to read if possible
-            if request.is_err() {
-                if (self.channel.interest & self.channel.readiness).is_readable() {
-                    if let Err(e) = self.channel.readable() {
-                        error!("error reading from channel: {:?}", e);
+            match self.channel.read_message() {
+                Ok(request) => match request.order {
+                    ProxyRequestOrder::HardStop => {
+                        let req_id = request.id.clone();
+                        self.notify(request);
+                        if let Err(e) = self.channel.write_message(&ProxyResponse::ok(req_id)) {
+                            error!("Could not send ok response to the main process: {}", e);
+                        }
+                        if let Err(e) = self.channel.run() {
+                            error!("Error while running the server channel: {}", e);
+                        }
+                        return;
                     }
-                    continue;
-                } else {
+                    ProxyRequestOrder::SoftStop => {
+                        self.shutting_down = Some(request.id.clone());
+                        self.last_sessions_len = self.sessions.borrow().slab.len();
+                        self.notify(request);
+                    }
+                    ProxyRequestOrder::ReturnListenSockets => {
+                        info!("received ReturnListenSockets order");
+                        self.return_listen_sockets();
+                    }
+                    _ => self.notify(request),
+                },
+                // Not an error per se, occurs when there is nothing to read
+                Err(_) => {
+                    // if the message was too large, we grow the buffer and retry to read if possible
+                    if (self.channel.interest & self.channel.readiness).is_readable() {
+                        if let Err(e) = self.channel.readable() {
+                            error!("error reading from channel: {:?}", e);
+                        }
+                        continue;
+                    }
                     break;
                 }
-            }
-
-            // do we really want to crash the server here?
-            let request = request.expect("the message should be valid");
-
-            match request.order {
-                ProxyRequestOrder::HardStop => {
-                    let req_id = request.id.clone();
-                    self.notify(request);
-                    if let Err(e) = self.channel.write_message(&ProxyResponse::ok(req_id)) {
-                        error!("Could not send ok response to the main process: {}", e);
-                    }
-                    if let Err(e) = self.channel.run() {
-                        error!("Error while running the server channel: {}", e);
-                    }
-                    return;
-                }
-                ProxyRequestOrder::SoftStop => {
-                    self.shutting_down = Some(request.id.clone());
-                    self.last_sessions_len = self.sessions.borrow().slab.len();
-                    self.notify(request);
-                }
-                ProxyRequestOrder::ReturnListenSockets => {
-                    info!("received ReturnListenSockets order");
-                    self.return_listen_sockets();
-                }
-                _ => self.notify(request),
             }
         }
     }
@@ -805,7 +800,7 @@ impl Server {
     }
 
     /// Order sessions to shut down, check that they are all down
-    fn shutting_down_complete(&mut self) -> bool {
+    fn shut_down_sessions(&mut self) -> bool {
         let sessions_count = self.sessions.borrow().slab.len();
         let slab = { self.sessions.borrow_mut().slab.clone() };
         for session in slab {
