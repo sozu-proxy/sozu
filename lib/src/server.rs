@@ -274,6 +274,8 @@ pub struct Server {
     base_sessions_count: usize,
     loop_start: Instant,
     last_sessions_len: usize,
+    last_zombie_check: Instant,
+    last_shutting_down_message: Option<Instant>,
 }
 
 impl Server {
@@ -437,8 +439,10 @@ impl Server {
             accept_queue: VecDeque::new(),
             accept_queue_timeout: Duration::seconds(i64::from(server_config.accept_queue_timeout)),
             base_sessions_count,
-            loop_start: Instant::now(), // to be reset on server run
-            last_sessions_len: 0,       // to be reset on server run
+            loop_start: Instant::now(),        // to be reset on server run
+            last_sessions_len: 0,              // to be reset on server run
+            last_zombie_check: Instant::now(), // to be reset on server run
+            last_shutting_down_message: None,
         };
 
         // initialize the worker with the state we got from a file
@@ -500,10 +504,9 @@ impl Server {
         let poll_timeout = Some(Duration::milliseconds(1000));
         let max_poll_errors = 10000;
         let mut current_poll_errors = 0;
-        let mut last_zombie_check = Instant::now();
+        self.last_zombie_check = Instant::now();
         self.last_sessions_len = self.sessions.borrow().slab.len();
         let mut should_poll_at: Option<Instant> = None;
-        let mut last_shutting_down_message = None;
 
         self.loop_start = Instant::now();
         loop {
@@ -604,78 +607,7 @@ impl Server {
 
             should_poll_at = TIMER.with(|timer| timer.borrow().next_poll_date());
 
-            let now = Instant::now();
-            if now - last_zombie_check > self.zombie_check_interval {
-                info!("zombie check");
-                last_zombie_check = now;
-
-                let mut tokens = HashSet::new();
-                let mut frontend_tokens = HashSet::new();
-
-                let mut count = 0;
-                let duration = self.zombie_check_interval;
-                for (_index, session) in self
-                    .sessions
-                    .borrow_mut()
-                    .slab
-                    .iter_mut()
-                    .filter(|(_, c)| now - c.borrow().last_event() > duration)
-                {
-                    let t = session.borrow().tokens();
-                    if !frontend_tokens.contains(&t[0]) {
-                        session.borrow().print_state();
-
-                        frontend_tokens.insert(t[0]);
-                        for tk in t.into_iter() {
-                            tokens.insert(tk);
-                        }
-
-                        count += 1;
-                    }
-                }
-
-                for tk in frontend_tokens.iter() {
-                    let cl = self.to_session(*tk);
-                    if self.sessions.borrow().slab.contains(cl.0) {
-                        let session = { self.sessions.borrow_mut().slab.remove(cl.0) };
-                        session.borrow_mut().close();
-
-                        let mut sessions = self.sessions.borrow_mut();
-                        assert!(sessions.nb_connections != 0);
-                        sessions.nb_connections -= 1;
-                        gauge!("client.connections", sessions.nb_connections);
-                        // do not be ready to accept right away, wait until we get back to 10% capacity
-                        if !sessions.can_accept
-                            && sessions.nb_connections < sessions.max_connections * 90 / 100
-                        {
-                            debug!(
-                                "nb_connections = {}, max_connections = {}, starting to accept again",
-                                sessions.nb_connections, sessions.max_connections
-                            );
-                            gauge!("accept_queue.backpressure", 0);
-                            sessions.can_accept = true;
-                        }
-                    }
-                }
-
-                if count > 0 {
-                    count!("zombies", count);
-
-                    let mut remaining = 0;
-                    for tk in tokens.into_iter() {
-                        let cl = self.to_session(tk);
-                        let mut sessions = self.sessions.borrow_mut();
-                        if sessions.slab.contains(cl.0) {
-                            sessions.slab.remove(cl.0);
-                            remaining += 1;
-                        }
-                    }
-                    info!(
-                        "removing {} zombies ({} remaining tokens after close)",
-                        count, remaining
-                    );
-                }
-            }
+            self.zombie_check();
 
             let now = time::OffsetDateTime::now_utc();
             // clear the local metrics drain every plain hour (01:00, 02:00, etc.) to prevent memory overuse
@@ -693,54 +625,8 @@ impl Server {
             });
 
             if self.shutting_down.is_some() {
-                let sessions_count = self.sessions.borrow().slab.len();
-                let slab = { self.sessions.borrow_mut().slab.clone() };
-                for session in slab {
-                    session.1.borrow_mut().shutting_down();
-                }
-
-                let new_sessions_count = self.sessions.borrow().slab.len();
-
-                if new_sessions_count < sessions_count {
-                    let now = Instant::now();
-                    if let Some(last) = last_shutting_down_message {
-                        if (now - last) > Duration::seconds(5) {
-                            info!(
-                                "closed {} sessions, {} sessions left, base_sessions_count = {}",
-                                sessions_count - new_sessions_count,
-                                new_sessions_count,
-                                self.base_sessions_count
-                            );
-                        }
-                    }
-                    last_shutting_down_message = Some(now);
-                }
-
-                if new_sessions_count <= self.base_sessions_count {
-                    info!("last session stopped, shutting down!");
-                    if let Err(e) = self.channel.run() {
-                        error!("Error while running the server channel: {}", e);
-                    }
-                    self.block_channel();
-                    let proxy_response = ProxyResponse {
-                        id: self
-                            .shutting_down
-                            .take()
-                            .expect("should have shut down correctly"), // panicking here makes sense actually
-                        status: ProxyResponseStatus::Ok,
-                        content: None,
-                    };
-                    if let Err(e) = self.channel.write_message(&proxy_response) {
-                        error!("Could not write response to the main process: {}", e);
-                    }
+                if self.shutting_down_complete() {
                     return;
-                } else if new_sessions_count < self.last_sessions_len {
-                    info!(
-                        "shutting down, {} slab elements remaining (base: {})",
-                        new_sessions_count - self.base_sessions_count,
-                        self.base_sessions_count
-                    );
-                    self.last_sessions_len = new_sessions_count;
                 }
             }
         }
@@ -833,6 +719,138 @@ impl Server {
                 _ => self.notify(request),
             }
         }
+    }
+
+    fn zombie_check(&mut self) {
+        let now = Instant::now();
+        if now - self.last_zombie_check > self.zombie_check_interval {
+            info!("zombie check");
+            self.last_zombie_check = now;
+
+            let mut tokens = HashSet::new();
+            let mut frontend_tokens = HashSet::new();
+
+            let mut count = 0;
+            let duration = self.zombie_check_interval;
+            for (_index, session) in self
+                .sessions
+                .borrow_mut()
+                .slab
+                .iter_mut()
+                .filter(|(_, c)| now - c.borrow().last_event() > duration)
+            {
+                let t = session.borrow().tokens();
+                if !frontend_tokens.contains(&t[0]) {
+                    session.borrow().print_state();
+
+                    frontend_tokens.insert(t[0]);
+                    for tk in t.into_iter() {
+                        tokens.insert(tk);
+                    }
+
+                    count += 1;
+                }
+            }
+
+            for tk in frontend_tokens.iter() {
+                let cl = self.to_session(*tk);
+                if self.sessions.borrow().slab.contains(cl.0) {
+                    let session = { self.sessions.borrow_mut().slab.remove(cl.0) };
+                    session.borrow_mut().close();
+
+                    let mut sessions = self.sessions.borrow_mut();
+                    assert!(sessions.nb_connections != 0);
+                    sessions.nb_connections -= 1;
+                    gauge!("client.connections", sessions.nb_connections);
+                    // do not be ready to accept right away, wait until we get back to 10% capacity
+                    if !sessions.can_accept
+                        && sessions.nb_connections < sessions.max_connections * 90 / 100
+                    {
+                        debug!(
+                            "nb_connections = {}, max_connections = {}, starting to accept again",
+                            sessions.nb_connections, sessions.max_connections
+                        );
+                        gauge!("accept_queue.backpressure", 0);
+                        sessions.can_accept = true;
+                    }
+                }
+            }
+
+            if count > 0 {
+                count!("zombies", count);
+
+                let mut remaining = 0;
+                for tk in tokens.into_iter() {
+                    let cl = self.to_session(tk);
+                    let mut sessions = self.sessions.borrow_mut();
+                    if sessions.slab.contains(cl.0) {
+                        sessions.slab.remove(cl.0);
+                        remaining += 1;
+                    }
+                }
+                info!(
+                    "removing {} zombies ({} remaining tokens after close)",
+                    count, remaining
+                );
+            }
+        }
+    }
+
+    /// Order sessions to shut down, check that they are all down
+    fn shutting_down_complete(&mut self) -> bool {
+        let sessions_count = self.sessions.borrow().slab.len();
+        let slab = { self.sessions.borrow_mut().slab.clone() };
+        for session in slab {
+            session.1.borrow_mut().shutting_down();
+        }
+
+        let new_sessions_count = self.sessions.borrow().slab.len();
+
+        if new_sessions_count < sessions_count {
+            let now = Instant::now();
+            if let Some(last) = self.last_shutting_down_message {
+                if (now - last) > Duration::seconds(5) {
+                    info!(
+                        "closed {} sessions, {} sessions left, base_sessions_count = {}",
+                        sessions_count - new_sessions_count,
+                        new_sessions_count,
+                        self.base_sessions_count
+                    );
+                }
+            }
+            self.last_shutting_down_message = Some(now);
+        }
+
+        if new_sessions_count <= self.base_sessions_count {
+            info!("last session stopped, shutting down!");
+            if let Err(e) = self.channel.run() {
+                error!("Error while running the server channel: {}", e);
+            }
+            self.block_channel();
+            let proxy_response = ProxyResponse {
+                id: self
+                    .shutting_down
+                    .take()
+                    .expect("should have shut down correctly"), // panicking here makes sense actually
+                status: ProxyResponseStatus::Ok,
+                content: None,
+            };
+            if let Err(e) = self.channel.write_message(&proxy_response) {
+                error!("Could not write response to the main process: {}", e);
+            }
+            return true;
+        }
+
+        if new_sessions_count < self.last_sessions_len {
+            info!(
+                "shutting down, {} slab elements remaining (base: {})",
+                new_sessions_count - self.base_sessions_count,
+                self.base_sessions_count
+            );
+            self.last_sessions_len = new_sessions_count;
+        }
+
+        false
     }
 
     fn send_queue(&mut self) {
