@@ -204,7 +204,6 @@ pub mod https;
 use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
 
 use mio::{net::TcpStream, Token};
-use thiserror::Error as ThisError;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
@@ -397,8 +396,7 @@ pub enum SessionResult {
     ConnectBackend,
 }
 
-// TODO: enrich with thiserror
-#[derive(Debug, PartialEq, Eq, ThisError)]
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum ConnectionError {
     #[error("No host given for the backend")]
     NoHostGiven,
@@ -418,6 +416,8 @@ pub enum ConnectionError {
     Unauthorized,
     #[error("Connect to backend failed. Too many connections. Host {0:?}")]
     TooManyConnections(Option<String>),
+    #[error("Connect to backend failed. Mio connect error: {0}")]
+    MioConnectError(String),
     // #[error("Connect to backend failed. EINPROGRESS, the socket is probably nonblocing")]
     // SocketIsNonblocking,
 }
@@ -541,14 +541,14 @@ impl Backend {
                 self.inc_connections();
                 Ok(tcp_stream)
             }
-            Err(_connection_error) => {
+            Err(mio_error) => {
                 self.retry_policy.fail();
                 self.failures += 1;
                 // TODO: handle EINPROGRESS. It is difficult. It is discussed here:
                 // https://docs.rs/mio/latest/mio/net/struct.TcpStream.html#method.connect
                 // with an example code here:
                 // https://github.com/Thomasdezeeuw/heph/blob/0c4f1ab3eaf08bea1d65776528bfd6114c9f8374/src/net/tcp/stream.rs#L560-L622
-                Err(ConnectionError::NoBackendAvailable(None))
+                Err(ConnectionError::MioConnectError(mio_error.to_string()))
             }
         }
     }
