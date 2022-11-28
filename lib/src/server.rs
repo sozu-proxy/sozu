@@ -1264,148 +1264,152 @@ impl Server {
 
         match deactivate.proxy {
             ListenerType::HTTP => {
-                match self
+                let (token, mut listener) = match self
                     .http
                     .borrow_mut()
                     .give_back_listener(deactivate.address)
                 {
-                    Some((token, mut listener)) => {
-                        if let Err(e) = self.poll.registry().deregister(&mut listener) {
-                            error!(
-                                "error deregistering HTTP listen socket({:?}): {:?}",
-                                deactivate, e
-                            );
-                        }
-                        let mut sessions = self.sessions.borrow_mut();
-                        if sessions.slab.contains(token.0) {
-                            sessions.slab.remove(token.0);
-                            info!("removed listen token {:?}", token);
-                        }
-
-                        if deactivate.to_scm {
-                            self.unblock_scm_socket();
-                            let listeners = Listeners {
-                                http: vec![(deactivate.address, listener.as_raw_fd())],
-                                tls: vec![],
-                                tcp: vec![],
-                            };
-                            info!("sending HTTP listener: {:?}", listeners);
-                            let res = self.scm.send_listeners(&listeners);
-
-                            self.block_scm_socket();
-
-                            info!("sent HTTP listener: {:?}", res);
-                        }
-                        ProxyResponse::ok(req_id)
-                    }
+                    Some((token, listener)) => (token, listener),
                     None => {
                         error!(
                             "Couldn't deactivate HTTP listener at address {:?}",
                             deactivate.address
                         );
-                        ProxyResponse::error(
+                        return ProxyResponse::error(
                             req_id,
                             format!(
                                 "cannot deactivate HTTP listener at address {:?}",
                                 deactivate.address
                             ),
-                        )
+                        );
+                    }
+                };
+
+                if let Err(e) = self.poll.registry().deregister(&mut listener) {
+                    error!(
+                        "error deregistering HTTP listen socket({:?}): {:?}",
+                        deactivate, e
+                    );
+                }
+
+                {
+                    let mut sessions = self.sessions.borrow_mut();
+                    if sessions.slab.contains(token.0) {
+                        sessions.slab.remove(token.0);
+                        info!("removed listen token {:?}", token);
                     }
                 }
+
+                if deactivate.to_scm {
+                    self.unblock_scm_socket();
+                    let listeners = Listeners {
+                        http: vec![(deactivate.address, listener.as_raw_fd())],
+                        tls: vec![],
+                        tcp: vec![],
+                    };
+                    info!("sending HTTP listener: {:?}", listeners);
+                    let res = self.scm.send_listeners(&listeners);
+
+                    self.block_scm_socket();
+
+                    info!("sent HTTP listener: {:?}", res);
+                }
+                ProxyResponse::ok(req_id)
             }
             ListenerType::HTTPS => {
-                match self
+                let (token, mut listener) = match self
                     .https
                     .borrow_mut()
                     .give_back_listener(deactivate.address)
                 {
-                    Some((token, mut listener)) => {
-                        if let Err(e) = self.poll.registry().deregister(&mut listener) {
-                            error!(
-                                "error deregistering HTTPS listen socket({:?}): {:?}",
-                                deactivate, e
-                            );
-                        }
-                        if self.sessions.borrow().slab.contains(token.0) {
-                            self.sessions.borrow_mut().slab.remove(token.0);
-                            info!("removed listen token {:?}", token);
-                        }
+                    Some((token, listener)) => (token, listener),
 
-                        if deactivate.to_scm {
-                            self.scm.set_blocking(false);
-                            let listeners = Listeners {
-                                http: vec![],
-                                tls: vec![(deactivate.address, listener.as_raw_fd())],
-                                tcp: vec![],
-                            };
-                            info!("sending HTTPS listener: {:?}", listeners);
-                            let res = self.scm.send_listeners(&listeners);
-
-                            self.scm.set_blocking(true);
-
-                            info!("sent HTTPS listener: {:?}", res);
-                        }
-                        ProxyResponse::ok(req_id)
-                    }
                     None => {
                         error!(
                             "Couldn't deactivate HTTPS listener at address {:?}",
                             deactivate.address
                         );
-                        ProxyResponse::error(
+                        return ProxyResponse::error(
                             req_id,
                             format!(
                                 "cannot deactivate HTTPS listener at address {:?}",
                                 deactivate.address
                             ),
-                        )
+                        );
                     }
+                };
+                if let Err(e) = self.poll.registry().deregister(&mut listener) {
+                    error!(
+                        "error deregistering HTTPS listen socket({:?}): {:?}",
+                        deactivate, e
+                    );
                 }
+                if self.sessions.borrow().slab.contains(token.0) {
+                    self.sessions.borrow_mut().slab.remove(token.0);
+                    info!("removed listen token {:?}", token);
+                }
+
+                if deactivate.to_scm {
+                    self.unblock_scm_socket();
+                    let listeners = Listeners {
+                        http: vec![],
+                        tls: vec![(deactivate.address, listener.as_raw_fd())],
+                        tcp: vec![],
+                    };
+                    info!("sending HTTPS listener: {:?}", listeners);
+                    let res = self.scm.send_listeners(&listeners);
+
+                    self.block_scm_socket();
+
+                    info!("sent HTTPS listener: {:?}", res);
+                }
+                ProxyResponse::ok(req_id)
             }
             ListenerType::TCP => {
-                match self.tcp.borrow_mut().give_back_listener(deactivate.address) {
-                    Some((token, mut listener)) => {
-                        if let Err(e) = self.poll.registry().deregister(&mut listener) {
+                let (token, mut listener) =
+                    match self.tcp.borrow_mut().give_back_listener(deactivate.address) {
+                        Some((token, listener)) => (token, listener),
+                        None => {
                             error!(
-                                "error deregistering TCP listen socket({:?}): {:?}",
-                                deactivate, e
+                                "Couldn't deactivate TCP listener at address {:?}",
+                                deactivate.address
+                            );
+                            return ProxyResponse::error(
+                                req_id,
+                                format!(
+                                    "cannot deactivate TCP listener at address {:?}",
+                                    deactivate.address
+                                ),
                             );
                         }
-                        if self.sessions.borrow().slab.contains(token.0) {
-                            self.sessions.borrow_mut().slab.remove(token.0);
-                            info!("removed listen token {:?}", token);
-                        }
+                    };
 
-                        if deactivate.to_scm {
-                            self.unblock_scm_socket();
-                            let listeners = Listeners {
-                                http: vec![],
-                                tls: vec![],
-                                tcp: vec![(deactivate.address, listener.as_raw_fd())],
-                            };
-                            info!("sending TCP listener: {:?}", listeners);
-                            let res = self.scm.send_listeners(&listeners);
-
-                            self.block_scm_socket();
-
-                            info!("sent TCP listener: {:?}", res);
-                        }
-                        ProxyResponse::ok(req_id)
-                    }
-                    None => {
-                        error!(
-                            "Couldn't deactivate TCP listener at address {:?}",
-                            deactivate.address
-                        );
-                        ProxyResponse::error(
-                            req_id,
-                            format!(
-                                "cannot deactivate TCP listener at address {:?}",
-                                deactivate.address
-                            ),
-                        )
-                    }
+                if let Err(e) = self.poll.registry().deregister(&mut listener) {
+                    error!(
+                        "error deregistering TCP listen socket({:?}): {:?}",
+                        deactivate, e
+                    );
                 }
+                if self.sessions.borrow().slab.contains(token.0) {
+                    self.sessions.borrow_mut().slab.remove(token.0);
+                    info!("removed listen token {:?}", token);
+                }
+
+                if deactivate.to_scm {
+                    self.unblock_scm_socket();
+                    let listeners = Listeners {
+                        http: vec![],
+                        tls: vec![],
+                        tcp: vec![(deactivate.address, listener.as_raw_fd())],
+                    };
+                    info!("sending TCP listener: {:?}", listeners);
+                    let res = self.scm.send_listeners(&listeners);
+
+                    self.block_scm_socket();
+
+                    info!("sent TCP listener: {:?}", res);
+                }
+                ProxyResponse::ok(req_id)
             }
         }
     }
@@ -1464,13 +1468,13 @@ impl Server {
         info!("sent default listeners: {:?}", res);
     }
 
-    fn block_scm_socket(&self) {
+    fn block_scm_socket(&mut self) {
         if let Err(e) = self.scm.set_blocking(true) {
             error!("Could not block scm socket: {}", e);
         }
     }
 
-    fn unblock_scm_socket(&self) {
+    fn unblock_scm_socket(&mut self) {
         if let Err(e) = self.scm.set_blocking(false) {
             error!("Could not unblock scm socket: {}", e);
         }
