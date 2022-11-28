@@ -20,7 +20,7 @@ pub const MAX_BYTES_OUT: usize = 4096;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScmSocket {
     pub fd: RawFd,
-    pub blocking: bool, // TODO this is never used anywhere. Use it by updating / checking it
+    pub blocking: bool,
 }
 
 impl ScmSocket {
@@ -43,7 +43,10 @@ impl ScmSocket {
     }
 
     /// Use the standard library (unsafe) to set the socket to blocking / unblocking
-    pub fn set_blocking(&self, blocking: bool) -> anyhow::Result<()> {
+    pub fn set_blocking(&mut self, blocking: bool) -> anyhow::Result<()> {
+        if self.blocking == blocking {
+            return Ok(());
+        }
         unsafe {
             let stream = StdUnixStream::from_raw_fd(self.fd);
             stream
@@ -51,6 +54,7 @@ impl ScmSocket {
                 .with_context(|| "could not change blocking status for stream")?;
             let _dropped_fd = stream.into_raw_fd();
         }
+        self.blocking = blocking;
         Ok(())
     }
 
@@ -261,7 +265,7 @@ mod tests {
         let scm_socket = ScmSocket::new(raw_file_descriptor);
         assert!(scm_socket.is_ok());
 
-        let scm_socket = scm_socket.unwrap();
+        let mut scm_socket = scm_socket.unwrap();
 
         assert!(scm_socket.set_blocking(true).is_ok());
         assert!(scm_socket.set_blocking(false).is_ok());
