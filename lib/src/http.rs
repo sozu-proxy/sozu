@@ -678,10 +678,10 @@ impl Session {
             }
 
             if front_interest.is_readable() {
-                let order = self.readable();
-                trace!("front readable\tinterpreting session order {:?}", order);
+                let session_result = self.readable();
+                trace!("front readable\tinterpreting session order {:?}", session_result);
 
-                match order {
+                match session_result {
                     SessionResult::ConnectBackend => {
                         match self.connect_to_backend(session.clone()) {
                             // reuse connection or send a default answer, we can continue

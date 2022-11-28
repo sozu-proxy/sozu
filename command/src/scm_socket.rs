@@ -20,7 +20,7 @@ pub const MAX_BYTES_OUT: usize = 4096;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScmSocket {
     pub fd: RawFd,
-    pub blocking: bool,
+    pub blocking: bool, // TODO this is never used anywhere. Use it by updating / checking it
 }
 
 impl ScmSocket {
