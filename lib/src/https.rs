@@ -818,9 +818,12 @@ impl Session {
                 self.close_backend();
                 match self.connect_to_backend(session.clone()) {
                     // reuse connection or send a default answer, we can continue
-                    Ok(BackendConnectAction::Reuse) | Err(_) => {}
-                    // New or Replace: stop here, we must wait for an event
-                    _ => return SessionResult::Continue,
+                    Ok(BackendConnectAction::Reuse) => {}
+                    Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
+                        // stop here, we must wait for an event
+                        return SessionResult::Continue;
+                    }
+                    Err(connection_error) => error!("{}", connection_error),
                 }
             } else {
                 self.metrics().backend_connected();
@@ -880,9 +883,12 @@ impl Session {
                     SessionResult::ConnectBackend => {
                         match self.connect_to_backend(session.clone()) {
                             // reuse connection or send a default answer, we can continue
-                            Ok(BackendConnectAction::Reuse) | Err(_) => {}
-                            // New or Replace: stop here, we must wait for an event
-                            _ => return SessionResult::Continue,
+                            Ok(BackendConnectAction::Reuse) => {}
+                            Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
+                                // we must wait for an event
+                                return SessionResult::Continue;
+                            }
+                            Err(connection_error) => error!("{}", connection_error),
                         }
                     }
                     SessionResult::Continue => {}
@@ -1035,7 +1041,9 @@ impl Session {
         if self.connection_attempt >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
             self.set_answer(DefaultAnswerStatus::Answer503, None);
-            return Err(ConnectionError::NoBackendAvailable);
+            return Err(ConnectionError::NoBackendAvailable(
+                self.cluster_id.to_owned(),
+            ));
         }
         Ok(())
     }
@@ -1077,11 +1085,11 @@ impl Session {
         let host: &str = match hostname_and_port(host.as_bytes()) {
             Ok((remaining_input, (hostname, port))) => {
                 if remaining_input != &b""[..] {
-                    error!(
-                        "connect_to_backend: invalid remaining chars after hostname. Host: {}",
-                        host
-                    );
-                    return Err(ConnectionError::InvalidHost);
+                    return Err(ConnectionError::InvalidHost {
+                        hostname: host.to_owned(),
+                        message: "connect_to_backend: invalid remaining chars after hostname"
+                            .to_owned(),
+                    });
                 }
 
                 // it is alright to call from_utf8_unchecked,
@@ -1105,7 +1113,7 @@ impl Session {
                     /*FIXME: deactivate this check for a temporary test
                     unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, None);
                     */
-                    return Err(ConnectionError::HostNotFound);
+                    return Err(ConnectionError::HostNotFound(hostname.to_owned()));
                 }
 
                 //FIXME: we should check that the port is right too
@@ -1116,9 +1124,11 @@ impl Session {
                     host
                 }
             }
-            Err(_) => {
-                error!("hostname parsing failed");
-                return Err(ConnectionError::InvalidHost);
+            Err(parse_error) => {
+                return Err(ConnectionError::InvalidHost {
+                    hostname: host.to_owned(),
+                    message: format!("Hostname parsing failed: {}", parse_error),
+                });
             }
         };
 
@@ -1236,8 +1246,9 @@ impl Session {
                 Err(ConnectionError::Unauthorized)
             }
             None => {
+                let no_host_error = ConnectionError::HostNotFound(host.to_owned());
                 self.set_answer(DefaultAnswerStatus::Answer404, None);
-                Err(ConnectionError::HostNotFound)
+                Err(no_host_error)
             }
         }
     }
@@ -1353,7 +1364,9 @@ impl Session {
                 {
                     error!("not enough memory, cannot connect to backend");
                     self.set_answer(DefaultAnswerStatus::Answer503, None);
-                    return Err(ConnectionError::TooManyConnections);
+                    return Err(ConnectionError::TooManyConnections(
+                        self.cluster_id.to_owned(),
+                    ));
                 }
 
                 let back_token = {

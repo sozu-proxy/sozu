@@ -89,26 +89,33 @@ impl BackendMap {
     ) -> Result<(Rc<RefCell<Backend>>, TcpStream), ConnectionError> {
         let cluster_backends = match self.backends.get_mut(cluster_id) {
             Some(backends) => backends,
-            None => return Err(ConnectionError::NoBackendAvailable),
+            None => {
+                return Err(ConnectionError::NoBackendAvailable(Some(
+                    cluster_id.to_owned(),
+                )))
+            }
         };
 
         if cluster_backends.backends.is_empty() {
             self.available = false;
-            return Err(ConnectionError::NoBackendAvailable);
+            return Err(ConnectionError::NoBackendAvailable(Some(
+                cluster_id.to_owned(),
+            )));
         }
 
         let next_backend = match cluster_backends.next_available_backend() {
             Some(nb) => nb,
             None => {
                 if self.available {
-                    error!("no more available backends for cluster {}", cluster_id);
                     self.available = false;
 
                     push_event(proxy::ProxyEvent::NoAvailableBackends(
                         cluster_id.to_string(),
                     ));
                 }
-                return Err(ConnectionError::NoBackendAvailable);
+                return Err(ConnectionError::NoBackendAvailable(Some(
+                    cluster_id.to_owned(),
+                )));
             }
         };
 
@@ -283,7 +290,6 @@ impl BackendList {
             .iter()
             .filter(|backend| {
                 let owned = backend.borrow();
-
                 owned.backup == backup && owned.can_open()
             })
             .map(Clone::clone)

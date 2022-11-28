@@ -396,18 +396,30 @@ pub enum SessionResult {
     ConnectBackend,
 }
 
-// TODO: enrich with thiserror
-#[derive(Debug, PartialEq, Eq)]
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum ConnectionError {
+    #[error("No host given for the backend")]
     NoHostGiven,
+    #[error("Connect to backend failed. No request line to extract a route.")]
     NoRequestLineGiven,
-    InvalidHost,
-    HostNotFound,
-    NoBackendAvailable,
+    #[error("Connect to backend failed. {message:?}. host: {hostname:?}")]
+    InvalidHost { message: String, hostname: String },
+    #[error("Connect to backend failed. Host not found: {0}")]
+    HostNotFound(String),
+    #[error("Connect to backend failed. No backend available for cluster {0:?}")]
+    NoBackendAvailable(Option<String>),
+    #[error("unimplemented error")]
     ToBeDefined,
-    HttpsRedirect,
+    #[error("Connect to backend failed. Cluster {0} should redirect HTTPS")]
+    HttpsRedirect(String),
+    #[error("Connect to backend failed. Route is unauthorized")]
     Unauthorized,
-    TooManyConnections,
+    #[error("Connect to backend failed. Too many connections. Host {0:?}")]
+    TooManyConnections(Option<String>),
+    #[error("Connect to backend failed. Mio connect error: {0}")]
+    MioConnectError(String),
+    // #[error("Connect to backend failed. EINPROGRESS, the socket is probably nonblocing")]
+    // SocketIsNonblocking,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -520,21 +532,25 @@ impl Backend {
 
     pub fn try_connect(&mut self) -> Result<mio::net::TcpStream, ConnectionError> {
         if self.status != BackendStatus::Normal {
-            return Err(ConnectionError::NoBackendAvailable);
+            return Err(ConnectionError::NoBackendAvailable(None));
         }
 
-        //FIXME: what happens if the connect() call fails with EINPROGRESS?
-        let conn = mio::net::TcpStream::connect(self.address)
-            .map_err(|_| ConnectionError::NoBackendAvailable);
-        if conn.is_ok() {
-            //self.retry_policy.succeed();
-            self.inc_connections();
-        } else {
-            self.retry_policy.fail();
-            self.failures += 1;
+        match mio::net::TcpStream::connect(self.address) {
+            Ok(tcp_stream) => {
+                //self.retry_policy.succeed();
+                self.inc_connections();
+                Ok(tcp_stream)
+            }
+            Err(mio_error) => {
+                self.retry_policy.fail();
+                self.failures += 1;
+                // TODO: handle EINPROGRESS. It is difficult. It is discussed here:
+                // https://docs.rs/mio/latest/mio/net/struct.TcpStream.html#method.connect
+                // with an example code here:
+                // https://github.com/Thomasdezeeuw/heph/blob/0c4f1ab3eaf08bea1d65776528bfd6114c9f8374/src/net/tcp/stream.rs#L560-L622
+                Err(ConnectionError::MioConnectError(mio_error.to_string()))
+            }
         }
-
-        conn
     }
 }
 
