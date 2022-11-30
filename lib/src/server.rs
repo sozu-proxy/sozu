@@ -29,7 +29,7 @@ use crate::{
             Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyEvent,
             ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
             ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,
-            QueryClusterType, RemoveBackend, TcpListener as CommandTcpListener, Topic,
+            QueryClusterType, RemoveBackend, TcpListener as CommandTcpListener,
         },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
@@ -1000,14 +1000,14 @@ impl Server {
             _ => {}
         };
 
-        let topics = request.order.get_topics();
-        if topics.contains(&Topic::HttpProxyConfig) {
+        let proxy_destinations = request.order.get_destinations();
+        if proxy_destinations.to_http_proxy {
             push_queue(self.http.borrow_mut().notify(request.clone()));
         }
-        if topics.contains(&Topic::HttpsProxyConfig) {
+        if proxy_destinations.to_https_proxy {
             push_queue(self.https.borrow_mut().notify(request.clone()));
         }
-        if topics.contains(&Topic::TcpProxyConfig) {
+        if proxy_destinations.to_tcp_proxy {
             push_queue(self.tcp.borrow_mut().notify(request.clone()));
         }
 
