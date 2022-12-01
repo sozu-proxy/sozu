@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      max-parallel: 1 # because concurrent testing bring certain time-based tests to fail
       matrix:
         rust:
           - stable
