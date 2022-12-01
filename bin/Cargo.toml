@@ -25,31 +25,31 @@ include = [
 name = "sozu"
 
 [dependencies]
-anyhow = "^1.0.65"
+anyhow = "^1.0.66"
 async-dup = "^1.2.2"
-async-io = "^1.9.0"
-clap = { version = "^4.0.14", features = ["derive"] }
-futures = "^0.3.24"
+async-io = "^1.12.0"
+clap = { version = "^4.0.29", features = ["derive"] }
+futures = "^0.3.25"
 futures-lite = "^1.12.0"
 hex = "^0.4.3"
 jemallocator = { version = "^0.5.0", optional = true }
 lazy_static = "^1.4.0"
-libc = "^0.2.135"
+libc = "^0.2.137"
 log = "^0.4.17"
-mio = { version = "^0.8.4", features = ["os-poll", "net"] }
-nix = "^0.25.0"
+mio = { version = "^0.8.5", features = ["os-poll", "net"] }
+nix = "^0.26.1"
 nom = "^7.1.1"
 paw = "^1.0.0"
 prettytable-rs = { version = "^0.9.0", default-features = false }
-serde = { version = "^1.0.145", features = ["derive"] }
-serde_json = "^1.0.86"
-time = "^0.3.15"
+serde = { version = "^1.0.148", features = ["derive"] }
+serde_json = "^1.0.89"
+time = "^0.3.17"
 rand = "^0.8.5"
-regex = "^1.6.0"
+regex = "^1.7.0"
 slab = "^0.4.7"
-smol = "^1.2.5"
+smol = "^1.3.0"
 tempfile = "^3.3.0"
-termion = "^1.5.6"
+termion = "^2.0.1"
 
 sozu-command-lib = { path = "../command" }
 sozu-lib = { path = "../lib" }
