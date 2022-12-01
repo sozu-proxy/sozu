@@ -199,6 +199,7 @@ pub struct StatusLine {
 }
 
 impl StatusLine {
+    // TODO: return anyhow::Result<StatusLine>
     pub fn from_raw_status_line(r: RawStatusLine) -> Option<StatusLine> {
         if let Ok(status_str) = str::from_utf8(r.status) {
             if let Ok(status) = status_str.parse::<u16>() {
@@ -636,6 +637,7 @@ pub enum TransferEncodingValue {
     Compress,
     Deflate,
     Gzip,
+    Br,
     Identity,
     Unknown,
 }
@@ -680,6 +682,8 @@ impl Header {
                 HeaderValue::Encoding(TransferEncodingValue::Deflate)
             } else if compare_no_case(&self.value, b"gzip") {
                 HeaderValue::Encoding(TransferEncodingValue::Gzip)
+            } else if compare_no_case(&self.value, b"br") {
+                HeaderValue::Encoding(TransferEncodingValue::Br)
             } else if compare_no_case(&self.value, b"identity") {
                 HeaderValue::Encoding(TransferEncodingValue::Identity)
             } else {
