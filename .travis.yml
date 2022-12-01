@@ -59,9 +59,7 @@ addons:
 script:
   - cd $ROOT_PATH/lib     && cargo test  --verbose
   - cd $ROOT_PATH/command && cargo test  --verbose
-  - cd $ROOT_PATH/futures && cargo test  --verbose
   - cd $ROOT_PATH/bin     && cargo build --verbose
-  - cd $ROOT_PATH/ctl     && cargo build --verbose
 
 cache:
   directories:
