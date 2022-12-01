@@ -2,7 +2,7 @@
 
 Summary:	A lightweight, fast, always-up reverse proxy server.
 Name:		sozu
-Version:	0.13.6
+Version:	0.14.1
 Release:	1%{?dist}
 Epoch:		1
 License:	AGPL-3.0
@@ -11,9 +11,6 @@ URL:		https://github.com/sozu-proxy/sozu
 
 Source0:	https://github.com/sozu-proxy/sozu/archive/%{version}.tar.gz
 
-Requires:	openssl >= 1.0.1
-
-BuildRequires:	openssl-devel >= 1.0.1
 BuildRequires:	m4
 BuildRequires:	selinux-policy-devel
 # BuildRequires: 	rust
@@ -40,7 +37,7 @@ Requires:	sozu
 %endif
 
 %build
-cargo build --release --all
+cargo build --release --all --locked
 
 %install
 rm -rf %{buildroot}

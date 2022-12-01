@@ -41,8 +41,6 @@ update the version number in `Cargo.toml` files in:
 - `command/`
 - `lib/`
 - `bin/`
-- `ctl/`
-- `futures/`
 
 Run `cargo build` at the root of the project to update the `Cargo.lock` file.
 

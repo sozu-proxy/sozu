@@ -12,7 +12,7 @@ However, if you built the project from source, `sozu` and `sozuctl` are placed i
 
 `./target/release/sozu start -c <path/to/your/config.toml>`
 
-> `cargo build --release` puts the resulting binary in `target/release` instead of `target/debug`.
+> `cargo build --release --locked` puts the resulting binary in `target/release` instead of `target/debug`.
 
 You can find a working `config.toml` example [here][cfg].
 

@@ -31,7 +31,7 @@ pkgver() {
 build() {
   cd "$srcdir/$_gitname"
 
-  cargo build --release --all
+  cargo build --release --all --locked
 }
 
 package() {

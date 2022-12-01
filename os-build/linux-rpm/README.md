@@ -19,5 +19,5 @@ packages.
 If you're building for production, this option is recommended.
 
 ```
-./rpm_build.sh --release
+./rpm_build.sh --release --locked
 ```
