@@ -322,35 +322,23 @@ impl ConfigState {
                 .with_context(|| "cannot calculate the certificate's fingerprint")?,
         );
 
-        self.certificates
+        let entry = self.certificates
             .entry(add.address)
             .or_insert_with(HashMap::new);
 
-        if self
-            .certificates
-            .get(&add.address)
-            .unwrap() // is guaranted not to happen because filled with HashMap::new
-            .contains_key(&fingerprint)
-        {
-            bail!(
-                "A certificate is already present for address {}",
-                add.address
-            );
+        if entry.contains_key(&fingerprint) {
+            info!("Skip loading of certificate '{}' for domain '{}' on listener '{}', the certificate is already present.", fingerprint, add.names.join(", "), add.address);
+            return Ok(());
         }
 
-        self.certificates
-            .get_mut(&add.address)
-            .unwrap() // is guaranted not to happen because filled with HashMap::new
-            .insert(fingerprint, (add.certificate.clone(), add.names.clone()));
-
+        entry.insert(fingerprint, (add.certificate.clone(), add.names.clone()));
         Ok(())
     }
 
     fn remove_certificate(&mut self, remove: &RemoveCertificate) -> anyhow::Result<()> {
-        self.certificates
-            .get_mut(&remove.address)
-            .with_context(|| format!("No certificate to remove for address {}", remove.address))?
-            .remove(&remove.fingerprint);
+        if let Some(index) = self.certificates.get_mut(&remove.address) {
+            index.remove(&remove.fingerprint);
+        }
 
         Ok(())
     }
