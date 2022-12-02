@@ -682,7 +682,10 @@ impl Session {
 
             if front_interest.is_readable() {
                 let session_result = self.readable();
-                trace!("front readable\tinterpreting session order {:?}", session_result);
+                trace!(
+                    "front readable\tinterpreting session order {:?}",
+                    session_result
+                );
 
                 match session_result {
                     SessionResult::ConnectBackend => {
@@ -847,7 +850,7 @@ impl Session {
     }
 
     fn check_circuit_breaker(&mut self) -> Result<(), ConnectionError> {
-        if self.connection_attempt == CONN_RETRIES {
+        if self.connection_attempt >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
             self.set_answer(DefaultAnswerStatus::Answer503, None);
             return Err(ConnectionError::NoBackendAvailable(
@@ -1217,29 +1220,27 @@ impl ProxySession for Session {
 
         self.close_backend();
 
-        if let Some(State::Http(ref mut http)) = self.protocol {
-            //if the state was initial, the connection was already reset
-            if http.request_state != Some(RequestState::Initial) {
-                gauge_add!("http.active_requests", -1);
+        match self.protocol {
+            Some(State::Http(ref mut http)) => {
+                //if the state was initial, the connection was already reset
+                if http.request_state != Some(RequestState::Initial) {
+                    gauge_add!("http.active_requests", -1);
 
-                if let Some(b) = http.backend_data.as_mut() {
+                    if let Some(b) = http.backend_data.as_mut() {
+                        let mut backend = b.borrow_mut();
+                        backend.active_requests = backend.active_requests.saturating_sub(1);
+                    }
+                }
+                gauge_add!("protocol.http", -1)
+            }
+            Some(State::WebSocket(_)) => {
+                if let Some(b) = &self.backend {
                     let mut backend = b.borrow_mut();
                     backend.active_requests = backend.active_requests.saturating_sub(1);
                 }
+                gauge_add!("protocol.ws", -1)
             }
-        }
-
-        if let Some(State::WebSocket(_)) = self.protocol {
-            if let Some(b) = &self.backend {
-                let mut backend = b.borrow_mut();
-                backend.active_requests = backend.active_requests.saturating_sub(1);
-            }
-        }
-
-        match self.protocol {
             Some(State::Expect(_)) => gauge_add!("protocol.proxy.expect", -1),
-            Some(State::Http(_)) => gauge_add!("protocol.http", -1),
-            Some(State::WebSocket(_)) => gauge_add!("protocol.ws", -1),
             None => {}
         }
 
