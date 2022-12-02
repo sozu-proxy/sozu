@@ -141,7 +141,11 @@ pub fn begin_worker_process(
         worker_config.log_access_target.as_deref(),
     );
 
-    trace!("Creating worker {} with config: {:#?}", worker_id, worker_config);
+    trace!(
+        "Creating worker {} with config: {:#?}",
+        worker_id,
+        worker_config
+    );
 
     let backend = target_to_backend(&worker_config.log_target);
     let access_backend = worker_config

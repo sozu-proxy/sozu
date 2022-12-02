@@ -949,17 +949,25 @@ impl FileConfig {
                                 }
                                 Some(FileListenerProtocolConfig::Https) => {
                                     if frontend.certificate.is_none() {
-                                        if let Some(https_listener) = https_listeners.iter()
-                                            .find(|listener| listener.address == frontend.address && listener.certificate.is_some()) {
+                                        if let Some(https_listener) =
+                                            https_listeners.iter().find(|listener| {
+                                                listener.address == frontend.address
+                                                    && listener.certificate.is_some()
+                                            })
+                                        {
                                             //println!("using listener certificate for {:}", frontend.address);
-                                            frontend.certificate = https_listener.certificate.clone();
-                                            frontend.certificate_chain = Some(https_listener.certificate_chain.clone());
+                                            frontend.certificate =
+                                                https_listener.certificate.clone();
+                                            frontend.certificate_chain =
+                                                Some(https_listener.certificate_chain.clone());
                                             frontend.key = https_listener.key.clone();
                                         }
                                         if frontend.certificate.is_none() {
                                             println!("known addresses: {:#?}", known_addresses);
                                             println!("frontend: {:#?}", frontend);
-                                            bail!("cannot set up a HTTP frontend on a HTTPS listener");
+                                            bail!(
+                                                "cannot set up a HTTP frontend on a HTTPS listener"
+                                            );
                                         }
                                     }
                                 }

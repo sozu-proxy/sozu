@@ -322,7 +322,8 @@ impl ConfigState {
                 .with_context(|| "cannot calculate the certificate's fingerprint")?,
         );
 
-        let entry = self.certificates
+        let entry = self
+            .certificates
             .entry(add.address)
             .or_insert_with(HashMap::new);
 
