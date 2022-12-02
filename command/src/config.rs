@@ -950,7 +950,7 @@ impl FileConfig {
                                 Some(FileListenerProtocolConfig::Https) => {
                                     if frontend.certificate.is_none() {
                                         if let Some(https_listener) = https_listeners.iter()
-                                            .find(|l| l.address == frontend.address && l.certificate.is_some()) {
+                                            .find(|listener| listener.address == frontend.address && listener.certificate.is_some()) {
                                             //println!("using listener certificate for {:}", frontend.address);
                                             frontend.certificate = https_listener.certificate.clone();
                                             frontend.certificate_chain = Some(https_listener.certificate_chain.clone());
