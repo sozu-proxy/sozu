@@ -927,15 +927,15 @@ impl FileConfig {
 
         if let Some(mut file_cluster_configs) = self.clusters {
             for (id, file_cluster_config) in file_cluster_configs.drain() {
-                let cluster_config = file_cluster_config
+                let mut cluster_config = file_cluster_config
                     .to_cluster_config(id.as_str(), &expect_proxy)
                     .with_context(|| {
                         format!("error parsing cluster configuration for cluster {}", id)
                     })?;
 
                 match cluster_config {
-                    ClusterConfig::Http(ref http) => {
-                        for frontend in http.frontends.iter() {
+                    ClusterConfig::Http(ref mut http) => {
+                        for frontend in http.frontends.iter_mut() {
                             match known_addresses.get(&frontend.address) {
                                 Some(FileListenerProtocolConfig::Tcp) => {
                                     bail!(
@@ -949,9 +949,26 @@ impl FileConfig {
                                 }
                                 Some(FileListenerProtocolConfig::Https) => {
                                     if frontend.certificate.is_none() {
-                                        println!("known addresses: {:#?}", known_addresses);
-                                        println!("frontend: {:#?}", frontend);
-                                        bail!("cannot set up a HTTP frontend on a HTTPS listener");
+                                        if let Some(https_listener) =
+                                            https_listeners.iter().find(|listener| {
+                                                listener.address == frontend.address
+                                                    && listener.certificate.is_some()
+                                            })
+                                        {
+                                            //println!("using listener certificate for {:}", frontend.address);
+                                            frontend.certificate =
+                                                https_listener.certificate.clone();
+                                            frontend.certificate_chain =
+                                                Some(https_listener.certificate_chain.clone());
+                                            frontend.key = https_listener.key.clone();
+                                        }
+                                        if frontend.certificate.is_none() {
+                                            println!("known addresses: {:#?}", known_addresses);
+                                            println!("frontend: {:#?}", frontend);
+                                            bail!(
+                                                "cannot set up a HTTP frontend on a HTTPS listener"
+                                            );
+                                        }
                                     }
                                 }
                                 None => {
