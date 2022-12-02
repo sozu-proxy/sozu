@@ -424,15 +424,16 @@ impl Session {
         }
     }
 
-    fn back_token(&self) -> Option<Token> {
-        match self.protocol {
-            Some(State::Pipe(ref pipe)) => pipe.back_token(),
-            Some(State::SendProxyProtocol(ref pp)) => pp.back_token(),
-            Some(State::RelayProxyProtocol(ref pp)) => pp.back_token(),
-            Some(State::ExpectProxyProtocol(_)) => None,
-            _ => unreachable!(),
-        }
-    }
+    // TODO: why did we have this AND self.backend_token? was it important?
+    // fn back_token(&self) -> Option<Token> {
+    //     match self.protocol {
+    //         Some(State::Pipe(ref pipe)) => pipe.back_token(),
+    //         Some(State::SendProxyProtocol(ref pp)) => pp.back_token(),
+    //         Some(State::RelayProxyProtocol(ref pp)) => pp.back_token(),
+    //         Some(State::ExpectProxyProtocol(_)) => None,
+    //         _ => unreachable!(),
+    //     }
+    // }
 
     fn set_back_socket(&mut self, socket: TcpStream) {
         match self.protocol {
@@ -605,6 +606,7 @@ impl Session {
                         // stop here, we must wait for an event
                         return SessionResult::Continue;
                     }
+                    // TODO: should we return CloseSession here?
                     Err(connection_error) => error!("{}", connection_error),
                 }
             } else if self.back_readiness().unwrap().event != Ready::empty() {
@@ -789,7 +791,7 @@ impl Session {
 
     fn close_backend(&mut self) {
         if let (Some(token), Some(fd)) = (
-            self.back_token(),
+            self.backend_token,
             self.back_socket_mut().map(|s| s.as_raw_fd()),
         ) {
             let proxy = self.proxy.borrow();
@@ -850,7 +852,7 @@ impl Session {
 
         self.cluster_id = Some(cluster_id.clone());
 
-        if self.connection_attempt == CONN_RETRIES {
+        if self.connection_attempt >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
             return Err(ConnectionError::NoBackendAvailable(Some(cluster_id)));
         }
@@ -952,6 +954,12 @@ impl ProxySession for Session {
         if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
             error!("1error deregistering socket({:?}): {:?}", fd, e);
         }
+
+        proxy
+            .sessions
+            .borrow_mut()
+            .slab
+            .try_remove(self.frontend_token.0);
     }
 
     fn timeout(&mut self, token: Token) {
@@ -1043,12 +1051,13 @@ impl ProxySession for Session {
         };
 
         error!("zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, cluster_id: {:?}, back_connected: {:?}, metrics: {:?}",
-      self.frontend_token, self.back_token(), rf, rb, p, self.cluster_id, self.back_connected, self.metrics);
+            self.frontend_token, self.backend_token, rf, rb, p, self.cluster_id, self.back_connected, self.metrics
+        );
     }
 
     fn tokens(&self) -> Vec<Token> {
         let mut v = vec![self.frontend_token];
-        if let Some(tk) = self.back_token() {
+        if let Some(tk) = self.backend_token {
             v.push(tk)
         }
 

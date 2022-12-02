@@ -877,7 +877,10 @@ impl Session {
 
             if front_interest.is_readable() {
                 let session_result = self.readable();
-                trace!("front readable\tinterpreting session order {:?}", session_result);
+                trace!(
+                    "front readable\tinterpreting session order {:?}",
+                    session_result
+                );
 
                 match session_result {
                     SessionResult::ConnectBackend => {
@@ -1451,6 +1454,11 @@ impl ProxySession for Session {
             if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
                 error!("1error deregistering socket({:?}): {:?}", fd, e);
             }
+            proxy
+                .sessions
+                .borrow_mut()
+                .slab
+                .try_remove(self.frontend_token.0);
         }
     }
 
