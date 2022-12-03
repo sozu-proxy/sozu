@@ -730,76 +730,77 @@ impl Server {
 
     fn zombie_check(&mut self) {
         let now = Instant::now();
-        if now - self.last_zombie_check > self.zombie_check_interval {
-            info!("zombie check");
-            self.last_zombie_check = now;
+        if now - self.last_zombie_check < self.zombie_check_interval {
+            return;
+        }
+        info!("zombie check");
+        self.last_zombie_check = now;
 
-            let mut tokens = HashSet::new();
-            let mut frontend_tokens = HashSet::new();
+        let mut tokens = HashSet::new();
+        let mut frontend_tokens = HashSet::new();
 
-            let mut count = 0;
-            let duration = self.zombie_check_interval;
-            for (_index, session) in self
-                .sessions
-                .borrow_mut()
-                .slab
-                .iter_mut()
-                .filter(|(_, c)| now - c.borrow().last_event() > duration)
-            {
-                let t = session.borrow().tokens();
-                if !frontend_tokens.contains(&t[0]) {
-                    session.borrow().print_state();
+        let mut count = 0;
+        let duration = self.zombie_check_interval;
+        for (_index, session) in self
+            .sessions
+            .borrow_mut()
+            .slab
+            .iter_mut()
+            .filter(|(_, c)| now - c.borrow().last_event() > duration)
+        {
+            let session_tokens = session.borrow().tokens();
+            if !frontend_tokens.contains(&session_tokens[0]) {
+                session.borrow().print_state();
 
-                    frontend_tokens.insert(t[0]);
-                    for tk in t.into_iter() {
-                        tokens.insert(tk);
-                    }
+                frontend_tokens.insert(session_tokens[0]);
+                for tk in session_tokens.into_iter() {
+                    tokens.insert(tk);
+                }
 
-                    count += 1;
+                count += 1;
+            }
+        }
+
+        for tk in frontend_tokens.iter() {
+            let cl = self.to_session(*tk);
+            if self.sessions.borrow().slab.contains(cl.0) {
+                let session = { self.sessions.borrow_mut().slab.remove(cl.0) };
+                session.borrow_mut().close();
+
+                let mut sessions = self.sessions.borrow_mut();
+                assert!(sessions.nb_connections != 0);
+                sessions.nb_connections -= 1;
+                gauge!("client.connections", sessions.nb_connections);
+                // do not be ready to accept right away, wait until we get back to 10% capacity
+                if !sessions.can_accept
+                    && sessions.nb_connections < sessions.max_connections * 90 / 100
+                {
+                    debug!(
+                        "nb_connections = {}, max_connections = {}, starting to accept again",
+                        sessions.nb_connections, sessions.max_connections
+                    );
+                    gauge!("accept_queue.backpressure", 0);
+                    sessions.can_accept = true;
                 }
             }
+        }
 
-            for tk in frontend_tokens.iter() {
-                let cl = self.to_session(*tk);
-                if self.sessions.borrow().slab.contains(cl.0) {
-                    let session = { self.sessions.borrow_mut().slab.remove(cl.0) };
-                    session.borrow_mut().close();
+        if count > 0 {
+            count!("zombies", count);
 
-                    let mut sessions = self.sessions.borrow_mut();
-                    assert!(sessions.nb_connections != 0);
-                    sessions.nb_connections -= 1;
-                    gauge!("client.connections", sessions.nb_connections);
-                    // do not be ready to accept right away, wait until we get back to 10% capacity
-                    if !sessions.can_accept
-                        && sessions.nb_connections < sessions.max_connections * 90 / 100
-                    {
-                        debug!(
-                            "nb_connections = {}, max_connections = {}, starting to accept again",
-                            sessions.nb_connections, sessions.max_connections
-                        );
-                        gauge!("accept_queue.backpressure", 0);
-                        sessions.can_accept = true;
-                    }
+            let mut remaining = 0;
+            for tk in tokens.into_iter() {
+                let cl = self.to_session(tk);
+                let mut sessions = self.sessions.borrow_mut();
+                if sessions.slab.contains(cl.0) {
+                    sessions.slab.remove(cl.0);
+                    remaining += 1;
                 }
             }
-
-            if count > 0 {
-                count!("zombies", count);
-
-                let mut remaining = 0;
-                for tk in tokens.into_iter() {
-                    let cl = self.to_session(tk);
-                    let mut sessions = self.sessions.borrow_mut();
-                    if sessions.slab.contains(cl.0) {
-                        sessions.slab.remove(cl.0);
-                        remaining += 1;
-                    }
-                }
-                info!(
-                    "removing {} zombies ({} remaining tokens after close)",
-                    count, remaining
-                );
-            }
+            info!(
+                "removing {} zombies ({} remaining tokens after close)",
+                count, remaining
+            );
         }
     }
 

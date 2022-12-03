@@ -203,6 +203,7 @@ pub mod https;
 
 use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
 
+use anyhow::{bail, Context};
 use mio::{net::TcpStream, Token};
 use time::{Duration, Instant};
 
@@ -396,32 +397,6 @@ pub enum SessionResult {
     ConnectBackend,
 }
 
-#[derive(thiserror::Error, Debug, PartialEq, Eq)]
-pub enum ConnectionError {
-    #[error("No host given for the backend")]
-    NoHostGiven,
-    #[error("Connect to backend failed. No request line to extract a route.")]
-    NoRequestLineGiven,
-    #[error("Connect to backend failed. {message:?}. host: {hostname:?}")]
-    InvalidHost { message: String, hostname: String },
-    #[error("Connect to backend failed. Host not found: {0}")]
-    HostNotFound(String),
-    #[error("Connect to backend failed. No backend available for cluster {0:?}")]
-    NoBackendAvailable(Option<String>),
-    #[error("unimplemented error")]
-    ToBeDefined,
-    #[error("Connect to backend failed. Cluster {0} should redirect HTTPS")]
-    HttpsRedirect(String),
-    #[error("Connect to backend failed. Route is unauthorized")]
-    Unauthorized,
-    #[error("Connect to backend failed. Too many connections. Host {0:?}")]
-    TooManyConnections(Option<String>),
-    #[error("Connect to backend failed. Mio connect error: {0}")]
-    MioConnectError(String),
-    // #[error("Connect to backend failed. EINPROGRESS, the socket is probably nonblocing")]
-    // SocketIsNonblocking,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum SocketType {
     Listener,
@@ -530,9 +505,9 @@ impl Backend {
         self.connection_time.get(self.active_connections)
     }
 
-    pub fn try_connect(&mut self) -> Result<mio::net::TcpStream, ConnectionError> {
+    pub fn try_connect(&mut self) -> anyhow::Result<mio::net::TcpStream> {
         if self.status != BackendStatus::Normal {
-            return Err(ConnectionError::NoBackendAvailable(None));
+            bail!("This backend as not a normal status");
         }
 
         match mio::net::TcpStream::connect(self.address) {
@@ -548,7 +523,7 @@ impl Backend {
                 // https://docs.rs/mio/latest/mio/net/struct.TcpStream.html#method.connect
                 // with an example code here:
                 // https://github.com/Thomasdezeeuw/heph/blob/0c4f1ab3eaf08bea1d65776528bfd6114c9f8374/src/net/tcp/stream.rs#L560-L622
-                Err(ConnectionError::MioConnectError(mio_error.to_string()))
+                Err(mio_error).with_context(|| "Failed to connect to socket with MIO")
             }
         }
     }

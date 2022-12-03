@@ -7,7 +7,7 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
@@ -41,9 +41,8 @@ use crate::{
     },
     timer::TimeoutContainer,
     util::UnwrapLog,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ConnectionError,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
-    SessionResult,
+    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, Protocol,
+    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult,
 };
 
 pub enum UpgradeResult {
@@ -607,7 +606,9 @@ impl Session {
                         return SessionResult::Continue;
                     }
                     // TODO: should we return CloseSession here?
-                    Err(connection_error) => error!("{}", connection_error),
+                    Err(connection_error) => {
+                        error!("Error connecting to backend: {:#}", connection_error)
+                    }
                 }
             } else if self.back_readiness().unwrap().event != Ready::empty() {
                 self.reset_connection_attempt();
@@ -625,7 +626,9 @@ impl Session {
                     // we must wait for an event
                     return SessionResult::Continue;
                 }
-                Err(connection_error) => error!("{}", connection_error),
+                Err(connection_error) => {
+                    error!("Error connecting to backend: {:#}", connection_error)
+                }
             }
         }
 
@@ -685,7 +688,9 @@ impl Session {
                                 // we must wait for an event
                                 return SessionResult::Continue;
                             }
-                            Err(connection_error) => error!("{}", connection_error),
+                            Err(connection_error) => {
+                                error!("Error connecting to backend: {:#}", connection_error)
+                            }
                         }
                     }
                     SessionResult::Continue => {}
@@ -834,7 +839,7 @@ impl Session {
     fn connect_to_backend(
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
-    ) -> Result<BackendConnectAction, ConnectionError> {
+    ) -> anyhow::Result<BackendConnectAction> {
         let cluster_id = if let Some(cluster_id) = self
             .proxy
             .borrow()
@@ -845,83 +850,88 @@ impl Session {
             cluster_id
         } else {
             error!("no TCP cluster corresponds to that front address");
-            return Err(ConnectionError::HostNotFound(
-                "no host given (TCP)".to_string(),
-            ));
+            bail!("no TCP cluster found.")
         };
 
         self.cluster_id = Some(cluster_id.clone());
 
         if self.connection_attempt >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
-            return Err(ConnectionError::NoBackendAvailable(Some(cluster_id)));
+            bail!(format!("Too many connections on cluster {}", cluster_id));
         }
 
         if self.proxy.borrow().sessions.borrow().slab.len()
             >= self.proxy.borrow().sessions.borrow().slab_capacity()
         {
-            error!("not enough memory, cannot connect to backend");
-            return Err(ConnectionError::TooManyConnections(None));
+            bail!("not enough memory, cannot connect to backend");
         }
 
-        let conn = self
+        let (backend, mut stream) = self
             .proxy
             .borrow()
             .backends
             .borrow_mut()
-            .backend_from_cluster_id(&cluster_id);
-        match conn {
-            Ok((backend, mut stream)) => {
-                if let Err(e) = stream.set_nodelay(true) {
-                    error!(
-                        "error setting nodelay on back socket({:?}): {:?}",
-                        stream, e
-                    );
-                }
-                self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
-
-                let back_token = {
-                    let proxy = self.proxy.borrow();
-                    let mut s = proxy.sessions.borrow_mut();
-                    let entry = s.slab.vacant_entry();
-                    let back_token = Token(entry.key());
-                    let _entry = entry.insert(session_rc.clone());
-                    back_token
-                };
-
-                if let Err(e) = self.proxy.borrow().registry.register(
-                    &mut stream,
-                    back_token,
-                    Interest::READABLE | Interest::WRITABLE,
-                ) {
-                    error!("error registering back socket({:?}): {:?}", stream, e);
-                }
-
-                let connect_timeout_duration = Duration::seconds(
-                    self.proxy.borrow().listeners[&self.accept_token]
-                        .borrow()
-                        .config
-                        .connect_timeout as i64,
-                );
-                self.back_timeout.set_duration(connect_timeout_duration);
-                self.back_timeout.set(back_token);
-
-                self.set_back_token(back_token);
-                self.set_back_socket(stream);
-
-                self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
-                self.metrics.backend_start();
-                self.set_backend_id(backend.borrow().backend_id.clone());
-
-                Ok(BackendConnectAction::New)
-            }
-            Err(ConnectionError::NoBackendAvailable(c_id)) => {
-                Err(ConnectionError::NoBackendAvailable(c_id))
-            }
-            Err(e) => {
-                panic!("tcp connect_to_backend: unexpected error: {:?}", e);
-            }
+            .backend_from_cluster_id(&cluster_id)
+            .with_context(|| {
+                format!(
+                    "Could not get backend and TCP stream from cluster id {}",
+                    cluster_id
+                )
+            })?;
+        /*
+        this was the old error matching for backend_from_cluster_id.
+        panic! is called in case of mio::net::TcpStream::connect() error
+        Do we really want to panic ?
+        Err(ConnectionError::NoBackendAvailable(c_id)) => {
+            Err(ConnectionError::NoBackendAvailable(c_id))
         }
+        Err(e) => {
+            panic!("tcp connect_to_backend: unexpected error: {:?}", e);
+        }
+        */
+
+        if let Err(e) = stream.set_nodelay(true) {
+            error!(
+                "error setting nodelay on back socket({:?}): {:?}",
+                stream, e
+            );
+        }
+        self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
+
+        let back_token = {
+            let proxy = self.proxy.borrow();
+            let mut s = proxy.sessions.borrow_mut();
+            let entry = s.slab.vacant_entry();
+            let back_token = Token(entry.key());
+            let _entry = entry.insert(session_rc.clone());
+            back_token
+        };
+
+        if let Err(e) = self.proxy.borrow().registry.register(
+            &mut stream,
+            back_token,
+            Interest::READABLE | Interest::WRITABLE,
+        ) {
+            error!("error registering back socket({:?}): {:?}", stream, e);
+        }
+
+        let connect_timeout_duration = Duration::seconds(
+            self.proxy.borrow().listeners[&self.accept_token]
+                .borrow()
+                .config
+                .connect_timeout as i64,
+        );
+        self.back_timeout.set_duration(connect_timeout_duration);
+        self.back_timeout.set(back_token);
+
+        self.set_back_token(back_token);
+        self.set_back_socket(stream);
+
+        self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        self.metrics.backend_start();
+        self.set_backend_id(backend.borrow().backend_id.clone());
+
+        Ok(BackendConnectAction::New)
     }
 }
 

@@ -8,7 +8,7 @@ use std::{
     str::from_utf8_unchecked,
 };
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
@@ -48,7 +48,7 @@ use super::{
     },
     socket::server_bind,
     sozu_command::state::ClusterId,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ConnectionError, Protocol,
+    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, Protocol,
     ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult,
 };
 
@@ -628,7 +628,9 @@ impl Session {
                         // we must wait for an event
                         return SessionResult::Continue;
                     }
-                    Err(connection_error) => error!("{}", connection_error),
+                    Err(connection_error) => {
+                        error!("Error connecting to backend: {:#}", connection_error)
+                    }
                 }
             } else {
                 self.metrics().backend_connected();
@@ -696,7 +698,9 @@ impl Session {
                                 // we must wait for an event
                                 return SessionResult::Continue;
                             }
-                            Err(connection_error) => error!("{}", connection_error),
+                            Err(connection_error) => {
+                                error!("Error connecting to backend: {:#}", connection_error)
+                            }
                         }
                     }
                     SessionResult::Continue => {}
@@ -849,13 +853,11 @@ impl Session {
         }
     }
 
-    fn check_circuit_breaker(&mut self) -> Result<(), ConnectionError> {
+    fn check_circuit_breaker(&mut self) -> anyhow::Result<()> {
         if self.connection_attempt >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
             self.set_answer(DefaultAnswerStatus::Answer503, None);
-            return Err(ConnectionError::NoBackendAvailable(
-                self.cluster_id.to_owned(),
-            ));
+            bail!("Maximum connection attempt reached");
         }
         Ok(())
     }
@@ -883,60 +885,61 @@ impl Session {
         true
     }
 
+    pub fn get_host(&self) -> Option<&str> {
+        self.protocol.as_ref().and_then(|protocol| match protocol {
+            State::Http(ref http) => http.get_host(),
+            _ => None,
+        })
+    }
+
     // -> host, path, method
-    pub fn extract_route(&self) -> Result<(&str, &str, &Method), ConnectionError> {
-        let host = self
-            .http()
-            .and_then(|http| http.request_state.as_ref())
-            .and_then(|request_state| request_state.get_host())
-            .ok_or(ConnectionError::NoHostGiven)?;
+    pub fn extract_route(&self) -> anyhow::Result<(&str, &str, &Method)> {
+        let given_host = self.get_host().with_context(|| "No host given")?;
 
         // redundant
         // we only keep host, but we need the request's hostname in frontend_from_request (calling twice hostname_and_port)
-        let host: &str = match hostname_and_port(host.as_bytes()) {
-            Ok((input, (hostname, port))) => {
-                if input != &b""[..] {
-                    return Err(ConnectionError::InvalidHost {
-                        hostname: host.to_owned(),
-                        message: "connect_to_backend: invalid remaining chars after hostname"
-                            .to_owned(),
-                    });
-                }
+        let (remaining_input, (hostname, port)) = match hostname_and_port(given_host.as_bytes()) {
+            Ok(tuple) => tuple,
 
-                //FIXME: we should check that the port is right too
-
-                if port == Some(&b"80"[..]) {
-                    // it is alright to call from_utf8_unchecked,
-                    // we already verified that there are only ascii
-                    // chars in there
-                    unsafe { from_utf8_unchecked(hostname) }
-                } else {
-                    host
-                }
-            }
             Err(parse_error) => {
-                return Err(ConnectionError::InvalidHost {
-                    hostname: host.to_owned(),
-                    message: format!("Hostname parsing failed: {}", parse_error),
-                });
+                // parse_error contains a slice of given_host, which should NOT escape this scope
+                bail!(
+                    "Hostname parsing failed for host {}: {}",
+                    given_host.clone(),
+                    parse_error,
+                );
             }
+        };
+        if remaining_input != &b""[..] {
+            bail!("invalid remaining chars after hostname {}", given_host);
+        }
+
+        //FIXME: we should check that the port is right too
+
+        let host = if port == Some(&b"80"[..]) {
+            // it is alright to call from_utf8_unchecked,
+            // we already verified that there are only ascii
+            // chars in there
+            unsafe { from_utf8_unchecked(hostname) }
+        } else {
+            given_host
         };
 
         let request_line = self
             .http()
             .and_then(|http| http.request_state.as_ref())
             .and_then(|request_state| request_state.get_request_line())
-            .ok_or(ConnectionError::NoRequestLineGiven)?;
+            .with_context(|| "No request line given in the request state")?;
 
         Ok((host, &request_line.uri, &request_line.method))
     }
 
-    fn cluster_id_from_request(&mut self) -> Result<String, ConnectionError> {
+    fn cluster_id_from_request(&mut self) -> anyhow::Result<String> {
         let (host, uri, method) = match self.extract_route() {
-            Ok((h, u, m)) => (h, u, m),
+            Ok(tuple) => tuple,
             Err(e) => {
                 self.set_answer(DefaultAnswerStatus::Answer400, None);
-                return Err(e);
+                return Err(e).with_context(|| "Could not extract route from request");
             }
         };
 
@@ -952,12 +955,12 @@ impl Session {
             Some(Route::ClusterId(cluster_id)) => cluster_id,
             Some(Route::Deny) => {
                 self.set_answer(DefaultAnswerStatus::Answer401, None);
-                return Err(ConnectionError::Unauthorized);
+                bail!("Unauthorized route");
             }
             None => {
-                let no_host_error = ConnectionError::HostNotFound(host.to_owned());
+                let no_host_error = format!("Host not found: {}", host);
                 self.set_answer(DefaultAnswerStatus::Answer404, None);
-                return Err(no_host_error);
+                bail!(no_host_error);
             }
         };
 
@@ -975,7 +978,7 @@ impl Session {
                 DefaultAnswerStatus::Answer301,
                 Some(Rc::new(answer.into_bytes())),
             );
-            return Err(ConnectionError::HttpsRedirect(cluster_id));
+            bail!("Route is unauthorized");
         }
 
         Ok(cluster_id)
@@ -985,39 +988,23 @@ impl Session {
         &mut self,
         cluster_id: &str,
         front_should_stick: bool,
-    ) -> Result<TcpStream, ConnectionError> {
+    ) -> anyhow::Result<TcpStream> {
         let sticky_session = self
             .http()
             .and_then(|http| http.request_state.as_ref())
             .and_then(|request_state| request_state.get_sticky_session());
 
-        let result = match (front_should_stick, sticky_session) {
-            (true, Some(sticky_session)) => self
-                .proxy
-                .borrow()
-                .backends
-                .borrow_mut()
-                .backend_from_sticky_session(cluster_id, sticky_session)
-                .map_err(|e| {
-                    debug!(
-                        "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
-                        sticky_session, cluster_id
-                    );
-                    e
-                }),
-            _ => self
-                .proxy
-                .borrow()
-                .backends
-                .borrow_mut()
-                .backend_from_cluster_id(cluster_id),
-        };
-
-        let (backend, conn) = match result {
+        let (backend, conn) = match self.get_backend_for_sticky_session(
+            front_should_stick,
+            sticky_session,
+            cluster_id,
+        ) {
             Ok((b, c)) => (b, c),
             Err(e) => {
                 self.set_answer(DefaultAnswerStatus::Answer503, None);
-                return Err(e);
+                return Err(e).with_context(|| {
+                    format!("Could not find a backend for cluster {}", cluster_id)
+                });
             }
         };
 
@@ -1054,16 +1041,47 @@ impl Session {
         Ok(conn)
     }
 
+    fn get_backend_for_sticky_session(
+        &self,
+        front_should_stick: bool,
+        sticky_session: Option<&str>,
+        cluster_id: &str,
+    ) -> anyhow::Result<(Rc<RefCell<Backend>>, TcpStream)> {
+        match (front_should_stick, sticky_session) {
+            (true, Some(sticky_session)) => self
+                .proxy
+                .borrow()
+                .backends
+                .borrow_mut()
+                .backend_from_sticky_session(cluster_id, sticky_session)
+                .with_context(|| {
+                    format!(
+                        "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
+                        sticky_session, cluster_id
+                    )
+                }),
+            _ => self
+                .proxy
+                .borrow()
+                .backends
+                .borrow_mut()
+                .backend_from_cluster_id(cluster_id),
+        }
+    }
+
     fn connect_to_backend(
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
-    ) -> Result<BackendConnectAction, ConnectionError> {
+    ) -> anyhow::Result<BackendConnectAction> {
         let old_cluster_id = self.http().and_then(|http| http.cluster_id.clone());
         let old_back_token = self.back_token();
 
-        self.check_circuit_breaker()?;
+        self.check_circuit_breaker()
+            .with_context(|| "Circuit broke")?;
 
-        let cluster_id = self.cluster_id_from_request()?;
+        let cluster_id = self
+            .cluster_id_from_request()
+            .with_context(|| "Could not get cluster id from request")?;
 
         // check if we can reuse the backend connection
         if (self.http().and_then(|h| h.cluster_id.as_ref()) == Some(&cluster_id))
@@ -1170,9 +1188,7 @@ impl Session {
                 if not_enough_memory {
                     error!("not enough memory, cannot connect to backend");
                     self.set_answer(DefaultAnswerStatus::Answer503, None);
-                    return Err(ConnectionError::TooManyConnections(
-                        self.cluster_id.to_owned(),
-                    ));
+                    bail!(format!("Too many connections on cluster {}", cluster_id));
                 }
 
                 let back_token = {

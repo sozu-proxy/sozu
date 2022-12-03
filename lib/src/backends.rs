@@ -1,5 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, net::SocketAddr, rc::Rc};
 
+use anyhow::{bail, Context};
 use mio::net::TcpStream;
 
 use crate::{
@@ -10,7 +11,7 @@ use crate::{
     },
 };
 
-use super::{load_balancing::*, Backend, ConnectionError};
+use super::{load_balancing::*, Backend};
 
 #[derive(Debug)]
 pub struct BackendMap {
@@ -82,25 +83,21 @@ impl BackendMap {
             .unwrap_or(false)
     }
 
-    // TODO: return anyhow::Result with context, log the error downstream
     pub fn backend_from_cluster_id(
         &mut self,
         cluster_id: &str,
-    ) -> Result<(Rc<RefCell<Backend>>, TcpStream), ConnectionError> {
-        let cluster_backends = match self.backends.get_mut(cluster_id) {
-            Some(backends) => backends,
-            None => {
-                return Err(ConnectionError::NoBackendAvailable(Some(
-                    cluster_id.to_owned(),
-                )))
-            }
-        };
+    ) -> anyhow::Result<(Rc<RefCell<Backend>>, TcpStream)> {
+        let cluster_backends = self
+            .backends
+            .get_mut(cluster_id)
+            .with_context(|| format!("No backend found for cluster {}", cluster_id))?;
 
         if cluster_backends.backends.is_empty() {
             self.available = false;
-            return Err(ConnectionError::NoBackendAvailable(Some(
-                cluster_id.to_owned(),
-            )));
+            bail!(format!(
+                "Found an empty backend list for cluster {}",
+                cluster_id
+            ));
         }
 
         let next_backend = match cluster_backends.next_available_backend() {
@@ -113,9 +110,7 @@ impl BackendMap {
                         cluster_id.to_string(),
                     ));
                 }
-                return Err(ConnectionError::NoBackendAvailable(Some(
-                    cluster_id.to_owned(),
-                )));
+                bail!("No more backend available for cluster {}", cluster_id);
             }
         };
 
@@ -131,52 +126,49 @@ impl BackendMap {
             )
         );
 
-        match borrowed_backend.try_connect() {
-            Ok(tcp_stream) => {
-                self.available = true;
-                Ok((next_backend.clone(), tcp_stream))
-            }
-            Err(connection_error) => {
-                error!(
-                    "could not connect {} to {:?} ({} failures)",
-                    cluster_id, borrowed_backend.address, borrowed_backend.failures
-                );
-                Err(connection_error)
-            }
-        }
+        let tcp_stream = borrowed_backend.try_connect().with_context(|| {
+            format!(
+                "could not connect {} to {:?} ({} failures)",
+                cluster_id, borrowed_backend.address, borrowed_backend.failures
+            )
+        })?;
+        self.available = true;
+
+        Ok((next_backend.clone(), tcp_stream))
     }
 
-    // TODO: return anyhow::Result with context, log the error downstream
     pub fn backend_from_sticky_session(
         &mut self,
         cluster_id: &str,
         sticky_session: &str,
-    ) -> Result<(Rc<RefCell<Backend>>, TcpStream), ConnectionError> {
-        let sticky_conn: Option<Result<(Rc<RefCell<Backend>>, TcpStream), ConnectionError>> = self
+    ) -> anyhow::Result<(Rc<RefCell<Backend>>, TcpStream)> {
+        let sticky_conn = self
             .backends
             .get_mut(cluster_id)
             .and_then(|cluster_backends| cluster_backends.find_sticky(sticky_session))
-            .map(|b| {
-                let mut backend = b.borrow_mut();
-                let conn = backend.try_connect();
+            .map(|backend| {
+                let mut borrowed = backend.borrow_mut();
+                let conn = borrowed.try_connect();
 
-                conn.map(|c| (b.clone(), c)).map_err(|e| {
-                    error!(
-                        "could not connect {} to {:?} using session {} ({} failures)",
-                        cluster_id, backend.address, sticky_session, backend.failures
-                    );
-                    e
-                })
+                conn.map(|tcp_stream| (backend.clone(), tcp_stream))
+                    .map_err(|e| {
+                        error!(
+                            "could not connect {} to {:?} using session {} ({} failures)",
+                            cluster_id, borrowed.address, sticky_session, borrowed.failures
+                        );
+                        e
+                    })
             });
 
-        if let Some(res) = sticky_conn {
-            res
-        } else {
-            debug!(
-                "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
-                sticky_session, cluster_id
-            );
-            self.backend_from_cluster_id(cluster_id)
+        match sticky_conn {
+            Some(backend_and_stream) => backend_and_stream,
+            None => {
+                debug!(
+                    "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
+                    sticky_session, cluster_id
+                );
+                self.backend_from_cluster_id(cluster_id)
+            }
         }
     }
 
