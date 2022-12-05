@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use mio::{
     net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
     unix::SourceFd,
@@ -68,9 +68,8 @@ use crate::{
         ParsedCertificateAndKey,
     },
     util::UnwrapLog,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ConnectionError,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
-    SessionResult,
+    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, Protocol,
+    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -823,7 +822,9 @@ impl Session {
                         // stop here, we must wait for an event
                         return SessionResult::Continue;
                     }
-                    Err(connection_error) => error!("{}", connection_error),
+                    Err(connection_error) => {
+                        error!("Error connecting to backend: {:#}", connection_error)
+                    }
                 }
             } else {
                 self.metrics().backend_connected();
@@ -891,7 +892,9 @@ impl Session {
                                 // we must wait for an event
                                 return SessionResult::Continue;
                             }
-                            Err(connection_error) => error!("{}", connection_error),
+                            Err(connection_error) => {
+                                error!("Error connecting to backend: {:#}", connection_error)
+                            }
                         }
                     }
                     SessionResult::Continue => {}
@@ -1040,13 +1043,11 @@ impl Session {
         }
     }
 
-    fn check_circuit_breaker(&mut self) -> Result<(), ConnectionError> {
+    fn check_circuit_breaker(&mut self) -> anyhow::Result<()> {
         if self.connection_attempt >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
             self.set_answer(DefaultAnswerStatus::Answer503, None);
-            return Err(ConnectionError::NoBackendAvailable(
-                self.cluster_id.to_owned(),
-            ));
+            bail!("Maximum connection attempt reached");
         }
         Ok(())
     }
@@ -1074,71 +1075,63 @@ impl Session {
         false
     }
 
-    pub fn extract_route(&self) -> Result<(&str, &str, &Method), ConnectionError> {
+    pub fn extract_route(&self) -> anyhow::Result<(&str, &str, &Method)> {
         let request_state = match self.state {
             State::Invalid => unreachable!(),
             State::Http(ref http) => http.request_state.as_ref(),
             _ => None,
         };
 
-        let host = request_state
+        let given_host = request_state
             .and_then(|request_state| request_state.get_host())
-            .ok_or(ConnectionError::NoHostGiven)?;
+            .with_context(|| "No host given")?;
 
-        let host: &str = match hostname_and_port(host.as_bytes()) {
-            Ok((remaining_input, (hostname, port))) => {
-                if remaining_input != &b""[..] {
-                    return Err(ConnectionError::InvalidHost {
-                        hostname: host.to_owned(),
-                        message: "connect_to_backend: invalid remaining chars after hostname"
-                            .to_owned(),
-                    });
-                }
-
-                // it is alright to call from_utf8_unchecked,
-                // we already verified that there are only ascii
-                // chars in there
-                let hostname = unsafe { from_utf8_unchecked(hostname) };
-
-                //FIXME: what if we don't use SNI?
-                let servername = match self.state {
-                    State::Invalid => unreachable!(),
-                    State::Http(ref http) => http.frontend.session.sni_hostname(),
-                    _ => None,
-                };
-                let servername = servername.map(|name| name.to_string());
-
-                if servername.as_deref() != Some(hostname) {
-                    error!(
-                        "TLS SNI hostname '{:?}' and Host header '{}' don't match",
-                        servername, hostname
-                    );
-                    /*FIXME: deactivate this check for a temporary test
-                    unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, None);
-                    */
-                    return Err(ConnectionError::HostNotFound(hostname.to_owned()));
-                }
-
-                //FIXME: we should check that the port is right too
-
-                if port == Some(&b"443"[..]) {
-                    hostname
-                } else {
-                    host
-                }
-            }
+        let (remaining_input, (hostname, port)) = match hostname_and_port(given_host.as_bytes()) {
+            Ok(tuple) => tuple,
             Err(parse_error) => {
-                return Err(ConnectionError::InvalidHost {
-                    hostname: host.to_owned(),
-                    message: format!("Hostname parsing failed: {}", parse_error),
-                });
+                bail!(
+                    "Hostname parsing failed for host {}: {}",
+                    given_host.clone(),
+                    parse_error,
+                );
             }
+        };
+
+        if remaining_input != &b""[..] {
+            bail!("invalid remaining chars after hostname {}", given_host);
+        }
+
+        let hostname = unsafe { from_utf8_unchecked(hostname) };
+
+        //FIXME: what if we don't use SNI?
+        let servername = match self.state {
+            State::Invalid => unreachable!(),
+            State::Http(ref http) => http.frontend.session.sni_hostname(),
+            _ => None,
+        };
+        let servername = servername.map(|name| name.to_string());
+
+        if servername.as_deref() != Some(hostname) {
+            error!(
+                "TLS SNI hostname '{:?}' and Host header '{}' don't match",
+                servername, hostname
+            );
+            /*FIXME: deactivate this check for a temporary test
+            unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, None);
+            */
+            bail!("Host not found: {}", hostname);
+        }
+
+        let host = if port == Some(&b"443"[..]) {
+            hostname
+        } else {
+            given_host
         };
 
         let request_line = request_state
             .as_ref()
             .and_then(|r| r.get_request_line())
-            .ok_or(ConnectionError::NoRequestLineGiven)?;
+            .with_context(|| "No request line given in the request state")?;
 
         Ok((host, &request_line.uri, &request_line.method))
     }
@@ -1147,7 +1140,7 @@ impl Session {
         &mut self,
         cluster_id: &str,
         front_should_stick: bool,
-    ) -> Result<MioTcpStream, ConnectionError> {
+    ) -> anyhow::Result<MioTcpStream> {
         let request_state = match self.state {
             State::Invalid => unreachable!(),
             State::Http(ref mut http) => http.request_state.as_ref(),
@@ -1179,58 +1172,58 @@ impl Session {
                 .backend_from_cluster_id(cluster_id),
         };
 
-        match result {
+        let (backend, conn) = match result {
             Err(e) => {
                 self.set_answer(DefaultAnswerStatus::Answer503, None);
-                Err(e)
+                return Err(e).with_context(|| {
+                    format!("Could not find a backend for cluster {}", cluster_id)
+                });
             }
-            Ok((backend, conn)) => {
-                if front_should_stick {
-                    let sticky_name = self.proxy.borrow().listeners[&self.listener_token]
-                        .borrow()
-                        .config
-                        .sticky_name
-                        .clone();
-                    let sticky_session = Some(StickySession::new(
-                        backend
-                            .borrow()
-                            .sticky_id
-                            .clone()
-                            .unwrap_or(backend.borrow().backend_id.clone()),
-                    ));
+            Ok((backend, conn)) => (backend, conn),
+        };
 
-                    match self.state {
-                        State::Invalid => unreachable!(),
-                        State::Http(ref mut http) => {
-                            http.sticky_session = sticky_session;
-                            http.sticky_name = sticky_name;
-                        }
-                        _ => {}
-                    };
+        if front_should_stick {
+            let sticky_name = self.proxy.borrow().listeners[&self.listener_token]
+                .borrow()
+                .config
+                .sticky_name
+                .clone();
+            let sticky_session = Some(StickySession::new(
+                backend
+                    .borrow()
+                    .sticky_id
+                    .clone()
+                    .unwrap_or(backend.borrow().backend_id.clone()),
+            ));
+
+            match self.state {
+                State::Invalid => unreachable!(),
+                State::Http(ref mut http) => {
+                    http.sticky_session = sticky_session;
+                    http.sticky_name = sticky_name;
                 }
-                self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
-                self.metrics.backend_start();
-
-                match self.state {
-                    State::Invalid => unreachable!(),
-                    State::Http(ref mut http) => {
-                        http.set_backend_id(backend.borrow().backend_id.clone())
-                    }
-                    _ => {}
-                }
-                self.backend = Some(backend);
-
-                Ok(conn)
-            }
+                _ => {}
+            };
         }
+        self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        self.metrics.backend_start();
+
+        match self.state {
+            State::Invalid => unreachable!(),
+            State::Http(ref mut http) => http.set_backend_id(backend.borrow().backend_id.clone()),
+            _ => {}
+        }
+        self.backend = Some(backend);
+
+        Ok(conn)
     }
 
-    fn cluster_id_from_request(&mut self) -> Result<String, ConnectionError> {
+    fn cluster_id_from_request(&mut self) -> anyhow::Result<String> {
         let (host, uri, method) = match self.extract_route() {
             Ok(tuple) => tuple,
             Err(e) => {
                 self.set_answer(DefaultAnswerStatus::Answer400, None);
-                return Err(e);
+                return Err(e).with_context(|| "Could not extract route from request");
             }
         };
 
@@ -1246,12 +1239,12 @@ impl Session {
             Some(Route::ClusterId(cluster_id)) => Ok(cluster_id),
             Some(Route::Deny) => {
                 self.set_answer(DefaultAnswerStatus::Answer401, None);
-                Err(ConnectionError::Unauthorized)
+                bail!("Route is unauthorized");
             }
             None => {
-                let no_host_error = ConnectionError::HostNotFound(host.to_owned());
+                let no_host_error = format!("Host not found: {}", host);
                 self.set_answer(DefaultAnswerStatus::Answer404, None);
-                Err(no_host_error)
+                bail!(no_host_error);
             }
         }
     }
@@ -1259,7 +1252,7 @@ impl Session {
     fn connect_to_backend(
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
-    ) -> Result<BackendConnectAction, ConnectionError> {
+    ) -> anyhow::Result<BackendConnectAction> {
         let old_cluster_id = match &self.state {
             State::Invalid => unreachable!(),
             State::Http(http) => http.cluster_id.clone(),
@@ -1267,9 +1260,12 @@ impl Session {
         };
         let old_back_token = self.back_token();
 
-        self.check_circuit_breaker()?;
+        self.check_circuit_breaker()
+            .with_context(|| "Circuit break.")?;
 
-        let requested_cluster_id = self.cluster_id_from_request()?;
+        let requested_cluster_id = self
+            .cluster_id_from_request()
+            .with_context(|| "Could not get cluster id from request")?;
 
         let backend_is_connected = self.back_connected == BackendConnectionStatus::Connected;
 
@@ -1323,7 +1319,9 @@ impl Session {
             .get(&requested_cluster_id)
             .map(|cluster| cluster.sticky_session)
             .unwrap_or(false);
-        let mut socket = self.backend_from_request(&requested_cluster_id, front_should_stick)?;
+        let mut socket = self
+            .backend_from_request(&requested_cluster_id, front_should_stick)
+            .with_context(|| "Could not get TCP stream from backend")?;
 
         // we still want to use the new socket
         if let Err(e) = socket.set_nodelay(true) {
@@ -1348,7 +1346,7 @@ impl Session {
 
         self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
 
-        let action_result = match old_back_token {
+        let connect_action = match old_back_token {
             Some(back_token) => {
                 self.set_back_token(back_token);
                 if let Err(e) = self.proxy.borrow().registry.register(
@@ -1359,7 +1357,7 @@ impl Session {
                     error!("error registering back socket({:?}): {:?}", socket, e);
                 }
 
-                Ok(BackendConnectAction::Replace)
+                BackendConnectAction::Replace
             }
             None => {
                 if self.proxy.borrow().sessions.borrow().slab.len()
@@ -1367,8 +1365,9 @@ impl Session {
                 {
                     error!("not enough memory, cannot connect to backend");
                     self.set_answer(DefaultAnswerStatus::Answer503, None);
-                    return Err(ConnectionError::TooManyConnections(
-                        self.cluster_id.to_owned(),
+                    bail!(format!(
+                        "Too many connections for cluster {:?}",
+                        self.cluster_id
                     ));
                 }
 
@@ -1390,7 +1389,7 @@ impl Session {
                 }
 
                 self.set_back_token(back_token);
-                Ok(BackendConnectAction::New)
+                BackendConnectAction::New
             }
         };
 
@@ -1400,7 +1399,7 @@ impl Session {
             State::Http(http) => http.set_back_timeout(connect_timeout),
             _ => {}
         }
-        action_result
+        Ok(connect_action)
     }
 }
 
