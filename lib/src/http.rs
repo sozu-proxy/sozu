@@ -1450,20 +1450,15 @@ impl Proxy {
         self.listeners.get(token).map(Clone::clone)
     }
 
-    pub fn remove_listener(&mut self, remove: RemoveListener, request_id: String) -> ProxyResponse {
-        debug!("removing HTTP listener at address {:?}", remove.address);
-
+    pub fn remove_listener(&mut self, remove: RemoveListener) -> anyhow::Result<()> {
         let len = self.listeners.len();
         self.listeners
             .retain(|_, l| l.borrow().address != remove.address);
 
         if self.listeners.len() < len {
-            ProxyResponse::ok(request_id)
+            Ok(())
         } else {
-            ProxyResponse::error(
-                request_id,
-                format!("no HTTP listener to remove at address {:?}", remove.address),
-            )
+            bail!("no HTTP listener to remove at address {:?}", remove.address)
         }
     }
 
@@ -1506,9 +1501,7 @@ impl Proxy {
             })
     }
 
-    pub fn add_cluster(&mut self, cluster: Cluster, request_id: String) -> ProxyResponse {
-        debug!("{} add cluster {:?}", request_id, cluster);
-
+    pub fn add_cluster(&mut self, cluster: Cluster) -> anyhow::Result<()> {
         if let Some(answer_503) = &cluster.answer_503 {
             for listener in self.listeners.values() {
                 listener
@@ -1519,12 +1512,10 @@ impl Proxy {
             }
         }
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
-        ProxyResponse::ok(request_id)
+        Ok(())
     }
 
-    pub fn remove_cluster(&mut self, cluster_id: &str, request_id: String) -> ProxyResponse {
-        debug!("{} remove cluster {:?}", request_id, cluster_id);
-
+    pub fn remove_cluster(&mut self, cluster_id: &str) -> anyhow::Result<()> {
         self.clusters.remove(cluster_id);
 
         for listener in self.listeners.values() {
@@ -1534,12 +1525,10 @@ impl Proxy {
                 .borrow_mut()
                 .remove_custom_answer(cluster_id);
         }
-        ProxyResponse::ok(request_id)
+        Ok(())
     }
 
-    pub fn add_http_frontend(&mut self, front: HttpFrontend, request_id: String) -> ProxyResponse {
-        debug!("{} add front {:?}", request_id, front);
-
+    pub fn add_http_frontend(&mut self, front: HttpFrontend) -> anyhow::Result<()> {
         match self
             .listeners
             .values()
@@ -1554,29 +1543,20 @@ impl Proxy {
                 match owned.add_http_front(front) {
                     Ok(_) => {
                         owned.set_tags(hostname, tags);
-                        ProxyResponse::ok(request_id)
+                        Ok(())
                     }
-                    Err(err) => ProxyResponse::error(request_id, err),
+                    Err(err) => Err(anyhow::Error::msg(err)),
                 }
             }
             None => {
                 // let (listener, tokens) = Listener::new(HttpListener::default(), event_loop,
                 //  self.pool.clone(), None, token: Token) -> (Listener,HashSet<Token>
-                ProxyResponse::error(
-                    request_id,
-                    format!("no HTTP listener found for front: {:?}", front),
-                )
+                bail!("no HTTP listener found for front: {:?}", front)
             }
         }
     }
 
-    pub fn remove_http_frontend(
-        &mut self,
-        front: HttpFrontend,
-        request_id: String,
-    ) -> ProxyResponse {
-        debug!("{} remove front {:?}", request_id, front);
-
+    pub fn remove_http_frontend(&mut self, front: HttpFrontend) -> anyhow::Result<()> {
         match self
             .listeners
             .values()
@@ -1589,21 +1569,16 @@ impl Proxy {
                 match owned.remove_http_front(front) {
                     Ok(_) => {
                         owned.set_tags(hostname, None);
-                        ProxyResponse::ok(request_id)
+                        Ok(())
                     }
-                    Err(err) => ProxyResponse::error(request_id, err),
+                    Err(err) => Err(anyhow::Error::msg(err)),
                 }
             }
-            None => ProxyResponse::error(
-                request_id,
-                "trying to remove front from non existing listener",
-            ),
+            None => bail!("trying to remove front from non existing listener"),
         }
     }
 
-    pub fn soft_stop(&mut self, request_id: String) -> ProxyResponse {
-        info!("{} processing soft shutdown", request_id);
-
+    pub fn soft_stop(&mut self) {
         let listeners: HashMap<_, _> = self.listeners.drain().collect();
         for (_, l) in listeners.iter() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
@@ -1612,12 +1587,9 @@ impl Proxy {
                 }
             }
         }
-        ProxyResponse::processing(request_id)
     }
 
-    pub fn hard_stop(&mut self, request_id: String) -> ProxyResponse {
-        info!("{} hard shutdown", request_id);
-
+    pub fn hard_stop(&mut self) {
         let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
         for (_, l) in listeners.drain() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
@@ -1626,24 +1598,14 @@ impl Proxy {
                 }
             }
         }
-        ProxyResponse::processing(request_id)
     }
 
-    pub fn status(&self, request_id: String) -> ProxyResponse {
-        debug!("{} status", request_id);
-        ProxyResponse::ok(request_id)
-    }
-
-    pub fn logging(&mut self, logging_filter: String, request_id: String) -> ProxyResponse {
-        info!(
-            "{} changing logging filter to {}",
-            request_id, logging_filter
-        );
+    pub fn logging(&mut self, logging_filter: String) -> anyhow::Result<()> {
         logging::LOGGER.with(|l| {
             let directives = logging::parse_logging_spec(&logging_filter);
             l.borrow_mut().set_directives(directives);
         });
-        ProxyResponse::ok(request_id)
+        Ok(())
     }
 }
 
@@ -1767,27 +1729,62 @@ impl Listener {
 
 impl ProxyConfiguration<Session> for Proxy {
     fn notify(&mut self, request: ProxyRequest) -> ProxyResponse {
-        match request.order {
-            ProxyRequestOrder::AddCluster(cluster) => self.add_cluster(cluster, request.id),
+        let request_id = request.id.clone();
+
+        let result = match request.order {
+            ProxyRequestOrder::AddCluster(cluster) => {
+                debug!("{} add cluster {:?}", request.id, cluster);
+                self.add_cluster(cluster)
+            }
             ProxyRequestOrder::RemoveCluster { cluster_id } => {
-                self.remove_cluster(&cluster_id, request.id)
+                debug!("{} remove cluster {:?}", request_id, cluster_id);
+                self.remove_cluster(&cluster_id)
             }
-            ProxyRequestOrder::AddHttpFrontend(front) => self.add_http_frontend(front, request.id),
+            ProxyRequestOrder::AddHttpFrontend(front) => {
+                debug!("{} add front {:?}", request_id, front);
+                self.add_http_frontend(front)
+            }
             ProxyRequestOrder::RemoveHttpFrontend(front) => {
-                self.remove_http_frontend(front, request.id)
+                debug!("{} remove front {:?}", request_id, front);
+                self.remove_http_frontend(front)
             }
-            ProxyRequestOrder::RemoveListener(remove) => self.remove_listener(remove, request.id),
-            ProxyRequestOrder::SoftStop => self.soft_stop(request.id),
-            ProxyRequestOrder::HardStop => self.hard_stop(request.id),
-            ProxyRequestOrder::Status => self.status(request.id),
-            ProxyRequestOrder::Logging(logging_filter) => self.logging(logging_filter, request.id),
+            ProxyRequestOrder::RemoveListener(remove) => {
+                debug!("removing HTTP listener at address {:?}", remove.address);
+                self.remove_listener(remove)
+            }
+            ProxyRequestOrder::SoftStop => {
+                info!("{} processing soft shutdown", request_id);
+                self.soft_stop();
+                return ProxyResponse::processing(request.id);
+            }
+            ProxyRequestOrder::HardStop => {
+                info!("{} processing hard shutdown", request_id);
+                self.hard_stop();
+                return ProxyResponse::processing(request.id);
+            }
+            ProxyRequestOrder::Status => {
+                debug!("{} status", request_id);
+                Ok(())
+            }
+            ProxyRequestOrder::Logging(logging_filter) => {
+                info!(
+                    "{} changing logging filter to {}",
+                    request_id, logging_filter
+                );
+                self.logging(logging_filter)
+            }
             other_command => {
                 debug!(
                     "{} unsupported message for HTTP proxy, ignoring: {:?}",
                     request.id, other_command
                 );
-                ProxyResponse::error(request.id, "unsupported message")
+                Err(anyhow::Error::msg("unsupported message"))
             }
+        };
+
+        match result {
+            Ok(()) => ProxyResponse::ok(request_id),
+            Err(error_message) => ProxyResponse::error(request_id, format!("{:#}", error_message)),
         }
     }
 
