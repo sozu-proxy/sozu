@@ -410,66 +410,25 @@ impl CommandServer {
 
     pub fn from_upgrade_data(upgrade_data: UpgradeData) -> anyhow::Result<CommandServer> {
         let UpgradeData {
-            command_socket_fd: command,
+            command_socket_fd,
             config,
             workers: serialized_workers,
             state,
             next_id,
         } = upgrade_data;
 
-        debug!("listener is: {}", command);
-        let listener = Async::new(unsafe { UnixListener::from_raw_fd(command) })?;
+        debug!("listener is: {}", command_socket_fd);
+        let async_listener = Async::new(unsafe { UnixListener::from_raw_fd(command_socket_fd) })?;
 
         let (accept_cancel_tx, accept_cancel_rx) = oneshot::channel();
         let (command_tx, command_rx) = channel(10000);
-        let mut tx = command_tx.clone();
+        let cloned_command_tx = command_tx.clone();
 
-        smol::spawn(async move {
-            let mut counter = 0usize;
-            let mut accept_cancel_rx = Some(accept_cancel_rx);
-            loop {
-                /*let (stream, _) = match futures::future::select(
-                accept_cancel_rx.take().unwrap(),
-                listener.read_with(|l| l.accept())
-                ).await {
-                */
-                let accept_client = listener.accept();
-                futures::pin_mut!(accept_client);
-                let (stream, _) = match futures::future::select(
-                    accept_cancel_rx.take().expect("No channel found"),
-                    accept_client,
-                )
-                .await
-                {
-                    futures::future::Either::Left((_canceled, _)) => {
-                        info!("stopping listener");
-                        break;
-                    }
-                    futures::future::Either::Right((res, cancel_rx)) => {
-                        accept_cancel_rx = Some(cancel_rx);
-                        res.expect("Can not get unix stream to create a client loop.")
-                    }
-                };
-                debug!("Accepted a client from upgraded");
-
-                let (client_tx, client_rx) = channel(10000);
-                let client_id = format!("CL-up-{}", counter);
-                smol::spawn(client_loop(
-                    client_id.clone(),
-                    stream,
-                    tx.clone(),
-                    client_rx,
-                ))
-                .detach();
-                tx.send(CommandMessage::ClientNew {
-                    client_id,
-                    sender: client_tx,
-                })
-                .await
-                .expect("Could not send ClientNew message");
-                counter += 1;
-            }
-        })
+        smol::spawn(accept_clients(
+            cloned_command_tx,
+            async_listener,
+            accept_cancel_rx,
+        ))
         .detach();
 
         let tx = command_tx.clone();
@@ -522,7 +481,7 @@ impl CommandServer {
         let executable_path = unsafe { get_executable_path()? };
 
         Ok(CommandServer {
-            unix_listener_fd: command,
+            unix_listener_fd: command_socket_fd,
             config,
             state,
             command_tx,
@@ -903,50 +862,15 @@ pub fn start_server(
         let async_listener = Async::new(unix_listener)?;
         info!("Listening on {:?}", async_listener.get_ref().local_addr()?);
 
-        let mut counter = 0usize;
         let (accept_cancel_tx, accept_cancel_rx) = oneshot::channel();
         let (command_tx, command_rx) = channel(10000);
-        let mut cloned_command_tx = command_tx.clone();
-        smol::spawn(async move {
-            let mut accept_cancel_rx = Some(accept_cancel_rx);
+        let cloned_command_tx = command_tx.clone();
 
-            // create client loops whenever a client connects to the socket
-            loop {
-                let accept_client = async_listener.accept();
-                futures::pin_mut!(accept_client);
-                let (stream, _) =
-                    match futures::future::select(accept_cancel_rx.take().unwrap(), accept_client)
-                        .await
-                    {
-                        futures::future::Either::Left((_canceled, _)) => {
-                            info!("stopping listener");
-                            break;
-                        }
-                        futures::future::Either::Right((result, cancel_rx)) => {
-                            accept_cancel_rx = Some(cancel_rx);
-                            result.unwrap()
-                        }
-                    };
-
-                let (client_tx, client_rx) = channel(10000);
-                let client_id = format!("CL-{}", counter);
-                smol::spawn(client_loop(
-                    client_id.clone(),
-                    stream,
-                    cloned_command_tx.clone(),
-                    client_rx,
-                ))
-                .detach();
-                cloned_command_tx
-                    .send(CommandMessage::ClientNew {
-                        client_id,
-                        sender: client_tx,
-                    })
-                    .await
-                    .expect("Failed at sending ClientNew message");
-                counter += 1;
-            }
-        })
+        smol::spawn(accept_clients(
+            cloned_command_tx,
+            async_listener,
+            accept_cancel_rx,
+        ))
         .detach();
 
         let saved_state_path = config.saved_state.clone();
@@ -978,9 +902,55 @@ pub fn start_server(
     })
 }
 
-// The client loop does two things:
-// - write everything destined to the client onto the unix stream
-// - parse CommandRequests from the unix stream and send them to the command server
+/// spawns a client loop whenever a client connects to the socket
+async fn accept_clients(
+    mut command_tx: Sender<CommandMessage>,
+    async_listener: Async<UnixListener>,
+    accept_cancel_rx: oneshot::Receiver<()>,
+) {
+    let mut counter = 0usize;
+    let mut accept_cancel_rx = Some(accept_cancel_rx);
+    info!("Accepting client connections");
+    loop {
+        let accept_client = async_listener.accept();
+        futures::pin_mut!(accept_client);
+        let (stream, _) =
+            match futures::future::select(accept_cancel_rx.take().unwrap(), accept_client).await {
+                futures::future::Either::Left((_canceled, _)) => {
+                    info!("stopping listener");
+                    break;
+                }
+                futures::future::Either::Right((stream_and_addr, cancel_rx)) => {
+                    accept_cancel_rx = Some(cancel_rx);
+                    stream_and_addr.expect("Can not get unix stream to create a client loop.")
+                }
+            };
+        let (client_tx, client_rx) = channel(10000);
+
+        let client_id = format!("CL-{}", counter);
+
+        smol::spawn(client_loop(
+            client_id.clone(),
+            stream,
+            command_tx.clone(),
+            client_rx,
+        ))
+        .detach();
+
+        command_tx
+            .send(CommandMessage::ClientNew {
+                client_id,
+                sender: client_tx,
+            })
+            .await
+            .expect("Failed at sending ClientNew message");
+        counter += 1;
+    }
+}
+
+/// The client loop does two things:
+/// - write everything destined to the client onto the unix stream
+/// - parse CommandRequests from the unix stream and send them to the command server
 async fn client_loop(
     client_id: String,
     stream: Async<UnixStream>,
@@ -1052,9 +1022,9 @@ async fn client_loop(
     }
 }
 
-// the worker loop does two things:
-// - write everything destined to the worker onto the unix stream
-// - parse ProxyResponses from the unix stream and send them to the CommandServer
+/// the worker loop does two things:
+/// - write everything destined to the worker onto the unix stream
+/// - parse ProxyResponses from the unix stream and send them to the CommandServer
 async fn worker_loop(
     worker_id: u32,
     stream: Async<UnixStream>,
