@@ -1,6 +1,7 @@
 pub mod pattern_trie;
 pub mod trie;
 
+use anyhow::{bail, Context};
 use regex::bytes::Regex;
 use std::str::from_utf8;
 
@@ -32,7 +33,6 @@ impl Router {
         }
     }
 
-    // TODO: return Result<Route> with context
     pub fn lookup(&self, hostname: &[u8], path: &[u8], method: &Method) -> Option<Route> {
         for (domain_rule, path_rule, method_rule, cluster_id) in &self.pre {
             if domain_rule.matches(hostname)
@@ -96,76 +96,74 @@ impl Router {
         None
     }
 
-    pub fn add_http_front(&mut self, front: HttpFrontend) -> bool {
-        match front.position {
-            RulePosition::Pre => match (
-                front.hostname.parse::<DomainRule>(),
-                PathRule::from_config(front.path),
-            ) {
-                (Ok(domain), Some(path)) => {
-                    self.add_pre_rule(domain, path, MethodRule::new(front.method), front.route)
-                }
-                _ => false,
+    pub fn add_http_front(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
+        let path_rule = PathRule::from_config(front.path.clone()).with_context(|| {
+            format!(
+                "Could not parse path rulo from frontend path {}",
+                front.path
+            )
+        })?;
+
+        let method_rule = MethodRule::new(front.method.clone());
+
+        let success = match front.position {
+            RulePosition::Pre => match front.hostname.parse::<DomainRule>() {
+                Ok(domain) => self.add_pre_rule(&domain, &path_rule, &method_rule, &front.route),
+                Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
             },
-            RulePosition::Post => match (
-                front.hostname.parse::<DomainRule>(),
-                PathRule::from_config(front.path),
-            ) {
-                (Ok(domain), Some(path)) => {
-                    self.add_post_rule(domain, path, MethodRule::new(front.method), front.route)
-                }
-                _ => false,
+            RulePosition::Post => match front.hostname.parse::<DomainRule>() {
+                Ok(domain) => self.add_post_rule(&domain, &path_rule, &method_rule, &front.route),
+                Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
             },
-            RulePosition::Tree => match PathRule::from_config(front.path) {
-                Some(path) => self.add_tree_rule(
-                    front.hostname.as_bytes(),
-                    path,
-                    MethodRule::new(front.method),
-                    front.route,
-                ),
-                _ => false,
-            },
+            RulePosition::Tree => self.add_tree_rule(
+                front.hostname.as_bytes(),
+                &path_rule,
+                &method_rule,
+                &front.route,
+            ),
+        };
+        match success {
+            true => Ok(()),
+            false => bail!("Could not add rule to the router"),
         }
     }
 
-    pub fn remove_http_front(&mut self, front: HttpFrontend) -> bool {
-        match front.position {
-            RulePosition::Pre => match (
-                front.hostname.parse::<DomainRule>(),
-                PathRule::from_config(front.path),
-            ) {
-                (Ok(domain), Some(path)) => {
-                    self.remove_pre_rule(domain, path, MethodRule::new(front.method))
-                }
-                _ => false,
+    pub fn remove_http_front(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
+        let path_rule = PathRule::from_config(front.path.clone()).with_context(|| {
+            format!(
+                "Could not parse path rulo from frontend path {}",
+                front.path
+            )
+        })?;
+
+        let method_rule = MethodRule::new(front.method.clone());
+
+        let remove_success = match front.position {
+            RulePosition::Pre => match front.hostname.parse::<DomainRule>() {
+                Ok(domain) => self.remove_pre_rule(&domain, &path_rule, &method_rule),
+                Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
             },
-            RulePosition::Post => match (
-                front.hostname.parse::<DomainRule>(),
-                PathRule::from_config(front.path),
-            ) {
-                (Ok(domain), Some(path)) => {
-                    self.remove_post_rule(domain, path, MethodRule::new(front.method))
-                }
-                _ => false,
+            RulePosition::Post => match front.hostname.parse::<DomainRule>() {
+                Ok(domain) => self.remove_post_rule(&domain, &path_rule, &method_rule),
+                Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
             },
-            RulePosition::Tree => match PathRule::from_config(front.path) {
-                Some(path) => self.remove_tree_rule(
-                    front.hostname.as_bytes(),
-                    path,
-                    MethodRule::new(front.method),
-                    front.route,
-                ),
-                _ => false,
-            },
+            RulePosition::Tree => {
+                self.remove_tree_rule(front.hostname.as_bytes(), &path_rule, &method_rule)
+            }
+        };
+
+        match remove_success {
+            true => Ok(()),
+            false => bail!("could not remove the rule from router"),
         }
     }
 
     pub fn add_tree_rule(
         &mut self,
         hostname: &[u8],
-        path: PathRule,
-        method: MethodRule,
-        cluster_id: Route,
+        path: &PathRule,
+        method: &MethodRule,
+        cluster: &Route,
     ) -> bool {
         let hostname = match from_utf8(hostname) {
             Err(_) => return false,
@@ -180,15 +178,17 @@ impl Router {
                     self.tree.domain_lookup_mut(hostname.as_bytes(), false)
                 {
                     empty = false;
-                    if !paths.iter().any(|(p, m, _)| *p == path && *m == method) {
-                        paths.push((path, method, cluster_id));
+                    if !paths.iter().any(|(p, m, _)| p == path && m == method) {
+                        paths.push((path.to_owned(), method.to_owned(), cluster.to_owned()));
                         return true;
                     }
                 }
 
                 if empty {
-                    self.tree
-                        .domain_insert(hostname.into_bytes(), vec![(path, method, cluster_id)]);
+                    self.tree.domain_insert(
+                        hostname.into_bytes(),
+                        vec![(path.to_owned(), method.to_owned(), cluster.to_owned())],
+                    );
                     return true;
                 }
 
@@ -201,9 +201,9 @@ impl Router {
     pub fn remove_tree_rule(
         &mut self,
         hostname: &[u8],
-        path: PathRule,
-        method: MethodRule,
-        _cluster_id: Route,
+        path: &PathRule,
+        method: &MethodRule,
+        // _cluster: &Route,
     ) -> bool {
         let hostname = match from_utf8(hostname) {
             Err(_) => return false,
@@ -216,7 +216,7 @@ impl Router {
                     let paths_opt = self.tree.domain_lookup_mut(hostname.as_bytes(), false);
 
                     if let Some((_, paths)) = paths_opt {
-                        paths.retain(|(p, m, _)| *p != path || *m != method);
+                        paths.retain(|(p, m, _)| p != path || m != method);
                     }
 
                     paths_opt
@@ -237,17 +237,22 @@ impl Router {
 
     pub fn add_pre_rule(
         &mut self,
-        domain: DomainRule,
-        path: PathRule,
-        method: MethodRule,
-        cluster_id: Route,
+        domain: &DomainRule,
+        path: &PathRule,
+        method: &MethodRule,
+        cluster_id: &Route,
     ) -> bool {
         if !self
             .pre
             .iter()
-            .any(|(d, p, m, _)| *d == domain && *p == path && *m == method)
+            .any(|(d, p, m, _)| d == domain && p == path && m == method)
         {
-            self.pre.push((domain, path, method, cluster_id));
+            self.pre.push((
+                domain.to_owned(),
+                path.to_owned(),
+                method.to_owned(),
+                cluster_id.to_owned(),
+            ));
             true
         } else {
             false
@@ -256,17 +261,22 @@ impl Router {
 
     pub fn add_post_rule(
         &mut self,
-        domain: DomainRule,
-        path: PathRule,
-        method: MethodRule,
-        cluster_id: Route,
+        domain: &DomainRule,
+        path: &PathRule,
+        method: &MethodRule,
+        cluster_id: &Route,
     ) -> bool {
         if !self
             .post
             .iter()
-            .any(|(d, p, m, _)| *d == domain && *p == path && *m == method)
+            .any(|(d, p, m, _)| d == domain && p == path && m == method)
         {
-            self.post.push((domain, path, method, cluster_id));
+            self.post.push((
+                domain.to_owned(),
+                path.to_owned(),
+                method.to_owned(),
+                cluster_id.to_owned(),
+            ));
             true
         } else {
             false
@@ -275,14 +285,14 @@ impl Router {
 
     pub fn remove_pre_rule(
         &mut self,
-        domain: DomainRule,
-        path: PathRule,
-        method: MethodRule,
+        domain: &DomainRule,
+        path: &PathRule,
+        method: &MethodRule,
     ) -> bool {
         match self
             .pre
             .iter()
-            .position(|(d, p, m, _)| *d == domain && *p == path && *m == method)
+            .position(|(d, p, m, _)| d == domain && p == path && m == method)
         {
             None => false,
             Some(index) => {
@@ -294,14 +304,14 @@ impl Router {
 
     pub fn remove_post_rule(
         &mut self,
-        domain: DomainRule,
-        path: PathRule,
-        method: MethodRule,
+        domain: &DomainRule,
+        path: &PathRule,
+        method: &MethodRule,
     ) -> bool {
         match self
             .post
             .iter()
-            .position(|(d, p, m, _)| *d == domain && *p == path && *m == method)
+            .position(|(d, p, m, _)| d == domain && p == path && m == method)
         {
             None => false,
             Some(index) => {
@@ -650,28 +660,28 @@ mod tests {
         let mut router = Router::new();
 
         assert!(router.add_pre_rule(
-            "*".parse::<DomainRule>().unwrap(),
-            PathRule::Prefix("/.well-known/acme-challenge".to_string()),
-            MethodRule::new(Some("GET".to_string())),
-            Route::ClusterId("acme".to_string())
+            &"*".parse::<DomainRule>().unwrap(),
+            &PathRule::Prefix("/.well-known/acme-challenge".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("acme".to_string())
         ));
         assert!(router.add_tree_rule(
-            "www.example.com".as_bytes(),
-            PathRule::Prefix("/".to_string()),
-            MethodRule::new(Some("GET".to_string())),
-            Route::ClusterId("example".to_string())
+            &"www.example.com".as_bytes(),
+            &PathRule::Prefix("/".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("example".to_string())
         ));
         assert!(router.add_tree_rule(
-            "*.test.example.com".as_bytes(),
-            PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()),
-            MethodRule::new(Some("GET".to_string())),
-            Route::ClusterId("examplewildcard".to_string())
+            &"*.test.example.com".as_bytes(),
+            &PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("examplewildcard".to_string())
         ));
         assert!(router.add_tree_rule(
-            "/test[0-9]/.example.com".as_bytes(),
-            PathRule::Prefix("/".to_string()),
-            MethodRule::new(Some("GET".to_string())),
-            Route::ClusterId("exampleregex".to_string())
+            &"/test[0-9]/.example.com".as_bytes(),
+            &PathRule::Prefix("/".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("exampleregex".to_string())
         ));
 
         assert_eq!(

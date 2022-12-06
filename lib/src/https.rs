@@ -1231,22 +1231,26 @@ impl Session {
             }
         };
 
-        let route_res = self
+        let cluster_id_res = self
             .proxy
             .borrow()
             .listeners
             .get(&self.listener_token)
+            .with_context(|| "No listener found for this request")?
             .as_ref()
-            .and_then(|listener| listener.borrow().frontend_from_request(host, uri, method));
+            .borrow()
+            .frontend_from_request(host, uri, method);
 
-        match route_res {
-            Some(Route::ClusterId(cluster_id)) => Ok(cluster_id),
-            Some(Route::Deny) => {
-                self.set_answer(DefaultAnswerStatus::Answer401, None);
-                bail!("Route is unauthorized");
-            }
-            None => {
-                let no_host_error = format!("Host not found: {}", host);
+        match cluster_id_res {
+            Ok(route) => match route {
+                Route::ClusterId(cluster_id) => Ok(cluster_id),
+                Route::Deny => {
+                    self.set_answer(DefaultAnswerStatus::Answer401, None);
+                    bail!("Route is unauthorized");
+                }
+            },
+            Err(e) => {
+                let no_host_error = format!("Host not found: {}: {:#}", host, e);
                 self.set_answer(DefaultAnswerStatus::Answer404, None);
                 bail!(no_host_error);
             }
@@ -1801,37 +1805,53 @@ impl Listener {
         Ok(server_config)
     }
 
-    pub fn add_https_front(&mut self, tls_front: HttpFrontend) -> bool {
-        self.fronts.add_http_front(tls_front)
+    pub fn add_https_front(&mut self, tls_front: HttpFrontend) -> anyhow::Result<()> {
+        self.fronts
+            .add_http_front(&tls_front)
+            .with_context(|| "Could not add https frontend")
     }
 
-    pub fn remove_https_front(&mut self, tls_front: HttpFrontend) -> bool {
+    pub fn remove_https_front(&mut self, tls_front: HttpFrontend) -> anyhow::Result<()> {
         debug!("removing tls_front {:?}", tls_front);
-        self.fronts.remove_http_front(tls_front)
+        self.fronts
+            .remove_http_front(&tls_front)
+            .with_context(|| "Could not remove https frontend")
     }
 
-    // TODO: return Result with context
-    // ToDo factor out with http.rs
-    pub fn frontend_from_request(&self, host: &str, uri: &str, method: &Method) -> Option<Route> {
-        let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
-            if i != &b""[..] {
-                error!(
-                    "frontend_from_request: invalid remaining chars after hostname. Host: {}",
-                    host
+    // TODO factor out with http.rs
+    pub fn frontend_from_request(
+        &self,
+        host: &str,
+        uri: &str,
+        method: &Method,
+    ) -> anyhow::Result<Route> {
+        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
+            Ok(tuple) => tuple,
+            Err(parse_error) => {
+                // parse_error contains a slice of given_host, which should NOT escape this scope
+                bail!(
+                    "Hostname parsing failed for host {}: {}",
+                    host.clone(),
+                    parse_error,
                 );
-                return None;
             }
-
-            // it is alright to call from_utf8_unchecked,
-            // we already verified that there are only ascii
-            // chars in there
-            unsafe { from_utf8_unchecked(hostname) }
-        } else {
-            error!("hostname parsing failed for: '{}'", host);
-            return None;
         };
 
-        self.fronts.lookup(host.as_bytes(), uri.as_bytes(), method)
+        if remaining_input != &b""[..] {
+            bail!(
+                "frontend_from_request: invalid remaining chars after hostname. Host: {}",
+                host
+            );
+        }
+
+        // it is alright to call from_utf8_unchecked,
+        // we already verified that there are only ascii
+        // chars in there
+        let host = unsafe { from_utf8_unchecked(hostname) };
+
+        self.fronts
+            .lookup(host.as_bytes(), uri.as_bytes(), method)
+            .with_context(|| "No cluster found")
     }
 
     fn accept(&mut self) -> Result<MioTcpStream, AcceptError> {
@@ -2104,7 +2124,9 @@ impl Proxy {
             Some(listener) => {
                 let mut owned = listener.borrow_mut();
                 owned.set_tags(front.hostname.to_owned(), front.tags.to_owned());
-                owned.add_https_front(front);
+                owned
+                    .add_https_front(front)
+                    .with_context(|| "Could not add https frontend")?;
                 Ok(None)
             }
             None => bail!("adding front {:?} to unknown listener", front),
@@ -2122,9 +2144,9 @@ impl Proxy {
         {
             let mut owned = listener.borrow_mut();
             owned.set_tags(front.hostname.to_owned(), None);
-            if !owned.remove_https_front(front) {
-                bail!("Could not remove https frontend");
-            }
+            owned
+                .remove_https_front(front)
+                .with_context(|| "Could not remove https frontend")?;
         }
         Ok(None)
     }
@@ -2563,27 +2585,27 @@ mod tests {
         let mut fronts = Router::new();
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
-            PathRule::Prefix(uri1),
-            MethodRule::new(None),
-            Route::ClusterId(cluster_id1.clone())
+            &PathRule::Prefix(uri1),
+            &MethodRule::new(None),
+            &Route::ClusterId(cluster_id1.clone())
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
-            PathRule::Prefix(uri2),
-            MethodRule::new(None),
-            Route::ClusterId(cluster_id2)
+            &PathRule::Prefix(uri2),
+            &MethodRule::new(None),
+            &Route::ClusterId(cluster_id2)
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
-            PathRule::Prefix(uri3),
-            MethodRule::new(None),
-            Route::ClusterId(cluster_id3)
+            &PathRule::Prefix(uri3),
+            &MethodRule::new(None),
+            &Route::ClusterId(cluster_id3)
         ));
         assert!(fronts.add_tree_rule(
             "other.domain".as_bytes(),
-            PathRule::Prefix("test".to_string()),
-            MethodRule::new(None),
-            Route::ClusterId(cluster_id1)
+            &PathRule::Prefix("test".to_string()),
+            &MethodRule::new(None),
+            &Route::ClusterId(cluster_id1)
         ));
 
         let address: StdSocketAddr = FromStr::from_str("127.0.0.1:1032")
@@ -2643,7 +2665,7 @@ mod tests {
         );
         println!("TEST {}", line!());
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
-        assert_eq!(frontend5, None);
+        assert!(frontend5.is_err());
         // assert!(false);
     }
 

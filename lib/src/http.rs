@@ -949,17 +949,21 @@ impl Session {
             .borrow()
             .listeners
             .get(&self.listener_token)
+            .with_context(|| "No listener found for this request")?
             .as_ref()
-            .and_then(|listener| listener.borrow().frontend_from_request(host, uri, method));
+            .borrow()
+            .frontend_from_request(host, uri, method);
 
         let cluster_id = match cluster_id_res {
-            Some(Route::ClusterId(cluster_id)) => cluster_id,
-            Some(Route::Deny) => {
-                self.set_answer(DefaultAnswerStatus::Answer401, None);
-                bail!("Unauthorized route");
-            }
-            None => {
-                let no_host_error = format!("Host not found: {}", host);
+            Ok(route) => match route {
+                Route::ClusterId(cluster_id) => cluster_id,
+                Route::Deny => {
+                    self.set_answer(DefaultAnswerStatus::Answer401, None);
+                    bail!("Unauthorized route");
+                }
+            },
+            Err(e) => {
+                let no_host_error = format!("Host not found: {}: {:#}", host, e);
                 self.set_answer(DefaultAnswerStatus::Answer404, None);
                 bail!(no_host_error);
             }
@@ -1667,54 +1671,58 @@ impl Listener {
         Some(self.token)
     }
 
-    // TODO: return Result with context
-    pub fn add_http_front(&mut self, http_front: HttpFrontend) -> Result<(), String> {
-        if self.fronts.add_http_front(http_front) {
-            Ok(())
-        } else {
-            Err(String::from("could not add HTTP front"))
-        }
+    pub fn add_http_front(&mut self, http_front: HttpFrontend) -> anyhow::Result<()> {
+        self.fronts
+            .add_http_front(&http_front)
+            .with_context(|| format!("Could not add http frontend {:?}", http_front))
     }
 
-    // TODO: return Result with context
-    pub fn remove_http_front(&mut self, http_front: HttpFrontend) -> Result<(), String> {
+    pub fn remove_http_front(&mut self, http_front: HttpFrontend) -> anyhow::Result<()> {
         debug!("removing http_front {:?}", http_front);
-        //FIXME: proper error reporting
-        if !self.fronts.remove_http_front(http_front) {
-            return Err(String::from("could not remove HTTP front"));
-        }
-        Ok(())
+        self.fronts
+            .remove_http_front(&http_front)
+            .with_context(|| format!("Could not remove http frontend {:?}", http_front))
     }
 
-    // TODO: return Result with context
-    pub fn frontend_from_request(&self, host: &str, uri: &str, method: &Method) -> Option<Route> {
-        // redundant
-        // already called once in extract_route
-        let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
-            if i != &b""[..] {
-                error!(
-                    "frontend_from_request: invalid remaining chars after hostname. Host: {}",
-                    host
+    // redundant, already called once in extract_route
+    pub fn frontend_from_request(
+        &self,
+        host: &str,
+        uri: &str,
+        method: &Method,
+    ) -> anyhow::Result<Route> {
+        let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
+            Ok(tuple) => tuple,
+            Err(parse_error) => {
+                // parse_error contains a slice of given_host, which should NOT escape this scope
+                bail!(
+                    "Hostname parsing failed for host {}: {}",
+                    host.clone(),
+                    parse_error,
                 );
-                return None;
             }
-
-            /*if port == Some(&b"80"[..]) {
-            // it is alright to call from_utf8_unchecked,
-            // we already verified that there are only ascii
-            // chars in there
-              unsafe { from_utf8_unchecked(hostname) }
-            } else {
-              host
-            }
-            */
-            unsafe { from_utf8_unchecked(hostname) }
-        } else {
-            error!("hostname parsing failed for: '{}'", host);
-            return None;
         };
+        if remaining_input != &b""[..] {
+            bail!(
+                "frontend_from_request: invalid remaining chars after hostname. Host: {}",
+                host
+            );
+        }
 
-        self.fronts.lookup(host.as_bytes(), uri.as_bytes(), method)
+        /*if port == Some(&b"80"[..]) {
+        // it is alright to call from_utf8_unchecked,
+        // we already verified that there are only ascii
+        // chars in there
+          unsafe { from_utf8_unchecked(hostname) }
+        } else {
+          host
+        }
+        */
+        let host = unsafe { from_utf8_unchecked(hostname) };
+
+        self.fronts
+            .lookup(host.as_bytes(), uri.as_bytes(), method)
+            .with_context(|| "No cluster found")
     }
 
     fn accept(&mut self) -> Result<TcpStream, AcceptError> {
@@ -2367,42 +2375,50 @@ mod tests {
         let uri3 = "/yolo/swag".to_owned();
 
         let mut fronts = Router::new();
-        fronts.add_http_front(HttpFrontend {
-            route: Route::ClusterId(cluster_id1),
-            address: "0.0.0.0:80".parse().unwrap(),
-            hostname: "lolcatho.st".to_owned(),
-            path: PathRule::Prefix(uri1),
-            method: None,
-            position: RulePosition::Tree,
-            tags: None,
-        });
-        fronts.add_http_front(HttpFrontend {
-            route: Route::ClusterId(cluster_id2),
-            address: "0.0.0.0:80".parse().unwrap(),
-            hostname: "lolcatho.st".to_owned(),
-            path: PathRule::Prefix(uri2),
-            method: None,
-            position: RulePosition::Tree,
-            tags: None,
-        });
-        fronts.add_http_front(HttpFrontend {
-            route: Route::ClusterId(cluster_id3),
-            address: "0.0.0.0:80".parse().unwrap(),
-            hostname: "lolcatho.st".to_owned(),
-            path: PathRule::Prefix(uri3),
-            method: None,
-            position: RulePosition::Tree,
-            tags: None,
-        });
-        fronts.add_http_front(HttpFrontend {
-            route: Route::ClusterId("cluster_1".to_owned()),
-            address: "0.0.0.0:80".parse().unwrap(),
-            hostname: "other.domain".to_owned(),
-            path: PathRule::Prefix("/test".to_owned()),
-            method: None,
-            position: RulePosition::Tree,
-            tags: None,
-        });
+        fronts
+            .add_http_front(&HttpFrontend {
+                route: Route::ClusterId(cluster_id1),
+                address: "0.0.0.0:80".parse().unwrap(),
+                hostname: "lolcatho.st".to_owned(),
+                path: PathRule::Prefix(uri1),
+                method: None,
+                position: RulePosition::Tree,
+                tags: None,
+            })
+            .expect("Could not add http frontend");
+        fronts
+            .add_http_front(&HttpFrontend {
+                route: Route::ClusterId(cluster_id2),
+                address: "0.0.0.0:80".parse().unwrap(),
+                hostname: "lolcatho.st".to_owned(),
+                path: PathRule::Prefix(uri2),
+                method: None,
+                position: RulePosition::Tree,
+                tags: None,
+            })
+            .expect("Could not add http frontend");
+        fronts
+            .add_http_front(&HttpFrontend {
+                route: Route::ClusterId(cluster_id3),
+                address: "0.0.0.0:80".parse().unwrap(),
+                hostname: "lolcatho.st".to_owned(),
+                path: PathRule::Prefix(uri3),
+                method: None,
+                position: RulePosition::Tree,
+                tags: None,
+            })
+            .expect("Could not add http frontend");
+        fronts
+            .add_http_front(&HttpFrontend {
+                route: Route::ClusterId("cluster_1".to_owned()),
+                address: "0.0.0.0:80".parse().unwrap(),
+                hostname: "other.domain".to_owned(),
+                path: PathRule::Prefix("/test".to_owned()),
+                method: None,
+                position: RulePosition::Tree,
+                tags: None,
+            })
+            .expect("Could not add http frontend");
 
         let address: SocketAddr =
             FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
@@ -2441,6 +2457,6 @@ mod tests {
             frontend4.expect("should find frontend"),
             Route::ClusterId("cluster_3".to_string())
         );
-        assert_eq!(frontend5, None);
+        assert!(frontend5.is_err());
     }
 }
