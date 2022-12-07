@@ -1746,27 +1746,36 @@ impl ProxyConfiguration<Session> for Proxy {
         let result = match request.order {
             ProxyRequestOrder::AddCluster(cluster) => {
                 info!("{} add cluster {:?}", request.id, cluster);
-                self.add_cluster(cluster)
+                self.add_cluster(cluster.clone())
+                    .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
             ProxyRequestOrder::RemoveCluster { cluster_id } => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
+                    .with_context(|| format!("Could not remove cluster {}", cluster_id))
             }
             ProxyRequestOrder::AddHttpFrontend(front) => {
                 info!("{} add front {:?}", request_id, front);
                 self.add_http_frontend(front)
+                    .with_context(|| "Could not add http frontend")
             }
             ProxyRequestOrder::RemoveHttpFrontend(front) => {
                 info!("{} remove front {:?}", request_id, front);
                 self.remove_http_frontend(front)
+                    .with_context(|| "Could not remove http frontend")
             }
             ProxyRequestOrder::RemoveListener(remove) => {
                 info!("removing HTTP listener at address {:?}", remove.address);
-                self.remove_listener(remove)
+                self.remove_listener(remove.clone()).with_context(|| {
+                    format!("Could not remove listener at address {:?}", remove.address)
+                })
             }
             ProxyRequestOrder::SoftStop => {
                 info!("{} processing soft shutdown", request_id);
-                match self.soft_stop() {
+                match self
+                    .soft_stop()
+                    .with_context(|| "Could not perform soft stop")
+                {
                     Ok(()) => {
                         info!("{} soft stop successful", request_id);
                         return ProxyResponse::processing(request.id);
@@ -1776,7 +1785,10 @@ impl ProxyConfiguration<Session> for Proxy {
             }
             ProxyRequestOrder::HardStop => {
                 info!("{} processing hard shutdown", request_id);
-                match self.hard_stop() {
+                match self
+                    .hard_stop()
+                    .with_context(|| "Could not perform hard stop")
+                {
                     Ok(()) => {
                         info!("{} hard stop successful", request_id);
                         return ProxyResponse::processing(request.id);
@@ -1793,7 +1805,8 @@ impl ProxyConfiguration<Session> for Proxy {
                     "{} changing logging filter to {}",
                     request_id, logging_filter
                 );
-                self.logging(logging_filter)
+                self.logging(logging_filter.clone())
+                    .with_context(|| format!("Could not set logging level to {}", logging_filter))
             }
             other_command => {
                 info!(

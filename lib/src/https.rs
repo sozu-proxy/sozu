@@ -2277,23 +2277,28 @@ impl ProxyConfiguration<Session> for Proxy {
         let content_result = match request.order {
             ProxyRequestOrder::AddCluster(cluster) => {
                 info!("{} add cluster {:?}", request_id, cluster);
-                self.add_cluster(cluster)
+                self.add_cluster(cluster.clone())
+                    .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
             ProxyRequestOrder::RemoveCluster { cluster_id } => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
+                    .with_context(|| format!("Could not remove cluster {}", cluster_id))
             }
             ProxyRequestOrder::AddHttpsFrontend(front) => {
                 info!("{} add https front {:?}", request_id, front);
                 self.add_https_frontend(front)
+                    .with_context(|| "Could not add https frontend")
             }
             ProxyRequestOrder::RemoveHttpsFrontend(front) => {
                 info!("{} remove https front {:?}", request_id, front);
                 self.remove_https_frontend(front)
+                    .with_context(|| "Could not remove https frontend")
             }
             ProxyRequestOrder::AddCertificate(add_certificate) => {
                 info!("{} add certificate: {:?}", request_id, add_certificate);
                 self.add_certificate(add_certificate)
+                    .with_context(|| "Could not add certificate")
             }
             ProxyRequestOrder::RemoveCertificate(remove_certificate) => {
                 info!(
@@ -2301,6 +2306,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     request_id, remove_certificate
                 );
                 self.remove_certificate(remove_certificate)
+                    .with_context(|| "Could not remove certificate")
             }
             ProxyRequestOrder::ReplaceCertificate(replace_certificate) => {
                 info!(
@@ -2308,14 +2314,20 @@ impl ProxyConfiguration<Session> for Proxy {
                     request_id, replace_certificate
                 );
                 self.replace_certificate(replace_certificate)
+                    .with_context(|| "Could not replace certificate")
             }
             ProxyRequestOrder::RemoveListener(remove) => {
                 info!("removing HTTPS listener at address {:?}", remove.address);
-                self.remove_listener(remove)
+                self.remove_listener(remove.clone()).with_context(|| {
+                    format!("Could not remove listener at address {:?}", remove.address)
+                })
             }
             ProxyRequestOrder::SoftStop => {
                 info!("{} processing soft shutdown", request_id);
-                match self.soft_stop() {
+                match self
+                    .soft_stop()
+                    .with_context(|| "Could not perform soft stop")
+                {
                     Ok(_) => {
                         info!("{} soft stop successful", request_id);
                         return ProxyResponse::processing(request.id);
@@ -2325,7 +2337,10 @@ impl ProxyConfiguration<Session> for Proxy {
             }
             ProxyRequestOrder::HardStop => {
                 info!("{} processing hard shutdown", request_id);
-                match self.hard_stop() {
+                match self
+                    .hard_stop()
+                    .with_context(|| "Could not perform hard stop")
+                {
                     Ok(_) => {
                         info!("{} hard stop successful", request_id);
                         return ProxyResponse::processing(request.id);
@@ -2342,15 +2357,18 @@ impl ProxyConfiguration<Session> for Proxy {
                     "{} changing logging filter to {}",
                     request_id, logging_filter
                 );
-                self.logging(logging_filter)
+                self.logging(logging_filter.clone())
+                    .with_context(|| format!("Could not set logging level to {}", logging_filter))
             }
             ProxyRequestOrder::Query(Query::Certificates(QueryCertificateType::All)) => {
                 info!("{} query all certificates", request_id);
                 self.query_all_certificates()
+                    .with_context(|| "Could not query all certificates")
             }
             ProxyRequestOrder::Query(Query::Certificates(QueryCertificateType::Domain(domain))) => {
                 info!("{} query certificate for domain {}", request_id, domain);
-                self.query_certificate_for_domain(domain)
+                self.query_certificate_for_domain(domain.clone())
+                    .with_context(|| format!("Could not query certificate for domain {}", domain))
             }
             other_order => {
                 error!(
