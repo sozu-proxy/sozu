@@ -1900,7 +1900,7 @@ impl Proxy {
             .retain(|_, listener| listener.borrow().address != remove.address);
 
         if !self.listeners.len() < len {
-            bail!(
+            info!(
                 "no HTTPS listener to remove at address {:?}",
                 remove.address
             )
@@ -1908,27 +1908,44 @@ impl Proxy {
         Ok(None)
     }
 
-    pub fn soft_stop(&mut self) {
+    pub fn soft_stop(&mut self) -> anyhow::Result<()> {
         let listeners: HashMap<_, _> = self.listeners.drain().collect();
+        let mut socket_errors = vec![];
         for (_, l) in listeners.iter() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
+                debug!("Deregistering socket {:?}", sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
-                    error!("error deregistering listen socket({:?}): {:?}", sock, e);
+                    let error = format!("socket {:?}: {:?}", sock, e);
+                    socket_errors.push(error);
                 }
             }
         }
+
+        if !socket_errors.is_empty() {
+            bail!("Error deregistering listen sockets: {:?}", socket_errors);
+        }
+
+        Ok(())
     }
 
-    pub fn hard_stop(&mut self) {
-        // TODO: compare with HTTP Proxy hard_stop, slightly different
-        let listeners: HashMap<_, _> = self.listeners.drain().collect();
-        for (_, listener) in listeners.iter() {
-            listener.borrow_mut().listener.take().map(|mut sock| {
+    pub fn hard_stop(&mut self) -> anyhow::Result<()> {
+        let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
+        let mut socket_errors = vec![];
+        for (_, l) in listeners.drain() {
+            if let Some(mut sock) = l.borrow_mut().listener.take() {
+                debug!("Deregistering socket {:?}", sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
-                    error!("error dereginstering listen socket({:?}): {:?}", sock, e);
+                    let error = format!("socket {:?}: {:?}", sock, e);
+                    socket_errors.push(error);
                 }
-            });
+            }
         }
+
+        if !socket_errors.is_empty() {
+            bail!("Error deregistering listen sockets: {:?}", socket_errors);
+        }
+
+        Ok(())
     }
 
     pub fn logging(
@@ -2098,41 +2115,39 @@ impl Proxy {
         &mut self,
         front: HttpFrontend,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
-        match self
+        if let Some(listener) = self
             .listeners
             .values()
             .find(|l| l.borrow_mut().address == front.address)
         {
-            Some(listener) => {
-                let mut owned = listener.borrow_mut();
-                owned.set_tags(front.hostname.to_owned(), None);
-                owned.remove_https_front(front);
-                Ok(None)
+            let mut owned = listener.borrow_mut();
+            owned.set_tags(front.hostname.to_owned(), None);
+            if !owned.remove_https_front(front) {
+                bail!("Could not remove https frontend");
             }
-            None => bail!("No listener found for the frontend {:?}", front),
         }
+        Ok(None)
     }
 
     pub fn add_certificate(
         &mut self,
         add_certificate: AddCertificate,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
-        let listener = match self
+        match self
             .listeners
             .values()
             .find(|l| l.borrow().address == add_certificate.address)
         {
-            Some(l) => l,
+            Some(listener) => listener
+                .borrow_mut()
+                .add_certificate(&add_certificate)
+                .with_context(|| "Could not add certificate to listener")?,
             None => {
                 error!("adding certificate to unknown listener");
                 bail!("unsupported message");
             }
         };
 
-        listener
-            .borrow_mut()
-            .add_certificate(&add_certificate)
-            .with_context(|| "Could not add certificate to listener")?;
         Ok(None)
     }
 
@@ -2141,22 +2156,21 @@ impl Proxy {
         &mut self,
         remove_certificate: RemoveCertificate,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
-        let listener = match self
+        match self
             .listeners
             .values()
             .find(|l| l.borrow().address == remove_certificate.address)
         {
-            Some(l) => l,
+            Some(listener) => listener
+                .borrow_mut()
+                .remove_certificate(&remove_certificate)
+                .with_context(|| "Could not remove certificate from listener")?,
             None => {
                 error!("removing certificate from unknown listener");
                 bail!("unsupported message");
             }
         };
 
-        listener
-            .borrow_mut()
-            .remove_certificate(&remove_certificate)
-            .with_context(|| "Could not remove certificate from listener")?;
         Ok(None)
     }
 
@@ -2165,26 +2179,21 @@ impl Proxy {
         &mut self,
         replace_certificate: ReplaceCertificate,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
-        for listener in &self.listeners {
-            error!("LISTENER: {:?}", listener.1.borrow().address);
-        }
-
-        let listener = match self
+        match self
             .listeners
             .values()
             .find(|l| l.borrow().address == replace_certificate.address)
         {
-            Some(l) => l,
+            Some(listener) => listener
+                .borrow_mut()
+                .replace_certificate(&replace_certificate)
+                .with_context(|| "Could not replace certificate on listener")?,
             None => {
                 error!("replacing certificate on unknown listener");
                 bail!("unsupported message");
             }
         };
 
-        listener
-            .borrow_mut()
-            .replace_certificate(&replace_certificate)
-            .with_context(|| "Could not replace certificate on listener")?;
         Ok(None)
     }
 }
@@ -2267,55 +2276,65 @@ impl ProxyConfiguration<Session> for Proxy {
 
         let content_result = match request.order {
             ProxyRequestOrder::AddCluster(cluster) => {
-                debug!("{} add cluster {:?}", request_id, cluster);
+                info!("{} add cluster {:?}", request_id, cluster);
                 self.add_cluster(cluster)
             }
             ProxyRequestOrder::RemoveCluster { cluster_id } => {
-                debug!("{} remove cluster {:?}", request_id, cluster_id);
+                info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
             }
             ProxyRequestOrder::AddHttpsFrontend(front) => {
-                debug!("{} add https front {:?}", request_id, front);
+                info!("{} add https front {:?}", request_id, front);
                 self.add_https_frontend(front)
             }
             ProxyRequestOrder::RemoveHttpsFrontend(front) => {
-                debug!("{} remove https front {:?}", request_id, front);
+                info!("{} remove https front {:?}", request_id, front);
                 self.remove_https_frontend(front)
             }
             ProxyRequestOrder::AddCertificate(add_certificate) => {
-                debug!("{} add certificate: {:?}", request_id, add_certificate);
+                info!("{} add certificate: {:?}", request_id, add_certificate);
                 self.add_certificate(add_certificate)
             }
             ProxyRequestOrder::RemoveCertificate(remove_certificate) => {
-                debug!(
+                info!(
                     "{} remove certificate: {:?}",
                     request_id, remove_certificate
                 );
                 self.remove_certificate(remove_certificate)
             }
             ProxyRequestOrder::ReplaceCertificate(replace_certificate) => {
-                debug!(
+                info!(
                     "{} replace certificate: {:?}",
                     request_id, replace_certificate
                 );
                 self.replace_certificate(replace_certificate)
             }
             ProxyRequestOrder::RemoveListener(remove) => {
-                debug!("removing HTTPS listener at address {:?}", remove.address);
+                info!("removing HTTPS listener at address {:?}", remove.address);
                 self.remove_listener(remove)
             }
             ProxyRequestOrder::SoftStop => {
                 info!("{} processing soft shutdown", request_id);
-                self.soft_stop();
-                return ProxyResponse::processing(request_id);
+                match self.soft_stop() {
+                    Ok(_) => {
+                        info!("{} soft stop successful", request_id);
+                        return ProxyResponse::processing(request.id);
+                    }
+                    Err(e) => Err(e),
+                }
             }
             ProxyRequestOrder::HardStop => {
-                info!("{} hard shutdown", request_id);
-                self.hard_stop();
-                return ProxyResponse::processing(request_id);
+                info!("{} processing hard shutdown", request_id);
+                match self.hard_stop() {
+                    Ok(_) => {
+                        info!("{} hard stop successful", request_id);
+                        return ProxyResponse::processing(request.id);
+                    }
+                    Err(e) => Err(e),
+                }
             }
             ProxyRequestOrder::Status => {
-                debug!("{} status", request_id);
+                info!("{} status", request_id);
                 Ok(None)
             }
             ProxyRequestOrder::Logging(logging_filter) => {
@@ -2326,11 +2345,11 @@ impl ProxyConfiguration<Session> for Proxy {
                 self.logging(logging_filter)
             }
             ProxyRequestOrder::Query(Query::Certificates(QueryCertificateType::All)) => {
-                debug!("{} query all certificates", request_id);
+                info!("{} query all certificates", request_id);
                 self.query_all_certificates()
             }
             ProxyRequestOrder::Query(Query::Certificates(QueryCertificateType::Domain(domain))) => {
-                debug!("{} query certificate for domain {}", request_id, domain);
+                info!("{} query certificate for domain {}", request_id, domain);
                 self.query_certificate_for_domain(domain)
             }
             other_order => {

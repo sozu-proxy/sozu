@@ -1592,15 +1592,24 @@ impl Proxy {
         Ok(())
     }
 
-    pub fn hard_stop(&mut self) {
+    pub fn hard_stop(&mut self) -> anyhow::Result<()> {
         let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
+        let mut socket_errors = vec![];
         for (_, l) in listeners.drain() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
+                debug!("Deregistering socket {:?}", sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
-                    error!("error deregistering listen socket({:?}): {:?}", sock, e);
+                    let error = format!("socket {:?}: {:?}", sock, e);
+                    socket_errors.push(error);
                 }
             }
         }
+
+        if !socket_errors.is_empty() {
+            bail!("Error deregistering listen sockets: {:?}", socket_errors);
+        }
+
+        Ok(())
     }
 
     pub fn logging(&mut self, logging_filter: String) -> anyhow::Result<()> {
@@ -1736,30 +1745,30 @@ impl ProxyConfiguration<Session> for Proxy {
 
         let result = match request.order {
             ProxyRequestOrder::AddCluster(cluster) => {
-                debug!("{} add cluster {:?}", request.id, cluster);
+                info!("{} add cluster {:?}", request.id, cluster);
                 self.add_cluster(cluster)
             }
             ProxyRequestOrder::RemoveCluster { cluster_id } => {
-                debug!("{} remove cluster {:?}", request_id, cluster_id);
+                info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
             }
             ProxyRequestOrder::AddHttpFrontend(front) => {
-                debug!("{} add front {:?}", request_id, front);
+                info!("{} add front {:?}", request_id, front);
                 self.add_http_frontend(front)
             }
             ProxyRequestOrder::RemoveHttpFrontend(front) => {
-                debug!("{} remove front {:?}", request_id, front);
+                info!("{} remove front {:?}", request_id, front);
                 self.remove_http_frontend(front)
             }
             ProxyRequestOrder::RemoveListener(remove) => {
-                debug!("removing HTTP listener at address {:?}", remove.address);
+                info!("removing HTTP listener at address {:?}", remove.address);
                 self.remove_listener(remove)
             }
             ProxyRequestOrder::SoftStop => {
                 info!("{} processing soft shutdown", request_id);
                 match self.soft_stop() {
                     Ok(()) => {
-                        info!("{} shutdown successful", request_id);
+                        info!("{} soft stop successful", request_id);
                         return ProxyResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
@@ -1767,11 +1776,16 @@ impl ProxyConfiguration<Session> for Proxy {
             }
             ProxyRequestOrder::HardStop => {
                 info!("{} processing hard shutdown", request_id);
-                self.hard_stop();
-                return ProxyResponse::processing(request.id);
+                match self.hard_stop() {
+                    Ok(()) => {
+                        info!("{} hard stop successful", request_id);
+                        return ProxyResponse::processing(request.id);
+                    }
+                    Err(e) => Err(e),
+                }
             }
             ProxyRequestOrder::Status => {
-                debug!("{} status", request_id);
+                info!("{} status", request_id);
                 Ok(())
             }
             ProxyRequestOrder::Logging(logging_filter) => {
@@ -1782,7 +1796,7 @@ impl ProxyConfiguration<Session> for Proxy {
                 self.logging(logging_filter)
             }
             other_command => {
-                debug!(
+                info!(
                     "{} unsupported message for HTTP proxy, ignoring: {:?}",
                     request.id, other_command
                 );
