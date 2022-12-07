@@ -142,7 +142,11 @@ pub fn main(
             Err(e) => bail!("could not create HTTP server: {}", e.to_string()),
         };
 
-        let address = server.server_addr();
+        let address = server
+            .server_addr()
+            .to_ip()
+            .with_context(|| "Could not convert server address to IP")?;
+
         let acme_app_id = generate_app_id(&cluster_id);
 
         debug!("setting up proxying");
