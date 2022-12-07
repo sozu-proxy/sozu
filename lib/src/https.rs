@@ -2362,12 +2362,18 @@ impl ProxyConfiguration<Session> for Proxy {
         };
 
         match content_result {
-            Ok(content) => ProxyResponse {
-                id: request_id,
-                status: ProxyResponseStatus::Ok,
-                content,
-            },
-            Err(error_message) => ProxyResponse::error(request_id, format!("{:#}", error_message)),
+            Ok(content) => {
+                info!("{} successful", request_id);
+                ProxyResponse {
+                    id: request_id,
+                    status: ProxyResponseStatus::Ok,
+                    content,
+                }
+            }
+            Err(error_message) => {
+                error!("{} unsuccessful: {:#}", request_id, error_message);
+                ProxyResponse::error(request_id, format!("{:#}", error_message))
+            }
         }
     }
 }
