@@ -152,7 +152,7 @@ pub fn begin_new_main_process(
         serde_json::from_reader(upgrade_file).with_context(|| "could not parse upgrade data")?;
     let config = upgrade_data.config.clone();
 
-    util::setup_logging(&config);
+    util::setup_logging(&config, "MAIN");
     util::setup_metrics(&config).with_context(|| "Could not setup metrics")?;
     //info!("new main got upgrade data: {:?}", upgrade_data);
 

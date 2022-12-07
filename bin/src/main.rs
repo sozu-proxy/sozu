@@ -21,6 +21,8 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 #[macro_use]
 mod logging;
 
+/// CLI utility for Let's Encrypt configuration
+mod acme;
 /// the arguments to the sozu command line
 mod cli;
 /// Receives orders from the CLI, transmits to workers
@@ -94,6 +96,29 @@ fn main(args: Args) -> anyhow::Result<()> {
                 max_command_buffer_size,
             )
         }
+        cli::SubCmd::Acme {
+            config,
+            domain,
+            email,
+            cluster_id,
+            old_certificate_path,
+            new_certificate_path,
+            certificate_chain_path,
+            key_path,
+            http_frontend_address,
+            https_frontend_address,
+        } => acme::main(
+            config,
+            domain,
+            email,
+            cluster_id,
+            old_certificate_path,
+            new_certificate_path,
+            certificate_chain_path,
+            key_path,
+            http_frontend_address,
+            https_frontend_address,
+        ),
         _ => ctl::ctl(args),
     }
 }
@@ -102,7 +127,7 @@ fn start(args: &cli::Args) -> Result<(), anyhow::Error> {
     let config_file_path = get_config_file_path(args)?;
     let config = load_configuration(config_file_path)?;
 
-    util::setup_logging(&config);
+    util::setup_logging(&config, "MAIN");
     info!("Starting up");
     util::setup_metrics(&config).with_context(|| "Could not setup metrics")?;
     util::write_pid_file(&config).with_context(|| "PID file is not writeable")?;
