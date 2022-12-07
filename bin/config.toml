@@ -17,7 +17,7 @@
 # "trace". For performance reasons, the logs at "debug" or "trace" level are
 # not compiled by default. To activate them, pass the "logs-debug" and
 # "logs-trace" compilation options to cargo
-log_level = "info"
+log_level = "debug"
 
 # where the logs will be sent. It defaults to sending the logs on standard output,
 # but they could be written to a UDP address:

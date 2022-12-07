@@ -1455,11 +1455,10 @@ impl Proxy {
         self.listeners
             .retain(|_, l| l.borrow().address != remove.address);
 
-        if self.listeners.len() < len {
-            Ok(())
-        } else {
-            bail!("no HTTP listener to remove at address {:?}", remove.address)
+        if !self.listeners.len() < len {
+            info!("no HTTP listener to remove at address {:?}", remove.address);
         }
+        Ok(())
     }
 
     pub fn activate_listener(
@@ -1557,36 +1556,40 @@ impl Proxy {
     }
 
     pub fn remove_http_frontend(&mut self, front: HttpFrontend) -> anyhow::Result<()> {
-        match self
+        if let Some(listener) = self
             .listeners
             .values()
             .find(|l| l.borrow().address == front.address)
         {
-            Some(listener) => {
-                let mut owned = listener.borrow_mut();
-                let hostname = front.hostname.to_owned();
+            let mut owned = listener.borrow_mut();
+            let hostname = front.hostname.to_owned();
 
-                match owned.remove_http_front(front) {
-                    Ok(_) => {
-                        owned.set_tags(hostname, None);
-                        Ok(())
-                    }
-                    Err(err) => Err(anyhow::Error::msg(err)),
-                }
+            match owned.remove_http_front(front) {
+                Ok(_) => owned.set_tags(hostname, None),
+                Err(err) => return Err(anyhow::Error::msg(err)),
             }
-            None => bail!("trying to remove front from non existing listener"),
         }
+        Ok(())
     }
 
-    pub fn soft_stop(&mut self) {
+    pub fn soft_stop(&mut self) -> anyhow::Result<()> {
         let listeners: HashMap<_, _> = self.listeners.drain().collect();
+        let mut socket_errors = vec![];
         for (_, l) in listeners.iter() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
+                debug!("Deregistering socket {:?}", sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
-                    error!("error deregistering listen socket({:?}): {:?}", sock, e);
+                    let error = format!("socket {:?}: {:?}", sock, e);
+                    socket_errors.push(error);
                 }
             }
         }
+
+        if !socket_errors.is_empty() {
+            bail!("Error deregistering listen sockets: {:?}", socket_errors);
+        }
+
+        Ok(())
     }
 
     pub fn hard_stop(&mut self) {
@@ -1754,8 +1757,13 @@ impl ProxyConfiguration<Session> for Proxy {
             }
             ProxyRequestOrder::SoftStop => {
                 info!("{} processing soft shutdown", request_id);
-                self.soft_stop();
-                return ProxyResponse::processing(request.id);
+                match self.soft_stop() {
+                    Ok(()) => {
+                        info!("{} shutdown successful", request_id);
+                        return ProxyResponse::processing(request.id);
+                    }
+                    Err(e) => Err(e),
+                }
             }
             ProxyRequestOrder::HardStop => {
                 info!("{} processing hard shutdown", request_id);
@@ -1783,8 +1791,14 @@ impl ProxyConfiguration<Session> for Proxy {
         };
 
         match result {
-            Ok(()) => ProxyResponse::ok(request_id),
-            Err(error_message) => ProxyResponse::error(request_id, format!("{:#}", error_message)),
+            Ok(()) => {
+                info!("{} successful", request_id);
+                ProxyResponse::ok(request_id)
+            }
+            Err(error_message) => {
+                error!("{} unsuccessful: {:#}", request_id, error_message);
+                ProxyResponse::error(request_id, format!("{:#}", error_message))
+            }
         }
     }
 
