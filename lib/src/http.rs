@@ -1547,11 +1547,7 @@ impl Proxy {
                     Err(err) => Err(anyhow::Error::msg(err)),
                 }
             }
-            None => {
-                // let (listener, tokens) = Listener::new(HttpListener::default(), event_loop,
-                //  self.pool.clone(), None, token: Token) -> (Listener,HashSet<Token>
-                bail!("no HTTP listener found for front: {:?}", front)
-            }
+            None => bail!("no HTTP listener found for address: {}", front.address),
         }
     }
 
