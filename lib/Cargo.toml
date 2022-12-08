@@ -45,7 +45,7 @@ rand = "^0.8.5"
 sha2 = "^0.10.6"
 slab = "^0.4.7"
 socket2 = { version = "^0.4.7", features = ["all"] }
-sozu-command-lib = { path = "../command" }
+sozu-command-lib = "^0.14.2"
 regex = "^1.7.0"
 rustls = "^0.20.7"
 rustls-pemfile = "^1.0.1"

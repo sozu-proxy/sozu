@@ -53,8 +53,8 @@ tiny_http = "^0.12.0"
 tempfile = "^3.3.0"
 termion = "^2.0.1"
 
-sozu-command-lib = { path = "../command" }
-sozu-lib = { path = "../lib" }
+sozu-command-lib = "^0.14.2"
+sozu-lib = "^0.14.2"
 
 [target.'cfg(target_os="linux")'.dependencies]
 num_cpus = "^1.13.1"
