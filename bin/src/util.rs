@@ -36,10 +36,10 @@ pub fn disable_close_on_exec(fd: RawFd) -> Result<i32, anyhow::Error> {
     fcntl(fd, FcntlArg::F_SETFD(new_flags)).with_context(|| "could not set file descriptor flags")
 }
 
-pub fn setup_logging(config: &Config) {
+pub fn setup_logging(config: &Config, tag: &str) {
     //FIXME: should have an id for the main too
     logging::setup(
-        "MAIN".to_string(),
+        tag.to_owned(),
         &config.log_level,
         &config.log_target,
         config.log_access_target.as_deref(),

@@ -205,6 +205,33 @@ pub enum SubCmd {
     },
     #[clap(name = "events", about = "receive sozu events")]
     Events,
+    #[clap(
+        name = "acme",
+        next_line_help = false,
+        about = "Set up or renew Let's Encrypt certificates for sozu HTTP reverse proxy"
+    )]
+    Acme {
+        #[clap(long = "config", help = "Sets a custom config file")]
+        config: String,
+        #[clap(long = "domain", help = "the application's domain name")]
+        domain: String,
+        #[clap(long = "email", help = "registration email")]
+        email: String,
+        #[clap(long = "id", help = "cluster identifier (usually an application)")]
+        cluster_id: String,
+        #[clap(long = "old-cert", help = "path of the previous certificate (optional)")]
+        old_certificate_path: Option<String>,
+        #[clap(long = "new-cert", help = "where to write the new certificate")]
+        new_certificate_path: String,
+        #[clap(long = "chain", help = "where to write the certificate chain")]
+        certificate_chain_path: String,
+        #[clap(short = 'k', long = "key-path", help = "where to write the key")]
+        key_path: String,
+        #[clap(long = "http", help = "HTTP frontend address, in the format IP:port")]
+        http_frontend_address: String,
+        #[clap(long = "https", help = "HTTPS frontend address, in the format IP:port")]
+        https_frontend_address: String,
+    },
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
