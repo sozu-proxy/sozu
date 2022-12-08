@@ -2142,10 +2142,10 @@ impl Proxy {
                 .borrow_mut()
                 .add_certificate(&add_certificate)
                 .with_context(|| "Could not add certificate to listener")?,
-            None => {
-                error!("adding certificate to unknown listener");
-                bail!("unsupported message");
-            }
+            None => bail!(
+                "adding certificate to unknown listener {}",
+                add_certificate.address
+            ),
         };
 
         Ok(None)
@@ -2165,10 +2165,10 @@ impl Proxy {
                 .borrow_mut()
                 .remove_certificate(&remove_certificate)
                 .with_context(|| "Could not remove certificate from listener")?,
-            None => {
-                error!("removing certificate from unknown listener");
-                bail!("unsupported message");
-            }
+            None => bail!(
+                "removing certificate from unknown listener {}",
+                remove_certificate.address
+            ),
         };
 
         Ok(None)
@@ -2188,10 +2188,10 @@ impl Proxy {
                 .borrow_mut()
                 .replace_certificate(&replace_certificate)
                 .with_context(|| "Could not replace certificate on listener")?,
-            None => {
-                error!("replacing certificate on unknown listener");
-                bail!("unsupported message");
-            }
+            None => bail!(
+                "replacing certificate on unknown listener {}",
+                replace_certificate.address
+            ),
         };
 
         Ok(None)
