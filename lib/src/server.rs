@@ -1191,18 +1191,18 @@ impl Server {
                     .and_then(|s| s.get_http(&activate.address))
                     .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
 
-                let listener_token = self
+                let activated_token = self
                     .http
                     .borrow_mut()
                     .activate_listener(&activate.address, listener);
-                match listener_token {
-                    Some(token) => {
-                        self.accept(ListenToken(token.0), Protocol::HTTPListen);
+                match activated_token {
+                    Ok(token) => {
+                        self.accept(ListenToken(token.0.clone()), Protocol::HTTPListen);
                         ProxyResponse::ok(req_id)
                     }
-                    None => {
-                        error!("Couldn't activate HTTP listener");
-                        ProxyResponse::error(req_id, "cannot activate HTTP listener")
+                    Err(activate_error) => {
+                        error!("Could not activate HTTP listener: {:#}", activate_error);
+                        ProxyResponse::error(req_id, format!("{:#}", activate_error))
                     }
                 }
             }
@@ -1213,18 +1213,18 @@ impl Server {
                     .and_then(|s| s.get_https(&activate.address))
                     .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
 
-                let listener_token = self
+                let activated_token = self
                     .https
                     .borrow_mut()
                     .activate_listener(&activate.address, listener);
-                match listener_token {
-                    Some(token) => {
-                        self.accept(ListenToken(token.0), Protocol::HTTPSListen);
+                match activated_token {
+                    Ok(token) => {
+                        self.accept(ListenToken(token.0.clone()), Protocol::HTTPSListen);
                         ProxyResponse::ok(req_id)
                     }
-                    None => {
-                        error!("Couldn't activate HTTPS listener");
-                        ProxyResponse::error(req_id, "cannot activate HTTPS listener")
+                    Err(activate_error) => {
+                        error!("Could not activate HTTPS listener: {:#}", activate_error);
+                        ProxyResponse::error(req_id, format!("{:#}", activate_error))
                     }
                 }
             }
@@ -1245,7 +1245,7 @@ impl Server {
                         ProxyResponse::ok(req_id)
                     }
                     None => {
-                        error!("Couldn't activate TCP listener");
+                        error!("Could not activate TCP listener");
                         ProxyResponse::error(req_id, "cannot activate TCP listener")
                     }
                 }
