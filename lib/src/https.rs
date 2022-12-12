@@ -1708,33 +1708,24 @@ impl Listener {
         &mut self,
         registry: &Registry,
         tcp_listener: Option<MioTcpListener>,
-    ) -> Option<Token> {
+    ) -> anyhow::Result<Token> {
         if self.active {
-            return Some(self.token);
+            return Ok(self.token);
         }
 
-        let mut listener = tcp_listener.or_else(|| {
-            server_bind(self.config.address)
-                .map_err(|e| {
-                    error!(
-                        "could not create listener {:?}: {:?}",
-                        self.config.address, e
-                    );
-                })
-                .ok()
-        });
+        let mut listener = match tcp_listener {
+            Some(tcp_listener) => tcp_listener,
+            None => server_bind(self.config.address)
+                .with_context(|| format!("could not create listener {:?}", self.config.address))?,
+        };
 
-        if let Some(ref mut sock) = listener {
-            if let Err(e) = registry.register(sock, self.token, Interest::READABLE) {
-                error!("cannot register listen socket({:?}): {:?}", sock, e);
-            }
-        } else {
-            return None;
-        }
+        registry
+            .register(&mut listener, self.token, Interest::READABLE)
+            .with_context(|| format!("Could not register listener socket {:?}", listener))?;
 
-        self.listener = listener;
+        self.listener = Some(listener);
         self.active = true;
-        Some(self.token)
+        Ok(self.token)
     }
 
     pub fn create_rustls_context(
@@ -2020,11 +2011,17 @@ impl Proxy {
         &mut self,
         addr: &StdSocketAddr,
         tcp_listener: Option<MioTcpListener>,
-    ) -> Option<Token> {
-        self.listeners
+    ) -> anyhow::Result<Token> {
+        let listener = self
+            .listeners
             .values()
             .find(|listener| listener.borrow().address == *addr)
-            .and_then(|listener| listener.borrow_mut().activate(&self.registry, tcp_listener))
+            .with_context(|| format!("No listener found for address {}", addr))?;
+
+        listener
+            .borrow_mut()
+            .activate(&self.registry, tcp_listener)
+            .with_context(|| "Failed to activate listener")
     }
 
     pub fn give_back_listeners(&mut self) -> Vec<(StdSocketAddr, MioTcpListener)> {
@@ -2496,7 +2493,7 @@ pub fn start(
     let mut proxy = Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     let address = config.address;
     if proxy.add_listener(config, token).is_some()
-        && proxy.activate_listener(&address, None).is_some()
+        && proxy.activate_listener(&address, None).is_ok()
     {
         let (scm_server, _scm_client) =
             UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;

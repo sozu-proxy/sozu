@@ -341,6 +341,7 @@ impl SocketHandler for FrontRustls {
     }
 }
 
+// TODO: Do we want to add context here or is it overkill?
 pub fn server_bind(addr: SocketAddr) -> io::Result<TcpListener> {
     let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
 
