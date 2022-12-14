@@ -10,20 +10,33 @@ use crate::{
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
+/// Details of a request sent by the CLI (or other) to the main process
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandRequestOrder {
+    /// an order to forward to workers
     Proxy(Box<ProxyRequestOrder>),
+    /// save Sōzu's parseable state as a file
     SaveState { path: String },
+    /// load a state file
     LoadState { path: String },
+    /// dump the state in JSON
     DumpState,
+    /// list the workers and their status
     ListWorkers,
+    /// list the frontends, filtered by protocol and/or domain
     ListFrontends(FrontendFilters),
+    /// launche a new worker
     LaunchWorker(String),
+    /// upgrade the main process
     UpgradeMain,
+    /// upgrade an existing worker
     UpgradeWorker(u32),
+    /// subscribe to proxy events
     SubscribeEvents,
+    /// reload the configuration from the config file, or a new file
     ReloadConfiguration { path: Option<String> },
+    /// give status of main process and all workers
     Status,
 }
 
@@ -35,6 +48,7 @@ pub struct FrontendFilters {
     pub domain: Option<String>,
 }
 
+/// Sent to the main process by the CLI (or other) through the unix socket
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommandRequest {
     pub id: String,
@@ -64,16 +78,21 @@ pub enum CommandStatus {
     Error,
 }
 
+/// details of a response sent by the main process to the client
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandResponseContent {
+    /// a list of workers, with ids, pids, statuses
     Workers(Vec<WorkerInfo>),
-    /// used by the main process to respond to the CLI
+    /// aggregated metrics of main process and workers
     Metrics(AggregatedMetricsData),
-    /// worker_id -> query_answer
+    /// worker responses to a same query: worker_id -> query_answer
     Query(BTreeMap<String, QueryAnswer>),
+    /// the state of Sōzu: frontends, backends, listeners, etc.
     State(Box<ConfigState>),
+    /// a proxy event
     Event(Event),
+    /// a filtered list of frontend
     FrontendList(ListedFrontends),
     // this is new
     Status(Vec<WorkerInfo>),
@@ -86,6 +105,7 @@ pub struct ListedFrontends {
     pub tcp_frontends: Vec<TcpFrontend>,
 }
 
+/// Responses of the main process to the CLI (or other client)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandResponse {
     pub id: String,
@@ -112,6 +132,7 @@ impl CommandResponse {
     }
 }
 
+/// Runstate of a worker
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RunState {
@@ -134,6 +155,7 @@ pub struct WorkerInfo {
     pub run_state: RunState,
 }
 
+/// a backend event that happened on a proxy
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Event {

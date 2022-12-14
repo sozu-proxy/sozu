@@ -49,8 +49,8 @@ mod worker;
 
 pub use worker::*;
 
-// The CommandServer receives these CommandMessages, either from within Sōzu,
-// or from without, in which case they are ALWAYS of the ClientRequest variant.
+/// The CommandServer receives these CommandMessages, either from within Sōzu,
+/// or from without, in which case they are ALWAYS of the ClientRequest variant.
 enum CommandMessage {
     ClientNew {
         client_id: String,

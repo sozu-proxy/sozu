@@ -12,6 +12,7 @@ use sozu_command_lib::{
     scm_socket::ScmSocket,
 };
 
+/// An instance of Sōzu, as seen from the main process
 pub struct Worker {
     pub id: u32,
     /// for the worker to receive requests and respond to the main process
@@ -23,6 +24,7 @@ pub struct Worker {
     pub queue: VecDeque<ProxyRequest>,
     /// Used to send and receive listeners (socket addresses and file descriptors)
     pub scm_socket: ScmSocket,
+    /// Used to send proxyrequests to the worker loop
     pub sender: Option<futures::channel::mpsc::Sender<ProxyRequest>>,
 }
 
@@ -64,8 +66,8 @@ impl Worker {
         }
     }
 
+    /// send a kill -0 to check on the pid, if it's dead it should be an error
     pub fn the_pid_is_alive(&self) -> bool {
-        // send a kill -0 to check on the pid, if it's dead it should be an error
         kill(Pid::from_raw(self.pid), None).is_ok()
     }
 
