@@ -239,7 +239,7 @@ impl CommandServer {
                         if let CommandRequestOrder::Proxy(order) = request.order {
                             message_counter += 1;
 
-                            if self.state.handle_order(&order).is_ok() {
+                            if self.state.dispatch(&order).is_ok() {
                                 diff_counter += 1;
 
                                 let mut found = false;
@@ -807,7 +807,7 @@ impl CommandServer {
 
         for message in new_config.generate_config_messages() {
             if let CommandRequestOrder::Proxy(order) = message.order {
-                if self.state.handle_order(&order).is_ok() {
+                if self.state.dispatch(&order).is_ok() {
                     diff_counter += 1;
 
                     let mut found = false;
@@ -1218,7 +1218,7 @@ impl CommandServer {
         }
 
         self.state
-            .handle_order(&order)
+            .dispatch(&order)
             .with_context(|| "Could not execute order on the state")?;
 
         if self.config.automatic_state_save

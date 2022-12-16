@@ -540,7 +540,7 @@ impl CommandServer {
         //FIXME: too many loops, this could be cleaner
         for message in self.config.generate_config_messages() {
             if let CommandRequestOrder::Proxy(order) = message.order {
-                if let Err(e) = self.state.handle_order(&order) {
+                if let Err(e) = self.state.dispatch(&order) {
                     error!("Could not execute order on state: {:#}", e);
                 }
 

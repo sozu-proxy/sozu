@@ -76,7 +76,7 @@ impl ConfigState {
         self.https_addresses.push(address)
     }
 
-    pub fn handle_order(&mut self, order: &ProxyRequestOrder) -> anyhow::Result<()> {
+    pub fn dispatch(&mut self, order: &ProxyRequestOrder) -> anyhow::Result<()> {
         match order {
             &ProxyRequestOrder::AddCluster(ref cluster) => self
                 .add_cluster(cluster)
@@ -1175,7 +1175,7 @@ mod tests {
     fn serialize() {
         let mut state: ConfigState = Default::default();
         state
-            .handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+            .dispatch(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
@@ -1186,7 +1186,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+            .dispatch(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
@@ -1197,7 +1197,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1207,7 +1207,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1217,7 +1217,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
@@ -1227,7 +1227,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-3"),
                 address: "192.168.1.3:1027".parse().unwrap(),
@@ -1237,7 +1237,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::RemoveBackend(RemoveBackend {
+            .dispatch(&ProxyRequestOrder::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-3"),
                 address: "192.168.1.3:1027".parse().unwrap(),
@@ -1259,7 +1259,7 @@ mod tests {
     fn diff() {
         let mut state: ConfigState = Default::default();
         state
-            .handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+            .dispatch(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
@@ -1270,7 +1270,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+            .dispatch(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
@@ -1281,7 +1281,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1291,7 +1291,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1301,7 +1301,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
@@ -1311,7 +1311,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddCluster(Cluster {
+            .dispatch(&ProxyRequestOrder::AddCluster(Cluster {
                 cluster_id: String::from("cluster_2"),
                 sticky_session: true,
                 https_redirect: true,
@@ -1324,7 +1324,7 @@ mod tests {
 
         let mut state2: ConfigState = Default::default();
         state2
-            .handle_order(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+            .dispatch(&ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
@@ -1335,7 +1335,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1345,7 +1345,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1355,7 +1355,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1365,7 +1365,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .handle_order(&ProxyRequestOrder::AddCluster(Cluster {
+            .dispatch(&ProxyRequestOrder::AddCluster(Cluster {
                 cluster_id: String::from("cluster_3"),
                 sticky_session: false,
                 https_redirect: false,
@@ -1423,7 +1423,7 @@ mod tests {
         let hash2 = state2.hash_state();
         let mut state3 = state.clone();
         state3
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1490,16 +1490,16 @@ mod tests {
         let add_https_front_order_cluster2 =
             ProxyRequestOrder::AddHttpsFrontend(https_front_cluster2);
         config
-            .handle_order(&add_http_front_order_cluster1)
+            .dispatch(&add_http_front_order_cluster1)
             .expect("Could not execute order");
         config
-            .handle_order(&add_http_front_order_cluster2)
+            .dispatch(&add_http_front_order_cluster2)
             .expect("Could not execute order");
         config
-            .handle_order(&add_https_front_order_cluster1)
+            .dispatch(&add_https_front_order_cluster1)
             .expect("Could not execute order");
         config
-            .handle_order(&add_https_front_order_cluster2)
+            .dispatch(&add_https_front_order_cluster2)
             .expect("Could not execute order");
 
         let mut cluster1_cluster2: HashSet<ClusterId> = HashSet::new();
@@ -1540,7 +1540,7 @@ mod tests {
     fn duplicate_backends() {
         let mut state: ConfigState = Default::default();
         state
-            .handle_order(&ProxyRequestOrder::AddBackend(Backend {
+            .dispatch(&ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1560,7 +1560,7 @@ mod tests {
         };
 
         state
-            .handle_order(&ProxyRequestOrder::AddBackend(b.clone()))
+            .dispatch(&ProxyRequestOrder::AddBackend(b.clone()))
             .expect("Could not execute order");
 
         assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
@@ -1570,7 +1570,7 @@ mod tests {
     fn listener_diff() {
         let mut state: ConfigState = Default::default();
         state
-            .handle_order(&ProxyRequestOrder::AddTcpListener(TcpListener {
+            .dispatch(&ProxyRequestOrder::AddTcpListener(TcpListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1580,14 +1580,14 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
+            .dispatch(&ProxyRequestOrder::ActivateListener(ActivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
                 from_scm: false,
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddHttpListener(HttpListener {
+            .dispatch(&ProxyRequestOrder::AddHttpListener(HttpListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1601,7 +1601,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
+            .dispatch(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1623,7 +1623,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
+            .dispatch(&ProxyRequestOrder::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
                 from_scm: false,
@@ -1632,7 +1632,7 @@ mod tests {
 
         let mut state2: ConfigState = Default::default();
         state2
-            .handle_order(&ProxyRequestOrder::AddTcpListener(TcpListener {
+            .dispatch(&ProxyRequestOrder::AddTcpListener(TcpListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: true,
@@ -1642,7 +1642,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .handle_order(&ProxyRequestOrder::AddHttpListener(HttpListener {
+            .dispatch(&ProxyRequestOrder::AddHttpListener(HttpListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1656,14 +1656,14 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
+            .dispatch(&ProxyRequestOrder::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 proxy: ListenerType::HTTP,
                 from_scm: false,
             }))
             .expect("Could not execute order");
         state2
-            .handle_order(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
+            .dispatch(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1685,7 +1685,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .handle_order(&ProxyRequestOrder::ActivateListener(ActivateListener {
+            .dispatch(&ProxyRequestOrder::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
                 from_scm: false,

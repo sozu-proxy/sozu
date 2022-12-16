@@ -979,7 +979,7 @@ impl Server {
     }
 
     pub fn notify_proxys(&mut self, request: ProxyRequest) {
-        if let Err(e) = self.config_state.handle_order(&request.order) {
+        if let Err(e) = self.config_state.dispatch(&request.order) {
             error!("Could not execute order on config state: {:#}", e);
         }
 
