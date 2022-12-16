@@ -164,7 +164,6 @@ impl std::fmt::Display for Success {
                 write!(f, "Successfully set the metrics to {:?}", metrics_cfg)
             }
             Self::MasterStop => write!(f, "stopping main process"),
-            // Self::Metrics => write!(f, "Successfully fetched the metrics"),
             Self::NotifiedClient(id) => {
                 write!(f, "Successfully notified client {} of the advancement", id)
             }
@@ -245,6 +244,7 @@ pub struct CommandServer {
     config: Config,
     /// id of the next worker to be spawned
     next_worker_id: u32,
+    /// the path to the sozu executable, used to spawn workers
     executable_path: String,
     /// caching the number of backends instead of going through the whole state.backends hashmap
     backends_count: usize,

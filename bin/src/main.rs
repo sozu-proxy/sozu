@@ -29,7 +29,7 @@ mod cli;
 mod command;
 /// The command line logic
 mod ctl;
-/// Forking & restarting the main process
+/// Forking & restarting the main process using a more recent executable of Sōzu
 mod upgrade;
 /// Some unix helper functions
 mod util;
