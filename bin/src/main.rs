@@ -29,7 +29,7 @@ mod cli;
 mod command;
 /// The command line logic
 mod ctl;
-/// Forking & restarting the main process
+/// Forking & restarting the main process using a more recent executable of Sōzu
 mod upgrade;
 /// Some unix helper functions
 mod util;
@@ -134,7 +134,10 @@ fn start(args: &cli::Args) -> Result<(), anyhow::Error> {
 
     update_process_limits(&config)?;
 
-    let workers = init_workers(&config)?;
+    let executable_path =
+        unsafe { get_executable_path().with_context(|| "Could not get executable path")? };
+    let workers =
+        start_workers(executable_path, &config).with_context(|| "Failed at spawning workers")?;
 
     if config.handle_process_affinity {
         set_workers_affinity(&workers);
@@ -146,11 +149,6 @@ fn start(args: &cli::Args) -> Result<(), anyhow::Error> {
         .with_context(|| "could not start Sozu")?;
 
     Ok(())
-}
-
-fn init_workers(config: &Config) -> Result<Vec<Worker>, anyhow::Error> {
-    let path = unsafe { get_executable_path().with_context(|| "Could not get executable path")? };
-    start_workers(path, config).with_context(|| "Failed at spawning workers")
 }
 
 pub fn get_config_file_path(args: &cli::Args) -> Result<&str, anyhow::Error> {

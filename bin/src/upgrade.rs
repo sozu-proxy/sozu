@@ -41,7 +41,6 @@ impl SerializedWorker {
             pid: worker.pid,
             id: worker.id,
             run_state: worker.run_state,
-            //token:      worker.token.clone().map(|Token(t)| t),
             queue: worker.queue.clone().into(),
             scm: worker.scm_socket.raw_fd(),
         }
@@ -53,15 +52,19 @@ impl SerializedWorker {
 pub struct UpgradeData {
     /// file descriptor of the unix command socket
     pub command_socket_fd: i32,
-    //clients: ????
     pub config: Config,
     /// JSON serialized workers
     pub workers: Vec<SerializedWorker>,
     pub state: ConfigState,
     pub next_id: u32,
-    //pub token_count: usize,
 }
 
+/// unix-forks the main process
+///
+/// - Parent: meant to disappear after the child confirms it's alive
+/// - Child: calls Sōzu's executable path with `sozu main [...]`
+///
+/// returns the pid of the new main, and a channel to get confirmation from the new main
 pub fn fork_main_into_new_main(
     executable_path: String,
     upgrade_data: UpgradeData,
@@ -130,7 +133,8 @@ pub fn fork_main_into_new_main(
     }
 }
 
-/// starts new main process with upgrade data, notifies the old main process
+/// Called by the child of a main process fork. 
+/// Starts new main process with upgrade data, notifies the old main process
 pub fn begin_new_main_process(
     new_to_old_channel_fd: i32,
     upgrade_file_fd: i32,

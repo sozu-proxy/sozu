@@ -42,6 +42,7 @@ use sozu_command_lib::{
 
 use crate::{command::Worker, logging, util};
 
+/// Called once at the beginning of the main process, this forks main into as many workers
 pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result<Vec<Worker>> {
     let state = ConfigState::new();
     let mut workers = Vec::new();
@@ -195,6 +196,12 @@ pub fn begin_worker_process(
     Ok(())
 }
 
+/// unix-forks the main process
+/// 
+/// - Parent: sends config and listeners to the new worker
+/// - Child: calls the sozu executable path like so: `sozu worker --id <worker_id> [...]`
+/// 
+/// returns the child process pid, and channels to talk to it.
 pub fn fork_main_into_worker(
     worker_id: &str,
     config: &Config,
@@ -238,8 +245,8 @@ pub fn fork_main_into_worker(
     info!("{} launching worker", worker_id);
     debug!("executable path is {}", executable_path);
     match unsafe { fork() } {
-        Ok(ForkResult::Parent { child }) => {
-            info!("{} worker launched: {}", worker_id, child);
+        Ok(ForkResult::Parent { child: worker_pid }) => {
+            info!("{} worker launched: {}", worker_id, worker_pid);
             main_to_worker_channel
                 .write_message(config)
                 .with_context(|| "Could not send config to the new worker using the channel")?;
@@ -257,7 +264,7 @@ pub fn fork_main_into_worker(
             util::disable_close_on_exec(main_to_worker_scm.fd)?;
 
             Ok((
-                child.into(),
+                worker_pid.into(),
                 main_to_worker_channel.into(),
                 main_to_worker_scm,
             ))

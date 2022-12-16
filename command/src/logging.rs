@@ -25,7 +25,9 @@ pub struct Logger {
     pub directives: Vec<LogDirective>,
     pub backend: LoggerBackend,
     pub access_backend: Option<LoggerBackend>,
+    /// is displayed in each log, for instance "MAIN" or worker_id
     pub tag: String,
+    /// the pid of the current process (main or worker)
     pub pid: i32,
     pub initialized: bool,
 }
