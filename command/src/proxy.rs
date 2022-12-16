@@ -196,6 +196,7 @@ impl fmt::Display for ProxyRequest {
     }
 }
 
+/// An order sent by the main process to the workers
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyRequestOrder {
@@ -606,6 +607,7 @@ pub struct DeactivateListener {
     pub to_scm: bool,
 }
 
+/// details of an HTTP listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpListener {
     pub address: SocketAddr,
@@ -615,7 +617,7 @@ pub struct HttpListener {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_false")]
     pub expect_proxy: bool,
-    // TODO: explain what this does
+    /// identifies sticky sessions
     #[serde(default = "default_sticky_name")]
     pub sticky_name: String,
     /// client inactive time
@@ -694,6 +696,7 @@ impl error::Error for ParseErrorTlsVersion {
     }
 }
 
+/// details of an HTTPS listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpsListener {
     pub address: SocketAddr,
@@ -758,6 +761,7 @@ impl Default for HttpsListener {
     }
 }
 
+/// details of an TCP listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TcpListener {
     pub address: SocketAddr,
@@ -778,6 +782,7 @@ pub enum MetricsConfiguration {
     Clear,
 }
 
+/// Details of a query for information, sent to a worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Query {
@@ -818,6 +823,7 @@ pub struct QueryMetricsOptions {
     pub metric_names: Vec<String>,
 }
 
+/// details of an query answer, sent by a worker
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryAnswer {
@@ -839,7 +845,7 @@ pub struct QueryAnswerCluster {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryAnswerCertificate {
-    /// returns a list of domain -> fingerprint
+    /// returns a list of certificates: domain -> fingerprint
     All(HashMap<SocketAddr, BTreeMap<String, Vec<u8>>>),
     /// returns a fingerprint
     Domain(HashMap<SocketAddr, Option<(String, Vec<u8>)>>),
@@ -859,6 +865,7 @@ pub enum QueryAnswerMetrics {
 }
 
 impl ProxyRequestOrder {
+    /// determine to which of the three proxies (HTTP, HTTPS, TCP) a request is destined
     pub fn get_destinations(&self) -> ProxyDestinations {
         let mut proxy_destination = ProxyDestinations {
             to_http_proxy: false,

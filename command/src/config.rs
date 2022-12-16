@@ -22,11 +22,10 @@ use crate::{
     },
 };
 
-// [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS
-// provider as it support only strongly secure ones.
-//
-// See:
-// - https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html
+/// [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS
+/// provider as it support only strongly secure ones.
+///
+/// See the [documentation](https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html)
 pub const DEFAULT_RUSTLS_CIPHER_LIST: [&'static str; 9] = [
     // TLS 1.3 cipher suites
     "TLS13_AES_256_GCM_SHA384",
@@ -62,9 +61,8 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&'static str; 9] = [
 
 pub const DEFAULT_GROUPS_LIST: [&'static str; 4] = ["P-521", "P-384", "P-256", "x25519"];
 
-// -------------------------------------------------------------------------------------------------
-// Listener structure
-
+// todo: refactor this with a builder pattern for cleanliness
+/// an HTTP, HTTPS or TCP listener as ordered by a client
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
@@ -863,6 +861,7 @@ impl FileConfig {
         }
     }
 
+    // TODO: split into severa functions
     pub fn into(self, config_path: &str) -> anyhow::Result<Config> {
         let mut clusters = HashMap::new();
         let mut http_listeners = Vec::new();

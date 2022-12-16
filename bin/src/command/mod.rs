@@ -49,8 +49,8 @@ mod worker;
 
 pub use worker::*;
 
-// The CommandServer receives these CommandMessages, either from within Sōzu,
-// or from without, in which case they are ALWAYS of the ClientRequest variant.
+/// The CommandServer receives these CommandMessages, either from within Sōzu,
+/// or from without, in which case they are ALWAYS of the ClientRequest variant.
 enum CommandMessage {
     ClientNew {
         client_id: String,
@@ -540,7 +540,7 @@ impl CommandServer {
         //FIXME: too many loops, this could be cleaner
         for message in self.config.generate_config_messages() {
             if let CommandRequestOrder::Proxy(order) = message.order {
-                if let Err(e) = self.state.handle_order(&order) {
+                if let Err(e) = self.state.dispatch(&order) {
                     error!("Could not execute order on state: {:#}", e);
                 }
 
