@@ -18,6 +18,7 @@ use std::{
     process::Command,
 };
 
+use std::env;
 use anyhow::{bail, Context};
 use libc::{self, pid_t};
 #[cfg(target_os = "macos")]
@@ -322,30 +323,11 @@ extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-pub unsafe fn get_executable_path() -> String {
-    let capacity = PATH_MAX as usize;
-    let mut temp: Vec<u8> = Vec::with_capacity(capacity);
-    temp.extend(repeat(0).take(capacity));
-    let pathbuf = CString::from_vec_unchecked(temp);
-    let ptr = pathbuf.into_raw();
-
-    let mut size = capacity as u32;
-    if _NSGetExecutablePath(ptr, &mut size) == 0 {
-        let mut temp2: Vec<u8> = Vec::with_capacity(capacity);
-        temp2.extend(repeat(0).take(capacity));
-        let pathbuf2 = CString::from_vec_unchecked(temp2);
-        let ptr2 = pathbuf2.into_raw();
-
-        if libc::realpath(ptr, ptr2) != null_mut() {
-            let path = CString::from_raw(ptr2);
-            path.to_str()
-                .expect("failed to convert CString to String")
-                .to_string()
-        } else {
-            panic!();
-        }
-    } else {
-        panic!("buffer too small");
+pub unsafe fn get_executable_path() -> anyhow::Result<String> {
+    let path = env::current_exe()?;
+    match path.into_os_string().into_string() {
+        Ok(exe_path) => Ok(exe_path),
+        Err(_) => bail!("Failed to convert PathBuf to String"),
     }
 }
 
