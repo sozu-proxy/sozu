@@ -324,11 +324,8 @@ extern "C" {
 
 #[cfg(target_os = "macos")]
 pub unsafe fn get_executable_path() -> anyhow::Result<String> {
-    let path = env::current_exe()?;
-    match path.into_os_string().into_string() {
-        Ok(exe_path) => Ok(exe_path),
-        Err(_) => bail!("Failed to convert PathBuf to String"),
-    }
+    let path = env::current_exe().with_context(|| "failed to retrieve current executable path")?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[cfg(target_os = "freebsd")]
