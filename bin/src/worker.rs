@@ -323,7 +323,7 @@ extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-pub unsafe fn get_executable_path() -> anyhow::Result<String> {
+pub fn get_executable_path() -> anyhow::Result<String> {
     let path = env::current_exe().with_context(|| "failed to retrieve current executable path")?;
     Ok(path.to_string_lossy().to_string())
 }
