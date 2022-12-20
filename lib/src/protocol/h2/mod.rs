@@ -10,7 +10,7 @@ use crate::{
     socket::{SocketHandler, SocketResult},
     sozu_command::buffer::fixed::Buffer,
     sozu_command::ready::Ready,
-    {Protocol, Readiness, SessionMetrics, SessionResult},
+    {Protocol, Readiness, SessionMetrics, StateResult},
 };
 
 mod parser;
@@ -80,13 +80,6 @@ impl<Front: SocketHandler> Http2<Front> {
         session
     }
 
-    fn tokens(&self) -> Option<(Token, Token)> {
-        if let Some(back) = self.backend_token {
-            return Some((self.frontend_token, back));
-        }
-        None
-    }
-
     pub fn front_socket(&self) -> &TcpStream {
         self.frontend.socket.socket_ref()
     }
@@ -111,8 +104,6 @@ impl<Front: SocketHandler> Http2<Front> {
         self.backend_token
     }
 
-    pub fn close(&mut self) {}
-
     pub fn log_context(&self) -> String {
         if let Some(ref cluster_id) = self.cluster_id {
             format!("{}\t{}\t", self.request_id, cluster_id)
@@ -133,13 +124,13 @@ impl<Front: SocketHandler> Http2<Front> {
         &mut self.back_readiness
     }
 
-    pub fn front_hup(&mut self) -> SessionResult {
-        SessionResult::CloseSession
+    pub fn front_hup(&mut self) -> StateResult {
+        StateResult::CloseSession
     }
 
-    pub fn back_hup(&mut self) -> SessionResult {
+    pub fn back_hup(&mut self) -> StateResult {
         error!("todo[{}:{}]: back_hup", file!(), line!());
-        SessionResult::CloseSession
+        StateResult::CloseSession
         /*
         if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
           if self.back_readiness.event.is_readable() {
@@ -160,7 +151,7 @@ impl<Front: SocketHandler> Http2<Front> {
     }
 
     // Read content from the session
-    pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    pub fn readable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         trace!("http2 readable");
         error!("todo[{}:{}]: readable", file!(), line!());
 
@@ -187,7 +178,7 @@ impl<Front: SocketHandler> Http2<Front> {
                 self.frontend.readiness.interest.remove(Ready::readable());
                 self.back_readiness.interest.insert(Ready::writable());
             }
-            return SessionResult::Continue;
+            return StateResult::Continue;
         }
 
         let res = self.frontend.read(metrics);
@@ -200,10 +191,10 @@ impl<Front: SocketHandler> Http2<Front> {
                     "front socket error, closing the connection. Readiness: {:?} -> {:?}",
                     front_readiness, back_readiness
                 );
-                return SessionResult::CloseSession;
+                return StateResult::CloseSession;
             }
             SocketResult::Closed => {
-                return SessionResult::CloseSession;
+                return StateResult::CloseSession;
             }
             SocketResult::WouldBlock => {}
             SocketResult::Continue => {}
@@ -212,7 +203,7 @@ impl<Front: SocketHandler> Http2<Front> {
         self.readable_parse(metrics)
     }
 
-    pub fn readable_parse(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    pub fn readable_parse(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         let mut state = self.state.take().unwrap();
         let (sz, cont) = { state.parse_and_handle(self.frontend.read_buffer.data()) };
         self.frontend.read_buffer.consume(sz);
@@ -220,9 +211,9 @@ impl<Front: SocketHandler> Http2<Front> {
         self.state = Some(state);
 
         match cont {
-            state::FrameResult::Close => SessionResult::CloseSession,
-            state::FrameResult::Continue => SessionResult::Continue,
-            state::FrameResult::ConnectBackend(id) => SessionResult::ConnectBackend,
+            state::FrameResult::Close => StateResult::CloseSession,
+            state::FrameResult::Continue => StateResult::Continue,
+            state::FrameResult::ConnectBackend(id) => StateResult::ConnectBackend,
         }
 
         /*let is_initial = unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial);
@@ -247,7 +238,7 @@ impl<Front: SocketHandler> Http2<Front> {
     }
 
     // Forward content to session
-    pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    pub fn writable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         trace!("http2 writable");
         error!("todo[{}:{}]: writable", file!(), line!());
 
@@ -262,7 +253,7 @@ impl<Front: SocketHandler> Http2<Front> {
             Err(e) => {
                 self.state = Some(state);
                 error!("error serializing to front write buffer: {:?}", e);
-                return SessionResult::CloseSession;
+                return StateResult::CloseSession;
             }
         }
 
@@ -280,21 +271,21 @@ impl<Front: SocketHandler> Http2<Front> {
                 self.frontend.readiness.reset();
                 self.back_readiness.reset();
                 self.state = Some(state);
-                return SessionResult::CloseSession;
+                return StateResult::CloseSession;
             }
             SocketResult::WouldBlock => {}
             SocketResult::Continue => {}
         }
 
         self.state = Some(state);
-        SessionResult::Continue
+        StateResult::Continue
     }
 
     // Forward content to cluster
-    pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         trace!("http2 back_writable");
         error!("todo[{}:{}]: back_writable", file!(), line!());
-        SessionResult::CloseSession
+        StateResult::CloseSession
         /*
         if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
           self.frontend.readiness.interest.insert(Ready::readable());
@@ -350,10 +341,10 @@ impl<Front: SocketHandler> Http2<Front> {
     }
 
     // Read content from cluster
-    pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         trace!("http2 back_readable");
         error!("todo[{}:{}]: back_readable", file!(), line!());
-        SessionResult::CloseSession
+        StateResult::CloseSession
         /*
         if self.back_buf.buffer.available_space() == 0 {
           self.back_readiness.interest.remove(Ready::readable());

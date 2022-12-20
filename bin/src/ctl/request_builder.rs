@@ -10,7 +10,8 @@ use sozu_command_lib::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, DeactivateListener, HttpFrontend, ListenerType, LoadBalancingParams,
         MetricsConfiguration, PathRule, ProxyRequestOrder, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RulePosition, TcpFrontend, TcpListener, TlsVersion,
+        RemoveListener, ReplaceCertificate, RulePosition, TcpFrontend, TcpListenerConfig,
+        TlsVersion,
     },
 };
 
@@ -406,7 +407,7 @@ impl CommandManager {
                 public_address,
                 expect_proxy,
             } => self.order_command(CommandRequestOrder::Proxy(Box::new(
-                ProxyRequestOrder::AddTcpListener(TcpListener {
+                ProxyRequestOrder::AddTcpListener(TcpListenerConfig {
                     address,
                     public_address,
                     expect_proxy,

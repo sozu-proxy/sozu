@@ -219,9 +219,9 @@ pub enum ProxyRequestOrder {
     AddBackend(Backend),
     RemoveBackend(RemoveBackend),
 
-    AddHttpListener(HttpListener),
-    AddHttpsListener(HttpsListener),
-    AddTcpListener(TcpListener),
+    AddHttpListener(HttpListenerConfig),
+    AddHttpsListener(HttpsListenerConfig),
+    AddTcpListener(TcpListenerConfig),
 
     RemoveListener(RemoveListener),
 
@@ -611,7 +611,7 @@ pub struct DeactivateListener {
 
 /// details of an HTTP listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HttpListener {
+pub struct HttpListenerConfig {
     pub address: SocketAddr,
     pub public_address: Option<SocketAddr>,
     pub answer_404: String,
@@ -632,9 +632,10 @@ pub struct HttpListener {
     pub request_timeout: u32,
 }
 
-impl Default for HttpListener {
-    fn default() -> HttpListener {
-        HttpListener {
+// TODO: set the default values elsewhere, see #873
+impl Default for HttpListenerConfig {
+    fn default() -> HttpListenerConfig {
+        HttpListenerConfig {
             address:           "127.0.0.1:8080".parse().expect("could not parse address"),
               public_address:  None,
               answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
@@ -700,7 +701,7 @@ impl error::Error for ParseErrorTlsVersion {
 
 /// details of an HTTPS listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HttpsListener {
+pub struct HttpsListenerConfig {
     pub address: SocketAddr,
     pub public_address: Option<SocketAddr>,
     pub answer_404: String,
@@ -730,9 +731,9 @@ pub struct HttpsListener {
     pub request_timeout: u32,
 }
 
-impl Default for HttpsListener {
-    fn default() -> HttpsListener {
-        HttpsListener {
+impl Default for HttpsListenerConfig {
+    fn default() -> HttpsListenerConfig {
+        HttpsListenerConfig {
       address:         "127.0.0.1:8443".parse().expect("could not parse address"),
       public_address:  None,
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
@@ -765,7 +766,7 @@ impl Default for HttpsListener {
 
 /// details of an TCP listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TcpListener {
+pub struct TcpListenerConfig {
     pub address: SocketAddr,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]

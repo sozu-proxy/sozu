@@ -1,8 +1,4 @@
-use std::{
-    cell::RefCell,
-    io::{Read, Write},
-    rc::Rc,
-};
+use std::{cell::RefCell, io::Write, rc::Rc};
 
 use mio::net::TcpStream;
 use mio::*;
@@ -11,29 +7,29 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::{pipe::Pipe, ProtocolResult},
+    protocol::{pipe::Pipe, SessionResult},
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
-    tcp::Listener,
-    Protocol, Readiness, SessionMetrics, SessionResult,
+    tcp::TcpListener,
+    Protocol, Readiness, SessionMetrics, StateResult,
 };
 
 use super::parser::parse_v2_header;
 
 pub struct RelayProxyProtocol<Front: SocketHandler> {
-    pub header_size: Option<usize>,
-    pub frontend: Front,
-    pub request_id: Ulid,
-    pub backend: Option<TcpStream>,
-    pub frontend_token: Token,
-    pub backend_token: Option<Token>,
-    pub front_buf: Checkout,
-    pub front_readiness: Readiness,
-    pub back_readiness: Readiness,
     cursor_header: usize,
+    pub backend_readiness: Readiness,
+    pub backend_token: Option<Token>,
+    pub backend: Option<TcpStream>,
+    pub frontend_buffer: Checkout,
+    pub frontend_readiness: Readiness,
+    pub frontend_token: Token,
+    pub frontend: Front,
+    pub header_size: Option<usize>,
+    pub request_id: Ulid,
 }
 
-impl<Front: SocketHandler + Read> RelayProxyProtocol<Front> {
+impl<Front: SocketHandler> RelayProxyProtocol<Front> {
     pub fn new(
         frontend: Front,
         frontend_token: Token,
@@ -42,34 +38,34 @@ impl<Front: SocketHandler + Read> RelayProxyProtocol<Front> {
         front_buf: Checkout,
     ) -> Self {
         RelayProxyProtocol {
-            header_size: None,
-            frontend,
-            request_id,
-            backend,
-            frontend_token,
-            backend_token: None,
-            front_buf,
-            front_readiness: Readiness {
-                interest: Ready::readable() | Ready::hup() | Ready::error(),
-                event: Ready::empty(),
-            },
-            back_readiness: Readiness {
+            backend_readiness: Readiness {
                 interest: Ready::hup() | Ready::error(),
                 event: Ready::empty(),
             },
+            backend_token: None,
+            backend,
             cursor_header: 0,
+            frontend_buffer: front_buf,
+            frontend_readiness: Readiness {
+                interest: Ready::readable() | Ready::hup() | Ready::error(),
+                event: Ready::empty(),
+            },
+            frontend_token,
+            frontend,
+            header_size: None,
+            request_id,
         }
     }
 
-    pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        let (sz, res) = self.frontend.socket_read(self.front_buf.space());
+    pub fn readable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+        let (sz, res) = self.frontend.socket_read(self.frontend_buffer.space());
         debug!(
             "FRONT proxy protocol [{:?}]: read {} bytes and res={:?}",
             self.frontend_token, sz, res
         );
 
         if sz > 0 {
-            self.front_buf.fill(sz);
+            self.frontend_buffer.fill(sz);
 
             count!("bytes_in", sz as i64);
             metrics.bin += sz;
@@ -81,65 +77,62 @@ impl<Front: SocketHandler + Read> RelayProxyProtocol<Front> {
                 );
                 metrics.service_stop();
                 incr!("proxy_protocol.errors");
-                self.front_readiness.reset();
-                self.back_readiness.reset();
-                return SessionResult::CloseSession;
+                self.frontend_readiness.reset();
+                self.backend_readiness.reset();
+                return StateResult::CloseSession;
             }
 
             if res == SocketResult::WouldBlock {
-                self.front_readiness.event.remove(Ready::readable());
+                self.frontend_readiness.event.remove(Ready::readable());
             }
 
-            let read_sz = match parse_v2_header(self.front_buf.data()) {
+            let read_sz = match parse_v2_header(self.frontend_buffer.data()) {
                 Ok((rest, _)) => {
-                    self.front_readiness.interest.remove(Ready::readable());
-                    self.back_readiness.interest.insert(Ready::writable());
-                    self.front_buf.data().offset(rest)
+                    self.frontend_readiness.interest.remove(Ready::readable());
+                    self.backend_readiness.interest.insert(Ready::writable());
+                    self.frontend_buffer.data().offset(rest)
                 }
-                Err(Err::Incomplete(_)) => return SessionResult::Continue,
+                Err(Err::Incomplete(_)) => return StateResult::Continue,
                 Err(e) => {
                     error!("[{:?}] error parsing the proxy protocol header(error={:?}), closing the connection",
             self.frontend_token, e);
-                    return SessionResult::CloseSession;
+                    return StateResult::CloseSession;
                 }
             };
 
             self.header_size = Some(read_sz);
-            self.front_buf.consume(sz);
-            return SessionResult::Continue;
+            self.frontend_buffer.consume(sz);
+            return StateResult::Continue;
         }
 
-        SessionResult::Continue
+        StateResult::Continue
     }
 
     // The header is send immediately at once upon the connection is establish
     // and prepended before any data.
-    pub fn back_writable(
-        &mut self,
-        metrics: &mut SessionMetrics,
-    ) -> (ProtocolResult, SessionResult) {
+    pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> (SessionResult, StateResult) {
         debug!("Writing proxy protocol header");
 
         if let Some(ref mut socket) = self.backend {
             if let Some(ref header_size) = self.header_size {
                 loop {
-                    match socket.write(self.front_buf.data()) {
+                    match socket.write(self.frontend_buffer.data()) {
                         Ok(sz) => {
                             self.cursor_header += sz;
 
                             metrics.backend_bout += sz;
-                            self.front_buf.consume(sz);
+                            self.frontend_buffer.consume(sz);
 
                             if self.cursor_header >= *header_size {
                                 info!("Proxy protocol sent, upgrading");
-                                return (ProtocolResult::Upgrade, SessionResult::Continue);
+                                return (SessionResult::Upgrade, StateResult::Continue);
                             }
                         }
                         Err(e) => {
                             metrics.service_stop();
                             incr!("proxy_protocol.errors");
-                            self.front_readiness.reset();
-                            self.back_readiness.reset();
+                            self.frontend_readiness.reset();
+                            self.backend_readiness.reset();
                             debug!("PROXY PROTOCOL {}", e);
                             break;
                         }
@@ -147,7 +140,7 @@ impl<Front: SocketHandler + Read> RelayProxyProtocol<Front> {
                 }
             }
         }
-        (ProtocolResult::Continue, SessionResult::Continue)
+        (SessionResult::Continue, StateResult::Continue)
     }
 
     pub fn front_socket(&self) -> &TcpStream {
@@ -179,38 +172,41 @@ impl<Front: SocketHandler + Read> RelayProxyProtocol<Front> {
     }
 
     pub fn front_readiness(&mut self) -> &mut Readiness {
-        &mut self.front_readiness
+        &mut self.frontend_readiness
     }
 
     pub fn back_readiness(&mut self) -> &mut Readiness {
-        &mut self.back_readiness
+        &mut self.backend_readiness
     }
 
     pub fn into_pipe(
         mut self,
         back_buf: Checkout,
-        listener: Rc<RefCell<Listener>>,
-    ) -> Pipe<Front, Listener> {
+        listener: Rc<RefCell<TcpListener>>,
+    ) -> Pipe<Front, TcpListener> {
         let backend_socket = self.backend.take().unwrap();
         let addr = self.front_socket().peer_addr().ok();
 
         let mut pipe = Pipe::new(
-            self.frontend.take(0).into_inner(),
-            self.frontend_token,
-            self.request_id,
-            None,
-            None,
+            back_buf,
             None,
             Some(backend_socket),
-            self.front_buf,
-            back_buf,
-            addr,
-            Protocol::TCP,
+            None,
+            None,
+            None,
+            None,
+            self.frontend_buffer,
+            self.frontend_token,
+            self.frontend,
             listener,
+            Protocol::TCP,
+            self.request_id,
+            addr,
+            None,
         );
 
-        pipe.front_readiness.event = self.front_readiness.event;
-        pipe.back_readiness.event = self.back_readiness.event;
+        pipe.frontend_readiness.event = self.frontend_readiness.event;
+        pipe.backend_readiness.event = self.backend_readiness.event;
 
         if let Some(back_token) = self.backend_token {
             pipe.set_back_token(back_token);

@@ -1,4 +1,4 @@
-use std::{cell::RefCell, io::Read, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
 use mio::{net::TcpStream, *};
 use nom::{Err, HexDisplay};
@@ -6,12 +6,13 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::pipe::Pipe,
-    protocol::ProtocolResult,
+    protocol::{http::LogContext, pipe::Pipe},
+    protocol::{SessionResult, SessionState},
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
-    tcp::Listener,
-    Protocol, Readiness, SessionMetrics, SessionResult,
+    tcp::TcpListener,
+    timer::TimeoutContainer,
+    Protocol, Readiness, SessionMetrics, StateResult,
 };
 
 use super::{header::ProxyAddr, parser::parse_v2_header};
@@ -23,35 +24,43 @@ pub enum HeaderLen {
     Unix,
 }
 
+// TODO: should have a backend
 pub struct ExpectProxyProtocol<Front: SocketHandler> {
-    pub frontend: Front,
-    pub frontend_token: Token,
-    pub request_id: Ulid,
-    pub buf: [u8; 232],
-    pub index: usize,
-    pub header_len: HeaderLen,
-    pub readiness: Readiness,
     pub addresses: Option<ProxyAddr>,
+    pub container_frontend_timeout: TimeoutContainer,
+    frontend_buffer: [u8; 232],
+    pub frontend_readiness: Readiness,
+    pub frontend_token: Token,
+    pub frontend: Front,
+    header_len: HeaderLen,
+    index: usize,
+    pub request_id: Ulid,
 }
 
-impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
-    pub fn new(frontend: Front, frontend_token: Token, request_id: Ulid) -> Self {
+impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
+    pub fn new(
+        container_frontend_timeout: TimeoutContainer,
+        frontend: Front,
+        frontend_token: Token,
+        request_id: Ulid,
+    ) -> Self {
         ExpectProxyProtocol {
-            frontend,
-            frontend_token,
-            request_id,
-            buf: [0; 232],
-            index: 0,
-            header_len: HeaderLen::V4,
-            readiness: Readiness {
+            addresses: None,
+            container_frontend_timeout,
+            frontend_buffer: [0; 232],
+            frontend_readiness: Readiness {
                 interest: Ready::readable(),
                 event: Ready::empty(),
             },
-            addresses: None,
+            frontend_token,
+            frontend,
+            header_len: HeaderLen::V4,
+            index: 0,
+            request_id,
         }
     }
 
-    pub fn readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, SessionResult) {
+    pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         let total_len = match self.header_len {
             HeaderLen::V4 => 28,
             HeaderLen::V6 => 52,
@@ -60,7 +69,7 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
 
         let (sz, socket_result) = self
             .frontend
-            .socket_read(&mut self.buf[self.index..total_len]);
+            .socket_read(&mut self.frontend_buffer[self.index..total_len]);
         trace!(
             "FRONT proxy protocol [{:?}]: read {} bytes and res={:?}, index = {}, total_len = {}",
             self.frontend_token,
@@ -76,11 +85,11 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
             count!("bytes_in", sz as i64);
             metrics.bin += sz;
 
-            if self.index == self.buf.len() {
-                self.readiness.interest.remove(Ready::readable());
+            if self.index == self.frontend_buffer.len() {
+                self.frontend_readiness.interest.remove(Ready::readable());
             }
         } else {
-            self.readiness.event.remove(Ready::readable());
+            self.frontend_readiness.event.remove(Ready::readable());
         }
 
         match socket_result {
@@ -88,16 +97,16 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
                 error!("[{:?}] (expect proxy) front socket error, closing the connection(read {}, wrote {})", self.frontend_token, metrics.bin, metrics.bout);
                 metrics.service_stop();
                 incr!("proxy_protocol.errors");
-                self.readiness.reset();
-                return (ProtocolResult::Continue, SessionResult::CloseSession);
+                self.frontend_readiness.reset();
+                return SessionResult::Close;
             }
             SocketResult::WouldBlock => {
-                self.readiness.event.remove(Ready::readable());
+                self.frontend_readiness.event.remove(Ready::readable());
             }
             SocketResult::Closed | SocketResult::Continue => {}
         }
 
-        match parse_v2_header(&self.buf[..self.index]) {
+        match parse_v2_header(&self.frontend_buffer[..self.index]) {
             Ok((rest, header)) => {
                 trace!(
                     "got expect header: {:?}, rest.len() = {}",
@@ -105,7 +114,7 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
                     rest.len()
                 );
                 self.addresses = Some(header.addr);
-                (ProtocolResult::Upgrade, SessionResult::Continue)
+                SessionResult::Upgrade
             }
             Err(Err::Incomplete(_)) => {
                 match self.header_len {
@@ -127,19 +136,19 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
                             );
                             metrics.service_stop();
                             incr!("proxy_protocol.errors");
-                            self.readiness.reset();
-                            return (ProtocolResult::Continue, SessionResult::CloseSession);
+                            self.frontend_readiness.reset();
+                            return SessionResult::Continue;
                         }
                     }
                 };
-                (ProtocolResult::Continue, SessionResult::Continue)
+                SessionResult::Continue
             }
             Err(Err::Error(e)) | Err(Err::Failure(e)) => {
                 error!("[{:?}] expect proxy protocol front socket parse error, closing the connection:\n{}", self.frontend_token, e.input.to_hex(16));
                 metrics.service_stop();
                 incr!("proxy_protocol.errors");
-                self.readiness.reset();
-                (ProtocolResult::Continue, SessionResult::CloseSession)
+                self.frontend_readiness.reset();
+                SessionResult::Close
             }
         }
     }
@@ -148,12 +157,8 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
         self.frontend.socket_ref()
     }
 
-    pub fn front_socket_mut(&mut self) -> &mut TcpStream {
-        self.frontend.socket_mut()
-    }
-
     pub fn readiness(&mut self) -> &mut Readiness {
-        &mut self.readiness
+        &mut self.frontend_readiness
     }
 
     pub fn into_pipe(
@@ -162,26 +167,29 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
         back_buf: Checkout,
         backend_socket: Option<TcpStream>,
         backend_token: Option<Token>,
-        listener: Rc<RefCell<Listener>>,
-    ) -> Pipe<Front, Listener> {
+        listener: Rc<RefCell<TcpListener>>,
+    ) -> Pipe<Front, TcpListener> {
         let addr = self.front_socket().peer_addr().ok();
 
         let mut pipe = Pipe::new(
-            self.frontend,
-            self.frontend_token,
-            self.request_id,
-            None,
-            None,
+            back_buf,
             None,
             backend_socket,
+            None,
+            None,
+            Some(self.container_frontend_timeout),
+            None,
             front_buf,
-            back_buf,
-            addr,
-            Protocol::TCP,
+            self.frontend_token,
+            self.frontend,
             listener,
+            Protocol::TCP,
+            self.request_id,
+            addr,
+            None,
         );
 
-        pipe.front_readiness.event = self.readiness.event;
+        pipe.frontend_readiness.event = self.frontend_readiness.event;
 
         if let Some(backend_token) = backend_token {
             pipe.set_back_token(backend_token);
@@ -189,11 +197,112 @@ impl<Front: SocketHandler + Read> ExpectProxyProtocol<Front> {
 
         pipe
     }
+
+    pub fn log_context(&self) -> LogContext {
+        LogContext {
+            request_id: self.request_id,
+            cluster_id: None,
+            backend_id: None,
+        }
+    }
+}
+
+impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
+    fn ready(
+        &mut self,
+        _session: Rc<RefCell<dyn crate::ProxySession>>,
+        _proxy: Rc<RefCell<dyn crate::L7Proxy>>,
+        metrics: &mut SessionMetrics,
+    ) -> SessionResult {
+        let mut counter = 0;
+        let max_loop_iterations = 100000;
+
+        if self.frontend_readiness.event.is_hup() {
+            return SessionResult::Close;
+        }
+
+        while counter < max_loop_iterations {
+            let frontend_interest = self.frontend_readiness.filter_interest();
+
+            trace!(
+                "PROXY\t{} {:?} {:?} -> None",
+                self.log_context(),
+                self.frontend_token,
+                self.frontend_readiness
+            );
+
+            if frontend_interest.is_empty() {
+                break;
+            }
+
+            if frontend_interest.is_readable() {
+                let session_result = self.readable(metrics);
+                if session_result != SessionResult::Continue {
+                    return session_result;
+                }
+            }
+
+            if frontend_interest.is_error() {
+                error!(
+                    "PROXY session {:?} front error, disconnecting",
+                    self.frontend_token
+                );
+                self.frontend_readiness.interest = Ready::empty();
+
+                return SessionResult::Close;
+            }
+
+            counter += 1;
+        }
+
+        if counter == max_loop_iterations {
+            error!(
+                "PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection",
+                self.frontend_token, max_loop_iterations
+            );
+            incr!("http.infinite_loop.error");
+
+            self.print_state("");
+
+            return SessionResult::Close;
+        }
+
+        SessionResult::Continue
+    }
+
+    fn update_readiness(&mut self, token: Token, events: Ready) {
+        if self.frontend_token == token {
+            self.frontend_readiness.event |= events;
+        }
+    }
+
+    fn timeout(&mut self, token: Token, _metrics: &mut SessionMetrics) -> StateResult {
+        if self.frontend_token == token {
+            self.container_frontend_timeout.triggered();
+            return StateResult::CloseSession;
+        }
+
+        error!(
+            "Expect state: got timeout for an invalid token: {:?}",
+            token
+        );
+        StateResult::CloseSession
+    }
+
+    fn cancel_timeouts(&mut self) {
+        self.container_frontend_timeout.cancel();
+    }
+
+    fn print_state(&self, context: &str) {
+        error!(
+            "{} Session(Expect)\n\tFrontend:\n\t\ttoken: {:?}\treadiness: {:?}",
+            context, self.frontend_token, self.frontend_readiness
+        );
+    }
 }
 
 #[cfg(test)]
 mod expect_test {
-
     use super::*;
     use mio::net::TcpListener;
     use rusty_ulid::Ulid;
@@ -204,6 +313,8 @@ mod expect_test {
         sync::{Arc, Barrier},
         thread::{self, JoinHandle},
     };
+
+    use time::Duration;
 
     use crate::protocol::proxy_protocol::header::*;
 
@@ -240,14 +351,20 @@ mod expect_test {
         }
 
         let mut session_metrics = SessionMetrics::new(None);
-        let mut expect_pp = ExpectProxyProtocol::new(session_stream, Token(0), Ulid::generate());
+        let container_frontend_timeout = TimeoutContainer::new(Duration::seconds(10), Token(0));
+        let mut expect_pp = ExpectProxyProtocol::new(
+            container_frontend_timeout,
+            session_stream,
+            Token(0),
+            Ulid::generate(),
+        );
 
-        let mut res = (ProtocolResult::Continue, SessionResult::Continue);
-        while res == (ProtocolResult::Continue, SessionResult::Continue) {
+        let mut res = SessionResult::Continue;
+        while res == SessionResult::Continue {
             res = expect_pp.readable(&mut session_metrics);
         }
 
-        if res != (ProtocolResult::Upgrade, SessionResult::Continue) {
+        if res != SessionResult::Upgrade {
             panic!("Should receive a complete proxy protocol header, res = {res:?}");
         };
     }

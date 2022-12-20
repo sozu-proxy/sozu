@@ -140,7 +140,7 @@ impl TimeoutContainer {
         }
     }
 
-    pub fn duration(&mut self) -> Duration {
+    pub fn duration(&self) -> Duration {
         self.duration
     }
 

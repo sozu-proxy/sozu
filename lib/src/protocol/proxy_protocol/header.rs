@@ -227,6 +227,7 @@ impl ProxyAddr {
         }
     }
 
+    // TODO: rename to a less ambiguous name, like "write bytes to buffer"
     fn into_bytes(&self, buf: &mut Vec<u8>) {
         match *self {
             ProxyAddr::Ipv4Addr { src_addr, dst_addr } => {

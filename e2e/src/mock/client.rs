@@ -36,6 +36,8 @@ impl Client {
         }
     }
 
+    /// Establish a TCP connection with its address,
+    /// register the yielded TCP stream, apply timeouts
     pub fn connect(&mut self) {
         let stream = TcpStream::connect(self.address).expect("could not connect");
         stream
@@ -98,5 +100,9 @@ impl Client {
             }
         }
         None
+    }
+
+    pub fn set_request<S1: Into<String>>(&mut self, request: S1) {
+        self.request = request.into();
     }
 }

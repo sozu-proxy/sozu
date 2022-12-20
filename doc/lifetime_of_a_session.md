@@ -134,7 +134,7 @@ buffer, and the kernel notifies the event loop that the socket is readable.
 As with listen sockets, the token associated with the TCP socket will get a
 "readable" event, and we will use the token to lookup which session it is
 associated with. We then call
-[`Session::process_events`](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/server.rs#L1431)
+[`Session::update_readiness`](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/server.rs#L1431)
 to notify it of the new
 [socket state](https://github.com/sozu-proxy/sozu/blob/e4e7488232ad6523791b94ad201239bcf7eb9b30/lib/src/https_openssl.rs#L810-L820).
 
