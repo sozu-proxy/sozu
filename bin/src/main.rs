@@ -292,7 +292,7 @@ fn update_process_limits(config: &Config) -> Result<(), anyhow::Error> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn update_process_limits(_: &Config) -> Result<(), StartupError> {
+fn update_process_limits(_: &Config) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
