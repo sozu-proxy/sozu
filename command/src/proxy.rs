@@ -551,9 +551,11 @@ impl FromStr for LoadBalancingAlgorithms {
     type Err = ParseErrorLoadBalancing;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "roundrobin" => Ok(LoadBalancingAlgorithms::RoundRobin),
+        match s.to_lowercase().as_str() {
+            "round_robin" => Ok(LoadBalancingAlgorithms::RoundRobin),
             "random" => Ok(LoadBalancingAlgorithms::Random),
+            "power_of_two" => Ok(LoadBalancingAlgorithms::PowerOfTwo),
+            "least_loaded" => Ok(LoadBalancingAlgorithms::LeastLoaded),
             _ => Err(ParseErrorLoadBalancing {}),
         }
     }
