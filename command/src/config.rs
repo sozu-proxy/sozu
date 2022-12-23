@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use toml;
+use tracing::{debug, info, error};
 
 use crate::{
     certificate::split_certificate_chain,
@@ -818,7 +819,7 @@ impl FileConfig {
                 if let Some(l) = config.listeners.as_ref() {
                     for listener in l.iter() {
                         if reserved_address.contains(&listener.address) {
-                            println!(
+                            info!(
                                 "listening address {:?} is already used in the configuration",
                                 listener.address
                             );
@@ -962,8 +963,8 @@ impl FileConfig {
                                             frontend.key = https_listener.key.clone();
                                         }
                                         if frontend.certificate.is_none() {
-                                            println!("known addresses: {:#?}", known_addresses);
-                                            println!("frontend: {:#?}", frontend);
+                                            info!("known addresses: {:#?}", known_addresses);
+                                            info!("frontend: {:#?}", frontend);
                                             bail!(
                                                 "cannot set up a HTTP frontend on a HTTPS listener"
                                             );

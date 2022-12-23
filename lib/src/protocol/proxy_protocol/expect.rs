@@ -3,6 +3,7 @@ use std::{cell::RefCell, io::Read, rc::Rc};
 use mio::{net::TcpStream, *};
 use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
+use tracing::{error, trace};
 
 use crate::{
     pool::Checkout,
@@ -206,6 +207,7 @@ mod expect_test {
     };
 
     use crate::protocol::proxy_protocol::header::*;
+    use crate::sozu_command::logging::setup_test_logger;
 
     // Flow diagram of the test below
     //                [connect]   [send proxy protocol]
@@ -214,7 +216,9 @@ mod expect_test {
     //  sozu     ---------v-----------v----X
     #[test]
     fn middleware_should_receive_proxy_protocol_header_from_an_upfront_middleware() {
-        setup_test_logger!();
+        // setup_test_logger(
+        //     "middleware_should_receive_proxy_protocol_header_from_an_upfront_middleware",
+        // );
         let middleware_addr: SocketAddr = "127.0.0.1:3500".parse().expect("parse address error");
         let barrier = Arc::new(Barrier::new(2));
 

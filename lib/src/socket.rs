@@ -5,7 +5,8 @@ use std::{
 
 use mio::net::{TcpListener, TcpStream};
 use rustls::{ProtocolVersion, ServerConnection};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, Socket, Type};use tracing::{debug, error, info, trace};
+
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum SocketResult {

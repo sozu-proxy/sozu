@@ -4,6 +4,7 @@ use std::{cell::RefCell, net::SocketAddr, rc::Weak};
 
 use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
+use tracing::{debug, error, info, trace};
 
 use crate::{
     pool::{Checkout, Pool},

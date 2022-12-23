@@ -31,6 +31,7 @@ use sozu_command::{
     proxy::{RemoveListener, ReplaceCertificate},
 };
 use time::{Duration, Instant};
+use tracing::{debug, error, info, trace};
 
 use crate::{
     backends::BackendMap,
@@ -55,7 +56,7 @@ use crate::{
     },
     socket::{server_bind, FrontRustls},
     sozu_command::{
-        logging,
+        // logging,
         proxy::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListener,
             ProxyEvent, ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
@@ -1963,10 +1964,13 @@ impl Proxy {
         &mut self,
         logging_filter: String,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
+        /*
+        TODO: replace with tracing_subscriber
         logging::LOGGER.with(|l| {
             let directives = logging::parse_logging_spec(&logging_filter);
             l.borrow_mut().set_directives(directives);
         });
+        */
         Ok(None)
     }
 

@@ -1,40 +1,27 @@
 #![allow(unused_variables, unused_must_use)]
 #[macro_use]
 extern crate sozu_lib as sozu;
-#[macro_use]
+// #[macro_use]
 extern crate sozu_command_lib as sozu_command;
 extern crate time;
 
-use std::{env, io::stdout, thread};
+use std::thread;
 
 use anyhow::Context;
 use sozu_command::config::DEFAULT_RUSTLS_CIPHER_LIST;
+use tracing::{debug, error, info};
 
 use crate::sozu_command::{
     channel::Channel,
-    logging::{Logger, LoggerBackend},
+    // logging::{Logger, LoggerBackend},
     proxy,
     proxy::{LoadBalancingParams, PathRule, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
-    if env::var("RUST_LOG").is_ok() {
-        Logger::init(
-            "EXAMPLE".to_string(),
-            &env::var("RUST_LOG").with_context(|| "could not get the RUST_LOG env var")?,
-            LoggerBackend::Stdout(stdout()),
-            None,
-        );
-    } else {
-        Logger::init(
-            "EXAMPLE".to_string(),
-            "info",
-            LoggerBackend::Stdout(stdout()),
-            None,
-        );
-    }
+    crate::sozu_command::logging::setup_tracing_subscriber_with_env();
 
-    info!("MAIN\tstarting up");
+    error!("MAIN\tstarting up");
 
     sozu::metrics::setup(
         &"127.0.0.1:8125"

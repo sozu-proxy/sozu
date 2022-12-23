@@ -7,6 +7,7 @@ use std::{
 };
 
 use mio::net::UdpSocket;
+use tracing::error;
 
 use super::{
     writer::{MetricSocket, MetricsWriter},

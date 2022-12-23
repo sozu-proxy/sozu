@@ -2,12 +2,15 @@ use std::{fs::File, io::Write, os::unix::io::RawFd};
 
 use anyhow::Context;
 
+use log::LevelFilter;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use tracing::{subscriber, Level};
 
 use sozu::metrics;
 use sozu_command_lib::config::Config;
+use tracing_subscriber::{fmt, reload};
 
-use crate::logging;
+// use crate::logging;
 
 pub fn enable_close_on_exec(fd: RawFd) -> Result<i32, anyhow::Error> {
     let file_descriptor =
@@ -36,6 +39,7 @@ pub fn disable_close_on_exec(fd: RawFd) -> Result<i32, anyhow::Error> {
     fcntl(fd, FcntlArg::F_SETFD(new_flags)).with_context(|| "could not set file descriptor flags")
 }
 
+/*
 pub fn setup_logging(config: &Config, tag: &str) {
     //FIXME: should have an id for the main too
     logging::setup(
@@ -45,6 +49,8 @@ pub fn setup_logging(config: &Config, tag: &str) {
         config.log_access_target.as_deref(),
     );
 }
+*/
+
 
 pub fn setup_metrics(config: &Config) -> anyhow::Result<()> {
     if let Some(metrics) = config.metrics.as_ref() {

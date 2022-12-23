@@ -11,6 +11,7 @@ use anyhow::{bail, Context};
 use async_io::Async;
 use futures::{channel::mpsc::*, SinkExt, StreamExt};
 use nom::{Err, HexDisplay, Offset};
+use tracing::{debug, error, info, trace, warn};
 
 use sozu_command_lib::{
     buffer::fixed::Buffer,
@@ -19,7 +20,7 @@ use sozu_command_lib::{
         CommandStatus, FrontendFilters, ListedFrontends, RunState, WorkerInfo, PROTOCOL_VERSION,
     },
     config::Config,
-    logging,
+    // logging,
     parser::parse_several_commands,
     proxy::{
         AggregatedMetricsData, MetricsConfiguration, ProxyRequest, ProxyRequestOrder,
@@ -1194,10 +1195,15 @@ impl CommandServer {
 
     pub fn set_logging_level(&mut self, logging_filter: String) -> anyhow::Result<Option<Success>> {
         debug!("Changing main process log level to {}", logging_filter);
+
+        /*
+        TODO: replace this with tracing_subscriber
         logging::LOGGER.with(|l| {
             let directives = logging::parse_logging_spec(&logging_filter);
             l.borrow_mut().set_directives(directives);
         });
+        */
+
         // also change / set the content of RUST_LOG so future workers / main thread
         // will have the new logging filter value
         ::std::env::set_var("RUST_LOG", &logging_filter);

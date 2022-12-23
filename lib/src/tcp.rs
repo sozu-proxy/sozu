@@ -12,6 +12,7 @@ use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
 use time::{Duration, Instant};
+use tracing::{error, info, trace};
 
 use crate::{
     backends::BackendMap,
@@ -30,7 +31,7 @@ use crate::{
     socket::server_bind,
     sozu_command::{
         config::ProxyProtocolConfig,
-        logging,
+        // logging,
         proxy::{
             ProxyEvent, ProxyRequest, ProxyRequestOrder, ProxyResponse, TcpFrontend,
             TcpListener as TcpListenerConfig,
@@ -1343,10 +1344,13 @@ impl ProxyConfiguration<Session> for Proxy {
                     "{} changing logging filter to {}",
                     message.id, logging_filter
                 );
+                /*
+                TODO: replace with proper logic
                 logging::LOGGER.with(|l| {
                     let directives = logging::parse_logging_spec(&logging_filter);
                     l.borrow_mut().set_directives(directives);
                 });
+                */
                 ProxyResponse::ok(message.id)
             }
             ProxyRequestOrder::AddCluster(cluster) => {
@@ -1587,6 +1591,7 @@ pub fn start(
 mod tests {
     use super::*;
     use crate::sozu_command::channel::Channel;
+    use crate::sozu_command::logging::setup_test_logger;
     use crate::sozu_command::proxy::{self, LoadBalancingParams, TcpFrontend};
     use crate::sozu_command::scm_socket::Listeners;
     use std::io::{Read, Write};
@@ -1612,7 +1617,7 @@ mod tests {
 
     #[test]
     fn mi() {
-        setup_test_logger!();
+        // setup_test_logger("mi");
         let barrier = Arc::new(Barrier::new(2));
         start_server(barrier.clone());
         let _tx = start_proxy().expect("Could not start proxy");
@@ -1628,7 +1633,7 @@ mod tests {
                 e
             })
             .unwrap();
-        println!("s1 sent");
+        info!("s1 sent");
 
         s2.write(&b"pouet pouet"[..])
             .map_err(|e| {
@@ -1637,7 +1642,7 @@ mod tests {
             })
             .unwrap();
 
-        println!("s2 sent");
+        info!("s2 sent");
 
         let mut res = [0; 128];
         s1.write(&b"coucou"[..])
@@ -1655,7 +1660,7 @@ mod tests {
                 e
             })
             .expect("could not read from socket");
-        println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
+        info!("s2 received {:?}", str::from_utf8(&res[..sz2]));
         assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
 
         let sz1 = s1
@@ -1665,7 +1670,7 @@ mod tests {
                 e
             })
             .expect("could not read from socket");
-        println!(
+        info!(
             "s1 received again({}): {:?}",
             sz1,
             str::from_utf8(&res[..sz1])
@@ -1681,11 +1686,11 @@ mod tests {
             let _response = b" END";
             while let Ok(sz) = stream.read(&mut buf[..]) {
                 if sz > 0 {
-                    println!("ECHO[{}] got \"{:?}\"", id, str::from_utf8(&buf[..sz]));
+                    info!("ECHO[{}] got \"{:?}\"", id, str::from_utf8(&buf[..sz]));
                     stream.write(&buf[..sz]).unwrap();
                 }
                 if TEST_FINISHED.load(Ordering::Relaxed) {
-                    println!("backend server stopping");
+                    info!("backend server stopping");
                     break;
                 }
             }
@@ -1698,12 +1703,12 @@ mod tests {
                 match conn {
                     Ok(mut stream) => {
                         thread::spawn(move || {
-                            println!("got a new client: {}", count);
+                            info!("got a new client: {}", count);
                             handle_client(&mut stream, count)
                         });
                     }
                     Err(e) => {
-                        println!("connection failed: {:?}", e);
+                        info!("connection failed: {:?}", e);
                     }
                 }
                 count += 1;
@@ -1722,7 +1727,7 @@ mod tests {
         // this thread should call a start() function that performs the same logic and returns Result<()>
         // any error coming from this start() would be mapped and logged within the thread
         thread::spawn(move || {
-            setup_test_logger!();
+            // setup_test_logger("tcp_proxy");
             info!("starting event loop");
             let poll = Poll::new().expect("could not create event loop");
             let max_connections = 100;
@@ -1886,7 +1891,7 @@ mod tests {
 
         // not sure why four times
         for _ in 0..4 {
-            println!(
+            info!(
                 "read_message: {:?}",
                 command
                     .read_message()

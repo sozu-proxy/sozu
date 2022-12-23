@@ -54,6 +54,8 @@ rusty_ulid = { version = "^1.0.0", default-features = true, features = [
 ] }
 thiserror = "^1.0.37"
 time = "^0.3.17"
+tracing = "^0.1.37"
+tracing-subscriber = { version = "^0.3.16", features = ["std", "env-filter"]}
 url = "^2.3.1"
 webpki = "^0.22.0"
 x509-parser = "^0.14.0"

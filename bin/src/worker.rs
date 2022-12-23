@@ -18,7 +18,6 @@ use std::{
     process::Command,
 };
 
-use std::env;
 use anyhow::{bail, Context};
 use libc::{self, pid_t};
 #[cfg(target_os = "macos")]
@@ -27,6 +26,8 @@ use libc::{c_char, PATH_MAX};
 use libc::{sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
 use mio::net::UnixStream;
 use nix::{self, unistd::*};
+use std::env;
+use tracing::{debug, error, info, trace};
 
 use tempfile::tempfile;
 
@@ -34,14 +35,19 @@ use sozu::{metrics, server::Server};
 use sozu_command_lib::{
     channel::Channel,
     config::Config,
-    logging::target_to_backend,
+    // logging::target_to_backend,
+    logging::setup_tracing_subscriber,
     proxy::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
 
-use crate::{command::Worker, logging, util};
+use crate::{
+    command::Worker,
+    //  logging,
+    util,
+};
 
 /// Called once at the beginning of the main process, this forks main into as many workers
 pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result<Vec<Worker>> {
@@ -136,12 +142,17 @@ pub fn begin_worker_process(
         .with_context(|| "worker could not read configuration from socket")?;
 
     let worker_id = format!("{}-{:02}", "WRK", id);
+
+    /*
+    TODO: replace this with tracing_subscriber stuff
     logging::setup(
         worker_id.clone(),
         &worker_config.log_level,
         &worker_config.log_target,
         worker_config.log_access_target.as_deref(),
     );
+    */
+    setup_tracing_subscriber(&worker_config, &worker_id)?;
 
     trace!(
         "Creating worker {} with config: {:#?}",
@@ -149,17 +160,22 @@ pub fn begin_worker_process(
         worker_config
     );
 
+    /*
+    TODO: replace this too
     let backend = target_to_backend(&worker_config.log_target);
     let access_backend = worker_config
         .log_access_target
         .as_deref()
         .map(target_to_backend);
+
     sozu_command_lib::logging::Logger::init(
         worker_id.clone(),
         &worker_config.log_level,
         backend,
         access_backend,
     );
+    */
+
     info!("worker {} starting...", id);
 
     if let Err(e) = worker_to_main_channel.nonblocking() {
@@ -198,10 +214,10 @@ pub fn begin_worker_process(
 }
 
 /// unix-forks the main process
-/// 
+///
 /// - Parent: sends config and listeners to the new worker
 /// - Child: calls the sozu executable path like so: `sozu worker --id <worker_id> [...]`
-/// 
+///
 /// returns the child process pid, and channels to talk to it.
 pub fn fork_main_into_worker(
     worker_id: &str,

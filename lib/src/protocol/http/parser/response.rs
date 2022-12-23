@@ -1,6 +1,7 @@
 use std::{convert::From, str};
 
 use nom::{Err, HexDisplay, IResult, Offset};
+use tracing::{debug, error, trace};
 
 use crate::{buffer_queue::BufferQueue, protocol::http::StickySession};
 

@@ -13,6 +13,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use tracing::{debug, error, info, trace};
 use poule;
 
 static BUFFER_COUNT: AtomicUsize = AtomicUsize::new(0);

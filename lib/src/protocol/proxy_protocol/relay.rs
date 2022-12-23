@@ -8,6 +8,7 @@ use mio::net::TcpStream;
 use mio::*;
 use nom::{Err, Offset};
 use rusty_ulid::Ulid;
+use tracing::{debug, error, info};
 
 use crate::{
     pool::Checkout,

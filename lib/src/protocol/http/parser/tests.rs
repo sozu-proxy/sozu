@@ -4,10 +4,12 @@ use std::{
 };
 
 use nom::{error::ErrorKind, Err, HexDisplay};
+use tracing::{debug, error, info, trace};
 
 use crate::buffer_queue::{buf_with_capacity, OutputElement};
-#[cfg(test)]
 use crate::protocol::http::AddedRequestHeader;
+#[cfg(test)]
+use crate::sozu_command::logging::setup_test_logger;
 
 use super::*;
 
@@ -415,7 +417,7 @@ fn parse_state_content_length_and_chunked_test() {
 
 #[test]
 fn parse_request_without_length() {
-    setup_test_logger!();
+    // setup_test_logger("parse_request_without_length");
     let input = b"GET / HTTP/1.1\r\n\
           Host: localhost:8888\r\n\
           Connection: close\r\n\
@@ -490,7 +492,7 @@ fn parse_request_http_1_0_connection_close() {
 
 #[test]
 fn parse_request_http_1_0_connection_keep_alive() {
-    setup_test_logger!();
+    // setup_test_logger("parse_request_http_1_0_connection_keep_alive");
     let input = b"GET / HTTP/1.0\r\n\
           Host: localhost:8888\r\n\
           Connection: keep-alive\r\n\
@@ -534,7 +536,7 @@ fn parse_request_http_1_0_connection_keep_alive() {
 
 #[test]
 fn parse_request_http_1_1_connection_keep_alive() {
-    setup_test_logger!();
+    // setup_test_logger("parse_request_http_1_1_connection_keep_alive");
     let input = b"GET / HTTP/1.1\r\n\
           Host: localhost:8888\r\n\
           \r\n";
@@ -575,7 +577,7 @@ fn parse_request_http_1_1_connection_keep_alive() {
 
 #[test]
 fn parse_request_http_1_1_connection_close() {
-    setup_test_logger!();
+    // setup_test_logger("parse_request_http_1_1_connection_close");
     let input = b"GET / HTTP/1.1\r\n\
           Connection: close\r\n\
           Host: localhost:8888\r\n\
@@ -618,7 +620,7 @@ fn parse_request_http_1_1_connection_close() {
 
 #[test]
 fn parse_request_add_header_test() {
-    setup_test_logger!();
+    // setup_test_logger("parse_request_add_header_test");
     let input = b"GET /index.html HTTP/1.1\r\n\
           Host: localhost:8888\r\n\
           User-Agent: curl/7.43.0\r\n\
@@ -684,7 +686,7 @@ fn parse_request_add_header_test() {
 
 #[test]
 fn parse_request_delete_forwarded_headers() {
-    setup_test_logger!();
+    // setup_test_logger("parse_request_delete_forwarded_headers");
     let input = b"GET /index.html HTTP/1.1\r\n\
           Host: localhost:8888\r\n\
           Forwarded: proto:https;for=10.0.0.2:1234;by:1.2.3.4\r\n\
@@ -1084,7 +1086,7 @@ fn parse_response_and_chunks_partial_test() {
 
 #[test]
 fn parse_incomplete_chunk_header_test() {
-    setup_test_logger!();
+    // setup_test_logger("parse_incomplete_chunk_header_test");
     let input = b"HTTP/1.1 200 OK\r\n\
           Server: ABCD\r\n\
           Transfer-Encoding: chunked\r\n\

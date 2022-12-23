@@ -14,8 +14,9 @@ use sozu_command_lib::{
 };
 use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};
 use tiny_http::{Response, Server};
+use tracing::{debug, error, info};
 
-use crate::util;
+// use crate::util;
 
 /// sozu-acme is a configuration tool for the
 /// [sōzu HTTP reverse proxy](https://github.com/sozu-proxy/sozu)
@@ -50,7 +51,8 @@ pub fn main(
     let config = Config::load_from_path(&config_file)
         .with_context(|| "could not parse configuration file")?;
 
-    util::setup_logging(&config, "ACME");
+    crate::sozu_command_lib::logging::setup_tracing_subscriber(&config, "ACME")?;
+
     info!("starting up");
 
     let http = http_frontend_address

@@ -10,9 +10,17 @@ use std::{
     str::FromStr,
 };
 
+use anyhow::{bail, Context};
 use libc;
 use mio::net::UnixDatagram;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use tracing::{
+    Level,
+    {span, span::Entered},
+};
+use tracing_subscriber::fmt::format::FmtSpan;
+
+use crate::config::Config;
 
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
@@ -755,6 +763,7 @@ impl log::Log for CompatLogger {
     fn flush(&self) {}
 }
 
+/*
 #[macro_export]
 macro_rules! setup_test_logger {
     () => {
@@ -766,6 +775,7 @@ macro_rules! setup_test_logger {
         );
     };
 }
+*/
 
 pub struct Rfc3339Time {
     inner: ::time::OffsetDateTime,
@@ -794,4 +804,70 @@ pub fn now() -> (Rfc3339Time, i128) {
         Rfc3339Time { inner: t },
         (t - time::OffsetDateTime::UNIX_EPOCH).whole_nanoseconds(),
     )
+}
+
+fn log_level_from_str(level: &str) -> anyhow::Result<tracing::Level> {
+    match level.to_lowercase().as_str() {
+        "trace" => Ok(Level::TRACE),
+        "debug" => Ok(Level::DEBUG),
+        "warn" => Ok(Level::WARN),
+        "info" => Ok(Level::INFO),
+        "error" => Ok(Level::ERROR),
+        other => bail!("Wrong log level {}", other),
+    }
+}
+
+fn filter_level_from_str(level: &str) -> anyhow::Result<tracing_subscriber::filter::LevelFilter> {
+    match level.to_lowercase().as_str() {
+        "trace" => Ok(tracing_subscriber::filter::LevelFilter::TRACE),
+        "debug" => Ok(tracing_subscriber::filter::LevelFilter::DEBUG),
+        "warn" => Ok(tracing_subscriber::filter::LevelFilter::WARN),
+        "info" => Ok(tracing_subscriber::filter::LevelFilter::INFO),
+        "error" => Ok(tracing_subscriber::filter::LevelFilter::ERROR),
+        other => bail!("Wrong log level {}", other),
+    }
+}
+
+pub fn setup_tracing_subscriber(config: &Config, tag: &str) -> anyhow::Result<()> {
+    let log_level = log_level_from_str(&config.log_level)
+        .with_context(|| "Could not get log level from config file")?;
+
+    // TODO: add the tag ("MAIN", "WRK-01"), into the log lines
+
+    tracing_subscriber::fmt().with_max_level(log_level).init();
+
+    /*
+    TODO: make a layer that is dynamically reconfigurable with tracing_subscriber::reload
+    let filter = filter_level_from_str(&config.log_level)?;
+    let (filter, reload_handle) = reload::Layer::new(filter);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::Layer::default())
+        .init();
+        // return the reload handle to do later: reload_handle.modify()
+    */
+
+    Ok(())
+}
+
+// TODO: this does not work yet when doing `RUST_LOG=trace cargo run...`
+// TODO: add a tag to it, as in setup_tracing_subscriber
+/// starts a subscriber that logs event with DEBUG as default, overriden by RUST_LOG if present
+pub fn setup_tracing_subscriber_with_env() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::DEBUG.into()),
+        )
+        .init();
+}
+
+// TODO: add the test name to the log lines, by creating a span or something
+pub fn setup_test_logger(test_name: &str) {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .pretty()
+        .with_line_number(true)
+        .with_span_events(FmtSpan::FULL)
+        .init();
 }

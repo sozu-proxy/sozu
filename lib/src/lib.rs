@@ -161,7 +161,7 @@ extern crate slab;
 extern crate socket2;
 extern crate time;
 extern crate url;
-#[macro_use]
+// #[macro_use]
 extern crate sozu_command_lib as sozu_command;
 extern crate cookie_factory;
 extern crate hpack;

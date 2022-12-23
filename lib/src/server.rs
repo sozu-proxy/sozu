@@ -14,7 +14,8 @@ use mio::{
 };
 use slab::Slab;
 use sozu_command::proxy::{ActivateListener, DeactivateListener, HttpListener, HttpsListener};
-use time::{Duration, Instant};
+use time::{Duration, Instant};use tracing::{debug, error, info, trace};
+
 
 use crate::{
     backends::BackendMap,

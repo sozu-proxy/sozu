@@ -16,6 +16,7 @@ use anyhow::{bail, Context};
 use mio::{event::Source, net::UnixStream as MioUnixStream};
 use serde::{de::DeserializeOwned, ser::Serialize};
 use serde_json;
+use tracing::error;
 
 use crate::{buffer::growable::Buffer, ready::Ready};
 

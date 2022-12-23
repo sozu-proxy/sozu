@@ -14,11 +14,12 @@ use rusty_ulid::Ulid;
 use slab::Slab;
 use sozu_command::proxy::RemoveListener;
 use time::{Duration, Instant};
+use tracing::{debug, error, info, trace};
 
 use crate::{
     router::Router,
     sozu_command::{
-        logging,
+        // logging,
         proxy::{
             Cluster, HttpFrontend, HttpListener, ProxyEvent, ProxyRequest, ProxyRequestOrder,
             ProxyResponse, Route,
@@ -1619,10 +1620,13 @@ impl Proxy {
     }
 
     pub fn logging(&mut self, logging_filter: String) -> anyhow::Result<()> {
+        /*
+        TODO: replace with tracing_subscriber logic
         logging::LOGGER.with(|l| {
             let directives = logging::parse_logging_spec(&logging_filter);
             l.borrow_mut().set_directives(directives);
         });
+        */
         Ok(())
     }
 }
@@ -2002,8 +2006,11 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     extern crate tiny_http;
+    use tracing::span;
+
     use super::*;
     use crate::sozu_command::channel::Channel;
+    use crate::sozu_command::logging::setup_test_logger;
     use crate::sozu_command::proxy::{
         Backend, HttpFrontend, HttpListener, LoadBalancingAlgorithms, LoadBalancingParams,
         PathRule, ProxyRequest, ProxyRequestOrder, Route, RulePosition,
@@ -2031,7 +2038,10 @@ mod tests {
 
     #[test]
     fn mi() {
-        setup_test_logger!();
+        setup_test_logger("mi");
+        let span = span!(tracing::Level::DEBUG, "mi");
+        let _entered = span.enter();
+
         let barrier = Arc::new(Barrier::new(2));
         start_server(1025, barrier.clone());
         barrier.wait();
@@ -2046,7 +2056,6 @@ mod tests {
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
         let _jg = thread::spawn(move || {
-            setup_test_logger!();
             start(config, channel, 10, 16384).expect("could not start the http server");
         });
 
@@ -2080,10 +2089,11 @@ mod tests {
             })
             .unwrap();
 
-        println!("test received: {:?}", command.read_message());
-        println!("test received: {:?}", command.read_message());
+        info!("test received: {:?}", command.read_message());
+        info!("test received: {:?}", command.read_message());
 
-        let mut client = TcpStream::connect(("127.0.0.1", 1024)).expect("could not parse address");
+        let mut client = TcpStream::connect(("127.0.0.1", 1024))
+            .expect("could not connect to socket 127.0.0.1:1024");
 
         // 5 seconds of timeout
         client.set_read_timeout(Some(Duration::new(1, 0))).unwrap();
@@ -2110,7 +2120,7 @@ mod tests {
                 }
             }
         }
-        println!(
+        info!(
             "Response: {}",
             str::from_utf8(&buffer[..index]).expect("could not make string from buffer")
         );
@@ -2118,7 +2128,7 @@ mod tests {
 
     #[test]
     fn keep_alive() {
-        setup_test_logger!();
+        // setup_test_logger("keep_alive");
         let barrier = Arc::new(Barrier::new(2));
         start_server(1028, barrier.clone());
         barrier.wait();
@@ -2134,7 +2144,6 @@ mod tests {
             Channel::generate(1000, 10000).expect("should create a channel");
 
         let _jg = thread::spawn(move || {
-            setup_test_logger!();
             start(config, channel, 10, 16384).expect("could not start the http server");
         });
 
@@ -2236,7 +2245,7 @@ mod tests {
 
     #[test]
     fn https_redirect() {
-        setup_test_logger!();
+        // setup_test_logger("https_redirect");
         let address: SocketAddr =
             FromStr::from_str("127.0.0.1:1041").expect("could not parse address");
         let config = HttpListener {
@@ -2247,7 +2256,6 @@ mod tests {
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
         let _jg = thread::spawn(move || {
-            setup_test_logger!();
             start(config, channel, 10, 16384).expect("could not start the http server");
         });
 
@@ -2296,9 +2304,9 @@ mod tests {
             })
             .unwrap();
 
-        println!("test received: {:?}", command.read_message());
-        println!("test received: {:?}", command.read_message());
-        println!("test received: {:?}", command.read_message());
+        info!("test received: {:?}", command.read_message());
+        info!("test received: {:?}", command.read_message());
+        info!("test received: {:?}", command.read_message());
 
         let mut client = TcpStream::connect(("127.0.0.1", 1041)).expect("could not parse address");
         // 5 seconds of timeout
@@ -2307,7 +2315,7 @@ mod tests {
         let w = client.write(
             &b"GET /redirected?true HTTP/1.1\r\nHost: localhost\r\nConnection: Close\r\n\r\n"[..],
         );
-        println!("http client write: {:?}", w);
+        info!("http client write: {:?}", w);
 
         let expected_answer = "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://localhost/redirected?true\r\n\r\n";
         let mut buffer = [0; 4096];
@@ -2319,7 +2327,7 @@ mod tests {
             }
 
             let r = client.read(&mut buffer[index..]);
-            println!("http client read: {:?}", r);
+            info!("http client read: {:?}", r);
             match r {
                 Err(e) => assert!(false, "client request should not fail. Error: {:?}", e),
                 Ok(sz) => {
@@ -2329,7 +2337,7 @@ mod tests {
         }
 
         let answer = str::from_utf8(&buffer[..index]).expect("could not make string from buffer");
-        println!("Response: {}", answer);
+        info!("Response: {}", answer);
         assert_eq!(answer, expected_answer);
     }
 
@@ -2337,7 +2345,6 @@ mod tests {
 
     fn start_server(port: u16, barrier: Arc<Barrier>) {
         thread::spawn(move || {
-            setup_test_logger!();
             let server =
                 Server::http(&format!("127.0.0.1:{}", port)).expect("could not create server");
             info!("starting web server in port {}", port);
@@ -2358,7 +2365,7 @@ mod tests {
                 info!("server session stopped");
             }
 
-            println!("server on port {} closed", port);
+            info!("server on port {} closed", port);
         });
     }
 

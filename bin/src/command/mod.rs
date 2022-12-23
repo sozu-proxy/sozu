@@ -22,6 +22,7 @@ use nix::{
     unistd::Pid,
 };
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, trace};
 
 use sozu_command_lib::{
     command::{

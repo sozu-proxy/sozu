@@ -1,33 +1,22 @@
 #![allow(unused_variables, unused_must_use)]
 extern crate sozu_lib as sozu;
-#[macro_use]
+// #[macro_use]
 extern crate sozu_command_lib as sozu_command;
 extern crate time;
 
 use std::{io::stdout, thread};
+use tracing::info;
 
 use anyhow::Context;
 
 use crate::sozu_command::{
     channel::Channel,
-    logging::{Logger, LoggerBackend},
+    // logging::{Logger, LoggerBackend},
     proxy::{self, LoadBalancingParams, TcpListener},
 };
 
 fn main() -> anyhow::Result<()> {
-    /*
-    if env::var("RUST_LOG").is_ok() {
-     Logger::init("EXAMPLE".to_string(), &env::var("RUST_LOG").with_context(|| "could not get the RUST_LOG env var"), LoggerBackend::Stdout(stdout()));
-    } else {
-     Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()));
-    }
-    */
-    Logger::init(
-        "EXAMPLE".to_string(),
-        "debug",
-        LoggerBackend::Stdout(stdout()),
-        None,
-    );
+    crate::sozu_command::logging::setup_tracing_subscriber_with_env();
 
     info!("starting up");
 
@@ -46,12 +35,13 @@ fn main() -> anyhow::Result<()> {
             back_timeout: 30,
             connect_timeout: 3,
         };
-        Logger::init(
-            "TCP".to_string(),
-            "debug",
-            LoggerBackend::Stdout(stdout()),
-            None,
-        );
+
+        // Logger::init(
+        //     "TCP".to_string(),
+        //     "debug",
+        //     LoggerBackend::Stdout(stdout()),
+        //     None,
+        // );
         sozu::tcp::start(listener, max_buffers, buffer_size, channel);
     });
 

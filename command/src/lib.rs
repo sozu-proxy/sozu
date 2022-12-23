@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate serde;
 
-#[macro_use]
+// #[macro_use]
 pub mod logging;
 pub mod buffer;
 pub mod certificate;

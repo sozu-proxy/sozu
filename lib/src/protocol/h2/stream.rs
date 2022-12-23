@@ -3,7 +3,8 @@ use std::{
     str::from_utf8,
 };
 
-use hpack::Decoder;
+use hpack::Decoder;use tracing::{debug, error, info, trace};
+
 
 use super::{
     parser,

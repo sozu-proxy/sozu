@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::Context;
 use mio::net::UdpSocket;
+use tracing::{debug, error};
 
 use crate::sozu_command::proxy::{
     FilteredData, MetricsConfiguration, QueryAnswerMetrics, QueryMetricsOptions,

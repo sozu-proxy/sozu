@@ -12,6 +12,7 @@ use anyhow::Context;
 use mio::net::TcpListener;
 use nix::{cmsg_space, sys::socket};
 use serde_json;
+use tracing::{debug, info};
 
 pub const MAX_FDS_OUT: usize = 200;
 pub const MAX_BYTES_OUT: usize = 4096;
@@ -140,14 +141,14 @@ impl ScmSocket {
         };
 
         if fds.is_empty() {
-            println!("{} send empty", self.fd);
+            info!("SCM socket {} sending an empty message", self.fd);
             socket::sendmsg::<()>(self.fd, &iov, &[], flags, None)
                 .with_context(|| "Could not send empty message per socket")?;
             return Ok(());
         };
 
         let control_message = [socket::ControlMessage::ScmRights(fds)];
-        println!("{} send with data", self.fd);
+        info!("SCM socket {} send with data", self.fd);
         socket::sendmsg::<()>(self.fd, &iov, &control_message, flags, None)
             .with_context(|| "Could not send message per socket")?;
         Ok(())

@@ -12,6 +12,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use serde::de::{self, Visitor};
+use tracing::info;
 
 use crate::{
     certificate::calculate_fingerprint,

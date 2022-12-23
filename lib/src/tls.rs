@@ -17,6 +17,7 @@ use rustls::{
 };
 use sha2::{Digest, Sha256};
 use sozu_command::proxy::TlsVersion;
+use tracing::{debug, error, info, trace};
 use x509_parser::{
     oid_registry::{OID_X509_COMMON_NAME, OID_X509_EXT_SUBJECT_ALT_NAME},
     pem::{parse_x509_pem, Pem},

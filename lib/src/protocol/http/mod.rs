@@ -12,6 +12,7 @@ use std::{
 use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
 use time::{Duration, Instant};
+use tracing::{debug, error, info, trace};
 
 use crate::{
     buffer_queue::BufferQueue,
@@ -653,6 +654,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             })
         });
 
+        /*
+        TODO: replace with subscriber logic to send it to its distinct target
         info_access!(
             "{}{} -> {}\t{} {} {} {}\t{}\t{} {} {}\t{}",
             self.log_context(),
@@ -668,6 +671,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             status_line,
             request_line
         );
+        */
     }
 
     pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
@@ -721,6 +725,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             })
         });
 
+        /*
+        TODO: replace with subscriber logic to send it to its distinct target
         info_access!(
             "{}{} -> {}\t{} {} {} {}\t{}\t{} {} {}\t{}",
             self.log_context(),
@@ -736,6 +742,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             status_line,
             request_line
         );
+        */
     }
 
     pub fn log_request_error(&mut self, metrics: &mut SessionMetrics, message: &str) {
@@ -797,6 +804,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             })
         });
 
+        /*
+        TODO: replace with subscriber logic to send it to its distinct target
         error_access!(
             "{}{} -> {}\t{} {} {} {}\t{} {} {}\t{} | {} {}",
             self.log_context(),
@@ -813,6 +822,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
             message,
             OptionalString::from(tags.as_ref())
         );
+        */
     }
 
     /// Read content from the session

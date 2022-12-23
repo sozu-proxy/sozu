@@ -1,11 +1,11 @@
 extern crate nom;
-#[macro_use]
+// #[macro_use]
 extern crate lazy_static;
 #[macro_use]
 extern crate prettytable;
 #[macro_use]
 extern crate sozu_lib as sozu;
-#[macro_use]
+// #[macro_use]
 extern crate sozu_command_lib;
 
 #[cfg(target_os = "linux")]
@@ -13,13 +13,14 @@ extern crate num_cpus;
 use cli::Args;
 #[cfg(target_os = "linux")]
 use regex::Regex;
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "jemallocator")]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
-#[macro_use]
-mod logging;
+// #[macro_use]
+// mod logging;
 
 /// CLI utility for Let's Encrypt configuration
 mod acme;
@@ -43,7 +44,7 @@ use anyhow::{bail, Context};
 use libc::{cpu_set_t, pid_t};
 
 use sozu::metrics::METRICS;
-use sozu_command_lib::config::Config;
+use sozu_command_lib::{config::Config, logging::setup_tracing_subscriber};
 
 use crate::{
     command::Worker,
@@ -127,7 +128,9 @@ fn start(args: &cli::Args) -> Result<(), anyhow::Error> {
     let config_file_path = get_config_file_path(args)?;
     let config = load_configuration(config_file_path)?;
 
-    util::setup_logging(&config, "MAIN");
+    setup_tracing_subscriber(&config, "MAIN")?;
+    // tracing_subscriber::fmt::i
+
     info!("Starting up");
     util::setup_metrics(&config).with_context(|| "Could not setup metrics")?;
     util::write_pid_file(&config).with_context(|| "PID file is not writeable")?;

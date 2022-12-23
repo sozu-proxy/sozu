@@ -2,6 +2,7 @@ use anyhow::{self, bail, Context};
 use prettytable::Table;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
+use tracing::info;
 
 use sozu_command_lib::{
     command::{

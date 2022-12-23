@@ -27,7 +27,8 @@ pub fn ctl(args: cli::Args) -> Result<(), anyhow::Error> {
     let config_file_path = get_config_file_path(&args)?;
     let config = load_configuration(config_file_path)?;
 
-    util::setup_logging(&config, "CTL");
+    // util::setup_logging(&config, "CTL");
+    tracing_subscriber::fmt::init();
 
     // If the command is `config check` then exit because if we are here, the configuration is valid
     if let SubCmd::Config {

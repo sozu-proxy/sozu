@@ -41,6 +41,8 @@ rand = "^0.8.5"
 serde = { version = "^1.0.148", features = ["derive"] }
 serde_json = "^1.0.89"
 sha2 = "^0.10.6"
+tracing = "^0.1.37"
+tracing-subscriber = { version = "^0.3.16", features = ["std", "env-filter"]}
 trailer = "^0.1.2"
 pool = "^0.1.4"
 poule = "^0.3.2"

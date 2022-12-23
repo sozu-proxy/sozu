@@ -3,6 +3,7 @@ use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 use mio::net::*;
 use mio::*;
 use rusty_ulid::Ulid;
+use tracing::{debug, error, info, trace};
 
 use crate::{
     pool::Checkout,
@@ -294,6 +295,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                     .join(", ")
             });
 
+        /*
+        TODO: replace with subscriber logic to send it to its distinct target
         info_access!(
             "{}{} -> {}\t{} {} {} {}\t{}\t{} {}",
             self.log_ctx,
@@ -307,6 +310,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             proto,
             self.websocket_context.as_deref().unwrap_or("-")
         );
+        */
     }
 
     pub fn log_request_error(&self, metrics: &SessionMetrics, message: &str) {
@@ -347,6 +351,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         let proto = self.protocol_string();
 
+        /*
+        TODO: replace with subscriber logic to send it to its distinct target
         error_access!(
             "{}{} -> {}\t{} {} {} {}\t{} {} | {}",
             self.log_ctx,
@@ -360,6 +366,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             self.websocket_context.as_deref().unwrap_or("-"),
             message
         );
+        */
     }
 
     pub fn check_connections(&self) -> bool {

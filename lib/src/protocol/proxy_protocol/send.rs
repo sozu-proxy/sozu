@@ -6,6 +6,7 @@ use std::{
 
 use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
+use tracing::{debug, error};
 
 use crate::{
     pool::Checkout,
@@ -202,6 +203,7 @@ mod send_test {
 
     use super::super::parser::parse_v2_header;
 
+    use crate::sozu_command::logging::setup_test_logger;
     use mio::net::{TcpListener, TcpStream};
     use rusty_ulid::Ulid;
     use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
@@ -214,7 +216,7 @@ mod send_test {
 
     #[test]
     fn it_should_send_a_proxy_protocol_header_to_the_upstream_backend() {
-        setup_test_logger!();
+        // setup_test_logger("it_should_send_a_proxy_protocol_header_to_the_upstream_backend");
         let addr_client: SocketAddr = "127.0.0.1:6666".parse().expect("parse address error");
         let addr_backend: SocketAddr = "127.0.0.1:2001".parse().expect("parse address error");
         let barrier = Arc::new(Barrier::new(3));

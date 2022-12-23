@@ -1,6 +1,6 @@
 #![allow(unused_variables, unused_must_use)]
 extern crate sozu_lib as sozu;
-#[macro_use]
+// #[macro_use]
 extern crate sozu_command_lib as sozu_command;
 extern crate time;
 extern crate tiny_http;
@@ -16,22 +16,18 @@ use std::{
 };
 
 use tiny_http::{Response, Server};
+use tracing::info;
 
 use crate::sozu_command::{
     channel::Channel,
-    logging::{Logger, LoggerBackend},
+    // logging::{Logger, LoggerBackend},
     proxy,
     proxy::{LoadBalancingParams, PathRule, Route, RulePosition},
 };
 
 #[test]
-fn test() {
-    Logger::init(
-        "EXAMPLE".to_string(),
-        "debug",
-        LoggerBackend::Stdout(stdout()),
-        None,
-    );
+fn main_test() {
+    crate::sozu_command::logging::setup_test_logger("main test");
 
     info!("starting up");
 
@@ -43,12 +39,16 @@ fn test() {
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
     let jg = thread::spawn(move || {
+        /*
+        TODO: check that this works, but the tracing_subscriber::init line should suffice. Then delete these lines
+        Or manage to start a pan that will have the TRACE log level
         Logger::init(
             "SOZU".to_string(),
             "trace",
             LoggerBackend::Stdout(stdout()),
             None,
         );
+        */
         let max_buffers = 20;
         let buffer_size = 16384;
         sozu::http::start(config, channel, max_buffers, buffer_size);
@@ -91,7 +91,7 @@ fn test() {
         id: String::from("ID_ABCD"),
         order: proxy::ProxyRequestOrder::AddHttpFrontend(http_frontend),
     });
-    println!("HTTP -> {:?}", command.read_message());
+    info!("HTTP -> {:?}", command.read_message());
 
     info!("expecting 503");
     match agent.get("http://example.com:8080/").call().unwrap_err() {
@@ -115,7 +115,7 @@ fn test() {
         order: proxy::ProxyRequestOrder::AddBackend(http_backend),
     });
 
-    println!("HTTP -> {:?}", command.read_message());
+    info!("HTTP -> {:?}", command.read_message());
 
     info!("sending invalid request, expecting 400");
     let mut client = TcpStream::connect(("127.0.0.1", 8080)).expect("could not parse address");
@@ -123,7 +123,7 @@ fn test() {
     client.set_read_timeout(Some(Duration::new(1, 0)));
 
     let w = client.write(&b"HELLO\r\n\r\n"[..]);
-    println!("http client write: {:?}", w);
+    info!("http client write: {:?}", w);
 
     let expected_answer =
         "HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
@@ -131,19 +131,19 @@ fn test() {
     let mut index = 0;
 
     let r = client.read(&mut buffer[..]);
-    println!("http client read: {:?}", r);
+    info!("http client read: {:?}", r);
     match r {
         Err(e) => assert!(false, "client request should not fail. Error: {:?}", e),
         Ok(sz) => {
             index += sz;
             let answer =
                 str::from_utf8(&buffer[..index]).expect("could not make string from buffer");
-            println!("Response: {}", answer);
+            info!("Response: {}", answer);
         }
     }
 
     let answer = str::from_utf8(&buffer[..index]).expect("could not make string from buffer");
-    println!("Response: {}", answer);
+    info!("Response: {}", answer);
     assert_eq!(answer, expected_answer);
 
     let barrier = Arc::new(Barrier::new(2));
@@ -237,7 +237,7 @@ fn test() {
     info!("server closes, expecting 503");
     match agent.get("http://example.com:8080/").call().unwrap_err() {
         ureq::Error::Status(503, res) => {
-            println!("res: {:?}", res);
+            info!("res: {:?}", res);
             assert_eq!(res.status_text(), "Service Unavailable");
         }
         e => panic!("invalid response: {:?}", e),
@@ -279,7 +279,7 @@ fn test() {
     barrier.wait();
     info!("expecting upgrade (101 switching protocols)");
     let res = agent.get("http://example.com:8080/").call().unwrap();
-    println!("res: {:?}", res);
+    info!("res: {:?}", res);
     assert_eq!(res.status(), 101);
     assert_eq!(res.header("Upgrade"), Some("WebSocket"));
     assert_eq!(res.header("Connection"), Some("Upgrade"));
@@ -321,6 +321,7 @@ fn start_server(port: u16, barrier: Arc<Barrier>) {
 
         barrier.wait();
         for request in server.incoming_requests() {
+            // DISCUSS: should this be logged with error! instead?
             eprintln!(
                 "backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
                 request.method(),

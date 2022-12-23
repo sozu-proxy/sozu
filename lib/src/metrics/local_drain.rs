@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, str, time::Instant};
 
 use anyhow::Context;
 use hdrhistogram::Histogram;
+use tracing::{debug, error, trace};
 
 use crate::sozu_command::proxy::{
     ClusterMetricsData, FilteredData, MetricsConfiguration, Percentiles, QueryAnswerMetrics,

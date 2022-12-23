@@ -1,6 +1,7 @@
 use std::str;
 
 use nom::{Err, HexDisplay, IResult, Offset};
+use tracing::{debug, error};
 use url::Url;
 
 use crate::{

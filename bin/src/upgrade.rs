@@ -12,11 +12,12 @@ use libc::{self, pid_t};
 use mio::net::UnixStream;
 use nix::unistd::*;
 use serde::{Deserialize, Serialize};
-
 use tempfile::tempfile;
+use tracing::{error, info, trace};
 
 use sozu_command_lib::{
-    channel::Channel, command::RunState, config::Config, proxy::ProxyRequest, state::ConfigState,
+    channel::Channel, command::RunState, config::Config, logging::setup_tracing_subscriber,
+    proxy::ProxyRequest, state::ConfigState,
 };
 
 use crate::{
@@ -133,7 +134,7 @@ pub fn fork_main_into_new_main(
     }
 }
 
-/// Called by the child of a main process fork. 
+/// Called by the child of a main process fork.
 /// Starts new main process with upgrade data, notifies the old main process
 pub fn begin_new_main_process(
     new_to_old_channel_fd: i32,
@@ -157,7 +158,8 @@ pub fn begin_new_main_process(
         serde_json::from_reader(upgrade_file).with_context(|| "could not parse upgrade data")?;
     let config = upgrade_data.config.clone();
 
-    util::setup_logging(&config, "MAIN");
+    setup_tracing_subscriber(&config, "MAIN")?;
+
     util::setup_metrics(&config).with_context(|| "Could not setup metrics")?;
     //info!("new main got upgrade data: {:?}", upgrade_data);
 

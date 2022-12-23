@@ -3,6 +3,7 @@ use std::io::ErrorKind;
 use mio::net::*;
 use rustls::ServerConnection;
 use rusty_ulid::Ulid;
+use tracing::{debug, error, info, trace};
 
 use crate::{protocol::ProtocolResult, Readiness, Ready, SessionResult};
 

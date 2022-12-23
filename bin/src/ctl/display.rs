@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
+use tracing::trace;
 
 use sozu_command_lib::{
     command::{CommandResponseContent, ListedFrontends, WorkerInfo},
