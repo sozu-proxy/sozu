@@ -866,7 +866,7 @@ pub fn setup_tracing_subscriber_with_env() {
 pub fn setup_test_logger(test_name: &str) {
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
-        .pretty()
+        // .pretty()
         .with_line_number(true)
         .with_span_events(FmtSpan::FULL)
         .init();

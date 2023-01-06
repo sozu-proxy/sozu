@@ -2180,7 +2180,9 @@ mod tests {
         println!("test received: {:?}", command.read_message());
         println!("test received: {:?}", command.read_message());
 
-        let mut client = TcpStream::connect(("127.0.0.1", 1031)).expect("could not parse address");
+        let mut client = TcpStream::connect(("127.0.0.1", 1031))
+            .expect(&format!("could not connect to address {}", address));
+
         // 5 seconds of timeout
         client.set_read_timeout(Some(Duration::new(5, 0))).unwrap();
 
@@ -2308,7 +2310,8 @@ mod tests {
         info!("test received: {:?}", command.read_message());
         info!("test received: {:?}", command.read_message());
 
-        let mut client = TcpStream::connect(("127.0.0.1", 1041)).expect("could not parse address");
+        let mut client = TcpStream::connect(address)
+            .expect(&format!("could not connect to address {}", address));
         // 5 seconds of timeout
         client.set_read_timeout(Some(Duration::new(5, 0))).unwrap();
 

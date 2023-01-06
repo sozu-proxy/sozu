@@ -8,7 +8,7 @@ extern crate ureq;
 
 use std::{
     io::{stdout, Read, Write},
-    net::{TcpListener, TcpStream, ToSocketAddrs},
+    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     str,
     sync::{Arc, Barrier},
     thread,
@@ -118,7 +118,10 @@ fn main_test() {
     info!("HTTP -> {:?}", command.read_message());
 
     info!("sending invalid request, expecting 400");
-    let mut client = TcpStream::connect(("127.0.0.1", 8080)).expect("could not parse address");
+    let address_8080: SocketAddr =
+        str::FromStr::from_str("127.0.0.1:8080").expect("could not parse address");
+    let mut client = TcpStream::connect(address_8080)
+        .expect(&format!("could not connect to address {}", address_8080));
     // 1 seconds of timeout
     client.set_read_timeout(Some(Duration::new(1, 0)));
 
@@ -149,8 +152,12 @@ fn main_test() {
     let barrier = Arc::new(Barrier::new(2));
     let barrier2 = barrier.clone();
 
+    let address_2048: SocketAddr =
+        str::FromStr::from_str("127.0.0.1:2048").expect("could not parse address");
+
     let _ = thread::spawn(move || {
-        let listener = TcpListener::bind("127.0.0.1:2048").expect("could not parse address");
+        let listener = TcpListener::bind(address_2048)
+            .expect(&format!("could not connect to address {}", address_2048));
         barrier2.wait();
         let mut stream = listener.incoming().next().unwrap().unwrap();
         let response = b"TEST\r\n\r\n";
@@ -191,7 +198,8 @@ fn main_test() {
 
     let barrier2 = barrier.clone();
     let _ = thread::spawn(move || {
-        let listener = TcpListener::bind("127.0.0.1:2048").expect("could not parse address");
+        let listener = TcpListener::bind(address_2048)
+            .expect(&format!("could not connect to address {}", address_2048));
         barrier2.wait();
         let mut stream = listener.incoming().next().unwrap().unwrap();
         let response = b"HTTP/1.1 200 Ok\r\nConnection: close\r\nContent-Length: 5\r\n\r\nHello";
@@ -210,7 +218,8 @@ fn main_test() {
 
     let barrier2 = barrier.clone();
     let _ = thread::spawn(move || {
-        let listener = TcpListener::bind("127.0.0.1:2048").expect("could not parse address");
+        let listener = TcpListener::bind(address_2048)
+            .expect(&format!("could not connect to address {}", address_2048));
         barrier2.wait();
         let mut stream = listener.incoming().next().unwrap().unwrap();
         let response = b"HTTP/1.1 200 Ok\r\nConnection: close\r\n\r\nHello world!";
@@ -227,7 +236,8 @@ fn main_test() {
 
     let barrier2 = barrier.clone();
     let _ = thread::spawn(move || {
-        let listener = TcpListener::bind("127.0.0.1:2048").expect("could not parse address");
+        let listener = TcpListener::bind(address_2048)
+            .expect(&format!("could not connect to address {}", address_2048));
         barrier2.wait();
         let stream = listener.incoming().next().unwrap().unwrap();
         stream.shutdown(std::net::Shutdown::Both).unwrap();
@@ -268,7 +278,8 @@ fn main_test() {
 
     let barrier2 = barrier.clone();
     let _ = thread::spawn(move || {
-        let listener = TcpListener::bind("127.0.0.1:2048").expect("could not parse address");
+        let listener = TcpListener::bind(address_2048)
+            .expect(&format!("could not connect to address {}", address_2048));
         barrier2.wait();
         let mut stream = listener.incoming().next().unwrap().unwrap();
         let response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n";

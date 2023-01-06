@@ -1597,9 +1597,11 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::os::unix::io::IntoRawFd;
+    use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Barrier};
     use std::{str, thread};
+
     static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
 
     /*
@@ -1623,9 +1625,15 @@ mod tests {
         let _tx = start_proxy().expect("Could not start proxy");
         barrier.wait();
 
-        let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
-        let s3 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
-        let mut s2 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
+        let address: SocketAddr =
+            FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
+
+        let mut s1 = TcpStream::connect(address)
+            .expect(&format!("could not connect to address {}", address));
+        let s3 = TcpStream::connect(address)
+            .expect(&format!("could not connect to address {}", address));
+        let mut s2 = TcpStream::connect(address)
+            .expect(&format!("could not connect to address {}", address));
 
         s1.write(&b"hello "[..])
             .map_err(|e| {
@@ -1680,7 +1688,8 @@ mod tests {
     }
 
     fn start_server(barrier: Arc<Barrier>) {
-        let listener = TcpListener::bind("127.0.0.1:5678").expect("could not parse address");
+        let listener = TcpListener::bind("127.0.0.1:5678")
+            .expect("could not connect to address 127.0.0.1:5678");
         fn handle_client(stream: &mut TcpStream, id: u8) {
             let mut buf = [0; 128];
             let _response = b" END";
