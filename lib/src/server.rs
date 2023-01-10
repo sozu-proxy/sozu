@@ -569,7 +569,10 @@ impl Server {
                                 break;
                             }
 
-                            self.read_channel_messages_and_notify();
+                            // exit the big loop if the message is HardStop
+                            if self.read_channel_messages_and_notify() {
+                                return;
+                            }
 
                             QUEUE.with(|queue| {
                                 if !(*queue.borrow()).is_empty() {
@@ -679,9 +682,10 @@ impl Server {
         timeout.and_then(|t| std::time::Duration::try_from(t).ok())
     }
 
-    fn read_channel_messages_and_notify(&mut self) {
+    /// Returns true if hardstop
+    fn read_channel_messages_and_notify(&mut self) -> bool {
         if !self.channel.readiness().is_readable() {
-            return;
+            return false;
         }
 
         if let Err(e) = self.channel.readable() {
@@ -700,7 +704,7 @@ impl Server {
                         if let Err(e) = self.channel.run() {
                             error!("Error while running the server channel: {}", e);
                         }
-                        return;
+                        return true;
                     }
                     ProxyRequestOrder::SoftStop => {
                         self.shutting_down = Some(request.id.clone());
@@ -726,6 +730,7 @@ impl Server {
                 }
             }
         }
+        false
     }
 
     fn zombie_check(&mut self) {

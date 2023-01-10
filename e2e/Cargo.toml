@@ -1,0 +1,14 @@
+[package]
+name = "sozu-e2e"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sozu-lib = { path = "../lib" }
+sozu-command-lib = { path = "../command" }
+slab = "^0.4.7"
+mio = "^0.8.4"
+time = "^0.3.14"
+futures = "^0.3.24"
+libc = "^0.2.138"
+serial_test = "^0.10.0"
