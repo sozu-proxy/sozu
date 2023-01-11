@@ -99,6 +99,7 @@ impl CommandManager {
                 ListenerCmd::Http { cmd } => self.http_listener_command(cmd),
                 ListenerCmd::Https { cmd } => self.https_listener_command(cmd),
                 ListenerCmd::Tcp { cmd } => self.tcp_listener_command(cmd),
+                ListenerCmd::List => self.list_listeners(),
             },
             SubCmd::Certificate { cmd } => match cmd {
                 CertificateCmd::Add {

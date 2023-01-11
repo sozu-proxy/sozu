@@ -16,7 +16,8 @@ use sozu_command_lib::{
     buffer::fixed::Buffer,
     command::{
         CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
-        CommandStatus, FrontendFilters, ListedFrontends, RunState, WorkerInfo, PROTOCOL_VERSION,
+        CommandStatus, FrontendFilters, ListedFrontends, ListenersList, RunState, WorkerInfo,
+        PROTOCOL_VERSION,
     },
     config::Config,
     logging,
@@ -55,6 +56,7 @@ impl CommandServer {
             CommandRequestOrder::DumpState => self.dump_state().await,
             CommandRequestOrder::ListWorkers => self.list_workers().await,
             CommandRequestOrder::ListFrontends(filters) => self.list_frontends(filters).await,
+            CommandRequestOrder::ListListeners => self.list_listeners(),
             CommandRequestOrder::LoadState { path } => {
                 self.load_state(
                     Some(request_identifier.client),
@@ -416,6 +418,16 @@ impl CommandServer {
 
         Ok(Some(Success::ListFrontends(
             CommandResponseContent::FrontendList(listed_frontends),
+        )))
+    }
+
+    fn list_listeners(&self) -> anyhow::Result<Option<Success>> {
+        Ok(Some(Success::ListListeners(
+            CommandResponseContent::ListenersList(ListenersList {
+                http_listeners: self.state.http_listeners.clone(),
+                https_listeners: self.state.https_listeners.clone(),
+                tcp_listeners: self.state.tcp_listeners.clone(),
+            }),
         )))
     }
 
@@ -1402,6 +1414,7 @@ impl CommandServer {
                     | Success::ListFrontends(crd)
                     | Success::ListWorkers(crd)
                     | Success::Query(crd)
+                    | Success::ListListeners(crd)
                     | Success::Status(crd) => Some(crd),
                     _ => None,
                 };

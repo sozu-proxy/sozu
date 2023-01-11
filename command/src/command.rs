@@ -1,9 +1,13 @@
-use std::{collections::BTreeMap, fmt, net::SocketAddr};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    net::SocketAddr,
+};
 
 use crate::{
     proxy::{
-        AggregatedMetricsData, HttpFrontend, ProxyEvent, ProxyRequestOrder, QueryAnswer,
-        TcpFrontend,
+        AggregatedMetricsData, HttpFrontend, HttpListener, HttpsListener, ProxyEvent,
+        ProxyRequestOrder, QueryAnswer, TcpFrontend, TcpListener,
     },
     state::ConfigState,
 };
@@ -17,15 +21,21 @@ pub enum CommandRequestOrder {
     /// an order to forward to workers
     Proxy(Box<ProxyRequestOrder>),
     /// save Sōzu's parseable state as a file
-    SaveState { path: String },
+    SaveState {
+        path: String,
+    },
     /// load a state file
-    LoadState { path: String },
+    LoadState {
+        path: String,
+    },
     /// dump the state in JSON
     DumpState,
     /// list the workers and their status
     ListWorkers,
     /// list the frontends, filtered by protocol and/or domain
     ListFrontends(FrontendFilters),
+    // list all listeners
+    ListListeners,
     /// launche a new worker
     LaunchWorker(String),
     /// upgrade the main process
@@ -35,7 +45,9 @@ pub enum CommandRequestOrder {
     /// subscribe to proxy events
     SubscribeEvents,
     /// reload the configuration from the config file, or a new file
-    ReloadConfiguration { path: Option<String> },
+    ReloadConfiguration {
+        path: Option<String>,
+    },
     /// give status of main process and all workers
     Status,
 }
@@ -96,6 +108,8 @@ pub enum CommandResponseContent {
     FrontendList(ListedFrontends),
     // this is new
     Status(Vec<WorkerInfo>),
+    /// all listeners
+    ListenersList(ListenersList),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -103,6 +117,15 @@ pub struct ListedFrontends {
     pub http_frontends: Vec<HttpFrontend>,
     pub https_frontends: Vec<HttpFrontend>,
     pub tcp_frontends: Vec<TcpFrontend>,
+}
+
+/// All listeners, listed for the CLI.
+/// the bool indicates if it is active or not
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ListenersList {
+    pub http_listeners: HashMap<SocketAddr, (HttpListener, bool)>,
+    pub https_listeners: HashMap<SocketAddr, (HttpsListener, bool)>,
+    pub tcp_listeners: HashMap<SocketAddr, (TcpListener, bool)>,
 }
 
 /// Responses of the main process to the CLI (or other client)

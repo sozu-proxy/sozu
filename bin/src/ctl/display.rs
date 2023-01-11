@@ -7,12 +7,116 @@ use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::{
-    command::{CommandResponseContent, ListedFrontends, WorkerInfo},
+    command::{CommandResponseContent, ListedFrontends, ListenersList, WorkerInfo},
     proxy::{
         AggregatedMetricsData, ClusterMetricsData, FilteredData, QueryAnswer,
         QueryAnswerCertificate, QueryAnswerMetrics, Route, WorkerMetrics,
     },
 };
+
+pub fn print_listeners(listeners_list: ListenersList) {
+    println!("\nHTTP LISTENERS\n================");
+
+    for (_, (http_listener, activated)) in listeners_list.http_listeners.iter() {
+        let mut table = Table::new();
+        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+        table.add_row(row![
+            "socket address",
+            format!("{:?}", http_listener.address)
+        ]);
+        table.add_row(row![
+            "public address",
+            format!("{:?}", http_listener.public_address),
+        ]);
+        table.add_row(row!["404", http_listener.answer_404]);
+        table.add_row(row!["503", http_listener.answer_503]);
+        table.add_row(row!["expect proxy", http_listener.expect_proxy]);
+        table.add_row(row!["sticky name", http_listener.sticky_name]);
+        table.add_row(row!["front timeout", http_listener.front_timeout]);
+        table.add_row(row!["back timeout", http_listener.back_timeout]);
+        table.add_row(row!["connect timeout", http_listener.connect_timeout]);
+        table.add_row(row!["request timeout", http_listener.request_timeout]);
+        table.add_row(row!["activated", activated]);
+        table.printstd();
+    }
+
+    println!("\nHTTPS LISTENERS\n================");
+
+    for (_, (https_listener, activated)) in listeners_list.https_listeners.iter() {
+        let mut table = Table::new();
+        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+        let mut tls_versions = String::new();
+        for tls_version in https_listener.versions.iter() {
+            tls_versions.push_str(&format!("{:?}\n", tls_version));
+        }
+
+        table.add_row(row![
+            "socket address",
+            format!("{:?}", https_listener.address)
+        ]);
+        table.add_row(row![
+            "public address",
+            format!("{:?}", https_listener.public_address)
+        ]);
+        table.add_row(row!["404", https_listener.answer_404,]);
+        table.add_row(row!["503", https_listener.answer_503,]);
+        table.add_row(row!["versions", tls_versions]);
+        table.add_row(row![
+            "cipher list",
+            list_string_vec(&https_listener.cipher_list),
+        ]);
+        table.add_row(row![
+            "cipher suites",
+            list_string_vec(&https_listener.cipher_suites),
+        ]);
+        table.add_row(row![
+            "signature algorithms",
+            list_string_vec(&https_listener.signature_algorithms),
+        ]);
+        table.add_row(row![
+            "groups list",
+            list_string_vec(&https_listener.groups_list),
+        ]);
+        table.add_row(row!["key", format!("{:?}", https_listener.key),]);
+        table.add_row(row!["expect proxy", https_listener.expect_proxy,]);
+        table.add_row(row!["sticky name", https_listener.sticky_name,]);
+        table.add_row(row!["front timeout", https_listener.front_timeout,]);
+        table.add_row(row!["back timeout", https_listener.back_timeout,]);
+        table.add_row(row!["connect timeout", https_listener.connect_timeout,]);
+        table.add_row(row!["request timeout", https_listener.request_timeout,]);
+        table.add_row(row!["activated", activated]);
+        table.printstd();
+    }
+
+    println!("\nTCP LISTENERS\n================");
+
+    if !listeners_list.tcp_listeners.is_empty() {
+        let mut table = Table::new();
+        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+        table.add_row(row!["TCP frontends"]);
+        table.add_row(row![
+            "socket address",
+            "public address",
+            "expect proxy",
+            "front timeout",
+            "back timeout",
+            "connect timeout",
+            "activated"
+        ]);
+        for (_, (tcp_listener, activated)) in listeners_list.tcp_listeners.iter() {
+            table.add_row(row![
+                format!("{:?}", tcp_listener.address),
+                format!("{:?}", tcp_listener.public_address),
+                tcp_listener.expect_proxy,
+                tcp_listener.front_timeout,
+                tcp_listener.back_timeout,
+                tcp_listener.connect_timeout,
+                activated,
+            ]);
+        }
+        table.printstd();
+    }
+}
 
 pub fn print_status(worker_info_vec: Vec<WorkerInfo>) {
     let mut table = Table::new();
@@ -625,4 +729,13 @@ pub fn print_available_metrics(answers: &BTreeMap<String, QueryAnswer>) -> anyho
         println!("\t{}", metric_name);
     }
     Ok(())
+}
+
+fn list_string_vec(vec: &Vec<String>) -> String {
+    let mut output = String::new();
+    for item in vec.iter() {
+        output.push_str(&item);
+        output.push_str("\n");
+    }
+    output
 }
