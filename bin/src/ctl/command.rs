@@ -118,14 +118,14 @@ impl CommandManager {
                     }
                     match response.content {
                         Some(response_content) => match response_content {
-                            CommandResponseContent::Workers(_) => todo!(),
-                            CommandResponseContent::Metrics(_) => todo!(),
-                            CommandResponseContent::Query(_) => todo!(),
+                            CommandResponseContent::Workers(_)
+                            | CommandResponseContent::Metrics(_)
+                            | CommandResponseContent::Query(_)
+                            | CommandResponseContent::Event(_) => {}
                             CommandResponseContent::State(state) => match json {
                                 true => print_json_response(&state)?,
                                 false => println!("{:#?}", state),
                             },
-                            CommandResponseContent::Event(_) => todo!(),
                             CommandResponseContent::FrontendList(frontends) => {
                                 print_frontend_list(frontends)
                             }
