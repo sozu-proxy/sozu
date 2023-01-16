@@ -219,7 +219,10 @@ pub enum SubCmd {
         email: String,
         #[clap(long = "id", help = "cluster identifier (usually an application)")]
         cluster_id: String,
-        #[clap(long = "old-cert", help = "path of the previous certificate (optional)")]
+        #[clap(
+            long = "old-cert",
+            help = "path of the previous certificate (optional)"
+        )]
         old_certificate_path: Option<String>,
         #[clap(long = "new-cert", help = "where to write the new certificate")]
         new_certificate_path: String,
@@ -561,6 +564,8 @@ pub enum ListenerCmd {
         #[clap(subcommand)]
         cmd: TcpListenerCmd,
     },
+    #[clap(name = "list", about = "List all listeners")]
+    List,
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]

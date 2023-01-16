@@ -20,7 +20,7 @@ use crate::{
         create_channel,
         display::{
             print_available_metrics, print_certificates, print_frontend_list, print_json_response,
-            print_metrics, print_query_response_data, print_status,
+            print_listeners, print_metrics, print_query_response_data, print_status,
         },
         CommandManager,
     },
@@ -743,6 +743,30 @@ impl CommandManager {
                 }
                 CommandStatus::Ok => {
                     println!("{}", response.message);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn list_listeners(&mut self) -> anyhow::Result<()> {
+        let id = generate_id();
+
+        self.send_request(&id, CommandRequestOrder::ListListeners)?;
+
+        loop {
+            let response = self.read_channel_message_with_timeout()?;
+            match response.status {
+                CommandStatus::Processing => println!("processing order…"),
+                CommandStatus::Error => {
+                    bail!("could not get the list of listeners: {}", response.message);
+                }
+                CommandStatus::Ok => {
+                    match response.content {
+                        Some(CommandResponseContent::ListenersList(list)) => print_listeners(list),
+                        _ => println!("Received an unexpected response: {:?}", response),
+                    }
                     break;
                 }
             }

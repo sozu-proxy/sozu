@@ -115,6 +115,7 @@ pub enum Success {
     DumpState(CommandResponseContent), // the cloned state
     HandledClientRequest,
     ListFrontends(CommandResponseContent), // the list of frontends
+    ListListeners(CommandResponseContent), // the list of listeners
     ListWorkers(CommandResponseContent),
     LoadState(String, usize, usize), // state path, oks, errors
     Logging(String),                 // new logging level
@@ -149,6 +150,7 @@ impl std::fmt::Display for Success {
             Self::DumpState(_) => write!(f, "Successfully gathered state from the main process"),
             Self::HandledClientRequest => write!(f, "Successfully handled the client request"),
             Self::ListFrontends(_) => write!(f, "Successfully gathered the list of frontends"),
+            Self::ListListeners(_) => write!(f, "Successfully listed all listeners"),
             Self::ListWorkers(_) => write!(f, "Successfully listed all workers"),
             Self::LoadState(path, ok, error) => write!(
                 f,
