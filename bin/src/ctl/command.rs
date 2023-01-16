@@ -6,24 +6,21 @@ use serde::Serialize;
 use sozu_command_lib::{
     command::{
         CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
-        CommandStatus, FrontendFilters, RunState, WorkerInfo,
+        CommandStatus, RunState, WorkerInfo,
     },
     proxy::{
-        MetricsConfiguration, ProxyRequestOrder, Query, QueryCertificateType, QueryClusterDomain,
-        QueryClusterType, QueryMetricsOptions,
+        ProxyRequestOrder, Query, QueryCertificateType, QueryClusterDomain, QueryClusterType,
+        QueryMetricsOptions,
     },
 };
 
-use crate::{
-    cli::MetricsCmd,
-    ctl::{
-        create_channel,
-        display::{
-            print_available_metrics, print_certificates, print_frontend_list, print_json_response,
-            print_listeners, print_metrics, print_query_response_data, print_status,
-        },
-        CommandManager,
+use crate::ctl::{
+    create_channel,
+    display::{
+        print_available_metrics, print_certificates, print_frontend_list, print_json_response,
+        print_listeners, print_metrics, print_query_response_data, print_status,
     },
+    CommandManager,
 };
 
 // Used to display the JSON response of the status command
@@ -70,158 +67,78 @@ impl CommandManager {
             .with_context(|| "Command timeout. The proxy didn't send an answer")
     }
 
-    pub fn save_state(&mut self, path: String) -> Result<(), anyhow::Error> {
-        let id = generate_id();
-
-        self.send_request(&id, CommandRequestOrder::SaveState { path })?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            if id != response.id {
-                bail!("received message with invalid id: {:?}", response);
-            }
-            match response.status {
-                CommandStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
-                }
-                CommandStatus::Error => {
-                    bail!("could not save proxy state: {}", response.message)
-                }
-                CommandStatus::Ok => {
-                    println!("{}", response.message);
-                    break;
-                }
-            }
-        }
-
-        Ok(())
+    pub fn order_command(&mut self, order: CommandRequestOrder) -> Result<(), anyhow::Error> {
+        self.order_command_with_worker_id(order, None, false)
     }
 
-    pub fn load_state(&mut self, path: String) -> Result<(), anyhow::Error> {
-        let id = generate_id();
-
-        self.send_request(&id, CommandRequestOrder::LoadState { path: path.clone() })?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            if id != response.id {
-                bail!("received message with invalid id: {:?}", response);
-            }
-            match response.status {
-                CommandStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
-                }
-                CommandStatus::Error => {
-                    bail!("could not load proxy state: {}", response.message)
-                }
-                CommandStatus::Ok => {
-                    println!("Proxy state loaded successfully from {}", path);
-                    break;
-                }
-            }
-        }
-
-        Ok(())
+    pub fn order_command_with_json(
+        &mut self,
+        command_request_order: CommandRequestOrder,
+        json: bool,
+    ) -> Result<(), anyhow::Error> {
+        self.order_command_with_worker_id(command_request_order, None, json)
     }
 
-    pub fn dump_state(&mut self, json: bool) -> Result<(), anyhow::Error> {
+    pub fn order_command_with_worker_id(
+        &mut self,
+        command_request_order: CommandRequestOrder,
+        worker_id: Option<u32>,
+        json: bool,
+    ) -> Result<(), anyhow::Error> {
         let id = generate_id();
 
-        self.send_request(&id.clone(), CommandRequestOrder::DumpState)?;
+        let command_request = CommandRequest::new(id, command_request_order, worker_id);
+
+        println!("Sending command : {:?}", command_request);
+
+        self.channel
+            .write_message(&command_request)
+            .with_context(|| "Could not write the request")?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
 
-            if id != response.id {
-                bail!("received message with invalid id: {:?}", response);
+            if command_request.id != response.id {
+                bail!(
+                    "received message with invalid id. Was expecting id {}, got id {}:\n\t{:?}",
+                    command_request.id,
+                    response.id,
+                    response
+                );
             }
             match response.status {
-                CommandStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
-                }
-                CommandStatus::Error => {
+                CommandStatus::Processing => println!("Proxy is processing: {}", response.message),
+                CommandStatus::Error => bail!("Order failed: {}", response.message),
+                CommandStatus::Ok => {
                     if json {
+                        // why do we need to print a success message in json?
                         print_json_response(&response.message)?;
+                    } else {
+                        println!("Success: {}", response.message);
                     }
-                    bail!("could not dump proxy state: {}", response.message);
-                }
-                CommandStatus::Ok => match response.content {
-                    Some(CommandResponseContent::State(state)) => {
-                        match json {
-                            true => print_json_response(&state)?,
-                            false => println!("{:#?}", state),
-                        }
-                        break;
-                    }
-                    _ => bail!("state dump was empty"),
-                },
-            }
-        }
-        Ok(())
-    }
-
-    pub fn soft_stop(&mut self, proxy_id: Option<u32>) -> Result<(), anyhow::Error> {
-        println!("shutting down proxy");
-        let id = generate_id();
-
-        self.channel
-            .write_message(&CommandRequest::new(
-                id.clone(),
-                CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::SoftStop)),
-                proxy_id,
-            ))
-            .with_context(|| "Could not send the request using the channel")?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            if id != response.id {
-                bail!("received message with invalid id: {:?}", response);
-            }
-
-            match response.status {
-                CommandStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
-                }
-                CommandStatus::Error => {
-                    bail!("could not stop the proxy: {}", response.message);
-                }
-                CommandStatus::Ok => {
-                    println!("Proxy shut down with message: \"{}\"", response.message);
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn hard_stop(&mut self, proxy_id: Option<u32>) -> Result<(), anyhow::Error> {
-        println!("shutting down proxy");
-        let id = generate_id();
-        self.channel
-            .write_message(&CommandRequest::new(
-                id.clone(),
-                CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::HardStop)),
-                proxy_id,
-            ))
-            .with_context(|| "Could not send the request using the channel")?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            match response.status {
-                CommandStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
-                }
-                CommandStatus::Error => {
-                    bail!("could not stop the proxy: {}", response.message);
-                }
-                CommandStatus::Ok => {
-                    if id == response.id {
-                        println!("Proxy shut down: {}", response.message);
+                    match response.content {
+                        Some(response_content) => match response_content {
+                            CommandResponseContent::Workers(_) => todo!(),
+                            CommandResponseContent::Metrics(_) => todo!(),
+                            CommandResponseContent::Query(_) => todo!(),
+                            CommandResponseContent::State(state) => match json {
+                                true => print_json_response(&state)?,
+                                false => println!("{:#?}", state),
+                            },
+                            CommandResponseContent::Event(_) => todo!(),
+                            CommandResponseContent::FrontendList(frontends) => {
+                                print_frontend_list(frontends)
+                            }
+                            CommandResponseContent::Status(worker_info_vec) => {
+                                if json {
+                                    print_json_response(&worker_info_vec)?;
+                                } else {
+                                    print_status(worker_info_vec);
+                                }
+                            }
+                            CommandResponseContent::ListenersList(list) => print_listeners(list),
+                        },
+                        None => {}
                     }
                     break;
                 }
@@ -354,84 +271,9 @@ impl CommandManager {
                     response.message
                 ),
                 CommandStatus::Ok => {
+                    // this is necessary because we may receive responses about other workers
                     if id == response.id {
                         info!("Worker {} shut down: {}", worker_id, response.message);
-                    }
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn status(&mut self, json: bool) -> anyhow::Result<()> {
-        let request_id = generate_id();
-
-        self.send_request(&request_id, CommandRequestOrder::Status)?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            if request_id != response.id {
-                bail!("received message with invalid id: {:?}", response);
-            }
-
-            match response.status {
-                CommandStatus::Processing => {
-                    println!("server is processing: {}", response.message);
-                }
-                CommandStatus::Error => {
-                    if json {
-                        print_json_response(&response.message)?;
-                    }
-                    bail!("could not get the worker list: {}", response.message);
-                }
-                CommandStatus::Ok => match response.content {
-                    Some(CommandResponseContent::Status(worker_info_vec)) => {
-                        print_status(worker_info_vec);
-                        break;
-                    }
-                    Some(_) => {
-                        bail!("Received the wrong kind of response data from the command server")
-                    }
-                    None => bail!("No data in the response"),
-                },
-            }
-        }
-        Ok(())
-    }
-
-    pub fn configure_metrics(&mut self, cmd: MetricsCmd) -> Result<(), anyhow::Error> {
-        let id = generate_id();
-        //println!("will send message for metrics with id {}", id);
-
-        let configuration = match cmd {
-            MetricsCmd::Enable => MetricsConfiguration::Enabled(true),
-            MetricsCmd::Disable => MetricsConfiguration::Enabled(false),
-            MetricsCmd::Clear => MetricsConfiguration::Clear,
-            _ => bail!("The command passed to the configure_metrics function is wrong."),
-        };
-
-        self.send_request(
-            &id,
-            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::ConfigureMetrics(
-                configuration,
-            ))),
-        )?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            match response.status {
-                CommandStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
-                }
-                CommandStatus::Error => {
-                    bail!("Error with metrics command: {}", response.message);
-                }
-                CommandStatus::Ok => {
-                    if id == response.id {
-                        println!("Successful metrics command: {}", response.message);
                     }
                     break;
                 }
@@ -508,89 +350,6 @@ impl CommandManager {
                 termion::cursor::Restore,
                 termion::clear::BeforeCursor
             );
-        }
-
-        Ok(())
-    }
-
-    pub fn reload_configuration(
-        &mut self,
-        path: Option<String>,
-        json: bool,
-    ) -> Result<(), anyhow::Error> {
-        let id = generate_id();
-
-        self.send_request(&id, CommandRequestOrder::ReloadConfiguration { path })?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            if id != response.id {
-                bail!("received message with invalid id: {:?}", response);
-            }
-            match response.status {
-                CommandStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
-                }
-                CommandStatus::Error => {
-                    if json {
-                        return print_json_response(&response.message);
-                    }
-                    bail!("could not get the worker list: {}", response.message);
-                }
-                CommandStatus::Ok => {
-                    match json {
-                        true => print_json_response(&response.message)?,
-                        false => println!("Reloaded configuration: {}", response.message),
-                    }
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn list_frontends(
-        &mut self,
-        http: bool,
-        https: bool,
-        tcp: bool,
-        domain: Option<String>,
-    ) -> Result<(), anyhow::Error> {
-        let command = CommandRequestOrder::ListFrontends(FrontendFilters {
-            http,
-            https,
-            tcp,
-            domain,
-        });
-
-        let id = generate_id();
-        self.send_request(&id, command)?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            if id != response.id {
-                bail!("received message with invalid id: {:?}", response);
-            }
-            match response.status {
-                CommandStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
-                }
-                CommandStatus::Error => {
-                    println!("could not query proxy state: {}", response.message)
-                }
-                CommandStatus::Ok => {
-                    match response.content {
-                        Some(CommandResponseContent::FrontendList(frontends)) => {
-                            print_frontend_list(frontends)
-                        }
-                        _ => println!("Received a response of the wrong kind: {:?}", response),
-                    }
-                    break;
-                }
-            }
         }
 
         Ok(())
@@ -715,83 +474,6 @@ impl CommandManager {
                         }
                         _ => bail!("unexpected response: {:?}", response.content),
                     }
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn events(&mut self) -> Result<(), anyhow::Error> {
-        let id = generate_id();
-
-        self.send_request(&id, CommandRequestOrder::SubscribeEvents)?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-            match response.status {
-                CommandStatus::Processing => match response.content {
-                    Some(CommandResponseContent::Event(event)) => {
-                        println!("got event from worker({}): {:?}", response.message, event)
-                    }
-                    _ => {
-                        println!("Received an unexpected response: {:?}", response)
-                    }
-                },
-                CommandStatus::Error => {
-                    bail!("could not get proxy events: {}", response.message);
-                }
-                CommandStatus::Ok => {
-                    println!("{}", response.message);
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn list_listeners(&mut self) -> anyhow::Result<()> {
-        let id = generate_id();
-
-        self.send_request(&id, CommandRequestOrder::ListListeners)?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-            match response.status {
-                CommandStatus::Processing => println!("processing order…"),
-                CommandStatus::Error => {
-                    bail!("could not get the list of listeners: {}", response.message);
-                }
-                CommandStatus::Ok => {
-                    match response.content {
-                        Some(CommandResponseContent::ListenersList(list)) => print_listeners(list),
-                        _ => println!("Received an unexpected response: {:?}", response),
-                    }
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn order_command(&mut self, order: ProxyRequestOrder) -> Result<(), anyhow::Error> {
-        let id = generate_id();
-
-        let request_order = CommandRequestOrder::Proxy(Box::new(order));
-        println!("Sending request order: {:?}", request_order);
-        self.send_request(&id, request_order)?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            if id != response.id {
-                bail!("received message with invalid id: {:?}", response);
-            }
-            match response.status {
-                CommandStatus::Processing => println!("Proxy is processing: {}", response.message),
-                CommandStatus::Error => bail!("Order failed: {}", response.message),
-                CommandStatus::Ok => {
-                    println!("Success: {}", response.message);
                     break;
                 }
             }
