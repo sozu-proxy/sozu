@@ -316,6 +316,23 @@ pub struct Cluster {
     pub load_metric: Option<LoadMetric>,
 }
 
+impl Cluster {
+    pub fn default_with_id<S>(id: S) -> Self
+    where
+        S: ToString,
+    {
+        Self {
+            cluster_id: id.to_string(),
+            sticky_session: false,
+            https_redirect: false,
+            proxy_protocol: None,
+            load_balancing: LoadBalancingAlgorithms::RoundRobin,
+            answer_503: None,
+            load_metric: None,
+        }
+    }
+}
+
 fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
     a.ip().cmp(&b.ip()).then(a.port().cmp(&b.port()))
 }
