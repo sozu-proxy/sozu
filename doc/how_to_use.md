@@ -26,18 +26,9 @@ You can edit the reverse proxy's configuration with the `config.toml` file. You 
 
 **But** for more flexibility, you should use the command socket (you can find one end of that unix socket at the path designed by `command_socket` in the configuration file).
 
-You can use `sozuctl` to interact with the reverse proxy.
+You can use `sozu` binary to interact with the reverse proxy.
 
-Checkout sozuctl [documentation](../ctl/README.md) for more information.
-
-## Logging
-
-The reverse proxy uses `env_logger`. You can select which module displays logs at which level with an environment variable.
-Here is an example to display most logs at the `info` level, but at `trace` level for the HTTP parser module:
-
-```bash
-RUST_LOG=info,sozu_lib::parser::http11=trace ./target/debug/sozu
-```
+Checkout sozu's command line [documentation](./configure_cli.md) for more information.
 
 ## Run it with Docker
 
