@@ -1,4 +1,4 @@
-__BIN_DIR__/sozu.*                --  gen_context(system_u:object_r:sozu_exec_t,s0)
-__STATE_DIR__/sozu(/.*)?          --  gen_context(system_u:object_r:sozu_var_run_t,s0)
-/usr/lib/systemd/system/sozu.*    --  gen_context(system_u:object_r:sozu_unit_file_t,s0)
+__BINDIR__/sozu.*                --  gen_context(system_u:object_r:sozu_exec_t,s0)
+__STATEDIR__/sozu(/.*)?          --  gen_context(system_u:object_r:sozu_var_run_t,s0)
+__UNITDIR__/sozu.*               --  gen_context(system_u:object_r:sozu_unit_file_t,s0)
 

@@ -1,11 +1,15 @@
-# sozu proxy test config file
-
 # top level options
 
 # path to a file sozu can use to load an initial configuration state for its
 # routing. You can generate this file from sozu's current routing by running
-# the command `sozuctl state save -f state.json`
-saved_state = "__RUNDIR__/sozu/state.json"
+# the command `sozu state save -f state.json`
+# this must be RELATIVE to config.toml
+# saved_state = "__RUNDIR__/sozu/tate.json"
+
+# save the configuration to the saved_state file every time we receive a
+# configuration message on the configuration socket
+# defaults to false, and will not work if the 'saved_state' option is not set
+# automatic_state_save = false
 
 # logging verbosity. Possible values are "error", "warn", "info", "debug" and
 # "trace". For performance reasons, the logs at "debug" or "trace" level are
@@ -27,21 +31,24 @@ log_target = "stdout"
 
 # optional different target for access logs (IP addresses, domains, URI, HTTP status, etc)
 # It supports the same options as log_target
-# log_access_target = "file:///var/logs/sozu-access.log"
+# log_access_target = "file:///var/log/sozu-access.log"
 
 # path to the unix socket file used to send commands to sozu
-command_socket = "__RUNDIR__/sozu.sock"
+# default value points to "sozu.sock" file in the current directory
+command_socket = "__RUNDIR__/sozu/sozu.sock"
 
 # size in bytes of the buffer used by the command socket protocol. If the message
 # sent to sozu is too large, or the data that sozu must return is too large, the
 # buffer will grow up to max_command_buffer_size. If the buffer is still not large
 # enough sozu will close the connection
 # defaults to 1000000
-command_buffer_size = 16384
+command_buffer_size = 163840
+
 # defaults to command_buffer_size * 2
-max_command_buffer_size = 163840
+max_command_buffer_size = 1638400
 
 # the number of worker processes that will handle traffic
+# defaults to 2 workers
 worker_count = 2
 
 # indicates if workers should be automatically restarted if they crash / hang
@@ -57,33 +64,53 @@ handle_process_affinity = false
 # maximum number of connections to a worker. If it reached that number and
 # there are new connections available, the worker will accept and close them
 # immediately to indicate it is too busy to handle traffic
-max_connections = 500
+# defaults to 10000 maximum connections
+max_connections = 10000
 
-# maximum number of buffers used by the protocol implementations for active
-# connections (ie currently serving a request). For now, you should estimate
-# that max_buffers = number of concurrent requests * 2
-max_buffers = 500
+# maximum number of buffers in the pool used by the protocol implementations
+# for active connections (ie currently serving a request). For now, you should
+# estimate that max_buffers = number of concurrent requests * 2
+# defaults to 1000
+max_buffers = 20000
+
+# minimum number of buffers preallocated in the pool
+# cannot be larger than max_buffers
+# defaults to 1
+# min_buffers = 1
 
 # size of the buffers used by the protocol implementations. Each worker will
 # preallocate max_buffers * 2 * buffer_size bytes, so you should plan for this
 # memory usage. If you plan to use sozu's runtime upgrade feature, you should
 # leave enough memory for one more worker (also for the kernel, etc), so total
 # RAM should be larger than (worker count + 1) * max_buffers * 2 * buffer_size bytes
-buffer_size = 16384
+# defaults to 16393 (minimum size for HTTP/2 is a 16384 bytes frame + 9 bytes of header
+buffer_size = 16393
 
 # how much time (in milliseconds) sozuctl will wait for a command to complete.
 # Defaults to 1000 milliseconds
-#ctl_command_timeout = 1000
+# ctl_command_timeout = 1000
 
 # PID file is a file containing the PID of the main process of sozu.
 # It can be helpful to help systemd or any other service system to keep track
 # of the main process across upgrades. PID file is not created unless this option
 # is set or if SOZU_PID_FILE_PATH environment variable was defined at build time.
-# pid_file_path = "__RUNDIR__/sozu/sozu.pid"
+pid_file_path = "__RUNDIR__/sozu/sozu.pid"
 
 # maximum time of inactivity for a frontend socket, in seconds
-# defaults to 60 seconds
-# front_timeout = 60
+# defaults to 60 seconds, can be specified at the listener level
+front_timeout = 3600
+
+# maximum time of inactivity for a backend socket, in seconds
+# defaults to 30 seconds, can be specified at the listener level
+back_timeout = 3600
+
+# maximum time to connect to a backend server, in seconds
+# defaults to 3 seconds, can be specified at the listener level
+connect_timeout = 3
+
+# maximum time to receive a request since the connection started
+# defaults to 10 seconds, can be specified at the listener level
+request_timeout = 180
 
 # duration between zombie checks, in seconds
 # defaults to 30 minutes
@@ -91,7 +118,12 @@ buffer_size = 16384
 # sessions could be stuck, not receiving any more event, and consuming resources.
 # sozu verifies regularly if there are such zombie sessions, logs their state
 # and removes them
-# zombie_check_interval = 1800
+zombie_check_interval = 1800
+
+# by default, all listeners start a TCP listen socket o startup
+# if set to false, this option will prevent them from listening. You can then add
+# the complete configuration, and send an ActivateListener message afterwards
+activate_listeners = true
 
 # various statistics can be sent to a server that supports the statsd protocol
 # You can see those statistics with sozuctl, like this: `sozuctl metrics` or
@@ -110,112 +142,75 @@ buffer_size = 16384
 # Example for a HTTP (plaintext) listener
 [[listeners]]
 protocol = "http"
+
 # listening address
 address = "0.0.0.0:80"
 
 # specify a different IP than the one the socket sees, for logs and forwarded headers
+# this option is incompatible with expect_proxy
 # public_address = "1.2.3.4:80"
 
 # path to custom 404 and 503 answers
 # a 404 response is sent when sozu does not know about the requested domain or path
 # a 503 response is sent if there are no backend servers available
-#answer_404 = "__DATADIR__/html/404.html"
-#answer_503 = "__DATADIR__/html/503.html"
+answer_404 = "__DATADIR__/html/404.html"
+answer_503 = "__DATADIR__/html/503.html"
 
 # defines the sticky session cookie's name, if `sticky_session` is activated for
 # a cluster. Defaults to "SOZUBALANCEID"
 # sticky_name = "SOZUBALANCEID"
-#
+
 # Configures the client socket to receive a PROXY protocol header
+# this option is incompatible with public_address
 # expect_proxy = false
 
-# Example for a HTTPS (rustls based) listener
+# Example for a HTTPS listener
 [[listeners]]
 protocol = "https"
+
 # listening address
 address = "0.0.0.0:443"
 
 # specify a different IP than the one the socket sees, for logs and forwarded headers
-# public_address = "1.2.3.4:443"
+# this option is incompatible with expect_proxy
+# public_address = "1.2.3.4:80"
 
-#answer_404 = "__DATADIR__/html/404.html"
-#answer_503 = "__DATADIR__/html/503.html"
+answer_404 = "__DATADIR__/html/404.html"
+answer_503 = "__DATADIR__/html/503.html"
 # sticky_name = "SOZUBALANCEID"
 
 # Configures the client socket to receive a PROXY protocol header
+# this option is incompatible with public_address
 # expect_proxy = false
 
-# supported TLS versions. Possible values are "SSLv2", "SSLv3",
-# "TLSv1.2", "TLSv1.3". Defaults to ["TLSv1.2", "TLSv1.3"]
-# tls_versions = ["TLSv1.2", "TLSv1.3"]
+# Supported TLS versions. Possible values are "SSLv2", "SSLv3", "TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3".
+# Defaults to `["TLSv1.2", "TLSv1.3"]`. Besides, `rustls` tls provider only support "TLSv1.2" and "TLSv1.3" values.
+tls_versions = ["TLSv1.2", "TLSv1.3"]
 
-# cipher combinations used by rustls
-# ciphersuites names, specified in https://docs.rs/rustls/0.13.0/rustls/static.ALL_CIPHERSUITES.html
-# defaults to all supported ciphersuites
-#rustls_cipher_list = ["TLS13_CHACHA20_POLY1305_SHA256"]
-
-
-# options specific to a TCP proxy listener
-#[[listeners]]
-# protocol = "tcp"
-# address = "127.0.0.1:8081"
-# specify a different IP than the one the socket sees, for logs and forwarded headers
-# public_address = "1.2.3.4:81"
-# Configures the client socket to receive a PROXY protocol header
-# expect_proxy = false
-
-# static configuration for clusters
+# TLS ciphers considered as secure can be retrieved on the ANSSI document located here:
+# https://www.ssi.gouv.fr/uploads/2020/03/anssi-guide-recommandations_de_securite_relatives_a_tls-v1.2.pdf
 #
-# those clusters will be routed by sozu directly from start
-[clusters]
-
-# every cluster has an "cluster id", here it is "MyCluster"
-# this is an example of a routing configuration for the HTTP and HTTPS proxies
-[clusters.MyCluster]
-
-# the protocol option indicates if we will use HTTP or TCP proxying
-# possible options are "http" or "tcp"
-protocol = "http"
-
-# per cluster load balancing algorithm. The possible values are
-# "roundrobin" and "random". Defaults to "roundrobin"
-# load_balancing_policy="roundrobin"
-
-# frontends configuration
-# this specifies which listeners; domains, certificates that will be configured for an cluster
-# each element of the array must be specified on one line (toml format limitation)
-# possible frontend options:
-# - address: TCP listener
-# - hostname: host name of the cluster
-# - path_begin = "/api" # optional. an cluster can receive requests going to a hostname and path prefix
-# - sticky_session = false # activates sticky sessions for this cluster
-# - https_redirect = false #  activates automatic redirection to HTTPS for this cluster
-frontends = [
-  { address = "0.0.0.0:80", hostname = "lolcatho.st" },
-  { address = "0.0.0.0:443", hostname = "lolcatho.st", certificate = "__DATADIR__/ssl/certificate.pem", key = "__DATADIR__/ssl/key.pem", certificate_chain = "__DATADIR__/ssl/certificate_chain.pem" }
+# When using `Rustls` TLS provider:
+# * Sets the lists of availables ciphers (TLSv1.2 and TLSv1.3). Supported ciphers names are specified at
+#   https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html
+#
+cipher_list = [
+  # TLS 1.3 cipher suites
+  "TLS13_AES_256_GCM_SHA384",
+  "TLS13_AES_128_GCM_SHA256",
+  "TLS13_CHACHA20_POLY1305_SHA256",
+  # TLS 1.2 cipher suites
+  "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+  "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+  "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+  "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+  "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+  "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
 ]
 
-# backends configuration
-# this indicates the backend servers used by the cluster
-# possible options:
-# - address: IP and port of the backend server
-# - weight: weight used by the load balancing algorithm
-# - sticky-id: sticky session identifier
-backends = [
-  { address = "127.0.0.1:1026" }
-]
-
-# this is an example of a routing configuration for the TCP proxy
-[clusters.TcpTest]
-protocol = "tcp"
-
-frontends = [
-  { address = "0.0.0.0:81" }
-]
-
-# activates the proxy protocol to send IP information to the backend
-# send_proxy = false
-
-backends = [
-  { address = "127.0.0.1:1026" }
-]
+# default certificate and key
+# in case you want to set up TLS without SNI, you can define the default
+# certificate here
+#certificate = "../lib/assets/cert_test.pem"
+#key = "../lib/assets/key_test.pem"
+#certificate_chain = "../lib/assets/certificate_chain.pem"
