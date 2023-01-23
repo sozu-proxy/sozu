@@ -54,6 +54,7 @@ Run it with the command:
 
 ```bash
 docker run \
+  --ulimit nofile=262144:262144 \
   --name sozu-proxy \
   -v /run/sozu:/run/sozu \
   -v /path/to/config/file:/etc/sozu \

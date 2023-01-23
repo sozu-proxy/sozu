@@ -16,25 +16,25 @@ COPY . /source/
 WORKDIR /source/bin
 RUN cargo build --release --locked
 
-
-
 FROM alpine:$ALPINE_VERSION as bin
 
 EXPOSE 80
 EXPOSE 443
 
-ENTRYPOINT ["/sozu"]
-CMD ["start", "-c", "/etc/sozu/config.toml"]
-
 VOLUME /etc/sozu
 VOLUME /run/sozu
 
-ENV SOZU_CONFIG /etc/sozu/config.toml
 RUN mkdir /var/lib/sozu
 
-RUN apk update && apk add --no-cache openssl-dev \
+RUN apk update && apk add --no-cache \
   llvm-libunwind \
-  libgcc
+  libgcc \
+  ca-certificates
 
-COPY --from=builder /source/target/release/sozu sozu
-COPY os-build/docker/config.toml $SOZU_CONFIG
+COPY --from=builder /source/target/release/sozu /usr/local/bin/sozu
+COPY os-build/docker/config.toml /etc/sozu/config.toml
+COPY lib/assets/404.html /etc/sozu/html/404.html
+COPY lib/assets/503.html /etc/sozu/html/503.html
+
+ENTRYPOINT ["/usr/local/bin/sozu"]
+CMD ["start", "-c", "/etc/sozu/config.toml"]
