@@ -7,7 +7,108 @@
 //! reloading from a file regularly. The event loop runs in its own thread
 //! and receives commands through a message queue.
 //!
-//! A documented example is provided in `lib/example/minimal.rs`.
+//! To create a HTTP proxy, you first need to create an HTTP listener structure
+//! (there are configuration structures for the HTTPS and TCP proxies too).
+//!
+//! ```ignore
+//! let listener_config = HttpListener {
+//!     address: "127.0.0.1:8080"
+//!         .parse()
+//!         .with_context(|| "could not parse address")?,
+//!     ..Default::default()
+//! };
+//! ```
+//! Then create channels to communicate with the proxy thread.
+//! These channels are custom-made wrappers around mio unix sockets.
+//!
+//! ```ignore
+//! let (
+//!     mut client_channel, // to send requests to the proxy (and receive responses)
+//!     proxy_channel,      // for the proxy to receive requests (and send responses)
+//! ) = Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
+//!
+//! let join_handle = thread::spawn(move || {
+//!     let max_buffers = 500;
+//!     let buffer_size = 16384;
+//!     sozu::http::start(listener_config, proxy_channel, max_buffers, buffer_size);
+//! });
+//! ```
+//!
+//! Once the thread is launched, the proxy will start its event loop and handle
+//! events on the listening interface and port specified in the configuration
+//! object. Since no clusters were specified for the proxy, it will receive
+//! the connections, parse the request, then send a default (but configurable)
+//! answer.
+//!
+//! Create a cluster.
+//! A Cluster is a collection of frontends and backends and routing rules between them.
+//! It usually represents an application.
+//!
+//! ```ignore
+//! let mut cluster = Cluster::default_with_id("test");
+//! cluster.load_balancing = LoadBalancingAlgorithms::RoundRobin;
+//!
+//! client_channel.write_message(&ProxyRequest {
+//!     id: String::from("ID_ABCD"),
+//!     order: ProxyRequestOrder::AddCluster(cluster),
+//! });
+//! ```
+//! Create a frontend.
+//! It is very important that:
+//! - the hostname redirects to the IP address you specify
+//! - the port matches the one of the listener
+//!
+//! ```ignore
+//! let http_front = HttpFrontend {
+//!     route: Route::ClusterId("test".to_owned()),
+//!     address: "127.0.0.1:8080"
+//!         .parse()
+//!         .with_context(|| "could not parse address")?,
+//!     hostname: String::from("127.0.0.1"),
+//!     path: PathRule::Prefix(String::from("/")),
+//!     method: None,
+//!     position: RulePosition::Pre,
+//!     tags: Some(BTreeMap::from([
+//!         ("owner".to_owned(), "John".to_owned()),
+//!         ("id".to_owned(), "my-own-http-front".to_owned()),
+//!     ])),
+//! };
+//!
+//! client_channel.write_message(&ProxyRequest {
+//!     id: String::from("ID_EFGH"),
+//!     order: ProxyRequestOrder::AddHttpFrontend(http_front),
+//! });
+//! ```
+//! Create a backend.
+//! The cluster_id should match with the one previously used for cluster and frontends.
+//! The address and port are the one within the infrastructure.
+//!
+//! ```ignore
+//! let http_backend = Backend {
+//!     cluster_id: String::from("test"),
+//!     backend_id: String::from("test-0"),
+//!     address: "127.0.0.1:8000"
+//!         .parse()
+//!         .with_context(|| "could not parse address")?,
+//!     load_balancing_parameters: Some(LoadBalancingParams::default()),
+//!     sticky_id: None,
+//!     backup: None,
+//! };
+//!
+//! client_channel.write_message(&ProxyRequest {
+//!     id: String::from("ID_IJKL"),
+//!     order: ProxyRequestOrder::AddBackend(http_backend),
+//! });
+//! ```
+//!
+//! Now you can wait for the server thread to finish, so that it runs indefinitely 
+//! (unless you send) a SoftStop request.
+//!
+//! ```ignore
+//! let _ = join_handle.join();
+//! ```
+//!
+//! The same code example is provided with more details `lib/example/minimal.rs`.
 #![cfg_attr(feature = "unstable", feature(test))]
 #[cfg(all(feature = "unstable", test))]
 extern crate test;
