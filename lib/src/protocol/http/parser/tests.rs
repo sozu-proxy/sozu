@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
-use nom::{AsBytes, HexDisplay};
+use nom::HexDisplay;
 
 use crate::buffer_queue::{buf_with_capacity, OutputElement};
 #[cfg(test)]

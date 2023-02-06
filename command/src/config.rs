@@ -5,7 +5,7 @@ use std::{
     fs::File,
     io::{self, Error, ErrorKind, Read},
     net::SocketAddr,
-    path::PathBuf,
+    path::PathBuf, ops::Range,
 };
 
 use anyhow::{bail, Context};
@@ -1366,11 +1366,9 @@ impl Config {
 }
 
 pub fn display_toml_error(file: &str, error: &toml::de::Error) {
-    println!("error parsing the configuration file: {error}");
-    if let Some((line, column)) = error.line_col() {
-        let l_span = line.to_string().len();
-        println!("{}| {}", line + 1, file.lines().nth(line).unwrap());
-        println!("{}^", " ".repeat(l_span + 2 + column));
+    println!("error parsing the configuration file '{file}': {error}");
+    if let Some(Range { start, end}) = error.span() {
+        print!("error parsing the configuration file '{file}' at position: {start}, {end}");
     }
 }
 
