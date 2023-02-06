@@ -78,61 +78,61 @@ impl ConfigState {
 
     pub fn dispatch(&mut self, order: &ProxyRequestOrder) -> anyhow::Result<()> {
         match order {
-            &ProxyRequestOrder::AddCluster(ref cluster) => self
+            ProxyRequestOrder::AddCluster(cluster) => self
                 .add_cluster(cluster)
                 .with_context(|| "Could not add cluster"),
-            &ProxyRequestOrder::RemoveCluster { ref cluster_id } => self
+            ProxyRequestOrder::RemoveCluster { cluster_id } => self
                 .remove_cluster(cluster_id)
                 .with_context(|| "Could not remove cluster"),
-            &ProxyRequestOrder::AddHttpListener(ref listener) => self
+            ProxyRequestOrder::AddHttpListener(listener) => self
                 .add_http_listener(listener)
                 .with_context(|| "Could not add HTTP listener"),
-            &ProxyRequestOrder::AddHttpsListener(ref listener) => self
+            ProxyRequestOrder::AddHttpsListener(listener) => self
                 .add_https_listener(listener)
                 .with_context(|| "Could not add HTTPS listener"),
-            &ProxyRequestOrder::AddTcpListener(ref listener) => self
+            ProxyRequestOrder::AddTcpListener(listener) => self
                 .add_tcp_listener(listener)
                 .with_context(|| "Could not add TCP listener"),
-            &ProxyRequestOrder::RemoveListener(ref remove) => self
+            ProxyRequestOrder::RemoveListener(remove) => self
                 .remove_listener(remove)
                 .with_context(|| "Could not remove listener"),
-            &ProxyRequestOrder::ActivateListener(ref activate) => self
+            ProxyRequestOrder::ActivateListener(activate) => self
                 .activate_listener(activate)
                 .with_context(|| "Could not activate listener"),
-            &ProxyRequestOrder::DeactivateListener(ref deactivate) => self
+            ProxyRequestOrder::DeactivateListener(deactivate) => self
                 .deactivate_listener(deactivate)
                 .with_context(|| "Could not deactivate listener"),
-            &ProxyRequestOrder::AddHttpFrontend(ref front) => self
+            ProxyRequestOrder::AddHttpFrontend(front) => self
                 .add_http_frontend(front)
                 .with_context(|| "Could not add HTTP frontend"),
-            &ProxyRequestOrder::RemoveHttpFrontend(ref front) => self
+            ProxyRequestOrder::RemoveHttpFrontend(front) => self
                 .remove_http_frontend(front)
                 .with_context(|| "Could not remove HTTP frontend"),
-            &ProxyRequestOrder::AddCertificate(ref add) => self
+            ProxyRequestOrder::AddCertificate(add) => self
                 .add_certificate(add)
                 .with_context(|| "Could not add certificate"),
-            &ProxyRequestOrder::RemoveCertificate(ref remove) => self
+            ProxyRequestOrder::RemoveCertificate(remove) => self
                 .remove_certificate(remove)
                 .with_context(|| "Could not remove certificate"),
-            &ProxyRequestOrder::ReplaceCertificate(ref replace) => self
+            ProxyRequestOrder::ReplaceCertificate(replace) => self
                 .replace_certificate(replace)
                 .with_context(|| "Could not replace certificate"),
-            &ProxyRequestOrder::AddHttpsFrontend(ref front) => self
+            ProxyRequestOrder::AddHttpsFrontend(front) => self
                 .add_http_frontend(front)
                 .with_context(|| "Could not add HTTPS frontend"),
-            &ProxyRequestOrder::RemoveHttpsFrontend(ref front) => self
+            ProxyRequestOrder::RemoveHttpsFrontend(front) => self
                 .remove_http_frontend(front)
                 .with_context(|| "Could not remove HTTPS frontend"),
-            &ProxyRequestOrder::AddTcpFrontend(ref front) => self
+            ProxyRequestOrder::AddTcpFrontend(front) => self
                 .add_tcp_frontend(front)
                 .with_context(|| "Could not add TCP frontend"),
-            &ProxyRequestOrder::RemoveTcpFrontend(ref front) => self
+            ProxyRequestOrder::RemoveTcpFrontend(front) => self
                 .remove_tcp_frontend(front)
                 .with_context(|| "Could not remove TCP frontend"),
-            &ProxyRequestOrder::AddBackend(ref backend) => self
+            ProxyRequestOrder::AddBackend(backend) => self
                 .add_backend(backend)
                 .with_context(|| "Could not add backend"),
-            &ProxyRequestOrder::RemoveBackend(ref backend) => self
+            ProxyRequestOrder::RemoveBackend(backend) => self
                 .remove_backend(backend)
                 .with_context(|| "Could not remove backend"),
             // This is to avoid the error message
@@ -492,7 +492,7 @@ impl ConfigState {
         }
 
         for (front, certs) in self.certificates.iter() {
-            for &(ref certificate_and_key, ref names) in certs.values() {
+            for (certificate_and_key, names) in certs.values() {
                 v.push(ProxyRequestOrder::AddCertificate(AddCertificate {
                     address: *front,
                     certificate: certificate_and_key.clone(),
@@ -1416,8 +1416,8 @@ mod tests {
 
         let d = state.diff(&state2);
         let diff = HashSet::from_iter(d.iter());
-        println!("diff orders:\n{:#?}\n", diff);
-        println!("expected diff orders:\n{:#?}\n", expected_diff);
+        println!("diff orders:\n{diff:#?}\n");
+        println!("expected diff orders:\n{expected_diff:#?}\n");
 
         let hash1 = state.hash_state();
         let hash2 = state2.hash_state();
@@ -1433,9 +1433,9 @@ mod tests {
             }))
             .expect("Could not execute order");
         let hash3 = state3.hash_state();
-        println!("state 1 hashes: {:#?}", hash1);
-        println!("state 2 hashes: {:#?}", hash2);
-        println!("state 3 hashes: {:#?}", hash3);
+        println!("state 1 hashes: {hash1:#?}");
+        println!("state 2 hashes: {hash2:#?}");
+        println!("state 3 hashes: {hash3:#?}");
 
         assert_eq!(diff, expected_diff);
     }
@@ -1759,8 +1759,8 @@ mod tests {
 
         let diff = state.diff(&state2);
         //let diff: HashSet<&ProxyRequestOrder> = HashSet::from_iter(d.iter());
-        println!("expected diff orders:\n{:#?}\n", e);
-        println!("diff orders:\n{:#?}\n", diff);
+        println!("expected diff orders:\n{e:#?}\n");
+        println!("diff orders:\n{diff:#?}\n");
 
         let _hash1 = state.hash_state();
         let _hash2 = state2.hash_state();
@@ -1790,7 +1790,7 @@ impl serde::Serialize for RouteKey {
         };
 
         if let Some(method) = &self.method {
-            s = format!("{};{}", s, method);
+            s = format!("{s};{method}");
         }
 
         serializer.serialize_str(&s)
@@ -1838,7 +1838,7 @@ impl<'de> Visitor<'de> for RouteKeyVisitor {
             .ok_or_else(|| E::custom("invalid format".to_string()))
             .and_then(|s| {
                 s.parse::<SocketAddr>()
-                    .map_err(|e| E::custom(format!("could not deserialize SocketAddr: {:?}", e)))
+                    .map_err(|e| E::custom(format!("could not deserialize SocketAddr: {e:?}")))
             })?;
 
         let hostname = it

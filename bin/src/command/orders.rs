@@ -106,7 +106,7 @@ impl CommandServer {
                 return_success(self.command_tx.clone(), cloned_identifier, success).await;
             }
             Err(anyhow_error) => {
-                let formatted = format!("{:#}", anyhow_error);
+                let formatted = format!("{anyhow_error:#}");
                 error!("{:#}", formatted);
                 return_error(self.command_tx.clone(), cloned_identifier, formatted).await;
             }
@@ -120,7 +120,7 @@ impl CommandServer {
     }
 
     pub async fn save_state(&mut self, path: &str) -> anyhow::Result<Option<Success>> {
-        let mut file = File::create(&path)
+        let mut file = File::create(path)
             .with_context(|| format!("could not open file at path: {}", &path))?;
 
         let counter = self
@@ -139,7 +139,7 @@ impl CommandServer {
         let result: anyhow::Result<usize> = (move || {
             for command in orders {
                 let message = CommandRequest::new(
-                    format!("SAVE-{}", counter),
+                    format!("SAVE-{counter}"),
                     CommandRequestOrder::Proxy(Box::new(command)),
                     None,
                 );
@@ -151,8 +151,7 @@ impl CommandServer {
                 )
                 .with_context(|| {
                     format!(
-                        "Could not add this instruction line to the saved state file: {:?}",
-                        message
+                        "Could not add this instruction line to the saved state file: {message:?}"
                     )
                 })?;
 
@@ -190,7 +189,7 @@ impl CommandServer {
         path: &str,
     ) -> anyhow::Result<Option<Success>> {
         let mut file =
-            File::open(&path).with_context(|| format!("Cannot open file at path {}", path))?;
+            File::open(path).with_context(|| format!("Cannot open file at path {path}"))?;
 
         let mut buffer = Buffer::with_capacity(200000);
 
@@ -245,7 +244,7 @@ impl CommandServer {
                                 diff_counter += 1;
 
                                 let mut found = false;
-                                let id = format!("LOAD-STATE-{}-{}", request_id, diff_counter);
+                                let id = format!("LOAD-STATE-{request_id}-{diff_counter}");
 
                                 for ref mut worker in self.workers.iter_mut().filter(|worker| {
                                     worker.run_state != RunState::Stopping
@@ -338,10 +337,7 @@ impl CommandServer {
                         return_error(
                             command_tx,
                             request_identifier,
-                            format!(
-                                "Loading state failed, ok: {}, error: {}, path: {}",
-                                ok, error, path
-                            ),
+                            format!("Loading state failed, ok: {ok}, error: {error}, path: {path}"),
                         )
                         .await;
                     }
@@ -506,9 +502,7 @@ impl CommandServer {
 
         let activate_orders = self.state.generate_activate_orders();
         for (count, order) in activate_orders.into_iter().enumerate() {
-            worker
-                .send(format!("{}-ACTIVATE-{}", id, count), order)
-                .await;
+            worker.send(format!("{id}-ACTIVATE-{count}"), order).await;
         }
 
         self.workers.push(worker);
@@ -627,7 +621,7 @@ impl CommandServer {
             .as_mut()
             .with_context(|| "No sender on new worker".to_string())?
             .send(ProxyRequest {
-                id: format!("UPGRADE-{}-STATUS", id),
+                id: format!("UPGRADE-{id}-STATUS"),
                 order: ProxyRequestOrder::Status,
             })
             .await
@@ -804,7 +798,7 @@ impl CommandServer {
         // check that this works
         let path = config_path.as_deref().unwrap_or(&self.config.config_path);
         let new_config = Config::load_from_path(path)
-            .with_context(|| format!("cannot load configuration from '{}'", path))?;
+            .with_context(|| format!("cannot load configuration from '{path}'"))?;
 
         let mut diff_counter = 0usize;
 
@@ -886,8 +880,7 @@ impl CommandServer {
                         command_tx,
                         cloned_identifier,
                         format!(
-                            "Reloading configuration failed. ok: {} messages, error: {}",
-                            ok, error
+                            "Reloading configuration failed. ok: {ok} messages, error: {error}"
                         ),
                     )
                     .await;
@@ -977,8 +970,8 @@ impl CommandServer {
             }
 
             let worker_info_vec: Vec<WorkerInfo> = worker_info_map
-                .iter()
-                .map(|(_, worker_info)| worker_info.to_owned())
+                .values()
+                .map(|worker_info| worker_info.to_owned())
                 .collect();
 
             return_success(
@@ -1247,7 +1240,7 @@ impl CommandServer {
                     .with_context(|| "Could not create file to automatically save the state")?;
 
                 self.save_state_to_file(&mut file)
-                    .with_context(|| format!("could not save state automatically to {}", path))?;
+                    .with_context(|| format!("could not save state automatically to {path}"))?;
             }
         }
 
@@ -1255,7 +1248,7 @@ impl CommandServer {
             self.command_tx.clone(),
             request_identifier.clone(),
             match worker_id {
-                Some(id) => format!("Sending the order to worker {}", id),
+                Some(id) => format!("Sending the order to worker {id}"),
                 None => "Sending the order to all workers".to_owned(),
             },
         )
@@ -1457,7 +1450,7 @@ impl CommandServer {
                     )
                 })?;
             }
-            None => bail!(format!("Could not find client {}", client_id)),
+            None => bail!(format!("Could not find client {client_id}")),
         }
 
         Ok(Success::NotifiedClient(client_id))

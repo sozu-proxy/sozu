@@ -24,19 +24,19 @@ use crate::{
 
 impl CommandManager {
     pub fn save_state(&mut self, path: String) -> anyhow::Result<()> {
-        println!("Loading the state to file {}", path);
+        println!("Loading the state to file {path}");
 
         self.order_command(CommandRequestOrder::SaveState { path })
     }
 
     pub fn load_state(&mut self, path: String) -> anyhow::Result<()> {
-        println!("Loading the state on path {}", path);
+        println!("Loading the state on path {path}");
 
-        self.order_command(CommandRequestOrder::LoadState { path: path.clone() })
+        self.order_command(CommandRequestOrder::LoadState { path })
     }
 
     pub fn dump_state(&mut self, json: bool) -> anyhow::Result<()> {
-        println!("Dumping the state, json={}", json);
+        println!("Dumping the state, json={json}");
 
         self.order_command_with_json(CommandRequestOrder::DumpState, json)
     }
@@ -79,7 +79,7 @@ impl CommandManager {
     }
 
     pub fn configure_metrics(&mut self, cmd: MetricsCmd) -> anyhow::Result<()> {
-        println!("Configuring metrics: {:?}", cmd);
+        println!("Configuring metrics: {cmd:?}");
 
         let configuration = match cmd {
             MetricsCmd::Enable => MetricsConfiguration::Enabled(true),
@@ -570,18 +570,11 @@ impl CommandManager {
 fn get_fingerprint_from_certificate_path(
     certificate_path: &str,
 ) -> anyhow::Result<CertificateFingerprint> {
-    let bytes = Config::load_file_bytes(certificate_path).with_context(|| {
-        format!(
-            "could not load certificate file on path {}",
-            certificate_path
-        )
-    })?;
+    let bytes = Config::load_file_bytes(certificate_path)
+        .with_context(|| format!("could not load certificate file on path {certificate_path}"))?;
 
     let parsed_bytes = calculate_fingerprint(&bytes).with_context(|| {
-        format!(
-            "could not calculate fingerprint for the certificate at {}",
-            certificate_path
-        )
+        format!("could not calculate fingerprint for the certificate at {certificate_path}")
     })?;
 
     Ok(CertificateFingerprint(parsed_bytes))
@@ -599,24 +592,17 @@ fn load_full_certificate(
     key_path: &str,
     versions: Vec<TlsVersion>,
 ) -> Result<CertificateAndKey, anyhow::Error> {
-    let certificate = Config::load_file(certificate_path).with_context(|| {
-        format!(
-            "Could not load certificate file on path {}",
-            certificate_path
-        )
-    })?;
+    let certificate = Config::load_file(certificate_path)
+        .with_context(|| format!("Could not load certificate file on path {certificate_path}"))?;
 
     let certificate_chain = Config::load_file(certificate_chain_path)
         .map(split_certificate_chain)
         .with_context(|| {
-            format!(
-                "could not load certificate chain on path: {}",
-                certificate_chain_path
-            )
+            format!("could not load certificate chain on path: {certificate_chain_path}")
         })?;
 
     let key = Config::load_file(key_path)
-        .with_context(|| format!("Could not load key file on path {}", key_path))?;
+        .with_context(|| format!("Could not load key file on path {key_path}"))?;
 
     Ok(CertificateAndKey {
         certificate,

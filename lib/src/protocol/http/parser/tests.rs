@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
-use nom::{error::ErrorKind, Err, HexDisplay};
+use nom::{AsBytes, HexDisplay};
 
 use crate::buffer_queue::{buf_with_capacity, OutputElement};
 #[cfg(test)]
@@ -67,8 +67,8 @@ fn header_iso_8859_1_test() {
     let input = "Test: Aéo\r\n";
     let result = message_header(input.as_bytes());
     let expected = Header {
-        name: b"Test",
-        value: "Aéo".as_bytes(),
+        name: "Test".as_bytes().to_vec(),
+        value: "Aéo".as_bytes().to_vec(),
     };
 
     assert_eq!(result, Ok((&b""[..], expected)))
@@ -114,7 +114,7 @@ fn parse_state_host_in_url_test() {
 
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
     println!("buffer output: {:?}", buf.output_queue);
@@ -162,7 +162,7 @@ fn parse_state_host_in_url_conflict_test() {
 
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
     println!("buffer output: {:?}", buf.output_queue);
@@ -205,7 +205,7 @@ fn parse_state_content_length_test() {
 
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
     println!("buffer output: {:?}", buf.output_queue);
@@ -274,7 +274,7 @@ fn parse_state_content_length_partial() {
         "unparsed data after parsing:\n{}",
         buf.unparsed_data().to_hex(16)
     );
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer output: {:?}", buf.output_queue);
     assert_eq!(
@@ -321,7 +321,7 @@ fn parse_state_chunked_test() {
 
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     assert_eq!(buf.start_parsing_position, 116);
     assert_eq!(
         result,
@@ -356,7 +356,7 @@ fn parse_state_duplicate_content_length_test() {
     buf.write(&input[..]).unwrap();
 
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     assert_eq!(buf.start_parsing_position, 128);
     assert_eq!(
         result,
@@ -393,7 +393,7 @@ fn parse_state_content_length_and_chunked_test() {
 
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     assert_eq!(buf.start_parsing_position, 136);
     assert_eq!(
         result,
@@ -426,7 +426,7 @@ fn parse_request_without_length() {
 
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer output: {:?}", buf.output_queue);
     assert_eq!(
@@ -468,7 +468,7 @@ fn parse_request_http_1_0_connection_close() {
 
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     assert_eq!(buf.start_parsing_position, 40);
     assert_eq!(
         result,
@@ -501,7 +501,7 @@ fn parse_request_http_1_0_connection_keep_alive() {
 
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer output: {:?}", buf.output_queue);
     assert_eq!(
@@ -545,7 +545,7 @@ fn parse_request_http_1_1_connection_keep_alive() {
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
     println!("end buf:\n{}", buf.buffer.data().to_hex(16));
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     assert_eq!(
         buf.output_queue,
         vec!(
@@ -587,7 +587,7 @@ fn parse_request_http_1_1_connection_close() {
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
     println!("end buf:\n{}", buf.buffer.data().to_hex(16));
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     assert_eq!(
         buf.output_queue,
         vec!(
@@ -641,7 +641,7 @@ fn parse_request_add_header_test() {
     });
 
     let result = parse_request_until_stop(initial, None, &mut buf, added.as_ref(), "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer output: {:?}", buf.output_queue);
 
@@ -708,7 +708,7 @@ fn parse_request_delete_forwarded_headers() {
     });
 
     let result = parse_request_until_stop(initial, None, &mut buf, added.as_ref(), "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer output: {:?}", buf.output_queue);
 
@@ -780,7 +780,7 @@ fn parse_chunk() {
     let initial = Chunk::Initial;
 
     let res = initial.parse(&input[..]);
-    println!("result: {:?}", res);
+    println!("result: {res:?}");
     assert_eq!(res, (BufferMove::Advance(43), Chunk::Ended));
 }
 
@@ -799,7 +799,7 @@ fn parse_chunk_partial() {
 
     println!("parsing input:\n{}", input[..12].to_hex(16));
     let res = initial.parse(&input[..12]);
-    println!("result: {:?}", res);
+    println!("result: {res:?}");
     assert_eq!(res, (BufferMove::Advance(17), Chunk::Copying));
 
     println!("consuming input:\n{}", input[..17].to_hex(16));
@@ -830,7 +830,7 @@ fn parse_requests_and_chunks_test() {
 
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     assert_eq!(buf.start_parsing_position, 160);
     assert_eq!(
         result,
@@ -1122,7 +1122,7 @@ fn parse_incomplete_chunk_header_test() {
         None,
         None,
     );
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("initial input:\n{}", &input[..72].to_hex(8));
     println!("buffer output: {:?}", buf.output_queue);
@@ -1160,7 +1160,7 @@ fn parse_incomplete_chunk_header_test() {
         None,
         None,
     );
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     assert_eq!(buf.start_parsing_position, 81);
     assert_eq!(
         result,
@@ -1264,7 +1264,7 @@ fn parse_response_302() {
         None,
         None,
     );
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
     println!("initial input:\n{}", &input[..72].to_hex(8));
@@ -1322,7 +1322,7 @@ fn parse_response_303() {
         None,
         None,
     );
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
     println!("buffer output: {:?}", buf.output_queue);
@@ -1379,7 +1379,7 @@ fn parse_response_304() {
         None,
         None,
     );
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
     println!("buffer output: {:?}", buf.output_queue);
@@ -1479,7 +1479,7 @@ fn parse_state_head_with_content_length_test() {
         None,
         None,
     );
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
     println!("buffer output: {:?}", buf.output_queue);
@@ -1525,7 +1525,7 @@ fn parse_connection_upgrade_test() {
 
     //let result = parse_request(initial, input);
     let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
     println!("buffer output: {:?}", buf.output_queue);

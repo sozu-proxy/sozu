@@ -145,8 +145,8 @@ pub enum Success {
 impl std::fmt::Display for Success {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::ClientClose(id) => write!(f, "Close client: {}", id),
-            Self::ClientNew(id) => write!(f, "New client successfully added: {}", id),
+            Self::ClientClose(id) => write!(f, "Close client: {id}"),
+            Self::ClientNew(id) => write!(f, "New client successfully added: {id}"),
             Self::DumpState(_) => write!(f, "Successfully gathered state from the main process"),
             Self::HandledClientRequest => write!(f, "Successfully handled the client request"),
             Self::ListFrontends(_) => write!(f, "Successfully gathered the list of frontends"),
@@ -154,20 +154,17 @@ impl std::fmt::Display for Success {
             Self::ListWorkers(_) => write!(f, "Successfully listed all workers"),
             Self::LoadState(path, ok, error) => write!(
                 f,
-                "Successfully loaded state from path {}, {} ok messages, {} errors",
-                path, ok, error
+                "Successfully loaded state from path {path}, {ok} ok messages, {error} errors"
             ),
-            Self::Logging(logging_filter) => write!(
-                f,
-                "Successfully set the logging level to {}",
-                logging_filter
-            ),
+            Self::Logging(logging_filter) => {
+                write!(f, "Successfully set the logging level to {logging_filter}")
+            }
             Self::Metrics(metrics_cfg) => {
-                write!(f, "Successfully set the metrics to {:?}", metrics_cfg)
+                write!(f, "Successfully set the metrics to {metrics_cfg:?}")
             }
             Self::MasterStop => write!(f, "stopping main process"),
             Self::NotifiedClient(id) => {
-                write!(f, "Successfully notified client {} of the advancement", id)
+                write!(f, "Successfully notified client {id} of the advancement")
             }
             Self::PropagatedWorkerEvent => {
                 write!(f, "Sent worker response to all subscribing clients")
@@ -175,37 +172,35 @@ impl std::fmt::Display for Success {
             Self::Query(_) => write!(f, "Ran the query successfully"),
             Self::ReloadConfiguration(ok, error) => write!(
                 f,
-                "Successfully reloaded configuration, ok: {}, errors: {}",
-                ok, error
+                "Successfully reloaded configuration, ok: {ok}, errors: {error}"
             ),
             Self::SaveState(counter, path) => {
-                write!(f, "saved {} config messages to {}", counter, path)
+                write!(f, "saved {counter} config messages to {path}")
             }
             Self::Status(_) => {
                 write!(f, "Sent a status response to client")
             }
             Self::SubscribeEvent(client_id) => {
-                write!(f, "Successfully Added {} to subscribers", client_id)
+                write!(f, "Successfully Added {client_id} to subscribers")
             }
             Self::UpgradeMain(pid) => write!(
                 f,
-                "new main process launched with pid {}, closing the old one",
-                pid
+                "new main process launched with pid {pid}, closing the old one"
             ),
             Self::UpgradeWorker(id) => {
-                write!(f, "Successfully upgraded worker with new id: {}", id)
+                write!(f, "Successfully upgraded worker with new id: {id}")
             }
-            Self::WorkerKilled(id) => write!(f, "Successfully killed worker {}", id),
-            Self::WorkerLaunched(id) => write!(f, "Successfully launched worker {}", id),
+            Self::WorkerKilled(id) => write!(f, "Successfully killed worker {id}"),
+            Self::WorkerLaunched(id) => write!(f, "Successfully launched worker {id}"),
             Self::WorkerOrder(worker) => match worker {
                 Some(worker_id) => {
-                    write!(f, "Successfully executed the order on worker {}", worker_id)
+                    write!(f, "Successfully executed the order on worker {worker_id}")
                 }
                 None => write!(f, "Successfully executed the order on all workers"),
             },
             Self::WorkerResponse => write!(f, "Successfully handled worker response"),
-            Self::WorkerRestarted(id) => write!(f, "Successfully restarted worker {}", id),
-            Self::WorkerStopped(id) => write!(f, "Successfully stopped worker {}", id),
+            Self::WorkerRestarted(id) => write!(f, "Successfully restarted worker {id}"),
+            Self::WorkerStopped(id) => write!(f, "Successfully stopped worker {id}"),
         }
     }
 }
@@ -658,7 +653,7 @@ impl CommandServer {
             &self.state,
             listeners,
         )
-        .with_context(|| format!("Could not start new worker {}", new_worker_id))?;
+        .with_context(|| format!("Could not start new worker {new_worker_id}"))?;
 
         info!("created new worker: {}", new_worker_id);
         self.next_worker_id += 1;
@@ -691,16 +686,13 @@ impl CommandServer {
         let mut orders = self.state.generate_activate_orders();
         for (count, order) in orders.drain(..).enumerate() {
             new_worker
-                .send(
-                    format!("RESTART-{}-ACTIVATE-{}", new_worker_id, count),
-                    order,
-                )
+                .send(format!("RESTART-{new_worker_id}-ACTIVATE-{count}"), order)
                 .await;
         }
 
         new_worker
             .send(
-                format!("RESTART-{}-STATUS", new_worker_id),
+                format!("RESTART-{new_worker_id}-STATUS"),
                 ProxyRequestOrder::Status,
             )
             .await;
@@ -747,7 +739,7 @@ impl CommandServer {
                 }
             }
         }
-        bail!(format!("Could not find worker {}", id))
+        bail!(format!("Could not find worker {id}"))
     }
 
     async fn handle_worker_response(
@@ -763,12 +755,13 @@ impl CommandServer {
                     let event = CommandResponse::new(
                         response.id.to_string(),
                         CommandStatus::Processing,
-                        format!("{}", worker_id),
+                        format!("{worker_id}"),
                         Some(CommandResponseContent::Event(event.clone())),
                     );
-                    client_tx.send(event).await.with_context(|| {
-                        format!("could not send message to client {}", client_id)
-                    })?
+                    client_tx
+                        .send(event)
+                        .await
+                        .with_context(|| format!("could not send message to client {client_id}"))?
                 }
             }
             return Ok(Success::PropagatedWorkerEvent);
@@ -825,7 +818,7 @@ pub fn start_server(
     if fs::metadata(&path).is_ok() {
         info!("A socket is already present. Deleting...");
         fs::remove_file(&path)
-            .with_context(|| format!("could not delete previous socket at {:?}", path))?;
+            .with_context(|| format!("could not delete previous socket at {path:?}"))?;
     }
 
     let unix_listener = match UnixListener::bind(&path) {
@@ -929,7 +922,7 @@ async fn accept_clients(
             };
         let (client_tx, client_rx) = channel(10000);
 
-        let client_id = format!("CL-{}", counter);
+        let client_id = format!("CL-{counter}");
 
         smol::spawn(client_loop(
             client_id.clone(),

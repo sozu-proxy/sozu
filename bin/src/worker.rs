@@ -12,7 +12,7 @@ use std::mem::size_of;
 use std::ptr::null_mut;
 use std::{
     fs::File,
-    io::{Seek, SeekFrom},
+    io::Seek,
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
     os::unix::process::CommandExt,
     process::Command,
@@ -70,7 +70,7 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
 
             worker_channel
                 .write_message(&ProxyRequest {
-                    id: format!("start-status-{}", index),
+                    id: format!("start-status-{index}"),
                     order: ProxyRequestOrder::Status,
                 })
                 .with_context(|| "Could not send status request to the worker")?;
@@ -197,10 +197,10 @@ pub fn begin_worker_process(
 }
 
 /// unix-forks the main process
-/// 
+///
 /// - Parent: sends config and listeners to the new worker
 /// - Child: calls the sozu executable path like so: `sozu worker --id <worker_id> [...]`
-/// 
+///
 /// returns the child process pid, and channels to talk to it.
 pub fn fork_main_into_worker(
     worker_id: &str,
@@ -219,7 +219,7 @@ pub fn fork_main_into_worker(
         .with_context(|| "could not write upgrade data to temporary file")?;
 
     state_file
-        .seek(SeekFrom::Start(0))
+        .rewind()
         .with_context(|| "could not seek to beginning of file")?;
 
     let (main_to_worker, worker_to_main) = UnixStream::pair()?;

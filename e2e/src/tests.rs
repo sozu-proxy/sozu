@@ -68,7 +68,7 @@ pub fn setup_test(
             .expect("could not parse back address");
         worker.send_proxy_request(ProxyRequestOrder::AddBackend(Worker::default_backend(
             "cluster_0",
-            format!("cluster_0-{}", i),
+            format!("cluster_0-{i}"),
             back_address,
         )));
         backends.push(back_address);
@@ -95,10 +95,10 @@ pub fn async_setup_test(
                 responses_sent: 0,
             };
             AsyncBackend::spawn_detached_backend(
-                format!("BACKEND_{}", i),
+                format!("BACKEND_{i}"),
                 back_address,
-                aggregator.to_owned(),
-                AsyncBackend::http_handler(format!("pong{}", i)),
+                aggregator,
+                AsyncBackend::http_handler(format!("pong{i}")),
             )
         })
         .collect::<Vec<_>>();
@@ -118,9 +118,9 @@ pub fn sync_setup_test(
         .enumerate()
         .map(|(i, back_address)| {
             SyncBackend::new(
-                format!("BACKEND_{}", i),
+                format!("BACKEND_{i}"),
                 back_address,
-                http_ok_response(format!("pong{}", i)),
+                http_ok_response(format!("pong{i}")),
             )
         })
         .collect::<Vec<_>>();
@@ -139,9 +139,9 @@ pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> S
     let mut clients = (0..nb_clients)
         .map(|i| {
             Client::new(
-                format!("client{}", i),
+                format!("client{i}"),
                 front_address,
-                http_request("GET", "/api", format!("ping{}", i)),
+                http_request("GET", "/api", format!("ping{i}")),
             )
         })
         .collect::<Vec<_>>();
@@ -154,7 +154,7 @@ pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> S
         }
         for client in clients.iter_mut() {
             match client.receive() {
-                Some(response) => println!("{}", response),
+                Some(response) => println!("{response}"),
                 _ => {}
             }
         }
@@ -197,9 +197,9 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
     let mut clients = (0..nb_clients)
         .map(|i| {
             Client::new(
-                format!("client{}", i),
+                format!("client{i}"),
                 front_address,
-                http_request("GET", "/api", format!("ping{}", i)),
+                http_request("GET", "/api", format!("ping{i}")),
             )
         })
         .collect::<Vec<_>>();
@@ -224,7 +224,7 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
         }
         for client in clients.iter_mut() {
             match client.receive() {
-                Some(response) => println!("{}", response),
+                Some(response) => println!("{response}"),
                 _ => {}
             }
         }
@@ -282,7 +282,7 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
             break;
         }
         match client.receive() {
-            Some(response) => println!("{}", response),
+            Some(response) => println!("{response}"),
             None => break,
         }
         if i == 0 {
@@ -298,9 +298,9 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
         "sent: {}, received: {}",
         client.requests_sent, client.responses_received
     );
-    println!("backend1 aggregator: {:?}", aggregator);
+    println!("backend1 aggregator: {aggregator:?}");
     aggregator = backend2.stop_and_get_aggregator();
-    println!("backend2 aggregator: {:?}", aggregator);
+    println!("backend2 aggregator: {aggregator:?}");
 
     if !success {
         State::Fail
@@ -356,7 +356,8 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     let front_address = "127.0.0.1:2001"
         .parse()
         .expect("could not parse front address");
-    let back_address = format!("127.0.0.1:2002")
+    let back_address = "127.0.0.1:2002"
+        .to_string()
         .parse()
         .expect("could not parse back address");
 
@@ -396,7 +397,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
         backend.receive(0);
         backend.send(0);
         let response = client.receive();
-        println!("Response: {:?}", response);
+        println!("Response: {response:?}");
     }
 
     worker.send_proxy_request(ProxyRequestOrder::SoftStop);
@@ -470,7 +471,7 @@ pub fn test_upgrade() -> State {
     backend.receive(0);
     backend.send(0);
     match client.receive() {
-        Some(msg) => println!("response: {}", msg),
+        Some(msg) => println!("response: {msg}"),
         None => return State::Fail,
     }
 
@@ -480,7 +481,7 @@ pub fn test_upgrade() -> State {
     thread::sleep(Duration::from_millis(100));
     backend.send(0);
     match client.receive() {
-        Some(msg) => println!("response: {}", msg),
+        Some(msg) => println!("response: {msg}"),
         None => return State::Fail,
     }
     client.connect();
@@ -490,7 +491,7 @@ pub fn test_upgrade() -> State {
     backend.receive(1);
     backend.send(1);
     match client.receive() {
-        Some(msg) => println!("response: {}", msg),
+        Some(msg) => println!("response: {msg}"),
         None => return State::Fail,
     }
 
@@ -524,12 +525,12 @@ pub fn test_http(nb_requests: usize) {
     let mut backend = backends.pop().expect("backend");
 
     let mut bad_client = Client::new(
-        format!("bad_client"),
+        "bad_client".to_string(),
         front_address,
         "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\nContent-Length: 3\r\n\r\nbad_ping",
     );
     let mut good_client = Client::new(
-        format!("good_client"),
+        "good_client".to_string(),
         front_address,
         http_request("GET", "/api", "good_ping"),
     );
@@ -540,11 +541,11 @@ pub fn test_http(nb_requests: usize) {
         bad_client.send();
         good_client.send();
         match bad_client.receive() {
-            Some(msg) => println!("response: {}", msg),
+            Some(msg) => println!("response: {msg}"),
             None => {}
         }
         match good_client.receive() {
-            Some(msg) => println!("response: {}", msg),
+            Some(msg) => println!("response: {msg}"),
             None => {}
         }
     }
@@ -561,7 +562,7 @@ pub fn test_http(nb_requests: usize) {
         good_client.name, good_client.requests_sent, good_client.responses_received
     );
     let aggregator = backend.stop_and_get_aggregator();
-    println!("backend aggregator: {:?}", aggregator);
+    println!("backend aggregator: {aggregator:?}");
 }
 
 pub fn try_hard_or_soft_stop(soft: bool) -> State {
@@ -600,13 +601,13 @@ pub fn try_hard_or_soft_stop(soft: bool) -> State {
             return State::Fail;
         }
         (true, Some(msg)) => {
-            println!("response on SoftStop: {}", msg);
+            println!("response on SoftStop: {msg}");
         }
         (false, None) => {
             println!("no response on HardStop");
         }
         (false, Some(msg)) => {
-            println!("HardStop waited for HTTP response to complete: {}", msg);
+            println!("HardStop waited for HTTP response to complete: {msg}");
             return State::Fail;
         }
     }
@@ -651,25 +652,25 @@ pub fn repeat_until_error_or<F>(times: usize, test_description: &str, test: F) -
 where
     F: Fn() -> State + Sized,
 {
-    println!("{}", test_description);
+    println!("{test_description}");
     for i in 1..=times {
         let state = test();
         match state {
             State::Success => {}
             State::Fail => {
                 println!("------------------------------------------------------------------");
-                println!("Test not successful after: {} iterations", i);
+                println!("Test not successful after: {i} iterations");
                 return State::Fail;
             }
             State::Undecided => {
                 println!("------------------------------------------------------------------");
-                println!("Test interupted after: {} iterations", i);
+                println!("Test interupted after: {i} iterations");
                 return State::Undecided;
             }
         }
     }
     println!("------------------------------------------------------------------");
-    println!("Test successful after: {} iterations", times);
+    println!("Test successful after: {times} iterations");
     State::Success
 }
 
@@ -788,7 +789,7 @@ fn test_issue_810_panic_variant() {
             repeat_until_error_or(
                 2,
                 "issue 810: shutdown panics on http connection accept after proxy cleared its listeners",
-                || try_issue_810_panic_variant()
+                try_issue_810_panic_variant
             ),
             State::Success
         );

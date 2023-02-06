@@ -26,7 +26,7 @@ use crate::{
 /// provider as it support only strongly secure ones.
 ///
 /// See the [documentation](https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html)
-pub const DEFAULT_RUSTLS_CIPHER_LIST: [&'static str; 9] = [
+pub const DEFAULT_RUSTLS_CIPHER_LIST: [&str; 9] = [
     // TLS 1.3 cipher suites
     "TLS13_AES_256_GCM_SHA384",
     "TLS13_AES_128_GCM_SHA256",
@@ -40,14 +40,14 @@ pub const DEFAULT_RUSTLS_CIPHER_LIST: [&'static str; 9] = [
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
 ];
 
-pub const DEFAULT_CIPHER_SUITES: [&'static str; 4] = [
+pub const DEFAULT_CIPHER_SUITES: [&str; 4] = [
     "TLS_AES_256_GCM_SHA384",
     "TLS_AES_128_GCM_SHA256",
     "TLS_AES_128_CCM_SHA256",
     "TLS_CHACHA20_POLY1305_SHA256",
 ];
 
-pub const DEFAULT_SIGNATURE_ALGORITHMS: [&'static str; 9] = [
+pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
     "ECDSA+SHA256",
     "ECDSA+SHA384",
     "ECDSA+SHA512",
@@ -59,7 +59,7 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&'static str; 9] = [
     "RSA-PSS+SHA512",
 ];
 
-pub const DEFAULT_GROUPS_LIST: [&'static str; 4] = ["P-521", "P-384", "P-256", "x25519"];
+pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"];
 
 // todo: refactor this with a builder pattern for cleanliness
 /// an HTTP, HTTPS or TCP listener as ordered by a client
@@ -307,11 +307,11 @@ impl Listener {
             Some(a_503_path) => {
                 let mut a_503 = String::new();
                 let mut file = File::open(a_503_path).with_context(|| {
-                    format!("Could not open 503 answer file on path {}", a_503_path)
+                    format!("Could not open 503 answer file on path {a_503_path}")
                 })?;
 
                 file.read_to_string(&mut a_503).with_context(|| {
-                    format!("Could not read 503 answer file on path {}", a_503_path)
+                    format!("Could not read 503 answer file on path {a_503_path}")
                 })?;
                 a_503
             }
@@ -403,7 +403,7 @@ impl FileClusterFrontendConfig {
             None => None,
             Some(path) => {
                 let key = Config::load_file(path)
-                    .with_context(|| format!("cannot load key at path '{}'", path))?;
+                    .with_context(|| format!("cannot load key at path '{path}'"))?;
                 Some(key)
             }
         };
@@ -412,7 +412,7 @@ impl FileClusterFrontendConfig {
             None => None,
             Some(path) => {
                 let certificate = Config::load_file(path)
-                    .with_context(|| format!("cannot load certificate at path '{}'", path))?;
+                    .with_context(|| format!("cannot load certificate at path '{path}'"))?;
                 Some(certificate)
             }
         };
@@ -421,7 +421,7 @@ impl FileClusterFrontendConfig {
             None => None,
             Some(path) => {
                 let certificate_chain = Config::load_file(path)
-                    .with_context(|| format!("cannot load certificate chain at path {}", path))?;
+                    .with_context(|| format!("cannot load certificate chain at path {path}"))?;
                 Some(split_certificate_chain(certificate_chain))
             }
         };
@@ -506,8 +506,7 @@ impl FileClusterConfig {
                         match has_expect_proxy {
                             Some(true) => {},
                             Some(false) => bail!(format!(
-                                "all the listeners for cluster {} should have the same expect_proxy option",
-                                cluster_id
+                                "all the listeners for cluster {cluster_id} should have the same expect_proxy option"
                             )),
                             None => has_expect_proxy = Some(true),
                         }
@@ -515,8 +514,7 @@ impl FileClusterConfig {
                         match has_expect_proxy {
                             Some(false) => {},
                             Some(true) => bail!(format!(
-                                "all the listeners for cluster {} should have the same expect_proxy option",
-                                cluster_id
+                                "all the listeners for cluster {cluster_id} should have the same expect_proxy option"
                             )),
                             None => has_expect_proxy = Some(false),
                         }
@@ -808,7 +806,7 @@ impl FileConfig {
                 display_toml_error(&data, &e);
                 Err(Error::new(
                     ErrorKind::InvalidData,
-                    format!("decoding error: {}", e),
+                    format!("decoding error: {e}"),
                 ))
             }
             Ok(config) => {
@@ -929,7 +927,7 @@ impl FileConfig {
                 let mut cluster_config = file_cluster_config
                     .to_cluster_config(id.as_str(), &expect_proxy)
                     .with_context(|| {
-                        format!("error parsing cluster configuration for cluster {}", id)
+                        format!("error parsing cluster configuration for cluster {id}")
                     })?;
 
                 match cluster_config {
@@ -962,8 +960,8 @@ impl FileConfig {
                                             frontend.key = https_listener.key.clone();
                                         }
                                         if frontend.certificate.is_none() {
-                                            println!("known addresses: {:#?}", known_addresses);
-                                            println!("frontend: {:#?}", frontend);
+                                            println!("known addresses: {known_addresses:#?}");
+                                            println!("frontend: {frontend:#?}");
                                             bail!(
                                                 "cannot set up a HTTP frontend on a HTTPS listener"
                                             );
@@ -1190,7 +1188,7 @@ impl Config {
 
         for listener in &self.http_listeners {
             v.push(CommandRequest {
-                id: format!("CONFIG-{}", count),
+                id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
                 order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpListener(
@@ -1202,7 +1200,7 @@ impl Config {
 
         for listener in &self.https_listeners {
             v.push(CommandRequest {
-                id: format!("CONFIG-{}", count),
+                id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
                 order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpsListener(
@@ -1214,7 +1212,7 @@ impl Config {
 
         for listener in &self.tcp_listeners {
             v.push(CommandRequest {
-                id: format!("CONFIG-{}", count),
+                id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
                 order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddTcpListener(
@@ -1228,7 +1226,7 @@ impl Config {
             let mut orders = cluster.generate_orders();
             for order in orders.drain(..) {
                 v.push(CommandRequest {
-                    id: format!("CONFIG-{}", count),
+                    id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
                     order: CommandRequestOrder::Proxy(Box::new(order)),
@@ -1240,7 +1238,7 @@ impl Config {
         if self.activate_listeners {
             for listener in &self.http_listeners {
                 v.push(CommandRequest {
-                    id: format!("CONFIG-{}", count),
+                    id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
                     order: CommandRequestOrder::Proxy(Box::new(
@@ -1256,7 +1254,7 @@ impl Config {
 
             for listener in &self.https_listeners {
                 v.push(CommandRequest {
-                    id: format!("CONFIG-{}", count),
+                    id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
                     order: CommandRequestOrder::Proxy(Box::new(
@@ -1272,7 +1270,7 @@ impl Config {
 
             for listener in &self.tcp_listeners {
                 v.push(CommandRequest {
-                    id: format!("CONFIG-{}", count),
+                    id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
                     order: CommandRequestOrder::Proxy(Box::new(
@@ -1303,7 +1301,7 @@ impl Config {
             Some(path) => {
                 config_folder.push(path);
                 config_folder.canonicalize().with_context(|| {
-                    format!("could not get command socket folder path: {:?}", path)
+                    format!("could not get command socket folder path: {path:?}")
                 })?
             }
         };
@@ -1347,10 +1345,7 @@ impl Config {
         );
 
         saved_state_path_raw.canonicalize().with_context(|| {
-            format!(
-                "could not get saved state path from config file input {:?}",
-                path
-            )
+            format!("could not get saved state path from config file input {path:?}")
         })?;
 
         let stringified_path = saved_state_path_raw
@@ -1371,7 +1366,7 @@ impl Config {
 }
 
 pub fn display_toml_error(file: &str, error: &toml::de::Error) {
-    println!("error parsing the configuration file: {}", error);
+    println!("error parsing the configuration file: {error}");
     if let Some((line, column)) = error.line_col() {
         let l_span = line.to_string().len();
         println!("{}| {}", line + 1, file.lines().nth(line).unwrap());
@@ -1462,16 +1457,16 @@ mod tests {
 
         println!("config: {:?}", to_string(&config));
         let encoded = to_string(&config).unwrap();
-        println!("conf:\n{}", encoded);
+        println!("conf:\n{encoded}");
     }
 
     #[test]
     fn parse() {
         let path = "assets/config.toml";
         let config = Config::load_from_path(path).unwrap_or_else(|load_error| {
-            panic!("Cannot load config from path {}: {:?}", path, load_error)
+            panic!("Cannot load config from path {path}: {load_error:?}")
         });
-        println!("config: {:#?}", config);
+        println!("config: {config:#?}");
         //panic!();
     }
 }

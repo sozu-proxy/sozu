@@ -147,7 +147,7 @@ impl Session {
             sticky_name,
             last_event: Instant::now(),
             front_timeout,
-            listener_token: listener_token,
+            listener_token,
             connection_attempt: 0,
             answers,
             frontend_timeout_duration,
@@ -963,7 +963,7 @@ impl Session {
                 }
             },
             Err(e) => {
-                let no_host_error = format!("Host not found: {}: {:#}", host, e);
+                let no_host_error = format!("Host not found: {host}: {e:#}");
                 self.set_answer(DefaultAnswerStatus::Answer404, None);
                 bail!(no_host_error);
             }
@@ -978,7 +978,7 @@ impl Session {
             .unwrap_or(false);
 
         if front_should_redirect_https {
-            let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, uri);
+            let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{host}{uri}\r\n\r\n");
             self.set_answer(
                 DefaultAnswerStatus::Answer301,
                 Some(Rc::new(answer.into_bytes())),
@@ -1007,9 +1007,8 @@ impl Session {
             Ok((b, c)) => (b, c),
             Err(e) => {
                 self.set_answer(DefaultAnswerStatus::Answer503, None);
-                return Err(e).with_context(|| {
-                    format!("Could not find a backend for cluster {}", cluster_id)
-                });
+                return Err(e)
+                    .with_context(|| format!("Could not find a backend for cluster {cluster_id}"));
             }
         };
 
@@ -1061,8 +1060,7 @@ impl Session {
                 .backend_from_sticky_session(cluster_id, sticky_session)
                 .with_context(|| {
                     format!(
-                        "Couldn't find a backend corresponding to sticky_session {} for cluster {}",
-                        sticky_session, cluster_id
+                        "Couldn't find a backend corresponding to sticky_session {sticky_session} for cluster {cluster_id}"
                     )
                 }),
             _ => self
@@ -1193,7 +1191,7 @@ impl Session {
                 if not_enough_memory {
                     error!("not enough memory, cannot connect to backend");
                     self.set_answer(DefaultAnswerStatus::Answer503, None);
-                    bail!(format!("Too many connections on cluster {}", cluster_id));
+                    bail!(format!("Too many connections on cluster {cluster_id}"));
                 }
 
                 let back_token = {
@@ -1474,7 +1472,7 @@ impl Proxy {
             .listeners
             .values()
             .find(|listener| listener.borrow().address == *addr)
-            .with_context(|| format!("No listener found for address {}", addr))?;
+            .with_context(|| format!("No listener found for address {addr}"))?;
 
         listener
             .borrow_mut()
@@ -1585,7 +1583,7 @@ impl Proxy {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
                 debug!("Deregistering socket {:?}", sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
-                    let error = format!("socket {:?}: {:?}", sock, e);
+                    let error = format!("socket {sock:?}: {e:?}");
                     socket_errors.push(error);
                 }
             }
@@ -1605,7 +1603,7 @@ impl Proxy {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
                 debug!("Deregistering socket {:?}", sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
-                    let error = format!("socket {:?}: {:?}", sock, e);
+                    let error = format!("socket {sock:?}: {e:?}");
                     socket_errors.push(error);
                 }
             }
@@ -1661,7 +1659,7 @@ impl Listener {
 
         registry
             .register(&mut listener, self.token, Interest::READABLE)
-            .with_context(|| format!("Could not register listener socket {:?}", listener))?;
+            .with_context(|| format!("Could not register listener socket {listener:?}"))?;
 
         self.listener = Some(listener);
         self.active = true;
@@ -1671,14 +1669,14 @@ impl Listener {
     pub fn add_http_front(&mut self, http_front: HttpFrontend) -> anyhow::Result<()> {
         self.fronts
             .add_http_front(&http_front)
-            .with_context(|| format!("Could not add http frontend {:?}", http_front))
+            .with_context(|| format!("Could not add http frontend {http_front:?}"))
     }
 
     pub fn remove_http_front(&mut self, http_front: HttpFrontend) -> anyhow::Result<()> {
         debug!("removing http_front {:?}", http_front);
         self.fronts
             .remove_http_front(&http_front)
-            .with_context(|| format!("Could not remove http frontend {:?}", http_front))
+            .with_context(|| format!("Could not remove http frontend {http_front:?}"))
     }
 
     // redundant, already called once in extract_route
@@ -1753,7 +1751,7 @@ impl ProxyConfiguration<Session> for Proxy {
             ProxyRequestOrder::RemoveCluster { cluster_id } => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
-                    .with_context(|| format!("Could not remove cluster {}", cluster_id))
+                    .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
             ProxyRequestOrder::AddHttpFrontend(front) => {
                 info!("{} add front {:?}", request_id, front);
@@ -1807,7 +1805,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     request_id, logging_filter
                 );
                 self.logging(logging_filter.clone())
-                    .with_context(|| format!("Could not set logging level to {}", logging_filter))
+                    .with_context(|| format!("Could not set logging level to {logging_filter}"))
             }
             other_command => {
                 info!(
@@ -1825,7 +1823,7 @@ impl ProxyConfiguration<Session> for Proxy {
             }
             Err(error_message) => {
                 error!("{} unsuccessful: {:#}", request_id, error_message);
-                ProxyResponse::error(request_id, format!("{:#}", error_message))
+                ProxyResponse::error(request_id, format!("{error_message:#}"))
             }
         }
     }
@@ -1849,7 +1847,7 @@ impl ProxyConfiguration<Session> for Proxy {
             .listeners
             .get(&Token(listener_token.0))
             .map(Clone::clone)
-            .ok_or_else(|| AcceptError::IoError)?;
+            .ok_or(AcceptError::IoError)?;
 
         if let Err(e) = frontend_sock.set_nodelay(true) {
             error!(
@@ -2089,7 +2087,7 @@ mod tests {
         client.set_read_timeout(Some(Duration::new(1, 0))).unwrap();
         let w = client
             .write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\nConnection: Close\r\n\r\n"[..]);
-        println!("http client write: {:?}", w);
+        println!("http client write: {w:?}");
 
         barrier.wait();
         let mut buffer = [0; 4096];
@@ -2102,9 +2100,9 @@ mod tests {
             }
 
             let r = client.read(&mut buffer[index..]);
-            println!("http client read: {:?}", r);
+            println!("http client read: {r:?}");
             match r {
-                Err(e) => assert!(false, "client request should not fail. Error: {:?}", e),
+                Err(e) => assert!(false, "client request should not fail. Error: {e:?}"),
                 Ok(sz) => {
                     index += sz;
                 }
@@ -2178,7 +2176,7 @@ mod tests {
         let w = client
             .write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..])
             .unwrap();
-        println!("http client write: {:?}", w);
+        println!("http client write: {w:?}");
         barrier.wait();
 
         let mut buffer = [0; 4096];
@@ -2191,9 +2189,9 @@ mod tests {
             }
 
             let r = client.read(&mut buffer[index..]);
-            println!("http client read: {:?}", r);
+            println!("http client read: {r:?}");
             match r {
-                Err(e) => assert!(false, "client request should not fail. Error: {:?}", e),
+                Err(e) => assert!(false, "client request should not fail. Error: {e:?}"),
                 Ok(sz) => {
                     index += sz;
                 }
@@ -2207,7 +2205,7 @@ mod tests {
 
         println!("first request ended, will send second one");
         let w2 = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]);
-        println!("http client write: {:?}", w2);
+        println!("http client write: {w2:?}");
         barrier.wait();
 
         let mut buffer2 = [0; 4096];
@@ -2220,9 +2218,9 @@ mod tests {
             }
 
             let r2 = client.read(&mut buffer2[index..]);
-            println!("http client read: {:?}", r2);
+            println!("http client read: {r2:?}");
             match r2 {
-                Err(e) => assert!(false, "client request should not fail. Error: {:?}", e),
+                Err(e) => assert!(false, "client request should not fail. Error: {e:?}"),
                 Ok(sz) => {
                     index += sz;
                 }
@@ -2307,7 +2305,7 @@ mod tests {
         let w = client.write(
             &b"GET /redirected?true HTTP/1.1\r\nHost: localhost\r\nConnection: Close\r\n\r\n"[..],
         );
-        println!("http client write: {:?}", w);
+        println!("http client write: {w:?}");
 
         let expected_answer = "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://localhost/redirected?true\r\n\r\n";
         let mut buffer = [0; 4096];
@@ -2319,9 +2317,9 @@ mod tests {
             }
 
             let r = client.read(&mut buffer[index..]);
-            println!("http client read: {:?}", r);
+            println!("http client read: {r:?}");
             match r {
-                Err(e) => assert!(false, "Failed to read client stream. Error: {:?}", e),
+                Err(e) => assert!(false, "Failed to read client stream. Error: {e:?}"),
                 Ok(sz) => {
                     index += sz;
                 }
@@ -2329,7 +2327,7 @@ mod tests {
         }
 
         let answer = str::from_utf8(&buffer[..index]).expect("could not make string from buffer");
-        println!("Response: {}", answer);
+        println!("Response: {answer}");
         assert_eq!(answer, expected_answer);
     }
 
@@ -2339,7 +2337,7 @@ mod tests {
         thread::spawn(move || {
             setup_test_logger!();
             let server =
-                Server::http(&format!("127.0.0.1:{}", port)).expect("could not create server");
+                Server::http(&format!("127.0.0.1:{port}")).expect("could not create server");
             info!("starting web server in port {}", port);
             barrier.wait();
 
@@ -2358,7 +2356,7 @@ mod tests {
                 info!("server session stopped");
             }
 
-            println!("server on port {} closed", port);
+            println!("server on port {port} closed");
         });
     }
 

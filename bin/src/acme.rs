@@ -130,7 +130,7 @@ pub fn main(
         let challenge = auth.http_challenge();
         let challenge_token = challenge.http_token();
 
-        let path = format!("/.well-known/acme-challenge/{}", challenge_token);
+        let path = format!("/.well-known/acme-challenge/{challenge_token}");
         let key_authorization = challenge.http_proof();
         debug!(
             "HTTP challenge token: {} key: {}",
@@ -175,12 +175,10 @@ pub fn main(
                     info!("challenge request answered");
                     // the challenge can be called multiple times
                     //return true;
-                } else {
-                    if let Err(e) = request
-                        .respond(Response::from_data(&b"not found"[..]).with_status_code(404))
-                    {
-                        error!("Error responding with 404 to request: {}", e);
-                    }
+                } else if let Err(e) =
+                    request.respond(Response::from_data(&b"not found"[..]).with_status_code(404))
+                {
+                    error!("Error responding with 404 to request: {}", e);
                 }
             }
 
@@ -266,7 +264,7 @@ fn generate_id() -> String {
         .take(6)
         .map(|c| c as char)
         .collect();
-    format!("ID-{}", s)
+    format!("ID-{s}")
 }
 
 fn generate_app_id(app_id: &str) -> String {
@@ -275,7 +273,7 @@ fn generate_app_id(app_id: &str) -> String {
         .take(6)
         .map(|c| c as char)
         .collect();
-    format!("{}-ACME-{}", app_id, s)
+    format!("{app_id}-ACME-{s}")
 }
 
 fn set_up_proxying(
@@ -289,7 +287,7 @@ fn set_up_proxying(
     let add_http_front = ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         hostname: String::from(hostname),
-        address: frontend.clone(),
+        address: *frontend,
         path: PathRule::Prefix(path_begin.to_owned()),
         method: None,
         position: RulePosition::Tree,
@@ -300,7 +298,7 @@ fn set_up_proxying(
 
     let add_backend = ProxyRequestOrder::AddBackend(Backend {
         cluster_id: String::from(cluster_id),
-        backend_id: format!("{}-0", cluster_id),
+        backend_id: format!("{cluster_id}-0"),
         address: server_address,
         load_balancing_parameters: None,
         sticky_id: None,
@@ -321,7 +319,7 @@ fn remove_proxying(
 ) -> anyhow::Result<()> {
     let remove_http_front_order = ProxyRequestOrder::RemoveHttpFrontend(HttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
-        address: frontend.clone(),
+        address: *frontend,
         hostname: String::from(hostname),
         path: PathRule::Prefix(path_begin.to_owned()),
         method: None,
@@ -333,7 +331,7 @@ fn remove_proxying(
 
     let remove_backend_order = ProxyRequestOrder::RemoveBackend(RemoveBackend {
         cluster_id: String::from(cluster_id),
-        backend_id: format!("{}-0", cluster_id),
+        backend_id: format!("{cluster_id}-0"),
         address: server_address,
     });
 
@@ -352,17 +350,17 @@ fn add_certificate(
     tls_versions: &Vec<TlsVersion>,
 ) -> anyhow::Result<()> {
     let certificate = Config::load_file(certificate_path)
-        .with_context(|| format!("could not load certificate"))?;
+        .with_context(|| "could not load certificate".to_string())?;
 
-    let key = Config::load_file(key_path).with_context(|| format!("could not load key"))?;
+    let key = Config::load_file(key_path).with_context(|| "could not load key".to_string())?;
 
     let certificate_chain = Config::load_file(chain_path)
         .map(split_certificate_chain)
-        .with_context(|| format!("could not load certificate chain"))?;
+        .with_context(|| "could not load certificate chain".to_string())?;
 
     let certificate_order = match old_fingerprint {
         None => ProxyRequestOrder::AddCertificate(AddCertificate {
-            address: frontend.clone(),
+            address: *frontend,
             certificate: CertificateAndKey {
                 certificate,
                 certificate_chain,
@@ -374,7 +372,7 @@ fn add_certificate(
         }),
 
         Some(f) => ProxyRequestOrder::ReplaceCertificate(ReplaceCertificate {
-            address: frontend.clone(),
+            address: *frontend,
             new_certificate: CertificateAndKey {
                 certificate,
                 certificate_chain,
@@ -410,7 +408,7 @@ fn order_command(
             .read_message()
             .with_context(|| "Could not read response on channel")?;
         if id != response.id {
-            panic!("received message with invalid id: {:?}", response);
+            panic!("received message with invalid id: {response:?}");
         }
         match response.status {
             CommandStatus::Processing => {

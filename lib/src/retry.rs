@@ -99,9 +99,9 @@ impl RetryPolicy for ExponentialBackoffPolicy {
     }
 }
 
-impl Into<RetryPolicyWrapper> for ExponentialBackoffPolicy {
-    fn into(self) -> RetryPolicyWrapper {
-        RetryPolicyWrapper::ExponentialBackoff(self)
+impl From<ExponentialBackoffPolicy> for RetryPolicyWrapper {
+    fn from(val: ExponentialBackoffPolicy) -> Self {
+        RetryPolicyWrapper::ExponentialBackoff(val)
     }
 }
 

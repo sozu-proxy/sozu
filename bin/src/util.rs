@@ -69,7 +69,7 @@ pub fn write_pid_file(config: &Config) -> Result<(), anyhow::Error> {
 
         let pid = unsafe { libc::getpid() };
 
-        file.write_all(format!("{}", pid).as_bytes())?;
+        file.write_all(format!("{pid}").as_bytes())?;
         file.sync_all()?;
     }
     Ok(())

@@ -279,7 +279,7 @@ impl<'de> Visitor<'de> for CertificateFingerprintVisitor {
         E: de::Error,
     {
         FromHex::from_hex(value)
-            .map_err(|e| E::custom(format!("could not deserialize hex: {:?}", e)))
+            .map_err(|e| E::custom(format!("could not deserialize hex: {e:?}")))
             .map(CertificateFingerprint)
     }
 }
@@ -378,9 +378,9 @@ fn is_default_path_rule(p: &PathRule) -> bool {
 impl std::fmt::Display for PathRule {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            PathRule::Prefix(s) => write!(f, "prefix '{}'", s),
+            PathRule::Prefix(s) => write!(f, "prefix '{s}'"),
             PathRule::Regex(r) => write!(f, "regexp '{}'", r.as_str()),
-            PathRule::Equals(s) => write!(f, "equals '{}'", s),
+            PathRule::Equals(s) => write!(f, "equals '{s}'"),
         }
     }
 }
@@ -943,7 +943,7 @@ impl std::fmt::Display for Route {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Route::Deny => write!(f, "deny"),
-            Route::ClusterId(string) => write!(f, "{}", string),
+            Route::ClusterId(string) => write!(f, "{string}"),
         }
     }
 }
@@ -958,7 +958,7 @@ mod tests {
         let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": { "CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
         let command: ProxyRequestOrder =
             serde_json::from_str(raw_json).expect("could not parse json");
-        println!("{:?}", command);
+        println!("{command:?}");
         assert!(
             command
                 == ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
@@ -978,7 +978,7 @@ mod tests {
         let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: ProxyRequestOrder =
             serde_json::from_str(raw_json).expect("could not parse json");
-        println!("{:?}", command);
+        println!("{command:?}");
         assert!(
             command
                 == ProxyRequestOrder::RemoveHttpFrontend(HttpFrontend {
@@ -1001,7 +1001,7 @@ mod tests {
         let raw_json = r#"{"type": "ADD_BACKEND", "data": {"cluster_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080", "load_balancing_parameters": { "weight": 0 }}}"#;
         let command: ProxyRequestOrder =
             serde_json::from_str(raw_json).expect("could not parse json");
-        println!("{:?}", command);
+        println!("{command:?}");
         assert!(
             command
                 == ProxyRequestOrder::AddBackend(Backend {
@@ -1020,7 +1020,7 @@ mod tests {
         let raw_json = r#"{"type": "REMOVE_BACKEND", "data": {"cluster_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080"}}"#;
         let command: ProxyRequestOrder =
             serde_json::from_str(raw_json).expect("could not parse json");
-        println!("{:?}", command);
+        println!("{command:?}");
         assert!(
             command
                 == ProxyRequestOrder::RemoveBackend(RemoveBackend {
@@ -1036,7 +1036,7 @@ mod tests {
         let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: ProxyRequestOrder =
             serde_json::from_str(raw_json).expect("could not parse json");
-        println!("{:?}", command);
+        println!("{command:?}");
         assert!(
             command
                 == ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
@@ -1058,7 +1058,7 @@ mod tests {
     fn http_front_crash_test2() {
         let raw_json = r#"{"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242" }"#;
         let front: HttpFrontend = serde_json::from_str(raw_json).expect("could not parse json");
-        println!("{:?}", front);
+        println!("{front:?}");
         assert!(
             front
                 == HttpFrontend {

@@ -187,8 +187,8 @@ impl Session {
     fn log_request(&self) {
         let frontend = match self.frontend_address {
             None => String::from("-"),
-            Some(SocketAddr::V4(addr)) => format!("{}", addr),
-            Some(SocketAddr::V6(addr)) => format!("{}", addr),
+            Some(SocketAddr::V4(addr)) => format!("{addr}"),
+            Some(SocketAddr::V6(addr)) => format!("{addr}"),
         };
 
         let backend_address = self
@@ -198,8 +198,8 @@ impl Session {
 
         let backend = match backend_address {
             None => String::from("-"),
-            Some(SocketAddr::V4(addr)) => format!("{}", addr),
-            Some(SocketAddr::V6(addr)) => format!("{}", addr),
+            Some(SocketAddr::V4(addr)) => format!("{addr}"),
+            Some(SocketAddr::V6(addr)) => format!("{addr}"),
         };
 
         let response_time = self.metrics.response_time().whole_milliseconds();
@@ -857,7 +857,7 @@ impl Session {
 
         if self.connection_attempt >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
-            bail!(format!("Too many connections on cluster {}", cluster_id));
+            bail!(format!("Too many connections on cluster {cluster_id}"));
         }
 
         if self.proxy.borrow().sessions.borrow().slab.len()
@@ -873,10 +873,7 @@ impl Session {
             .borrow_mut()
             .backend_from_cluster_id(&cluster_id)
             .with_context(|| {
-                format!(
-                    "Could not get backend and TCP stream from cluster id {}",
-                    cluster_id
-                )
+                format!("Could not get backend and TCP stream from cluster id {cluster_id}")
             })?;
         /*
         this was the old error matching for backend_from_cluster_id.
@@ -1415,7 +1412,7 @@ impl ProxyConfiguration<Session> for Proxy {
         let listener = self
             .listeners
             .get(&internal_token)
-            .ok_or_else(|| AcceptError::IoError)?;
+            .ok_or(AcceptError::IoError)?;
 
         let owned = listener.borrow();
         let mut pool = owned.pool.borrow_mut();
@@ -1698,12 +1695,12 @@ mod tests {
                 match conn {
                     Ok(mut stream) => {
                         thread::spawn(move || {
-                            println!("got a new client: {}", count);
+                            println!("got a new client: {count}");
                             handle_client(&mut stream, count)
                         });
                     }
                     Err(e) => {
-                        println!("connection failed: {:?}", e);
+                        println!("connection failed: {e:?}");
                     }
                 }
                 count += 1;

@@ -88,7 +88,7 @@ mod test {
 
         string.push('\0');
 
-        println!("string to parse: {}", string);
+        println!("string to parse: {string}");
 
         let bytes = &string.as_bytes();
 
@@ -133,7 +133,7 @@ mod test {
 
         let parsed_commands = parse_several_commands(bytes_to_parse).unwrap();
 
-        println!("parsed commands: {:?}", parsed_commands);
+        println!("parsed commands: {parsed_commands:?}");
 
         let empty_vec: Vec<u8> = vec![];
 

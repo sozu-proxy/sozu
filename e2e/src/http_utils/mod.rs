@@ -2,10 +2,7 @@ pub fn http_ok_response<S: Into<String>>(content: S) -> String {
     let content = content.into();
     let status_line = "HTTP/1.1 200 OK";
     let length = content.len();
-    format!(
-        "{}\r\nContent-Length: {}\r\n\r\n{}",
-        status_line, length, content
-    )
+    format!("{status_line}\r\nContent-Length: {length}\r\n\r\n{content}")
 }
 
 /// Creates an HTTP/1 raw request

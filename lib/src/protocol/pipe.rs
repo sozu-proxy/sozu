@@ -250,14 +250,14 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     pub fn log_request_success(&self, metrics: &SessionMetrics) {
         let session_addr = match self.get_session_address() {
             None => String::from("-"),
-            Some(SocketAddr::V4(addr)) => format!("{}", addr),
-            Some(SocketAddr::V6(addr)) => format!("{}", addr),
+            Some(SocketAddr::V4(addr)) => format!("{addr}"),
+            Some(SocketAddr::V6(addr)) => format!("{addr}"),
         };
 
         let backend = match self.get_backend_address() {
             None => String::from("-"),
-            Some(SocketAddr::V4(addr)) => format!("{}", addr),
-            Some(SocketAddr::V6(addr)) => format!("{}", addr),
+            Some(SocketAddr::V4(addr)) => format!("{addr}"),
+            Some(SocketAddr::V6(addr)) => format!("{addr}"),
         };
 
         let response_time = metrics.response_time();
@@ -289,7 +289,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             .get_tags(&listener.get_addr().to_string())
             .map(|tags| {
                 tags.iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
+                    .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             });
@@ -312,14 +312,14 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     pub fn log_request_error(&self, metrics: &SessionMetrics, message: &str) {
         let session = match self.get_session_address() {
             None => String::from("-"),
-            Some(SocketAddr::V4(addr)) => format!("{}", addr),
-            Some(SocketAddr::V6(addr)) => format!("{}", addr),
+            Some(SocketAddr::V4(addr)) => format!("{addr}"),
+            Some(SocketAddr::V6(addr)) => format!("{addr}"),
         };
 
         let backend = match self.get_backend_address() {
             None => String::from("-"),
-            Some(SocketAddr::V4(addr)) => format!("{}", addr),
-            Some(SocketAddr::V6(addr)) => format!("{}", addr),
+            Some(SocketAddr::V4(addr)) => format!("{addr}"),
+            Some(SocketAddr::V6(addr)) => format!("{addr}"),
         };
 
         let response_time = metrics.response_time();

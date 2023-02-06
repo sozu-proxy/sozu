@@ -78,10 +78,10 @@ impl NetworkDrain {
         });
 
         if self.is_writable {
-            for (ref key, ref mut stored_metric) in
-                self.proxy_metrics.iter_mut().filter(|&(_, ref value)| {
-                    value.updated && now.duration_since(value.last_sent) > secs
-                })
+            for (ref key, ref mut stored_metric) in self
+                .proxy_metrics
+                .iter_mut()
+                .filter(|(_, value)| value.updated && now.duration_since(value.last_sent) > secs)
             {
                 //info!("will write {} -> {:#?}", key, stored_metric);
                 let res = match stored_metric.data {
@@ -162,10 +162,10 @@ impl NetworkDrain {
         }*/
 
         if self.is_writable {
-            for (key, mut stored_metric) in
-                self.cluster_metrics.iter_mut().filter(|&(_, ref value)| {
-                    value.updated && now.duration_since(value.last_sent) > secs
-                })
+            for (key, mut stored_metric) in self
+                .cluster_metrics
+                .iter_mut()
+                .filter(|(_, value)| value.updated && now.duration_since(value.last_sent) > secs)
             {
                 //info!("will write {:?} -> {:#?}", key, stored_metric);
                 let res = match stored_metric.data {

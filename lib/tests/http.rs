@@ -74,7 +74,7 @@ fn test() {
         ureq::Error::Status(404, res) => {
             assert_eq!(res.header("connection"), Some("close"));
         }
-        e => panic!("invalid response: {:?}", e),
+        e => panic!("invalid response: {e:?}"),
     };
 
     let http_frontend = proxy::HttpFrontend {
@@ -98,7 +98,7 @@ fn test() {
         ureq::Error::Status(503, res) => {
             assert_eq!(res.header("connection"), Some("close"));
         }
-        e => panic!("invalid response: {:?}", e),
+        e => panic!("invalid response: {e:?}"),
     };
 
     let http_backend = proxy::Backend {
@@ -123,7 +123,7 @@ fn test() {
     client.set_read_timeout(Some(Duration::new(1, 0)));
 
     let w = client.write(&b"HELLO\r\n\r\n"[..]);
-    println!("http client write: {:?}", w);
+    println!("http client write: {w:?}");
 
     let expected_answer =
         "HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
@@ -131,19 +131,19 @@ fn test() {
     let mut index = 0;
 
     let r = client.read(&mut buffer[..]);
-    println!("http client read: {:?}", r);
+    println!("http client read: {r:?}");
     match r {
-        Err(e) => assert!(false, "client request should not fail. Error: {:?}", e),
+        Err(e) => assert!(false, "client request should not fail. Error: {e:?}"),
         Ok(sz) => {
             index += sz;
             let answer =
                 str::from_utf8(&buffer[..index]).expect("could not make string from buffer");
-            println!("Response: {}", answer);
+            println!("Response: {answer}");
         }
     }
 
     let answer = str::from_utf8(&buffer[..index]).expect("could not make string from buffer");
-    println!("Response: {}", answer);
+    println!("Response: {answer}");
     assert_eq!(answer, expected_answer);
 
     let barrier = Arc::new(Barrier::new(2));
@@ -163,7 +163,7 @@ fn test() {
         ureq::Error::Status(502, res) => {
             assert_eq!(res.status_text(), "Bad Gateway");
         }
-        e => panic!("invalid response: {:?}", e),
+        e => panic!("invalid response: {e:?}"),
     };
 
     command.write_message(&proxy::ProxyRequest {
@@ -237,10 +237,10 @@ fn test() {
     info!("server closes, expecting 503");
     match agent.get("http://example.com:8080/").call().unwrap_err() {
         ureq::Error::Status(503, res) => {
-            println!("res: {:?}", res);
+            println!("res: {res:?}");
             assert_eq!(res.status_text(), "Service Unavailable");
         }
-        e => panic!("invalid response: {:?}", e),
+        e => panic!("invalid response: {e:?}"),
     };
 
     command.write_message(&proxy::ProxyRequest {
@@ -279,7 +279,7 @@ fn test() {
     barrier.wait();
     info!("expecting upgrade (101 switching protocols)");
     let res = agent.get("http://example.com:8080/").call().unwrap();
-    println!("res: {:?}", res);
+    println!("res: {res:?}");
     assert_eq!(res.status(), 101);
     assert_eq!(res.header("Upgrade"), Some("WebSocket"));
     assert_eq!(res.header("Connection"), Some("Upgrade"));
@@ -316,7 +316,7 @@ fn test() {
 
 fn start_server(port: u16, barrier: Arc<Barrier>) {
     thread::spawn(move || {
-        let server = Server::http(&format!("127.0.0.1:{}", port)).expect("could not create server");
+        let server = Server::http(&format!("127.0.0.1:{port}")).expect("could not create server");
         info!("starting web server in port {}", port);
 
         barrier.wait();
@@ -350,6 +350,6 @@ fn start_server(port: u16, barrier: Arc<Barrier>) {
             eprintln!("server session stopped");
         }
 
-        eprintln!("server on port {} closed", port);
+        eprintln!("server on port {port} closed");
     });
 }

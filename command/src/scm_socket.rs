@@ -210,21 +210,21 @@ impl Listeners {
         self.http
             .iter()
             .position(|(front, _)| front == addr)
-            .and_then(|pos| Some(self.http.remove(pos).1))
+            .map(|pos| self.http.remove(pos).1)
     }
 
     pub fn get_https(&mut self, addr: &SocketAddr) -> Option<RawFd> {
         self.tls
             .iter()
             .position(|(front, _)| front == addr)
-            .and_then(|pos| Some(self.tls.remove(pos).1))
+            .map(|pos| self.tls.remove(pos).1)
     }
 
     pub fn get_tcp(&mut self, addr: &SocketAddr) -> Option<RawFd> {
         self.tcp
             .iter()
             .position(|(front, _)| front == addr)
-            .and_then(|pos| Some(self.tcp.remove(pos).1))
+            .map(|pos| self.tcp.remove(pos).1)
     }
 
     /// Deactivate all listeners by closing their file descriptors
@@ -272,10 +272,8 @@ mod tests {
     }
 
     fn socket_addr_from_str(str: &str) -> SocketAddr {
-        SocketAddr::from_str(str).expect(&format!(
-            "failed to create socket address from string slice {}",
-            str
-        ))
+        SocketAddr::from_str(str)
+            .unwrap_or_else(|_| panic!("failed to create socket address from string slice {str}"))
     }
 
     #[test]
@@ -311,16 +309,16 @@ mod tests {
         let (stream_1, stream_2) =
             MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
 
-        println!("unix stream pair: {:?} and {:?}", stream_1, stream_2);
+        println!("unix stream pair: {stream_1:?} and {stream_2:?}");
         let sending_scm_socket =
             ScmSocket::new(stream_1.into_raw_fd()).expect("Could not create scm socket");
 
-        println!("sending socket: {:?}", sending_scm_socket);
+        println!("sending socket: {sending_scm_socket:?}");
 
         let receiving_scm_socket =
             ScmSocket::new(stream_2.into_raw_fd()).expect("Could not create scm socket");
 
-        println!("receiving socket: {:?}", receiving_scm_socket);
+        println!("receiving socket: {receiving_scm_socket:?}");
 
         // We have to provide actual file descriptors, even if they will all be changed in the takeover
         let (http_socket1, http_socket2) =
@@ -364,7 +362,7 @@ mod tests {
         };
 
         println!("self.fd: {}", sending_scm_socket.fd);
-        println!("listeners to send: {:#?}", listeners);
+        println!("listeners to send: {listeners:#?}");
 
         sending_scm_socket
             .send_listeners(&listeners)

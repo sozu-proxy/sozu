@@ -36,7 +36,7 @@ fn generate_id() -> String {
         .take(6)
         .map(|c| c as char)
         .collect();
-    format!("ID-{}", s)
+    format!("ID-{s}")
 }
 
 fn generate_tagged_id(tag: &str) -> String {
@@ -45,7 +45,7 @@ fn generate_tagged_id(tag: &str) -> String {
         .take(6)
         .map(|c| c as char)
         .collect();
-    format!("{}-{}", tag, s)
+    format!("{tag}-{s}")
 }
 
 impl CommandManager {
@@ -89,7 +89,7 @@ impl CommandManager {
 
         let command_request = CommandRequest::new(id, command_request_order, worker_id);
 
-        println!("Sending command : {:?}", command_request);
+        println!("Sending command : {command_request:?}");
 
         self.channel
             .write_message(&command_request)
@@ -124,7 +124,7 @@ impl CommandManager {
                             | CommandResponseContent::Event(_) => {}
                             CommandResponseContent::State(state) => match json {
                                 true => print_json_response(&state)?,
-                                false => println!("{:#?}", state),
+                                false => println!("{state:#?}"),
                             },
                             CommandResponseContent::FrontendList(frontends) => {
                                 print_frontend_list(frontends)
@@ -244,7 +244,7 @@ impl CommandManager {
 
                         println!("Proxy successfully upgraded!");
                     } else {
-                        println!("Received a response of the wrong kind: {:?}", response);
+                        println!("Received a response of the wrong kind: {response:?}");
                     }
                     break;
                 }
@@ -254,7 +254,7 @@ impl CommandManager {
     }
 
     pub fn upgrade_worker(&mut self, worker_id: u32) -> Result<(), anyhow::Error> {
-        println!("upgrading worker {}", worker_id);
+        println!("upgrading worker {worker_id}");
         let id = generate_id();
 
         //FIXME: we should be able to soft stop one specific worker
@@ -382,7 +382,7 @@ impl CommandManager {
                     .get(0)
                     .with_context(|| "Domain can't be empty")?
                     .clone(),
-                path: splitted.get(1).cloned().map(|path| format!("/{}", path)), // We add the / again because of the splitn removing it
+                path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
             };
 
             CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(Query::Clusters(

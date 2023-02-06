@@ -611,7 +611,7 @@ mod tests {
         root.domain_insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
 
         let res = root.domain_lookup(b"test.services.clever-cloud.com", true);
-        println!("query result: {:?}", res);
+        println!("query result: {res:?}");
 
         assert_eq!(
             root.domain_lookup(b"pgstudio.services.clever-cloud.com", true),
@@ -636,9 +636,7 @@ mod tests {
             assert_eq!(
                 root.insert(Vec::from(k.as_bytes()), *v),
                 InsertResult::Ok,
-                "could not insert ({}, {})",
-                k,
-                v
+                "could not insert ({k}, {v})"
             );
             //root.print();
         }
@@ -656,7 +654,7 @@ mod tests {
             //match root.domain_lookup(k.as_bytes()) {
             match root.lookup(k.as_bytes(), true) {
                 None => {
-                    println!("did not find key '{}'", k);
+                    println!("did not find key '{k}'");
                     return false;
                 }
                 Some(&(ref k1, v1)) => {
