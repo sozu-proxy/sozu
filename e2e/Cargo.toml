@@ -7,8 +7,8 @@ edition = "2021"
 sozu-lib = { path = "../lib" }
 sozu-command-lib = { path = "../command" }
 slab = "^0.4.7"
-mio = "^0.8.4"
-time = "^0.3.14"
-futures = "^0.3.24"
-libc = "^0.2.138"
-serial_test = "^0.10.0"
+mio = "^0.8.5"
+time = "^0.3.17"
+futures = "^0.3.26"
+libc = "^0.2.139"
+serial_test = "^1.0.0"
