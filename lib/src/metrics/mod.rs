@@ -48,10 +48,7 @@ impl MetricData {
             (&mut MetricData::Gauge(ref mut v1), MetricData::GaugeAdd(v2)) => {
                 debug_assert!(
                     *v1 as i64 + v2 >= 0,
-                    "metric {} underflow: previous value: {}, adding: {}",
-                    key,
-                    v1,
-                    v2
+                    "metric {key} underflow: previous value: {v1}, adding: {v2}"
                 );
                 let changed = v2 != 0;
                 let res = *v1 as i64 + v2;
@@ -73,8 +70,7 @@ impl MetricData {
                 changed
             }
             (s, m) => panic!(
-                "tried to update metric {} of value {:?} with an incompatible metric: {:?}",
-                key, s, m
+                "tried to update metric {key} of value {s:?} with an incompatible metric: {m:?}"
             ),
         }
     }

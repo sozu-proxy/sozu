@@ -16,7 +16,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
-  pub static TAG:    String          = LOGGER.with(|logger| (*logger.borrow()).tag.clone());
+  pub static TAG:    String          = LOGGER.with(|logger| logger.borrow().tag.clone());
 }
 
 pub static COMPAT_LOGGER: CompatLogger = CompatLogger;
@@ -71,7 +71,7 @@ impl Logger {
                 logger.initialized = true;
 
                 let _ = log::set_logger(&COMPAT_LOGGER)
-                    .map_err(|e| println!("could not register compat logger: {:?}", e));
+                    .map_err(|e| println!("could not register compat logger: {e:?}"));
                 log::set_max_level(log::LevelFilter::Info);
             }
         });
@@ -86,7 +86,7 @@ impl Logger {
                 //FIXME: should have a buffer to write to instead of allocating a string
                 LoggerBackend::Unix(ref mut socket) => {
                     let _ = socket.send(format(args).as_bytes()).map_err(|e| {
-                        println!("cannot write logs to Unix socket: {:?}", e);
+                        println!("cannot write logs to Unix socket: {e:?}");
                     });
                 }
                 //FIXME: should have a buffer to write to instead of allocating a string
@@ -94,17 +94,17 @@ impl Logger {
                     let _ = socket
                         .send_to(format(args).as_bytes(), address)
                         .map_err(|e| {
-                            println!("cannot write logs to UDP socket: {:?}", e);
+                            println!("cannot write logs to UDP socket: {e:?}");
                         });
                 }
                 LoggerBackend::Tcp(ref mut socket) => {
                     let _ = socket.write_fmt(args).map_err(|e| {
-                        println!("cannot write logs to TCP socket: {:?}", e);
+                        println!("cannot write logs to TCP socket: {e:?}");
                     });
                 }
                 LoggerBackend::File(ref mut file) => {
                     let _ = file.write_fmt(args).map_err(|e| {
-                        println!("cannot write logs to file: {:?}", e);
+                        println!("cannot write logs to file: {e:?}");
                     });
                 }
             }
@@ -121,7 +121,7 @@ impl Logger {
                 //FIXME: should have a buffer to write to instead of allocating a string
                 LoggerBackend::Unix(ref mut socket) => {
                     let _ = socket.send(format(args).as_bytes()).map_err(|e| {
-                        println!("cannot write logs to Unix socket: {:?}", e);
+                        println!("cannot write logs to Unix socket: {e:?}");
                     });
                 }
                 //FIXME: should have a buffer to write to instead of allocating a string
@@ -129,17 +129,17 @@ impl Logger {
                     let _ = socket
                         .send_to(format(args).as_bytes(), address)
                         .map_err(|e| {
-                            println!("cannot write logs to UDP socket: {:?}", e);
+                            println!("cannot write logs to UDP socket: {e:?}");
                         });
                 }
                 LoggerBackend::Tcp(ref mut socket) => {
                     let _ = socket.write_fmt(args).map_err(|e| {
-                        println!("cannot write logs to TCP socket: {:?}", e);
+                        println!("cannot write logs to TCP socket: {e:?}");
                     });
                 }
                 LoggerBackend::File(ref mut file) => {
                     let _ = file.write_fmt(args).map_err(|e| {
-                        println!("cannot write logs to file: {:?}", e);
+                        println!("cannot write logs to file: {e:?}");
                     });
                 }
             }
@@ -155,7 +155,7 @@ impl Logger {
                 //FIXME: should have a buffer to write to instead of allocating a string
                 LoggerBackend::Unix(ref mut socket) => {
                     let _ = socket.send(format(args).as_bytes()).map_err(|e| {
-                        println!("cannot write logs to Unix socket: {:?}", e);
+                        println!("cannot write logs to Unix socket: {e:?}");
                     });
                 }
                 //FIXME: should have a buffer to write to instead of allocating a string
@@ -163,17 +163,17 @@ impl Logger {
                     let _ = socket
                         .send_to(format(args).as_bytes(), address)
                         .map_err(|e| {
-                            println!("cannot write logs to UDP socket: {:?}", e);
+                            println!("cannot write logs to UDP socket: {e:?}");
                         });
                 }
                 LoggerBackend::Tcp(ref mut socket) => {
                     let _ = socket.write_fmt(args).map_err(|e| {
-                        println!("cannot write logs to TCP socket: {:?}", e);
+                        println!("cannot write logs to TCP socket: {e:?}");
                     });
                 }
                 LoggerBackend::File(ref mut file) => {
                     let _ = file.write_fmt(args).map_err(|e| {
-                        println!("cannot write logs to file: {:?}", e);
+                        println!("cannot write logs to file: {e:?}");
                     });
                 }
             }
@@ -431,9 +431,8 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
     let _ = parts.next();
     if parts.next().is_some() {
         println!(
-            "warning: invalid logging spec '{}', \
-                 ignoring it (too many '/'s)",
-            spec
+            "warning: invalid logging spec '{spec}', \
+                 ignoring it (too many '/'s)"
         );
         return dirs;
     }
@@ -458,18 +457,16 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
                         Ok(num) => (num, Some(part0)),
                         _ => {
                             println!(
-                                "warning: invalid logging spec '{}', \
-                                 ignoring it",
-                                part1
+                                "warning: invalid logging spec '{part1}', \
+                                 ignoring it"
                             );
                             continue;
                         }
                     },
                     _ => {
                         println!(
-                            "warning: invalid logging spec '{}', \
-                         ignoring it",
-                            s
+                            "warning: invalid logging spec '{s}', \
+                         ignoring it"
                         );
                         continue;
                     }
@@ -490,7 +487,7 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
     } else if let Some(addr) = target.strip_prefix("udp://") {
         match addr.to_socket_addrs() {
             Err(e) => {
-                println!("invalid log target configuration ({:?}): {}", e, target);
+                println!("invalid log target configuration ({e:?}): {target}");
                 LoggerBackend::Stdout(stdout())
             }
             Ok(mut addrs) => {
@@ -501,7 +498,7 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
     } else if let Some(addr) = target.strip_prefix("tcp://") {
         match addr.to_socket_addrs() {
             Err(e) => {
-                println!("invalid log target configuration ({:?}): {}", e, target);
+                println!("invalid log target configuration ({e:?}): {target}");
                 LoggerBackend::Stdout(stdout())
             }
             Ok(mut addrs) => LoggerBackend::Tcp(TcpStream::connect(addrs.next().unwrap()).unwrap()),
@@ -509,7 +506,7 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
     } else if let Some(addr) = target.strip_prefix("unix://") {
         let path = Path::new(addr);
         if !path.exists() {
-            println!("invalid log target configuration: {} is not a file", addr);
+            println!("invalid log target configuration: {addr} is not a file");
             LoggerBackend::Stdout(stdout())
         } else {
             let mut dir = env::temp_dir();
@@ -529,14 +526,13 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
             Ok(file) => LoggerBackend::File(crate::writer::MultiLineWriter::new(file)),
             Err(e) => {
                 println!(
-                    "invalid log target configuration: could not open file at {} (error: {:?})",
-                    addr, e
+                    "invalid log target configuration: could not open file at {addr} (error: {e:?})"
                 );
                 LoggerBackend::Stdout(stdout())
             }
         }
     } else {
-        println!("invalid log target configuration: {}", target);
+        println!("invalid log target configuration: {target}");
         LoggerBackend::Stdout(stdout())
     }
 }

@@ -268,9 +268,7 @@ impl Session {
         // - determine next protocol (tcps, https ,http2)
 
         let front_buf = self.pool.upgrade().and_then(|p| p.borrow_mut().checkout());
-        if front_buf.is_none() {
-            return None;
-        }
+        front_buf.as_ref()?;
 
         let sni = handshake.session.sni_hostname();
         let alpn = handshake.session.alpn_protocol();
@@ -1179,9 +1177,8 @@ impl Session {
         let (backend, conn) = match result {
             Err(e) => {
                 self.set_answer(DefaultAnswerStatus::Answer503, None);
-                return Err(e).with_context(|| {
-                    format!("Could not find a backend for cluster {}", cluster_id)
-                });
+                return Err(e)
+                    .with_context(|| format!("Could not find a backend for cluster {cluster_id}"));
             }
             Ok((backend, conn)) => (backend, conn),
         };
@@ -1250,7 +1247,7 @@ impl Session {
                 }
             },
             Err(e) => {
-                let no_host_error = format!("Host not found: {}: {:#}", host, e);
+                let no_host_error = format!("Host not found: {host}: {e:#}");
                 self.set_answer(DefaultAnswerStatus::Answer404, None);
                 bail!(no_host_error);
             }
@@ -1725,7 +1722,7 @@ impl Listener {
 
         registry
             .register(&mut listener, self.token, Interest::READABLE)
-            .with_context(|| format!("Could not register listener socket {:?}", listener))?;
+            .with_context(|| format!("Could not register listener socket {listener:?}"))?;
 
         self.listener = Some(listener);
         self.active = true;
@@ -1746,7 +1743,7 @@ impl Listener {
                 .collect::<Vec<_>>()
         };
 
-        #[cfg_attr(rustfmt, rustfmt_skip)]
+        #[rustfmt::skip]
         let ciphers = cipher_names
             .into_iter()
             .filter_map(|cipher| match cipher {
@@ -1926,7 +1923,7 @@ impl Proxy {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
                 debug!("Deregistering socket {:?}", sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
-                    let error = format!("socket {:?}: {:?}", sock, e);
+                    let error = format!("socket {sock:?}: {e:?}");
                     socket_errors.push(error);
                 }
             }
@@ -1946,7 +1943,7 @@ impl Proxy {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
                 debug!("Deregistering socket {:?}", sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {
-                    let error = format!("socket {:?}: {:?}", sock, e);
+                    let error = format!("socket {sock:?}: {e:?}");
                     socket_errors.push(error);
                 }
             }
@@ -2036,7 +2033,7 @@ impl Proxy {
             .listeners
             .values()
             .find(|listener| listener.borrow().address == *addr)
-            .with_context(|| format!("No listener found for address {}", addr))?;
+            .with_context(|| format!("No listener found for address {addr}"))?;
 
         listener
             .borrow_mut()
@@ -2235,7 +2232,7 @@ impl ProxyConfiguration<Session> for Proxy {
         let listener = self
             .listeners
             .get(&Token(token.0))
-            .ok_or_else(|| AcceptError::IoError)?;
+            .ok_or(AcceptError::IoError)?;
         if let Err(e) = frontend_sock.set_nodelay(true) {
             error!(
                 "error setting nodelay on front socket({:?}): {:?}",
@@ -2302,7 +2299,7 @@ impl ProxyConfiguration<Session> for Proxy {
             ProxyRequestOrder::RemoveCluster { cluster_id } => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
-                    .with_context(|| format!("Could not remove cluster {}", cluster_id))
+                    .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
             ProxyRequestOrder::AddHttpsFrontend(front) => {
                 info!("{} add https front {:?}", request_id, front);
@@ -2377,7 +2374,7 @@ impl ProxyConfiguration<Session> for Proxy {
                     request_id, logging_filter
                 );
                 self.logging(logging_filter.clone())
-                    .with_context(|| format!("Could not set logging level to {}", logging_filter))
+                    .with_context(|| format!("Could not set logging level to {logging_filter}"))
             }
             ProxyRequestOrder::Query(Query::Certificates(QueryCertificateType::All)) => {
                 info!("{} query all certificates", request_id);
@@ -2387,7 +2384,7 @@ impl ProxyConfiguration<Session> for Proxy {
             ProxyRequestOrder::Query(Query::Certificates(QueryCertificateType::Domain(domain))) => {
                 info!("{} query certificate for domain {}", request_id, domain);
                 self.query_certificate_for_domain(domain.clone())
-                    .with_context(|| format!("Could not query certificate for domain {}", domain))
+                    .with_context(|| format!("Could not query certificate for domain {domain}"))
             }
             other_order => {
                 error!(
@@ -2409,7 +2406,7 @@ impl ProxyConfiguration<Session> for Proxy {
             }
             Err(error_message) => {
                 error!("{} unsuccessful: {:#}", request_id, error_message);
-                ProxyResponse::error(request_id, format!("{:#}", error_message))
+                ProxyResponse::error(request_id, format!("{error_message:#}"))
             }
         }
     }
@@ -2683,7 +2680,7 @@ mod tests {
         );
 
         let res = trie.domain_lookup(b"test.services.clever-cloud.com", true);
-        println!("query result: {:?}", res);
+        println!("query result: {res:?}");
 
         assert_eq!(
             trie.domain_lookup(b"pgstudio.services.clever-cloud.com", true),
@@ -2703,7 +2700,7 @@ mod tests {
         trie.domain_insert("hello.sub.test.example.com".as_bytes().to_vec(), 2u8);
 
         let res = trie.domain_lookup(b"sub.test.example.com", true);
-        println!("query result: {:?}", res);
+        println!("query result: {res:?}");
 
         assert_eq!(
             trie.domain_lookup(b"sub.test.example.com", true),
@@ -2721,7 +2718,7 @@ mod tests {
         trie.domain_insert("*.test.example.com".as_bytes().to_vec(), 1u8);
 
         let res = trie.domain_lookup(b"sub.test.example.com", true);
-        println!("query result: {:?}", res);
+        println!("query result: {res:?}");
 
         assert_eq!(
             trie.domain_lookup(b"sub.test.example.com", true),

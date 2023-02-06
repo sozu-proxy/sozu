@@ -47,7 +47,7 @@ pub fn print_listeners(listeners_list: ListenersList) {
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         let mut tls_versions = String::new();
         for tls_version in https_listener.versions.iter() {
-            tls_versions.push_str(&format!("{:?}\n", tls_version));
+            tls_versions.push_str(&format!("{tls_version:?}\n"));
         }
 
         table.add_row(row![
@@ -211,7 +211,7 @@ pub fn print_metrics(
 
     // workers
     for (worker_id, query_answer_metrics) in aggregated_metrics.workers.iter() {
-        println!("\nWorker {}\n=========", worker_id);
+        println!("\nWorker {worker_id}\n=========");
         print_worker_metrics(query_answer_metrics)?;
     }
     Ok(())
@@ -224,7 +224,7 @@ fn print_worker_metrics(query_answer: &QueryAnswer) -> anyhow::Result<()> {
             print_cluster_metrics(clusters);
         }
         QueryAnswer::Metrics(QueryAnswerMetrics::Error(error)) => {
-            println!("Error: {}\nMaybe check your command.", error)
+            println!("Error: {error}\nMaybe check your command.")
         }
         _ => bail!("The query answer is wrong."),
     }
@@ -243,7 +243,7 @@ fn print_proxy_metrics(proxy_metrics: &Option<BTreeMap<String, FilteredData>>) {
 fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetricsData>>) {
     if let Some(cluster_metrics) = cluster_metrics {
         for (cluster_id, cluster_metrics_data) in cluster_metrics.iter() {
-            println!("\nCluster {}\n--------", cluster_id);
+            println!("\nCluster {cluster_id}\n--------");
 
             if let Some(cluster) = &cluster_metrics_data.cluster {
                 let filtered = filter_metrics(cluster);
@@ -253,7 +253,7 @@ fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetric
 
             if let Some(backends) = &cluster_metrics_data.backends {
                 for (backend_id, backend_metrics) in backends.iter() {
-                    println!("\n{}/{}\n--------", cluster_id, backend_id);
+                    println!("\n{cluster_id}/{backend_id}\n--------");
                     let filtered = filter_metrics(backend_metrics);
                     print_gauges_and_counts(&filtered);
                     print_percentiles(&filtered);
@@ -455,7 +455,7 @@ pub fn print_query_response_data(
                 }
             }
 
-            println!("Cluster level configuration for {}:\n", needle);
+            println!("Cluster level configuration for {needle}:\n");
 
             for (key, values) in cluster_data.iter() {
                 let mut row = Vec::new();
@@ -488,7 +488,7 @@ pub fn print_query_response_data(
 
             cluster_table.printstd();
 
-            println!("\nHTTP frontends configuration for {}:\n", needle);
+            println!("\nHTTP frontends configuration for {needle}:\n");
 
             for (key, values) in frontend_data.iter() {
                 let mut row = Vec::new();
@@ -512,7 +512,7 @@ pub fn print_query_response_data(
 
             frontend_table.printstd();
 
-            println!("\nHTTPS frontends configuration for {}:\n", needle);
+            println!("\nHTTPS frontends configuration for {needle}:\n");
 
             for (key, values) in https_frontend_data.iter() {
                 let mut row = Vec::new();
@@ -536,7 +536,7 @@ pub fn print_query_response_data(
 
             https_frontend_table.printstd();
 
-            println!("\nTCP frontends configuration for {}:\n", needle);
+            println!("\nTCP frontends configuration for {needle}:\n");
 
             for (key, values) in tcp_frontend_data.iter() {
                 let mut row = vec![cell!(key.cluster_id), cell!(format!("{}", key.address))];
@@ -554,7 +554,7 @@ pub fn print_query_response_data(
 
             tcp_frontend_table.printstd();
 
-            println!("\nbackends configuration for {}:\n", needle);
+            println!("\nbackends configuration for {needle}:\n");
 
             for (key, values) in backend_data.iter() {
                 let mut row = vec![
@@ -603,7 +603,7 @@ pub fn print_query_response_data(
         for (key, values) in query_data.iter() {
             let mut row = vec![cell!(key)];
             for val in values.iter() {
-                row.push(cell!(format!("{}", val)));
+                row.push(cell!(format!("{val}")));
             }
 
             let hs: HashSet<&u64> = values.iter().cloned().collect();
@@ -631,18 +631,18 @@ pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> an
     let it = data.iter().map(|(k, v)| match v {
         QueryAnswer::Certificates(c) => (k, c),
         v => {
-            eprintln!("unexpected certificates query answer: {:?}", v);
+            eprintln!("unexpected certificates query answer: {v:?}");
             exit(1);
         }
     });
 
     for (k, v) in it {
-        println!("process '{}':", k);
+        println!("process '{k}':");
 
         match v {
             QueryAnswerCertificate::All(h) => {
                 for (addr, h2) in h.iter() {
-                    println!("\t{}:", addr);
+                    println!("\t{addr}:");
 
                     for (domain, fingerprint) in h2.iter() {
                         println!("\t\t{}:\t{}", domain, hex::encode(fingerprint));
@@ -653,7 +653,7 @@ pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> an
             }
             QueryAnswerCertificate::Domain(h) => {
                 for (addr, opt) in h.iter() {
-                    println!("\t{}:", addr);
+                    println!("\t{addr}:");
                     if let Some((key, fingerprint)) = opt {
                         println!("\t\t{}:\t{}", key, hex::encode(fingerprint));
                     } else {
@@ -665,7 +665,7 @@ pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> an
             }
             QueryAnswerCertificate::Fingerprint(opt) => {
                 if let Some((s, v)) = opt {
-                    println!("\tfrontends: {:?}\ncertificate:\n{}", v, s);
+                    println!("\tfrontends: {v:?}\ncertificate:\n{s}");
                 } else {
                     println!("\tnot found");
                 }
@@ -679,7 +679,7 @@ pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> an
 fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
     tags.map(|tags| {
         tags.iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(", ")
     })
@@ -722,11 +722,11 @@ pub fn print_available_metrics(answers: &BTreeMap<String, QueryAnswer>) -> anyho
 
     println!("Available metrics on the proxy level:");
     for metric_name in proxy_metrics_names {
-        println!("\t{}", metric_name);
+        println!("\t{metric_name}");
     }
     println!("Available metrics on the cluster level:");
     for metric_name in cluster_metrics_names {
-        println!("\t{}", metric_name);
+        println!("\t{metric_name}");
     }
     Ok(())
 }
@@ -734,8 +734,8 @@ pub fn print_available_metrics(answers: &BTreeMap<String, QueryAnswer>) -> anyho
 fn list_string_vec(vec: &Vec<String>) -> String {
     let mut output = String::new();
     for item in vec.iter() {
-        output.push_str(&item);
-        output.push_str("\n");
+        output.push_str(item);
+        output.push('\n');
     }
     output
 }

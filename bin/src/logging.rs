@@ -9,7 +9,7 @@ lazy_static! {
     pub static ref MAIN_LOGGER: Arc<Mutex<Logger>> = Arc::new(Mutex::new(Logger::new()));
     pub static ref TAG: String = {
         let logger = MAIN_LOGGER.lock().unwrap();
-        (*logger).tag.clone()
+        logger.tag.clone()
     };
 }
 

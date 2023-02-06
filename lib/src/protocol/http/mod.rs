@@ -647,7 +647,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
             self.listener.borrow().get_tags(hostname).map(|tags| {
                 tags.iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
+                    .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             })
@@ -715,7 +715,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
             self.listener.borrow().get_tags(hostname).map(|tags| {
                 tags.iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
+                    .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             })
@@ -791,7 +791,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
 
             self.listener.borrow().get_tags(hostname).map(|tags| {
                 tags.iter()
-                    .map(|(k, v)| format!("\"{}={}\"", k, v))
+                    .map(|(k, v)| format!("\"{k}={v}\""))
                     .collect::<Vec<_>>()
                     .join(" ")
             })
@@ -843,7 +843,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
         }
 
         if self.front_buf.as_ref().unwrap().buffer.available_space() == 0 {
-            if self.backend_token == None {
+            if self.backend_token.is_none() {
                 self.set_answer(DefaultAnswerStatus::Answer413, None);
                 self.front_readiness.interest.remove(Ready::readable());
                 self.front_readiness.interest.insert(Ready::writable());
@@ -905,8 +905,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                     self.log_request_error(
                         metrics,
                         &format!(
-                            "front socket error, closing the session. Readiness: {:?} -> {:?}, read {} bytes",
-                            front_readiness, back_readiness, size
+                            "front socket error, closing the session. Readiness: {front_readiness:?} -> {back_readiness:?}, read {size} bytes"
                         )
                     );
                 }
@@ -933,8 +932,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Http<Front, L> {
                     self.log_request_error(
                         metrics,
                         &format!(
-                            "front socket was closed, closing the session. Readiness: {:?} -> {:?}, read {} bytes",
-                            front_readiness, back_readiness, size
+                            "front socket was closed, closing the session. Readiness: {front_readiness:?} -> {back_readiness:?}, read {size} bytes"
                         )
                     );
                 }
@@ -1955,8 +1953,8 @@ impl std::fmt::Display for SessionAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
             None => write!(f, "X"),
-            Some(SocketAddr::V4(addr)) => write!(f, "{}", addr),
-            Some(SocketAddr::V6(addr)) => write!(f, "{}", addr),
+            Some(SocketAddr::V4(addr)) => write!(f, "{addr}"),
+            Some(SocketAddr::V6(addr)) => write!(f, "{addr}"),
         }
     }
 }
@@ -1975,7 +1973,7 @@ impl<'a> std::fmt::Display for OptionalString<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.inner {
             None => write!(f, "-"),
-            Some(s) => write!(f, "{}", s),
+            Some(s) => write!(f, "{s}"),
         }
     }
 }
@@ -2007,7 +2005,7 @@ impl<'a> std::fmt::Display for OptionalRequest<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.inner {
             None => write!(f, "-"),
-            Some((s1, s2)) => write!(f, "{} {}", s1, s2),
+            Some((s1, s2)) => write!(f, "{s1} {s2}"),
         }
     }
 }
@@ -2026,7 +2024,7 @@ impl<'a> std::fmt::Display for OptionalStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match &self.inner {
             None => write!(f, "-"),
-            Some(code) => write!(f, "{}", code),
+            Some(code) => write!(f, "{code}"),
         }
     }
 }
@@ -2061,13 +2059,13 @@ impl AddedRequestHeader {
         let mut s = String::new();
 
         if !headers.x_proto {
-            if let Err(e) = write!(&mut s, "X-Forwarded-Proto: {}\r\n", proto) {
+            if let Err(e) = write!(&mut s, "X-Forwarded-Proto: {proto}\r\n") {
                 error!("could not append request header: {:?}", e);
             }
         }
 
         if !headers.x_port {
-            if let Err(e) = write!(&mut s, "X-Forwarded-Port: {}\r\n", front_port) {
+            if let Err(e) = write!(&mut s, "X-Forwarded-Port: {front_port}\r\n") {
                 error!("could not append request header: {:?}", e);
             }
         }
@@ -2077,12 +2075,12 @@ impl AddedRequestHeader {
             let peer_port = peer_addr.port();
             match &headers.x_for {
                 None => {
-                    if let Err(e) = write!(&mut s, "X-Forwarded-For: {}\r\n", peer_ip) {
+                    if let Err(e) = write!(&mut s, "X-Forwarded-For: {peer_ip}\r\n") {
                         error!("could not append request header: {:?}", e);
                     }
                 }
                 Some(value) => {
-                    if let Err(e) = write!(&mut s, "X-Forwarded-For: {}, {}\r\n", value, peer_ip) {
+                    if let Err(e) = write!(&mut s, "X-Forwarded-For: {value}, {peer_ip}\r\n") {
                         error!("could not append request header: {:?}", e);
                     }
                 }
@@ -2095,7 +2093,7 @@ impl AddedRequestHeader {
                     }
                 }
                 Some(value) => {
-                    if let Err(e) = write!(&mut s, "Forwarded: {}, ", value) {
+                    if let Err(e) = write!(&mut s, "Forwarded: {value}, ") {
                         error!("could not append request header: {:?}", e);
                     }
                 }
@@ -2105,8 +2103,7 @@ impl AddedRequestHeader {
                 (IpAddr::V4(_), peer_port, IpAddr::V4(_)) => {
                     if let Err(e) = write!(
                         &mut s,
-                        "proto={};for={}:{};by={}\r\n",
-                        proto, peer_ip, peer_port, front_ip
+                        "proto={proto};for={peer_ip}:{peer_port};by={front_ip}\r\n"
                     ) {
                         error!("could not append request header: {:?}", e);
                     }
@@ -2114,8 +2111,7 @@ impl AddedRequestHeader {
                 (IpAddr::V4(_), peer_port, IpAddr::V6(_)) => {
                     if let Err(e) = write!(
                         &mut s,
-                        "proto={};for={}:{};by=\"{}\"\r\n",
-                        proto, peer_ip, peer_port, front_ip
+                        "proto={proto};for={peer_ip}:{peer_port};by=\"{front_ip}\"\r\n"
                     ) {
                         error!("could not append request header: {:?}", e);
                     }
@@ -2123,8 +2119,7 @@ impl AddedRequestHeader {
                 (IpAddr::V6(_), peer_port, IpAddr::V4(_)) => {
                     if let Err(e) = write!(
                         &mut s,
-                        "proto={};for=\"{}:{}\";by={}\r\n",
-                        proto, peer_ip, peer_port, front_ip
+                        "proto={proto};for=\"{peer_ip}:{peer_port}\";by={front_ip}\r\n"
                     ) {
                         error!("could not append request header: {:?}", e);
                     }
@@ -2132,8 +2127,7 @@ impl AddedRequestHeader {
                 (IpAddr::V6(_), peer_port, IpAddr::V6(_)) => {
                     if let Err(e) = write!(
                         &mut s,
-                        "proto={};for=\"{}:{}\";by=\"{}\"\r\n",
-                        proto, peer_ip, peer_port, front_ip
+                        "proto={proto};for=\"{peer_ip}:{peer_port}\";by=\"{front_ip}\"\r\n"
                     ) {
                         error!("could not append request header: {:?}", e);
                     }

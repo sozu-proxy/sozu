@@ -255,10 +255,10 @@ impl fmt::Debug for ProxyAddr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             ProxyAddr::Ipv4Addr { src_addr, dst_addr } => {
-                write!(f, "{:?} {:?}", dst_addr, src_addr)
+                write!(f, "{dst_addr:?} {src_addr:?}")
             }
             ProxyAddr::Ipv6Addr { src_addr, dst_addr } => {
-                write!(f, "{:?} {:?}", dst_addr, src_addr)
+                write!(f, "{dst_addr:?} {src_addr:?}")
             }
             ProxyAddr::UnixAddr { src_addr, dst_addr } => {
                 write!(f, "{:?} {:?}", &dst_addr[..], &src_addr[..])

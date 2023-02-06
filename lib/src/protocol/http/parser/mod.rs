@@ -82,7 +82,7 @@ fn is_vchar(i: u8) -> bool {
 // cf https://github.com/sozu-proxy/sozu/issues/479
 #[cfg(feature = "tolerant-http1-parser")]
 fn is_header_value_char(i: u8) -> bool {
-    i == 9 || (i >= 32 && i <= 126) || i >= 160
+    i == 9 || (32..=126).contains(&i) || i >= 160
 }
 
 #[cfg(not(feature = "tolerant-http1-parser"))]
@@ -142,7 +142,7 @@ impl fmt::Display for Method {
             Method::Delete => write!(f, "DELETE"),
             Method::Trace => write!(f, "TRACE"),
             Method::Connect => write!(f, "CONNECT"),
-            Method::Custom(s) => write!(f, "{}", s),
+            Method::Custom(s) => write!(f, "{s}"),
         }
     }
 }

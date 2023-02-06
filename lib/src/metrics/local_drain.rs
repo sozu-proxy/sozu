@@ -27,13 +27,12 @@ impl AggregatedMetric {
             MetricData::Count(value) => Ok(AggregatedMetric::Count(value)),
             MetricData::Time(value) => {
                 let mut histogram = ::hdrhistogram::Histogram::new(3).context(format!(
-                    "Could not create histogram for time metric {:?}",
-                    metric
+                    "Could not create histogram for time metric {metric:?}"
                 ))?;
 
                 histogram
                     .record(value as u64)
-                    .context(format!("could not record time metric: {:?}", metric))?;
+                    .context(format!("could not record time metric: {metric:?}"))?;
 
                 Ok(AggregatedMetric::Time(histogram))
             }
@@ -57,8 +56,7 @@ impl AggregatedMetric {
                 }
             }
             (s, m) => panic!(
-                "tried to update metric {} of value {:?} with an incompatible metric: {:?}",
-                key, s, m
+                "tried to update metric {key} of value {s:?} with an incompatible metric: {m:?}"
             ),
         }
     }
@@ -256,8 +254,7 @@ impl LocalDrain {
             let cluster_metrics = self
                 .metrics_of_one_cluster(&cluster_id, metric_names)
                 .context(format!(
-                    "Could not retrieve metrics of cluster {}",
-                    cluster_id
+                    "Could not retrieve metrics of cluster {cluster_id}"
                 ))?;
             cluster_data.insert(cluster_id.to_owned(), cluster_metrics);
         }
@@ -270,10 +267,10 @@ impl LocalDrain {
         cluster_id: &str,
         metric_names: &Vec<String>,
     ) -> anyhow::Result<ClusterMetricsData> {
-        let raw_metrics = self.cluster_metrics.get(cluster_id).context(format!(
-            "No metrics found for cluster with id {}",
-            cluster_id
-        ))?;
+        let raw_metrics = self
+            .cluster_metrics
+            .get(cluster_id)
+            .context(format!("No metrics found for cluster with id {cluster_id}"))?;
 
         let cluster: BTreeMap<String, FilteredData> = raw_metrics
             .iter()
@@ -292,8 +289,7 @@ impl LocalDrain {
             let backend_metrics = self
                 .metrics_of_one_backend(&backend_id, metric_names)
                 .context(format!(
-                    "Could not retrieve metrics for backend {} of cluster {}",
-                    backend_id, cluster_id
+                    "Could not retrieve metrics for backend {backend_id} of cluster {cluster_id}"
                 ))?;
             backends.insert(backend_id.to_owned(), backend_metrics);
         }
@@ -308,10 +304,10 @@ impl LocalDrain {
         backend_id: &str,
         metric_names: &Vec<String>,
     ) -> anyhow::Result<BTreeMap<String, FilteredData>> {
-        let backend_metrics = self.cluster_metrics.get(backend_id).context(format!(
-            "No metrics found for backend with id {}",
-            backend_id
-        ))?;
+        let backend_metrics = self
+            .cluster_metrics
+            .get(backend_id)
+            .context(format!("No metrics found for backend with id {backend_id}"))?;
 
         let filtered_backend_metrics = backend_metrics
             .iter()
@@ -361,10 +357,7 @@ impl LocalDrain {
             let cluster_id = self
                 .backend_to_cluster
                 .get(backend_id)
-                .context(format!(
-                    "No metrics found for backend with id {}",
-                    backend_id
-                ))?
+                .context(format!("No metrics found for backend with id {backend_id}"))?
                 .to_owned();
 
             let mut backend_map: BTreeMap<String, BTreeMap<String, FilteredData>> = BTreeMap::new();

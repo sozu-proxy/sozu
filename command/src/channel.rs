@@ -39,7 +39,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         max_buffer_size: usize,
     ) -> anyhow::Result<Channel<Tx, Rx>> {
         let unix_stream = MioUnixStream::connect(path)
-            .with_context(|| format!("Could not connect to socket with path {}", path))?;
+            .with_context(|| format!("Could not connect to socket with path {path}"))?;
         Ok(Channel::new(unix_stream, buffer_size, max_buffer_size))
     }
 
@@ -79,11 +79,8 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         unsafe {
             let fd = self.sock.as_raw_fd();
             let stream = StdUnixStream::from_raw_fd(fd);
-            let _ = stream.set_nonblocking(nonblocking).with_context(|| {
-                format!(
-                    "could not change blocking status of unix stream with file descriptor {}",
-                    fd
-                )
+            stream.set_nonblocking(nonblocking).with_context(|| {
+                format!("could not change blocking status of unix stream with file descriptor {fd}")
             })?;
             let _fd = stream.into_raw_fd();
         }
@@ -240,10 +237,10 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                     .with_context(|| "invalid utf-8 encoding in command message, ignoring")?;
 
                 let json_parsed = serde_json::from_str(utf8_str)
-                    .with_context(|| format!("could not parse message {}, ignoring", utf8_str))?;
+                    .with_context(|| format!("could not parse message {utf8_str}, ignoring"))?;
 
                 self.front_buf.consume(position + 1);
-                return Ok(json_parsed);
+                Ok(json_parsed)
             }
             None => {
                 if self.front_buf.available_space() == 0 {
@@ -284,9 +281,8 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                     let utf8_str = from_utf8(&self.front_buf.data()[..position])
                         .with_context(|| "invalid utf-8 encoding in command message, ignoring")?;
 
-                    let json_parsed = serde_json::from_str(utf8_str).with_context(|| {
-                        format!("could not parse message {}, ignoring", utf8_str)
-                    })?;
+                    let json_parsed = serde_json::from_str(utf8_str)
+                        .with_context(|| format!("could not parse message {utf8_str}, ignoring"))?;
 
                     self.front_buf.consume(position + 1);
                     return Ok(json_parsed);

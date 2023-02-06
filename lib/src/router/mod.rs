@@ -666,19 +666,19 @@ mod tests {
             &Route::ClusterId("acme".to_string())
         ));
         assert!(router.add_tree_rule(
-            &"www.example.com".as_bytes(),
+            "www.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
             &Route::ClusterId("example".to_string())
         ));
         assert!(router.add_tree_rule(
-            &"*.test.example.com".as_bytes(),
+            "*.test.example.com".as_bytes(),
             &PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()),
             &MethodRule::new(Some("GET".to_string())),
             &Route::ClusterId("examplewildcard".to_string())
         ));
         assert!(router.add_tree_rule(
-            &"/test[0-9]/.example.com".as_bytes(),
+            "/test[0-9]/.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
             &Route::ClusterId("exampleregex".to_string())

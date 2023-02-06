@@ -7,7 +7,7 @@ fn main() {
     let variables = vec!["SOZU_CONFIG", "SOZU_PID_FILE_PATH"];
     for variable in variables {
         if let Ok(val) = env::var(variable) {
-            println!("cargo:rustc-env={}={}", variable, val);
+            println!("cargo:rustc-env={variable}={val}");
         }
     }
 }

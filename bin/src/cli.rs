@@ -294,7 +294,7 @@ pub enum LoggingLevel {
 }
 impl std::fmt::Display for LoggingLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -858,7 +858,7 @@ fn parse_tls_versions(i: &str) -> Result<TlsVersion, String> {
         "TLSv1.1" => Ok(TlsVersion::TLSv1_1),
         "TLSv1.2" => Ok(TlsVersion::TLSv1_2),
         "TLSv1.3" => Ok(TlsVersion::TLSv1_2),
-        s => Err(format!("unrecognized TLS version: {}", s)),
+        s => Err(format!("unrecognized TLS version: {s}")),
     }
 }
 
@@ -870,8 +870,7 @@ fn parse_tags(string_to_parse: &str) -> Result<BTreeMap<String, String>, String>
             tags.insert(key.to_owned(), value.to_owned());
         } else {
             return Err(format!(
-                "something went wrong while parsing the tags '{}'",
-                string_to_parse
+                "something went wrong while parsing the tags '{string_to_parse}'"
             ));
         }
     }

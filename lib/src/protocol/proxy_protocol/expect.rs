@@ -248,10 +248,7 @@ mod expect_test {
         }
 
         if res != (ProtocolResult::Upgrade, SessionResult::Continue) {
-            panic!(
-                "Should receive a complete proxy protocol header, res = {:?}",
-                res
-            );
+            panic!("Should receive a complete proxy protocol header, res = {res:?}");
         };
     }
 
@@ -266,11 +263,11 @@ mod expect_test {
             let proxy_protocol = HeaderV2::new(Command::Local, src_addr, dst_addr).into_bytes();
 
             barrier.wait();
-            match StdTcpStream::connect(&next_middleware_addr) {
+            match StdTcpStream::connect(next_middleware_addr) {
                 Ok(mut stream) => {
                     stream.write(&proxy_protocol).unwrap();
                 }
-                Err(e) => panic!("could not connect to the next middleware: {}", e),
+                Err(e) => panic!("could not connect to the next middleware: {e}"),
             };
         })
     }

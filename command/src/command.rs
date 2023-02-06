@@ -167,7 +167,7 @@ pub enum RunState {
 
 impl fmt::Display for RunState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -226,7 +226,7 @@ mod tests {
     fn config_message_test() {
         let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
         let message: CommandRequest = serde_json::from_str(raw_json).unwrap();
-        println!("{:?}", message);
+        println!("{message:?}");
         assert_eq!(
             message.order,
             CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpFrontend(

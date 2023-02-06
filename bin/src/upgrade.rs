@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{Seek, SeekFrom},
+    io::Seek,
     os::unix::io::{AsRawFd, FromRawFd},
     os::unix::process::CommandExt,
     process::Command,
@@ -79,7 +79,7 @@ pub fn fork_main_into_new_main(
     serde_json::to_writer(&mut upgrade_file, &upgrade_data)
         .with_context(|| "could not write upgrade data to temporary file")?;
     upgrade_file
-        .seek(SeekFrom::Start(0))
+        .rewind()
         .with_context(|| "could not seek to beginning of file")?;
 
     let (old_to_new, new_to_old) = UnixStream::pair()?;
@@ -133,7 +133,7 @@ pub fn fork_main_into_new_main(
     }
 }
 
-/// Called by the child of a main process fork. 
+/// Called by the child of a main process fork.
 /// Starts new main process with upgrade data, notifies the old main process
 pub fn begin_new_main_process(
     new_to_old_channel_fd: i32,

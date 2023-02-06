@@ -747,7 +747,7 @@ impl fmt::Display for LogDuration {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let secs = self.0.whole_seconds();
         if secs >= 10 {
-            return write!(f, "{}s", secs);
+            return write!(f, "{secs}s");
         }
 
         let ms = self.0.whole_milliseconds();
@@ -755,14 +755,14 @@ impl fmt::Display for LogDuration {
         if ms < 10 {
             let us = self.0.whole_microseconds();
             if us >= 10 {
-                return write!(f, "{}μs", us);
+                return write!(f, "{us}μs");
             }
 
             let ns = self.0.whole_nanoseconds();
-            return write!(f, "{}ns", ns);
+            return write!(f, "{ns}ns");
         }
 
-        write!(f, "{}ms", ms)
+        write!(f, "{ms}ms")
     }
 }
 

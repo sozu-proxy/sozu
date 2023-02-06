@@ -558,7 +558,7 @@ mod test {
         assert_eq!(None, t.poll_to(tick));
 
         rcv.sort_unstable();
-        assert!(rcv == ["a", "b"], "actual={:?}", rcv);
+        assert!(rcv == ["a", "b"], "actual={rcv:?}");
 
         tick = ms_to_tick(&t, 200);
         assert_eq!(None, t.poll_to(tick));

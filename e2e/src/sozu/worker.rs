@@ -42,7 +42,7 @@ pub fn set_no_close_exec(fd: i32) {
     unsafe {
         let old_flags = libc::fcntl(fd, libc::F_GETFD);
         let new_flags = old_flags & !1;
-        println!("flags: {} -> {}", old_flags, new_flags);
+        println!("flags: {old_flags} -> {new_flags}");
         libc::fcntl(fd, libc::F_SETFD, new_flags);
     }
 }
@@ -160,7 +160,7 @@ impl Worker {
         let scm_worker_to_main = ScmSocket::new(scm_worker_to_main.into_raw_fd())
             .expect("could not create an SCM socket");
         scm_main_to_worker
-            .send_listeners(&listeners)
+            .send_listeners(listeners)
             .expect("could not send listeners");
 
         let thread_config = config.to_owned();
@@ -177,7 +177,7 @@ impl Worker {
             )
             .expect("could not create sozu worker");
             server.run();
-            println!("{} STOPPED", thread_name);
+            println!("{thread_name} STOPPED");
         });
 
         Self {
@@ -203,7 +203,7 @@ impl Worker {
             .scm_main_to_worker
             .receive_listeners()
             .expect("receive listeners");
-        println!("Listeners from old worker: {:?}", listeners);
+        println!("Listeners from old worker: {listeners:?}");
         println!("State from old worker: {:?}", self.state);
         self.send_proxy_request(ProxyRequestOrder::SoftStop);
 
@@ -269,7 +269,7 @@ impl Worker {
                     true
                 }
                 Err(error) => {
-                    println!("could not join: {:#?}", error);
+                    println!("could not join: {error:#?}");
                     false
                 }
             }

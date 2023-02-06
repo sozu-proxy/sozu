@@ -54,7 +54,7 @@ impl Client {
     /// Write its own request on the TcpStream, returns the number of bytes written
     pub fn send(&mut self) -> Option<usize> {
         match self.stream {
-            Some(ref mut stream) => match stream.write(&self.request.as_bytes()) {
+            Some(ref mut stream) => match stream.write(self.request.as_bytes()) {
                 Ok(0) => {
                     println!("{} sent nothing", self.name);
                 }

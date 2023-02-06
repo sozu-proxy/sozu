@@ -90,13 +90,12 @@ impl BackendMap {
         let cluster_backends = self
             .backends
             .get_mut(cluster_id)
-            .with_context(|| format!("No backend found for cluster {}", cluster_id))?;
+            .with_context(|| format!("No backend found for cluster {cluster_id}"))?;
 
         if cluster_backends.backends.is_empty() {
             self.available = false;
             bail!(format!(
-                "Found an empty backend list for cluster {}",
-                cluster_id
+                "Found an empty backend list for cluster {cluster_id}"
             ));
         }
 
@@ -231,8 +230,7 @@ impl BackendList {
 
     pub fn add_backend(&mut self, backend: Backend) {
         match self.backends.iter_mut().find(|b| {
-            (*b.borrow()).address == backend.address
-                && (*b.borrow()).backend_id == backend.backend_id
+            b.borrow().address == backend.address && b.borrow().backend_id == backend.backend_id
         }) {
             None => {
                 let backend = Rc::new(RefCell::new(backend));
@@ -252,7 +250,7 @@ impl BackendList {
 
     pub fn remove_backend(&mut self, backend_address: &SocketAddr) {
         self.backends
-            .retain(|backend| &(*backend.borrow()).address != backend_address);
+            .retain(|backend| &backend.borrow().address != backend_address);
     }
 
     pub fn has_backend(&self, backend_address: &SocketAddr) -> bool {
@@ -360,7 +358,7 @@ mod backends_test {
         backend_map.add_backend(
             cluster_id,
             Backend::new(
-                &format!("{}-1", cluster_id),
+                &format!("{cluster_id}-1"),
                 backend_addr.parse().unwrap(),
                 None,
                 None,
@@ -406,7 +404,7 @@ mod backends_test {
         backend_map.add_backend(
             cluster_id,
             Backend::new(
-                &format!("{}-1", cluster_id),
+                &format!("{cluster_id}-1"),
                 "127.0.0.1:9001".parse().unwrap(),
                 Some("server-1".to_string()),
                 None,
@@ -416,7 +414,7 @@ mod backends_test {
         backend_map.add_backend(
             cluster_id,
             Backend::new(
-                &format!("{}-2", cluster_id),
+                &format!("{cluster_id}-2"),
                 "127.0.0.1:9000".parse().unwrap(),
                 Some("server-2".to_string()),
                 None,
@@ -427,7 +425,7 @@ mod backends_test {
         backend_map.add_backend(
             cluster_id,
             Backend::new(
-                &format!("{}-3", cluster_id),
+                &format!("{cluster_id}-3"),
                 backend_addr.parse().unwrap(),
                 Some("server-3".to_string()),
                 None,

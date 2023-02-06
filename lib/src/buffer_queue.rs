@@ -394,8 +394,7 @@ impl BufferQueue {
                 None => {
                     assert!(
                         to_consume == 0,
-                        "no more element in queue, we should not ask to consume {} more bytes",
-                        to_consume
+                        "no more element in queue, we should not ask to consume {to_consume} more bytes"
                     );
                     break;
                 }
@@ -429,7 +428,7 @@ impl BufferQueue {
                         Some(new_element)
                     }
                 }
-                Some(&OutputElement::Insert(ref v)) => {
+                Some(OutputElement::Insert(v)) => {
                     if to_consume >= v.len() {
                         to_consume -= v.len();
                         None
@@ -562,9 +561,9 @@ mod tests {
         );
         assert_eq!(b.next_output_data(), &b"ABCD"[..]);
 
-        println!("before consume: {:?}", b);
+        println!("before consume: {b:?}");
         b.consume_output_data(2);
-        println!("after consume: {:?}", b);
+        println!("after consume: {b:?}");
         println!("next output data: {}", b.next_output_data().to_hex(8));
         assert_eq!(b.next_output_data(), &b"CD"[..]);
 

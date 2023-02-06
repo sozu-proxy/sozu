@@ -49,7 +49,7 @@ impl<A: Aggregator + Send + Sync + 'static> BackendHandle<A> {
                 let stream = listener.accept();
                 match stream {
                     Ok(stream) => {
-                        println!("{}: new connection", thread_name);
+                        println!("{thread_name}: new connection");
                         stream
                             .0
                             .set_nonblocking(true)
@@ -58,7 +58,7 @@ impl<A: Aggregator + Send + Sync + 'static> BackendHandle<A> {
                     }
                     Err(error) => {
                         if error.kind() != ErrorKind::WouldBlock {
-                            println!("IO Error: {:?}", error);
+                            println!("IO Error: {error:?}");
                         }
                     }
                 }
@@ -105,7 +105,7 @@ impl BackendHandle<SimpleAggregator> {
             match stream.read(&mut buf) {
                 Ok(0) => return aggregator,
                 Ok(n) => {
-                    println!("{} received {}", backend_name, n);
+                    println!("{backend_name} received {n}");
                     println!("{}", unsafe { from_utf8_unchecked(&buf) });
                 }
                 Err(_) => {
@@ -127,16 +127,16 @@ impl BackendHandle<SimpleAggregator> {
     pub fn tcp_handler<S: Into<String>>(
         content: String,
     ) -> Box<dyn Fn(&TcpStream, &String, SimpleAggregator) -> SimpleAggregator + Send + Sync> {
-        let content: String = content.into();
+        let content: String = content;
         Box::new(move |mut stream, backend_name, mut aggregator| {
             let mut buf = [0u8; BUFFER_SIZE];
             match stream.read(&mut buf) {
                 Ok(0) => return aggregator,
                 Ok(n) => {
-                    println!("{} received {}", backend_name, n);
+                    println!("{backend_name} received {n}");
                 }
                 Err(error) => {
-                    println!("{} could not receive {}", content, error);
+                    println!("{content} could not receive {error}");
                     return aggregator;
                 }
             }

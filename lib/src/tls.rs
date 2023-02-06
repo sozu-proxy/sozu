@@ -693,7 +693,7 @@ mod tests {
             match err {
                 GenericCertificateResolverError::IsStillInUseError => {}
                 _ => {
-                    return Err(format!("the certificate must not been removed, {}", err).into());
+                    return Err(format!("the certificate must not been removed, {err}").into());
                 }
             }
         }
@@ -743,7 +743,7 @@ mod tests {
             match err {
                 GenericCertificateResolverError::IsStillInUseError => {}
                 _ => {
-                    return Err(format!("the certificate must not been removed, {}", err).into());
+                    return Err(format!("the certificate must not been removed, {err}").into());
                 }
             }
         }

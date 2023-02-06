@@ -246,7 +246,7 @@ mod send_test {
 
         // connect in blocking first, then convert to a mio socket
         let backend_stream =
-            StdTcpStream::connect(&addr_backend).expect("could not connect to the backend");
+            StdTcpStream::connect(addr_backend).expect("could not connect to the backend");
         let fd = backend_stream.into_raw_fd();
         let backend_stream = unsafe { TcpStream::from_raw_fd(fd) };
 
@@ -264,8 +264,7 @@ mod send_test {
             let (protocol, session) = send_pp.back_writable(&mut session_metrics);
             if session != SessionResult::Continue {
                 panic!(
-                    "state machine error: protocol result = {:?}, session result = {:?}",
-                    protocol, session
+                    "state machine error: protocol result = {protocol:?}, session result = {session:?}"
                 );
             }
 
@@ -280,7 +279,7 @@ mod send_test {
         thread::spawn(move || {
             barrier.wait();
 
-            let _stream = StdTcpStream::connect(&addr).unwrap();
+            let _stream = StdTcpStream::connect(addr).unwrap();
 
             end_barrier.wait();
         });
@@ -293,7 +292,7 @@ mod send_test {
         barrier: Arc<Barrier>,
         end_barrier: Arc<Barrier>,
     ) -> JoinHandle<()> {
-        let listener = StdTcpListener::bind(&addr).expect("could not start backend");
+        let listener = StdTcpListener::bind(addr).expect("could not start backend");
 
         thread::spawn(move || {
             barrier.wait();
@@ -315,11 +314,11 @@ mod send_test {
                         ErrorKind::WouldBlock => continue,
                         e => {
                             end_barrier.wait();
-                            panic!("read error: {:?}", e);
+                            panic!("read error: {e:?}");
                         }
                     },
                     Ok(sz) => {
-                        println!("backend read {} bytes", sz);
+                        println!("backend read {sz} bytes");
                         index += sz;
                     }
                 }
@@ -329,7 +328,7 @@ mod send_test {
                 Ok((_, _)) => println!("complete header received"),
                 err => {
                     end_barrier.wait();
-                    panic!("incorrect proxy protocol header received: {:?}", err);
+                    panic!("incorrect proxy protocol header received: {err:?}");
                 }
             };
 

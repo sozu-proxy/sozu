@@ -460,7 +460,7 @@ impl Server {
         // initialize the worker with the state we got from a file
         if let Some(state) = config_state {
             for (counter, order) in state.generate_orders().iter().enumerate() {
-                let id = format!("INIT-{}", counter);
+                let id = format!("INIT-{counter}");
                 let message = ProxyRequest {
                     id,
                     order: order.to_owned(),
@@ -629,10 +629,8 @@ impl Server {
                 (*metrics.borrow_mut()).send_data();
             });
 
-            if self.shutting_down.is_some() {
-                if self.shut_down_sessions() {
-                    return;
-                }
+            if self.shutting_down.is_some() && self.shut_down_sessions() {
+                return;
             }
         }
     }
@@ -1202,12 +1200,12 @@ impl Server {
                     .activate_listener(&activate.address, listener);
                 match activated_token {
                     Ok(token) => {
-                        self.accept(ListenToken(token.0.clone()), Protocol::HTTPListen);
+                        self.accept(ListenToken(token.0), Protocol::HTTPListen);
                         ProxyResponse::ok(req_id)
                     }
                     Err(activate_error) => {
                         error!("Could not activate HTTP listener: {:#}", activate_error);
-                        ProxyResponse::error(req_id, format!("{:#}", activate_error))
+                        ProxyResponse::error(req_id, format!("{activate_error:#}"))
                     }
                 }
             }
@@ -1224,12 +1222,12 @@ impl Server {
                     .activate_listener(&activate.address, listener);
                 match activated_token {
                     Ok(token) => {
-                        self.accept(ListenToken(token.0.clone()), Protocol::HTTPSListen);
+                        self.accept(ListenToken(token.0), Protocol::HTTPSListen);
                         ProxyResponse::ok(req_id)
                     }
                     Err(activate_error) => {
                         error!("Could not activate HTTPS listener: {:#}", activate_error);
-                        ProxyResponse::error(req_id, format!("{:#}", activate_error))
+                        ProxyResponse::error(req_id, format!("{activate_error:#}"))
                     }
                 }
             }

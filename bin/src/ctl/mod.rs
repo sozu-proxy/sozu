@@ -144,7 +144,7 @@ impl CommandManager {
             SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
             SubCmd::Events => self.events(),
             rest => {
-                panic!("that command should have been handled earlier: {:x?}", rest)
+                panic!("that command should have been handled earlier: {rest:x?}")
             }
         }
     }
