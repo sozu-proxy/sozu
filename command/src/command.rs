@@ -6,8 +6,8 @@ use std::{
 
 use crate::{
     proxy::{
-        AggregatedMetricsData, HttpFrontend, HttpListener, HttpsListener, ProxyEvent,
-        ProxyRequestOrder, QueryAnswer, TcpFrontend, TcpListener,
+        AggregatedMetricsData, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, ProxyEvent,
+        ProxyRequestOrder, QueryAnswer, TcpFrontend, TcpListenerConfig,
     },
     state::ConfigState,
 };
@@ -123,9 +123,9 @@ pub struct ListedFrontends {
 /// the bool indicates if it is active or not
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ListenersList {
-    pub http_listeners: HashMap<SocketAddr, (HttpListener, bool)>,
-    pub https_listeners: HashMap<SocketAddr, (HttpsListener, bool)>,
-    pub tcp_listeners: HashMap<SocketAddr, (TcpListener, bool)>,
+    pub http_listeners: HashMap<SocketAddr, (HttpListenerConfig, bool)>,
+    pub https_listeners: HashMap<SocketAddr, (HttpsListenerConfig, bool)>,
+    pub tcp_listeners: HashMap<SocketAddr, (TcpListenerConfig, bool)>,
 }
 
 /// Responses of the main process to the CLI (or other client)

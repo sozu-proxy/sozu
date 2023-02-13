@@ -11,7 +11,7 @@ use anyhow::Context;
 use crate::sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    proxy::{self, LoadBalancingParams, TcpListener},
+    proxy::{self, LoadBalancingParams, TcpListenerConfig},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
         let max_listeners = 500;
         let max_buffers = 500;
         let buffer_size = 16384;
-        let listener = TcpListener {
+        let listener = TcpListenerConfig {
             address: "127.0.0.1:8080".parse().expect("could not parse address"),
             public_address: None,
             expect_proxy: false,
@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
             LoggerBackend::Stdout(stdout()),
             None,
         );
-        sozu::tcp::start(listener, max_buffers, buffer_size, channel);
+        sozu::tcp::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 
     let tcp_front = proxy::TcpFrontend {

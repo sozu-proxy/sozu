@@ -201,18 +201,27 @@ pub mod tcp;
 
 pub mod https;
 
-use std::{cell::RefCell, collections::BTreeMap, fmt, net::SocketAddr, rc::Rc, str};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    fmt,
+    net::SocketAddr,
+    rc::Rc,
+    str,
+};
 
 use anyhow::{bail, Context};
-use mio::{net::TcpStream, Token};
+use mio::{net::TcpStream, Interest, Token};
+use protocol::http::parser::Method;
+use sozu_command::state::ClusterId;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
-    proxy::{LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse},
+    proxy::{Cluster, LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse, Route},
     ready::Ready,
 };
 
-use self::retry::RetryPolicy;
+use self::{backends::BackendMap, retry::RetryPolicy};
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,26 +247,143 @@ pub trait ProxySession {
     /// if a session received an event or can still execute, the event loop will
     /// call this method. Its result indicates if it can still execute, needs to
     /// connect to a backend server, close the session
-    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>);
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed;
     /// if the event loop got an event for a token associated with the session,
     /// it will call this method on the session
-    fn process_events(&mut self, token: Token, events: Ready);
-    /// closes a session
+    fn update_readiness(&mut self, token: Token, events: Ready);
+    /// closes a session, frontend and backend sockets,
+    /// remove the entries from the session manager slab
     fn close(&mut self);
     /// if a timeout associated with the session triggers, the event loop will
     /// call this method with the timeout's token
-    fn timeout(&mut self, t: Token);
+    fn timeout(&mut self, t: Token) -> SessionIsToBeClosed;
     /// last time the session got an event
     fn last_event(&self) -> Instant;
     /// displays the session's internal state (for debugging purpose)
-    fn print_state(&self);
-    /// list the tokens associated with the session
-    fn tokens(&self) -> Vec<Token>;
-    /// tells the session to shut down if possible
+    fn print_session(&self);
+    /// get the token associated with the frontend
+    fn frontend_token(&self) -> Token;
+    /// tell the session it has to shut down if possible
     ///
     /// if the session handles HTTP requests, it will not close until the response
     /// is completely sent back to the client
-    fn shutting_down(&mut self);
+    fn shutting_down(&mut self) -> SessionIsToBeClosed;
+}
+
+#[macro_export]
+macro_rules! branch {
+    (if $($value:ident)? == $expected:ident { $($then:tt)* } else { $($else:tt)* }) => {
+        macro_rules! expect {
+            ($expected) => {$($then)*};
+            ($a:ident) => {$($else)*};
+            () => {$($else)*}
+        }
+        expect!($($value)?);
+    };
+    (if $($value:ident)? == $expected:ident { $($then:tt)* } ) => {
+        macro_rules! expect {
+            ($expected) => {$($then)*};
+        }
+        expect!($($value)?);
+    };
+}
+
+#[macro_export]
+macro_rules! fallback {
+    ({} $($default:tt)*) => {
+        $($default)*
+    };
+    ({$($value:tt)+} $($default:tt)*) => {
+        $($value)+
+    };
+}
+
+#[macro_export]
+macro_rules! StateMachineBuilder {
+    (
+        ($d:tt)
+        $(#[$($state_macros:tt)*])*
+        enum $state_name:ident $(impl $trait:ident)?  {
+            $($(#[$($variant_macros:tt)*])*
+            $variant_name:ident($state:ty$(,$($aux:ty),+)?) $(-> $override:expr)?),+ $(,)?
+        }
+    ) => {
+        /// A summary of the last valid State
+        #[derive(Clone, Copy, Debug)]
+        pub enum StateMarker {
+            $($variant_name,)+
+        }
+
+        $(#[$($state_macros)*])*
+        pub enum $state_name {
+            $(
+                $(#[$($variant_macros)*])*
+                $variant_name($state$(,$($aux),+)?),
+            )+
+            /// Informs about upgrade failure, contains a summary the last valid State
+            FailedUpgrade(StateMarker),
+        }
+
+        macro_rules! _fn_impl {
+            ($function:ident(&$d($mut:ident)?, self $d(,$arg_name:ident: $arg_type:ty)*) $d(-> $ret:ty)? $d(| $marker:tt => $fail:expr)?) => {
+                fn $function(&$d($mut)? self $d(,$arg_name: $arg_type)*) $d(-> $ret)? {
+                    match self {
+                        $($state_name::$variant_name(_state, ..) => $crate::fallback!({$($override)?} _state.$function($d($arg_name),*)),)+
+                        $state_name::FailedUpgrade($crate::fallback!({$d($marker)?} _)) => $crate::fallback!({$d($fail)?} unreachable!())
+                    }
+                }
+            };
+        }
+
+        impl $state_name {
+            /// Informs about the last valid State before upgrade failure
+            fn marker(&self) -> StateMarker {
+                match self {
+                    $($state_name::$variant_name(..) => StateMarker::$variant_name,)+
+                    $state_name::FailedUpgrade(marker) => *marker,
+                }
+            }
+            /// Returns wether or not the State is FailedUpgrade
+            fn failed(&self) -> bool {
+                match self {
+                    $state_name::FailedUpgrade(_) => true,
+                    _ => false,
+                }
+            }
+            /// Gives back an owned version of the State,
+            /// leaving a FailedUpgrade in its place.
+            /// The FailedUpgrade retains the marker of the previous State.
+            fn take(&mut self) -> $state_name {
+                let mut owned_state = $state_name::FailedUpgrade(self.marker());
+                std::mem::swap(&mut owned_state, self);
+                owned_state
+            }
+            fn front_readiness(&mut self) -> &mut Readiness {
+                match self {
+                    $($state_name::$variant_name(_state, ..) => $crate::fallback!({$($override)?} &mut _state.frontend_readiness),)+
+                    $state_name::FailedUpgrade(_) => unreachable!(),
+                }
+            }
+            _fn_impl!{front_socket(&, self) -> &mio::net::TcpStream}
+        }
+
+        $crate::branch!{
+            if $($trait)? == SessionState {
+                impl SessionState for $state_name {
+                    _fn_impl!{ready(&mut, self, session: Rc<RefCell<dyn ProxySession>>, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) -> SessionResult}
+                    _fn_impl!{update_readiness(&mut, self, token: Token, events: Ready)}
+                    _fn_impl!{timeout(&mut, self, token: Token, metrics: &mut SessionMetrics) -> StateResult}
+                    _fn_impl!{cancel_timeouts(&mut, self)}
+                    _fn_impl!{print_state(&, self, context: &str) | marker => error!("{} Session(FailedUpgrade({:?}))", context, marker)}
+                    _fn_impl!{close(&mut, self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) | _ => {}}
+                    _fn_impl!{shutting_down(&mut, self) -> SessionIsToBeClosed | _ => true}
+                }
+            } else {}
+        }
+    };
+    ($($tt:tt)+) => {
+        StateMachineBuilder!{($) $($tt)+}
+    }
 }
 
 pub trait ListenerHandler {
@@ -266,6 +392,19 @@ pub trait ListenerHandler {
     fn get_tags(&self, key: &str) -> Option<&BTreeMap<String, String>>;
 
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
+}
+
+pub trait L7ListenerHandler {
+    fn get_sticky_name(&self) -> &str;
+
+    fn get_connect_timeout(&self) -> u32;
+
+    fn frontend_from_request(
+        &self,
+        host: &str,
+        uri: &str,
+        method: &Method,
+    ) -> anyhow::Result<Route>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,7 +436,7 @@ pub enum AcceptError {
 }
 
 use self::server::ListenToken;
-pub trait ProxyConfiguration<Session> {
+pub trait ProxyConfiguration {
     fn notify(&mut self, message: ProxyRequest) -> ProxyResponse;
     fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
     fn create_session(
@@ -308,6 +447,27 @@ pub trait ProxyConfiguration<Session> {
         proxy: Rc<RefCell<Self>>,
         // should we insert the tags here?
     ) -> Result<(), AcceptError>;
+}
+
+pub trait L7Proxy {
+    fn register_socket(
+        &self,
+        socket: &mut TcpStream,
+        token: Token,
+        interest: Interest,
+    ) -> Result<(), std::io::Error>;
+
+    fn deregister_socket(&self, tcp_stream: &mut TcpStream) -> Result<(), std::io::Error>;
+
+    fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token;
+
+    /// Remove the session from the session manager slab.
+    /// Returns true if the session was actually there before deletion
+    fn remove_session(&self, token: Token) -> bool;
+
+    fn backends(&self) -> Rc<RefCell<BackendMap>>;
+
+    fn clusters(&self) -> &HashMap<ClusterId, Cluster>;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -388,13 +548,30 @@ impl RequiredEvents {
     }
 }
 
+/// Signals transitions between states of a given Protocol
 #[derive(Debug, PartialEq, Eq)]
-pub enum SessionResult {
-    CloseSession,
+pub enum StateResult {
+    /// Signals to the Protocol to close its backend
     CloseBackend,
-    ReconnectBackend,
-    Continue,
+    /// Signals to the parent Session to close itself
+    CloseSession,
+    /// Signals to the Protocol to connect to backend
     ConnectBackend,
+    /// Signals to the Protocol to continue
+    Continue,
+    /// Signals to the parent Session to upgrade to the next Protocol
+    Upgrade,
+}
+
+/// Signals transitions between states of a given Session
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionResult {
+    /// Signals to the Session to close itself
+    Close,
+    /// Signals to the Session to continue
+    Continue,
+    /// Signals to the Session to upgrade its Protocol
+    Upgrade,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -409,6 +586,8 @@ pub enum BackendStatus {
     Closing,
     Closed,
 }
+
+type SessionIsToBeClosed = bool;
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Backend {
@@ -474,6 +653,7 @@ impl Backend {
         }
     }
 
+    /// TODO: normalize with saturating_sub()
     pub fn dec_connections(&mut self) -> Option<usize> {
         match self.status {
             BackendStatus::Normal => {
@@ -507,7 +687,7 @@ impl Backend {
 
     pub fn try_connect(&mut self) -> anyhow::Result<mio::net::TcpStream> {
         if self.status != BackendStatus::Normal {
-            bail!("This backend as not a normal status");
+            bail!("This backend is not in a normal status");
         }
 
         match mio::net::TcpStream::connect(self.address) {

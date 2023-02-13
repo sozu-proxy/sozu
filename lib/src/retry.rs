@@ -45,7 +45,7 @@ impl ExponentialBackoffPolicy {
             max_tries,
             current_tries: 0,
             last_try: time::Instant::now(),
-            wait: time::Duration::default(),
+            wait: time::Duration::from_secs(0),
         }
     }
 }
@@ -85,7 +85,7 @@ impl RetryPolicy for ExponentialBackoffPolicy {
     }
 
     fn can_try(&self) -> Option<RetryAction> {
-        let action = if self.last_try.elapsed().gt(&self.wait) {
+        let action = if self.last_try.elapsed().ge(&self.wait) {
             RetryAction::OKAY
         } else {
             RetryAction::WAIT

@@ -38,6 +38,7 @@ impl Backend {
         }
     }
 
+    /// Binds itself to its address, stores the yielded TCP listener
     pub fn connect(&mut self) {
         let listener = TcpListener::bind(self.address).expect("could not bind");
         self.listener = Some(listener);
@@ -122,5 +123,31 @@ impl Backend {
             }
         }
         None
+    }
+
+    /// Shutdown the connection to a client
+    pub fn close(&mut self, client_id: usize) -> bool {
+        match self.clients.get_mut(&client_id) {
+            Some(stream) => match stream.shutdown(std::net::Shutdown::Both) {
+                Ok(()) => {
+                    println!("{} closed connection with {}", self.name, client_id);
+                    return true;
+                }
+                Err(error) => {
+                    println!(
+                        "{} could not close connection with {}: {}",
+                        self.name, client_id, error
+                    );
+                }
+            },
+            None => {
+                println!("no client with id {} on backend {}", client_id, self.name);
+            }
+        }
+        false
+    }
+
+    pub fn set_response<S1: Into<String>>(&mut self, response: S1) {
+        self.response = response.into();
     }
 }

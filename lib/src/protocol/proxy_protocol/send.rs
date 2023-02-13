@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Write},
     rc::Rc,
 };
 
@@ -9,28 +9,28 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::{pipe::Pipe, ProtocolResult},
+    protocol::{pipe::Pipe, SessionResult},
     socket::SocketHandler,
     sozu_command::ready::Ready,
-    tcp::Listener,
-    BackendConnectionStatus, Protocol, Readiness, SessionMetrics, SessionResult,
+    tcp::TcpListener,
+    BackendConnectionStatus, Protocol, Readiness, SessionMetrics, StateResult,
 };
 
 use super::header::*;
 
 pub struct SendProxyProtocol<Front: SocketHandler> {
-    pub header: Option<Vec<u8>>,
-    pub frontend: Front,
-    pub request_id: Ulid,
-    pub backend: Option<TcpStream>,
-    pub frontend_token: Token,
-    pub backend_token: Option<Token>,
-    pub front_readiness: Readiness,
-    pub back_readiness: Readiness,
     cursor_header: usize,
+    pub backend_readiness: Readiness,
+    pub backend_token: Option<Token>,
+    pub backend: Option<TcpStream>,
+    pub frontend_readiness: Readiness,
+    pub frontend_token: Token,
+    pub frontend: Front,
+    pub header: Option<Vec<u8>>,
+    pub request_id: Ulid,
 }
 
-impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
+impl<Front: SocketHandler> SendProxyProtocol<Front> {
     pub fn new(
         frontend: Front,
         frontend_token: Token,
@@ -44,11 +44,11 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
             backend,
             frontend_token,
             backend_token: None,
-            front_readiness: Readiness {
+            frontend_readiness: Readiness {
                 interest: Ready::hup() | Ready::error(),
                 event: Ready::empty(),
             },
-            back_readiness: Readiness {
+            backend_readiness: Readiness {
                 interest: Ready::hup() | Ready::error(),
                 event: Ready::empty(),
             },
@@ -58,10 +58,7 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
 
     // The header is send immediately at once upon the connection is establish
     // and prepended before any data.
-    pub fn back_writable(
-        &mut self,
-        metrics: &mut SessionMetrics,
-    ) -> (ProtocolResult, SessionResult) {
+    pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> (SessionResult, StateResult) {
         debug!("Trying to write proxy protocol header");
 
         // Generate the proxy protocol header if not already exist.
@@ -77,7 +74,7 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
                         .into_bytes(),
                     );
                 } else {
-                    return (ProtocolResult::Continue, SessionResult::CloseSession);
+                    return (SessionResult::Continue, StateResult::CloseSession);
                 }
             };
         }
@@ -92,18 +89,18 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
 
                             if self.cursor_header == header.len() {
                                 debug!("Proxy protocol sent, upgrading");
-                                return (ProtocolResult::Upgrade, SessionResult::Continue);
+                                return (SessionResult::Upgrade, StateResult::Continue);
                             }
                         }
                         Err(e) => match e.kind() {
                             ErrorKind::WouldBlock => {
-                                self.back_readiness.event.remove(Ready::writable());
-                                return (ProtocolResult::Continue, SessionResult::Continue);
+                                self.backend_readiness.event.remove(Ready::writable());
+                                return (SessionResult::Continue, StateResult::Continue);
                             }
                             e => {
                                 incr!("proxy_protocol.errors");
                                 debug!("send proxy protocol write error {:?}", e);
-                                return (ProtocolResult::Continue, SessionResult::CloseSession);
+                                return (SessionResult::Continue, StateResult::CloseSession);
                             }
                         },
                     }
@@ -112,7 +109,7 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
         }
 
         error!("started Send proxy protocol with no header or backend socket");
-        (ProtocolResult::Continue, SessionResult::CloseSession)
+        (SessionResult::Continue, StateResult::CloseSession)
     }
 
     pub fn front_socket(&self) -> &TcpStream {
@@ -145,47 +142,50 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
 
     pub fn set_back_connected(&mut self, status: BackendConnectionStatus) {
         if status == BackendConnectionStatus::Connected {
-            self.back_readiness.interest.insert(Ready::writable());
+            self.backend_readiness.interest.insert(Ready::writable());
         }
     }
 
     pub fn front_readiness(&mut self) -> &mut Readiness {
-        &mut self.front_readiness
+        &mut self.frontend_readiness
     }
 
     pub fn back_readiness(&mut self) -> &mut Readiness {
-        &mut self.back_readiness
+        &mut self.backend_readiness
     }
 
     pub fn into_pipe(
         mut self,
         front_buf: Checkout,
         back_buf: Checkout,
-        listener: Rc<RefCell<Listener>>,
-    ) -> Pipe<Front, Listener> {
+        listener: Rc<RefCell<TcpListener>>,
+    ) -> Pipe<Front, TcpListener> {
         let backend_socket = self.backend.take().unwrap();
         let addr = self.front_socket().peer_addr().ok();
 
         let mut pipe = Pipe::new(
-            self.frontend,
-            self.frontend_token,
-            self.request_id,
-            None,
-            None,
+            back_buf,
             None,
             Some(backend_socket),
+            None,
+            None,
+            None,
+            None,
             front_buf,
-            back_buf,
-            addr,
-            Protocol::TCP,
+            self.frontend_token,
+            self.frontend,
             listener,
+            Protocol::TCP,
+            self.request_id,
+            addr,
+            None,
         );
 
-        pipe.front_readiness = self.front_readiness;
-        pipe.back_readiness = self.back_readiness;
+        pipe.frontend_readiness = self.frontend_readiness;
+        pipe.backend_readiness = self.backend_readiness;
 
-        pipe.front_readiness.interest.insert(Ready::readable());
-        pipe.back_readiness.interest.insert(Ready::readable());
+        pipe.frontend_readiness.interest.insert(Ready::readable());
+        pipe.backend_readiness.interest.insert(Ready::readable());
 
         if let Some(back_token) = self.backend_token {
             pipe.set_back_token(back_token);
@@ -197,19 +197,20 @@ impl<Front: SocketHandler + Read> SendProxyProtocol<Front> {
 
 #[cfg(test)]
 mod send_test {
-
-    use super::*;
-
-    use super::super::parser::parse_v2_header;
+    use std::{
+        io::Read,
+        net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
+        os::unix::io::{FromRawFd, IntoRawFd},
+        sync::{Arc, Barrier},
+        thread::{self, JoinHandle},
+    };
 
     use mio::net::{TcpListener, TcpStream};
     use rusty_ulid::Ulid;
-    use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
-    use std::os::unix::io::{FromRawFd, IntoRawFd};
-    use std::{
-        net::SocketAddr,
-        sync::{Arc, Barrier},
-        thread::{self, JoinHandle},
+
+    use super::{
+        super::parser::parse_v2_header, BackendConnectionStatus, ErrorKind, SendProxyProtocol,
+        SessionMetrics, SessionResult, StateResult, Token,
     };
 
     #[test]
@@ -262,13 +263,13 @@ mod send_test {
 
         loop {
             let (protocol, session) = send_pp.back_writable(&mut session_metrics);
-            if session != SessionResult::Continue {
+            if session != StateResult::Continue {
                 panic!(
                     "state machine error: protocol result = {protocol:?}, session result = {session:?}"
                 );
             }
 
-            if protocol == ProtocolResult::Upgrade {
+            if protocol == SessionResult::Upgrade {
                 break;
             }
         }

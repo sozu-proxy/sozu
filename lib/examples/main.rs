@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     );
     gauge!("sozu.TEST", 42);
 
-    let config = proxy::HttpListener {
+    let config = proxy::HttpListenerConfig {
         address: "127.0.0.1:8080"
             .parse()
             .with_context(|| "could not parse address")?,
@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::http::start(config, channel, max_buffers, buffer_size);
+        sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
     });
 
     let http_front = proxy::HttpFrontend {
@@ -97,7 +97,7 @@ fn main() -> anyhow::Result<()> {
     info!("MAIN\tHTTP -> {:?}", command.read_message());
     info!("MAIN\tHTTP -> {:?}", command.read_message());
 
-    let config = proxy::HttpsListener {
+    let config = proxy::HttpsListenerConfig {
         address: "127.0.0.1:8443"
             .parse()
             .with_context(|| "could not parse address")?,
@@ -113,7 +113,7 @@ fn main() -> anyhow::Result<()> {
     let jg2 = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::https::start(config, channel2, max_buffers, buffer_size)
+        sozu::https::start_https_worker(config, channel2, max_buffers, buffer_size)
     });
 
     let cert1 = include_str!("../assets/certificate.pem");

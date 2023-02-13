@@ -17,9 +17,10 @@ use crate::{
     certificate::calculate_fingerprint,
     proxy::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
-        Cluster, DeactivateListener, HttpFrontend, HttpListener, HttpsListener, ListenerType,
-        PathRule, ProxyRequestOrder, QueryAnswerCluster, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, Route, TcpFrontend, TcpListener,
+        Cluster, DeactivateListener, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
+        ListenerType, PathRule, ProxyRequestOrder, QueryAnswerCluster, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, Route, TcpFrontend,
+        TcpListenerConfig,
     },
 };
 
@@ -46,9 +47,9 @@ pub struct ConfigState {
     pub clusters: BTreeMap<ClusterId, Cluster>,
     pub backends: BTreeMap<ClusterId, Vec<Backend>>,
     /// the bool indicates if it is active or not
-    pub http_listeners: HashMap<SocketAddr, (HttpListener, bool)>,
-    pub https_listeners: HashMap<SocketAddr, (HttpsListener, bool)>,
-    pub tcp_listeners: HashMap<SocketAddr, (TcpListener, bool)>,
+    pub http_listeners: HashMap<SocketAddr, (HttpListenerConfig, bool)>,
+    pub https_listeners: HashMap<SocketAddr, (HttpsListenerConfig, bool)>,
+    pub tcp_listeners: HashMap<SocketAddr, (TcpListenerConfig, bool)>,
     /// indexed by (address, hostname, path)
     pub http_fronts: BTreeMap<RouteKey, HttpFrontend>,
     /// indexed by (address, hostname, path)
@@ -160,7 +161,7 @@ impl ConfigState {
         }
     }
 
-    fn add_http_listener(&mut self, listener: &HttpListener) -> anyhow::Result<()> {
+    fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> anyhow::Result<()> {
         match self.http_listeners.entry(listener.address) {
             HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
             HashMapEntry::Occupied(_) => {
@@ -170,7 +171,7 @@ impl ConfigState {
         Ok(())
     }
 
-    fn add_https_listener(&mut self, listener: &HttpsListener) -> anyhow::Result<()> {
+    fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> anyhow::Result<()> {
         match self.https_listeners.entry(listener.address) {
             HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
             HashMapEntry::Occupied(_) => {
@@ -180,7 +181,7 @@ impl ConfigState {
         Ok(())
     }
 
-    fn add_tcp_listener(&mut self, listener: &TcpListener) -> anyhow::Result<()> {
+    fn add_tcp_listener(&mut self, listener: &TcpListenerConfig) -> anyhow::Result<()> {
         match self.tcp_listeners.entry(listener.address) {
             HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
             HashMapEntry::Occupied(_) => {
@@ -1570,7 +1571,7 @@ mod tests {
     fn listener_diff() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&ProxyRequestOrder::AddTcpListener(TcpListener {
+            .dispatch(&ProxyRequestOrder::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1587,7 +1588,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&ProxyRequestOrder::AddHttpListener(HttpListener {
+            .dispatch(&ProxyRequestOrder::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1601,7 +1602,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
+            .dispatch(&ProxyRequestOrder::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1632,7 +1633,7 @@ mod tests {
 
         let mut state2: ConfigState = Default::default();
         state2
-            .dispatch(&ProxyRequestOrder::AddTcpListener(TcpListener {
+            .dispatch(&ProxyRequestOrder::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: true,
@@ -1642,7 +1643,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&ProxyRequestOrder::AddHttpListener(HttpListener {
+            .dispatch(&ProxyRequestOrder::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1663,7 +1664,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&ProxyRequestOrder::AddHttpsListener(HttpsListener {
+            .dispatch(&ProxyRequestOrder::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1697,7 +1698,7 @@ mod tests {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
             }),
-            ProxyRequestOrder::AddTcpListener(TcpListener {
+            ProxyRequestOrder::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: true,
@@ -1714,7 +1715,7 @@ mod tests {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 proxy: ListenerType::HTTP,
             }),
-            ProxyRequestOrder::AddHttpListener(HttpListener {
+            ProxyRequestOrder::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1735,7 +1736,7 @@ mod tests {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
             }),
-            ProxyRequestOrder::AddHttpsListener(HttpsListener {
+            ProxyRequestOrder::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,

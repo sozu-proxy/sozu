@@ -2,7 +2,7 @@
 pub trait Aggregator {}
 
 /// Gathers only data on sent and received requests
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SimpleAggregator {
     pub requests_received: usize,
     pub responses_sent: usize,

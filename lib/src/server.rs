@@ -13,7 +13,9 @@ use mio::{
     Events, Interest, Poll, Token,
 };
 use slab::Slab;
-use sozu_command::proxy::{ActivateListener, DeactivateListener, HttpListener, HttpsListener};
+use sozu_command::proxy::{
+    ActivateListener, DeactivateListener, HttpListenerConfig, HttpsListenerConfig,
+};
 use time::{Duration, Instant};
 
 use crate::{
@@ -29,7 +31,7 @@ use crate::{
             Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyEvent,
             ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
             ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,
-            QueryClusterType, RemoveBackend, TcpListener as CommandTcpListener,
+            QueryClusterType, RemoveBackend, TcpListenerConfig as CommandTcpListener,
         },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
@@ -37,7 +39,7 @@ use crate::{
     },
     tcp,
     timer::Timer,
-    AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession,
+    AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed,
 };
 
 // Number of retries to perform on a server after a connection failure
@@ -195,37 +197,9 @@ impl SessionManager {
         gauge!("client.connections", self.nb_connections);
     }
 
-    pub fn close_session(&mut self, token: SessionToken) {
-        if self.slab.contains(token.0) {
-            let session = self.slab.remove(token.0);
-            session.borrow_mut().close();
-
-            assert!(self.nb_connections != 0);
-            self.nb_connections -= 1;
-            gauge!("client.connections", self.nb_connections);
-        }
-
-        // do not be ready to accept right away, wait until we get back to 10% capacity
-        if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
-            debug!(
-                "nb_connections = {}, max_connections = {}, starting to accept again",
-                self.nb_connections, self.max_connections
-            );
-            gauge!("accept_queue.backpressure", 0);
-            self.can_accept = true;
-        }
-    }
-
-    pub fn close_session_tokens(&mut self, tokens: Vec<Token>) {
-        for tk in tokens.into_iter() {
-            let cl = Self::to_session(tk);
-            if self.slab.contains(cl.0) {
-                self.slab.remove(cl.0);
-            }
-        }
-    }
-
-    pub fn check_can_accept(&mut self) {
+    /// Decrements the number of sessions, start accepting new connections
+    /// if the capacity limit of 90% has not been reached.
+    pub fn decr(&mut self) {
         assert!(self.nb_connections != 0);
         self.nb_connections -= 1;
         gauge!("client.connections", self.nb_connections);
@@ -259,31 +233,31 @@ impl SessionManager {
 /// Listeners and sessions are all stored in a slab structure to index them
 /// by a [Token], they all have to implement the [ProxySession] trait.
 pub struct Server {
-    pub poll: Poll,
-    shutting_down: Option<MessageId>,
+    accept_queue_timeout: Duration,
+    accept_queue: VecDeque<(TcpStream, ListenToken, Protocol, Instant)>,
     accept_ready: HashSet<ListenToken>,
+    backends: Rc<RefCell<BackendMap>>,
+    base_sessions_count: usize,
     channel: ProxyChannel,
-    http: Rc<RefCell<http::Proxy>>,
-    https: Rc<RefCell<https::Proxy>>,
-    tcp: Rc<RefCell<tcp::Proxy>>,
     config_state: ConfigState,
+    current_poll_errors: i32,
+    http: Rc<RefCell<http::HttpProxy>>,
+    https: Rc<RefCell<https::HttpsProxy>>,
+    last_sessions_len: usize,
+    last_shutting_down_message: Option<Instant>,
+    last_zombie_check: Instant,
+    loop_start: Instant,
+    max_poll_errors: i32, // TODO: make this configurable? this defaults to 10000 for now
+    pub poll: Poll,
+    poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
+    pool: Rc<RefCell<Pool>>,
+    scm_listeners: Option<Listeners>,
     scm: ScmSocket,
     sessions: Rc<RefCell<SessionManager>>,
-    pool: Rc<RefCell<Pool>>,
-    backends: Rc<RefCell<BackendMap>>,
-    scm_listeners: Option<Listeners>,
-    zombie_check_interval: Duration,
-    accept_queue: VecDeque<(TcpStream, ListenToken, Protocol, Instant)>,
-    accept_queue_timeout: Duration,
-    base_sessions_count: usize,
-    loop_start: Instant,
-    last_sessions_len: usize,
-    last_zombie_check: Instant,
-    last_shutting_down_message: Option<Instant>,
-    max_poll_errors: i32, // TODO: make this configurable? this defaults to 10000 for now
-    current_poll_errors: i32,
     should_poll_at: Option<Instant>,
-    poll_timeout: Option<Duration>, // TODO: make this configurable? this defaults to 1000 milliseconds for now
+    shutting_down: Option<MessageId>,
+    tcp: Rc<RefCell<tcp::TcpProxy>>,
+    zombie_check_interval: Duration,
 }
 
 impl Server {
@@ -339,7 +313,8 @@ impl Server {
             .try_clone()
             .with_context(|| "could not clone the mio Registry")?;
 
-        let https = https::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+        let https =
+            https::HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
 
         Server::new(
             event_loop,
@@ -364,9 +339,9 @@ impl Server {
         sessions: Rc<RefCell<SessionManager>>,
         pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
-        http: Option<http::Proxy>,
-        https: Option<https::Proxy>,
-        tcp: Option<tcp::Proxy>,
+        http: Option<http::HttpProxy>,
+        https: Option<https::HttpsProxy>,
+        tcp: Option<tcp::TcpProxy>,
         server_config: ServerConfig,
         config_state: Option<ConfigState>,
         expects_initial_status: bool,
@@ -400,7 +375,7 @@ impl Server {
                     .registry()
                     .try_clone()
                     .with_context(|| "could not clone the mio Registry")?;
-                http::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
+                http::HttpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
             }
         }));
 
@@ -412,7 +387,7 @@ impl Server {
                     .try_clone()
                     .with_context(|| "could not clone the mio Registry")?;
 
-                https::Proxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
+                https::HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
             }
         }));
 
@@ -423,38 +398,38 @@ impl Server {
                     .registry()
                     .try_clone()
                     .with_context(|| "could not clone the mio Registry")?;
-                tcp::Proxy::new(registry, sessions.clone(), backends.clone())
+                tcp::TcpProxy::new(registry, sessions.clone(), backends.clone())
             }
         }));
 
         let mut server = Server {
-            poll,
-            shutting_down: None,
+            accept_queue_timeout: Duration::seconds(i64::from(server_config.accept_queue_timeout)),
+            accept_queue: VecDeque::new(),
             accept_ready: HashSet::new(),
+            backends,
+            base_sessions_count,
             channel,
+            config_state: ConfigState::new(),
+            current_poll_errors: 0,
             http,
             https,
-            tcp,
-            config_state: ConfigState::new(),
+            last_sessions_len: 0, // to be reset on server run
+            last_shutting_down_message: None,
+            last_zombie_check: Instant::now(), // to be reset on server run
+            loop_start: Instant::now(),        // to be reset on server run
+            max_poll_errors: 10000,            // TODO: make it configurable?
+            poll_timeout: Some(Duration::milliseconds(1000)), // TODO: make it configurable?
+            poll,
+            pool,
+            scm_listeners: None,
             scm,
             sessions,
-            scm_listeners: None,
-            pool,
-            backends,
+            should_poll_at: None,
+            shutting_down: None,
+            tcp,
             zombie_check_interval: Duration::seconds(i64::from(
                 server_config.zombie_check_interval,
             )),
-            accept_queue: VecDeque::new(),
-            accept_queue_timeout: Duration::seconds(i64::from(server_config.accept_queue_timeout)),
-            base_sessions_count,
-            loop_start: Instant::now(),        // to be reset on server run
-            last_sessions_len: 0,              // to be reset on server run
-            last_zombie_check: Instant::now(), // to be reset on server run
-            last_shutting_down_message: None,
-            max_poll_errors: 10000, // TODO: make it configurable?
-            current_poll_errors: 0,
-            should_poll_at: None,
-            poll_timeout: Some(Duration::milliseconds(1000)), // TODO: make it configurable?
         };
 
         // initialize the worker with the state we got from a file
@@ -731,6 +706,7 @@ impl Server {
         false
     }
 
+    /// Scans all sessions that have been inactive for longer than the configured interval
     fn zombie_check(&mut self) {
         let now = Instant::now();
         if now - self.last_zombie_check < self.zombie_check_interval {
@@ -739,81 +715,80 @@ impl Server {
         info!("zombie check");
         self.last_zombie_check = now;
 
-        let mut tokens = HashSet::new();
-        let mut frontend_tokens = HashSet::new();
+        let mut zombie_tokens = HashSet::new();
 
-        let mut count = 0;
-        let duration = self.zombie_check_interval;
+        // find the zombie sessions
         for (_index, session) in self
             .sessions
             .borrow_mut()
             .slab
             .iter_mut()
-            .filter(|(_, c)| now - c.borrow().last_event() > duration)
+            .filter(|(_, c)| now - c.borrow().last_event() > self.zombie_check_interval)
         {
-            let session_tokens = session.borrow().tokens();
-            if !frontend_tokens.contains(&session_tokens[0]) {
-                session.borrow().print_state();
-
-                frontend_tokens.insert(session_tokens[0]);
-                for tk in session_tokens.into_iter() {
-                    tokens.insert(tk);
-                }
-
-                count += 1;
+            let session_token = session.borrow().frontend_token();
+            if !zombie_tokens.contains(&session_token) {
+                session.borrow().print_session();
+                zombie_tokens.insert(session_token);
             }
         }
 
-        for tk in frontend_tokens.iter() {
-            let cl = self.to_session(*tk);
-            if self.sessions.borrow().slab.contains(cl.0) {
-                let session = { self.sessions.borrow_mut().slab.remove(cl.0) };
+        let zombie_count = zombie_tokens.len() as i64;
+        count!("zombies", zombie_count);
+
+        let remaining_count = self.shut_down_sessions_by_frontend_tokens(zombie_tokens);
+        info!(
+            "removing {} zombies ({} remaining entries after close)",
+            zombie_count, remaining_count
+        );
+    }
+
+    /// Calls close on targeted sessions, yields the number of entries in the slab
+    /// that were not properly removed
+    fn shut_down_sessions_by_frontend_tokens(&self, tokens: HashSet<Token>) -> usize {
+        if tokens.is_empty() {
+            return 0;
+        }
+
+        // close the sessions associated with the tokens
+        for token in &tokens {
+            if self.sessions.borrow().slab.contains(token.0) {
+                let session = { self.sessions.borrow_mut().slab.remove(token.0) };
                 session.borrow_mut().close();
-
-                let mut sessions = self.sessions.borrow_mut();
-                assert!(sessions.nb_connections != 0);
-                sessions.nb_connections -= 1;
-                gauge!("client.connections", sessions.nb_connections);
-                // do not be ready to accept right away, wait until we get back to 10% capacity
-                if !sessions.can_accept
-                    && sessions.nb_connections < sessions.max_connections * 90 / 100
-                {
-                    debug!(
-                        "nb_connections = {}, max_connections = {}, starting to accept again",
-                        sessions.nb_connections, sessions.max_connections
-                    );
-                    gauge!("accept_queue.backpressure", 0);
-                    sessions.can_accept = true;
-                }
+                self.sessions.borrow_mut().decr();
             }
         }
 
-        if count > 0 {
-            count!("zombies", count);
-
-            let mut remaining = 0;
-            for tk in tokens.into_iter() {
-                let cl = self.to_session(tk);
-                let mut sessions = self.sessions.borrow_mut();
-                if sessions.slab.contains(cl.0) {
-                    sessions.slab.remove(cl.0);
-                    remaining += 1;
-                }
+        // find the entries of closed sessions in the session manager (they should not be there)
+        let mut dangling_entries = HashSet::new();
+        for (entry_key, session) in &self.sessions.borrow().slab {
+            if tokens.contains(&session.borrow().frontend_token()) {
+                dangling_entries.insert(entry_key);
             }
-            info!(
-                "removing {} zombies ({} remaining tokens after close)",
-                count, remaining
-            );
         }
+
+        // remove these from the session manager
+        let mut dangling_entries_count = 0;
+        for entry_key in dangling_entries {
+            let mut sessions = self.sessions.borrow_mut();
+            if sessions.slab.contains(entry_key) {
+                sessions.slab.remove(entry_key);
+                dangling_entries_count += 1;
+            }
+        }
+        dangling_entries_count
     }
 
     /// Order sessions to shut down, check that they are all down
     fn shut_down_sessions(&mut self) -> bool {
         let sessions_count = self.sessions.borrow().slab.len();
-        let slab = { self.sessions.borrow_mut().slab.clone() };
-        for session in slab {
-            session.1.borrow_mut().shutting_down();
+        let mut sessions_to_shut_down = HashSet::new();
+
+        for (key, session) in &self.sessions.borrow().slab {
+            if session.borrow_mut().shutting_down() {
+                sessions_to_shut_down.insert(Token(key));
+            }
         }
+        let _ = self.shut_down_sessions_by_frontend_tokens(sessions_to_shut_down);
 
         let new_sessions_count = self.sessions.borrow().slab.len();
 
@@ -862,6 +837,11 @@ impl Server {
         }
 
         false
+    }
+
+    fn kill_session(&self, session: Rc<RefCell<dyn ProxySession>>) {
+        let token = session.borrow().frontend_token();
+        let _ = self.shut_down_sessions_by_frontend_tokens(HashSet::from([token]));
     }
 
     fn send_queue(&mut self) {
@@ -1079,7 +1059,11 @@ impl Server {
         ProxyResponse::ok(req_id)
     }
 
-    fn notify_add_http_listener(&mut self, req_id: &str, listener: &HttpListener) -> ProxyResponse {
+    fn notify_add_http_listener(
+        &mut self,
+        req_id: &str,
+        listener: &HttpListenerConfig,
+    ) -> ProxyResponse {
         debug!("{} add http listener {:?}", req_id, listener);
 
         if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
@@ -1111,7 +1095,7 @@ impl Server {
     fn notify_add_https_listener(
         &mut self,
         req_id: &str,
-        listener: &HttpsListener,
+        listener: &HttpsListenerConfig,
     ) -> ProxyResponse {
         debug!("{} add https listener {:?}", req_id, listener);
 
@@ -1571,6 +1555,8 @@ impl Server {
             }
 
             //FIXME: check the timestamp
+            //TODO: create_session should return the session and
+            // the server should insert it in the the SessionManager
             match protocol {
                 Protocol::TCPListen => {
                     let proxy = self.tcp.clone();
@@ -1605,7 +1591,8 @@ impl Server {
                     }
                 }
                 _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
-            }
+            };
+            self.sessions.borrow_mut().incr();
         }
 
         gauge!("accept_queue.count", self.accept_queue.len());
@@ -1650,12 +1637,11 @@ impl Server {
                 _ => {}
             }
 
-            self.sessions.borrow_mut().slab[session_token]
-                .borrow_mut()
-                .process_events(token, events);
-
             let session = self.sessions.borrow_mut().slab[session_token].clone();
-            session.borrow_mut().ready(session.clone());
+            session.borrow_mut().update_readiness(token, events);
+            if session.borrow_mut().ready(session.clone()) {
+                self.kill_session(session);
+            }
         }
     }
 
@@ -1665,7 +1651,9 @@ impl Server {
         let session_token = token.0;
         if self.sessions.borrow().slab.contains(session_token) {
             let session = self.sessions.borrow_mut().slab[session_token].clone();
-            session.borrow_mut().timeout(token);
+            if session.borrow_mut().timeout(token) {
+                self.kill_session(session);
+            }
         }
     }
 
@@ -1708,28 +1696,33 @@ impl ProxySession for ListenSession {
         Instant::now()
     }
 
-    fn print_state(&self) {}
+    fn print_session(&self) {}
 
-    fn tokens(&self) -> Vec<Token> {
-        Vec::new()
+    fn frontend_token(&self) -> Token {
+        Token(0)
     }
 
     fn protocol(&self) -> Protocol {
         self.protocol
     }
 
-    fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) {}
+    fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+        false
+    }
 
-    fn shutting_down(&mut self) {}
+    fn shutting_down(&mut self) -> SessionIsToBeClosed {
+        false
+    }
 
-    fn process_events(&mut self, _token: Token, _events: Ready) {}
+    fn update_readiness(&mut self, _token: Token, _events: Ready) {}
 
     fn close(&mut self) {}
 
-    fn timeout(&mut self, _token: Token) {
+    fn timeout(&mut self, _token: Token) -> SessionIsToBeClosed {
         error!(
             "called ProxySession::timeout(token={:?}, time) on ListenSession {{ protocol: {:?} }}",
             _token, self.protocol
         );
+        false
     }
 }

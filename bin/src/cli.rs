@@ -596,13 +596,25 @@ pub enum HttpListenerCmd {
         expect_proxy: bool,
         #[clap(long = "sticky-name", help = "sticky session cookie name")]
         sticky_name: Option<String>,
-        #[clap(long = "front-timeout", help = "Set front timeout")]
+        #[clap(
+            long = "front-timeout",
+            help = "maximum time of inactivity for a frontend socket"
+        )]
         front_timeout: Option<u32>,
-        #[clap(long = "back-timeout", help = "Set back timeout")]
+        #[clap(
+            long = "back-timeout",
+            help = "maximum time of inactivity for a backend socket"
+        )]
         back_timeout: Option<u32>,
-        #[clap(long = "request-timeout", help = "Set request timeout")]
+        #[clap(
+            long = "request-timeout",
+            help = "maximum time to receive a request since the connection started"
+        )]
         request_timeout: Option<u32>,
-        #[clap(long = "connect-timeout", help = "Set connect timeout")]
+        #[clap(
+            long = "connect-timeout",
+            help = "maximum time to connect to a backend server"
+        )]
         connect_timeout: Option<u32>,
     },
     #[clap(name = "remove")]
@@ -669,13 +681,25 @@ pub enum HttpsListenerCmd {
         expect_proxy: bool,
         #[clap(long = "sticky-name", help = "sticky session cookie name")]
         sticky_name: Option<String>,
-        #[clap(long = "front-timeout", help = "Set front timeout")]
+        #[clap(
+            long = "front-timeout",
+            help = "maximum time of inactivity for a frontend socket"
+        )]
         front_timeout: Option<u32>,
-        #[clap(long = "back-timeout", help = "Set back timeout")]
+        #[clap(
+            long = "back-timeout",
+            help = "maximum time of inactivity for a frontend socket"
+        )]
         back_timeout: Option<u32>,
-        #[clap(long = "request-timeout", help = "Set request timeout")]
+        #[clap(
+            long = "request-timeout",
+            help = "maximum time to receive a request since the connection started"
+        )]
         request_timeout: Option<u32>,
-        #[clap(long = "connect-timeout", help = "Set connect timeout")]
+        #[clap(
+            long = "connect-timeout",
+            help = "maximum time to connect to a backend server"
+        )]
         connect_timeout: Option<u32>,
     },
     #[clap(name = "remove")]

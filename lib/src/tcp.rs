@@ -8,7 +8,12 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use mio::{net::*, unix::SourceFd, *};
+use mio::{
+    net::TcpListener as MioTcpListener,
+    net::{TcpStream as MioTcpStream, UnixStream},
+    unix::SourceFd,
+    Interest, Poll, Registry, Token,
+};
 use rusty_ulid::Ulid;
 use slab::Slab;
 use time::{Duration, Instant};
@@ -20,7 +25,7 @@ use crate::{
         proxy_protocol::{
             expect::ExpectProxyProtocol, relay::RelayProxyProtocol, send::SendProxyProtocol,
         },
-        {Pipe, ProtocolResult},
+        Pipe,
     },
     retry::RetryPolicy,
     server::{
@@ -33,154 +38,159 @@ use crate::{
         logging,
         proxy::{
             ProxyEvent, ProxyRequest, ProxyRequestOrder, ProxyResponse, TcpFrontend,
-            TcpListener as TcpListenerConfig,
+            TcpListenerConfig,
         },
         ready::Ready,
         scm_socket::ScmSocket,
         state::ClusterId,
     },
     timer::TimeoutContainer,
-    util::UnwrapLog,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, Protocol,
-    ProxyConfiguration, ProxySession, Readiness, SessionMetrics, SessionResult,
+    ProxyConfiguration, ProxySession, Readiness, SessionIsToBeClosed, SessionMetrics,
+    SessionResult, StateMachineBuilder, StateResult,
 };
 
-pub enum UpgradeResult {
-    Continue,
-    Close,
-    ConnectBackend,
+StateMachineBuilder! {
+    /// The various Stages of a TCP connection:
+    ///
+    /// 1. optional (ExpectProxyProtocol | SendProxyProtocol | RelayProxyProtocol)
+    /// 2. Pipe
+    enum TcpStateMachine {
+        Pipe(Pipe<MioTcpStream, TcpListener>),
+        SendProxyProtocol(SendProxyProtocol<MioTcpStream>),
+        RelayProxyProtocol(RelayProxyProtocol<MioTcpStream>),
+        ExpectProxyProtocol(ExpectProxyProtocol<MioTcpStream>),
+    }
 }
 
-pub enum State {
-    Pipe(Pipe<TcpStream, Listener>),
-    SendProxyProtocol(SendProxyProtocol<TcpStream>),
-    RelayProxyProtocol(RelayProxyProtocol<TcpStream>),
-    ExpectProxyProtocol(ExpectProxyProtocol<TcpStream>),
-}
-
-pub struct Session {
-    backend: Option<Rc<RefCell<Backend>>>,
-    frontend_token: Token,
-    backend_token: Option<Token>,
-    back_connected: BackendConnectionStatus,
-    accept_token: Token,
-    request_id: Ulid,
-    cluster_id: Option<String>,
+pub struct TcpSession {
+    backend_buffer: Option<Checkout>,
+    backend_connected: BackendConnectionStatus,
     backend_id: Option<String>,
-    metrics: SessionMetrics,
-    protocol: Option<State>,
-    front_buf: Option<Checkout>,
-    back_buf: Option<Checkout>,
-    last_event: Instant,
+    backend_token: Option<Token>,
+    backend: Option<Rc<RefCell<Backend>>>,
+    cluster_id: Option<String>,
     connection_attempt: u8,
+    container_backend_timeout: TimeoutContainer,
+    container_frontend_timeout: TimeoutContainer,
     frontend_address: Option<SocketAddr>,
-    front_timeout: TimeoutContainer,
-    back_timeout: TimeoutContainer,
-    proxy: Rc<RefCell<Proxy>>,
-    listener: Rc<RefCell<Listener>>,
+    frontend_buffer: Option<Checkout>,
+    frontend_token: Token,
+    has_been_closed: SessionIsToBeClosed,
+    last_event: Instant,
+    listener: Rc<RefCell<TcpListener>>,
+    metrics: SessionMetrics,
+    proxy: Rc<RefCell<TcpProxy>>,
+    request_id: Ulid,
+    state: TcpStateMachine,
 }
 
-impl Session {
+impl TcpSession {
     fn new(
-        sock: TcpStream,
-        frontend_token: Token,
-        accept_token: Token,
-        proxy: Rc<RefCell<Proxy>>,
-        front_buf: Checkout,
-        back_buf: Checkout,
-        cluster_id: Option<String>,
+        backend_buffer: Checkout,
         backend_id: Option<String>,
+        cluster_id: Option<String>,
+        configured_backend_timeout: Duration,
+        configured_frontend_timeout: Duration,
+        frontend_buffer: Checkout,
+        frontend_token: Token,
+        listener: Rc<RefCell<TcpListener>>,
         proxy_protocol: Option<ProxyProtocolConfig>,
+        proxy: Rc<RefCell<TcpProxy>>,
+        socket: MioTcpStream,
         wait_time: Duration,
-        front_timeout_duration: Duration,
-        backend_timeout_duration: Duration,
-        listener: Rc<RefCell<Listener>>,
-    ) -> Session {
-        let frontend_address = sock.peer_addr().ok();
-        let mut frontend_buffer = None;
-        let mut backend_buffer = None;
+    ) -> TcpSession {
+        let frontend_address = socket.peer_addr().ok();
+        let mut frontend_buffer_session = None;
+        let mut backend_buffer_session = None;
 
         let request_id = Ulid::generate();
-        let front_timeout = TimeoutContainer::new(front_timeout_duration, frontend_token);
-        let back_timeout = TimeoutContainer::new_empty(backend_timeout_duration);
 
-        let protocol = match proxy_protocol {
+        let container_frontend_timeout =
+            TimeoutContainer::new(configured_frontend_timeout, frontend_token);
+        let container_backend_timeout = TimeoutContainer::new_empty(configured_backend_timeout);
+
+        let state = match proxy_protocol {
             Some(ProxyProtocolConfig::RelayHeader) => {
-                backend_buffer = Some(back_buf);
+                backend_buffer_session = Some(backend_buffer);
                 gauge_add!("protocol.proxy.relay", 1);
-                Some(State::RelayProxyProtocol(RelayProxyProtocol::new(
-                    sock,
+                TcpStateMachine::RelayProxyProtocol(RelayProxyProtocol::new(
+                    socket,
                     frontend_token,
                     request_id,
                     None,
-                    front_buf,
-                )))
+                    frontend_buffer,
+                ))
             }
             Some(ProxyProtocolConfig::ExpectHeader) => {
-                frontend_buffer = Some(front_buf);
-                backend_buffer = Some(back_buf);
+                frontend_buffer_session = Some(frontend_buffer);
+                backend_buffer_session = Some(backend_buffer);
                 gauge_add!("protocol.proxy.expect", 1);
-                Some(State::ExpectProxyProtocol(ExpectProxyProtocol::new(
-                    sock,
+                TcpStateMachine::ExpectProxyProtocol(ExpectProxyProtocol::new(
+                    container_frontend_timeout.clone(),
+                    socket,
                     frontend_token,
                     request_id,
-                )))
+                ))
             }
             Some(ProxyProtocolConfig::SendHeader) => {
-                frontend_buffer = Some(front_buf);
-                backend_buffer = Some(back_buf);
+                frontend_buffer_session = Some(frontend_buffer);
+                backend_buffer_session = Some(backend_buffer);
                 gauge_add!("protocol.proxy.send", 1);
-                Some(State::SendProxyProtocol(SendProxyProtocol::new(
-                    sock,
+                TcpStateMachine::SendProxyProtocol(SendProxyProtocol::new(
+                    socket,
                     frontend_token,
                     request_id,
                     None,
-                )))
+                ))
             }
             None => {
                 gauge_add!("protocol.tcp", 1);
                 let mut pipe = Pipe::new(
-                    sock,
-                    frontend_token,
-                    request_id,
-                    cluster_id.clone(),
+                    backend_buffer,
                     backend_id.clone(),
                     None,
                     None,
-                    front_buf,
-                    back_buf,
-                    frontend_address,
-                    Protocol::TCP,
+                    None,
+                    None,
+                    cluster_id.clone(),
+                    frontend_buffer,
+                    frontend_token,
+                    socket,
                     listener.clone(),
+                    Protocol::TCP,
+                    request_id,
+                    frontend_address,
+                    None,
                 );
                 pipe.set_cluster_id(cluster_id.clone());
-                Some(State::Pipe(pipe))
+                TcpStateMachine::Pipe(pipe)
             }
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
         //FIXME: timeout usage
 
-        Session {
-            backend: None,
-            frontend_token,
-            backend_token: None,
-            back_connected: BackendConnectionStatus::NotConnected,
-            accept_token,
-            request_id,
-            cluster_id,
+        TcpSession {
+            backend_buffer: backend_buffer_session,
+            backend_connected: BackendConnectionStatus::NotConnected,
             backend_id,
-            metrics,
-            protocol,
-            front_buf: frontend_buffer,
-            back_buf: backend_buffer,
-            last_event: Instant::now(),
+            backend_token: None,
+            backend: None,
+            cluster_id,
             connection_attempt: 0,
+            container_backend_timeout,
+            container_frontend_timeout,
             frontend_address,
-            front_timeout,
-            back_timeout,
-            proxy,
+            frontend_buffer: frontend_buffer_session,
+            frontend_token,
+            has_been_closed: false,
+            last_event: Instant::now(),
             listener,
+            metrics,
+            proxy,
+            request_id,
+            state,
         }
     }
 
@@ -233,22 +243,22 @@ impl Session {
         );
     }
 
-    fn front_hup(&mut self) -> SessionResult {
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.front_hup(&mut self.metrics),
+    fn front_hup(&mut self) -> StateResult {
+        match &mut self.state {
+            TcpStateMachine::Pipe(pipe) => pipe.frontend_hup(&mut self.metrics),
             _ => {
                 self.log_request();
-                SessionResult::CloseSession
+                StateResult::CloseSession
             }
         }
     }
 
-    fn back_hup(&mut self) -> SessionResult {
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.back_hup(&mut self.metrics),
+    fn back_hup(&mut self) -> StateResult {
+        match &mut self.state {
+            TcpStateMachine::Pipe(pipe) => pipe.backend_hup(&mut self.metrics),
             _ => {
                 self.log_request();
-                SessionResult::CloseSession
+                StateResult::CloseSession
             }
         }
     }
@@ -262,216 +272,208 @@ impl Session {
         )
     }
 
-    fn readable(&mut self) -> SessionResult {
-        if !self.front_timeout.reset() {
+    fn readable(&mut self) -> StateResult {
+        if !self.container_frontend_timeout.reset() {
             error!("could not reset front timeout");
         }
 
-        let mut should_upgrade_protocol = ProtocolResult::Continue;
+        let mut should_upgrade_protocol = SessionResult::Continue;
 
-        let res = match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.readable(&mut self.metrics),
-            Some(State::RelayProxyProtocol(ref mut pp)) => pp.readable(&mut self.metrics),
-            Some(State::ExpectProxyProtocol(ref mut pp)) => {
-                let res = pp.readable(&mut self.metrics);
-                should_upgrade_protocol = res.0;
-                res.1
+        let state_result = match &mut self.state {
+            TcpStateMachine::Pipe(pipe) => pipe.readable(&mut self.metrics),
+            TcpStateMachine::RelayProxyProtocol(pp) => pp.readable(&mut self.metrics),
+            TcpStateMachine::ExpectProxyProtocol(pp) => {
+                should_upgrade_protocol = pp.readable(&mut self.metrics);
+                match should_upgrade_protocol {
+                    SessionResult::Upgrade => StateResult::Continue,
+                    SessionResult::Continue => StateResult::Continue,
+                    SessionResult::Close => StateResult::CloseSession,
+                }
             }
-            _ => SessionResult::Continue,
+            TcpStateMachine::SendProxyProtocol(_) => StateResult::Continue,
+            TcpStateMachine::FailedUpgrade(_) => unreachable!(),
         };
 
-        if let ProtocolResult::Upgrade = should_upgrade_protocol {
+        if let SessionResult::Upgrade = should_upgrade_protocol {
             match self.upgrade() {
-                UpgradeResult::Continue => SessionResult::Continue,
-                UpgradeResult::Close => SessionResult::CloseSession,
-                UpgradeResult::ConnectBackend => SessionResult::ConnectBackend,
+                false => StateResult::Continue,
+                true => StateResult::CloseSession,
             }
         } else {
-            res
+            state_result
         }
     }
 
-    fn writable(&mut self) -> SessionResult {
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.writable(&mut self.metrics),
-            _ => SessionResult::Continue,
+    fn writable(&mut self) -> StateResult {
+        match &mut self.state {
+            TcpStateMachine::Pipe(pipe) => pipe.writable(&mut self.metrics),
+            _ => StateResult::Continue,
         }
     }
 
-    fn back_readable(&mut self) -> SessionResult {
-        if !self.back_timeout.reset() {
+    fn back_readable(&mut self) -> StateResult {
+        if !self.container_backend_timeout.reset() {
             error!("could not reset back timeout");
         }
 
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.back_readable(&mut self.metrics),
-            _ => SessionResult::Continue,
+        match &mut self.state {
+            TcpStateMachine::Pipe(pipe) => pipe.backend_readable(&mut self.metrics),
+            _ => StateResult::Continue,
         }
     }
 
-    fn back_writable(&mut self) -> SessionResult {
-        let mut res = (ProtocolResult::Continue, SessionResult::Continue);
+    fn back_writable(&mut self) -> StateResult {
+        let mut res = (SessionResult::Continue, StateResult::Continue);
 
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => res.1 = pipe.back_writable(&mut self.metrics),
-            Some(State::RelayProxyProtocol(ref mut pp)) => {
+        match &mut self.state {
+            TcpStateMachine::Pipe(pipe) => res.1 = pipe.backend_writable(&mut self.metrics),
+            TcpStateMachine::RelayProxyProtocol(pp) => {
                 res = pp.back_writable(&mut self.metrics);
             }
-            Some(State::SendProxyProtocol(ref mut pp)) => {
+            TcpStateMachine::SendProxyProtocol(pp) => {
                 res = pp.back_writable(&mut self.metrics);
             }
-            _ => unreachable!(),
+            TcpStateMachine::ExpectProxyProtocol(_) | TcpStateMachine::FailedUpgrade(_) => unreachable!(),
         };
 
-        if let ProtocolResult::Upgrade = res.0 {
+        if let SessionResult::Upgrade = res.0 {
             self.upgrade();
         }
 
         res.1
     }
 
-    fn front_socket(&self) -> &TcpStream {
-        match self.protocol {
-            Some(State::Pipe(ref pipe)) => pipe.front_socket(),
-            Some(State::SendProxyProtocol(ref pp)) => pp.front_socket(),
-            Some(State::RelayProxyProtocol(ref pp)) => pp.front_socket(),
-            Some(State::ExpectProxyProtocol(ref pp)) => pp.front_socket(),
-            _ => unreachable!(),
+    fn back_socket_mut(&mut self) -> Option<&mut MioTcpStream> {
+        match &mut self.state {
+            TcpStateMachine::Pipe(pipe) => pipe.back_socket_mut(),
+            TcpStateMachine::SendProxyProtocol(pp) => pp.back_socket_mut(),
+            TcpStateMachine::RelayProxyProtocol(pp) => pp.back_socket_mut(),
+            TcpStateMachine::ExpectProxyProtocol(_) => None,
+            TcpStateMachine::FailedUpgrade(_) => unreachable!(),
         }
     }
 
-    fn back_socket_mut(&mut self) -> Option<&mut TcpStream> {
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.back_socket_mut(),
-            Some(State::SendProxyProtocol(ref mut pp)) => pp.back_socket_mut(),
-            Some(State::RelayProxyProtocol(ref mut pp)) => pp.back_socket_mut(),
-            Some(State::ExpectProxyProtocol(_)) => None,
-            _ => unreachable!(),
+    pub fn upgrade(&mut self) -> SessionIsToBeClosed {
+        let new_state = match self.state.take() {
+            TcpStateMachine::SendProxyProtocol(spp) => self.upgrade_send(spp),
+            TcpStateMachine::RelayProxyProtocol(rpp) => self.upgrade_relay(rpp),
+            TcpStateMachine::ExpectProxyProtocol(epp) => self.upgrade_expect(epp),
+            TcpStateMachine::Pipe(_) => None,
+            TcpStateMachine::FailedUpgrade(_) => todo!(),
+        };
+
+        match new_state {
+            Some(state) => {
+                self.state = state;
+                false
+            } // The state stays FailedUpgrade, but the Session should be closed right after
+
+            None => true,
         }
     }
 
-    pub fn upgrade(&mut self) -> UpgradeResult {
-        let protocol = self.protocol.take();
-
-        if let Some(State::SendProxyProtocol(pp)) = protocol {
-            if self.back_buf.is_some() && self.front_buf.is_some() {
-                let mut pipe = pp.into_pipe(
-                    self.front_buf.take().unwrap(),
-                    self.back_buf.take().unwrap(),
-                    self.listener.clone(),
-                );
-                pipe.set_cluster_id(self.cluster_id.clone());
-                self.protocol = Some(State::Pipe(pipe));
-                gauge_add!("protocol.proxy.send", -1);
-                gauge_add!("protocol.tcp", 1);
-                UpgradeResult::Continue
-            } else {
-                error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
-                UpgradeResult::Close
-            }
-        } else if let Some(State::RelayProxyProtocol(pp)) = protocol {
-            if self.back_buf.is_some() {
-                let mut pipe = pp.into_pipe(self.back_buf.take().unwrap(), self.listener.clone());
-                pipe.set_cluster_id(self.cluster_id.clone());
-                self.protocol = Some(State::Pipe(pipe));
-                gauge_add!("protocol.proxy.relay", -1);
-                gauge_add!("protocol.tcp", 1);
-                UpgradeResult::Continue
-            } else {
-                error!("Missing the backend buffer queue, we can't switch to a pipe");
-                UpgradeResult::Close
-            }
-        } else if let Some(State::ExpectProxyProtocol(pp)) = protocol {
-            if self.front_buf.is_some() && self.back_buf.is_some() {
-                let mut pipe = pp.into_pipe(
-                    self.front_buf.take().unwrap(),
-                    self.back_buf.take().unwrap(),
-                    None,
-                    None,
-                    self.listener.clone(),
-                );
-                pipe.set_cluster_id(self.cluster_id.clone());
-                self.protocol = Some(State::Pipe(pipe));
-                gauge_add!("protocol.proxy.expect", -1);
-                gauge_add!("protocol.tcp", 1);
-                UpgradeResult::ConnectBackend
-            } else {
-                error!("Missing the backend buffer queue, we can't switch to a pipe");
-                UpgradeResult::Close
-            }
-        } else {
-            UpgradeResult::Close
+    fn upgrade_send(
+        &mut self,
+        send_proxy_protocol: SendProxyProtocol<MioTcpStream>,
+    ) -> Option<TcpStateMachine> {
+        if self.backend_buffer.is_some() && self.frontend_buffer.is_some() {
+            let mut pipe = send_proxy_protocol.into_pipe(
+                self.frontend_buffer.take().unwrap(),
+                self.backend_buffer.take().unwrap(),
+                self.listener.clone(),
+            );
+            pipe.set_cluster_id(self.cluster_id.clone());
+            gauge_add!("protocol.proxy.send", -1);
+            gauge_add!("protocol.tcp", 1);
+            return Some(TcpStateMachine::Pipe(pipe));
         }
+        error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
+        None
+    }
+
+    fn upgrade_relay(&mut self, rpp: RelayProxyProtocol<MioTcpStream>) -> Option<TcpStateMachine> {
+        if self.backend_buffer.is_some() {
+            let mut pipe =
+                rpp.into_pipe(self.backend_buffer.take().unwrap(), self.listener.clone());
+            pipe.set_cluster_id(self.cluster_id.clone());
+            gauge_add!("protocol.proxy.relay", -1);
+            gauge_add!("protocol.tcp", 1);
+            return Some(TcpStateMachine::Pipe(pipe));
+        }
+        error!("Missing the backend buffer queue, we can't switch to a pipe");
+        None
+    }
+
+    fn upgrade_expect(&mut self, epp: ExpectProxyProtocol<MioTcpStream>) -> Option<TcpStateMachine> {
+        if self.frontend_buffer.is_some() && self.backend_buffer.is_some() {
+            let mut pipe = epp.into_pipe(
+                self.frontend_buffer.take().unwrap(),
+                self.backend_buffer.take().unwrap(),
+                None,
+                None,
+                self.listener.clone(),
+            );
+            pipe.set_cluster_id(self.cluster_id.clone());
+            gauge_add!("protocol.proxy.expect", -1);
+            gauge_add!("protocol.tcp", 1);
+            return Some(TcpStateMachine::Pipe(pipe));
+        }
+        error!("Missing the backend buffer queue, we can't switch to a pipe");
+        None
     }
 
     fn front_readiness(&mut self) -> &mut Readiness {
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.front_readiness(),
-            Some(State::SendProxyProtocol(ref mut pp)) => pp.front_readiness(),
-            Some(State::RelayProxyProtocol(ref mut pp)) => pp.front_readiness(),
-            Some(State::ExpectProxyProtocol(ref mut pp)) => pp.readiness(),
-            _ => unreachable!(),
-        }
+        self.state.front_readiness()
     }
 
     fn back_readiness(&mut self) -> Option<&mut Readiness> {
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => Some(pipe.back_readiness()),
-            Some(State::SendProxyProtocol(ref mut pp)) => Some(pp.back_readiness()),
-            Some(State::RelayProxyProtocol(ref mut pp)) => Some(pp.back_readiness()),
-            _ => None,
+        match &mut self.state {
+            TcpStateMachine::Pipe(pipe) => Some(pipe.back_readiness()),
+            TcpStateMachine::SendProxyProtocol(pp) => Some(pp.back_readiness()),
+            TcpStateMachine::RelayProxyProtocol(pp) => Some(pp.back_readiness()),
+            TcpStateMachine::ExpectProxyProtocol(_) => None,
+            TcpStateMachine::FailedUpgrade(_) => todo!(),
         }
     }
 
-    // TODO: why did we have this AND self.backend_token? was it important?
-    // fn back_token(&self) -> Option<Token> {
-    //     match self.protocol {
-    //         Some(State::Pipe(ref pipe)) => pipe.back_token(),
-    //         Some(State::SendProxyProtocol(ref pp)) => pp.back_token(),
-    //         Some(State::RelayProxyProtocol(ref pp)) => pp.back_token(),
-    //         Some(State::ExpectProxyProtocol(_)) => None,
-    //         _ => unreachable!(),
-    //     }
-    // }
-
-    fn set_back_socket(&mut self, socket: TcpStream) {
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.set_back_socket(socket),
-            Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
-            Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
-            Some(State::ExpectProxyProtocol(_)) => {
+    fn set_back_socket(&mut self, socket: MioTcpStream) {
+        match &mut self.state {
+            TcpStateMachine::Pipe(pipe) => pipe.set_back_socket(socket),
+            TcpStateMachine::SendProxyProtocol(pp) => pp.set_back_socket(socket),
+            TcpStateMachine::RelayProxyProtocol(pp) => pp.set_back_socket(socket),
+            TcpStateMachine::ExpectProxyProtocol(_) => {
                 panic!("we should not set the back socket for the expect proxy protocol")
             }
-            _ => unreachable!(),
+            TcpStateMachine::FailedUpgrade(_) => unreachable!(),
         }
     }
 
     fn set_back_token(&mut self, token: Token) {
         self.backend_token = Some(token);
 
-        match self.protocol {
-            Some(State::Pipe(ref mut pipe)) => pipe.set_back_token(token),
-            Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_token(token),
-            Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_token(token),
-            Some(State::ExpectProxyProtocol(_)) => self.backend_token = Some(token),
-            _ => unreachable!(),
+        match &mut self.state {
+            TcpStateMachine::Pipe(pipe) => pipe.set_back_token(token),
+            TcpStateMachine::SendProxyProtocol(pp) => pp.set_back_token(token),
+            TcpStateMachine::RelayProxyProtocol(pp) => pp.set_back_token(token),
+            TcpStateMachine::ExpectProxyProtocol(_) => self.backend_token = Some(token),
+            TcpStateMachine::FailedUpgrade(_) => unreachable!(),
         }
     }
 
     fn set_backend_id(&mut self, id: String) {
         self.backend_id = Some(id.clone());
-        if let Some(State::Pipe(ref mut pipe)) = self.protocol {
+        if let TcpStateMachine::Pipe(pipe) = &mut self.state {
             pipe.set_backend_id(Some(id));
         }
     }
 
     fn back_connected(&self) -> BackendConnectionStatus {
-        self.back_connected
+        self.backend_connected
     }
 
     fn set_back_connected(&mut self, status: BackendConnectionStatus) {
-        let last = self.back_connected;
-        self.back_connected = status;
+        let last = self.backend_connected;
+        self.backend_connected = status;
 
         if status == BackendConnectionStatus::Connected {
             gauge_add!("backend.connections", 1);
@@ -481,8 +483,8 @@ impl Session {
                 self.cluster_id.as_deref(),
                 self.metrics.backend_id.as_deref()
             );
-            if let Some(State::SendProxyProtocol(ref mut pp)) = self.protocol {
-                pp.set_back_connected(BackendConnectionStatus::Connected);
+            if let TcpStateMachine::SendProxyProtocol(spp) = &mut self.state {
+                spp.set_back_connected(BackendConnectionStatus::Connected);
             }
 
             if let Some(backend) = self.backend.as_ref() {
@@ -562,7 +564,7 @@ impl Session {
         self.connection_attempt = 0;
     }
 
-    pub fn test_back_socket(&mut self) -> bool {
+    pub fn test_back_socket(&mut self) -> SessionIsToBeClosed {
         match self.back_socket_mut() {
             Some(ref mut s) => {
                 let mut tmp = [0u8; 1];
@@ -580,11 +582,11 @@ impl Session {
     }
 
     pub fn cancel_timeouts(&mut self) {
-        self.front_timeout.cancel();
-        self.back_timeout.cancel();
+        self.container_frontend_timeout.cancel();
+        self.container_backend_timeout.cancel();
     }
 
-    fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
+    fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> StateResult {
         let mut counter = 0;
         let max_loop_iterations = 100000;
 
@@ -603,7 +605,7 @@ impl Session {
                     Ok(BackendConnectAction::Reuse) => {}
                     Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
                         // stop here, we must wait for an event
-                        return SessionResult::Continue;
+                        return StateResult::Continue;
                     }
                     // TODO: should we return CloseSession here?
                     Err(connection_error) => {
@@ -613,8 +615,10 @@ impl Session {
             } else if self.back_readiness().unwrap().event != Ready::empty() {
                 self.reset_connection_attempt();
                 let back_token = self.backend_token.unwrap();
-                self.back_timeout.set(back_token);
-                self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
+                self.container_backend_timeout.set(back_token);
+                // Why is this here? this artificially reset the connection time for no apparent reasons
+                // TODO: maybe remove this?
+                self.backend_connected = BackendConnectionStatus::Connecting(Instant::now());
 
                 self.set_back_connected(BackendConnectionStatus::Connected);
             }
@@ -624,7 +628,7 @@ impl Session {
                 Ok(BackendConnectAction::Reuse) => {}
                 Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
                     // we must wait for an event
-                    return SessionResult::Continue;
+                    return StateResult::Continue;
                 }
                 Err(connection_error) => {
                     error!("Error connecting to backend: {:#}", connection_error)
@@ -635,7 +639,7 @@ impl Session {
         if self.front_readiness().event.is_hup() {
             let order = self.front_hup();
             match order {
-                SessionResult::CloseSession => {
+                StateResult::CloseSession => {
                     return order;
                 }
                 _ => {
@@ -680,34 +684,34 @@ impl Session {
                 trace!("front readable\tinterpreting session order {:?}", order);
 
                 match order {
-                    SessionResult::ConnectBackend => {
+                    StateResult::ConnectBackend => {
                         match self.connect_to_backend(session.clone()) {
                             // reuse connection or send a default answer, we can continue
                             Ok(BackendConnectAction::Reuse) => {}
                             Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
                                 // we must wait for an event
-                                return SessionResult::Continue;
+                                return StateResult::Continue;
                             }
                             Err(connection_error) => {
                                 error!("Error connecting to backend: {:#}", connection_error)
                             }
                         }
                     }
-                    SessionResult::Continue => {}
+                    StateResult::Continue => {}
                     order => return order,
                 }
             }
 
             if back_interest.is_writable() {
                 let order = self.back_writable();
-                if order != SessionResult::Continue {
+                if order != StateResult::Continue {
                     return order;
                 }
             }
 
             if back_interest.is_readable() {
                 let order = self.back_readable();
-                if order != SessionResult::Continue {
+                if order != StateResult::Continue {
                     return order;
                 }
             }
@@ -715,7 +719,7 @@ impl Session {
             if front_interest.is_writable() {
                 let order = self.writable();
                 trace!("front writable\tinterpreting session order {:?}", order);
-                if order != SessionResult::Continue {
+                if order != StateResult::Continue {
                     return order;
                 }
             }
@@ -723,10 +727,10 @@ impl Session {
             if back_interest.is_hup() {
                 let order = self.back_hup();
                 match order {
-                    SessionResult::CloseSession => {
+                    StateResult::CloseSession => {
                         return order;
                     }
-                    SessionResult::Continue => {}
+                    StateResult::Continue => {}
                     _ => {
                         if let Some(r) = self.back_readiness() {
                             r.event.remove(Ready::hup());
@@ -747,10 +751,10 @@ impl Session {
                     r.interest = Ready::empty();
                 }
 
-                return SessionResult::CloseSession;
+                return StateResult::CloseSession;
             }
 
-            if back_interest.is_error() && self.back_hup() == SessionResult::CloseSession {
+            if back_interest.is_error() && self.back_hup() == StateResult::CloseSession {
                 self.front_readiness().interest = Ready::empty();
                 if let Some(r) = self.back_readiness() {
                     r.interest = Ready::empty();
@@ -760,7 +764,7 @@ impl Session {
                     "PROXY session {:?} back error, disconnecting",
                     self.frontend_token
                 );
-                return SessionResult::CloseSession;
+                return StateResult::CloseSession;
             }
 
             counter += 1;
@@ -786,14 +790,15 @@ impl Session {
                 front_interest,
                 back_interest
             );
-            self.print_state();
+            self.print_session();
 
-            return SessionResult::CloseSession;
+            return StateResult::CloseSession;
         }
 
-        SessionResult::Continue
+        StateResult::Continue
     }
 
+    /// TCP session closes its backend on its own, without defering this task to the state
     fn close_backend(&mut self) {
         if let (Some(token), Some(fd)) = (
             self.backend_token,
@@ -840,17 +845,12 @@ impl Session {
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
     ) -> anyhow::Result<BackendConnectAction> {
-        let cluster_id = if let Some(cluster_id) = self
-            .proxy
-            .borrow()
-            .listeners
-            .get(&self.accept_token)
-            .and_then(|listener| listener.borrow().cluster_id.clone())
-        {
-            cluster_id
-        } else {
-            error!("no TCP cluster corresponds to that front address");
-            bail!("no TCP cluster found.")
+        let cluster_id = match self.listener.borrow().cluster_id.clone() {
+            Some(cluster_id) => cluster_id,
+            None => {
+                error!("no TCP cluster corresponds to that front address");
+                bail!("no TCP cluster found.")
+            }
         };
 
         self.cluster_id = Some(cluster_id.clone());
@@ -877,7 +877,7 @@ impl Session {
             })?;
         /*
         this was the old error matching for backend_from_cluster_id.
-        panic! is called in case of mio::net::TcpStream::connect() error
+        panic! is called in case of mio::net::MioTcpStream::connect() error
         Do we really want to panic ?
         Err(ConnectionError::NoBackendAvailable(c_id)) => {
             Err(ConnectionError::NoBackendAvailable(c_id))
@@ -893,7 +893,7 @@ impl Session {
                 stream, e
             );
         }
-        self.back_connected = BackendConnectionStatus::Connecting(Instant::now());
+        self.backend_connected = BackendConnectionStatus::Connecting(Instant::now());
 
         let back_token = {
             let proxy = self.proxy.borrow();
@@ -912,14 +912,11 @@ impl Session {
             error!("error registering back socket({:?}): {:?}", stream, e);
         }
 
-        let connect_timeout_duration = Duration::seconds(
-            self.proxy.borrow().listeners[&self.accept_token]
-                .borrow()
-                .config
-                .connect_timeout as i64,
-        );
-        self.back_timeout.set_duration(connect_timeout_duration);
-        self.back_timeout.set(back_token);
+        let connect_timeout_duration =
+            Duration::seconds(self.listener.borrow().config.connect_timeout as i64);
+        self.container_backend_timeout
+            .set_duration(connect_timeout_duration);
+        self.container_backend_timeout.set(back_token);
 
         self.set_back_token(back_token);
         self.set_back_socket(stream);
@@ -932,64 +929,80 @@ impl Session {
     }
 }
 
-impl ProxySession for Session {
+impl ProxySession for TcpSession {
     fn close(&mut self) {
+        if self.has_been_closed {
+            return;
+        }
+
+        // TODO: the state should handle the timeouts
+        info!("Closing TCP session");
         self.metrics.service_stop();
+
+        // Restore gauges
+        match self.state.marker() {
+            StateMarker::Pipe => gauge_add!("protocol.tcp", -1),
+            StateMarker::SendProxyProtocol => gauge_add!("protocol.proxy.send", -1),
+            StateMarker::RelayProxyProtocol => gauge_add!("protocol.proxy.relay", -1),
+            StateMarker::ExpectProxyProtocol => gauge_add!("protocol.proxy.expect", -1),
+        }
+
+        if self.state.failed() {
+            return;
+        }
+
         self.cancel_timeouts();
-        if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
-            if e.kind() != ErrorKind::NotConnected {
+
+        let front_socket = self.state.front_socket();
+        if let Err(e) = front_socket.shutdown(Shutdown::Both) {
+            error!(
+                "error shutting down front socket({:?}): {:?}",
+                front_socket, e
+            );
+        }
+
+        // deregister the frontend and remove it, in a separate scope to drop proxy when done
+        {
+            let proxy = self.proxy.borrow();
+            let fd = front_socket.as_raw_fd();
+            if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
                 error!(
-                    "error shutting down front socket({:?}): {:?}",
-                    self.front_socket(),
-                    e
+                    "error deregistering front socket({:?}) while closing TCP session: {:?}",
+                    fd, e
                 );
             }
+            proxy
+                .sessions
+                .borrow_mut()
+                .slab
+                .try_remove(self.frontend_token.0);
         }
 
         self.close_backend();
-
-        match self.protocol {
-            Some(State::Pipe(_)) => gauge_add!("protocol.tcp", -1),
-            Some(State::SendProxyProtocol(_)) => gauge_add!("protocol.proxy.send", -1),
-            Some(State::RelayProxyProtocol(_)) => gauge_add!("protocol.proxy.relay", -1),
-            Some(State::ExpectProxyProtocol(_)) => gauge_add!("protocol.proxy.expect", -1),
-            None => {}
-        }
-
-        let fd = self.front_socket().as_raw_fd();
-        let proxy = self.proxy.borrow();
-        if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-            error!("1error deregistering socket({:?}): {:?}", fd, e);
-        }
-
-        proxy
-            .sessions
-            .borrow_mut()
-            .slab
-            .try_remove(self.frontend_token.0);
+        self.has_been_closed = true;
     }
 
-    fn timeout(&mut self, token: Token) {
+    fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
         if self.frontend_token == token {
             let dur = Instant::now() - self.last_event;
-            let front_timeout = self.front_timeout.duration();
+            let front_timeout = self.container_frontend_timeout.duration();
             if dur < front_timeout {
                 TIMER.with(|timer| {
                     timer.borrow_mut().set_timeout(front_timeout - dur, token);
                 });
-            } else {
-                self.close();
+                return false;
             }
-        } else {
-            // invalid token, obsolete timeout triggered
+            return true;
         }
+        // invalid token, obsolete timeout triggered
+        false
     }
 
     fn protocol(&self) -> Protocol {
         Protocol::TCP
     }
 
-    fn process_events(&mut self, token: Token, events: Ready) {
+    fn update_readiness(&mut self, token: Token, events: Ready) {
         trace!(
             "token {:?} got event {}",
             token,
@@ -1007,83 +1020,93 @@ impl ProxySession for Session {
         }
     }
 
-    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) {
+    fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
         self.metrics().service_start();
-        let res = self.ready_inner(session);
+        let state_result = self.ready_inner(session);
 
-        if res == SessionResult::CloseSession {
-            self.close();
-        } else if let SessionResult::CloseBackend = res {
-            self.close_backend();
-        }
+        let to_bo_closed = match state_result {
+            StateResult::CloseBackend => {
+                self.close_backend();
+                false
+            }
+            StateResult::CloseSession => true,
+            StateResult::Continue => false,
+            StateResult::ConnectBackend => unreachable!(),
+            StateResult::Upgrade => unreachable!(),
+        };
 
         self.metrics().service_stop();
+        to_bo_closed
     }
 
-    fn shutting_down(&mut self) {
-        self.close();
-        self.proxy
-            .borrow()
-            .sessions
-            .borrow_mut()
-            .slab
-            .try_remove(self.frontend_token.0);
+    fn shutting_down(&mut self) -> SessionIsToBeClosed {
+        true
     }
 
     fn last_event(&self) -> Instant {
         self.last_event
     }
 
-    fn print_state(&self) {
-        let p: String = match &self.protocol {
-            Some(State::ExpectProxyProtocol(_)) => String::from("Expect"),
-            Some(State::SendProxyProtocol(_)) => String::from("Send"),
-            Some(State::RelayProxyProtocol(_)) => String::from("Relay"),
-            Some(State::Pipe(_)) => String::from("TCP"),
-            None => String::from("None"),
+    fn print_session(&self) {
+        let state: String = match &self.state {
+            TcpStateMachine::ExpectProxyProtocol(_) => String::from("Expect"),
+            TcpStateMachine::SendProxyProtocol(_) => String::from("Send"),
+            TcpStateMachine::RelayProxyProtocol(_) => String::from("Relay"),
+            TcpStateMachine::Pipe(_) => String::from("TCP"),
+            TcpStateMachine::FailedUpgrade(marker) => format!("FailedUpgrade({marker:?})"),
         };
 
-        let rf = match *unwrap_msg!(self.protocol.as_ref()) {
-            State::ExpectProxyProtocol(ref expect) => &expect.readiness,
-            State::SendProxyProtocol(ref send) => &send.front_readiness,
-            State::RelayProxyProtocol(ref relay) => &relay.front_readiness,
-            State::Pipe(ref pipe) => &pipe.front_readiness,
+        let front_readiness = match &self.state {
+            TcpStateMachine::ExpectProxyProtocol(expect) => Some(&expect.frontend_readiness),
+            TcpStateMachine::SendProxyProtocol(send) => Some(&send.frontend_readiness),
+            TcpStateMachine::RelayProxyProtocol(relay) => Some(&relay.frontend_readiness),
+            TcpStateMachine::Pipe(pipe) => Some(&pipe.frontend_readiness),
+            TcpStateMachine::FailedUpgrade(_) => None,
         };
 
-        let rb = match *unwrap_msg!(self.protocol.as_ref()) {
-            State::SendProxyProtocol(ref send) => Some(&send.back_readiness),
-            State::RelayProxyProtocol(ref relay) => Some(&relay.back_readiness),
-            State::Pipe(ref pipe) => Some(&pipe.back_readiness),
-            _ => None,
+        let back_readiness = match &self.state {
+            TcpStateMachine::SendProxyProtocol(send) => Some(&send.backend_readiness),
+            TcpStateMachine::RelayProxyProtocol(relay) => Some(&relay.backend_readiness),
+            TcpStateMachine::Pipe(pipe) => Some(&pipe.backend_readiness),
+            TcpStateMachine::ExpectProxyProtocol(_) => None,
+            TcpStateMachine::FailedUpgrade(_) => None,
         };
 
-        error!("zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, cluster_id: {:?}, back_connected: {:?}, metrics: {:?}",
-            self.frontend_token, self.backend_token, rf, rb, p, self.cluster_id, self.back_connected, self.metrics
+        error!(
+            "\
+TCP Session ({:?})
+\tFrontend:
+\t\ttoken: {:?}\treadiness: {:?}
+\tBackend:
+\t\ttoken: {:?}\treadiness: {:?}\tstatus: {:?}\tcluster id: {:?}",
+            state,
+            self.frontend_token,
+            front_readiness,
+            self.backend_token,
+            back_readiness,
+            self.backend_connected,
+            self.cluster_id
         );
+        error!("Metrics: {:?}", self.metrics);
     }
 
-    fn tokens(&self) -> Vec<Token> {
-        let mut v = vec![self.frontend_token];
-        if let Some(tk) = self.backend_token {
-            v.push(tk)
-        }
-
-        v
+    fn frontend_token(&self) -> Token {
+        self.frontend_token
     }
 }
 
-pub struct Listener {
-    cluster_id: Option<String>,
-    listener: Option<TcpListener>,
-    token: Token,
+pub struct TcpListener {
+    active: SessionIsToBeClosed,
     address: SocketAddr,
-    pool: Rc<RefCell<Pool>>,
+    cluster_id: Option<String>,
     config: TcpListenerConfig,
-    active: bool,
+    listener: Option<MioTcpListener>,
+    pool: Rc<RefCell<Pool>>,
     tags: BTreeMap<String, BTreeMap<String, String>>,
+    token: Token,
 }
 
-impl ListenerHandler for Listener {
+impl ListenerHandler for TcpListener {
     fn get_addr(&self) -> &SocketAddr {
         &self.address
     }
@@ -1100,9 +1123,9 @@ impl ListenerHandler for Listener {
     }
 }
 
-impl Listener {
-    fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool>>, token: Token) -> Listener {
-        Listener {
+impl TcpListener {
+    fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool>>, token: Token) -> TcpListener {
+        TcpListener {
             cluster_id: None,
             listener: None,
             token,
@@ -1118,7 +1141,7 @@ impl Listener {
     pub fn activate(
         &mut self,
         registry: &Registry,
-        tcp_listener: Option<TcpListener>,
+        tcp_listener: Option<MioTcpListener>,
     ) -> Option<Token> {
         if self.active {
             return Some(self.token);
@@ -1156,22 +1179,22 @@ pub struct ClusterConfiguration {
     // load_balancing: LoadBalancingAlgorithms,
 }
 
-pub struct Proxy {
+pub struct TcpProxy {
     fronts: HashMap<String, Token>,
     backends: Rc<RefCell<BackendMap>>,
-    listeners: HashMap<Token, Rc<RefCell<Listener>>>,
+    listeners: HashMap<Token, Rc<RefCell<TcpListener>>>,
     configs: HashMap<ClusterId, ClusterConfiguration>,
     registry: Registry,
     sessions: Rc<RefCell<SessionManager>>,
 }
 
-impl Proxy {
+impl TcpProxy {
     pub fn new(
         registry: Registry,
         sessions: Rc<RefCell<SessionManager>>,
         backends: Rc<RefCell<BackendMap>>,
-    ) -> Proxy {
-        Proxy {
+    ) -> TcpProxy {
+        TcpProxy {
             backends,
             listeners: HashMap::new(),
             configs: HashMap::new(),
@@ -1190,14 +1213,14 @@ impl Proxy {
     ) -> Option<Token> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                entry.insert(Rc::new(RefCell::new(Listener::new(config, pool, token))));
+                entry.insert(Rc::new(RefCell::new(TcpListener::new(config, pool, token))));
                 Some(token)
             }
             _ => None,
         }
     }
 
-    pub fn remove_listener(&mut self, address: SocketAddr) -> bool {
+    pub fn remove_listener(&mut self, address: SocketAddr) -> SessionIsToBeClosed {
         let len = self.listeners.len();
 
         self.listeners.retain(|_, l| l.borrow().address != address);
@@ -1208,7 +1231,7 @@ impl Proxy {
     pub fn activate_listener(
         &self,
         addr: &SocketAddr,
-        tcp_listener: Option<TcpListener>,
+        tcp_listener: Option<MioTcpListener>,
     ) -> Option<Token> {
         self.listeners
             .values()
@@ -1216,7 +1239,7 @@ impl Proxy {
             .and_then(|listener| listener.borrow_mut().activate(&self.registry, tcp_listener))
     }
 
-    pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
+    pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, MioTcpListener)> {
         self.listeners
             .values()
             .filter_map(|listener| {
@@ -1231,7 +1254,7 @@ impl Proxy {
     }
 
     // TODO: return Result with context
-    pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, TcpListener)> {
+    pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, MioTcpListener)> {
         self.listeners
             .values()
             .find(|listener| listener.borrow().address == address)
@@ -1292,7 +1315,7 @@ impl Proxy {
     }
 }
 
-impl ProxyConfiguration<Session> for Proxy {
+impl ProxyConfiguration for TcpProxy {
     fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
         match message.order {
             ProxyRequestOrder::AddTcpFrontend(front) => {
@@ -1378,7 +1401,7 @@ impl ProxyConfiguration<Session> for Proxy {
         }
     }
 
-    fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
+    fn accept(&mut self, token: ListenToken) -> Result<MioTcpStream, AcceptError> {
         let internal_token = Token(token.0);
         if let Some(listener) = self.listeners.get(&internal_token) {
             if let Some(tcp_listener) = &listener.borrow().listener {
@@ -1402,16 +1425,16 @@ impl ProxyConfiguration<Session> for Proxy {
 
     fn create_session(
         &mut self,
-        mut frontend_sock: TcpStream,
+        mut frontend_sock: MioTcpStream,
         token: ListenToken,
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
     ) -> Result<(), AcceptError> {
-        let internal_token = Token(token.0);
+        let listener_token = Token(token.0);
 
         let listener = self
             .listeners
-            .get(&internal_token)
+            .get(&listener_token)
             .ok_or(AcceptError::IoError)?;
 
         let owned = listener.borrow();
@@ -1451,11 +1474,11 @@ impl ProxyConfiguration<Session> for Proxy {
 
         let mut session_manager = self.sessions.borrow_mut();
         let entry = session_manager.slab.vacant_entry();
-        let session_token = Token(entry.key());
+        let frontend_token = Token(entry.key());
 
         if let Err(register_error) = self.registry.register(
             &mut frontend_sock,
-            session_token,
+            frontend_token,
             Interest::READABLE | Interest::WRITABLE,
         ) {
             error!(
@@ -1465,34 +1488,31 @@ impl ProxyConfiguration<Session> for Proxy {
             return Err(AcceptError::RegisterError);
         }
 
-        let session = Session::new(
-            frontend_sock,
-            session_token,
-            internal_token,
-            proxy,
-            front_buffer,
+        let session = TcpSession::new(
             back_buffer,
-            owned.cluster_id.clone(),
             None,
-            proxy_protocol,
-            wait_time,
-            Duration::seconds(owned.config.front_timeout as i64),
+            owned.cluster_id.clone(),
             Duration::seconds(owned.config.back_timeout as i64),
+            Duration::seconds(owned.config.front_timeout as i64),
+            front_buffer,
+            frontend_token,
             listener.clone(),
+            proxy_protocol,
+            proxy,
+            frontend_sock,
+            wait_time,
         );
         incr!("tcp.requests");
 
         let session = Rc::new(RefCell::new(session));
         entry.insert(session);
 
-        session_manager.incr();
-
         Ok(())
     }
 }
 
 /// This is not directly used by Sōzu but is available for example and testing purposes
-pub fn start(
+pub fn start_tcp_worker(
     config: TcpListenerConfig,
     max_buffers: usize,
     buffer_size: usize,
@@ -1546,7 +1566,7 @@ pub fn start(
         .registry()
         .try_clone()
         .with_context(|| "Failed at creating a registry")?;
-    let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
+    let mut configuration = TcpProxy::new(registry, sessions.clone(), backends.clone());
     let _ = configuration.add_listener(config, pool.clone(), token);
     let _ = configuration.activate_listener(&address, None);
     let (scm_server, _scm_client) =
@@ -1757,7 +1777,7 @@ mod tests {
 
             let sessions = SessionManager::new(sessions, max_connections);
             let registry = poll.registry().try_clone().unwrap();
-            let mut configuration = Proxy::new(registry, sessions.clone(), backends.clone());
+            let mut configuration = TcpProxy::new(registry, sessions.clone(), backends.clone());
             let listener_config = TcpListenerConfig {
                 address: "127.0.0.1:1234".parse().unwrap(),
                 public_address: None,

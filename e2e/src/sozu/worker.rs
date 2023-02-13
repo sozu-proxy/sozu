@@ -1,4 +1,6 @@
 use std::{
+    env,
+    io::stdout,
     net::SocketAddr,
     os::unix::prelude::{AsRawFd, FromRawFd, IntoRawFd},
     thread::{self, JoinHandle},
@@ -13,10 +15,11 @@ use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
     config::{Config, FileConfig},
+    logging::{Logger, LoggerBackend},
     proxy::{
-        Backend, Cluster, HttpFrontend, HttpListener, HttpsListener, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, ProxyRequest, ProxyRequestOrder, ProxyResponse, Route,
-        RulePosition, TcpFrontend, TcpListener,
+        Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, ProxyRequest, ProxyRequestOrder,
+        ProxyResponse, Route, RulePosition, TcpFrontend, TcpListenerConfig,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -150,10 +153,6 @@ impl Worker {
 
         set_no_close_exec(scm_main_to_worker.as_raw_fd());
         set_no_close_exec(scm_worker_to_main.as_raw_fd());
-        println!("****Socket fd: {}", scm_main_to_worker.as_raw_fd());
-        println!("****Socket fd: {}", scm_worker_to_main.as_raw_fd());
-        println!("****Socket fd: {}", cmd_main_to_worker.sock.as_raw_fd());
-        println!("****Socket fd: {}", cmd_worker_to_main.sock.as_raw_fd());
 
         let scm_main_to_worker = ScmSocket::new(scm_main_to_worker.into_raw_fd())
             .expect("could not create an SCM socket");
@@ -167,7 +166,17 @@ impl Worker {
         let thread_state = state.to_owned();
         let thread_name = name.to_owned();
         let thread_scm_worker_to_main = scm_worker_to_main.to_owned();
+
+        println!("Setting up logging");
+
         let server_job = thread::spawn(move || {
+            let log_level = env::var("RUST_LOG").unwrap_or("error".to_string());
+            Logger::init(
+                    thread_name.to_owned(),
+                    &log_level,
+                    LoggerBackend::Stdout(stdout()),
+                    None,
+                );
             let mut server = Server::try_new_from_config(
                 cmd_worker_to_main,
                 thread_scm_worker_to_main,
@@ -281,8 +290,8 @@ impl Worker {
         result
     }
 
-    pub fn default_tcp_listener(address: SocketAddr) -> TcpListener {
-        TcpListener {
+    pub fn default_tcp_listener(address: SocketAddr) -> TcpListenerConfig {
+        TcpListenerConfig {
             address,
             public_address: None,
             expect_proxy: false,
@@ -292,27 +301,27 @@ impl Worker {
         }
     }
 
-    pub fn default_http_listener(address: SocketAddr) -> HttpListener {
-        HttpListener {
+    pub fn default_http_listener(address: SocketAddr) -> HttpListenerConfig {
+        HttpListenerConfig {
             address,
             public_address: None,
             expect_proxy: false,
             front_timeout: 60,
             back_timeout: 30,
             connect_timeout: 3,
-            ..HttpListener::default()
+            ..HttpListenerConfig::default()
         }
     }
 
-    pub fn default_https_listener(address: SocketAddr) -> HttpsListener {
-        HttpsListener {
+    pub fn default_https_listener(address: SocketAddr) -> HttpsListenerConfig {
+        HttpsListenerConfig {
             address,
             public_address: None,
             expect_proxy: false,
             front_timeout: 60,
             back_timeout: 30,
             connect_timeout: 3,
-            ..HttpsListener::default()
+            ..HttpsListenerConfig::default()
         }
     }
 
