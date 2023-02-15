@@ -1,0 +1,703 @@
+syntax = "proto2";
+package protocommand;
+
+// ---------------------------------------------------------------
+//                          REQUESTS
+// ---------------------------------------------------------------
+
+// Sent to the main process or to workers
+message Request {
+    required string id = 1;
+    required int32 version = 2; // This should be u8 but... protobuf
+    // if any, the worker to which the order is intended
+    optional int32 worker_id = 3;
+    oneof Order {
+        WorkerOrder worker_order = 4;
+        SaveState save_state = 5;
+        LoadState load_state = 6;
+        DumpState dump_state = 7;
+        ListWorkers list_workers = 8;
+        FrontendFilters list_frontends = 9;
+        ListListeners list_listeners = 10;
+        LaunchWorker launch_worker = 11;
+        UpgradeMain upgrade_main = 12;
+        UpgradeWorker upgrade_worker = 13;
+        SubscribeEvents subscribe_events = 14;
+        ReloadConfiguration reload_configuration = 15;
+        Status status = 16;
+    }
+}
+
+
+// save Sōzu's parseable state as a file
+message SaveState { required string path = 1; }
+
+// load a state file
+message LoadState { required string path = 1; }
+
+// dump the state in JSON
+message DumpState {}
+
+// list the workers and their status
+message ListWorkers {}
+
+// list the frontends, filtered by protocol and/or domain
+message FrontendFilters {
+    required bool http = 1;
+    required bool https = 2;
+    required bool tcp = 3;
+    optional string domain = 4;
+}
+
+// list all listeners
+message ListListeners {}
+
+// upgrade the main process
+message Upgrade {}
+
+// launch a new worker
+message LaunchWorker { required int32 id = 1; }
+
+message UpgradeMain {}
+
+// upgrade an existing worker
+message UpgradeWorker { required int32 id = 1; }
+
+// subscribe to worker events
+message SubscribeEvents {}
+
+// reload the configuration from the config file, or a new file
+message ReloadConfiguration { optional string path = 1; }
+
+// give status of main process and all workers
+message Status {}
+
+// an order to forward to workers
+message WorkerOrder {
+    oneof inner {
+        Cluster add_cluster = 1;
+        RemoveCluster remove_cluster = 2;
+        HttpFrontend add_http_frontend = 3;
+        HttpFrontend remove_http_frontend = 4;
+        AddCertificate add_certificate = 5;
+        ReplaceCertificate replace_certificate = 6;
+        RemoveCertificate remove_certificate = 7;
+        TcpFrontend add_tcp_frontend = 8;
+        TcpFrontend remove_tcp_frontend = 9;
+        Backend add_backend = 10;
+        HttpListenerConfig add_http_listener = 11;
+        HttpsListenerConfig add_https_listener = 12;
+        TcpListenerConfig add_tcp_listener = 13;
+        RemoveListener remove_listener = 14;
+        ActivateListener activate_listener = 15;
+        DeactivateListener deactivate_listener = 16;
+        SoftStop soft_stop = 18;
+        HardStop hard_stop = 19;
+        Status status = 20;
+        MetricsConfiguration configure_metrics = 21;
+        Logging logging = 22;
+        ReturnListenSockets return_listen_sockets = 23;
+        RemoveBackend remove_backend = 24;
+        HttpFrontend add_https_frontend = 25;
+        HttpFrontend remove_https_frontend = 26;
+        string query_cluster_by_id = 27;
+        QueryClusterByDomain query_cluster_by_domain = 28;
+        QueryAllCertificates query_all_certificates = 29;
+        string query_certificate_by_domain = 30;
+        Fingerprint query_certificate_by_fingerprint = 31;
+        QueryMetricsOptions query_metrics = 32;
+        QueryClusterHashes query_cluster_hashes = 34;
+    }
+}
+
+// identifier for the routing between a frontend ands backends
+message Cluster {
+   required string cluster_id = 1;
+   required bool sticky_session = 2;
+   required bool https_redirect = 3;
+   optional ProxyProtocolConfig proxy_protocol_config = 4;
+   required LoadBalancingAlgorithms load_balancing = 5;
+   optional string answer_503 = 6;
+   optional LoadMetric load_metric = 7;
+}
+
+// orders Sōzu to remove a given cluster
+message RemoveCluster {
+    required string cluster_id = 1;
+}
+
+message HttpFrontend {
+    optional string cluster_id = 1;
+    required string socket_address = 3; // should be a SocketAddr struct, std::net::SocketAddr
+    required string hostname = 4;
+    required PathRule path_rule = 5;
+    optional string method = 6;
+    required RulePosition rule_position = 7;
+    map<string, string> tags = 8;
+}
+
+// add a TLS certificate for a given socket address
+message AddCertificate {
+    // the socket address of the listener
+    required string address = 1; // should be a SocketAddr struct, std::net::SocketAddr
+    required Certificate certificate_and_key = 2;
+    repeated string names = 3;   // translate this: #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
+    // The `expired_at` overrides certificate expiration, the value of the field is a unix timestamp
+    optional int64 expired_at = 4;
+}
+
+// replace a TLS certificate for a given socket address
+message ReplaceCertificate {
+    required string address = 1; // should be a SocketAddr struct, std::net::SocketAddr
+    required Certificate new_certificate = 2;
+    required Fingerprint old_fingerprint =3; // should be a Vec<u8>
+    repeated string new_names = 4;
+    optional int64 new_expired_at = 5;
+}
+
+message Fingerprint {
+    required bytes inner = 1;
+}
+
+// remove a TLS certificate (identified by its fingerprint) on a given socket address, 
+message RemoveCertificate {
+    required string address = 1; // should be a SocketAddr struct, std::net::SocketAddr
+    required Fingerprint fingerprint = 2;
+}
+
+message TcpFrontend {
+    required string cluster_id = 1;
+    required string address = 2; // should be a SocketAddr struct, std::net::SocketAddr
+    map<string, string> tags = 3;
+}
+
+message Backend {
+    required string cluster_id = 1;
+    required string backend_id = 2;
+    required string address = 3; // should be a SocketAddr struct, std::net::SocketAddr
+    optional string sticky_id = 4;
+    optional LoadBalancingParams load_balancing_parameters = 5;
+    optional bool backup = 6;
+}
+
+message RemoveBackend {
+    required string cluster_id = 1;
+    required string backend_id = 2;
+    required string address = 3; // should be a SocketAddr struct, std::net::SocketAddr
+}
+
+// details of an HTTP listener, sent by the main process to the worker
+message HttpListenerConfig {
+    required string address = 1; // should be a SocketAddr struct, std::net::SocketAddr
+    optional string public_address = 2; // should be a SocketAddr struct, std::net::SocketAddr
+    required string answer_404 = 3;
+    required string answer_503 = 4;
+    required bool expect_proxy = 5;
+    required bool sticky_name = 6;
+    required int32 front_timeout = 7;
+    required int32 back_timeout = 8;    
+    required int32 connect_timeout = 9;
+    required int32 request_timeout = 10;
+    required bool activated = 11;
+}
+
+// details of an HTTPS listener, sent by the main process to the worker
+message HttpsListenerConfig {
+    required string address = 1; // should be a SocketAddr struct, std::net::SocketAddr
+    optional string public_address = 2; // should be a SocketAddr struct, std::net::SocketAddr
+    required string answer_404 = 3;
+    required string answer_503 = 4;
+    repeated TLSVersion versions = 5;
+    repeated string cipher_list = 6;
+    repeated string signature_algorithms = 7;
+    repeated string groups_list = 8;
+    required bool expect_proxy = 9;
+    required bool sticky_name = 10;
+    optional string certificate = 11;
+    repeated string certificate_chain = 12;
+    optional string key = 13;
+    required int32 front_timeout = 14;
+    required int32 back_timeout = 15;    
+    required int32 connect_timeout = 16;
+    required int32 request_timeout = 17;
+    required bool activated = 18;
+}
+
+// details of a TCP listener, sent by the main process to the worker
+message TcpListenerConfig {
+    required string address = 1; // should be a SocketAddr struct, std::net::SocketAddr
+    optional string public_address = 2; // should be a SocketAddr struct, std::net::SocketAddr
+    required bool expect_proxy = 3;
+    required int32 front_timeout = 4;
+    required int32 back_timeout = 5;    
+    required int32 connect_timeout = 6;
+    required bool activated = 7;
+}
+
+// Remove a Listener, identified by its socket address
+message RemoveListener {
+    required string address = 1; // should be a SocketAddr struct, std::net::SocketAddr
+    required ListenerType proxy = 2;
+}
+
+// HTTP | HTTPS | TCP
+enum ListenerType {
+    HTTP = 0;
+    HTTPS = 1;
+    TCP = 2;
+}
+
+// Bind a listener to its socket, so it starts listening
+message ActivateListener {
+    required string address = 1; // should be a SocketAddr struct, std::net::SocketAddr
+    required ListenerType proxy = 2; 
+    // this is never ever used in Sōzu as of 0.14.2
+    required bool from_scm = 3;
+}
+
+// Remove a listener from the proxy
+message DeactivateListener {
+    required string address = 1; // should be a SocketAddr struct, std::net::SocketAddr
+    required ListenerType proxy = 2;
+    // order the proxy to yiel the listener's file descriptors back to the main process
+    // on the scm socket
+    required bool to_scm = 3;
+}
+
+// orders Sōzu to stop after all connections are properly ended
+message SoftStop {}
+
+// orders Sōzu to stop abruptly
+message HardStop {}
+
+// enable, disable or clear the collection of metrics on the workers
+enum MetricsConfiguration {
+    ENABLED = 1;
+    DISABLED = 2;
+    CLEAR = 3;
+}
+
+// the logging level of the main process and the workers
+enum Logging {
+    INFO = 0;
+    WARN = 1;
+    DEBUG = 2;
+    ERROR = 3;
+    TRACE = 4;
+}
+
+// orders a worker to send all its listeners (socket addresses and file descriptors)
+// through an scm socket
+message ReturnListenSockets {}
+
+message ClusterId { required string id = 1; }
+message Deny {}
+
+// A filter for the path of incoming requests
+message PathRule {
+    // The kind of filter used for path rules
+    required PathRuleKind kind = 1;
+    // the value of the given prefix, regex or equal pathrule
+    required string value = 2;
+}
+
+// The kind of filter used for path rules
+enum PathRuleKind {
+    // filters paths that start with a pattern, typically "/api"
+    PREFIX = 0;
+    // filters paths that match a regex pattern
+    REGEX = 1;
+    // filters paths that exactly match a pattern, no more, no less
+    EQUAL = 2;
+}
+
+// TODO: find a proper definition for this
+enum RulePosition { 
+    PRE = 0;
+    POST = 1;
+    TREE = 2;
+}
+
+// Everything necessary to add a certificate
+message Certificate {
+    // The actual TLS certificates
+    required string certificate = 1;
+    // The certificates issued by the authority
+    repeated string certificate_chain = 2;
+    required string key = 3;
+    repeated TLSVersion versions = 4;
+    // hostnames linked to the certificate
+    repeated string names = 5;
+}
+
+// the version of TLS used for a certificate
+enum TLSVersion {
+    Sslv2 = 0;
+    SSLv3 = 1;
+    TLSv1_0 = 2; // #[serde(rename = "TLSv1")]
+    TLSv1_1 = 3; // #[serde(rename = "TLSv1.1")]
+    TLSv1_2 = 4; // #[serde(rename = "TLSv1.2")]
+    TLSv1_3 = 5; // #[serde(rename = "TLSv1.3")]
+}
+
+message LoadBalancingParams {
+    required int32 weight = 1; // should be u8
+}
+
+message All {}
+message Domain {} // should contain a bare string
+
+// options for querying metrics
+message QueryMetricsOptions {
+    // wether to provide a list of available metrics
+    required bool list = 1;
+    // clusters of which we want the metrics
+    repeated string cluster_ids = 2;
+    // backends of which we want the metrics
+    repeated string backend_ids = 3;
+    // metrics we want, by names
+    repeated string metric_names = 4;    
+}
+
+// Get a cluster's information, providing its domain
+message QueryClusterByDomain {
+    required string hostname = 1;
+    optional string path = 2;
+}
+
+// Get all the certificates of a worker
+message QueryAllCertificates {}
+
+message QueryClusterHashes {}
+
+// TODO: document this
+enum ProxyProtocolConfig {
+    EXPECT_HEADER = 0;
+    SEND_HEADER = 1;
+    RELAY_HEADER = 2;
+}
+
+// How Sōzu measures which backend is less loaded
+enum LoadMetric {
+    // Number of TCP connections
+    CONNECTIONS = 0;
+    // Number of active HTTP requests
+    REQUESTS = 1;
+    // Time to connect to the backend, weighted by the number of active connections (peak EWMA)
+    CONNECTION_TIME = 2;
+}
+
+enum LoadBalancingAlgorithms {
+    ROUND_ROBIN = 0;
+    RANDOM = 1;
+    LEAST_LOADED = 2;
+    POWER_OF_TWO = 3;
+}
+
+message WorkerRequest {
+    required string id = 1;
+    required WorkerOrder order = 2;
+}
+
+// ---------------------------------------------------------------
+//                          RESPONSES
+// ---------------------------------------------------------------
+
+// Responses of the main process to the CLI (or other client)
+message Response {
+    required string id = 1;
+    required int32 version = 2; // This should be u8 but... protobuf
+    required ResponseStatus status = 3;
+    optional string message = 4;
+    optional ResponseContent content = 5;
+}
+
+message ResponseContent {
+    oneof inner {
+        // a list of workers, with ids, pids, statuses
+        WorkersInfos worker_infos = 5;
+
+        // aggregated metrics of main process and workers
+        AggregatedMetrics metrics = 6;
+
+        // list available metrics of main process and workers
+        AvailableMetrics available_metrics = 17;
+
+        // main and worker responses to a same query: worker_id -> response_content
+        QueryResponses query_responses = 20;
+
+        // worker responses to a same query: worker_id -> response content
+        WorkerResponseContents query = 7;
+
+        // the state of Sōzu: frontends, backends, listeners, etc.
+        ConfigState state = 8;
+
+        // a proxy event
+        Event event = 9;
+
+        // a filtered list of frontend
+        ListedFrontends frontend_list = 10;
+
+        // all listeners
+        ListenersList listeners_list = 12;
+
+        // contains proxy & cluster metrics
+        WorkerMetrics worker_metrics = 13;
+
+        // A list of cluster id and their hashes
+        ClusterHashes cluster_hashes = 14;
+
+        // One certificate with its names
+        CertificateWithNames certificate_with_names = 15;
+
+        // All certificates used by by a worker
+        WorkerCertificates worker_certificates = 22;
+
+        // A list of clusters with their details
+        ClusterInformations cluster_informations = 16;
+
+        // returns certificates that match a QueryCertificateByDomain
+        CertificatesByDomain certificates_by_domain = 18;
+    }
+}
+
+message AllWorkersCertificate {
+    repeated CertificatesByAddress inner = 1;
+}
+
+enum ResponseStatus {
+    OK = 0;
+    PROCESSING = 1;
+    FAILURE = 2;
+}
+
+message WorkerCertificates {
+    repeated CertificatesByAddress inner = 1;
+}
+
+message WorkersInfos {
+    repeated WorkerInfo worker_info =1;
+}
+
+message QueryResponses {
+    map<string, ResponseContent> inner = 1;
+}
+
+// A list of clusters with their details
+message ClusterInformations {
+    repeated ClusterInformation inner = 1;
+}
+
+// All listeners, listed for the CLI.
+message ListenersList {
+    // map socket_address -> listener details
+    map<string, HttpListenerConfig> http_listeners = 1;
+    map<string, HttpsListenerConfig> https_listeners = 2;
+    map<string, TcpListenerConfig> tcp_listeners = 3;
+}
+
+message ActivatedHttpListener {
+    required HttpListenerConfig listener = 1;
+    required bool activated = 2;
+}
+
+message ActivatedHttpsListener {
+    required HttpsListenerConfig listener = 1;
+    required bool activated = 2;
+}
+
+message ActivatedTcpListener {
+    required TcpListenerConfig listener = 1;
+    required bool activated = 2;
+}
+
+message SocketAddress {}
+
+message WorkerInfo {
+    required int32 id = 1;
+    required int32 pid = 2;
+    required RunState run_state = 3;
+}
+enum RunState {
+    RUNNING = 0;
+    STOPPING = 1;
+    STOPPED = 2;
+    NOT_ANSWERING = 3;
+}
+
+// Aggregated metrics of main process & workers
+message AggregatedMetrics {
+    map<string, FilteredMetrics> main = 1;
+    map<string, WorkerMetrics> workers = 2;
+}
+
+// lists of available metrics in the main process and the workers
+message AvailableMetrics {
+    repeated string main = 1;
+    map<string, AvailableWorkerMetrics> workers = 2;
+}
+
+// lists of available metrics in a worker
+message AvailableWorkerMetrics {
+    repeated string proxy_metrics = 1;
+    repeated string cluster_metrics = 2;
+}
+
+// a map of worker id -> worker responses
+message WorkerResponseContents {
+    map<string, ResponseContent> inner = 1;
+}
+
+message Event {
+    oneof inner {
+        BackendIdAndAddress backend_down = 1;
+        BackendIdAndAddress backend_up = 2;
+        // cluster id for whick no backend has been found
+        string NoAvailableBackends = 3;
+        BackendIdAndAddress removed_backend_has_no_connections = 4;
+    }
+}
+message BackendIdAndAddress {
+    required string id = 1;
+    required string socket_address = 2;
+}
+message ListedFrontends {
+    repeated HttpFrontend http_frontends = 1;
+    repeated HttpFrontend https_frontends = 2;
+    repeated TcpFrontend tcp_frontends = 3;
+}
+message FilteredMetrics {
+    oneof inner {
+        int64 gauge = 1;
+        int64 count = 2;
+        int64 time = 3;
+        Percentiles percentiles = 4;
+        FilteredTimeSerie time_serie = 5;
+    }
+}
+message Percentiles {
+    required int64 samples = 1;
+    required int64 p_50 = 2;
+    required int64 p_90 = 3;
+    required int64 p_99 = 4;
+    required int64 p_99_9 = 5;
+    required int64 p_99_99 = 6;
+    required int64 p_99_999 = 7;
+    required int64 p_100 = 8;
+}
+message FilteredTimeSerie {
+    required int32 last_second = 1;
+    repeated int32 last_minute = 2;
+    repeated int32 last_hour = 3;
+}
+
+message ClusterInformation {
+    optional Cluster configuration = 1;
+    repeated HttpFrontend http_frontends = 2;
+    repeated HttpFrontend https_frontends = 3;
+    repeated TcpFrontend tcp_frontend = 4;
+    repeated Backend backends = 5;
+}
+
+message ClusterHashes {
+    map<string, int64> cluster_hashes = 2;    // cluster id -> hash of cluster information
+}
+
+
+message ReturnedCertificate {
+    required string address = 1;
+    required string domain = 2;
+    required Fingerprint fingerprint = 3;
+}
+
+// returns certificates that match a QueryCertificateByDomain
+message CertificatesByDomain {
+    repeated CertificatesByAddress inner = 1;
+}
+
+message CertificateSummary {
+    required string domain = 1;
+    required Fingerprint fingerprint = 2;
+}
+
+// returns a list of certificates: domain -> fingerprint
+message CertificatesByAddress {
+    required string address = 1;
+    repeated CertificateSummary domains_and_fingerprints = 2;
+}
+
+message CertificateWithNames {
+    required string certificate = 1;    
+    repeated string names = 2;
+}
+
+// All metrics of a worker: proxy and clusters
+// Populated by Options so partial results can be sent
+message WorkerMetrics {
+    // Metrics of the worker process, key -> value
+    map<string, FilteredMetrics> proxy = 1;
+    // Metrics of the worker's clusters: cluster_id -> cluster_metrics
+    map<string, ClusterMetrics> clusters = 2;
+}
+
+// the metrics of a given cluster, with several backends
+message ClusterMetrics {
+    // metric name -> metric value
+    map<string, FilteredMetrics> cluster = 1;
+    // backend_id -> backend metrics
+    repeated BackendMetrics backends = 2;
+}
+
+// the metrics of a given backend
+message BackendMetrics {
+    required string backend_id = 1;
+    // metric name -> metric value
+    map<string, FilteredMetrics> metrics = 2 ;
+}
+
+// cluster id -> hash of cluster information
+message ClusterHash {
+    required ClusterId cluster_id = 1;
+    required int64 hash = 2;
+}
+
+message MessageId { 
+    required string id = 1;
+}
+
+// ---------------------------------------------------------------
+//                          STATE
+// ---------------------------------------------------------------
+
+message ConfigState {
+    map<string, Cluster> clusters = 1;
+    map<string, Backends> backends = 2;
+    map<string, HttpListenerConfig> http_listeners = 3;
+    map<string, HttpsListenerConfig> https_listeners = 4;
+    map<string, TcpListenerConfig> tcp_listeners = 5;
+
+    // HTTP frontends, indexed by RouteKey, a serialization of (address, hostname, path)
+    map<string, HttpFrontend> http_fronts = 6;
+    // HTTPS frontends, indexed by RouteKey, a serialization of (address, hostname, path)
+    map<string, HttpFrontend> https_fronts = 7;
+
+    // maps cluster id to a list of TCP frontends
+    map<string, TcpFrontends> tcp_fronts = 8;
+
+    required Certificates certificates = 9;
+    repeated SocketAddress http_addresses = 10;
+    repeated SocketAddress https_address = 11;
+
+}
+
+message Backends {
+    repeated Backend vec = 1;
+}
+
+message Certificates {
+    map<string, Certificate> map = 1;
+}
+
+message TcpFrontends {
+    repeated TcpFrontend vec = 1;
+}

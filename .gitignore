@@ -1,5 +1,6 @@
 target
 .env
+command/src/proto/protocommand.rs
 lib/Cargo.lock
 examples/demo.rs
 examples/websocket.rs

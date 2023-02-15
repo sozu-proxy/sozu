@@ -1,6 +1,7 @@
 #[macro_use]
 extern crate serde;
 
+
 #[macro_use]
 pub mod logging;
 pub mod buffer;
@@ -14,3 +15,5 @@ pub mod ready;
 pub mod scm_socket;
 pub mod state;
 pub mod writer;
+
+pub mod proto;

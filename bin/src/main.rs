@@ -36,7 +36,7 @@ mod util;
 /// Start and restart the worker UNIX processes
 mod worker;
 
-use std::panic;
+use std::{collections::BTreeMap, panic};
 
 use anyhow::{bail, Context};
 #[cfg(target_os = "linux")]
