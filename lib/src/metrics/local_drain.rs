@@ -138,9 +138,8 @@ impl LocalDrain {
 
     pub fn configure(&mut self, config: &MetricsConfiguration) {
         match config {
-            MetricsConfiguration::Enabled(enabled) => {
-                self.enabled = *enabled;
-            }
+            MetricsConfiguration::Enabled => self.enabled = true,
+            MetricsConfiguration::Disabled => self.enabled = false,
             MetricsConfiguration::Clear => self.clear(),
         }
     }
