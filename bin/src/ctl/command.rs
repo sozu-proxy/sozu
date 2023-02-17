@@ -8,10 +8,7 @@ use sozu_command_lib::{
         CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
         CommandStatus, RunState, WorkerInfo,
     },
-    proxy::{
-        ProxyRequestOrder, Query, QueryCertificateType, QueryClusterDomain, QueryClusterType,
-        QueryMetricsOptions,
-    },
+    proxy::{ProxyRequestOrder, QueryMetricsOptions},
 };
 
 use crate::ctl::{
@@ -291,13 +288,13 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(
-            Query::Metrics(QueryMetricsOptions {
+        let command = CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::QueryMetrics(
+            QueryMetricsOptions {
                 list,
                 cluster_ids,
                 backend_ids,
                 metric_names,
-            }),
+            },
         )));
 
         // a loop to reperform the query every refresh time
@@ -365,31 +362,36 @@ impl CommandManager {
             bail!("Error: Either request an cluster ID or a domain name");
         }
 
-        let command = if let Some(ref cluster_id) = cluster_id {
-            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(Query::Clusters(
-                QueryClusterType::ClusterId(cluster_id.to_string()),
-            ))))
-        } else if let Some(ref domain) = domain {
-            let splitted: Vec<String> =
-                domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
-
-            if splitted.is_empty() {
-                bail!("Domain can't be empty");
+        let command = match (cluster_id.clone(), domain.clone()) {
+            (Some(cluster_id), _) => {
+                CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::QueryClusterById {
+                    cluster_id,
+                }))
             }
+            (None, Some(domain)) => {
+                let splitted: Vec<String> =
+                    domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
 
-            let query_domain = QueryClusterDomain {
-                hostname: splitted
+                if splitted.is_empty() {
+                    bail!("Domain can't be empty");
+                }
+
+                let hostname = splitted
                     .get(0)
                     .with_context(|| "Domain can't be empty")?
-                    .clone(),
-                path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
-            };
+                    .clone();
 
-            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(Query::Clusters(
-                QueryClusterType::Domain(query_domain),
-            ))))
-        } else {
-            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(Query::ClustersHashes)))
+                // We add the / again because of the splitn removing it
+                let path = splitted.get(1).cloned().map(|path| format!("/{path}"));
+
+                CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::QueryClusterByDomain {
+                    hostname,
+                    path,
+                }))
+            }
+            (None, None) => {
+                CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::QueryClustersHashes))
+            }
         };
 
         let id = generate_id();
@@ -427,23 +429,21 @@ impl CommandManager {
         fingerprint: Option<String>,
         domain: Option<String>,
     ) -> Result<(), anyhow::Error> {
-        let query = match (fingerprint, domain) {
-            (None, None) => QueryCertificateType::All,
+        let order = match (fingerprint, domain) {
+            (None, None) => ProxyRequestOrder::QueryAllCertificates,
             (Some(f), None) => match hex::decode(f) {
                 Err(e) => {
                     bail!("invalid fingerprint: {:?}", e);
                 }
-                Ok(f) => QueryCertificateType::Fingerprint(f),
+                Ok(f) => ProxyRequestOrder::QueryCertificateByFingerprint(f),
             },
-            (None, Some(d)) => QueryCertificateType::Domain(d),
+            (None, Some(d)) => ProxyRequestOrder::QueryCertificateByDomain(d),
             (Some(_), Some(_)) => {
                 bail!("Error: Either request a fingerprint or a domain name");
             }
         };
 
-        let command = CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(
-            Query::Certificates(query),
-        )));
+        let command = CommandRequestOrder::Proxy(Box::new(order));
 
         let id = generate_id();
 

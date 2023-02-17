@@ -24,7 +24,7 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proxy::{
         AggregatedMetricsData, MetricsConfiguration, ProxyRequest, ProxyRequestOrder,
-        ProxyResponseContent, ProxyResponseStatus, Query, QueryAnswer, QueryClusterType,
+        ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -76,7 +76,20 @@ impl CommandServer {
                 ProxyRequestOrder::ConfigureMetrics(config) => {
                     self.configure_metrics(request_identifier, config).await
                 }
-                ProxyRequestOrder::Query(query) => self.query(request_identifier, query).await,
+
+                ProxyRequestOrder::QueryAllCertificates
+                | ProxyRequestOrder::QueryCertificateByDomain(_)
+                | ProxyRequestOrder::QueryCertificateByFingerprint(_)
+                | ProxyRequestOrder::QueryClusterByDomain {
+                    hostname: _,
+                    path: _,
+                }
+                | ProxyRequestOrder::QueryClusterById { cluster_id: _ }
+                | ProxyRequestOrder::QueryClustersHashes
+                | ProxyRequestOrder::QueryMetrics(_) => {
+                    self.query(request_identifier, *proxy_request_order).await
+                }
+
                 ProxyRequestOrder::Logging(logging_filter) => {
                     self.set_logging_level(logging_filter)
                 }
@@ -1069,9 +1082,9 @@ impl CommandServer {
     pub async fn query(
         &mut self,
         request_identifier: RequestIdentifier,
-        query: Query,
+        proxy_request_order: ProxyRequestOrder,
     ) -> anyhow::Result<Option<Success>> {
-        debug!("Received this query: {:?}", query);
+        debug!("Received this order: {:?}", proxy_request_order);
         let (query_tx, mut query_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
@@ -1081,7 +1094,7 @@ impl CommandServer {
         {
             let req_id = format!("{}-query-{}", request_identifier.client, worker.id);
             worker
-                .send(req_id.clone(), ProxyRequestOrder::Query(query.clone()))
+                .send(req_id.clone(), proxy_request_order.clone())
                 .await;
             count += 1;
             self.in_flight.insert(req_id, (query_tx.clone(), 1));
@@ -1090,36 +1103,31 @@ impl CommandServer {
         return_processing(
             self.command_tx.clone(),
             request_identifier.clone(),
-            "Query was sent to the workers...",
+            "Query order was sent to the workers...",
         )
         .await;
 
         let mut main_query_answer = None;
-        match &query {
-            Query::ClustersHashes => {
+        match &proxy_request_order {
+            ProxyRequestOrder::QueryClustersHashes => {
                 main_query_answer = Some(QueryAnswer::ClustersHashes(self.state.hash_state()));
             }
-            Query::Clusters(query_type) => {
-                main_query_answer = Some(QueryAnswer::Clusters(match query_type {
-                    QueryClusterType::ClusterId(cluster_id) => {
-                        vec![self.state.cluster_state(cluster_id)]
-                    }
-                    QueryClusterType::Domain(domain) => {
-                        let cluster_ids = get_cluster_ids_by_domain(
-                            &self.state,
-                            domain.hostname.clone(),
-                            domain.path.clone(),
-                        );
-                        cluster_ids
-                            .iter()
-                            .map(|cluster_id| self.state.cluster_state(cluster_id))
-                            .collect()
-                    }
-                }));
+            ProxyRequestOrder::QueryClusterById { cluster_id } => {
+                main_query_answer = Some(QueryAnswer::Clusters(vec![self
+                    .state
+                    .cluster_state(cluster_id)]));
             }
-            Query::Certificates(_) => {}
-            Query::Metrics(_) => {}
-        };
+            ProxyRequestOrder::QueryClusterByDomain { hostname, path } => {
+                let cluster_ids =
+                    get_cluster_ids_by_domain(&self.state, hostname.clone(), path.clone());
+                let clusters = cluster_ids
+                    .iter()
+                    .map(|cluster_id| self.state.cluster_state(cluster_id))
+                    .collect();
+                main_query_answer = Some(QueryAnswer::Clusters(clusters));
+            }
+            _ => {}
+        }
 
         // all these are passed to the thread
         let command_tx = self.command_tx.clone();
@@ -1163,20 +1171,26 @@ impl CommandServer {
                 })
                 .collect();
 
-            let success = match &query {
-                &Query::ClustersHashes | &Query::Clusters(_) => {
-                    let main = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
-                    proxy_responses_map.insert(String::from("main"), main);
+            let success = match &proxy_request_order {
+                ProxyRequestOrder::QueryClustersHashes
+                | ProxyRequestOrder::QueryClusterById { cluster_id: _ }
+                | ProxyRequestOrder::QueryClusterByDomain {
+                    hostname: _,
+                    path: _,
+                } => {
+                    let query_answer = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
+                    proxy_responses_map.insert(String::from("main"), query_answer);
                     Success::Query(CommandResponseContent::Query(proxy_responses_map))
                 }
-                &Query::Certificates(_) => {
+                ProxyRequestOrder::QueryCertificateByDomain(_)
+                | ProxyRequestOrder::QueryCertificateByFingerprint(_) => {
                     info!(
                         "certificates query answer received: {:?}",
                         proxy_responses_map
                     );
                     Success::Query(CommandResponseContent::Query(proxy_responses_map))
                 }
-                Query::Metrics(options) => {
+                ProxyRequestOrder::QueryMetrics(options) => {
                     debug!("metrics query answer received: {:?}", proxy_responses_map);
 
                     if options.list {
@@ -1188,6 +1202,7 @@ impl CommandServer {
                         }))
                     }
                 }
+                _ => return, // very very unlikely
             };
 
             return_success(command_tx, cloned_identifier, success).await;

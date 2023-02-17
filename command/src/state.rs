@@ -139,12 +139,20 @@ impl ConfigState {
             // This is to avoid the error message
             &ProxyRequestOrder::Logging(_)
             | &ProxyRequestOrder::Status
-            | &ProxyRequestOrder::Query(_)
             | &ProxyRequestOrder::SoftStop
-            | &ProxyRequestOrder::HardStop => Ok(()),
-            other_order => {
-                bail!("state cannot handle order message: {:#?}", other_order);
+            | &ProxyRequestOrder::QueryClusterById { cluster_id: _ }
+            | &ProxyRequestOrder::QueryClusterByDomain {
+                hostname: _,
+                path: _,
             }
+            | &ProxyRequestOrder::QueryAllCertificates
+            | &ProxyRequestOrder::QueryCertificateByDomain(_)
+            | &ProxyRequestOrder::QueryCertificateByFingerprint(_)
+            | &ProxyRequestOrder::QueryMetrics(_)
+            | &ProxyRequestOrder::QueryClustersHashes
+            | &ProxyRequestOrder::ConfigureMetrics(_)
+            | &ProxyRequestOrder::ReturnListenSockets
+            | &ProxyRequestOrder::HardStop => Ok(()),
         }
     }
 

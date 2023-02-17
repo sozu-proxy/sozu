@@ -201,7 +201,9 @@ impl fmt::Display for ProxyRequest {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyRequestOrder {
     AddCluster(Cluster),
-    RemoveCluster { cluster_id: String },
+    RemoveCluster {
+        cluster_id: String,
+    },
 
     AddHttpFrontend(HttpFrontend),
     RemoveHttpFrontend(HttpFrontend),
@@ -228,8 +230,21 @@ pub enum ProxyRequestOrder {
     ActivateListener(ActivateListener),
     DeactivateListener(DeactivateListener),
 
-    Query(Query),
+    QueryClusterById {
+        cluster_id: String,
+    },
+    QueryClusterByDomain {
+        hostname: String,
+        path: Option<String>,
+    },
 
+    QueryAllCertificates,
+    QueryCertificateByDomain(String),
+    QueryCertificateByFingerprint(Vec<u8>),
+
+    QueryMetrics(QueryMetricsOptions),
+
+    QueryClustersHashes,
     SoftStop,
     HardStop,
 
@@ -786,37 +801,6 @@ pub enum MetricsConfiguration {
     Clear,
 }
 
-/// Details of a query for information, sent to a worker
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Query {
-    Clusters(QueryClusterType),
-    Certificates(QueryCertificateType),
-    Metrics(QueryMetricsOptions),
-    ClustersHashes,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum QueryClusterType {
-    ClusterId(String),
-    Domain(QueryClusterDomain),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct QueryClusterDomain {
-    pub hostname: String,
-    pub path: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum QueryCertificateType {
-    All,
-    Domain(String),
-    Fingerprint(Vec<u8>),
-}
-
 /// Options originating from the command line
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -887,7 +871,12 @@ impl ProxyRequestOrder {
             | ProxyRequestOrder::AddCertificate(_)
             | ProxyRequestOrder::ReplaceCertificate(_)
             | ProxyRequestOrder::RemoveCertificate(_)
-            | ProxyRequestOrder::Query(_) => proxy_destination.to_https_proxy = true,
+            | ProxyRequestOrder::QueryClustersHashes
+            | ProxyRequestOrder::QueryCertificateByDomain(_)
+            | ProxyRequestOrder::QueryAllCertificates
+            | ProxyRequestOrder::QueryCertificateByFingerprint(_) => {
+                proxy_destination.to_https_proxy = true
+            }
 
             ProxyRequestOrder::AddTcpFrontend(_) | ProxyRequestOrder::RemoveTcpFrontend(_) => {
                 proxy_destination.to_tcp_proxy = true
@@ -899,6 +888,12 @@ impl ProxyRequestOrder {
             | ProxyRequestOrder::RemoveBackend(_)
             | ProxyRequestOrder::SoftStop
             | ProxyRequestOrder::HardStop
+            | ProxyRequestOrder::QueryMetrics(_)
+            | ProxyRequestOrder::QueryClusterById { cluster_id: _ }
+            | ProxyRequestOrder::QueryClusterByDomain {
+                hostname: _,
+                path: _,
+            }
             | ProxyRequestOrder::Status
             | ProxyRequestOrder::Logging(_) => {
                 proxy_destination.to_http_proxy = true;
