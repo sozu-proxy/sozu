@@ -30,7 +30,7 @@ use crate::{
         proxy::{
             Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyEvent,
             ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
-            ProxyResponseStatus, QueryAnswer, QueryAnswerCertificate, RemoveBackend,
+            ProxyResponseStatus, QueryAnswerCertificate, RemoveBackend,
             TcpListenerConfig as CommandTcpListener,
         },
         ready::Ready,
@@ -890,26 +890,27 @@ impl Server {
                 push_queue(ProxyResponse {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::Query(QueryAnswer::ClustersHashes(
+                    content: Some(ProxyResponseContent::ClustersHashes(
                         self.config_state.hash_state(),
-                    ))),
+                    )),
                 });
                 return;
             }
             ProxyRequestOrder::QueryClusterById { cluster_id } => {
-                let query_answer =
-                    QueryAnswer::Clusters(vec![self.config_state.cluster_state(&cluster_id)]);
+                let response_content = ProxyResponseContent::Clusters(vec![self
+                    .config_state
+                    .cluster_state(&cluster_id)]);
                 push_queue(ProxyResponse {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::Query(query_answer)),
+                    content: Some(response_content),
                 });
                 return;
             }
             ProxyRequestOrder::QueryClusterByDomain { hostname, path } => {
                 let cluster_ids =
                     get_cluster_ids_by_domain(&self.config_state, hostname.clone(), path.clone());
-                let answer = cluster_ids
+                let clusters = cluster_ids
                     .iter()
                     .map(|cluster_id| self.config_state.cluster_state(cluster_id))
                     .collect();
@@ -917,7 +918,7 @@ impl Server {
                 push_queue(ProxyResponse {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::Query(QueryAnswer::Clusters(answer))),
+                    content: Some(ProxyResponseContent::Clusters(clusters)),
                 });
                 return;
             }
@@ -925,12 +926,12 @@ impl Server {
                 push_queue(ProxyResponse {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::Query(QueryAnswer::Certificates(
+                    content: Some(ProxyResponseContent::Certificates(
                         QueryAnswerCertificate::Fingerprint(get_certificate(
                             &self.config_state,
                             &f,
                         )),
-                    ))),
+                    )),
                 });
                 return;
             }
@@ -941,7 +942,7 @@ impl Server {
                     push_queue(ProxyResponse {
                         id: message.id.clone(),
                         status: ProxyResponseStatus::Ok,
-                        content: Some(ProxyResponseContent::Query(QueryAnswer::Metrics(data))),
+                        content: Some(ProxyResponseContent::QueriedMetrics(data)),
                     });
                 });
                 return;

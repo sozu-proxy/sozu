@@ -24,7 +24,7 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proxy::{
         AggregatedMetricsData, MetricsConfiguration, ProxyRequest, ProxyRequestOrder,
-        ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
+        ProxyResponseContent, ProxyResponseStatus,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -1110,10 +1110,12 @@ impl CommandServer {
         let mut main_query_answer = None;
         match &proxy_request_order {
             ProxyRequestOrder::QueryClustersHashes => {
-                main_query_answer = Some(QueryAnswer::ClustersHashes(self.state.hash_state()));
+                main_query_answer = Some(ProxyResponseContent::ClustersHashes(
+                    self.state.hash_state(),
+                ));
             }
             ProxyRequestOrder::QueryClusterById { cluster_id } => {
-                main_query_answer = Some(QueryAnswer::Clusters(vec![self
+                main_query_answer = Some(ProxyResponseContent::Clusters(vec![self
                     .state
                     .cluster_state(cluster_id)]));
             }
@@ -1124,7 +1126,7 @@ impl CommandServer {
                     .iter()
                     .map(|cluster_id| self.state.cluster_state(cluster_id))
                     .collect();
-                main_query_answer = Some(QueryAnswer::Clusters(clusters));
+                main_query_answer = Some(ProxyResponseContent::Clusters(clusters));
             }
             _ => {}
         }
@@ -1160,14 +1162,11 @@ impl CommandServer {
                 }
             }
 
-            let mut proxy_responses_map: BTreeMap<String, QueryAnswer> = responses
+            let mut proxy_responses_map: BTreeMap<String, ProxyResponseContent> = responses
                 .into_iter()
-                .filter_map(|(worker_id, proxy_response)| {
-                    if let Some(ProxyResponseContent::Query(d)) = proxy_response.content {
-                        Some((worker_id.to_string(), d))
-                    } else {
-                        None
-                    }
+                .filter_map(|(worker_id, proxy_response)| match proxy_response.content {
+                    Some(content) => Some((worker_id.to_string(), content)),
+                    None => None,
                 })
                 .collect();
 

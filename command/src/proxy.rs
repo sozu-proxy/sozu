@@ -24,6 +24,7 @@ use crate::{
 
 pub type MessageId = String;
 
+/// Sent by a worker
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyResponse {
     pub id: MessageId,
@@ -96,15 +97,20 @@ pub enum ProxyResponseStatus {
 pub enum ProxyResponseContent {
     /// contains proxy & cluster metrics
     Metrics(WorkerMetrics),
-    Query(QueryAnswer),
+    // Query(QueryAnswer),
     Event(ProxyEvent),
+    Clusters(Vec<QueryAnswerCluster>),
+    /// cluster id -> hash of cluster information
+    ClustersHashes(BTreeMap<String, u64>),
+    Certificates(QueryAnswerCertificate),
+    QueriedMetrics(QueryAnswerMetrics),
 }
 
 /// Aggregated metrics of main process & workers, for the CLI
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedMetricsData {
     pub main: BTreeMap<String, FilteredData>,
-    pub workers: BTreeMap<String, QueryAnswer>,
+    pub workers: BTreeMap<String, ProxyResponseContent>,
 }
 
 /// All metrics of a worker: proxy and clusters
@@ -812,16 +818,17 @@ pub struct QueryMetricsOptions {
 }
 
 /// details of an query answer, sent by a worker
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum QueryAnswer {
-    Clusters(Vec<QueryAnswerCluster>),
-    /// cluster id -> hash of cluster information
-    ClustersHashes(BTreeMap<String, u64>),
-    Certificates(QueryAnswerCertificate),
-    Metrics(QueryAnswerMetrics),
-}
+// #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+// pub enum QueryAnswer {
+//     Clusters(Vec<QueryAnswerCluster>),
+//     /// cluster id -> hash of cluster information
+//     ClustersHashes(BTreeMap<String, u64>),
+//     Certificates(QueryAnswerCertificate),
+//     Metrics(QueryAnswerMetrics),
+// }
 
+/// all information about one cluster
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueryAnswerCluster {
     pub configuration: Option<Cluster>,
