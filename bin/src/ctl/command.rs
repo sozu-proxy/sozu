@@ -293,7 +293,7 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::QueryMetrics(
+        let command = CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::QueryMetrics(
             QueryMetricsOptions {
                 list,
                 cluster_ids,
@@ -369,7 +369,7 @@ impl CommandManager {
 
         let command = match (cluster_id.clone(), domain.clone()) {
             (Some(cluster_id), _) => {
-                CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::QueryClusterById {
+                CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::QueryClusterById {
                     cluster_id,
                 }))
             }
@@ -389,13 +389,13 @@ impl CommandManager {
                 // We add the / again because of the splitn removing it
                 let path = splitted.get(1).cloned().map(|path| format!("/{path}"));
 
-                CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::QueryClusterByDomain {
+                CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::QueryClusterByDomain {
                     hostname,
                     path,
                 }))
             }
             (None, None) => {
-                CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::QueryClustersHashes))
+                CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::QueryClustersHashes))
             }
         };
 
@@ -448,7 +448,7 @@ impl CommandManager {
             }
         };
 
-        let command = CommandRequestOrder::Proxy(Box::new(order));
+        let command = CommandRequestOrder::Worker(Box::new(order));
 
         let id = generate_id();
 

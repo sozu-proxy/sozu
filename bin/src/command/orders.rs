@@ -72,7 +72,7 @@ impl CommandServer {
             CommandRequestOrder::UpgradeWorker(worker_id) => {
                 self.upgrade_worker(request_identifier, worker_id).await
             }
-            CommandRequestOrder::Proxy(proxy_request_order) => match *proxy_request_order {
+            CommandRequestOrder::Worker(proxy_request_order) => match *proxy_request_order {
                 WorkerRequestOrder::ConfigureMetrics(config) => {
                     self.configure_metrics(request_identifier, config).await
                 }
@@ -153,7 +153,7 @@ impl CommandServer {
             for command in orders {
                 let message = CommandRequest::new(
                     format!("SAVE-{counter}"),
-                    CommandRequestOrder::Proxy(Box::new(command)),
+                    CommandRequestOrder::Worker(Box::new(command)),
                     None,
                 );
 
@@ -250,7 +250,7 @@ impl CommandServer {
                     }
 
                     for request in requests {
-                        if let CommandRequestOrder::Proxy(order) = request.order {
+                        if let CommandRequestOrder::Worker(order) = request.order {
                             message_counter += 1;
 
                             if self.state.dispatch(&order).is_ok() {
@@ -825,7 +825,7 @@ impl CommandServer {
         .await;
 
         for message in new_config.generate_config_messages() {
-            if let CommandRequestOrder::Proxy(order) = message.order {
+            if let CommandRequestOrder::Worker(order) = message.order {
                 if self.state.dispatch(&order).is_ok() {
                     diff_counter += 1;
 

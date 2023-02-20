@@ -1196,7 +1196,7 @@ impl Config {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddHttpListener(
+                order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddHttpListener(
                     listener.clone(),
                 ))),
             });
@@ -1208,7 +1208,7 @@ impl Config {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddHttpsListener(
+                order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddHttpsListener(
                     listener.clone(),
                 ))),
             });
@@ -1220,7 +1220,7 @@ impl Config {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddTcpListener(
+                order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddTcpListener(
                     listener.clone(),
                 ))),
             });
@@ -1234,7 +1234,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Proxy(Box::new(order)),
+                    order: CommandRequestOrder::Worker(Box::new(order)),
                 });
                 count += 1;
             }
@@ -1246,7 +1246,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Proxy(Box::new(
+                    order: CommandRequestOrder::Worker(Box::new(
                         WorkerRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::HTTP,
@@ -1262,7 +1262,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Proxy(Box::new(
+                    order: CommandRequestOrder::Worker(Box::new(
                         WorkerRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::HTTPS,
@@ -1278,7 +1278,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Proxy(Box::new(
+                    order: CommandRequestOrder::Worker(Box::new(
                         WorkerRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::TCP,

@@ -20,7 +20,7 @@ pub const PROTOCOL_VERSION: u8 = 0;
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandRequestOrder {
     /// an order to forward to workers
-    Proxy(Box<WorkerRequestOrder>),
+    Worker(Box<WorkerRequestOrder>),
     /// save Sōzu's parseable state as a file
     SaveState {
         path: String,
@@ -234,12 +234,12 @@ mod tests {
 
     #[test]
     fn config_message_test() {
-        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
+        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "WORKER", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
         let message: CommandRequest = serde_json::from_str(raw_json).unwrap();
         println!("{message:?}");
         assert_eq!(
             message.order,
-            CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddHttpFrontend(
+            CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddHttpFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -293,7 +293,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddCluster(Cluster {
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddCluster(Cluster {
                 cluster_id: String::from("xxx"),
                 sticky_session: true,
                 https_redirect: true,
@@ -312,7 +312,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::RemoveCluster {
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveCluster {
                 cluster_id: String::from("xxx")
             })),
             worker_id: None
@@ -325,7 +325,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddHttpFrontend(
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddHttpFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -346,7 +346,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::RemoveHttpFrontend(
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveHttpFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -373,7 +373,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddHttpsFrontend(
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddHttpsFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -394,7 +394,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::RemoveHttpsFrontend(
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveHttpsFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -425,7 +425,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddCertificate(
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddCertificate(
                 AddCertificate {
                     address: "0.0.0.0:443".parse().unwrap(),
                     certificate: CertificateAndKey {
@@ -448,7 +448,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::RemoveCertificate(
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveCertificate(
                 RemoveCertificate {
                     address: "0.0.0.0:443".parse().unwrap(),
                     fingerprint: CertificateFingerprint(
@@ -469,7 +469,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddBackend(Backend {
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("xxx"),
                 backend_id: String::from("xxx-0"),
                 address: "127.0.0.1:8080".parse().unwrap(),
@@ -487,7 +487,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::RemoveBackend(
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveBackend(
                 RemoveBackend {
                     cluster_id: String::from("xxx"),
                     backend_id: String::from("xxx-0"),
@@ -504,7 +504,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::SoftStop)),
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::SoftStop)),
             worker_id: Some(0),
         }
     );
@@ -515,7 +515,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::HardStop)),
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::HardStop)),
             worker_id: Some(0),
         }
     );
@@ -526,7 +526,7 @@ mod tests {
         CommandRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::Status)),
+            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::Status)),
             worker_id: Some(0),
         }
     );

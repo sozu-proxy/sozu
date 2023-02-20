@@ -46,7 +46,7 @@ impl CommandManager {
         println!("shutting down proxy softly");
 
         self.order_command_with_worker_id(
-            CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::SoftStop)),
+            CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::SoftStop)),
             worker_id,
             false,
         )
@@ -56,7 +56,7 @@ impl CommandManager {
         println!("shutting down proxy the hard way");
 
         self.order_command_with_worker_id(
-            CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::HardStop)),
+            CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::HardStop)),
             worker_id,
             false,
         )
@@ -89,7 +89,7 @@ impl CommandManager {
             _ => bail!("The command passed to the configure_metrics function is wrong."),
         };
 
-        self.order_command(CommandRequestOrder::Proxy(Box::new(
+        self.order_command(CommandRequestOrder::Worker(Box::new(
             WorkerRequestOrder::ConfigureMetrics(configuration),
         )))
     }
@@ -129,7 +129,7 @@ impl CommandManager {
                 address,
                 sticky_id,
                 backup,
-            } => self.order_command(CommandRequestOrder::Proxy(Box::new(
+            } => self.order_command(CommandRequestOrder::Worker(Box::new(
                 WorkerRequestOrder::AddBackend(Backend {
                     cluster_id: id,
                     address,
@@ -143,7 +143,7 @@ impl CommandManager {
                 id,
                 backend_id,
                 address,
-            } => self.order_command(CommandRequestOrder::Proxy(Box::new(
+            } => self.order_command(CommandRequestOrder::Worker(Box::new(
                 WorkerRequestOrder::RemoveBackend(RemoveBackend {
                     cluster_id: id,
                     address,
@@ -169,7 +169,7 @@ impl CommandManager {
                     (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
                     _ => None,
                 };
-                self.order_command(CommandRequestOrder::Proxy(Box::new(
+                self.order_command(CommandRequestOrder::Worker(Box::new(
                     WorkerRequestOrder::AddCluster(Cluster {
                         cluster_id: id,
                         sticky_session,
@@ -181,7 +181,7 @@ impl CommandManager {
                     }),
                 )))
             }
-            ClusterCmd::Remove { id } => self.order_command(CommandRequestOrder::Proxy(Box::new(
+            ClusterCmd::Remove { id } => self.order_command(CommandRequestOrder::Worker(Box::new(
                 WorkerRequestOrder::RemoveCluster { cluster_id: id },
             ))),
         }
@@ -190,7 +190,7 @@ impl CommandManager {
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> anyhow::Result<()> {
         match cmd {
             TcpFrontendCmd::Add { id, address, tags } => {
-                self.order_command(CommandRequestOrder::Proxy(Box::new(
+                self.order_command(CommandRequestOrder::Worker(Box::new(
                     WorkerRequestOrder::AddTcpFrontend(TcpFrontend {
                         cluster_id: id,
                         address,
@@ -199,7 +199,7 @@ impl CommandManager {
                 )))
             }
             TcpFrontendCmd::Remove { id, address } => {
-                self.order_command(CommandRequestOrder::Proxy(Box::new(
+                self.order_command(CommandRequestOrder::Worker(Box::new(
                     WorkerRequestOrder::RemoveTcpFrontend(TcpFrontend {
                         cluster_id: id,
                         address,
@@ -221,7 +221,7 @@ impl CommandManager {
                 method,
                 route,
                 tags,
-            } => self.order_command(CommandRequestOrder::Proxy(Box::new(
+            } => self.order_command(CommandRequestOrder::Worker(Box::new(
                 WorkerRequestOrder::AddHttpFrontend(HttpFrontend {
                     route: route.into(),
                     address,
@@ -241,7 +241,7 @@ impl CommandManager {
                 address,
                 method,
                 route,
-            } => self.order_command(CommandRequestOrder::Proxy(Box::new(
+            } => self.order_command(CommandRequestOrder::Worker(Box::new(
                 WorkerRequestOrder::RemoveHttpFrontend(HttpFrontend {
                     route: route.into(),
                     address,
@@ -266,7 +266,7 @@ impl CommandManager {
                 method,
                 route,
                 tags,
-            } => self.order_command(CommandRequestOrder::Proxy(Box::new(
+            } => self.order_command(CommandRequestOrder::Worker(Box::new(
                 WorkerRequestOrder::AddHttpsFrontend(HttpFrontend {
                     route: route.into(),
                     address,
@@ -285,7 +285,7 @@ impl CommandManager {
                 address,
                 method,
                 route,
-            } => self.order_command(CommandRequestOrder::Proxy(Box::new(
+            } => self.order_command(CommandRequestOrder::Worker(Box::new(
                 WorkerRequestOrder::RemoveHttpsFrontend(HttpFrontend {
                     route: route.into(),
                     address,
@@ -337,7 +337,7 @@ impl CommandManager {
                         request_timeout,
                     )
                     .with_context(|| "Error creating HTTPS listener")?;
-                self.order_command(CommandRequestOrder::Proxy(Box::new(
+                self.order_command(CommandRequestOrder::Worker(Box::new(
                     WorkerRequestOrder::AddHttpsListener(https_listener),
                 )))
             }
@@ -384,7 +384,7 @@ impl CommandManager {
                         request_timeout,
                     )
                     .with_context(|| "Error creating HTTP listener")?;
-                self.order_command(CommandRequestOrder::Proxy(Box::new(
+                self.order_command(CommandRequestOrder::Worker(Box::new(
                     WorkerRequestOrder::AddHttpListener(http_listener),
                 )))
             }
@@ -406,7 +406,7 @@ impl CommandManager {
                 address,
                 public_address,
                 expect_proxy,
-            } => self.order_command(CommandRequestOrder::Proxy(Box::new(
+            } => self.order_command(CommandRequestOrder::Worker(Box::new(
                 WorkerRequestOrder::AddTcpListener(TcpListenerConfig {
                     address,
                     public_address,
@@ -435,7 +435,7 @@ impl CommandManager {
         address: SocketAddr,
         proxy: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_command(CommandRequestOrder::Proxy(Box::new(
+        self.order_command(CommandRequestOrder::Worker(Box::new(
             WorkerRequestOrder::RemoveListener(RemoveListener { address, proxy }),
         )))
     }
@@ -445,7 +445,7 @@ impl CommandManager {
         address: SocketAddr,
         proxy: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_command(CommandRequestOrder::Proxy(Box::new(
+        self.order_command(CommandRequestOrder::Worker(Box::new(
             WorkerRequestOrder::ActivateListener(ActivateListener {
                 address,
                 proxy,
@@ -459,7 +459,7 @@ impl CommandManager {
         address: SocketAddr,
         proxy: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_command(CommandRequestOrder::Proxy(Box::new(
+        self.order_command(CommandRequestOrder::Worker(Box::new(
             WorkerRequestOrder::DeactivateListener(DeactivateListener {
                 address,
                 proxy,
@@ -469,7 +469,7 @@ impl CommandManager {
     }
 
     pub fn logging_filter(&mut self, filter: &LoggingLevel) -> anyhow::Result<()> {
-        self.order_command(CommandRequestOrder::Proxy(Box::new(
+        self.order_command(CommandRequestOrder::Worker(Box::new(
             WorkerRequestOrder::Logging(filter.to_string().to_lowercase()),
         )))
     }
@@ -486,7 +486,7 @@ impl CommandManager {
             load_full_certificate(certificate_path, certificate_chain_path, key_path, versions)
                 .with_context(|| "Could not load the full certificate")?;
 
-        self.order_command(CommandRequestOrder::Proxy(Box::new(
+        self.order_command(CommandRequestOrder::Worker(Box::new(
             WorkerRequestOrder::AddCertificate(AddCertificate {
                 address,
                 certificate: new_certificate,
@@ -527,7 +527,7 @@ impl CommandManager {
         )
         .with_context(|| "Could not load the full certificate")?;
 
-        self.order_command(CommandRequestOrder::Proxy(Box::new(
+        self.order_command(CommandRequestOrder::Worker(Box::new(
             WorkerRequestOrder::ReplaceCertificate(ReplaceCertificate {
                 address,
                 new_certificate,
@@ -559,7 +559,7 @@ impl CommandManager {
                 .with_context(|| "Error decoding the given fingerprint")?,
         };
 
-        self.order_command(CommandRequestOrder::Proxy(Box::new(
+        self.order_command(CommandRequestOrder::Worker(Box::new(
             WorkerRequestOrder::RemoveCertificate(RemoveCertificate {
                 address,
                 fingerprint,

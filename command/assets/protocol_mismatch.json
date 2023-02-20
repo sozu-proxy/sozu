@@ -1,7 +1,7 @@
 {
   "id": "ID_TEST",
   "version": 1,
-  "type": "PROXY",
+  "type": "WORKER",
   "content": {
     "type": "ADD_BACKEND",
     "data": {
