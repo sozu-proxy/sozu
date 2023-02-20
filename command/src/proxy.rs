@@ -96,13 +96,13 @@ pub enum ProxyResponseStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyResponseContent {
     /// contains proxy & cluster metrics
-    Metrics(WorkerMetrics),
+    Metrics(AllWorkerMetrics),
     Event(ProxyEvent),
     Clusters(Vec<QueryAnswerCluster>),
     /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
     Certificates(WorkerCertificates),
-    QueriedMetrics(QueryAnswerMetrics),
+    QueriedMetrics(WorkerMetrics),
 }
 
 /// Aggregated metrics of main process & workers, for the CLI
@@ -115,7 +115,7 @@ pub struct AggregatedMetricsData {
 /// All metrics of a worker: proxy and clusters
 /// Populated by Options so partial results can be sent
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerMetrics {
+pub struct AllWorkerMetrics {
     /// Metrics of the worker process, key -> value
     pub proxy: Option<BTreeMap<String, FilteredData>>,
     /// cluster_id -> cluster_metrics
@@ -849,11 +849,11 @@ pub enum WorkerCertificates {
 
 /// Returned by the local drain
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QueryAnswerMetrics {
+pub enum WorkerMetrics {
     /// (list of proxy metrics, list of cluster metrics)
     List((Vec<String>, Vec<String>)),
     /// all worker metrics, proxy & clusters, with Options all around for partial answers
-    All(WorkerMetrics),
+    All(AllWorkerMetrics),
     /// Use to trickle up errors to the CLI
     Error(String),
 }

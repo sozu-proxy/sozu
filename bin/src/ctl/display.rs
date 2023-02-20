@@ -10,7 +10,7 @@ use sozu_command_lib::{
     command::{CommandResponseContent, ListedFrontends, ListenersList, WorkerInfo},
     proxy::{
         AggregatedMetricsData, ClusterMetricsData, FilteredData, ProxyResponseContent,
-        WorkerCertificates, QueryAnswerMetrics, Route, WorkerMetrics,
+        WorkerCertificates, WorkerMetrics, Route, AllWorkerMetrics,
     },
 };
 
@@ -219,14 +219,14 @@ pub fn print_metrics(
 
 fn print_worker_metrics(response_content: &ProxyResponseContent) -> anyhow::Result<()> {
     match response_content {
-        ProxyResponseContent::QueriedMetrics(QueryAnswerMetrics::All(WorkerMetrics {
+        ProxyResponseContent::QueriedMetrics(WorkerMetrics::All(AllWorkerMetrics {
             proxy,
             clusters,
         })) => {
             print_proxy_metrics(proxy);
             print_cluster_metrics(clusters);
         }
-        ProxyResponseContent::QueriedMetrics(QueryAnswerMetrics::Error(error)) => {
+        ProxyResponseContent::QueriedMetrics(WorkerMetrics::Error(error)) => {
             println!("Error: {error}\nMaybe check your command.")
         }
         _ => bail!("The query answer is wrong."),
@@ -699,7 +699,7 @@ pub fn print_available_metrics(
         (HashSet::new(), HashSet::new());
     for response_content in response_contents.values() {
         match response_content {
-            ProxyResponseContent::QueriedMetrics(QueryAnswerMetrics::List((
+            ProxyResponseContent::QueriedMetrics(WorkerMetrics::List((
                 proxy_metric_keys,
                 cluster_metric_keys,
             ))) => {

@@ -5,8 +5,8 @@ use anyhow::Context;
 use hdrhistogram::Histogram;
 
 use crate::sozu_command::proxy::{
-    ClusterMetricsData, FilteredData, MetricsConfiguration, Percentiles, QueryAnswerMetrics,
-    QueryMetricsOptions, WorkerMetrics,
+    ClusterMetricsData, FilteredData, MetricsConfiguration, Percentiles, WorkerMetrics,
+    QueryMetricsOptions, AllWorkerMetrics,
 };
 
 use super::{MetricData, Subscriber};
@@ -174,7 +174,7 @@ impl LocalDrain {
             .collect()
     }
 
-    pub fn query(&mut self, options: &QueryMetricsOptions) -> QueryAnswerMetrics {
+    pub fn query(&mut self, options: &QueryMetricsOptions) -> WorkerMetrics {
         trace!(
             "The local drain received a metrics query with this options: {:?}",
             options
@@ -198,12 +198,12 @@ impl LocalDrain {
         };
 
         match worker_metrics {
-            Ok(worker_metrics) => QueryAnswerMetrics::All(worker_metrics),
-            Err(e) => QueryAnswerMetrics::Error(e.to_string()),
+            Ok(worker_metrics) => WorkerMetrics::All(worker_metrics),
+            Err(e) => WorkerMetrics::Error(e.to_string()),
         }
     }
 
-    fn list_all_metric_names(&self) -> QueryAnswerMetrics {
+    fn list_all_metric_names(&self) -> WorkerMetrics {
         let proxy_metrics_names = self.proxy_metrics.keys().cloned().collect();
 
         let mut cluster_metrics_names = Vec::new();
@@ -213,14 +213,14 @@ impl LocalDrain {
                 cluster_metrics_names.push(metric_name.to_owned());
             }
         }
-        QueryAnswerMetrics::List((proxy_metrics_names, cluster_metrics_names))
+        WorkerMetrics::List((proxy_metrics_names, cluster_metrics_names))
     }
 
     pub fn dump_all_metrics(
         &mut self,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<WorkerMetrics> {
-        Ok(WorkerMetrics {
+    ) -> anyhow::Result<AllWorkerMetrics> {
+        Ok(AllWorkerMetrics {
             proxy: Some(self.dump_proxy_metrics(metric_names)),
             clusters: Some(self.dump_cluster_metrics(metric_names)?),
         })
@@ -327,7 +327,7 @@ impl LocalDrain {
         &mut self,
         cluster_ids: &Vec<String>,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<WorkerMetrics> {
+    ) -> anyhow::Result<AllWorkerMetrics> {
         debug!("Querying cluster with ids: {:?}", cluster_ids);
         let mut clusters: BTreeMap<String, ClusterMetricsData> = BTreeMap::new();
 
@@ -339,7 +339,7 @@ impl LocalDrain {
         }
 
         trace!("query result: {:#?}", clusters);
-        Ok(WorkerMetrics {
+        Ok(AllWorkerMetrics {
             proxy: None,
             clusters: Some(clusters),
         })
@@ -349,7 +349,7 @@ impl LocalDrain {
         &mut self,
         backend_ids: &Vec<String>,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<WorkerMetrics> {
+    ) -> anyhow::Result<AllWorkerMetrics> {
         let mut clusters: BTreeMap<String, ClusterMetricsData> = BTreeMap::new();
 
         for backend_id in backend_ids {
@@ -375,7 +375,7 @@ impl LocalDrain {
         }
 
         trace!("query result: {:#?}", clusters);
-        Ok(WorkerMetrics {
+        Ok(AllWorkerMetrics {
             proxy: None,
             clusters: Some(clusters),
         })

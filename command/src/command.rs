@@ -216,8 +216,8 @@ mod tests {
     use crate::proxy::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
         ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Percentiles, ProxyRequestOrder, QueryAnswerMetrics,
-        RemoveBackend, RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
+        LoadBalancingParams, PathRule, Percentiles, ProxyRequestOrder, WorkerMetrics,
+        RemoveBackend, RemoveCertificate, Route, RulePosition, TlsVersion, AllWorkerMetrics,
     };
     use hex::FromHex;
     use serde_json;
@@ -633,7 +633,7 @@ mod tests {
                 .collect(),
                 workers: [(
                     String::from("0"),
-                    ProxyResponseContent::QueriedMetrics(QueryAnswerMetrics::All(WorkerMetrics {
+                    ProxyResponseContent::QueriedMetrics(WorkerMetrics::All(AllWorkerMetrics {
                         proxy: Some(
                             [
                                 (String::from("sozu.gauge"), FilteredData::Gauge(1)),
