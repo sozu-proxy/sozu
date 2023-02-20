@@ -828,9 +828,9 @@ pub struct ClusterInformation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkerCertificates {
     /// returns a list of certificates: domain -> fingerprint
-    All(HashMap<SocketAddr, BTreeMap<String, Vec<u8>>>),
+    All(HashMap<SocketAddr, BTreeMap<String, CertificateFingerprint>>),
     /// returns a fingerprint
-    Domain(HashMap<SocketAddr, Option<(String, Vec<u8>)>>),
+    Domain(HashMap<SocketAddr, Option<(String, CertificateFingerprint)>>),
     /// returns the certificate
     Fingerprint(Option<(String, Vec<String>)>),
 }

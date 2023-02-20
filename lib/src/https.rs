@@ -951,7 +951,7 @@ impl HttpsProxy {
                     .domains
                     .to_hashmap()
                     .drain()
-                    .map(|(k, v)| (String::from_utf8(k).unwrap(), v.0))
+                    .map(|(domain, fingerprint)| (String::from_utf8(domain).unwrap(), fingerprint))
                     .collect();
 
                 (owned.address, res)
@@ -982,7 +982,12 @@ impl HttpsProxy {
                     owned.address,
                     resolver
                         .domain_lookup(domain.as_bytes(), true)
-                        .map(|(k, v)| (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())),
+                        .map(|(domain, fingerprint)| {
+                            (
+                                String::from_utf8(domain.to_vec()).unwrap(),
+                                fingerprint.clone(),
+                            )
+                        }),
                 )
             })
             .collect::<HashMap<_, _>>();

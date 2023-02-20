@@ -640,7 +640,7 @@ pub fn print_certificates(
                     println!("\t{addr}:");
 
                     for (domain, fingerprint) in h2.iter() {
-                        println!("\t\t{}:\t{}", domain, hex::encode(fingerprint));
+                        println!("\t\t{}:\t{}", domain, hex::encode(fingerprint.0.clone()));
                     }
 
                     println!();
@@ -650,7 +650,7 @@ pub fn print_certificates(
                 for (addr, opt) in h.iter() {
                     println!("\t{addr}:");
                     if let Some((key, fingerprint)) = opt {
-                        println!("\t\t{}:\t{}", key, hex::encode(fingerprint));
+                        println!("\t\t{}:\t{}", key, hex::encode(fingerprint.0.clone()));
                     } else {
                         println!("\t\tnot found");
                     }
