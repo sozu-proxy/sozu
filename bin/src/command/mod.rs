@@ -30,7 +30,7 @@ use sozu_command_lib::{
     },
     config::Config,
     proxy::{
-        MetricsConfiguration, ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseStatus,
+        MetricsConfiguration, WorkerOrder, WorkerRequestOrder, ProxyResponse, ProxyResponseStatus,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -540,7 +540,7 @@ impl CommandServer {
                     error!("Could not execute order on state: {:#}", e);
                 }
 
-                if let &ProxyRequestOrder::AddCertificate(_) = &*order {
+                if let &WorkerRequestOrder::AddCertificate(_) = &*order {
                     debug!("config generated AddCertificate( ... )");
                 } else {
                     debug!("config generated {:?}", order);
@@ -692,7 +692,7 @@ impl CommandServer {
         new_worker
             .send(
                 format!("RESTART-{new_worker_id}-STATUS"),
-                ProxyRequestOrder::Status,
+                WorkerRequestOrder::Status,
             )
             .await;
 
@@ -1023,7 +1023,7 @@ async fn worker_loop(
     worker_id: u32,
     stream: Async<UnixStream>,
     mut command_tx: Sender<CommandMessage>,
-    mut worker_rx: Receiver<ProxyRequest>,
+    mut worker_rx: Receiver<WorkerOrder>,
 ) {
     let read_stream = Arc::new(stream);
     let mut write_stream = read_stream.clone();

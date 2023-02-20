@@ -84,14 +84,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&proxy::ProxyRequest {
+    command.write_message(&proxy::WorkerOrder {
         id: String::from("ID_ABCD"),
-        order: proxy::ProxyRequestOrder::AddHttpFrontend(http_front),
+        order: proxy::WorkerRequestOrder::AddHttpFrontend(http_front),
     });
 
-    command.write_message(&proxy::ProxyRequest {
+    command.write_message(&proxy::WorkerOrder {
         id: String::from("ID_EFGH"),
-        order: proxy::ProxyRequestOrder::AddBackend(http_backend),
+        order: proxy::WorkerRequestOrder::AddBackend(http_backend),
     });
 
     info!("MAIN\tHTTP -> {:?}", command.read_message());
@@ -125,9 +125,9 @@ fn main() -> anyhow::Result<()> {
         certificate_chain: vec![],
         versions: vec![],
     };
-    command2.write_message(&proxy::ProxyRequest {
+    command2.write_message(&proxy::WorkerOrder {
         id: String::from("ID_IJKL1"),
-        order: proxy::ProxyRequestOrder::AddCertificate(proxy::AddCertificate {
+        order: proxy::WorkerRequestOrder::AddCertificate(proxy::AddCertificate {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
@@ -149,9 +149,9 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    command2.write_message(&proxy::ProxyRequest {
+    command2.write_message(&proxy::WorkerOrder {
         id: String::from("ID_IJKL2"),
-        order: proxy::ProxyRequestOrder::AddHttpsFrontend(tls_front),
+        order: proxy::WorkerRequestOrder::AddHttpsFrontend(tls_front),
     });
     let tls_backend = proxy::Backend {
         cluster_id: String::from("cluster_1"),
@@ -164,9 +164,9 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command2.write_message(&proxy::ProxyRequest {
+    command2.write_message(&proxy::WorkerOrder {
         id: String::from("ID_MNOP"),
-        order: proxy::ProxyRequestOrder::AddBackend(tls_backend),
+        order: proxy::WorkerRequestOrder::AddBackend(tls_backend),
     });
 
     let cert2 = include_str!("../assets/cert_test.pem");
@@ -179,9 +179,9 @@ fn main() -> anyhow::Result<()> {
         versions: vec![],
     };
 
-    command2.write_message(&proxy::ProxyRequest {
+    command2.write_message(&proxy::WorkerOrder {
         id: String::from("ID_QRST1"),
-        order: proxy::ProxyRequestOrder::AddCertificate(proxy::AddCertificate {
+        order: proxy::WorkerRequestOrder::AddCertificate(proxy::AddCertificate {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
@@ -203,9 +203,9 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    command2.write_message(&proxy::ProxyRequest {
+    command2.write_message(&proxy::WorkerOrder {
         id: String::from("ID_QRST2"),
-        order: proxy::ProxyRequestOrder::AddHttpsFrontend(tls_front2),
+        order: proxy::WorkerRequestOrder::AddHttpsFrontend(tls_front2),
     });
 
     let tls_backend2 = proxy::Backend {
@@ -219,9 +219,9 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command2.write_message(&proxy::ProxyRequest {
+    command2.write_message(&proxy::WorkerOrder {
         id: String::from("ID_UVWX"),
-        order: proxy::ProxyRequestOrder::AddBackend(tls_backend2),
+        order: proxy::WorkerRequestOrder::AddBackend(tls_backend2),
     });
 
     info!("MAIN\tTLS -> {:?}", command2.read_message());

@@ -57,14 +57,14 @@
 //!   port:       8080
 //! };
 //!
-//! command.write_message(&proxy::ProxyRequest {
+//! command.write_message(&proxy::WorkerRequest {
 //!   id:    String::from("ID_ABCD"),
-//!   order: proxy::ProxyRequestOrder::AddHttpFront(http_front)
+//!   order: proxy::WorkerRequestOrder::AddHttpFront(http_front)
 //! });
 //!
-//! command.write_message(&proxy::ProxyRequest {
+//! command.write_message(&proxy::WorkerRequest {
 //!   id:    String::from("ID_EFGH"),
-//!   order: proxy::ProxyRequestOrder::AddBackend(http_backend)
+//!   order: proxy::WorkerRequestOrder::AddBackend(http_backend)
 //! });
 //!
 //! println!("HTTP -> {:?}", command.read_message());
@@ -125,14 +125,14 @@
 //!     port:       8080
 //!   };
 //!
-//!   command.write_message(&proxy::ProxyRequest {
+//!   command.write_message(&proxy::WorkerRequest {
 //!     id:    String::from("ID_ABCD"),
-//!     order: proxy::ProxyRequestOrder::AddHttpFront(http_front)
+//!     order: proxy::WorkerRequestOrder::AddHttpFront(http_front)
 //!   });
 //!
-//!   command.write_message(&proxy::ProxyRequest {
+//!   command.write_message(&proxy::WorkerRequest {
 //!     id:    String::from("ID_EFGH"),
-//!     order: proxy::ProxyRequestOrder::AddBackend(http_backend)
+//!     order: proxy::WorkerRequestOrder::AddBackend(http_backend)
 //!   });
 //!
 //!   println!("HTTP -> {:?}", command.read_message());
@@ -217,7 +217,7 @@ use sozu_command::state::ClusterId;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
-    proxy::{Cluster, LoadBalancingParams, WorkerEvent, ProxyRequest, ProxyResponse, Route},
+    proxy::{Cluster, LoadBalancingParams, WorkerEvent, WorkerOrder, ProxyResponse, Route},
     ready::Ready,
 };
 
@@ -437,7 +437,7 @@ pub enum AcceptError {
 
 use self::server::ListenToken;
 pub trait ProxyConfiguration {
-    fn notify(&mut self, message: ProxyRequest) -> ProxyResponse;
+    fn notify(&mut self, message: WorkerOrder) -> ProxyResponse;
     fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
     fn create_session(
         &mut self,

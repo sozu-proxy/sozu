@@ -75,14 +75,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&proxy::ProxyRequest {
+    command.write_message(&proxy::WorkerOrder {
         id: String::from("ID_ABCD"),
-        order: proxy::ProxyRequestOrder::AddHttpFrontend(http_front),
+        order: proxy::WorkerRequestOrder::AddHttpFrontend(http_front),
     });
 
-    command.write_message(&proxy::ProxyRequest {
+    command.write_message(&proxy::WorkerOrder {
         id: String::from("ID_EFGH"),
-        order: proxy::ProxyRequestOrder::AddBackend(http_backend),
+        order: proxy::WorkerRequestOrder::AddBackend(http_backend),
     });
 
     println!("HTTP -> {:?}", command.read_message());

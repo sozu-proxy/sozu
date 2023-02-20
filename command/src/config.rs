@@ -17,7 +17,7 @@ use crate::{
     proxy::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, PathRule, ProxyRequestOrder, Route, RulePosition,
+        LoadBalancingParams, LoadMetric, PathRule, WorkerRequestOrder, Route, RulePosition,
         TcpFrontend, TcpListenerConfig, TlsVersion,
     },
 };
@@ -597,11 +597,11 @@ pub struct HttpFrontendConfig {
 }
 
 impl HttpFrontendConfig {
-    pub fn generate_orders(&self, cluster_id: &str) -> Vec<ProxyRequestOrder> {
+    pub fn generate_orders(&self, cluster_id: &str) -> Vec<WorkerRequestOrder> {
         let mut v = Vec::new();
 
         if self.key.is_some() && self.certificate.is_some() {
-            v.push(ProxyRequestOrder::AddCertificate(AddCertificate {
+            v.push(WorkerRequestOrder::AddCertificate(AddCertificate {
                 address: self.address,
                 certificate: CertificateAndKey {
                     key: self.key.clone().unwrap(),
@@ -613,7 +613,7 @@ impl HttpFrontendConfig {
                 expired_at: None,
             }));
 
-            v.push(ProxyRequestOrder::AddHttpsFrontend(HttpFrontend {
+            v.push(WorkerRequestOrder::AddHttpsFrontend(HttpFrontend {
                 route: Route::ClusterId(cluster_id.to_string()),
                 address: self.address,
                 hostname: self.hostname.clone(),
@@ -624,7 +624,7 @@ impl HttpFrontendConfig {
             }));
         } else {
             //create the front both for HTTP and HTTPS if possible
-            v.push(ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+            v.push(WorkerRequestOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(cluster_id.to_string()),
                 address: self.address,
                 hostname: self.hostname.clone(),
@@ -653,8 +653,8 @@ pub struct HttpClusterConfig {
 }
 
 impl HttpClusterConfig {
-    pub fn generate_orders(&self) -> Vec<ProxyRequestOrder> {
-        let mut v = vec![ProxyRequestOrder::AddCluster(Cluster {
+    pub fn generate_orders(&self) -> Vec<WorkerRequestOrder> {
+        let mut v = vec![WorkerRequestOrder::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: self.sticky_session,
             https_redirect: self.https_redirect,
@@ -674,7 +674,7 @@ impl HttpClusterConfig {
                 weight: backend.weight.unwrap_or(100),
             });
 
-            v.push(ProxyRequestOrder::AddBackend(Backend {
+            v.push(WorkerRequestOrder::AddBackend(Backend {
                 cluster_id: self.cluster_id.clone(),
                 backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                     format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
@@ -708,8 +708,8 @@ pub struct TcpClusterConfig {
 }
 
 impl TcpClusterConfig {
-    pub fn generate_orders(&self) -> Vec<ProxyRequestOrder> {
-        let mut v = vec![ProxyRequestOrder::AddCluster(Cluster {
+    pub fn generate_orders(&self) -> Vec<WorkerRequestOrder> {
+        let mut v = vec![WorkerRequestOrder::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: false,
             https_redirect: false,
@@ -720,7 +720,7 @@ impl TcpClusterConfig {
         })];
 
         for frontend in &self.frontends {
-            v.push(ProxyRequestOrder::AddTcpFrontend(TcpFrontend {
+            v.push(WorkerRequestOrder::AddTcpFrontend(TcpFrontend {
                 cluster_id: self.cluster_id.clone(),
                 address: frontend.address,
                 tags: frontend.tags.clone(),
@@ -732,7 +732,7 @@ impl TcpClusterConfig {
                 weight: backend.weight.unwrap_or(100),
             });
 
-            v.push(ProxyRequestOrder::AddBackend(Backend {
+            v.push(WorkerRequestOrder::AddBackend(Backend {
                 cluster_id: self.cluster_id.clone(),
                 backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                     format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
@@ -755,7 +755,7 @@ pub enum ClusterConfig {
 }
 
 impl ClusterConfig {
-    pub fn generate_orders(&self) -> Vec<ProxyRequestOrder> {
+    pub fn generate_orders(&self) -> Vec<WorkerRequestOrder> {
         match *self {
             ClusterConfig::Http(ref http) => http.generate_orders(),
             ClusterConfig::Tcp(ref tcp) => tcp.generate_orders(),
@@ -1196,7 +1196,7 @@ impl Config {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpListener(
+                order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddHttpListener(
                     listener.clone(),
                 ))),
             });
@@ -1208,7 +1208,7 @@ impl Config {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpsListener(
+                order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddHttpsListener(
                     listener.clone(),
                 ))),
             });
@@ -1220,7 +1220,7 @@ impl Config {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddTcpListener(
+                order: CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::AddTcpListener(
                     listener.clone(),
                 ))),
             });
@@ -1247,7 +1247,7 @@ impl Config {
                     version: PROTOCOL_VERSION,
                     worker_id: None,
                     order: CommandRequestOrder::Proxy(Box::new(
-                        ProxyRequestOrder::ActivateListener(ActivateListener {
+                        WorkerRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::HTTP,
                             from_scm: false,
@@ -1263,7 +1263,7 @@ impl Config {
                     version: PROTOCOL_VERSION,
                     worker_id: None,
                     order: CommandRequestOrder::Proxy(Box::new(
-                        ProxyRequestOrder::ActivateListener(ActivateListener {
+                        WorkerRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::HTTPS,
                             from_scm: false,
@@ -1279,7 +1279,7 @@ impl Config {
                     version: PROTOCOL_VERSION,
                     worker_id: None,
                     order: CommandRequestOrder::Proxy(Box::new(
-                        ProxyRequestOrder::ActivateListener(ActivateListener {
+                        WorkerRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::TCP,
                             from_scm: false,

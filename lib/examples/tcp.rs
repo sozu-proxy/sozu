@@ -73,14 +73,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&proxy::ProxyRequest {
+    command.write_message(&proxy::WorkerOrder {
         id: String::from("ID_ABCD"),
-        order: proxy::ProxyRequestOrder::AddTcpFrontend(tcp_front),
+        order: proxy::WorkerRequestOrder::AddTcpFrontend(tcp_front),
     });
 
-    command.write_message(&proxy::ProxyRequest {
+    command.write_message(&proxy::WorkerOrder {
         id: String::from("ID_EFGH"),
-        order: proxy::ProxyRequestOrder::AddBackend(tcp_backend),
+        order: proxy::WorkerRequestOrder::AddBackend(tcp_backend),
     });
 
     info!("TCP -> {:?}", command.read_message());

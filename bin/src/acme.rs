@@ -9,7 +9,7 @@ use sozu_command_lib::{
     config::Config,
     proxy::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
-        ProxyRequestOrder, RemoveBackend, ReplaceCertificate, Route, RulePosition, TlsVersion,
+        WorkerRequestOrder, RemoveBackend, ReplaceCertificate, Route, RulePosition, TlsVersion,
     },
 };
 use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};
@@ -284,7 +284,7 @@ fn set_up_proxying(
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let add_http_front = ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+    let add_http_front = WorkerRequestOrder::AddHttpFrontend(HttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         hostname: String::from(hostname),
         address: *frontend,
@@ -296,7 +296,7 @@ fn set_up_proxying(
 
     order_command(channel, add_http_front).with_context(|| "Order AddHttpFront failed")?;
 
-    let add_backend = ProxyRequestOrder::AddBackend(Backend {
+    let add_backend = WorkerRequestOrder::AddBackend(Backend {
         cluster_id: String::from(cluster_id),
         backend_id: format!("{cluster_id}-0"),
         address: server_address,
@@ -317,7 +317,7 @@ fn remove_proxying(
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let remove_http_front_order = ProxyRequestOrder::RemoveHttpFrontend(HttpFrontend {
+    let remove_http_front_order = WorkerRequestOrder::RemoveHttpFrontend(HttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         address: *frontend,
         hostname: String::from(hostname),
@@ -329,7 +329,7 @@ fn remove_proxying(
     order_command(channel, remove_http_front_order)
         .with_context(|| "RemoveHttpFront order failed")?;
 
-    let remove_backend_order = ProxyRequestOrder::RemoveBackend(RemoveBackend {
+    let remove_backend_order = WorkerRequestOrder::RemoveBackend(RemoveBackend {
         cluster_id: String::from(cluster_id),
         backend_id: format!("{cluster_id}-0"),
         address: server_address,
@@ -359,7 +359,7 @@ fn add_certificate(
         .with_context(|| "could not load certificate chain".to_string())?;
 
     let certificate_order = match old_fingerprint {
-        None => ProxyRequestOrder::AddCertificate(AddCertificate {
+        None => WorkerRequestOrder::AddCertificate(AddCertificate {
             address: *frontend,
             certificate: CertificateAndKey {
                 certificate,
@@ -371,7 +371,7 @@ fn add_certificate(
             expired_at: None,
         }),
 
-        Some(f) => ProxyRequestOrder::ReplaceCertificate(ReplaceCertificate {
+        Some(f) => WorkerRequestOrder::ReplaceCertificate(ReplaceCertificate {
             address: *frontend,
             new_certificate: CertificateAndKey {
                 certificate,
@@ -392,7 +392,7 @@ fn add_certificate(
 
 fn order_command(
     channel: &mut Channel<CommandRequest, CommandResponse>,
-    order: ProxyRequestOrder,
+    order: WorkerRequestOrder,
 ) -> anyhow::Result<()> {
     let id = generate_id();
     channel
@@ -421,22 +421,22 @@ fn order_command(
             }
             CommandStatus::Ok => {
                 match order {
-                    ProxyRequestOrder::AddBackend(_) => {
+                    WorkerRequestOrder::AddBackend(_) => {
                         info!("backend added : {}", response.message)
                     }
-                    ProxyRequestOrder::RemoveBackend(_) => {
+                    WorkerRequestOrder::RemoveBackend(_) => {
                         info!("backend removed : {} ", response.message)
                     }
-                    ProxyRequestOrder::AddCertificate(_) => {
+                    WorkerRequestOrder::AddCertificate(_) => {
                         info!("certificate added: {}", response.message)
                     }
-                    ProxyRequestOrder::RemoveCertificate(_) => {
+                    WorkerRequestOrder::RemoveCertificate(_) => {
                         info!("certificate removed: {}", response.message)
                     }
-                    ProxyRequestOrder::AddHttpFrontend(_) => {
+                    WorkerRequestOrder::AddHttpFrontend(_) => {
                         info!("front added: {}", response.message)
                     }
-                    ProxyRequestOrder::RemoveHttpFrontend(_) => {
+                    WorkerRequestOrder::RemoveHttpFrontend(_) => {
                         info!("front removed: {}", response.message)
                     }
                     _ => {

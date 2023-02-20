@@ -18,7 +18,7 @@ use sozu_command::{
     logging::{Logger, LoggerBackend},
     proxy::{
         Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, ProxyRequest, ProxyRequestOrder,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, WorkerOrder, WorkerRequestOrder,
         ProxyResponse, Route, RulePosition, TcpFrontend, TcpListenerConfig,
     },
     scm_socket::{Listeners, ScmSocket},
@@ -34,7 +34,7 @@ pub struct Worker {
     pub state: ConfigState,
     pub scm_main_to_worker: ScmSocket,
     pub scm_worker_to_main: ScmSocket,
-    pub command_channel: Channel<ProxyRequest, ProxyResponse>,
+    pub command_channel: Channel<WorkerOrder, ProxyResponse>,
     pub command_id: CommandID,
     pub server_job: JoinHandle<()>,
 }
@@ -107,7 +107,7 @@ impl Worker {
         config: Config,
         listeners: Listeners,
         state: ConfigState,
-    ) -> (ScmSocket, Channel<ProxyRequest, ProxyResponse>, Server) {
+    ) -> (ScmSocket, Channel<WorkerOrder, ProxyResponse>, Server) {
         let (scm_main_to_worker, scm_worker_to_main) =
             UnixStream::pair().expect("could not create unix stream pair");
         let (cmd_main_to_worker, cmd_worker_to_main) =
@@ -202,7 +202,7 @@ impl Worker {
     }
 
     pub fn upgrade<S: Into<String>>(&mut self, name: S) -> Self {
-        self.send_proxy_request(ProxyRequestOrder::ReturnListenSockets);
+        self.send_proxy_request(WorkerRequestOrder::ReturnListenSockets);
         self.read_to_last();
 
         self.scm_main_to_worker
@@ -214,7 +214,7 @@ impl Worker {
             .expect("receive listeners");
         println!("Listeners from old worker: {listeners:?}");
         println!("State from old worker: {:?}", self.state);
-        self.send_proxy_request(ProxyRequestOrder::SoftStop);
+        self.send_proxy_request(WorkerRequestOrder::SoftStop);
 
         let mut worker = Worker::start_new_worker(
             name,
@@ -238,10 +238,10 @@ impl Worker {
         worker
     }
 
-    pub fn send_proxy_request(&mut self, order: ProxyRequestOrder) {
+    pub fn send_proxy_request(&mut self, order: WorkerRequestOrder) {
         //self.state.handle_order(&order);
         self.command_channel
-            .write_message(&ProxyRequest {
+            .write_message(&WorkerOrder {
                 id: self.command_id.next(),
                 order,
             })

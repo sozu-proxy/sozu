@@ -8,7 +8,7 @@ use sozu_command_lib::{
         CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
         CommandStatus, RunState, WorkerInfo,
     },
-    proxy::{ProxyRequestOrder, QueryMetricsOptions},
+    proxy::{WorkerRequestOrder, QueryMetricsOptions},
 };
 
 use crate::ctl::{
@@ -293,7 +293,7 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::QueryMetrics(
+        let command = CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::QueryMetrics(
             QueryMetricsOptions {
                 list,
                 cluster_ids,
@@ -369,7 +369,7 @@ impl CommandManager {
 
         let command = match (cluster_id.clone(), domain.clone()) {
             (Some(cluster_id), _) => {
-                CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::QueryClusterById {
+                CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::QueryClusterById {
                     cluster_id,
                 }))
             }
@@ -389,13 +389,13 @@ impl CommandManager {
                 // We add the / again because of the splitn removing it
                 let path = splitted.get(1).cloned().map(|path| format!("/{path}"));
 
-                CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::QueryClusterByDomain {
+                CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::QueryClusterByDomain {
                     hostname,
                     path,
                 }))
             }
             (None, None) => {
-                CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::QueryClustersHashes))
+                CommandRequestOrder::Proxy(Box::new(WorkerRequestOrder::QueryClustersHashes))
             }
         };
 
@@ -435,14 +435,14 @@ impl CommandManager {
         domain: Option<String>,
     ) -> Result<(), anyhow::Error> {
         let order = match (fingerprint, domain) {
-            (None, None) => ProxyRequestOrder::QueryAllCertificates,
+            (None, None) => WorkerRequestOrder::QueryAllCertificates,
             (Some(f), None) => match hex::decode(f) {
                 Err(e) => {
                     bail!("invalid fingerprint: {:?}", e);
                 }
-                Ok(f) => ProxyRequestOrder::QueryCertificateByFingerprint(f),
+                Ok(f) => WorkerRequestOrder::QueryCertificateByFingerprint(f),
             },
-            (None, Some(d)) => ProxyRequestOrder::QueryCertificateByDomain(d),
+            (None, Some(d)) => WorkerRequestOrder::QueryCertificateByDomain(d),
             (Some(_), Some(_)) => {
                 bail!("Error: Either request a fingerprint or a domain name");
             }
