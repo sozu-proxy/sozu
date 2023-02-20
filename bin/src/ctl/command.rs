@@ -111,7 +111,6 @@ impl CommandManager {
                             ResponseContent::AvailableMetrics(_)
                             | ResponseContent::AvailableWorkerMetrics(_)
                             | ResponseContent::Event(_)
-                            | ResponseContent::ListenersList(_)
                             | ResponseContent::Metrics(_)
                             | ResponseContent::Query(_)
                             | ResponseContent::WorkerCertificates(_)
@@ -120,6 +119,7 @@ impl CommandManager {
                             | ResponseContent::WorkerEvent(_)
                             | ResponseContent::WorkerMetrics(_)
                             | ResponseContent::Workers(_) => {}
+                            ResponseContent::ListenersList(list) => print_listeners(list),
                             ResponseContent::State(state) => match json {
                                 true => print_json_response(&state)?,
                                 false => println!("{state:#?}"),

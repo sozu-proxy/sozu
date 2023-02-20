@@ -1083,9 +1083,9 @@ impl CommandServer {
     pub async fn query(
         &mut self,
         request_identifier: RequestIdentifier,
-        proxy_request_order: WorkerOrder,
+        order: WorkerOrder,
     ) -> anyhow::Result<Option<Success>> {
-        debug!("Received this order: {:?}", proxy_request_order);
+        debug!("Received this order: {:?}", order);
         let (query_tx, mut query_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
@@ -1094,9 +1094,7 @@ impl CommandServer {
             .filter(|worker| worker.run_state != RunState::Stopped)
         {
             let req_id = format!("{}-query-{}", request_identifier.client, worker.id);
-            worker
-                .send(req_id.clone(), proxy_request_order.clone())
-                .await;
+            worker.send(req_id.clone(), order.clone()).await;
             count += 1;
             self.in_flight.insert(req_id, (query_tx.clone(), 1));
         }
@@ -1108,29 +1106,7 @@ impl CommandServer {
         )
         .await;
 
-        let mut main_query_answer = None;
-        match &proxy_request_order {
-            WorkerOrder::QueryClustersHashes => {
-                main_query_answer = Some(ResponseContent::WorkerClustersHashes(
-                    self.state.hash_state(),
-                ));
-            }
-            WorkerOrder::QueryClusterById { cluster_id } => {
-                main_query_answer = Some(ResponseContent::WorkerClusters(vec![self
-                    .state
-                    .cluster_state(cluster_id)]));
-            }
-            WorkerOrder::QueryClusterByDomain { hostname, path } => {
-                let cluster_ids =
-                    get_cluster_ids_by_domain(&self.state, hostname.clone(), path.clone());
-                let clusters = cluster_ids
-                    .iter()
-                    .map(|cluster_id| self.state.cluster_state(cluster_id))
-                    .collect();
-                main_query_answer = Some(ResponseContent::WorkerClusters(clusters));
-            }
-            _ => {}
-        }
+        let response_of_main = self.query_main_process(&order);
 
         // all these are passed to the thread
         let command_tx = self.command_tx.clone();
@@ -1173,14 +1149,14 @@ impl CommandServer {
                 )
                 .collect();
 
-            let success = match &proxy_request_order {
+            let success = match &order {
                 WorkerOrder::QueryClustersHashes
                 | WorkerOrder::QueryClusterById { cluster_id: _ }
                 | WorkerOrder::QueryClusterByDomain {
                     hostname: _,
                     path: _,
                 } => {
-                    let query_answer = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
+                    let query_answer = response_of_main.unwrap(); // we should refactor to avoid this unwrap()
                     worker_responses_map.insert(String::from("main"), query_answer);
                     Success::Query(ResponseContent::Query(worker_responses_map))
                 }
@@ -1206,7 +1182,7 @@ impl CommandServer {
                             })
                             .collect();
                         Success::Query(ResponseContent::AvailableMetrics(AvailableMetrics {
-                            main: vec![],
+                            main: vec![], // TODO: get available metrics of main process in CommandServer::query_main_process()
                             workers,
                         }))
                     } else {
@@ -1233,6 +1209,29 @@ impl CommandServer {
         .detach();
 
         Ok(None)
+    }
+
+    fn query_main_process(&self, order: &WorkerOrder) -> Option<ResponseContent> {
+        match order {
+            WorkerOrder::QueryClustersHashes => Some(ResponseContent::WorkerClustersHashes(
+                self.state.hash_state(),
+            )),
+            WorkerOrder::QueryClusterById { cluster_id } => {
+                Some(ResponseContent::WorkerClusters(vec![self
+                    .state
+                    .cluster_state(cluster_id)]))
+            }
+            WorkerOrder::QueryClusterByDomain { hostname, path } => {
+                let cluster_ids =
+                    get_cluster_ids_by_domain(&self.state, hostname.clone(), path.clone());
+                let clusters = cluster_ids
+                    .iter()
+                    .map(|cluster_id| self.state.cluster_state(cluster_id))
+                    .collect();
+                Some(ResponseContent::WorkerClusters(clusters))
+            }
+            _ => None,
+        }
     }
 
     pub fn set_logging_level(&mut self, logging_filter: String) -> anyhow::Result<Option<Success>> {
