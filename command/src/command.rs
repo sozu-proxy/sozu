@@ -18,7 +18,7 @@ pub const PROTOCOL_VERSION: u8 = 0;
 /// Details of a request sent by the CLI (or other) to the main process
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CommandRequestOrder {
+pub enum Order {
     /// an order to forward to workers
     Worker(Box<WorkerOrder>),
     /// save Sōzu's parseable state as a file
@@ -69,11 +69,11 @@ pub struct Request {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<u32>,
     #[serde(flatten)]
-    pub order: CommandRequestOrder,
+    pub order: Order,
 }
 
 impl Request {
-    pub fn new(id: String, order: CommandRequestOrder, worker_id: Option<u32>) -> Request {
+    pub fn new(id: String, order: Order, worker_id: Option<u32>) -> Request {
         Request {
             version: PROTOCOL_VERSION,
             id,
@@ -239,7 +239,7 @@ mod tests {
         println!("{message:?}");
         assert_eq!(
             message.order,
-            CommandRequestOrder::Worker(Box::new(WorkerOrder::AddHttpFrontend(HttpFrontend {
+            Order::Worker(Box::new(WorkerOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
@@ -291,7 +291,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddCluster(Cluster {
+            order: Order::Worker(Box::new(WorkerOrder::AddCluster(Cluster {
                 cluster_id: String::from("xxx"),
                 sticky_session: true,
                 https_redirect: true,
@@ -310,7 +310,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::RemoveCluster {
+            order: Order::Worker(Box::new(WorkerOrder::RemoveCluster {
                 cluster_id: String::from("xxx")
             })),
             worker_id: None
@@ -323,17 +323,15 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddHttpFrontend(
-                HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
-                    hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
-                    method: None,
-                    address: "0.0.0.0:8080".parse().unwrap(),
-                    position: RulePosition::Tree,
-                    tags: None,
-                }
-            ))),
+            order: Order::Worker(Box::new(WorkerOrder::AddHttpFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("xxx")),
+                hostname: String::from("yyy"),
+                path: PathRule::Prefix(String::from("xxx")),
+                method: None,
+                address: "0.0.0.0:8080".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: None,
+            }))),
             worker_id: None
         }
     );
@@ -344,23 +342,21 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::RemoveHttpFrontend(
-                HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
-                    hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
-                    method: None,
-                    address: "0.0.0.0:8080".parse().unwrap(),
-                    position: RulePosition::Tree,
-                    tags: Some(BTreeMap::from([
-                        ("owner".to_owned(), "John".to_owned()),
-                        (
-                            "uuid".to_owned(),
-                            "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
-                        )
-                    ]))
-                }
-            ))),
+            order: Order::Worker(Box::new(WorkerOrder::RemoveHttpFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("xxx")),
+                hostname: String::from("yyy"),
+                path: PathRule::Prefix(String::from("xxx")),
+                method: None,
+                address: "0.0.0.0:8080".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: Some(BTreeMap::from([
+                    ("owner".to_owned(), "John".to_owned()),
+                    (
+                        "uuid".to_owned(),
+                        "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
+                    )
+                ]))
+            }))),
             worker_id: None
         }
     );
@@ -371,17 +367,15 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddHttpsFrontend(
-                HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
-                    hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
-                    method: None,
-                    address: "0.0.0.0:8443".parse().unwrap(),
-                    position: RulePosition::Tree,
-                    tags: None,
-                }
-            ))),
+            order: Order::Worker(Box::new(WorkerOrder::AddHttpsFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("xxx")),
+                hostname: String::from("yyy"),
+                path: PathRule::Prefix(String::from("xxx")),
+                method: None,
+                address: "0.0.0.0:8443".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: None,
+            }))),
             worker_id: None
         }
     );
@@ -392,23 +386,21 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::RemoveHttpsFrontend(
-                HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
-                    hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
-                    method: None,
-                    address: "0.0.0.0:8443".parse().unwrap(),
-                    position: RulePosition::Tree,
-                    tags: Some(BTreeMap::from([
-                        ("owner".to_owned(), "John".to_owned()),
-                        (
-                            "uuid".to_owned(),
-                            "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
-                        )
-                    ]))
-                }
-            ))),
+            order: Order::Worker(Box::new(WorkerOrder::RemoveHttpsFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("xxx")),
+                hostname: String::from("yyy"),
+                path: PathRule::Prefix(String::from("xxx")),
+                method: None,
+                address: "0.0.0.0:8443".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: Some(BTreeMap::from([
+                    ("owner".to_owned(), "John".to_owned()),
+                    (
+                        "uuid".to_owned(),
+                        "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
+                    )
+                ]))
+            }))),
             worker_id: None
         }
     );
@@ -423,19 +415,17 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddCertificate(
-                AddCertificate {
-                    address: "0.0.0.0:443".parse().unwrap(),
-                    certificate: CertificateAndKey {
-                        certificate: String::from(CERTIFICATE),
-                        certificate_chain: split_certificate_chain(String::from(CHAIN)),
-                        key: String::from(KEY),
-                        versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
-                    },
-                    names: vec![],
-                    expired_at: None,
-                }
-            ))),
+            order: Order::Worker(Box::new(WorkerOrder::AddCertificate(AddCertificate {
+                address: "0.0.0.0:443".parse().unwrap(),
+                certificate: CertificateAndKey {
+                    certificate: String::from(CERTIFICATE),
+                    certificate_chain: split_certificate_chain(String::from(CHAIN)),
+                    key: String::from(KEY),
+                    versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
+                },
+                names: vec![],
+                expired_at: None,
+            }))),
             worker_id: None
         }
     );
@@ -446,7 +436,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::RemoveCertificate(
+            order: Order::Worker(Box::new(WorkerOrder::RemoveCertificate(
                 RemoveCertificate {
                     address: "0.0.0.0:443".parse().unwrap(),
                     fingerprint: CertificateFingerprint(
@@ -467,7 +457,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddBackend(Backend {
+            order: Order::Worker(Box::new(WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("xxx"),
                 backend_id: String::from("xxx-0"),
                 address: "127.0.0.1:8080".parse().unwrap(),
@@ -485,13 +475,11 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::RemoveBackend(
-                RemoveBackend {
-                    cluster_id: String::from("xxx"),
-                    backend_id: String::from("xxx-0"),
-                    address: "127.0.0.1:8080".parse().unwrap(),
-                }
-            ))),
+            order: Order::Worker(Box::new(WorkerOrder::RemoveBackend(RemoveBackend {
+                cluster_id: String::from("xxx"),
+                backend_id: String::from("xxx-0"),
+                address: "127.0.0.1:8080".parse().unwrap(),
+            }))),
             worker_id: None
         }
     );
@@ -502,7 +490,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::SoftStop)),
+            order: Order::Worker(Box::new(WorkerOrder::SoftStop)),
             worker_id: Some(0),
         }
     );
@@ -513,7 +501,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::HardStop)),
+            order: Order::Worker(Box::new(WorkerOrder::HardStop)),
             worker_id: Some(0),
         }
     );
@@ -524,7 +512,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::Status)),
+            order: Order::Worker(Box::new(WorkerOrder::Status)),
             worker_id: Some(0),
         }
     );
@@ -535,7 +523,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::LoadState {
+            order: Order::LoadState {
                 path: String::from("./config_dump.json")
             },
             worker_id: None
@@ -548,7 +536,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::SaveState {
+            order: Order::SaveState {
                 path: String::from("./config_dump.json")
             },
             worker_id: None
@@ -561,7 +549,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::DumpState,
+            order: Order::DumpState,
             worker_id: None
         }
     );
@@ -572,7 +560,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::ListWorkers,
+            order: Order::ListWorkers,
             worker_id: None
         }
     );
@@ -583,7 +571,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::UpgradeMain,
+            order: Order::UpgradeMain,
             worker_id: None
         }
     );
@@ -594,7 +582,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::UpgradeWorker(0),
+            order: Order::UpgradeWorker(0),
             worker_id: None
         }
     );

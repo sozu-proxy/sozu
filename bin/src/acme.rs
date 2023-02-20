@@ -5,7 +5,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain},
     channel::Channel,
-    command::{CommandRequestOrder, CommandResponse, Request, RequestStatus},
+    command::{CommandResponse, Order, Request, RequestStatus},
     config::Config,
     worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
@@ -398,7 +398,7 @@ fn order_command(
     channel
         .write_message(&Request::new(
             id.clone(),
-            CommandRequestOrder::Worker(Box::new(order.clone())),
+            Order::Worker(Box::new(order.clone())),
             None,
         ))
         .with_context(|| "Could not write message on the channel")?;

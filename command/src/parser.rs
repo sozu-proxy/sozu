@@ -74,15 +74,11 @@ where
 mod test {
     use super::*;
 
-    use crate::command::{CommandRequestOrder, Request};
+    use crate::command::{Order, Request};
 
     #[test]
     fn parse_one_command_request_works() {
-        let command_request = Request::new(
-            "Some request".to_string(),
-            CommandRequestOrder::DumpState,
-            Some(5),
-        );
+        let command_request = Request::new("Some request".to_string(), Order::DumpState, Some(5));
 
         let mut string = serde_json::ser::to_string(&command_request).unwrap();
 
@@ -105,21 +101,17 @@ mod test {
         let commands = vec![
             Request::new(
                 "Some request".to_string(),
-                CommandRequestOrder::SaveState {
+                Order::SaveState {
                     path: "/some/path".to_string(),
                 },
                 Some(5),
             ),
             Request::new(
                 "Some other request".to_string(),
-                CommandRequestOrder::SubscribeEvents,
+                Order::SubscribeEvents,
                 Some(4),
             ),
-            Request::new(
-                "Yet another request".to_string(),
-                CommandRequestOrder::DumpState,
-                None,
-            ),
+            Request::new("Yet another request".to_string(), Order::DumpState, None),
         ];
 
         let mut serialized_commands = String::new();

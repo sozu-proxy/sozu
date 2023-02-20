@@ -24,10 +24,7 @@ use nix::{
 use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
-    command::{
-        CommandRequestOrder, CommandResponse, Event, Request, RequestStatus, ResponseContent,
-        RunState,
-    },
+    command::{CommandResponse, Event, Order, Request, RequestStatus, ResponseContent, RunState},
     config::Config,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -535,7 +532,7 @@ impl CommandServer {
 
         //FIXME: too many loops, this could be cleaner
         for message in self.config.generate_config_messages() {
-            if let CommandRequestOrder::Worker(order) = message.order {
+            if let Order::Worker(order) = message.order {
                 if let Err(e) = self.state.dispatch(&order) {
                     error!("Could not execute order on state: {:#}", e);
                 }

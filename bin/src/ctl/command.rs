@@ -5,8 +5,7 @@ use serde::Serialize;
 
 use sozu_command_lib::{
     command::{
-        CommandRequestOrder, CommandResponse, Request, RequestStatus, ResponseContent, RunState,
-        WorkerInfo,
+        CommandResponse, Order, Request, RequestStatus, ResponseContent, RunState, WorkerInfo,
     },
     worker::{QueryMetricsOptions, WorkerOrder},
 };
@@ -46,11 +45,7 @@ fn generate_tagged_id(tag: &str) -> String {
 }
 
 impl CommandManager {
-    fn send_request(
-        &mut self,
-        id: &str,
-        command_request_order: CommandRequestOrder,
-    ) -> anyhow::Result<()> {
+    fn send_request(&mut self, id: &str, command_request_order: Order) -> anyhow::Result<()> {
         let command_request = Request::new(id.to_string(), command_request_order, None);
 
         self.channel
@@ -64,13 +59,13 @@ impl CommandManager {
             .with_context(|| "Command timeout. The proxy didn't send an answer")
     }
 
-    pub fn order_command(&mut self, order: CommandRequestOrder) -> Result<(), anyhow::Error> {
+    pub fn order_command(&mut self, order: Order) -> Result<(), anyhow::Error> {
         self.order_command_with_worker_id(order, None, false)
     }
 
     pub fn order_command_with_json(
         &mut self,
-        command_request_order: CommandRequestOrder,
+        command_request_order: Order,
         json: bool,
     ) -> Result<(), anyhow::Error> {
         self.order_command_with_worker_id(command_request_order, None, json)
@@ -78,7 +73,7 @@ impl CommandManager {
 
     pub fn order_command_with_worker_id(
         &mut self,
-        command_request_order: CommandRequestOrder,
+        command_request_order: Order,
         worker_id: Option<u32>,
         json: bool,
     ) -> Result<(), anyhow::Error> {
@@ -157,7 +152,7 @@ impl CommandManager {
 
         let id = generate_tagged_id("LIST-WORKERS");
 
-        self.send_request(&id, CommandRequestOrder::ListWorkers)?;
+        self.send_request(&id, Order::ListWorkers)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -189,7 +184,7 @@ impl CommandManager {
                         println!();
 
                         let id = generate_tagged_id("UPGRADE-MAIN");
-                        self.send_request(&id, CommandRequestOrder::UpgradeMain)?;
+                        self.send_request(&id, Order::UpgradeMain)?;
 
                         println!("Upgrading main process");
 
@@ -260,7 +255,7 @@ impl CommandManager {
         let id = generate_id();
 
         //FIXME: we should be able to soft stop one specific worker
-        self.send_request(&id, CommandRequestOrder::UpgradeWorker(worker_id))?;
+        self.send_request(&id, Order::UpgradeWorker(worker_id))?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -293,13 +288,12 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command =
-            CommandRequestOrder::Worker(Box::new(WorkerOrder::QueryMetrics(QueryMetricsOptions {
-                list,
-                cluster_ids,
-                backend_ids,
-                metric_names,
-            })));
+        let command = Order::Worker(Box::new(WorkerOrder::QueryMetrics(QueryMetricsOptions {
+            list,
+            cluster_ids,
+            backend_ids,
+            metric_names,
+        })));
 
         // a loop to reperform the query every refresh time
         loop {
@@ -368,7 +362,7 @@ impl CommandManager {
 
         let command = match (cluster_id.clone(), domain.clone()) {
             (Some(cluster_id), _) => {
-                CommandRequestOrder::Worker(Box::new(WorkerOrder::QueryClusterById { cluster_id }))
+                Order::Worker(Box::new(WorkerOrder::QueryClusterById { cluster_id }))
             }
             (None, Some(domain)) => {
                 let splitted: Vec<String> =
@@ -386,12 +380,12 @@ impl CommandManager {
                 // We add the / again because of the splitn removing it
                 let path = splitted.get(1).cloned().map(|path| format!("/{path}"));
 
-                CommandRequestOrder::Worker(Box::new(WorkerOrder::QueryClusterByDomain {
+                Order::Worker(Box::new(WorkerOrder::QueryClusterByDomain {
                     hostname,
                     path,
                 }))
             }
-            (None, None) => CommandRequestOrder::Worker(Box::new(WorkerOrder::QueryClustersHashes)),
+            (None, None) => Order::Worker(Box::new(WorkerOrder::QueryClustersHashes)),
         };
 
         let id = generate_id();
@@ -443,7 +437,7 @@ impl CommandManager {
             }
         };
 
-        let command = CommandRequestOrder::Worker(Box::new(order));
+        let command = Order::Worker(Box::new(order));
 
         let id = generate_id();
 

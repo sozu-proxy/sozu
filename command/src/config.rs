@@ -14,7 +14,7 @@ use toml;
 
 use crate::{
     certificate::split_certificate_chain,
-    command::{CommandRequestOrder, Request, PROTOCOL_VERSION},
+    command::{Order, Request, PROTOCOL_VERSION},
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
@@ -1197,9 +1197,7 @@ impl Config {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddHttpListener(
-                    listener.clone(),
-                ))),
+                order: Order::Worker(Box::new(WorkerOrder::AddHttpListener(listener.clone()))),
             });
             count += 1;
         }
@@ -1209,9 +1207,7 @@ impl Config {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddHttpsListener(
-                    listener.clone(),
-                ))),
+                order: Order::Worker(Box::new(WorkerOrder::AddHttpsListener(listener.clone()))),
             });
             count += 1;
         }
@@ -1221,9 +1217,7 @@ impl Config {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
-                order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddTcpListener(
-                    listener.clone(),
-                ))),
+                order: Order::Worker(Box::new(WorkerOrder::AddTcpListener(listener.clone()))),
             });
             count += 1;
         }
@@ -1235,7 +1229,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Worker(Box::new(order)),
+                    order: Order::Worker(Box::new(order)),
                 });
                 count += 1;
             }
@@ -1247,7 +1241,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Worker(Box::new(WorkerOrder::ActivateListener(
+                    order: Order::Worker(Box::new(WorkerOrder::ActivateListener(
                         ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::HTTP,
@@ -1263,7 +1257,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Worker(Box::new(WorkerOrder::ActivateListener(
+                    order: Order::Worker(Box::new(WorkerOrder::ActivateListener(
                         ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::HTTPS,
@@ -1279,7 +1273,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
-                    order: CommandRequestOrder::Worker(Box::new(WorkerOrder::ActivateListener(
+                    order: Order::Worker(Box::new(WorkerOrder::ActivateListener(
                         ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::TCP,

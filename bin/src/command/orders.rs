@@ -15,8 +15,8 @@ use nom::{Err, HexDisplay, Offset};
 use sozu_command_lib::{
     buffer::fixed::Buffer,
     command::{
-        CommandRequestOrder, CommandResponse, FrontendFilters, ListedFrontends, ListenersList,
-        Request, RequestStatus, ResponseContent, RunState, WorkerInfo, PROTOCOL_VERSION,
+        CommandResponse, FrontendFilters, ListedFrontends, ListenersList, Order, Request,
+        RequestStatus, ResponseContent, RunState, WorkerInfo, PROTOCOL_VERSION,
     },
     config::Config,
     logging,
@@ -50,12 +50,12 @@ impl CommandServer {
         let cloned_identifier = request_identifier.clone();
 
         let result: anyhow::Result<Option<Success>> = match request.order {
-            CommandRequestOrder::SaveState { path } => self.save_state(&path).await,
-            CommandRequestOrder::DumpState => self.dump_state().await,
-            CommandRequestOrder::ListWorkers => self.list_workers().await,
-            CommandRequestOrder::ListFrontends(filters) => self.list_frontends(filters).await,
-            CommandRequestOrder::ListListeners => self.list_listeners(),
-            CommandRequestOrder::LoadState { path } => {
+            Order::SaveState { path } => self.save_state(&path).await,
+            Order::DumpState => self.dump_state().await,
+            Order::ListWorkers => self.list_workers().await,
+            Order::ListFrontends(filters) => self.list_frontends(filters).await,
+            Order::ListListeners => self.list_listeners(),
+            Order::LoadState { path } => {
                 self.load_state(
                     Some(request_identifier.client),
                     request_identifier.request,
@@ -63,14 +63,12 @@ impl CommandServer {
                 )
                 .await
             }
-            CommandRequestOrder::LaunchWorker(tag) => {
-                self.launch_worker(request_identifier, &tag).await
-            }
-            CommandRequestOrder::UpgradeMain => self.upgrade_main(request_identifier).await,
-            CommandRequestOrder::UpgradeWorker(worker_id) => {
+            Order::LaunchWorker(tag) => self.launch_worker(request_identifier, &tag).await,
+            Order::UpgradeMain => self.upgrade_main(request_identifier).await,
+            Order::UpgradeWorker(worker_id) => {
                 self.upgrade_worker(request_identifier, worker_id).await
             }
-            CommandRequestOrder::Worker(proxy_request_order) => match *proxy_request_order {
+            Order::Worker(proxy_request_order) => match *proxy_request_order {
                 WorkerOrder::ConfigureMetrics(config) => {
                     self.configure_metrics(request_identifier, config).await
                 }
@@ -98,14 +96,14 @@ impl CommandServer {
                         .await
                 }
             },
-            CommandRequestOrder::SubscribeEvents => {
+            Order::SubscribeEvents => {
                 self.event_subscribers.insert(client_id.clone());
                 Ok(Some(Success::SubscribeEvent(client_id.clone())))
             }
-            CommandRequestOrder::ReloadConfiguration { path } => {
+            Order::ReloadConfiguration { path } => {
                 self.reload_configuration(request_identifier, path).await
             }
-            CommandRequestOrder::Status => self.status(request_identifier).await,
+            Order::Status => self.status(request_identifier).await,
         };
 
         // Notify the command server by sending using his command_tx
@@ -149,7 +147,7 @@ impl CommandServer {
             for command in orders {
                 let message = Request::new(
                     format!("SAVE-{counter}"),
-                    CommandRequestOrder::Worker(Box::new(command)),
+                    Order::Worker(Box::new(command)),
                     None,
                 );
 
@@ -246,7 +244,7 @@ impl CommandServer {
                     }
 
                     for request in requests {
-                        if let CommandRequestOrder::Worker(order) = request.order {
+                        if let Order::Worker(order) = request.order {
                             message_counter += 1;
 
                             if self.state.dispatch(&order).is_ok() {
@@ -821,7 +819,7 @@ impl CommandServer {
         .await;
 
         for message in new_config.generate_config_messages() {
-            if let CommandRequestOrder::Worker(order) = message.order {
+            if let Order::Worker(order) = message.order {
                 if self.state.dispatch(&order).is_ok() {
                     diff_counter += 1;
 
