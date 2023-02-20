@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     proxy::{
-        AggregatedMetricsData, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, ProxyEvent,
+        AggregatedMetrics, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, ProxyEvent,
         ProxyRequestOrder, ProxyResponseContent, TcpFrontend, TcpListenerConfig,
     },
     state::ConfigState,
@@ -97,7 +97,7 @@ pub enum CommandResponseContent {
     /// a list of workers, with ids, pids, statuses
     Workers(Vec<WorkerInfo>),
     /// aggregated metrics of main process and workers
-    Metrics(AggregatedMetricsData),
+    Metrics(AggregatedMetrics),
     /// worker responses to a same query: worker_id -> query_answer
     Query(BTreeMap<String, ProxyResponseContent>),
     /// the state of Sōzu: frontends, backends, listeners, etc.
@@ -622,7 +622,7 @@ mod tests {
             version: 0,
             status: CommandStatus::Ok,
             message: String::from(""),
-            content: Some(CommandResponseContent::Metrics(AggregatedMetricsData {
+            content: Some(CommandResponseContent::Metrics(AggregatedMetrics {
                 main: [
                     (String::from("sozu.gauge"), FilteredData::Gauge(1)),
                     (String::from("sozu.count"), FilteredData::Count(-2)),

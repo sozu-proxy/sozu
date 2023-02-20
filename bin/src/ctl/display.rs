@@ -9,7 +9,7 @@ use prettytable::{Row, Table};
 use sozu_command_lib::{
     command::{CommandResponseContent, ListedFrontends, ListenersList, WorkerInfo},
     proxy::{
-        AggregatedMetricsData, ClusterMetricsData, FilteredData, ProxyResponseContent,
+        AggregatedMetrics, ClusterMetricsData, FilteredData, ProxyResponseContent,
         WorkerCertificates, WorkerMetrics, Route, AllWorkerMetrics,
     },
 };
@@ -196,7 +196,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
 
 pub fn print_metrics(
     // main & worker metrics
-    aggregated_metrics: AggregatedMetricsData,
+    aggregated_metrics: AggregatedMetrics,
     json: bool,
 ) -> anyhow::Result<()> {
     if json {

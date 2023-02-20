@@ -107,7 +107,7 @@ pub enum ProxyResponseContent {
 
 /// Aggregated metrics of main process & workers, for the CLI
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AggregatedMetricsData {
+pub struct AggregatedMetrics {
     pub main: BTreeMap<String, FilteredData>,
     pub workers: BTreeMap<String, ProxyResponseContent>,
 }

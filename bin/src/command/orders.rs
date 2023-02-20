@@ -23,7 +23,7 @@ use sozu_command_lib::{
     logging,
     parser::parse_several_commands,
     proxy::{
-        AggregatedMetricsData, MetricsConfiguration, ProxyRequest, ProxyRequestOrder,
+        AggregatedMetrics, MetricsConfiguration, ProxyRequest, ProxyRequestOrder,
         ProxyResponseContent, ProxyResponseStatus,
     },
     scm_socket::Listeners,
@@ -1195,7 +1195,7 @@ impl CommandServer {
                     if options.list {
                         Success::Query(CommandResponseContent::Query(proxy_responses_map))
                     } else {
-                        Success::Query(CommandResponseContent::Metrics(AggregatedMetricsData {
+                        Success::Query(CommandResponseContent::Metrics(AggregatedMetrics {
                             main: main_metrics,
                             workers: proxy_responses_map,
                         }))
