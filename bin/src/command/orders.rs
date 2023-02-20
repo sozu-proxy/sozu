@@ -24,8 +24,7 @@ use sozu_command_lib::{
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
     worker::{
-        AggregatedMetrics, MetricsConfiguration, WorkerOrder, WorkerRequestOrder,
-        WorkerResponseStatus,
+        AggregatedMetrics, MetricsConfiguration, WorkerOrder, WorkerRequest, WorkerResponseStatus,
     },
 };
 
@@ -72,26 +71,24 @@ impl CommandServer {
                 self.upgrade_worker(request_identifier, worker_id).await
             }
             CommandRequestOrder::Worker(proxy_request_order) => match *proxy_request_order {
-                WorkerRequestOrder::ConfigureMetrics(config) => {
+                WorkerOrder::ConfigureMetrics(config) => {
                     self.configure_metrics(request_identifier, config).await
                 }
 
-                WorkerRequestOrder::QueryAllCertificates
-                | WorkerRequestOrder::QueryCertificateByDomain(_)
-                | WorkerRequestOrder::QueryCertificateByFingerprint(_)
-                | WorkerRequestOrder::QueryClusterByDomain {
+                WorkerOrder::QueryAllCertificates
+                | WorkerOrder::QueryCertificateByDomain(_)
+                | WorkerOrder::QueryCertificateByFingerprint(_)
+                | WorkerOrder::QueryClusterByDomain {
                     hostname: _,
                     path: _,
                 }
-                | WorkerRequestOrder::QueryClusterById { cluster_id: _ }
-                | WorkerRequestOrder::QueryClustersHashes
-                | WorkerRequestOrder::QueryMetrics(_) => {
+                | WorkerOrder::QueryClusterById { cluster_id: _ }
+                | WorkerOrder::QueryClustersHashes
+                | WorkerOrder::QueryMetrics(_) => {
                     self.query(request_identifier, *proxy_request_order).await
                 }
 
-                WorkerRequestOrder::Logging(logging_filter) => {
-                    self.set_logging_level(logging_filter)
-                }
+                WorkerOrder::Logging(logging_filter) => self.set_logging_level(logging_filter),
                 // we should have something like
                 // ProxyRequestOrder::SoftStop => self.do_something(),
                 // ProxyRequestOrder::HardStop => self.do_nothing_and_return_early(),
@@ -632,9 +629,9 @@ impl CommandServer {
             .sender
             .as_mut()
             .with_context(|| "No sender on new worker".to_string())?
-            .send(WorkerOrder {
+            .send(WorkerRequest {
                 id: format!("UPGRADE-{id}-STATUS"),
-                order: WorkerRequestOrder::Status,
+                order: WorkerOrder::Status,
             })
             .await
             .with_context(|| {
@@ -662,7 +659,7 @@ impl CommandServer {
             let id = format!("{}-return-sockets", request_identifier.client);
             self.in_flight.insert(id.clone(), (sockets_return_tx, 1));
             old_worker
-                .send(id.clone(), WorkerRequestOrder::ReturnListenSockets)
+                .send(id.clone(), WorkerOrder::ReturnListenSockets)
                 .await;
 
             info!("sent ReturnListenSockets to old worker");
@@ -720,7 +717,7 @@ impl CommandServer {
             let softstop_id = format!("{}-softstop", request_identifier.client);
             self.in_flight.insert(softstop_id.clone(), (softstop_tx, 1));
             old_worker
-                .send(softstop_id.clone(), WorkerRequestOrder::SoftStop)
+                .send(softstop_id.clone(), WorkerOrder::SoftStop)
                 .await;
 
             let mut command_tx = self.command_tx.clone();
@@ -944,7 +941,7 @@ impl CommandServer {
             if worker.run_state == RunState::Running {
                 info!("Summoning status of worker {}", worker.id);
                 worker
-                    .send(worker_request_id.clone(), WorkerRequestOrder::Status)
+                    .send(worker_request_id.clone(), WorkerOrder::Status)
                     .await;
                 count += 1;
                 self.in_flight
@@ -1015,7 +1012,7 @@ impl CommandServer {
             worker
                 .send(
                     req_id.clone(),
-                    WorkerRequestOrder::ConfigureMetrics(config.clone()),
+                    WorkerOrder::ConfigureMetrics(config.clone()),
                 )
                 .await;
             count += 1;
@@ -1081,7 +1078,7 @@ impl CommandServer {
     pub async fn query(
         &mut self,
         request_identifier: RequestIdentifier,
-        proxy_request_order: WorkerRequestOrder,
+        proxy_request_order: WorkerOrder,
     ) -> anyhow::Result<Option<Success>> {
         debug!("Received this order: {:?}", proxy_request_order);
         let (query_tx, mut query_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
@@ -1108,17 +1105,17 @@ impl CommandServer {
 
         let mut main_query_answer = None;
         match &proxy_request_order {
-            WorkerRequestOrder::QueryClustersHashes => {
+            WorkerOrder::QueryClustersHashes => {
                 main_query_answer = Some(ResponseContent::WorkerClustersHashes(
                     self.state.hash_state(),
                 ));
             }
-            WorkerRequestOrder::QueryClusterById { cluster_id } => {
+            WorkerOrder::QueryClusterById { cluster_id } => {
                 main_query_answer = Some(ResponseContent::WorkerClusters(vec![self
                     .state
                     .cluster_state(cluster_id)]));
             }
-            WorkerRequestOrder::QueryClusterByDomain { hostname, path } => {
+            WorkerOrder::QueryClusterByDomain { hostname, path } => {
                 let cluster_ids =
                     get_cluster_ids_by_domain(&self.state, hostname.clone(), path.clone());
                 let clusters = cluster_ids
@@ -1170,9 +1167,9 @@ impl CommandServer {
                 .collect();
 
             let success = match &proxy_request_order {
-                WorkerRequestOrder::QueryClustersHashes
-                | WorkerRequestOrder::QueryClusterById { cluster_id: _ }
-                | WorkerRequestOrder::QueryClusterByDomain {
+                WorkerOrder::QueryClustersHashes
+                | WorkerOrder::QueryClusterById { cluster_id: _ }
+                | WorkerOrder::QueryClusterByDomain {
                     hostname: _,
                     path: _,
                 } => {
@@ -1180,15 +1177,15 @@ impl CommandServer {
                     proxy_responses_map.insert(String::from("main"), query_answer);
                     Success::Query(ResponseContent::Query(proxy_responses_map))
                 }
-                WorkerRequestOrder::QueryCertificateByDomain(_)
-                | WorkerRequestOrder::QueryCertificateByFingerprint(_) => {
+                WorkerOrder::QueryCertificateByDomain(_)
+                | WorkerOrder::QueryCertificateByFingerprint(_) => {
                     info!(
                         "certificates query answer received: {:?}",
                         proxy_responses_map
                     );
                     Success::Query(ResponseContent::Query(proxy_responses_map))
                 }
-                WorkerRequestOrder::QueryMetrics(options) => {
+                WorkerOrder::QueryMetrics(options) => {
                     debug!("metrics query answer received: {:?}", proxy_responses_map);
 
                     if options.list {
@@ -1226,10 +1223,10 @@ impl CommandServer {
     pub async fn worker_order(
         &mut self,
         request_identifier: RequestIdentifier,
-        order: WorkerRequestOrder,
+        order: WorkerOrder,
         worker_id: Option<u32>,
     ) -> anyhow::Result<Option<Success>> {
-        if let &WorkerRequestOrder::AddCertificate(_) = &order {
+        if let &WorkerOrder::AddCertificate(_) = &order {
             debug!("workerconfig client order AddCertificate()");
         } else {
             debug!("workerconfig client order {:?}", order);
@@ -1240,7 +1237,7 @@ impl CommandServer {
             .with_context(|| "Could not execute order on the state")?;
 
         if self.config.automatic_state_save
-            & (order != WorkerRequestOrder::SoftStop || order != WorkerRequestOrder::HardStop)
+            & (order != WorkerOrder::SoftStop || order != WorkerOrder::HardStop)
         {
             if let Some(path) = self.config.saved_state.clone() {
                 return_processing(
@@ -1283,7 +1280,7 @@ impl CommandServer {
             }
 
             let should_stop_worker =
-                order == WorkerRequestOrder::SoftStop || order == WorkerRequestOrder::HardStop;
+                order == WorkerOrder::SoftStop || order == WorkerOrder::HardStop;
             if should_stop_worker {
                 worker.run_state = RunState::Stopping;
                 stopping_workers.insert(worker.id);
@@ -1298,8 +1295,7 @@ impl CommandServer {
             worker_count += 1;
         }
 
-        let should_stop_main = (order == WorkerRequestOrder::SoftStop
-            || order == WorkerRequestOrder::HardStop)
+        let should_stop_main = (order == WorkerOrder::SoftStop || order == WorkerOrder::HardStop)
             && worker_id.is_none();
 
         let mut command_tx = self.command_tx.clone();
@@ -1379,15 +1375,15 @@ impl CommandServer {
         }
 
         match order {
-            WorkerRequestOrder::AddBackend(_) | WorkerRequestOrder::RemoveBackend(_) => {
+            WorkerOrder::AddBackend(_) | WorkerOrder::RemoveBackend(_) => {
                 self.backends_count = self.state.count_backends()
             }
-            WorkerRequestOrder::AddHttpFrontend(_)
-            | WorkerRequestOrder::AddHttpsFrontend(_)
-            | WorkerRequestOrder::AddTcpFrontend(_)
-            | WorkerRequestOrder::RemoveHttpFrontend(_)
-            | WorkerRequestOrder::RemoveHttpsFrontend(_)
-            | WorkerRequestOrder::RemoveTcpFrontend(_) => {
+            WorkerOrder::AddHttpFrontend(_)
+            | WorkerOrder::AddHttpsFrontend(_)
+            | WorkerOrder::AddTcpFrontend(_)
+            | WorkerOrder::RemoveHttpFrontend(_)
+            | WorkerOrder::RemoveHttpsFrontend(_)
+            | WorkerOrder::RemoveTcpFrontend(_) => {
                 self.frontends_count = self.state.count_frontends()
             }
             _ => {}

@@ -34,7 +34,7 @@ use crate::{
         worker::{
             Backend as CommandLibBackend, Cluster, ListenerType, MessageId, RemoveBackend,
             TcpListenerConfig as CommandTcpListener, WorkerCertificates, WorkerEvent, WorkerOrder,
-            WorkerRequestOrder, WorkerResponse, WorkerResponseStatus,
+            WorkerRequest, WorkerResponse, WorkerResponseStatus,
         },
     },
     tcp,
@@ -45,7 +45,7 @@ use crate::{
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;
 
-pub type ProxyChannel = Channel<WorkerResponse, WorkerOrder>;
+pub type ProxyChannel = Channel<WorkerResponse, WorkerRequest>;
 
 thread_local! {
   pub static QUEUE: RefCell<VecDeque<WorkerResponse>> = RefCell::new(VecDeque::new());
@@ -436,7 +436,7 @@ impl Server {
         if let Some(state) = config_state {
             for (counter, order) in state.generate_orders().iter().enumerate() {
                 let id = format!("INIT-{counter}");
-                let message = WorkerOrder {
+                let message = WorkerRequest {
                     id,
                     order: order.to_owned(),
                 };
@@ -668,7 +668,7 @@ impl Server {
         loop {
             match self.channel.read_message() {
                 Ok(request) => match request.order {
-                    WorkerRequestOrder::HardStop => {
+                    WorkerOrder::HardStop => {
                         let req_id = request.id.clone();
                         self.notify(request);
                         if let Err(e) = self.channel.write_message(&WorkerResponse::ok(req_id)) {
@@ -679,12 +679,12 @@ impl Server {
                         }
                         return true;
                     }
-                    WorkerRequestOrder::SoftStop => {
+                    WorkerOrder::SoftStop => {
                         self.shutting_down = Some(request.id.clone());
                         self.last_sessions_len = self.sessions.borrow().slab.len();
                         self.notify(request);
                     }
-                    WorkerRequestOrder::ReturnListenSockets => {
+                    WorkerOrder::ReturnListenSockets => {
                         info!("received ReturnListenSockets order");
                         self.return_listen_sockets();
                     }
@@ -874,8 +874,8 @@ impl Server {
         }
     }
 
-    fn notify(&mut self, message: WorkerOrder) {
-        if let WorkerRequestOrder::ConfigureMetrics(configuration) = &message.order {
+    fn notify(&mut self, message: WorkerRequest) {
+        if let WorkerOrder::ConfigureMetrics(configuration) = &message.order {
             //let id = message.id.clone();
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).configure(configuration);
@@ -886,7 +886,7 @@ impl Server {
         }
 
         match &message.order {
-            WorkerRequestOrder::QueryClustersHashes => {
+            WorkerOrder::QueryClustersHashes => {
                 push_queue(WorkerResponse {
                     id: message.id.clone(),
                     status: WorkerResponseStatus::Ok,
@@ -896,7 +896,7 @@ impl Server {
                 });
                 return;
             }
-            WorkerRequestOrder::QueryClusterById { cluster_id } => {
+            WorkerOrder::QueryClusterById { cluster_id } => {
                 let response_content = ResponseContent::WorkerClusters(vec![self
                     .config_state
                     .cluster_state(&cluster_id)]);
@@ -907,7 +907,7 @@ impl Server {
                 });
                 return;
             }
-            WorkerRequestOrder::QueryClusterByDomain { hostname, path } => {
+            WorkerOrder::QueryClusterByDomain { hostname, path } => {
                 let cluster_ids =
                     get_cluster_ids_by_domain(&self.config_state, hostname.clone(), path.clone());
                 let clusters = cluster_ids
@@ -922,7 +922,7 @@ impl Server {
                 });
                 return;
             }
-            WorkerRequestOrder::QueryCertificateByFingerprint(f) => {
+            WorkerOrder::QueryCertificateByFingerprint(f) => {
                 push_queue(WorkerResponse {
                     id: message.id.clone(),
                     status: WorkerResponseStatus::Ok,
@@ -932,7 +932,7 @@ impl Server {
                 });
                 return;
             }
-            WorkerRequestOrder::QueryMetrics(query_metrics_options) => {
+            WorkerOrder::QueryMetrics(query_metrics_options) => {
                 METRICS.with(|metrics| {
                     let data = (*metrics.borrow_mut()).query(&query_metrics_options);
 
@@ -950,7 +950,7 @@ impl Server {
         self.notify_proxys(message);
     }
 
-    pub fn notify_proxys(&mut self, request: WorkerOrder) {
+    pub fn notify_proxys(&mut self, request: WorkerRequest) {
         if let Err(e) = self.config_state.dispatch(&request.order) {
             error!("Could not execute order on config state: {:#}", e);
         }
@@ -958,15 +958,15 @@ impl Server {
         let req_id = request.id.clone();
 
         match request.order {
-            WorkerRequestOrder::AddCluster(ref cluster) => {
+            WorkerOrder::AddCluster(ref cluster) => {
                 self.add_cluster(cluster);
                 //not returning because the message must still be handled by each proxy
             }
-            WorkerRequestOrder::AddBackend(ref backend) => {
+            WorkerOrder::AddBackend(ref backend) => {
                 push_queue(self.add_backend(&req_id, backend));
                 return;
             }
-            WorkerRequestOrder::RemoveBackend(ref remove_backend) => {
+            WorkerOrder::RemoveBackend(ref remove_backend) => {
                 push_queue(self.remove_backend(&req_id, remove_backend));
                 return;
             }
@@ -986,16 +986,16 @@ impl Server {
 
         match request.order {
             // special case for adding listeners, because we need to register a listener
-            WorkerRequestOrder::AddHttpListener(ref listener) => {
+            WorkerOrder::AddHttpListener(ref listener) => {
                 push_queue(self.notify_add_http_listener(&req_id, listener));
             }
-            WorkerRequestOrder::AddHttpsListener(ref listener) => {
+            WorkerOrder::AddHttpsListener(ref listener) => {
                 push_queue(self.notify_add_https_listener(&req_id, listener));
             }
-            WorkerRequestOrder::AddTcpListener(listener) => {
+            WorkerOrder::AddTcpListener(listener) => {
                 push_queue(self.notify_add_tcp_listener(&req_id, listener));
             }
-            WorkerRequestOrder::RemoveListener(ref remove) => {
+            WorkerOrder::RemoveListener(ref remove) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
                 let response = match remove.proxy {
@@ -1005,10 +1005,10 @@ impl Server {
                 };
                 push_queue(response);
             }
-            WorkerRequestOrder::ActivateListener(ref activate) => {
+            WorkerOrder::ActivateListener(ref activate) => {
                 push_queue(self.notify_activate_listener(&req_id, activate));
             }
-            WorkerRequestOrder::DeactivateListener(ref deactivate) => {
+            WorkerOrder::DeactivateListener(ref deactivate) => {
                 push_queue(self.notify_deactivate_listener(&req_id, deactivate));
             }
             _other_order => {}

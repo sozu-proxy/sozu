@@ -75,14 +75,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&worker::WorkerOrder {
+    command.write_message(&worker::WorkerRequest {
         id: String::from("ID_ABCD"),
-        order: worker::WorkerRequestOrder::AddHttpFrontend(http_front),
+        order: worker::WorkerOrder::AddHttpFrontend(http_front),
     });
 
-    command.write_message(&worker::WorkerOrder {
+    command.write_message(&worker::WorkerRequest {
         id: String::from("ID_EFGH"),
-        order: worker::WorkerRequestOrder::AddBackend(http_backend),
+        order: worker::WorkerOrder::AddBackend(http_backend),
     });
 
     println!("HTTP -> {:?}", command.read_message());

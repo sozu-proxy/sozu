@@ -23,7 +23,7 @@ use crate::{
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
         worker::{
-            Cluster, HttpFrontend, HttpListenerConfig, Route, WorkerOrder, WorkerRequestOrder,
+            Cluster, HttpFrontend, HttpListenerConfig, Route, WorkerOrder, WorkerRequest,
             WorkerResponse,
         },
     },
@@ -783,37 +783,37 @@ impl HttpListener {
 }
 
 impl ProxyConfiguration for HttpProxy {
-    fn notify(&mut self, request: WorkerOrder) -> WorkerResponse {
+    fn notify(&mut self, request: WorkerRequest) -> WorkerResponse {
         let request_id = request.id.clone();
 
         let result = match request.order {
-            WorkerRequestOrder::AddCluster(cluster) => {
+            WorkerOrder::AddCluster(cluster) => {
                 info!("{} add cluster {:?}", request.id, cluster);
                 self.add_cluster(cluster.clone())
                     .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
-            WorkerRequestOrder::RemoveCluster { cluster_id } => {
+            WorkerOrder::RemoveCluster { cluster_id } => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
                     .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
-            WorkerRequestOrder::AddHttpFrontend(front) => {
+            WorkerOrder::AddHttpFrontend(front) => {
                 info!("{} add front {:?}", request_id, front);
                 self.add_http_frontend(front)
                     .with_context(|| "Could not add http frontend")
             }
-            WorkerRequestOrder::RemoveHttpFrontend(front) => {
+            WorkerOrder::RemoveHttpFrontend(front) => {
                 info!("{} remove front {:?}", request_id, front);
                 self.remove_http_frontend(front)
                     .with_context(|| "Could not remove http frontend")
             }
-            WorkerRequestOrder::RemoveListener(remove) => {
+            WorkerOrder::RemoveListener(remove) => {
                 info!("removing HTTP listener at address {:?}", remove.address);
                 self.remove_listener(remove.clone()).with_context(|| {
                     format!("Could not remove listener at address {:?}", remove.address)
                 })
             }
-            WorkerRequestOrder::SoftStop => {
+            WorkerOrder::SoftStop => {
                 info!("{} processing soft shutdown", request_id);
                 match self
                     .soft_stop()
@@ -826,7 +826,7 @@ impl ProxyConfiguration for HttpProxy {
                     Err(e) => Err(e),
                 }
             }
-            WorkerRequestOrder::HardStop => {
+            WorkerOrder::HardStop => {
                 info!("{} processing hard shutdown", request_id);
                 match self
                     .hard_stop()
@@ -839,11 +839,11 @@ impl ProxyConfiguration for HttpProxy {
                     Err(e) => Err(e),
                 }
             }
-            WorkerRequestOrder::Status => {
+            WorkerOrder::Status => {
                 info!("{} status", request_id);
                 Ok(())
             }
-            WorkerRequestOrder::Logging(logging_filter) => {
+            WorkerOrder::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     request_id, logging_filter
@@ -1086,7 +1086,7 @@ mod tests {
     use crate::sozu_command::channel::Channel;
     use crate::sozu_command::worker::{
         Backend, HttpFrontend, HttpListenerConfig, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, Route, RulePosition, WorkerOrder, WorkerRequestOrder,
+        PathRule, Route, RulePosition, WorkerOrder, WorkerRequest,
     };
     use std::io::{Read, Write};
     use std::net::SocketAddr;
@@ -1140,9 +1140,9 @@ mod tests {
             tags: None,
         };
         command
-            .write_message(&WorkerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                order: WorkerRequestOrder::AddHttpFrontend(front),
+                order: WorkerOrder::AddHttpFrontend(front),
             })
             .unwrap();
         let backend = Backend {
@@ -1154,9 +1154,9 @@ mod tests {
             backup: None,
         };
         command
-            .write_message(&WorkerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                order: WorkerRequestOrder::AddBackend(backend),
+                order: WorkerOrder::AddBackend(backend),
             })
             .unwrap();
 
@@ -1228,9 +1228,9 @@ mod tests {
             tags: None,
         };
         command
-            .write_message(&WorkerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                order: WorkerRequestOrder::AddHttpFrontend(front),
+                order: WorkerOrder::AddHttpFrontend(front),
             })
             .unwrap();
         let backend = Backend {
@@ -1242,9 +1242,9 @@ mod tests {
             sticky_id: None,
         };
         command
-            .write_message(&WorkerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                order: WorkerRequestOrder::AddBackend(backend),
+                order: WorkerOrder::AddBackend(backend),
             })
             .unwrap();
 
@@ -1341,9 +1341,9 @@ mod tests {
             sticky_session: false,
         };
         command
-            .write_message(&WorkerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                order: WorkerRequestOrder::AddCluster(cluster),
+                order: WorkerOrder::AddCluster(cluster),
             })
             .unwrap();
         let front = HttpFrontend {
@@ -1356,9 +1356,9 @@ mod tests {
             tags: None,
         };
         command
-            .write_message(&WorkerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                order: WorkerRequestOrder::AddHttpFrontend(front),
+                order: WorkerOrder::AddHttpFrontend(front),
             })
             .unwrap();
         let backend = Backend {
@@ -1370,9 +1370,9 @@ mod tests {
             sticky_id: None,
         };
         command
-            .write_message(&WorkerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_IJKL"),
-                order: WorkerRequestOrder::AddBackend(backend),
+                order: WorkerOrder::AddBackend(backend),
             })
             .unwrap();
 

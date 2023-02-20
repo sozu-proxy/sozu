@@ -40,8 +40,7 @@ use crate::{
         scm_socket::ScmSocket,
         state::ClusterId,
         worker::{
-            TcpFrontend, TcpListenerConfig, WorkerEvent, WorkerOrder, WorkerRequestOrder,
-            WorkerResponse,
+            TcpFrontend, TcpListenerConfig, WorkerEvent, WorkerOrder, WorkerRequest, WorkerResponse,
         },
     },
     timer::TimeoutContainer,
@@ -1321,23 +1320,23 @@ impl TcpProxy {
 }
 
 impl ProxyConfiguration for TcpProxy {
-    fn notify(&mut self, message: WorkerOrder) -> WorkerResponse {
+    fn notify(&mut self, message: WorkerRequest) -> WorkerResponse {
         match message.order {
-            WorkerRequestOrder::AddTcpFrontend(front) => {
+            WorkerOrder::AddTcpFrontend(front) => {
                 if let Err(err) = self.add_tcp_front(front) {
                     return WorkerResponse::error(message.id, err);
                 }
 
                 WorkerResponse::ok(message.id)
             }
-            WorkerRequestOrder::RemoveTcpFrontend(front) => {
+            WorkerOrder::RemoveTcpFrontend(front) => {
                 if let Err(err) = self.remove_tcp_front(&front) {
                     return WorkerResponse::error(message.id, err);
                 }
 
                 WorkerResponse::ok(message.id)
             }
-            WorkerRequestOrder::SoftStop => {
+            WorkerOrder::SoftStop => {
                 info!("{} processing soft shutdown", message.id);
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.iter() {
@@ -1348,7 +1347,7 @@ impl ProxyConfiguration for TcpProxy {
                 }
                 WorkerResponse::processing(message.id)
             }
-            WorkerRequestOrder::HardStop => {
+            WorkerOrder::HardStop => {
                 info!("{} hard shutdown", message.id);
                 let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.drain() {
@@ -1359,11 +1358,11 @@ impl ProxyConfiguration for TcpProxy {
                 }
                 WorkerResponse::ok(message.id)
             }
-            WorkerRequestOrder::Status => {
+            WorkerOrder::Status => {
                 info!("{} status", message.id);
                 WorkerResponse::ok(message.id)
             }
-            WorkerRequestOrder::Logging(logging_filter) => {
+            WorkerOrder::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     message.id, logging_filter
@@ -1374,7 +1373,7 @@ impl ProxyConfiguration for TcpProxy {
                 });
                 WorkerResponse::ok(message.id)
             }
-            WorkerRequestOrder::AddCluster(cluster) => {
+            WorkerOrder::AddCluster(cluster) => {
                 let config = ClusterConfiguration {
                     proxy_protocol: cluster.proxy_protocol,
                     //load_balancing: cluster.load_balancing,
@@ -1382,11 +1381,11 @@ impl ProxyConfiguration for TcpProxy {
                 self.configs.insert(cluster.cluster_id, config);
                 WorkerResponse::ok(message.id)
             }
-            WorkerRequestOrder::RemoveCluster { cluster_id } => {
+            WorkerOrder::RemoveCluster { cluster_id } => {
                 self.configs.remove(&cluster_id);
                 WorkerResponse::ok(message.id)
             }
-            WorkerRequestOrder::RemoveListener(remove) => {
+            WorkerOrder::RemoveListener(remove) => {
                 if !self.remove_listener(remove.address) {
                     WorkerResponse::error(
                         message.id,
@@ -1734,7 +1733,7 @@ mod tests {
     }
 
     /// used in tests only
-    pub fn start_proxy() -> anyhow::Result<Channel<WorkerOrder, WorkerResponse>> {
+    pub fn start_proxy() -> anyhow::Result<Channel<WorkerRequest, WorkerResponse>> {
         use crate::server;
 
         info!("listen for connections");
@@ -1862,15 +1861,15 @@ mod tests {
             };
 
             command
-                .write_message(&WorkerOrder {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO1"),
-                    order: WorkerRequestOrder::AddTcpFrontend(front),
+                    order: WorkerOrder::AddTcpFrontend(front),
                 })
                 .unwrap();
             command
-                .write_message(&WorkerOrder {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO2"),
-                    order: WorkerRequestOrder::AddBackend(backend),
+                    order: WorkerOrder::AddBackend(backend),
                 })
                 .unwrap();
         }
@@ -1893,15 +1892,15 @@ mod tests {
                 backup: None,
             };
             command
-                .write_message(&WorkerOrder {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO3"),
-                    order: WorkerRequestOrder::AddTcpFrontend(front),
+                    order: WorkerOrder::AddTcpFrontend(front),
                 })
                 .unwrap();
             command
-                .write_message(&WorkerOrder {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO4"),
-                    order: WorkerRequestOrder::AddBackend(backend),
+                    order: WorkerOrder::AddBackend(backend),
                 })
                 .unwrap();
         }

@@ -9,7 +9,7 @@ use crate::{
     worker::{
         AggregatedMetrics, ClusterInformation, HttpFrontend, HttpListenerConfig,
         HttpsListenerConfig, TcpFrontend, TcpListenerConfig, WorkerCertificates, WorkerEvent,
-        WorkerMetrics, WorkerRequestOrder,
+        WorkerMetrics, WorkerOrder,
     },
 };
 
@@ -20,7 +20,7 @@ pub const PROTOCOL_VERSION: u8 = 0;
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandRequestOrder {
     /// an order to forward to workers
-    Worker(Box<WorkerRequestOrder>),
+    Worker(Box<WorkerOrder>),
     /// save Sōzu's parseable state as a file
     SaveState {
         path: String,
@@ -227,7 +227,7 @@ mod tests {
         AddCertificate, AllWorkerMetrics, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
         LoadBalancingParams, PathRule, Percentiles, RemoveBackend, RemoveCertificate, Route,
-        RulePosition, TlsVersion, WorkerMetrics, WorkerRequestOrder,
+        RulePosition, TlsVersion, WorkerMetrics, WorkerOrder,
     };
     use hex::FromHex;
     use serde_json;
@@ -239,17 +239,15 @@ mod tests {
         println!("{message:?}");
         assert_eq!(
             message.order,
-            CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddHttpFrontend(
-                HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
-                    hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
-                    method: None,
-                    address: "0.0.0.0:8080".parse().unwrap(),
-                    position: RulePosition::Tree,
-                    tags: None,
-                }
-            )))
+            CommandRequestOrder::Worker(Box::new(WorkerOrder::AddHttpFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("xxx")),
+                hostname: String::from("yyy"),
+                path: PathRule::Prefix(String::from("xxx")),
+                method: None,
+                address: "0.0.0.0:8080".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: None,
+            })))
         );
     }
 
@@ -262,7 +260,7 @@ mod tests {
         let pretty_print = serde_json::to_string_pretty(&$expected_message).expect("should have serialized");
         assert_eq!(&pretty_print, data, "\nserialized message:\n{}\n\nexpected message:\n{}", pretty_print, data);
 
-        let message: CommandRequest = serde_json::from_str(data).unwrap();
+        let message: Request = serde_json::from_str(data).unwrap();
         assert_eq!(message, $expected_message, "\ndeserialized message:\n{:#?}\n\nexpected message:\n{:#?}", message, $expected_message);
 
       }
@@ -293,7 +291,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddCluster(Cluster {
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddCluster(Cluster {
                 cluster_id: String::from("xxx"),
                 sticky_session: true,
                 https_redirect: true,
@@ -312,7 +310,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveCluster {
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::RemoveCluster {
                 cluster_id: String::from("xxx")
             })),
             worker_id: None
@@ -325,7 +323,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddHttpFrontend(
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddHttpFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -346,7 +344,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveHttpFrontend(
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::RemoveHttpFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -373,7 +371,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddHttpsFrontend(
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddHttpsFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -394,7 +392,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveHttpsFrontend(
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::RemoveHttpsFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -425,7 +423,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddCertificate(
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddCertificate(
                 AddCertificate {
                     address: "0.0.0.0:443".parse().unwrap(),
                     certificate: CertificateAndKey {
@@ -448,7 +446,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveCertificate(
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::RemoveCertificate(
                 RemoveCertificate {
                     address: "0.0.0.0:443".parse().unwrap(),
                     fingerprint: CertificateFingerprint(
@@ -469,7 +467,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddBackend(Backend {
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("xxx"),
                 backend_id: String::from("xxx-0"),
                 address: "127.0.0.1:8080".parse().unwrap(),
@@ -487,7 +485,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveBackend(
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::RemoveBackend(
                 RemoveBackend {
                     cluster_id: String::from("xxx"),
                     backend_id: String::from("xxx-0"),
@@ -504,7 +502,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::SoftStop)),
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::SoftStop)),
             worker_id: Some(0),
         }
     );
@@ -515,7 +513,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::HardStop)),
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::HardStop)),
             worker_id: Some(0),
         }
     );
@@ -526,7 +524,7 @@ mod tests {
         Request {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::Status)),
+            order: CommandRequestOrder::Worker(Box::new(WorkerOrder::Status)),
             worker_id: Some(0),
         }
     );

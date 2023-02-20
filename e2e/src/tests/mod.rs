@@ -6,7 +6,7 @@ use sozu_command_lib::{
     config::Config,
     scm_socket::Listeners,
     state::ConfigState,
-    worker::{ActivateListener, ListenerType, WorkerRequestOrder},
+    worker::{ActivateListener, ListenerType, WorkerOrder},
 };
 
 use crate::{
@@ -42,27 +42,28 @@ pub fn setup_test<S: Into<String>>(
 ) -> (Worker, Vec<SocketAddr>) {
     let mut worker = Worker::start_new_worker(name, config, &listeners, state);
 
-    worker.send_proxy_request(WorkerRequestOrder::AddHttpListener(
-        Worker::default_http_listener(front_address),
-    ));
-    worker.send_proxy_request(WorkerRequestOrder::ActivateListener(ActivateListener {
+    worker.send_proxy_request(WorkerOrder::AddHttpListener(Worker::default_http_listener(
+        front_address,
+    )));
+    worker.send_proxy_request(WorkerOrder::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::HTTP,
         from_scm: false,
     }));
-    worker.send_proxy_request(WorkerRequestOrder::AddCluster(Worker::default_cluster(
+    worker.send_proxy_request(WorkerOrder::AddCluster(Worker::default_cluster(
         "cluster_0",
     )));
-    worker.send_proxy_request(WorkerRequestOrder::AddHttpFrontend(
-        Worker::default_http_frontend("cluster_0", front_address),
-    ));
+    worker.send_proxy_request(WorkerOrder::AddHttpFrontend(Worker::default_http_frontend(
+        "cluster_0",
+        front_address,
+    )));
 
     let mut backends = Vec::new();
     for i in 0..nb_backends {
         let back_address = format!("127.0.0.1:{}", 2002 + i)
             .parse()
             .expect("could not parse back address");
-        worker.send_proxy_request(WorkerRequestOrder::AddBackend(Worker::default_backend(
+        worker.send_proxy_request(WorkerOrder::AddBackend(Worker::default_backend(
             "cluster_0",
             format!("cluster_0-{i}"),
             back_address,

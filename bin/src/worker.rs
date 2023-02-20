@@ -37,7 +37,7 @@ use sozu_command_lib::{
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
-    worker::{WorkerOrder, WorkerRequestOrder, WorkerResponse},
+    worker::{WorkerOrder, WorkerRequest, WorkerResponse},
 };
 
 use crate::{command::Worker, logging, util};
@@ -69,9 +69,9 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
             }
 
             worker_channel
-                .write_message(&WorkerOrder {
+                .write_message(&WorkerRequest {
                     id: format!("start-status-{index}"),
-                    order: WorkerRequestOrder::Status,
+                    order: WorkerOrder::Status,
                 })
                 .with_context(|| "Could not send status request to the worker")?;
 
@@ -165,7 +165,7 @@ pub fn begin_worker_process(
         error!("Could not unblock the worker-to-main channel: {}", e);
     }
 
-    let mut worker_to_main_channel: Channel<WorkerResponse, WorkerOrder> =
+    let mut worker_to_main_channel: Channel<WorkerResponse, WorkerRequest> =
         worker_to_main_channel.into();
     worker_to_main_channel.readiness.insert(Ready::readable());
 
@@ -208,7 +208,7 @@ pub fn fork_main_into_worker(
     executable_path: String,
     state: &ConfigState,
     listeners: Option<Listeners>,
-) -> anyhow::Result<(pid_t, Channel<WorkerOrder, WorkerResponse>, ScmSocket)> {
+) -> anyhow::Result<(pid_t, Channel<WorkerRequest, WorkerResponse>, ScmSocket)> {
     trace!("parent({})", unsafe { libc::getpid() });
 
     let mut state_file =

@@ -19,8 +19,7 @@ use crate::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, ClusterInformation, DeactivateListener, HttpFrontend, HttpListenerConfig,
         HttpsListenerConfig, ListenerType, PathRule, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, Route, TcpFrontend, TcpListenerConfig,
-        WorkerRequestOrder,
+        RemoveListener, ReplaceCertificate, Route, TcpFrontend, TcpListenerConfig, WorkerOrder,
     },
 };
 
@@ -77,82 +76,82 @@ impl ConfigState {
         self.https_addresses.push(address)
     }
 
-    pub fn dispatch(&mut self, order: &WorkerRequestOrder) -> anyhow::Result<()> {
+    pub fn dispatch(&mut self, order: &WorkerOrder) -> anyhow::Result<()> {
         match order {
-            WorkerRequestOrder::AddCluster(cluster) => self
+            WorkerOrder::AddCluster(cluster) => self
                 .add_cluster(cluster)
                 .with_context(|| "Could not add cluster"),
-            WorkerRequestOrder::RemoveCluster { cluster_id } => self
+            WorkerOrder::RemoveCluster { cluster_id } => self
                 .remove_cluster(cluster_id)
                 .with_context(|| "Could not remove cluster"),
-            WorkerRequestOrder::AddHttpListener(listener) => self
+            WorkerOrder::AddHttpListener(listener) => self
                 .add_http_listener(listener)
                 .with_context(|| "Could not add HTTP listener"),
-            WorkerRequestOrder::AddHttpsListener(listener) => self
+            WorkerOrder::AddHttpsListener(listener) => self
                 .add_https_listener(listener)
                 .with_context(|| "Could not add HTTPS listener"),
-            WorkerRequestOrder::AddTcpListener(listener) => self
+            WorkerOrder::AddTcpListener(listener) => self
                 .add_tcp_listener(listener)
                 .with_context(|| "Could not add TCP listener"),
-            WorkerRequestOrder::RemoveListener(remove) => self
+            WorkerOrder::RemoveListener(remove) => self
                 .remove_listener(remove)
                 .with_context(|| "Could not remove listener"),
-            WorkerRequestOrder::ActivateListener(activate) => self
+            WorkerOrder::ActivateListener(activate) => self
                 .activate_listener(activate)
                 .with_context(|| "Could not activate listener"),
-            WorkerRequestOrder::DeactivateListener(deactivate) => self
+            WorkerOrder::DeactivateListener(deactivate) => self
                 .deactivate_listener(deactivate)
                 .with_context(|| "Could not deactivate listener"),
-            WorkerRequestOrder::AddHttpFrontend(front) => self
+            WorkerOrder::AddHttpFrontend(front) => self
                 .add_http_frontend(front)
                 .with_context(|| "Could not add HTTP frontend"),
-            WorkerRequestOrder::RemoveHttpFrontend(front) => self
+            WorkerOrder::RemoveHttpFrontend(front) => self
                 .remove_http_frontend(front)
                 .with_context(|| "Could not remove HTTP frontend"),
-            WorkerRequestOrder::AddCertificate(add) => self
+            WorkerOrder::AddCertificate(add) => self
                 .add_certificate(add)
                 .with_context(|| "Could not add certificate"),
-            WorkerRequestOrder::RemoveCertificate(remove) => self
+            WorkerOrder::RemoveCertificate(remove) => self
                 .remove_certificate(remove)
                 .with_context(|| "Could not remove certificate"),
-            WorkerRequestOrder::ReplaceCertificate(replace) => self
+            WorkerOrder::ReplaceCertificate(replace) => self
                 .replace_certificate(replace)
                 .with_context(|| "Could not replace certificate"),
-            WorkerRequestOrder::AddHttpsFrontend(front) => self
+            WorkerOrder::AddHttpsFrontend(front) => self
                 .add_http_frontend(front)
                 .with_context(|| "Could not add HTTPS frontend"),
-            WorkerRequestOrder::RemoveHttpsFrontend(front) => self
+            WorkerOrder::RemoveHttpsFrontend(front) => self
                 .remove_http_frontend(front)
                 .with_context(|| "Could not remove HTTPS frontend"),
-            WorkerRequestOrder::AddTcpFrontend(front) => self
+            WorkerOrder::AddTcpFrontend(front) => self
                 .add_tcp_frontend(front)
                 .with_context(|| "Could not add TCP frontend"),
-            WorkerRequestOrder::RemoveTcpFrontend(front) => self
+            WorkerOrder::RemoveTcpFrontend(front) => self
                 .remove_tcp_frontend(front)
                 .with_context(|| "Could not remove TCP frontend"),
-            WorkerRequestOrder::AddBackend(backend) => self
+            WorkerOrder::AddBackend(backend) => self
                 .add_backend(backend)
                 .with_context(|| "Could not add backend"),
-            WorkerRequestOrder::RemoveBackend(backend) => self
+            WorkerOrder::RemoveBackend(backend) => self
                 .remove_backend(backend)
                 .with_context(|| "Could not remove backend"),
             // This is to avoid the error message
-            &WorkerRequestOrder::Logging(_)
-            | &WorkerRequestOrder::Status
-            | &WorkerRequestOrder::SoftStop
-            | &WorkerRequestOrder::QueryClusterById { cluster_id: _ }
-            | &WorkerRequestOrder::QueryClusterByDomain {
+            &WorkerOrder::Logging(_)
+            | &WorkerOrder::Status
+            | &WorkerOrder::SoftStop
+            | &WorkerOrder::QueryClusterById { cluster_id: _ }
+            | &WorkerOrder::QueryClusterByDomain {
                 hostname: _,
                 path: _,
             }
-            | &WorkerRequestOrder::QueryAllCertificates
-            | &WorkerRequestOrder::QueryCertificateByDomain(_)
-            | &WorkerRequestOrder::QueryCertificateByFingerprint(_)
-            | &WorkerRequestOrder::QueryMetrics(_)
-            | &WorkerRequestOrder::QueryClustersHashes
-            | &WorkerRequestOrder::ConfigureMetrics(_)
-            | &WorkerRequestOrder::ReturnListenSockets
-            | &WorkerRequestOrder::HardStop => Ok(()),
+            | &WorkerOrder::QueryAllCertificates
+            | &WorkerOrder::QueryCertificateByDomain(_)
+            | &WorkerOrder::QueryCertificateByFingerprint(_)
+            | &WorkerOrder::QueryMetrics(_)
+            | &WorkerOrder::QueryClustersHashes
+            | &WorkerOrder::ConfigureMetrics(_)
+            | &WorkerOrder::ReturnListenSockets
+            | &WorkerOrder::HardStop => Ok(()),
         }
     }
 
@@ -456,13 +455,13 @@ impl ConfigState {
         Ok(())
     }
 
-    pub fn generate_orders(&self) -> Vec<WorkerRequestOrder> {
+    pub fn generate_orders(&self) -> Vec<WorkerOrder> {
         let mut v = Vec::new();
 
         for &(ref listener, active) in self.http_listeners.values() {
-            v.push(WorkerRequestOrder::AddHttpListener(listener.clone()));
+            v.push(WorkerOrder::AddHttpListener(listener.clone()));
             if active {
-                v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+                v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
@@ -471,9 +470,9 @@ impl ConfigState {
         }
 
         for &(ref listener, active) in self.https_listeners.values() {
-            v.push(WorkerRequestOrder::AddHttpsListener(listener.clone()));
+            v.push(WorkerOrder::AddHttpsListener(listener.clone()));
             if active {
-                v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+                v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
@@ -482,9 +481,9 @@ impl ConfigState {
         }
 
         for &(ref listener, active) in self.tcp_listeners.values() {
-            v.push(WorkerRequestOrder::AddTcpListener(listener.clone()));
+            v.push(WorkerOrder::AddTcpListener(listener.clone()));
             if active {
-                v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+                v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -493,16 +492,16 @@ impl ConfigState {
         }
 
         for cluster in self.clusters.values() {
-            v.push(WorkerRequestOrder::AddCluster(cluster.clone()));
+            v.push(WorkerOrder::AddCluster(cluster.clone()));
         }
 
         for front in self.http_fronts.values() {
-            v.push(WorkerRequestOrder::AddHttpFrontend(front.clone()));
+            v.push(WorkerOrder::AddHttpFrontend(front.clone()));
         }
 
         for (front, certs) in self.certificates.iter() {
             for (certificate_and_key, names) in certs.values() {
-                v.push(WorkerRequestOrder::AddCertificate(AddCertificate {
+                v.push(WorkerOrder::AddCertificate(AddCertificate {
                     address: *front,
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
@@ -512,25 +511,25 @@ impl ConfigState {
         }
 
         for front in self.https_fronts.values() {
-            v.push(WorkerRequestOrder::AddHttpsFrontend(front.clone()));
+            v.push(WorkerOrder::AddHttpsFrontend(front.clone()));
         }
 
         for front_list in self.tcp_fronts.values() {
             for front in front_list {
-                v.push(WorkerRequestOrder::AddTcpFrontend(front.clone()));
+                v.push(WorkerOrder::AddTcpFrontend(front.clone()));
             }
         }
 
         for backend_list in self.backends.values() {
             for backend in backend_list {
-                v.push(WorkerRequestOrder::AddBackend(backend.clone()));
+                v.push(WorkerOrder::AddBackend(backend.clone()));
             }
         }
 
         v
     }
 
-    pub fn generate_activate_orders(&self) -> Vec<WorkerRequestOrder> {
+    pub fn generate_activate_orders(&self) -> Vec<WorkerOrder> {
         let mut v = Vec::new();
         for front in self
             .http_listeners
@@ -538,7 +537,7 @@ impl ConfigState {
             .filter(|(_, t)| t.1)
             .map(|(k, _)| k)
         {
-            v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+            v.push(WorkerOrder::ActivateListener(ActivateListener {
                 address: *front,
                 proxy: ListenerType::HTTP,
                 from_scm: false,
@@ -551,7 +550,7 @@ impl ConfigState {
             .filter(|(_, t)| t.1)
             .map(|(k, _)| k)
         {
-            v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+            v.push(WorkerOrder::ActivateListener(ActivateListener {
                 address: *front,
                 proxy: ListenerType::HTTPS,
                 from_scm: false,
@@ -563,7 +562,7 @@ impl ConfigState {
             .filter(|(_, t)| t.1)
             .map(|(k, _)| k)
         {
-            v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+            v.push(WorkerOrder::ActivateListener(ActivateListener {
                 address: *front,
                 proxy: ListenerType::TCP,
                 from_scm: false,
@@ -573,7 +572,7 @@ impl ConfigState {
         v
     }
 
-    pub fn diff(&self, other: &ConfigState) -> Vec<WorkerRequestOrder> {
+    pub fn diff(&self, other: &ConfigState) -> Vec<WorkerOrder> {
         //pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
         let my_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
         let their_tcp_listeners: HashSet<&SocketAddr> = other.tcp_listeners.keys().collect();
@@ -594,26 +593,26 @@ impl ConfigState {
 
         for address in removed_tcp_listeners {
             if self.tcp_listeners[address].1 {
-                v.push(WorkerRequestOrder::DeactivateListener(DeactivateListener {
+                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::TCP,
                     to_scm: false,
                 }));
             }
 
-            v.push(WorkerRequestOrder::RemoveListener(RemoveListener {
+            v.push(WorkerOrder::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::TCP,
             }));
         }
 
         for address in added_tcp_listeners.clone() {
-            v.push(WorkerRequestOrder::AddTcpListener(
+            v.push(WorkerOrder::AddTcpListener(
                 other.tcp_listeners[address].0.clone(),
             ));
 
             if other.tcp_listeners[address].1 {
-                v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+                v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -623,26 +622,26 @@ impl ConfigState {
 
         for address in removed_http_listeners {
             if self.http_listeners[address].1 {
-                v.push(WorkerRequestOrder::DeactivateListener(DeactivateListener {
+                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::HTTP,
                     to_scm: false,
                 }));
             }
 
-            v.push(WorkerRequestOrder::RemoveListener(RemoveListener {
+            v.push(WorkerOrder::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::HTTP,
             }));
         }
 
         for address in added_http_listeners.clone() {
-            v.push(WorkerRequestOrder::AddHttpListener(
+            v.push(WorkerOrder::AddHttpListener(
                 other.http_listeners[address].0.clone(),
             ));
 
             if other.http_listeners[address].1 {
-                v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+                v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
@@ -652,26 +651,26 @@ impl ConfigState {
 
         for address in removed_https_listeners {
             if self.https_listeners[address].1 {
-                v.push(WorkerRequestOrder::DeactivateListener(DeactivateListener {
+                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::HTTPS,
                     to_scm: false,
                 }));
             }
 
-            v.push(WorkerRequestOrder::RemoveListener(RemoveListener {
+            v.push(WorkerOrder::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::HTTPS,
             }));
         }
 
         for address in added_https_listeners.clone() {
-            v.push(WorkerRequestOrder::AddHttpsListener(
+            v.push(WorkerOrder::AddHttpsListener(
                 other.https_listeners[address].0.clone(),
             ));
 
             if other.https_listeners[address].1 {
-                v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+                v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
@@ -684,16 +683,16 @@ impl ConfigState {
             let (their_listener, their_active) = &other.tcp_listeners[addr];
 
             if my_listener != their_listener {
-                v.push(WorkerRequestOrder::RemoveListener(RemoveListener {
+                v.push(WorkerOrder::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                 }));
 
-                v.push(WorkerRequestOrder::AddTcpListener(their_listener.clone()));
+                v.push(WorkerOrder::AddTcpListener(their_listener.clone()));
             }
 
             if *my_active && !*their_active {
-                v.push(WorkerRequestOrder::DeactivateListener(DeactivateListener {
+                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                     to_scm: false,
@@ -701,7 +700,7 @@ impl ConfigState {
             }
 
             if !*my_active && *their_active {
-                v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+                v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -714,16 +713,16 @@ impl ConfigState {
             let (their_listener, their_active) = &other.http_listeners[addr];
 
             if my_listener != their_listener {
-                v.push(WorkerRequestOrder::RemoveListener(RemoveListener {
+                v.push(WorkerOrder::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                 }));
 
-                v.push(WorkerRequestOrder::AddHttpListener(their_listener.clone()));
+                v.push(WorkerOrder::AddHttpListener(their_listener.clone()));
             }
 
             if *my_active && !*their_active {
-                v.push(WorkerRequestOrder::DeactivateListener(DeactivateListener {
+                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                     to_scm: false,
@@ -731,7 +730,7 @@ impl ConfigState {
             }
 
             if !*my_active && *their_active {
-                v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+                v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
@@ -744,16 +743,16 @@ impl ConfigState {
             let (their_listener, their_active) = &other.https_listeners[addr];
 
             if my_listener != their_listener {
-                v.push(WorkerRequestOrder::RemoveListener(RemoveListener {
+                v.push(WorkerOrder::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                 }));
 
-                v.push(WorkerRequestOrder::AddHttpsListener(their_listener.clone()));
+                v.push(WorkerOrder::AddHttpsListener(their_listener.clone()));
             }
 
             if *my_active && !*their_active {
-                v.push(WorkerRequestOrder::DeactivateListener(DeactivateListener {
+                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                     to_scm: false,
@@ -761,7 +760,7 @@ impl ConfigState {
             }
 
             if !*my_active && *their_active {
-                v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+                v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
@@ -771,10 +770,10 @@ impl ConfigState {
 
         for (cluster_id, res) in diff_map(self.clusters.iter(), other.clusters.iter()) {
             match res {
-                DiffResult::Added | DiffResult::Changed => v.push(WorkerRequestOrder::AddCluster(
+                DiffResult::Added | DiffResult::Changed => v.push(WorkerOrder::AddCluster(
                     other.clusters.get(cluster_id).unwrap().clone(),
                 )),
-                DiffResult::Removed => v.push(WorkerRequestOrder::RemoveCluster {
+                DiffResult::Removed => v.push(WorkerOrder::RemoveCluster {
                     cluster_id: cluster_id.to_string(),
                 }),
             }
@@ -797,7 +796,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(WorkerRequestOrder::AddBackend(backend.clone()));
+                    v.push(WorkerOrder::AddBackend(backend.clone()));
                 }
                 DiffResult::Removed => {
                     let backend = self
@@ -806,7 +805,7 @@ impl ConfigState {
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
-                    v.push(WorkerRequestOrder::RemoveBackend(RemoveBackend {
+                    v.push(WorkerOrder::RemoveBackend(RemoveBackend {
                         cluster_id: backend.cluster_id.clone(),
                         backend_id: backend.backend_id.clone(),
                         address: backend.address,
@@ -819,7 +818,7 @@ impl ConfigState {
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
-                    v.push(WorkerRequestOrder::RemoveBackend(RemoveBackend {
+                    v.push(WorkerOrder::RemoveBackend(RemoveBackend {
                         cluster_id: backend.cluster_id.clone(),
                         backend_id: backend.backend_id.clone(),
                         address: backend.address,
@@ -830,7 +829,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(WorkerRequestOrder::AddBackend(backend.clone()));
+                    v.push(WorkerOrder::AddBackend(backend.clone()));
                 }
             }
         }
@@ -848,11 +847,11 @@ impl ConfigState {
         let added_http_fronts = their_http_fronts.difference(&my_http_fronts);
 
         for &(_, front) in removed_http_fronts {
-            v.push(WorkerRequestOrder::RemoveHttpFrontend(front.clone()));
+            v.push(WorkerOrder::RemoveHttpFrontend(front.clone()));
         }
 
         for &(_, front) in added_http_fronts {
-            v.push(WorkerRequestOrder::AddHttpFrontend(front.clone()));
+            v.push(WorkerOrder::AddHttpFrontend(front.clone()));
         }
 
         let mut my_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
@@ -867,11 +866,11 @@ impl ConfigState {
         let added_https_fronts = their_https_fronts.difference(&my_https_fronts);
 
         for &(_, front) in removed_https_fronts {
-            v.push(WorkerRequestOrder::RemoveHttpsFrontend(front.clone()));
+            v.push(WorkerOrder::RemoveHttpsFrontend(front.clone()));
         }
 
         for &(_, front) in added_https_fronts {
-            v.push(WorkerRequestOrder::AddHttpsFrontend(front.clone()));
+            v.push(WorkerOrder::AddHttpsFrontend(front.clone()));
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
@@ -891,11 +890,11 @@ impl ConfigState {
         let added_tcp_fronts = their_tcp_fronts.difference(&my_tcp_fronts);
 
         for &(_, front) in removed_tcp_fronts {
-            v.push(WorkerRequestOrder::RemoveTcpFrontend(front.clone()));
+            v.push(WorkerOrder::RemoveTcpFrontend(front.clone()));
         }
 
         for &(_, front) in added_tcp_fronts {
-            v.push(WorkerRequestOrder::AddTcpFrontend(front.clone()));
+            v.push(WorkerOrder::AddTcpFrontend(front.clone()));
         }
 
         //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -915,7 +914,7 @@ impl ConfigState {
         let added_certificates = their_certificates.difference(&my_certificates);
 
         for &(address, fingerprint) in removed_certificates {
-            v.push(WorkerRequestOrder::RemoveCertificate(RemoveCertificate {
+            v.push(WorkerOrder::RemoveCertificate(RemoveCertificate {
                 address,
                 fingerprint: fingerprint.clone(),
             }));
@@ -927,7 +926,7 @@ impl ConfigState {
                 .get(&address)
                 .and_then(|certs| certs.get(fingerprint))
             {
-                v.push(WorkerRequestOrder::AddCertificate(AddCertificate {
+                v.push(WorkerOrder::AddCertificate(AddCertificate {
                     address,
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
@@ -939,7 +938,7 @@ impl ConfigState {
         for address in added_tcp_listeners {
             let listener = &other.tcp_listeners[address];
             if listener.1 {
-                v.push(WorkerRequestOrder::ActivateListener(ActivateListener {
+                v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: listener.0.address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -1177,14 +1176,14 @@ mod tests {
     use super::*;
     use crate::worker::{
         Backend, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams, PathRule, Route,
-        RulePosition, WorkerRequestOrder,
+        RulePosition, WorkerOrder,
     };
 
     #[test]
     fn serialize() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&WorkerRequestOrder::AddHttpFrontend(HttpFrontend {
+            .dispatch(&WorkerOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
@@ -1195,7 +1194,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddHttpFrontend(HttpFrontend {
+            .dispatch(&WorkerOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
@@ -1206,7 +1205,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1216,7 +1215,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1226,7 +1225,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
@@ -1236,7 +1235,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-3"),
                 address: "192.168.1.3:1027".parse().unwrap(),
@@ -1246,7 +1245,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::RemoveBackend(RemoveBackend {
+            .dispatch(&WorkerOrder::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-3"),
                 address: "192.168.1.3:1027".parse().unwrap(),
@@ -1268,7 +1267,7 @@ mod tests {
     fn diff() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&WorkerRequestOrder::AddHttpFrontend(HttpFrontend {
+            .dispatch(&WorkerOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
@@ -1279,7 +1278,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddHttpFrontend(HttpFrontend {
+            .dispatch(&WorkerOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
@@ -1290,7 +1289,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1300,7 +1299,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1310,7 +1309,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
@@ -1320,7 +1319,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddCluster(Cluster {
+            .dispatch(&WorkerOrder::AddCluster(Cluster {
                 cluster_id: String::from("cluster_2"),
                 sticky_session: true,
                 https_redirect: true,
@@ -1333,7 +1332,7 @@ mod tests {
 
         let mut state2: ConfigState = Default::default();
         state2
-            .dispatch(&WorkerRequestOrder::AddHttpFrontend(HttpFrontend {
+            .dispatch(&WorkerOrder::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
@@ -1344,7 +1343,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1354,7 +1353,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1364,7 +1363,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1374,7 +1373,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&WorkerRequestOrder::AddCluster(Cluster {
+            .dispatch(&WorkerOrder::AddCluster(Cluster {
                 cluster_id: String::from("cluster_3"),
                 sticky_session: false,
                 https_redirect: false,
@@ -1386,7 +1385,7 @@ mod tests {
             .expect("Could not execute order");
 
         let e = vec![
-            WorkerRequestOrder::RemoveHttpFrontend(HttpFrontend {
+            WorkerOrder::RemoveHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
@@ -1395,12 +1394,12 @@ mod tests {
                 position: RulePosition::Tree,
                 tags: None,
             }),
-            WorkerRequestOrder::RemoveBackend(RemoveBackend {
+            WorkerOrder::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
             }),
-            WorkerRequestOrder::AddBackend(Backend {
+            WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1408,10 +1407,10 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }),
-            WorkerRequestOrder::RemoveCluster {
+            WorkerOrder::RemoveCluster {
                 cluster_id: String::from("cluster_2"),
             },
-            WorkerRequestOrder::AddCluster(Cluster {
+            WorkerOrder::AddCluster(Cluster {
                 cluster_id: String::from("cluster_3"),
                 sticky_session: false,
                 https_redirect: false,
@@ -1421,7 +1420,7 @@ mod tests {
                 answer_503: None,
             }),
         ];
-        let expected_diff: HashSet<&WorkerRequestOrder> = HashSet::from_iter(e.iter());
+        let expected_diff: HashSet<&WorkerOrder> = HashSet::from_iter(e.iter());
 
         let d = state.diff(&state2);
         let diff = HashSet::from_iter(d.iter());
@@ -1432,7 +1431,7 @@ mod tests {
         let hash2 = state2.hash_state();
         let mut state3 = state.clone();
         state3
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1492,14 +1491,10 @@ mod tests {
             tags: None,
         };
 
-        let add_http_front_order_cluster1 =
-            WorkerRequestOrder::AddHttpFrontend(http_front_cluster1);
-        let add_http_front_order_cluster2 =
-            WorkerRequestOrder::AddHttpFrontend(http_front_cluster2);
-        let add_https_front_order_cluster1 =
-            WorkerRequestOrder::AddHttpsFrontend(https_front_cluster1);
-        let add_https_front_order_cluster2 =
-            WorkerRequestOrder::AddHttpsFrontend(https_front_cluster2);
+        let add_http_front_order_cluster1 = WorkerOrder::AddHttpFrontend(http_front_cluster1);
+        let add_http_front_order_cluster2 = WorkerOrder::AddHttpFrontend(http_front_cluster2);
+        let add_https_front_order_cluster1 = WorkerOrder::AddHttpsFrontend(https_front_cluster1);
+        let add_https_front_order_cluster2 = WorkerOrder::AddHttpsFrontend(https_front_cluster2);
         config
             .dispatch(&add_http_front_order_cluster1)
             .expect("Could not execute order");
@@ -1551,7 +1546,7 @@ mod tests {
     fn duplicate_backends() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&WorkerRequestOrder::AddBackend(Backend {
+            .dispatch(&WorkerOrder::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1571,7 +1566,7 @@ mod tests {
         };
 
         state
-            .dispatch(&WorkerRequestOrder::AddBackend(b.clone()))
+            .dispatch(&WorkerOrder::AddBackend(b.clone()))
             .expect("Could not execute order");
 
         assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
@@ -1581,7 +1576,7 @@ mod tests {
     fn listener_diff() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&WorkerRequestOrder::AddTcpListener(TcpListenerConfig {
+            .dispatch(&WorkerOrder::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1591,14 +1586,14 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::ActivateListener(ActivateListener {
+            .dispatch(&WorkerOrder::ActivateListener(ActivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
                 from_scm: false,
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddHttpListener(HttpListenerConfig {
+            .dispatch(&WorkerOrder::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1612,7 +1607,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::AddHttpsListener(HttpsListenerConfig {
+            .dispatch(&WorkerOrder::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1634,7 +1629,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&WorkerRequestOrder::ActivateListener(ActivateListener {
+            .dispatch(&WorkerOrder::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
                 from_scm: false,
@@ -1643,7 +1638,7 @@ mod tests {
 
         let mut state2: ConfigState = Default::default();
         state2
-            .dispatch(&WorkerRequestOrder::AddTcpListener(TcpListenerConfig {
+            .dispatch(&WorkerOrder::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: true,
@@ -1653,7 +1648,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&WorkerRequestOrder::AddHttpListener(HttpListenerConfig {
+            .dispatch(&WorkerOrder::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1667,14 +1662,14 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&WorkerRequestOrder::ActivateListener(ActivateListener {
+            .dispatch(&WorkerOrder::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 proxy: ListenerType::HTTP,
                 from_scm: false,
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&WorkerRequestOrder::AddHttpsListener(HttpsListenerConfig {
+            .dispatch(&WorkerOrder::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1696,7 +1691,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&WorkerRequestOrder::ActivateListener(ActivateListener {
+            .dispatch(&WorkerOrder::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
                 from_scm: false,
@@ -1704,11 +1699,11 @@ mod tests {
             .expect("Could not execute order");
 
         let e = vec![
-            WorkerRequestOrder::RemoveListener(RemoveListener {
+            WorkerOrder::RemoveListener(RemoveListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
             }),
-            WorkerRequestOrder::AddTcpListener(TcpListenerConfig {
+            WorkerOrder::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: true,
@@ -1716,16 +1711,16 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }),
-            WorkerRequestOrder::DeactivateListener(DeactivateListener {
+            WorkerOrder::DeactivateListener(DeactivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
                 to_scm: false,
             }),
-            WorkerRequestOrder::RemoveListener(RemoveListener {
+            WorkerOrder::RemoveListener(RemoveListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 proxy: ListenerType::HTTP,
             }),
-            WorkerRequestOrder::AddHttpListener(HttpListenerConfig {
+            WorkerOrder::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1737,16 +1732,16 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }),
-            WorkerRequestOrder::ActivateListener(ActivateListener {
+            WorkerOrder::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 proxy: ListenerType::HTTP,
                 from_scm: false,
             }),
-            WorkerRequestOrder::RemoveListener(RemoveListener {
+            WorkerOrder::RemoveListener(RemoveListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
             }),
-            WorkerRequestOrder::AddHttpsListener(HttpsListenerConfig {
+            WorkerOrder::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,

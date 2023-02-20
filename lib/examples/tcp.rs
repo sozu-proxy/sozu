@@ -73,14 +73,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&worker::WorkerOrder {
+    command.write_message(&worker::WorkerRequest {
         id: String::from("ID_ABCD"),
-        order: worker::WorkerRequestOrder::AddTcpFrontend(tcp_front),
+        order: worker::WorkerOrder::AddTcpFrontend(tcp_front),
     });
 
-    command.write_message(&worker::WorkerOrder {
+    command.write_message(&worker::WorkerRequest {
         id: String::from("ID_EFGH"),
-        order: worker::WorkerRequestOrder::AddBackend(tcp_backend),
+        order: worker::WorkerOrder::AddBackend(tcp_backend),
     });
 
     info!("TCP -> {:?}", command.read_message());

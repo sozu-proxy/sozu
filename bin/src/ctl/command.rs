@@ -8,7 +8,7 @@ use sozu_command_lib::{
         CommandRequestOrder, CommandResponse, Request, RequestStatus, ResponseContent, RunState,
         WorkerInfo,
     },
-    worker::{QueryMetricsOptions, WorkerRequestOrder},
+    worker::{QueryMetricsOptions, WorkerOrder},
 };
 
 use crate::ctl::{
@@ -293,14 +293,13 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::QueryMetrics(
-            QueryMetricsOptions {
+        let command =
+            CommandRequestOrder::Worker(Box::new(WorkerOrder::QueryMetrics(QueryMetricsOptions {
                 list,
                 cluster_ids,
                 backend_ids,
                 metric_names,
-            },
-        )));
+            })));
 
         // a loop to reperform the query every refresh time
         loop {
@@ -369,9 +368,7 @@ impl CommandManager {
 
         let command = match (cluster_id.clone(), domain.clone()) {
             (Some(cluster_id), _) => {
-                CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::QueryClusterById {
-                    cluster_id,
-                }))
+                CommandRequestOrder::Worker(Box::new(WorkerOrder::QueryClusterById { cluster_id }))
             }
             (None, Some(domain)) => {
                 let splitted: Vec<String> =
@@ -389,14 +386,12 @@ impl CommandManager {
                 // We add the / again because of the splitn removing it
                 let path = splitted.get(1).cloned().map(|path| format!("/{path}"));
 
-                CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::QueryClusterByDomain {
+                CommandRequestOrder::Worker(Box::new(WorkerOrder::QueryClusterByDomain {
                     hostname,
                     path,
                 }))
             }
-            (None, None) => {
-                CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::QueryClustersHashes))
-            }
+            (None, None) => CommandRequestOrder::Worker(Box::new(WorkerOrder::QueryClustersHashes)),
         };
 
         let id = generate_id();
@@ -435,14 +430,14 @@ impl CommandManager {
         domain: Option<String>,
     ) -> Result<(), anyhow::Error> {
         let order = match (fingerprint, domain) {
-            (None, None) => WorkerRequestOrder::QueryAllCertificates,
+            (None, None) => WorkerOrder::QueryAllCertificates,
             (Some(f), None) => match hex::decode(f) {
                 Err(e) => {
                     bail!("invalid fingerprint: {:?}", e);
                 }
-                Ok(f) => WorkerRequestOrder::QueryCertificateByFingerprint(f),
+                Ok(f) => WorkerOrder::QueryCertificateByFingerprint(f),
             },
-            (None, Some(d)) => WorkerRequestOrder::QueryCertificateByDomain(d),
+            (None, Some(d)) => WorkerOrder::QueryCertificateByDomain(d),
             (Some(_), Some(_)) => {
                 bail!("Error: Either request a fingerprint or a domain name");
             }
