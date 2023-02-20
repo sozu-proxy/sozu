@@ -16,7 +16,7 @@ use sozu_command::{
     channel::Channel,
     config::{Config, FileConfig},
     logging::{Logger, LoggerBackend},
-    proxy::{
+    worker::{
         Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
         LoadBalancingAlgorithms, LoadBalancingParams, PathRule, WorkerOrder, WorkerRequestOrder,
         WorkerResponse, Route, RulePosition, TcpFrontend, TcpListenerConfig,

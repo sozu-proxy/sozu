@@ -217,7 +217,7 @@ use sozu_command::state::ClusterId;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
-    proxy::{Cluster, LoadBalancingParams, WorkerEvent, WorkerOrder, WorkerResponse, Route},
+    worker::{Cluster, LoadBalancingParams, WorkerEvent, WorkerOrder, WorkerResponse, Route},
     ready::Ready,
 };
 

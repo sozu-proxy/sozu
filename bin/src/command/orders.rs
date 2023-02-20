@@ -22,7 +22,7 @@ use sozu_command_lib::{
     config::Config,
     logging,
     parser::parse_several_commands,
-    proxy::{
+    worker::{
         AggregatedMetrics, MetricsConfiguration, WorkerOrder, WorkerRequestOrder,
         WorkerResponseStatus,
     },

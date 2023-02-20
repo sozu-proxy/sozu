@@ -8,7 +8,7 @@ use prettytable::{Row, Table};
 
 use sozu_command_lib::{
     command::{CommandResponseContent, ListedFrontends, ListenersList, WorkerInfo},
-    proxy::{
+    worker::{
         AggregatedMetrics, AllWorkerMetrics, ClusterMetricsData, FilteredData, Route,
         WorkerCertificates, WorkerMetrics,
     },

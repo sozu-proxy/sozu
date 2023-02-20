@@ -10,7 +10,7 @@ use sozu_command_lib::{
     config::FileConfig,
     info,
     logging::{Logger, LoggerBackend},
-    proxy::{
+    worker::{
         ActivateListener, AddCertificate, CertificateAndKey, HttpFrontend, ListenerType,
         WorkerRequestOrder, RemoveBackend,
     },

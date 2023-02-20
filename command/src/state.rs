@@ -15,7 +15,7 @@ use serde::de::{self, Visitor};
 
 use crate::{
     certificate::calculate_fingerprint,
-    proxy::{
+    worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, DeactivateListener, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
         ListenerType, PathRule, WorkerRequestOrder, ClusterInformation, RemoveBackend,
@@ -1175,7 +1175,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proxy::{
+    use crate::worker::{
         Backend, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
         WorkerRequestOrder, Route, RulePosition,
     };

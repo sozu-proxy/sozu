@@ -16,7 +16,7 @@ use rustls::{
     Certificate, PrivateKey,
 };
 use sha2::{Digest, Sha256};
-use sozu_command::proxy::TlsVersion;
+use sozu_command::worker::TlsVersion;
 use x509_parser::{
     oid_registry::{OID_X509_COMMON_NAME, OID_X509_EXT_SUBJECT_ALT_NAME},
     pem::{parse_x509_pem, Pem},
@@ -24,7 +24,7 @@ use x509_parser::{
 
 use crate::{
     router::trie::*,
-    sozu_command::proxy::{
+    sozu_command::worker::{
         AddCertificate, CertificateAndKey, CertificateFingerprint, RemoveCertificate,
         ReplaceCertificate,
     },
@@ -656,7 +656,7 @@ mod tests {
         GenericCertificateResolverError,
     };
 
-    use crate::sozu_command::proxy::{AddCertificate, CertificateAndKey, RemoveCertificate};
+    use crate::sozu_command::worker::{AddCertificate, CertificateAndKey, RemoveCertificate};
 
     use rand::{seq::SliceRandom, thread_rng};
     use x509_parser::pem::parse_x509_pem;

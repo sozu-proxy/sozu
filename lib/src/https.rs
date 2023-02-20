@@ -28,7 +28,7 @@ use rusty_ulid::Ulid;
 use slab::Slab;
 use sozu_command::{
     config::DEFAULT_CIPHER_SUITES,
-    proxy::{RemoveListener, ReplaceCertificate},
+    worker::{RemoveListener, ReplaceCertificate},
 };
 use time::{Duration, Instant};
 
@@ -52,7 +52,7 @@ use crate::{
     sozu_command::{
         command::CommandResponseContent,
         logging,
-        proxy::{
+        worker::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
             WorkerOrder, WorkerRequestOrder, WorkerResponse, WorkerResponseStatus, RemoveCertificate,
             Route, TlsVersion, WorkerCertificates,
@@ -662,7 +662,7 @@ impl CertificateResolver for HttpsListener {
 
     fn add_certificate(
         &mut self,
-        opts: &sozu_command_lib::proxy::AddCertificate,
+        opts: &sozu_command_lib::worker::AddCertificate,
     ) -> Result<CertificateFingerprint, Self::Error> {
         let mut resolver = self
             .resolver
@@ -677,7 +677,7 @@ impl CertificateResolver for HttpsListener {
 
     fn remove_certificate(
         &mut self,
-        opts: &sozu_command_lib::proxy::RemoveCertificate,
+        opts: &sozu_command_lib::worker::RemoveCertificate,
     ) -> Result<(), Self::Error> {
         let mut resolver = self
             .resolver
@@ -1561,7 +1561,7 @@ mod tests {
     use std::{str::FromStr, sync::Arc};
 
     use crate::router::{trie::TrieNode, MethodRule, PathRule, Router};
-    use crate::sozu_command::proxy::Route;
+    use crate::sozu_command::worker::Route;
 
     use super::*;
 

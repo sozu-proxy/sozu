@@ -14,7 +14,7 @@ use toml;
 use crate::{
     certificate::split_certificate_chain,
     command::{CommandRequest, CommandRequestOrder, PROTOCOL_VERSION},
-    proxy::{
+    worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
         LoadBalancingParams, LoadMetric, PathRule, WorkerRequestOrder, Route, RulePosition,

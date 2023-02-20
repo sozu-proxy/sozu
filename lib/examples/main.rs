@@ -13,8 +13,8 @@ use sozu_command::config::DEFAULT_RUSTLS_CIPHER_LIST;
 use crate::sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    proxy,
-    proxy::{LoadBalancingParams, PathRule, Route, RulePosition},
+    worker,
+    worker::{LoadBalancingParams, PathRule, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
     );
     gauge!("sozu.TEST", 42);
 
-    let config = proxy::HttpListenerConfig {
+    let config = worker::HttpListenerConfig {
         address: "127.0.0.1:8080"
             .parse()
             .with_context(|| "could not parse address")?,
@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
         sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
     });
 
-    let http_front = proxy::HttpFrontend {
+    let http_front = worker::HttpFrontend {
         route: Route::ClusterId(String::from("cluster_1")),
         address: "127.0.0.1:8080"
             .parse()
@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    let http_backend = proxy::Backend {
+    let http_backend = worker::Backend {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
@@ -84,20 +84,20 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&proxy::WorkerOrder {
+    command.write_message(&worker::WorkerOrder {
         id: String::from("ID_ABCD"),
-        order: proxy::WorkerRequestOrder::AddHttpFrontend(http_front),
+        order: worker::WorkerRequestOrder::AddHttpFrontend(http_front),
     });
 
-    command.write_message(&proxy::WorkerOrder {
+    command.write_message(&worker::WorkerOrder {
         id: String::from("ID_EFGH"),
-        order: proxy::WorkerRequestOrder::AddBackend(http_backend),
+        order: worker::WorkerRequestOrder::AddBackend(http_backend),
     });
 
     info!("MAIN\tHTTP -> {:?}", command.read_message());
     info!("MAIN\tHTTP -> {:?}", command.read_message());
 
-    let config = proxy::HttpsListenerConfig {
+    let config = worker::HttpsListenerConfig {
         address: "127.0.0.1:8443"
             .parse()
             .with_context(|| "could not parse address")?,
@@ -119,15 +119,15 @@ fn main() -> anyhow::Result<()> {
     let cert1 = include_str!("../assets/certificate.pem");
     let key1 = include_str!("../assets/key.pem");
 
-    let certificate_and_key = proxy::CertificateAndKey {
+    let certificate_and_key = worker::CertificateAndKey {
         certificate: String::from(cert1),
         key: String::from(key1),
         certificate_chain: vec![],
         versions: vec![],
     };
-    command2.write_message(&proxy::WorkerOrder {
+    command2.write_message(&worker::WorkerOrder {
         id: String::from("ID_IJKL1"),
-        order: proxy::WorkerRequestOrder::AddCertificate(proxy::AddCertificate {
+        order: worker::WorkerRequestOrder::AddCertificate(worker::AddCertificate {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
@@ -137,7 +137,7 @@ fn main() -> anyhow::Result<()> {
         }),
     });
 
-    let tls_front = proxy::HttpFrontend {
+    let tls_front = worker::HttpFrontend {
         route: Route::ClusterId(String::from("cluster_1")),
         address: "127.0.0.1:8443"
             .parse()
@@ -149,11 +149,11 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    command2.write_message(&proxy::WorkerOrder {
+    command2.write_message(&worker::WorkerOrder {
         id: String::from("ID_IJKL2"),
-        order: proxy::WorkerRequestOrder::AddHttpsFrontend(tls_front),
+        order: worker::WorkerRequestOrder::AddHttpsFrontend(tls_front),
     });
-    let tls_backend = proxy::Backend {
+    let tls_backend = worker::Backend {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
@@ -164,24 +164,24 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command2.write_message(&proxy::WorkerOrder {
+    command2.write_message(&worker::WorkerOrder {
         id: String::from("ID_MNOP"),
-        order: proxy::WorkerRequestOrder::AddBackend(tls_backend),
+        order: worker::WorkerRequestOrder::AddBackend(tls_backend),
     });
 
     let cert2 = include_str!("../assets/cert_test.pem");
     let key2 = include_str!("../assets/key_test.pem");
 
-    let certificate_and_key2 = proxy::CertificateAndKey {
+    let certificate_and_key2 = worker::CertificateAndKey {
         certificate: String::from(cert2),
         key: String::from(key2),
         certificate_chain: vec![],
         versions: vec![],
     };
 
-    command2.write_message(&proxy::WorkerOrder {
+    command2.write_message(&worker::WorkerOrder {
         id: String::from("ID_QRST1"),
-        order: proxy::WorkerRequestOrder::AddCertificate(proxy::AddCertificate {
+        order: worker::WorkerRequestOrder::AddCertificate(worker::AddCertificate {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
@@ -191,7 +191,7 @@ fn main() -> anyhow::Result<()> {
         }),
     });
 
-    let tls_front2 = proxy::HttpFrontend {
+    let tls_front2 = worker::HttpFrontend {
         route: Route::ClusterId(String::from("cluster_2")),
         address: "127.0.0.1:8443"
             .parse()
@@ -203,12 +203,12 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    command2.write_message(&proxy::WorkerOrder {
+    command2.write_message(&worker::WorkerOrder {
         id: String::from("ID_QRST2"),
-        order: proxy::WorkerRequestOrder::AddHttpsFrontend(tls_front2),
+        order: worker::WorkerRequestOrder::AddHttpsFrontend(tls_front2),
     });
 
-    let tls_backend2 = proxy::Backend {
+    let tls_backend2 = worker::Backend {
         cluster_id: String::from("cluster_2"),
         backend_id: String::from("cluster_2-0"),
         sticky_id: None,
@@ -219,9 +219,9 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command2.write_message(&proxy::WorkerOrder {
+    command2.write_message(&worker::WorkerOrder {
         id: String::from("ID_UVWX"),
-        order: proxy::WorkerRequestOrder::AddBackend(tls_backend2),
+        order: worker::WorkerRequestOrder::AddBackend(tls_backend2),
     });
 
     info!("MAIN\tTLS -> {:?}", command2.read_message());
