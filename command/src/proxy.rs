@@ -98,7 +98,7 @@ pub enum ProxyResponseStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyResponseContent {
     WorkerEvent(WorkerEvent),
-    WorkerClusters(Vec<QueryAnswerCluster>),
+    WorkerClusters(Vec<ClusterInformation>),
     /// cluster id -> hash of cluster information
     WorkerClustersHashes(BTreeMap<String, u64>),
     WorkerCertificates(WorkerCertificates),
@@ -829,7 +829,7 @@ pub struct QueryMetricsOptions {
 
 /// all information about one cluster
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct QueryAnswerCluster {
+pub struct ClusterInformation {
     pub configuration: Option<Cluster>,
     pub http_frontends: Vec<HttpFrontend>,
     pub https_frontends: Vec<HttpFrontend>,
