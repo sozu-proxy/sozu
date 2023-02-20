@@ -5,7 +5,8 @@ use std::{
     fs::File,
     io::{self, Error, ErrorKind, Read},
     net::SocketAddr,
-    path::PathBuf, ops::Range,
+    ops::Range,
+    path::PathBuf,
 };
 
 use anyhow::{bail, Context};
@@ -17,8 +18,8 @@ use crate::{
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, PathRule, WorkerRequestOrder, Route, RulePosition,
-        TcpFrontend, TcpListenerConfig, TlsVersion,
+        LoadBalancingParams, LoadMetric, PathRule, Route, RulePosition, TcpFrontend,
+        TcpListenerConfig, TlsVersion, WorkerRequestOrder,
     },
 };
 
@@ -1372,7 +1373,7 @@ impl Config {
 
 pub fn display_toml_error(file: &str, error: &toml::de::Error) {
     println!("error parsing the configuration file '{file}': {error}");
-    if let Some(Range { start, end}) = error.span() {
+    if let Some(Range { start, end }) = error.span() {
         print!("error parsing the configuration file '{file}' at position: {start}, {end}");
     }
 }

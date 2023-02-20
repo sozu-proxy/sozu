@@ -15,7 +15,7 @@ use anyhow::Context;
 use mio::net::UdpSocket;
 
 use crate::sozu_command::worker::{
-    FilteredData, MetricsConfiguration, WorkerMetrics, QueryMetricsOptions,
+    FilteredData, MetricsConfiguration, QueryMetricsOptions, WorkerMetrics,
 };
 
 use self::{local_drain::LocalDrain, network_drain::NetworkDrain};

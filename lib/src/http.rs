@@ -20,12 +20,12 @@ use crate::{
     router::Router,
     sozu_command::{
         logging,
-        worker::{
-            Cluster, HttpFrontend, HttpListenerConfig, WorkerOrder, WorkerRequestOrder,
-            WorkerResponse, Route,
-        },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
+        worker::{
+            Cluster, HttpFrontend, HttpListenerConfig, Route, WorkerOrder, WorkerRequestOrder,
+            WorkerResponse,
+        },
     },
     timer::TimeoutContainer,
     util::UnwrapLog,
@@ -1086,7 +1086,7 @@ mod tests {
     use crate::sozu_command::channel::Channel;
     use crate::sozu_command::worker::{
         Backend, HttpFrontend, HttpListenerConfig, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, WorkerOrder, WorkerRequestOrder, Route, RulePosition,
+        PathRule, Route, RulePosition, WorkerOrder, WorkerRequestOrder,
     };
     use std::io::{Read, Write};
     use std::net::SocketAddr;

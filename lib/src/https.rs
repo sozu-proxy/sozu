@@ -52,14 +52,14 @@ use crate::{
     sozu_command::{
         command::CommandResponseContent,
         logging,
-        worker::{
-            AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
-            WorkerOrder, WorkerRequestOrder, WorkerResponse, WorkerResponseStatus, RemoveCertificate,
-            Route, TlsVersion, WorkerCertificates,
-        },
         ready::Ready,
         scm_socket::ScmSocket,
         state::ClusterId,
+        worker::{
+            AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
+            RemoveCertificate, Route, TlsVersion, WorkerCertificates, WorkerOrder,
+            WorkerRequestOrder, WorkerResponse, WorkerResponseStatus,
+        },
     },
     timer::TimeoutContainer,
     tls::{

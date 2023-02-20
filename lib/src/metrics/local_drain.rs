@@ -5,8 +5,8 @@ use anyhow::Context;
 use hdrhistogram::Histogram;
 
 use crate::sozu_command::worker::{
-    ClusterMetricsData, FilteredData, MetricsConfiguration, Percentiles, WorkerMetrics,
-    QueryMetricsOptions, AllWorkerMetrics,
+    AllWorkerMetrics, ClusterMetricsData, FilteredData, MetricsConfiguration, Percentiles,
+    QueryMetricsOptions, WorkerMetrics,
 };
 
 use super::{MetricData, Subscriber};

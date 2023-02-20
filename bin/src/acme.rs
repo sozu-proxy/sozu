@@ -9,7 +9,7 @@ use sozu_command_lib::{
     config::Config,
     worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
-        WorkerRequestOrder, RemoveBackend, ReplaceCertificate, Route, RulePosition, TlsVersion,
+        RemoveBackend, ReplaceCertificate, Route, RulePosition, TlsVersion, WorkerRequestOrder,
     },
 };
 use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};

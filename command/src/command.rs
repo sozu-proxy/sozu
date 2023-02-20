@@ -5,12 +5,12 @@ use std::{
 };
 
 use crate::{
-    worker::{
-        AggregatedMetrics, ClusterInformation, HttpFrontend,
-        HttpListenerConfig, HttpsListenerConfig, WorkerRequestOrder, TcpFrontend, TcpListenerConfig,
-        WorkerCertificates, WorkerEvent, WorkerMetrics,
-    },
     state::ConfigState,
+    worker::{
+        AggregatedMetrics, ClusterInformation, HttpFrontend, HttpListenerConfig,
+        HttpsListenerConfig, TcpFrontend, TcpListenerConfig, WorkerCertificates, WorkerEvent,
+        WorkerMetrics, WorkerRequestOrder,
+    },
 };
 
 pub const PROTOCOL_VERSION: u8 = 0;
@@ -226,8 +226,8 @@ mod tests {
     use crate::worker::{
         AddCertificate, AllWorkerMetrics, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Percentiles, WorkerRequestOrder, RemoveBackend,
-        RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
+        LoadBalancingParams, PathRule, Percentiles, RemoveBackend, RemoveCertificate, Route,
+        RulePosition, TlsVersion, WorkerMetrics, WorkerRequestOrder,
     };
     use hex::FromHex;
     use serde_json;

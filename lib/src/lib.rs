@@ -217,8 +217,8 @@ use sozu_command::state::ClusterId;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
-    worker::{Cluster, LoadBalancingParams, WorkerEvent, WorkerOrder, WorkerResponse, Route},
     ready::Ready,
+    worker::{Cluster, LoadBalancingParams, Route, WorkerEvent, WorkerOrder, WorkerResponse},
 };
 
 use self::{backends::BackendMap, retry::RetryPolicy};

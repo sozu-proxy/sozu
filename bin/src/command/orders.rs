@@ -22,12 +22,12 @@ use sozu_command_lib::{
     config::Config,
     logging,
     parser::parse_several_commands,
+    scm_socket::Listeners,
+    state::get_cluster_ids_by_domain,
     worker::{
         AggregatedMetrics, MetricsConfiguration, WorkerOrder, WorkerRequestOrder,
         WorkerResponseStatus,
     },
-    scm_socket::Listeners,
-    state::get_cluster_ids_by_domain,
 };
 
 use sozu::metrics::METRICS;

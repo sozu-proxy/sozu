@@ -8,7 +8,7 @@ use sozu_command_lib::{
         CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
         CommandStatus, RunState, WorkerInfo,
     },
-    worker::{WorkerRequestOrder, QueryMetricsOptions},
+    worker::{QueryMetricsOptions, WorkerRequestOrder},
 };
 
 use crate::ctl::{

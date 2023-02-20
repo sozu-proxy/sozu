@@ -16,13 +16,13 @@ use sozu_command::{
     channel::Channel,
     config::{Config, FileConfig},
     logging::{Logger, LoggerBackend},
-    worker::{
-        Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, WorkerOrder, WorkerRequestOrder,
-        WorkerResponse, Route, RulePosition, TcpFrontend, TcpListenerConfig,
-    },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
+    worker::{
+        Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, Route, RulePosition, TcpFrontend,
+        TcpListenerConfig, WorkerOrder, WorkerRequestOrder, WorkerResponse,
+    },
 };
 
 use crate::sozu::command_id::CommandID;
@@ -172,11 +172,11 @@ impl Worker {
         let server_job = thread::spawn(move || {
             let log_level = env::var("RUST_LOG").unwrap_or("error".to_string());
             Logger::init(
-                    thread_name.to_owned(),
-                    &log_level,
-                    LoggerBackend::Stdout(stdout()),
-                    None,
-                );
+                thread_name.to_owned(),
+                &log_level,
+                LoggerBackend::Stdout(stdout()),
+                None,
+            );
             let mut server = Server::try_new_from_config(
                 cmd_worker_to_main,
                 thread_scm_worker_to_main,

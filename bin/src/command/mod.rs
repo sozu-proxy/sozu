@@ -29,11 +29,11 @@ use sozu_command_lib::{
         CommandStatus, Event, RunState,
     },
     config::Config,
+    scm_socket::{Listeners, ScmSocket},
+    state::ConfigState,
     worker::{
         MetricsConfiguration, WorkerOrder, WorkerRequestOrder, WorkerResponse, WorkerResponseStatus,
     },
-    scm_socket::{Listeners, ScmSocket},
-    state::ConfigState,
 };
 
 use crate::{

@@ -10,11 +10,11 @@ use sozu_command_lib::{
     config::FileConfig,
     info,
     logging::{Logger, LoggerBackend},
+    state::ConfigState,
     worker::{
         ActivateListener, AddCertificate, CertificateAndKey, HttpFrontend, ListenerType,
-        WorkerRequestOrder, RemoveBackend,
+        RemoveBackend, WorkerRequestOrder,
     },
-    state::ConfigState,
 };
 
 use crate::{
@@ -343,7 +343,8 @@ pub fn try_tls_endpoint() -> State {
     let front_address = "127.0.0.1:2001"
         .parse()
         .expect("could not parse front address");
-    let back_address = "127.0.0.1:2002".to_string()
+    let back_address = "127.0.0.1:2002"
+        .to_string()
         .parse()
         .expect("could not parse back address");
 

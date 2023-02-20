@@ -17,10 +17,10 @@ use crate::{
     certificate::calculate_fingerprint,
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
-        Cluster, DeactivateListener, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        ListenerType, PathRule, WorkerRequestOrder, ClusterInformation, RemoveBackend,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, Route, TcpFrontend,
-        TcpListenerConfig,
+        Cluster, ClusterInformation, DeactivateListener, HttpFrontend, HttpListenerConfig,
+        HttpsListenerConfig, ListenerType, PathRule, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, Route, TcpFrontend, TcpListenerConfig,
+        WorkerRequestOrder,
     },
 };
 
@@ -1176,8 +1176,8 @@ impl<
 mod tests {
     use super::*;
     use crate::worker::{
-        Backend, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
-        WorkerRequestOrder, Route, RulePosition,
+        Backend, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams, PathRule, Route,
+        RulePosition, WorkerRequestOrder,
     };
 
     #[test]
@@ -1492,8 +1492,10 @@ mod tests {
             tags: None,
         };
 
-        let add_http_front_order_cluster1 = WorkerRequestOrder::AddHttpFrontend(http_front_cluster1);
-        let add_http_front_order_cluster2 = WorkerRequestOrder::AddHttpFrontend(http_front_cluster2);
+        let add_http_front_order_cluster1 =
+            WorkerRequestOrder::AddHttpFrontend(http_front_cluster1);
+        let add_http_front_order_cluster2 =
+            WorkerRequestOrder::AddHttpFrontend(http_front_cluster2);
         let add_https_front_order_cluster1 =
             WorkerRequestOrder::AddHttpsFrontend(https_front_cluster1);
         let add_https_front_order_cluster2 =

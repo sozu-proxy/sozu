@@ -6,8 +6,8 @@ use mio::net::TcpStream;
 use crate::{
     server::push_event,
     sozu_command::{
-        worker::{self, LoadBalancingAlgorithms},
         state::ClusterId,
+        worker::{self, LoadBalancingAlgorithms},
     },
 };
 

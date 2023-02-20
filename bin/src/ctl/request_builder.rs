@@ -9,9 +9,9 @@ use sozu_command_lib::{
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, DeactivateListener, HttpFrontend, ListenerType, LoadBalancingParams,
-        MetricsConfiguration, PathRule, WorkerRequestOrder, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RulePosition, TcpFrontend, TcpListenerConfig,
-        TlsVersion,
+        MetricsConfiguration, PathRule, RemoveBackend, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, RulePosition, TcpFrontend, TcpListenerConfig, TlsVersion,
+        WorkerRequestOrder,
     },
 };
 

@@ -34,10 +34,10 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     logging::target_to_backend,
-    worker::{WorkerOrder, WorkerRequestOrder, WorkerResponse},
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
+    worker::{WorkerOrder, WorkerRequestOrder, WorkerResponse},
 };
 
 use crate::{command::Worker, logging, util};

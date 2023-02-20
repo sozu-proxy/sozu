@@ -8,8 +8,8 @@ use sozu_command_lib::{
     channel::Channel,
     command::{RunState, WorkerInfo},
     config::Config,
-    worker::{WorkerOrder, WorkerRequestOrder, WorkerResponse},
     scm_socket::ScmSocket,
+    worker::{WorkerOrder, WorkerRequestOrder, WorkerResponse},
 };
 
 /// An instance of Sōzu, as seen from the main process
