@@ -107,7 +107,7 @@ impl fmt::Display for WorkerResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedMetrics {
     pub main: BTreeMap<String, FilteredData>,
-    pub workers: BTreeMap<String, ResponseContent>,
+    pub workers: BTreeMap<String, WorkerMetrics>,
 }
 
 /// All metrics of a worker: proxy and clusters

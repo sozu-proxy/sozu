@@ -629,7 +629,7 @@ mod tests {
                 .collect(),
                 workers: [(
                     String::from("0"),
-                    ResponseContent::WorkerMetrics(WorkerMetrics::All(AllWorkerMetrics {
+                    WorkerMetrics::All(AllWorkerMetrics {
                         proxy: Some(
                             [
                                 (String::from("sozu.gauge"), FilteredData::Gauge(1)),
@@ -702,7 +702,7 @@ mod tests {
                             .cloned()
                             .collect()
                         )
-                    }))
+                    })
                 )]
                 .iter()
                 .cloned()

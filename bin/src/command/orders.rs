@@ -1197,9 +1197,18 @@ impl CommandServer {
                     if options.list {
                         Success::Query(ResponseContent::Query(worker_responses_map))
                     } else {
+                        let workers = worker_responses_map
+                            .into_iter()
+                            .filter_map(|(worker_id, worker_response)| match worker_response {
+                                ResponseContent::WorkerMetrics(worker_metrics) => {
+                                    Some((worker_id, worker_metrics))
+                                }
+                                _ => None,
+                            })
+                            .collect();
                         Success::Query(ResponseContent::Metrics(AggregatedMetrics {
                             main: main_metrics,
-                            workers: worker_responses_map,
+                            workers,
                         }))
                     }
                 }

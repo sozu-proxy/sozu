@@ -210,23 +210,20 @@ pub fn print_metrics(
     print_proxy_metrics(&Some(aggregated_metrics.main));
 
     // workers
-    for (worker_id, query_answer_metrics) in aggregated_metrics.workers.iter() {
+    for (worker_id, worker_metrics) in aggregated_metrics.workers.iter() {
         println!("\nWorker {worker_id}\n=========");
-        print_worker_metrics(query_answer_metrics)?;
+        print_worker_metrics(worker_metrics)?;
     }
     Ok(())
 }
 
-fn print_worker_metrics(response_content: &ResponseContent) -> anyhow::Result<()> {
-    match response_content {
-        ResponseContent::WorkerMetrics(WorkerMetrics::All(AllWorkerMetrics {
-            proxy,
-            clusters,
-        })) => {
+fn print_worker_metrics(worker_metrics: &WorkerMetrics) -> anyhow::Result<()> {
+    match worker_metrics {
+        WorkerMetrics::All(AllWorkerMetrics { proxy, clusters }) => {
             print_proxy_metrics(proxy);
             print_cluster_metrics(clusters);
         }
-        ResponseContent::WorkerMetrics(WorkerMetrics::Error(error)) => {
+        WorkerMetrics::Error(error) => {
             println!("Error: {error}\nMaybe check your command.")
         }
         _ => bail!("The query answer is wrong."),
