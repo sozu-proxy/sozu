@@ -50,7 +50,7 @@ use crate::{
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     sozu_command::{
-        command::ResponseContent,
+        command::{RequestStatus, ResponseContent},
         logging,
         ready::Ready,
         scm_socket::ScmSocket,
@@ -58,7 +58,7 @@ use crate::{
         worker::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
             RemoveCertificate, Route, TlsVersion, WorkerCertificates, WorkerOrder, WorkerRequest,
-            WorkerResponse, WorkerResponseStatus,
+            WorkerResponse,
         },
     },
     timer::TimeoutContainer,
@@ -1366,7 +1366,8 @@ impl ProxyConfiguration for HttpsProxy {
                 info!("{} successful", request_id);
                 WorkerResponse {
                     id: request_id,
-                    status: WorkerResponseStatus::Ok,
+                    status: RequestStatus::Ok,
+                    error: None,
                     content,
                 }
             }

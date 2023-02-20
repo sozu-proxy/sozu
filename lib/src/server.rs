@@ -26,7 +26,7 @@ use crate::{
     pool::Pool,
     sozu_command::{
         channel::Channel,
-        command::ResponseContent,
+        command::{RequestStatus, ResponseContent},
         config::Config,
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
@@ -34,7 +34,7 @@ use crate::{
         worker::{
             Backend as CommandLibBackend, Cluster, ListenerType, MessageId, RemoveBackend,
             TcpListenerConfig as CommandTcpListener, WorkerCertificates, WorkerEvent, WorkerOrder,
-            WorkerRequest, WorkerResponse, WorkerResponseStatus,
+            WorkerRequest, WorkerResponse,
         },
     },
     tcp,
@@ -65,7 +65,8 @@ pub fn push_event(event: WorkerEvent) {
     QUEUE.with(|queue| {
         (*queue.borrow_mut()).push_back(WorkerResponse {
             id: "EVENT".to_string(),
-            status: WorkerResponseStatus::Processing,
+            status: RequestStatus::Processing,
+            error: None,
             content: Some(ResponseContent::WorkerEvent(event)),
         });
     });
@@ -818,7 +819,8 @@ impl Server {
                     .shutting_down
                     .take()
                     .expect("should have shut down correctly"), // panicking here makes sense actually
-                status: WorkerResponseStatus::Ok,
+                status: RequestStatus::Ok,
+                error: None,
                 content: None,
             };
             if let Err(e) = self.channel.write_message(&proxy_response) {
@@ -887,24 +889,20 @@ impl Server {
 
         match &message.order {
             WorkerOrder::QueryClustersHashes => {
-                push_queue(WorkerResponse {
-                    id: message.id.clone(),
-                    status: WorkerResponseStatus::Ok,
-                    content: Some(ResponseContent::WorkerClustersHashes(
-                        self.config_state.hash_state(),
-                    )),
-                });
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id,
+                    ResponseContent::WorkerClustersHashes(self.config_state.hash_state()),
+                ));
                 return;
             }
             WorkerOrder::QueryClusterById { cluster_id } => {
                 let response_content = ResponseContent::WorkerClusters(vec![self
                     .config_state
                     .cluster_state(&cluster_id)]);
-                push_queue(WorkerResponse {
-                    id: message.id.clone(),
-                    status: WorkerResponseStatus::Ok,
-                    content: Some(response_content),
-                });
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id,
+                    response_content,
+                ));
                 return;
             }
             WorkerOrder::QueryClusterByDomain { hostname, path } => {
@@ -915,32 +913,29 @@ impl Server {
                     .map(|cluster_id| self.config_state.cluster_state(cluster_id))
                     .collect();
 
-                push_queue(WorkerResponse {
-                    id: message.id.clone(),
-                    status: WorkerResponseStatus::Ok,
-                    content: Some(ResponseContent::WorkerClusters(clusters)),
-                });
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id,
+                    ResponseContent::WorkerClusters(clusters),
+                ));
                 return;
             }
             WorkerOrder::QueryCertificateByFingerprint(f) => {
-                push_queue(WorkerResponse {
-                    id: message.id.clone(),
-                    status: WorkerResponseStatus::Ok,
-                    content: Some(ResponseContent::WorkerCertificates(
-                        WorkerCertificates::Fingerprint(get_certificate(&self.config_state, &f)),
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id,
+                    ResponseContent::WorkerCertificates(WorkerCertificates::Fingerprint(
+                        get_certificate(&self.config_state, &f),
                     )),
-                });
+                ));
                 return;
             }
             WorkerOrder::QueryMetrics(query_metrics_options) => {
                 METRICS.with(|metrics| {
                     let data = (*metrics.borrow_mut()).query(&query_metrics_options);
 
-                    push_queue(WorkerResponse {
-                        id: message.id.clone(),
-                        status: WorkerResponseStatus::Ok,
-                        content: Some(ResponseContent::WorkerMetrics(data)),
-                    });
+                    push_queue(WorkerResponse::ok_with_content(
+                        message.id,
+                        ResponseContent::WorkerMetrics(data),
+                    ));
                 });
                 return;
             }

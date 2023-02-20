@@ -23,9 +23,7 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
-    worker::{
-        AggregatedMetrics, MetricsConfiguration, WorkerOrder, WorkerRequest, WorkerResponseStatus,
-    },
+    worker::{AggregatedMetrics, MetricsConfiguration, WorkerOrder, WorkerRequest},
 };
 
 use sozu::metrics::METRICS;
@@ -115,7 +113,7 @@ impl CommandServer {
             Err(anyhow_error) => {
                 let formatted = format!("{anyhow_error:#}");
                 error!("{:#}", formatted);
-                return_error(self.command_tx.clone(), cloned_identifier, formatted).await;
+                return_error(self.command_tx.clone(), cloned_identifier, Some(formatted)).await;
             }
             Ok(None) => {
                 // do nothing here. Ok(None) means the function has already returned its result
@@ -305,14 +303,14 @@ impl CommandServer {
             smol::spawn(async move {
                 let mut ok = 0usize;
                 let mut error = 0usize;
-                while let Some((proxy_response, _)) = load_state_rx.next().await {
-                    match proxy_response.status {
-                        WorkerResponseStatus::Ok => {
+                while let Some((worker_response, _)) = load_state_rx.next().await {
+                    match worker_response.status {
+                        RequestStatus::Ok => {
                             ok += 1;
                         }
-                        WorkerResponseStatus::Processing => {}
-                        WorkerResponseStatus::Error(message) => {
-                            error!("{}", message);
+                        RequestStatus::Processing => {}
+                        RequestStatus::Error => {
+                            error!("{:?}", worker_response.error);
                             error += 1;
                         }
                     };
@@ -344,7 +342,9 @@ impl CommandServer {
                         return_error(
                             command_tx,
                             request_identifier,
-                            format!("Loading state failed, ok: {ok}, error: {error}, path: {path}"),
+                            Some(format!(
+                                "Loading state failed, ok: {ok}, error: {error}, path: {path}"
+                            )),
                         )
                         .await;
                     }
@@ -665,17 +665,18 @@ impl CommandServer {
             let cloned_command_tx = self.command_tx.clone();
             let cloned_req_id = request_identifier.clone();
             smol::spawn(async move {
-                while let Some((proxy_response, _)) = sockets_return_rx.next().await {
-                    match proxy_response.status {
-                        WorkerResponseStatus::Ok => {
+                while let Some((worker_response, _)) = sockets_return_rx.next().await {
+                    match worker_response.status {
+                        RequestStatus::Ok => {
                             info!("returnsockets OK");
                             break;
                         }
-                        WorkerResponseStatus::Processing => {
+                        RequestStatus::Processing => {
                             info!("returnsockets processing");
                         }
-                        WorkerResponseStatus::Error(message) => {
-                            return_error(cloned_command_tx, cloned_req_id, message).await;
+                        RequestStatus::Error => {
+                            return_error(cloned_command_tx, cloned_req_id, worker_response.error)
+                                .await;
                             break;
                         }
                     };
@@ -722,10 +723,10 @@ impl CommandServer {
             let cloned_request_identifier = request_identifier.clone();
             let worker_id = old_worker.id;
             smol::spawn(async move {
-                while let Some((proxy_response, _)) = softstop_rx.next().await {
-                    match proxy_response.status {
+                while let Some((worker_response, _)) = softstop_rx.next().await {
+                    match worker_response.status {
                         // should we send all this to the command server?
-                        WorkerResponseStatus::Ok => {
+                        RequestStatus::Ok => {
                             info!("softstop OK"); // this doesn't display :-(
                             if let Err(e) = command_tx
                                 .send(CommandMessage::WorkerClose { worker_id })
@@ -738,11 +739,11 @@ impl CommandServer {
                             }
                             break;
                         }
-                        WorkerResponseStatus::Processing => {
+                        RequestStatus::Processing => {
                             info!("softstop processing");
                         }
-                        WorkerResponseStatus::Error(message) => {
-                            info!("softstop error: {:?}", message);
+                        RequestStatus::Error => {
+                            info!("softstop error: {:?}", worker_response.error);
                             break;
                         }
                     };
@@ -861,14 +862,14 @@ impl CommandServer {
             smol::spawn(async move {
                 let mut ok = 0usize;
                 let mut error = 0usize;
-                while let Some((proxy_response, _)) = load_state_rx.next().await {
-                    match proxy_response.status {
-                        WorkerResponseStatus::Ok => {
+                while let Some((worker_response, _)) = load_state_rx.next().await {
+                    match worker_response.status {
+                        RequestStatus::Ok => {
                             ok += 1;
                         }
-                        WorkerResponseStatus::Processing => {}
-                        WorkerResponseStatus::Error(message) => {
-                            error!("{}", message);
+                        RequestStatus::Processing => {}
+                        RequestStatus::Error => {
+                            error!("{:?}", worker_response.error);
                             error += 1;
                         }
                     };
@@ -886,9 +887,9 @@ impl CommandServer {
                     return_error(
                         command_tx,
                         cloned_identifier,
-                        format!(
+                        Some(format!(
                             "Reloading configuration failed. ok: {ok} messages, error: {error}"
-                        ),
+                        )),
                     )
                     .await;
                 }
@@ -956,18 +957,18 @@ impl CommandServer {
         smol::spawn(async move {
             let mut i = 0;
 
-            while let Some((proxy_response, _)) = status_rx.next().await {
+            while let Some((worker_response, _)) = status_rx.next().await {
                 info!(
                     "received response with id {}: {:?}",
-                    proxy_response.id, proxy_response
+                    worker_response.id, worker_response
                 );
-                let new_run_state = match proxy_response.status {
-                    WorkerResponseStatus::Ok => RunState::Running,
-                    WorkerResponseStatus::Processing => continue,
-                    WorkerResponseStatus::Error(_) => RunState::NotAnswering,
+                let new_run_state = match worker_response.status {
+                    RequestStatus::Ok => RunState::Running,
+                    RequestStatus::Processing => continue,
+                    RequestStatus::Error => RunState::NotAnswering,
                 };
                 worker_info_map
-                    .entry(proxy_response.id)
+                    .entry(worker_response.id)
                     .and_modify(|worker_info| worker_info.run_state = new_run_state);
 
                 i += 1;
@@ -1024,19 +1025,19 @@ impl CommandServer {
         smol::spawn(async move {
             let mut responses = Vec::new();
             let mut i = 0;
-            while let Some((proxy_response, _)) = metrics_rx.next().await {
-                match proxy_response.status {
-                    WorkerResponseStatus::Ok => {
-                        let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
-                        responses.push((tag, proxy_response));
+            while let Some((worker_response, _)) = metrics_rx.next().await {
+                match worker_response.status {
+                    RequestStatus::Ok => {
+                        let tag = worker_response.id.trim_start_matches(&prefix).to_string();
+                        responses.push((tag, worker_response));
                     }
-                    WorkerResponseStatus::Processing => {
+                    RequestStatus::Processing => {
                         //info!("metrics processing");
                         continue;
                     }
-                    WorkerResponseStatus::Error(_) => {
-                        let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
-                        responses.push((tag, proxy_response));
+                    RequestStatus::Error => {
+                        let tag = worker_response.id.trim_start_matches(&prefix).to_string();
+                        responses.push((tag, worker_response));
                     }
                 };
 
@@ -1050,8 +1051,8 @@ impl CommandServer {
             let mut has_error = false;
             for response in responses.iter() {
                 match response.1.status {
-                    WorkerResponseStatus::Error(ref e) => {
-                        messages.push(format!("{}: {}", response.0, e));
+                    RequestStatus::Error => {
+                        messages.push(format!("{}: {:?}", response.0, response.1.error));
                         has_error = true;
                     }
                     _ => messages.push(format!("{}: OK", response.0)),
@@ -1059,7 +1060,12 @@ impl CommandServer {
             }
 
             if has_error {
-                return_error(command_tx, thread_request_identifier, messages.join(", ")).await;
+                return_error(
+                    command_tx,
+                    thread_request_identifier,
+                    Some(messages.join(", ")),
+                )
+                .await;
             } else {
                 return_success(
                     command_tx,
@@ -1136,17 +1142,17 @@ impl CommandServer {
         smol::spawn(async move {
             let mut responses = Vec::new();
             let mut i = 0;
-            while let Some((proxy_response, worker_id)) = query_rx.next().await {
-                match proxy_response.status {
-                    WorkerResponseStatus::Ok => {
-                        responses.push((worker_id, proxy_response));
+            while let Some((worker_response, worker_id)) = query_rx.next().await {
+                match worker_response.status {
+                    RequestStatus::Ok => {
+                        responses.push((worker_id, worker_response));
                     }
-                    WorkerResponseStatus::Processing => {
+                    RequestStatus::Processing => {
                         info!("metrics processing");
                         continue;
                     }
-                    WorkerResponseStatus::Error(_) => {
-                        responses.push((worker_id, proxy_response));
+                    RequestStatus::Error => {
+                        responses.push((worker_id, worker_response));
                     }
                 };
 
@@ -1156,12 +1162,14 @@ impl CommandServer {
                 }
             }
 
-            let mut proxy_responses_map: BTreeMap<String, ResponseContent> = responses
+            let mut worker_responses_map: BTreeMap<String, ResponseContent> = responses
                 .into_iter()
-                .filter_map(|(worker_id, proxy_response)| match proxy_response.content {
-                    Some(content) => Some((worker_id.to_string(), content)),
-                    None => None,
-                })
+                .filter_map(
+                    |(worker_id, worker_response)| match worker_response.content {
+                        Some(content) => Some((worker_id.to_string(), content)),
+                        None => None,
+                    },
+                )
                 .collect();
 
             let success = match &proxy_request_order {
@@ -1172,26 +1180,26 @@ impl CommandServer {
                     path: _,
                 } => {
                     let query_answer = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
-                    proxy_responses_map.insert(String::from("main"), query_answer);
-                    Success::Query(ResponseContent::Query(proxy_responses_map))
+                    worker_responses_map.insert(String::from("main"), query_answer);
+                    Success::Query(ResponseContent::Query(worker_responses_map))
                 }
                 WorkerOrder::QueryCertificateByDomain(_)
                 | WorkerOrder::QueryCertificateByFingerprint(_) => {
                     info!(
                         "certificates query answer received: {:?}",
-                        proxy_responses_map
+                        worker_responses_map
                     );
-                    Success::Query(ResponseContent::Query(proxy_responses_map))
+                    Success::Query(ResponseContent::Query(worker_responses_map))
                 }
                 WorkerOrder::QueryMetrics(options) => {
-                    debug!("metrics query answer received: {:?}", proxy_responses_map);
+                    debug!("metrics query answer received: {:?}", worker_responses_map);
 
                     if options.list {
-                        Success::Query(ResponseContent::Query(proxy_responses_map))
+                        Success::Query(ResponseContent::Query(worker_responses_map))
                     } else {
                         Success::Query(ResponseContent::Metrics(AggregatedMetrics {
                             main: main_metrics,
-                            workers: proxy_responses_map,
+                            workers: worker_responses_map,
                         }))
                     }
                 }
@@ -1302,10 +1310,10 @@ impl CommandServer {
         smol::spawn(async move {
             let mut responses = Vec::new();
             let mut response_count = 0usize;
-            while let Some((proxy_response, worker_id)) = worker_order_rx.next().await {
-                match proxy_response.status {
-                    WorkerResponseStatus::Ok => {
-                        responses.push((worker_id, proxy_response));
+            while let Some((worker_response, worker_id)) = worker_order_rx.next().await {
+                match worker_response.status {
+                    RequestStatus::Ok => {
+                        responses.push((worker_id, worker_response));
 
                         if stopping_workers.contains(&worker_id) {
                             if let Err(e) = command_tx
@@ -1319,12 +1327,12 @@ impl CommandServer {
                             }
                         }
                     }
-                    WorkerResponseStatus::Processing => {
+                    RequestStatus::Processing => {
                         info!("Order is processing");
                         continue;
                     }
-                    WorkerResponseStatus::Error(_) => {
-                        responses.push((worker_id, proxy_response));
+                    RequestStatus::Error => {
+                        responses.push((worker_id, worker_response));
                     }
                 };
 
@@ -1345,8 +1353,8 @@ impl CommandServer {
             let mut has_error = false;
             for response in responses.iter() {
                 match response.1.status {
-                    WorkerResponseStatus::Error(ref e) => {
-                        messages.push(format!("{}: {}", response.0, e));
+                    RequestStatus::Error => {
+                        messages.push(format!("{}: {:?}", response.0, response.1.error));
                         has_error = true;
                     }
                     _ => messages.push(format!("{}: OK", response.0)),
@@ -1354,7 +1362,12 @@ impl CommandServer {
             }
 
             if has_error {
-                return_error(command_tx, thread_request_identifier, messages.join(", ")).await;
+                return_error(
+                    command_tx,
+                    thread_request_identifier,
+                    Some(messages.join(", ")),
+                )
+                .await;
             } else {
                 return_success(
                     command_tx,
@@ -1469,13 +1482,16 @@ impl CommandServer {
 async fn return_error<T>(
     mut command_tx: Sender<CommandMessage>,
     request_identifier: RequestIdentifier,
-    error_message: T,
+    error_message: Option<T>,
 ) where
     T: ToString,
 {
     let error_command_message = CommandMessage::Advancement {
         request_identifier,
-        advancement: Advancement::Error(error_message.to_string()),
+        advancement: Advancement::Error(match error_message {
+            Some(error) => error.to_string(),
+            None => "No context provided for this error".to_string(),
+        }),
     };
 
     trace!("return_error: sending event to the command server");

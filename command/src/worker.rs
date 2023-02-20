@@ -15,7 +15,7 @@ use serde::{
 };
 
 use crate::{
-    command::ResponseContent,
+    command::{RequestStatus, ResponseContent},
     config::{
         ProxyProtocolConfig, DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST,
         DEFAULT_RUSTLS_CIPHER_LIST, DEFAULT_SIGNATURE_ALGORITHMS,
@@ -29,7 +29,8 @@ pub type MessageId = String;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerResponse {
     pub id: MessageId,
-    pub status: WorkerResponseStatus,
+    pub status: RequestStatus,
+    pub error: Option<String>,
     pub content: Option<ResponseContent>,
 }
 
@@ -40,8 +41,21 @@ impl WorkerResponse {
     {
         Self {
             id: id.to_string(),
-            status: WorkerResponseStatus::Ok,
+            status: RequestStatus::Ok,
+            error: None,
             content: None,
+        }
+    }
+
+    pub fn ok_with_content<T>(id: T, content: ResponseContent) -> Self
+    where
+        T: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            status: RequestStatus::Ok,
+            error: None,
+            content: Some(content),
         }
     }
 
@@ -52,7 +66,8 @@ impl WorkerResponse {
     {
         Self {
             id: id.to_string(),
-            status: WorkerResponseStatus::Error(error.to_string()),
+            status: RequestStatus::Error,
+            error: Some(error.to_string()),
             content: None,
         }
     }
@@ -63,18 +78,20 @@ impl WorkerResponse {
     {
         Self {
             id: id.to_string(),
-            status: WorkerResponseStatus::Processing,
+            status: RequestStatus::Processing,
+            error: None,
             content: None,
         }
     }
 
-    pub fn status<T>(id: T, status: WorkerResponseStatus) -> Self
+    pub fn status<T>(id: T, status: RequestStatus) -> Self
     where
         T: ToString,
     {
         Self {
             id: id.to_string(),
             status,
+            error: None,
             content: None,
         }
     }
@@ -84,13 +101,6 @@ impl fmt::Display for WorkerResponse {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}-{:?}", self.id, self.status)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum WorkerResponseStatus {
-    Ok,
-    Processing,
-    Error(String),
 }
 
 /// Aggregated metrics of main process & workers, for the CLI

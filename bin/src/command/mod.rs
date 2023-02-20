@@ -28,9 +28,7 @@ use sozu_command_lib::{
     config::Config,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
-    worker::{
-        MetricsConfiguration, WorkerOrder, WorkerRequest, WorkerResponse, WorkerResponseStatus,
-    },
+    worker::{MetricsConfiguration, WorkerOrder, WorkerRequest, WorkerResponse},
 };
 
 use crate::{
@@ -576,17 +574,17 @@ impl CommandServer {
             let mut i = 0;
             while let Some((proxy_response, _)) = rx.next().await {
                 match proxy_response.status {
-                    WorkerResponseStatus::Ok => {
+                    RequestStatus::Ok => {
                         ok += 1;
                     }
-                    WorkerResponseStatus::Processing => {
+                    RequestStatus::Processing => {
                         //info!("metrics processing");
                         continue;
                     }
-                    WorkerResponseStatus::Error(e) => {
+                    RequestStatus::Error => {
                         error!(
-                            "error handling configuration message {}: {}",
-                            proxy_response.id, e
+                            "error handling configuration message {}: {:?}",
+                            proxy_response.id, proxy_response.error
                         );
                         error += 1;
                     }
@@ -780,7 +778,7 @@ impl CommandServer {
                 // if a worker returned Ok or Error, we're not expecting any more
                 // messages with this id from it
                 match response.status {
-                    WorkerResponseStatus::Ok | WorkerResponseStatus::Error(_) => {
+                    RequestStatus::Ok | RequestStatus::Error => {
                         expected_responses -= 1;
                     }
                     _ => {}
