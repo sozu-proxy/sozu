@@ -633,7 +633,7 @@ mod tests {
                 .collect(),
                 workers: [(
                     String::from("0"),
-                    ProxyResponseContent::QueriedMetrics(WorkerMetrics::All(AllWorkerMetrics {
+                    ProxyResponseContent::WorkerMetrics(WorkerMetrics::All(AllWorkerMetrics {
                         proxy: Some(
                             [
                                 (String::from("sozu.gauge"), FilteredData::Gauge(1)),

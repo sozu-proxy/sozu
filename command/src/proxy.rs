@@ -100,9 +100,9 @@ pub enum ProxyResponseContent {
     WorkerEvent(WorkerEvent),
     WorkerClusters(Vec<QueryAnswerCluster>),
     /// cluster id -> hash of cluster information
-    ClustersHashes(BTreeMap<String, u64>),
+    WorkerClustersHashes(BTreeMap<String, u64>),
     WorkerCertificates(WorkerCertificates),
-    QueriedMetrics(WorkerMetrics),
+    WorkerMetrics(WorkerMetrics),
 }
 
 /// Aggregated metrics of main process & workers, for the CLI

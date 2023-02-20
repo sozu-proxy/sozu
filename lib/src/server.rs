@@ -890,7 +890,7 @@ impl Server {
                 push_queue(ProxyResponse {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::ClustersHashes(
+                    content: Some(ProxyResponseContent::WorkerClustersHashes(
                         self.config_state.hash_state(),
                     )),
                 });
@@ -942,7 +942,7 @@ impl Server {
                     push_queue(ProxyResponse {
                         id: message.id.clone(),
                         status: ProxyResponseStatus::Ok,
-                        content: Some(ProxyResponseContent::QueriedMetrics(data)),
+                        content: Some(ProxyResponseContent::WorkerMetrics(data)),
                     });
                 });
                 return;

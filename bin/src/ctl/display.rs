@@ -219,14 +219,14 @@ pub fn print_metrics(
 
 fn print_worker_metrics(response_content: &ProxyResponseContent) -> anyhow::Result<()> {
     match response_content {
-        ProxyResponseContent::QueriedMetrics(WorkerMetrics::All(AllWorkerMetrics {
+        ProxyResponseContent::WorkerMetrics(WorkerMetrics::All(AllWorkerMetrics {
             proxy,
             clusters,
         })) => {
             print_proxy_metrics(proxy);
             print_cluster_metrics(clusters);
         }
-        ProxyResponseContent::QueriedMetrics(WorkerMetrics::Error(error)) => {
+        ProxyResponseContent::WorkerMetrics(WorkerMetrics::Error(error)) => {
             println!("Error: {error}\nMaybe check your command.")
         }
         _ => bail!("The query answer is wrong."),
@@ -596,7 +596,7 @@ pub fn print_query_response_data(
 
         for metrics in data.values() {
             //let m: u8 = metrics;
-            if let ProxyResponseContent::ClustersHashes(clusters) = metrics {
+            if let ProxyResponseContent::WorkerClustersHashes(clusters) = metrics {
                 for (key, value) in clusters.iter() {
                     query_data.entry(key).or_insert(Vec::new()).push(value);
                 }
@@ -699,7 +699,7 @@ pub fn print_available_metrics(
         (HashSet::new(), HashSet::new());
     for response_content in response_contents.values() {
         match response_content {
-            ProxyResponseContent::QueriedMetrics(WorkerMetrics::List((
+            ProxyResponseContent::WorkerMetrics(WorkerMetrics::List((
                 proxy_metric_keys,
                 cluster_metric_keys,
             ))) => {

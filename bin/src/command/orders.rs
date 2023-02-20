@@ -1110,7 +1110,7 @@ impl CommandServer {
         let mut main_query_answer = None;
         match &proxy_request_order {
             ProxyRequestOrder::QueryClustersHashes => {
-                main_query_answer = Some(ProxyResponseContent::ClustersHashes(
+                main_query_answer = Some(ProxyResponseContent::WorkerClustersHashes(
                     self.state.hash_state(),
                 ));
             }

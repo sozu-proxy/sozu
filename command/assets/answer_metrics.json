@@ -22,7 +22,7 @@
       },
       "workers": {
         "0": {
-          "type": "QUERIED_METRICS",
+          "type": "WORKER_METRICS",
           "data": {
             "All": {
               "proxy": {
