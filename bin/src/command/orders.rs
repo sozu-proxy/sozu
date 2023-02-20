@@ -15,9 +15,8 @@ use nom::{Err, HexDisplay, Offset};
 use sozu_command_lib::{
     buffer::fixed::Buffer,
     command::{
-        CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
-        CommandStatus, FrontendFilters, ListedFrontends, ListenersList, RunState, WorkerInfo,
-        PROTOCOL_VERSION,
+        CommandRequestOrder, CommandResponse, FrontendFilters, ListedFrontends, ListenersList,
+        Request, RequestStatus, ResponseContent, RunState, WorkerInfo, PROTOCOL_VERSION,
     },
     config::Config,
     logging,
@@ -42,7 +41,7 @@ impl CommandServer {
     pub async fn handle_client_request(
         &mut self,
         client_id: String,
-        request: CommandRequest,
+        request: Request,
     ) -> anyhow::Result<Success> {
         trace!("Received order {:?}", request);
         let request_identifier = RequestIdentifier {
@@ -151,7 +150,7 @@ impl CommandServer {
 
         let result: anyhow::Result<usize> = (move || {
             for command in orders {
-                let message = CommandRequest::new(
+                let message = Request::new(
                     format!("SAVE-{counter}"),
                     CommandRequestOrder::Worker(Box::new(command)),
                     None,
@@ -190,9 +189,9 @@ impl CommandServer {
     pub async fn dump_state(&mut self) -> anyhow::Result<Option<Success>> {
         let state = self.state.clone();
 
-        Ok(Some(Success::DumpState(CommandResponseContent::State(
-            Box::new(state),
-        ))))
+        Ok(Some(Success::DumpState(ResponseContent::State(Box::new(
+            state,
+        )))))
     }
 
     pub async fn load_state(
@@ -228,7 +227,7 @@ impl CommandServer {
             }
 
             let mut offset = 0usize;
-            match parse_several_commands::<CommandRequest>(buffer.data()) {
+            match parse_several_commands::<Request>(buffer.data()) {
                 Ok((i, requests)) => {
                     if !i.is_empty() {
                         debug!("could not parse {} bytes", i.len());
@@ -425,14 +424,14 @@ impl CommandServer {
             }
         }
 
-        Ok(Some(Success::ListFrontends(
-            CommandResponseContent::FrontendList(listed_frontends),
-        )))
+        Ok(Some(Success::ListFrontends(ResponseContent::FrontendList(
+            listed_frontends,
+        ))))
     }
 
     fn list_listeners(&self) -> anyhow::Result<Option<Success>> {
         Ok(Some(Success::ListListeners(
-            CommandResponseContent::ListenersList(ListenersList {
+            ResponseContent::ListenersList(ListenersList {
                 http_listeners: self.state.http_listeners.clone(),
                 https_listeners: self.state.https_listeners.clone(),
                 tcp_listeners: self.state.tcp_listeners.clone(),
@@ -453,7 +452,7 @@ impl CommandServer {
 
         debug!("workers: {:#?}", workers);
 
-        Ok(Some(Success::ListWorkers(CommandResponseContent::Workers(
+        Ok(Some(Success::ListWorkers(ResponseContent::Workers(
             workers,
         ))))
     }
@@ -990,7 +989,7 @@ impl CommandServer {
             return_success(
                 command_tx,
                 thread_request_identifier,
-                Success::Status(CommandResponseContent::Status(worker_info_vec)),
+                Success::Status(ResponseContent::Status(worker_info_vec)),
             )
             .await;
         })
@@ -1110,12 +1109,12 @@ impl CommandServer {
         let mut main_query_answer = None;
         match &proxy_request_order {
             WorkerRequestOrder::QueryClustersHashes => {
-                main_query_answer = Some(CommandResponseContent::WorkerClustersHashes(
+                main_query_answer = Some(ResponseContent::WorkerClustersHashes(
                     self.state.hash_state(),
                 ));
             }
             WorkerRequestOrder::QueryClusterById { cluster_id } => {
-                main_query_answer = Some(CommandResponseContent::WorkerClusters(vec![self
+                main_query_answer = Some(ResponseContent::WorkerClusters(vec![self
                     .state
                     .cluster_state(cluster_id)]));
             }
@@ -1126,7 +1125,7 @@ impl CommandServer {
                     .iter()
                     .map(|cluster_id| self.state.cluster_state(cluster_id))
                     .collect();
-                main_query_answer = Some(CommandResponseContent::WorkerClusters(clusters));
+                main_query_answer = Some(ResponseContent::WorkerClusters(clusters));
             }
             _ => {}
         }
@@ -1162,7 +1161,7 @@ impl CommandServer {
                 }
             }
 
-            let mut proxy_responses_map: BTreeMap<String, CommandResponseContent> = responses
+            let mut proxy_responses_map: BTreeMap<String, ResponseContent> = responses
                 .into_iter()
                 .filter_map(|(worker_id, proxy_response)| match proxy_response.content {
                     Some(content) => Some((worker_id.to_string(), content)),
@@ -1179,7 +1178,7 @@ impl CommandServer {
                 } => {
                     let query_answer = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
                     proxy_responses_map.insert(String::from("main"), query_answer);
-                    Success::Query(CommandResponseContent::Query(proxy_responses_map))
+                    Success::Query(ResponseContent::Query(proxy_responses_map))
                 }
                 WorkerRequestOrder::QueryCertificateByDomain(_)
                 | WorkerRequestOrder::QueryCertificateByFingerprint(_) => {
@@ -1187,15 +1186,15 @@ impl CommandServer {
                         "certificates query answer received: {:?}",
                         proxy_responses_map
                     );
-                    Success::Query(CommandResponseContent::Query(proxy_responses_map))
+                    Success::Query(ResponseContent::Query(proxy_responses_map))
                 }
                 WorkerRequestOrder::QueryMetrics(options) => {
                     debug!("metrics query answer received: {:?}", proxy_responses_map);
 
                     if options.list {
-                        Success::Query(CommandResponseContent::Query(proxy_responses_map))
+                        Success::Query(ResponseContent::Query(proxy_responses_map))
                     } else {
-                        Success::Query(CommandResponseContent::Metrics(AggregatedMetrics {
+                        Success::Query(ResponseContent::Metrics(AggregatedMetrics {
                             main: main_metrics,
                             workers: proxy_responses_map,
                         }))
@@ -1428,20 +1427,20 @@ impl CommandServer {
 
                 CommandResponse::new(
                     request_id.clone(),
-                    CommandStatus::Ok,
+                    RequestStatus::Ok,
                     success_message,
                     command_response_data,
                 )
             }
             Response::Processing(processing_message) => CommandResponse::new(
                 request_id.clone(),
-                CommandStatus::Processing,
+                RequestStatus::Processing,
                 processing_message,
                 None,
             ),
             Response::Error(error_message) => CommandResponse::new(
                 request_id.clone(),
-                CommandStatus::Error,
+                RequestStatus::Error,
                 error_message,
                 None,
             ),

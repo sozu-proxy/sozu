@@ -63,7 +63,7 @@ pub struct FrontendFilters {
 
 /// Sent to the main process by the CLI (or other) through the unix socket
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CommandRequest {
+pub struct Request {
     pub id: String,
     pub version: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,9 +72,9 @@ pub struct CommandRequest {
     pub order: CommandRequestOrder,
 }
 
-impl CommandRequest {
-    pub fn new(id: String, order: CommandRequestOrder, worker_id: Option<u32>) -> CommandRequest {
-        CommandRequest {
+impl Request {
+    pub fn new(id: String, order: CommandRequestOrder, worker_id: Option<u32>) -> Request {
+        Request {
             version: PROTOCOL_VERSION,
             id,
             order,
@@ -85,7 +85,7 @@ impl CommandRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CommandStatus {
+pub enum RequestStatus {
     Ok,
     Processing,
     Error,
@@ -95,13 +95,13 @@ pub enum CommandStatus {
 /// or by a worker to the main process
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CommandResponseContent {
+pub enum ResponseContent {
     /// a list of workers, with ids, pids, statuses
     Workers(Vec<WorkerInfo>),
     /// aggregated metrics of main process and workers
     Metrics(AggregatedMetrics),
     /// worker responses to a same query: worker_id -> query_answer
-    Query(BTreeMap<String, CommandResponseContent>),
+    Query(BTreeMap<String, ResponseContent>),
     /// the state of Sōzu: frontends, backends, listeners, etc.
     State(Box<ConfigState>),
     /// a proxy event
@@ -143,17 +143,17 @@ pub struct ListenersList {
 pub struct CommandResponse {
     pub id: String,
     pub version: u8,
-    pub status: CommandStatus,
+    pub status: RequestStatus,
     pub message: String,
-    pub content: Option<CommandResponseContent>,
+    pub content: Option<ResponseContent>,
 }
 
 impl CommandResponse {
     pub fn new(
         id: String,
-        status: CommandStatus,
+        status: RequestStatus,
         message: String,
-        content: Option<CommandResponseContent>,
+        content: Option<ResponseContent>,
     ) -> CommandResponse {
         CommandResponse {
             version: PROTOCOL_VERSION,
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn config_message_test() {
         let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "WORKER", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
-        let message: CommandRequest = serde_json::from_str(raw_json).unwrap();
+        let message: Request = serde_json::from_str(raw_json).unwrap();
         println!("{message:?}");
         assert_eq!(
             message.order,
@@ -290,7 +290,7 @@ mod tests {
     test_message!(
         add_cluster,
         "../assets/add_cluster.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddCluster(Cluster {
@@ -309,7 +309,7 @@ mod tests {
     test_message!(
         remove_cluster,
         "../assets/remove_cluster.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveCluster {
@@ -322,7 +322,7 @@ mod tests {
     test_message!(
         add_http_front,
         "../assets/add_http_front.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddHttpFrontend(
@@ -343,7 +343,7 @@ mod tests {
     test_message!(
         remove_http_front,
         "../assets/remove_http_front.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveHttpFrontend(
@@ -370,7 +370,7 @@ mod tests {
     test_message!(
         add_https_front,
         "../assets/add_https_front.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddHttpsFrontend(
@@ -391,7 +391,7 @@ mod tests {
     test_message!(
         remove_https_front,
         "../assets/remove_https_front.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveHttpsFrontend(
@@ -422,7 +422,7 @@ mod tests {
     test_message!(
         add_certificate,
         "../assets/add_certificate.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddCertificate(
@@ -445,7 +445,7 @@ mod tests {
     test_message!(
         remove_certificate,
         "../assets/remove_certificate.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveCertificate(
@@ -466,7 +466,7 @@ mod tests {
     test_message!(
         add_backend,
         "../assets/add_backend.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::AddBackend(Backend {
@@ -484,7 +484,7 @@ mod tests {
     test_message!(
         remove_backend,
         "../assets/remove_backend.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::RemoveBackend(
@@ -501,7 +501,7 @@ mod tests {
     test_message!(
         soft_stop,
         "../assets/soft_stop.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::SoftStop)),
@@ -512,7 +512,7 @@ mod tests {
     test_message!(
         hard_stop,
         "../assets/hard_stop.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::HardStop)),
@@ -523,7 +523,7 @@ mod tests {
     test_message!(
         status,
         "../assets/status.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Worker(Box::new(WorkerRequestOrder::Status)),
@@ -534,7 +534,7 @@ mod tests {
     test_message!(
         load_state,
         "../assets/load_state.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::LoadState {
@@ -547,7 +547,7 @@ mod tests {
     test_message!(
         save_state,
         "../assets/save_state.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::SaveState {
@@ -560,7 +560,7 @@ mod tests {
     test_message!(
         dump_state,
         "../assets/dump_state.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::DumpState,
@@ -571,7 +571,7 @@ mod tests {
     test_message!(
         list_workers,
         "../assets/list_workers.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::ListWorkers,
@@ -582,7 +582,7 @@ mod tests {
     test_message!(
         upgrade_main,
         "../assets/upgrade_main.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::UpgradeMain,
@@ -593,7 +593,7 @@ mod tests {
     test_message!(
         upgrade_worker,
         "../assets/upgrade_worker.json",
-        CommandRequest {
+        Request {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::UpgradeWorker(0),
@@ -607,9 +607,9 @@ mod tests {
         CommandResponse {
             id: "ID_TEST".to_string(),
             version: 0,
-            status: CommandStatus::Ok,
+            status: RequestStatus::Ok,
             message: String::from(""),
-            content: Some(CommandResponseContent::Workers(vec!(
+            content: Some(ResponseContent::Workers(vec!(
                 WorkerInfo {
                     id: 1,
                     pid: 5678,
@@ -630,9 +630,9 @@ mod tests {
         CommandResponse {
             id: "ID_TEST".to_string(),
             version: 0,
-            status: CommandStatus::Ok,
+            status: RequestStatus::Ok,
             message: String::from(""),
-            content: Some(CommandResponseContent::Metrics(AggregatedMetrics {
+            content: Some(ResponseContent::Metrics(AggregatedMetrics {
                 main: [
                     (String::from("sozu.gauge"), FilteredData::Gauge(1)),
                     (String::from("sozu.count"), FilteredData::Count(-2)),
@@ -643,7 +643,7 @@ mod tests {
                 .collect(),
                 workers: [(
                     String::from("0"),
-                    CommandResponseContent::WorkerMetrics(WorkerMetrics::All(AllWorkerMetrics {
+                    ResponseContent::WorkerMetrics(WorkerMetrics::All(AllWorkerMetrics {
                         proxy: Some(
                             [
                                 (String::from("sozu.gauge"), FilteredData::Gauge(1)),

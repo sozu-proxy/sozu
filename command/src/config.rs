@@ -14,7 +14,7 @@ use toml;
 
 use crate::{
     certificate::split_certificate_chain,
-    command::{CommandRequest, CommandRequestOrder, PROTOCOL_VERSION},
+    command::{CommandRequestOrder, Request, PROTOCOL_VERSION},
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
@@ -1188,12 +1188,12 @@ impl Config {
         Ok(config)
     }
 
-    pub fn generate_config_messages(&self) -> Vec<CommandRequest> {
+    pub fn generate_config_messages(&self) -> Vec<Request> {
         let mut v = Vec::new();
         let mut count = 0u8;
 
         for listener in &self.http_listeners {
-            v.push(CommandRequest {
+            v.push(Request {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
@@ -1205,7 +1205,7 @@ impl Config {
         }
 
         for listener in &self.https_listeners {
-            v.push(CommandRequest {
+            v.push(Request {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
@@ -1217,7 +1217,7 @@ impl Config {
         }
 
         for listener in &self.tcp_listeners {
-            v.push(CommandRequest {
+            v.push(Request {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
                 worker_id: None,
@@ -1231,7 +1231,7 @@ impl Config {
         for cluster in self.clusters.values() {
             let mut orders = cluster.generate_orders();
             for order in orders.drain(..) {
-                v.push(CommandRequest {
+                v.push(Request {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
@@ -1243,7 +1243,7 @@ impl Config {
 
         if self.activate_listeners {
             for listener in &self.http_listeners {
-                v.push(CommandRequest {
+                v.push(Request {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
@@ -1259,7 +1259,7 @@ impl Config {
             }
 
             for listener in &self.https_listeners {
-                v.push(CommandRequest {
+                v.push(Request {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,
@@ -1275,7 +1275,7 @@ impl Config {
             }
 
             for listener in &self.tcp_listeners {
-                v.push(CommandRequest {
+                v.push(Request {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
                     worker_id: None,

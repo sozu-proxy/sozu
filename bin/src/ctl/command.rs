@@ -5,8 +5,8 @@ use serde::Serialize;
 
 use sozu_command_lib::{
     command::{
-        CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
-        CommandStatus, RunState, WorkerInfo,
+        CommandRequestOrder, CommandResponse, Request, RequestStatus, ResponseContent, RunState,
+        WorkerInfo,
     },
     worker::{QueryMetricsOptions, WorkerRequestOrder},
 };
@@ -51,7 +51,7 @@ impl CommandManager {
         id: &str,
         command_request_order: CommandRequestOrder,
     ) -> anyhow::Result<()> {
-        let command_request = CommandRequest::new(id.to_string(), command_request_order, None);
+        let command_request = Request::new(id.to_string(), command_request_order, None);
 
         self.channel
             .write_message(&command_request)
@@ -84,7 +84,7 @@ impl CommandManager {
     ) -> Result<(), anyhow::Error> {
         let id = generate_id();
 
-        let command_request = CommandRequest::new(id, command_request_order, worker_id);
+        let command_request = Request::new(id, command_request_order, worker_id);
 
         println!("Sending command : {command_request:?}");
 
@@ -104,9 +104,9 @@ impl CommandManager {
                 );
             }
             match response.status {
-                CommandStatus::Processing => println!("Proxy is processing: {}", response.message),
-                CommandStatus::Error => bail!("Order failed: {}", response.message),
-                CommandStatus::Ok => {
+                RequestStatus::Processing => println!("Proxy is processing: {}", response.message),
+                RequestStatus::Error => bail!("Order failed: {}", response.message),
+                RequestStatus::Ok => {
                     if json {
                         // why do we need to print a success message in json?
                         print_json_response(&response.message)?;
@@ -115,30 +115,30 @@ impl CommandManager {
                     }
                     match response.content {
                         Some(response_content) => match response_content {
-                            CommandResponseContent::Event(_)
-                            | CommandResponseContent::Metrics(_)
-                            | CommandResponseContent::Query(_)
-                            | CommandResponseContent::Workers(_)
-                            | CommandResponseContent::WorkerCertificates(_)
-                            | CommandResponseContent::WorkerClusters(_)
-                            | CommandResponseContent::WorkerClustersHashes(_)
-                            | CommandResponseContent::WorkerEvent(_)
-                            | CommandResponseContent::WorkerMetrics(_) => {}
-                            CommandResponseContent::State(state) => match json {
+                            ResponseContent::Event(_)
+                            | ResponseContent::Metrics(_)
+                            | ResponseContent::Query(_)
+                            | ResponseContent::Workers(_)
+                            | ResponseContent::WorkerCertificates(_)
+                            | ResponseContent::WorkerClusters(_)
+                            | ResponseContent::WorkerClustersHashes(_)
+                            | ResponseContent::WorkerEvent(_)
+                            | ResponseContent::WorkerMetrics(_) => {}
+                            ResponseContent::State(state) => match json {
                                 true => print_json_response(&state)?,
                                 false => println!("{state:#?}"),
                             },
-                            CommandResponseContent::FrontendList(frontends) => {
+                            ResponseContent::FrontendList(frontends) => {
                                 print_frontend_list(frontends)
                             }
-                            CommandResponseContent::Status(worker_info_vec) => {
+                            ResponseContent::Status(worker_info_vec) => {
                                 if json {
                                     print_json_response(&worker_info_vec)?;
                                 } else {
                                     print_status(worker_info_vec);
                                 }
                             }
-                            CommandResponseContent::ListenersList(list) => print_listeners(list),
+                            ResponseContent::ListenersList(list) => print_listeners(list),
                         },
                         None => {}
                     }
@@ -166,17 +166,17 @@ impl CommandManager {
                 bail!("Error: received unexpected message: {:?}", response);
             }
             match response.status {
-                CommandStatus::Processing => {
+                RequestStatus::Processing => {
                     println!("Processing: {}", response.message);
                 }
-                CommandStatus::Error => {
+                RequestStatus::Error => {
                     bail!(
                         "Error: failed to get the list of worker: {}",
                         response.message
                     );
                 }
-                CommandStatus::Ok => {
-                    if let Some(CommandResponseContent::Workers(ref workers)) = response.content {
+                RequestStatus::Ok => {
+                    if let Some(ResponseContent::Workers(ref workers)) = response.content {
                         let mut table = Table::new();
                         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
                         table.add_row(row!["Worker", "pid", "run state"]);
@@ -201,16 +201,16 @@ impl CommandManager {
                             }
 
                             match response.status {
-                                CommandStatus::Processing => {
+                                RequestStatus::Processing => {
                                     println!("Main process is upgrading");
                                 }
-                                CommandStatus::Error => {
+                                RequestStatus::Error => {
                                     bail!(
                                         "Error: failed to upgrade the main: {}",
                                         response.message
                                     );
                                 }
-                                CommandStatus::Ok => {
+                                RequestStatus::Ok => {
                                     println!(
                                         "Main process upgrade succeeded: {}",
                                         response.message
@@ -266,13 +266,13 @@ impl CommandManager {
             let response = self.read_channel_message_with_timeout()?;
 
             match response.status {
-                CommandStatus::Processing => info!("Proxy is processing: {}", response.message),
-                CommandStatus::Error => bail!(
+                RequestStatus::Processing => info!("Proxy is processing: {}", response.message),
+                RequestStatus::Error => bail!(
                     "could not stop the worker {}: {}",
                     worker_id,
                     response.message
                 ),
-                CommandStatus::Ok => {
+                RequestStatus::Ok => {
                     // this is necessary because we may receive responses about other workers
                     if id == response.id {
                         info!("Worker {} shut down: {}", worker_id, response.message);
@@ -317,22 +317,22 @@ impl CommandManager {
                     bail!("received message with invalid id: {:?}", response);
                 }
                 match response.status {
-                    CommandStatus::Processing => {
+                    RequestStatus::Processing => {
                         println!("Proxy is processing: {}", response.message);
                     }
-                    CommandStatus::Error => {
+                    RequestStatus::Error => {
                         if json {
                             return print_json_response(&response.message);
                         } else {
                             bail!("could not query proxy state: {}", response.message);
                         }
                     }
-                    CommandStatus::Ok => {
+                    RequestStatus::Ok => {
                         match response.content {
-                            Some(CommandResponseContent::Metrics(aggregated_metrics_data)) => {
+                            Some(ResponseContent::Metrics(aggregated_metrics_data)) => {
                                 print_metrics(aggregated_metrics_data, json)?
                             }
-                            Some(CommandResponseContent::Query(lists_of_metrics)) => {
+                            Some(ResponseContent::Query(lists_of_metrics)) => {
                                 print_available_metrics(&lists_of_metrics)?;
                             }
                             _ => println!("Wrong kind of response here"),
@@ -409,16 +409,16 @@ impl CommandManager {
                 bail!("received message with invalid id: {:?}", response);
             }
             match response.status {
-                CommandStatus::Processing => {
+                RequestStatus::Processing => {
                     println!("Proxy is processing: {}", response.message);
                 }
-                CommandStatus::Error => {
+                RequestStatus::Error => {
                     if json {
                         print_json_response(&response.message)?;
                     }
                     bail!("could not query proxy state: {}", response.message);
                 }
-                CommandStatus::Ok => {
+                RequestStatus::Ok => {
                     print_query_response_data(cluster_id, domain, response.content, json)?;
                     break;
                 }
@@ -461,10 +461,10 @@ impl CommandManager {
                 bail!("received message with invalid id: {:?}", response);
             }
             match response.status {
-                CommandStatus::Processing => {
+                RequestStatus::Processing => {
                     println!("Proxy is processing: {}", response.message);
                 }
-                CommandStatus::Error => {
+                RequestStatus::Error => {
                     if json {
                         print_json_response(&response.message)?;
                         bail!("We received an error message");
@@ -472,11 +472,9 @@ impl CommandManager {
                         bail!("could not query proxy state: {}", response.message);
                     }
                 }
-                CommandStatus::Ok => {
+                RequestStatus::Ok => {
                     match response.content {
-                        Some(CommandResponseContent::Query(data)) => {
-                            print_certificates(data, json)?
-                        }
+                        Some(ResponseContent::Query(data)) => print_certificates(data, json)?,
                         _ => bail!("unexpected response: {:?}", response.content),
                     }
                     break;

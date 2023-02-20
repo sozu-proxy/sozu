@@ -74,11 +74,11 @@ where
 mod test {
     use super::*;
 
-    use crate::command::{CommandRequest, CommandRequestOrder};
+    use crate::command::{CommandRequestOrder, Request};
 
     #[test]
     fn parse_one_command_request_works() {
-        let command_request = CommandRequest::new(
+        let command_request = Request::new(
             "Some request".to_string(),
             CommandRequestOrder::DumpState,
             Some(5),
@@ -103,19 +103,19 @@ mod test {
     #[test]
     fn parse_several_command_requests_works() {
         let commands = vec![
-            CommandRequest::new(
+            Request::new(
                 "Some request".to_string(),
                 CommandRequestOrder::SaveState {
                     path: "/some/path".to_string(),
                 },
                 Some(5),
             ),
-            CommandRequest::new(
+            Request::new(
                 "Some other request".to_string(),
                 CommandRequestOrder::SubscribeEvents,
                 Some(4),
             ),
-            CommandRequest::new(
+            Request::new(
                 "Yet another request".to_string(),
                 CommandRequestOrder::DumpState,
                 None,

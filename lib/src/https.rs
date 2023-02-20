@@ -50,7 +50,7 @@ use crate::{
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     sozu_command::{
-        command::CommandResponseContent,
+        command::ResponseContent,
         logging,
         ready::Ready,
         scm_socket::ScmSocket,
@@ -877,7 +877,7 @@ impl HttpsProxy {
     pub fn remove_listener(
         &mut self,
         remove: RemoveListener,
-    ) -> anyhow::Result<Option<CommandResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         let len = self.listeners.len();
 
         self.listeners
@@ -932,10 +932,7 @@ impl HttpsProxy {
         Ok(())
     }
 
-    pub fn logging(
-        &mut self,
-        logging_filter: String,
-    ) -> anyhow::Result<Option<CommandResponseContent>> {
+    pub fn logging(&mut self, logging_filter: String) -> anyhow::Result<Option<ResponseContent>> {
         logging::LOGGER.with(|l| {
             let directives = logging::parse_logging_spec(&logging_filter);
             l.borrow_mut().set_directives(directives);
@@ -943,7 +940,7 @@ impl HttpsProxy {
         Ok(None)
     }
 
-    pub fn query_all_certificates(&mut self) -> anyhow::Result<Option<CommandResponseContent>> {
+    pub fn query_all_certificates(&mut self) -> anyhow::Result<Option<ResponseContent>> {
         let certificates = self
             .listeners
             .values()
@@ -966,7 +963,7 @@ impl HttpsProxy {
             certificates
         );
 
-        Ok(Some(CommandResponseContent::WorkerCertificates(
+        Ok(Some(ResponseContent::WorkerCertificates(
             WorkerCertificates::All(certificates),
         )))
     }
@@ -974,7 +971,7 @@ impl HttpsProxy {
     pub fn query_certificate_for_domain(
         &mut self,
         domain: String,
-    ) -> anyhow::Result<Option<CommandResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         let certificates = self
             .listeners
             .values()
@@ -995,7 +992,7 @@ impl HttpsProxy {
             domain, certificates
         );
 
-        Ok(Some(CommandResponseContent::WorkerCertificates(
+        Ok(Some(ResponseContent::WorkerCertificates(
             WorkerCertificates::Domain(certificates),
         )))
     }
@@ -1049,10 +1046,7 @@ impl HttpsProxy {
             })
     }
 
-    pub fn add_cluster(
-        &mut self,
-        mut cluster: Cluster,
-    ) -> anyhow::Result<Option<CommandResponseContent>> {
+    pub fn add_cluster(&mut self, mut cluster: Cluster) -> anyhow::Result<Option<ResponseContent>> {
         if let Some(answer_503) = cluster.answer_503.take() {
             for listener in self.listeners.values() {
                 listener
@@ -1066,10 +1060,7 @@ impl HttpsProxy {
         Ok(None)
     }
 
-    pub fn remove_cluster(
-        &mut self,
-        cluster_id: &str,
-    ) -> anyhow::Result<Option<CommandResponseContent>> {
+    pub fn remove_cluster(&mut self, cluster_id: &str) -> anyhow::Result<Option<ResponseContent>> {
         self.clusters.remove(cluster_id);
         for listener in self.listeners.values() {
             listener
@@ -1085,7 +1076,7 @@ impl HttpsProxy {
     pub fn add_https_frontend(
         &mut self,
         front: HttpFrontend,
-    ) -> anyhow::Result<Option<CommandResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         match self
             .listeners
             .values()
@@ -1106,7 +1097,7 @@ impl HttpsProxy {
     pub fn remove_https_frontend(
         &mut self,
         front: HttpFrontend,
-    ) -> anyhow::Result<Option<CommandResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         if let Some(listener) = self
             .listeners
             .values()
@@ -1124,7 +1115,7 @@ impl HttpsProxy {
     pub fn add_certificate(
         &mut self,
         add_certificate: AddCertificate,
-    ) -> anyhow::Result<Option<CommandResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         match self
             .listeners
             .values()
@@ -1147,7 +1138,7 @@ impl HttpsProxy {
     pub fn remove_certificate(
         &mut self,
         remove_certificate: RemoveCertificate,
-    ) -> anyhow::Result<Option<CommandResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         match self
             .listeners
             .values()
@@ -1170,7 +1161,7 @@ impl HttpsProxy {
     pub fn replace_certificate(
         &mut self,
         replace_certificate: ReplaceCertificate,
-    ) -> anyhow::Result<Option<CommandResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         match self
             .listeners
             .values()

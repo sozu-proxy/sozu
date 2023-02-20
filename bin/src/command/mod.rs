@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
     command::{
-        CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
-        CommandStatus, Event, RunState,
+        CommandRequestOrder, CommandResponse, Event, Request, RequestStatus, ResponseContent,
+        RunState,
     },
     config::Config,
     scm_socket::{Listeners, ScmSocket},
@@ -60,7 +60,7 @@ enum CommandMessage {
     },
     ClientRequest {
         client_id: String,
-        request: CommandRequest,
+        request: Request,
     },
     WorkerResponse {
         worker_id: u32,
@@ -109,13 +109,13 @@ pub enum Response {
 // in which case Success caries the response data.
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Success {
-    ClientClose(String),               // the client id
-    ClientNew(String),                 // the client id
-    DumpState(CommandResponseContent), // the cloned state
+    ClientClose(String),        // the client id
+    ClientNew(String),          // the client id
+    DumpState(ResponseContent), // the cloned state
     HandledClientRequest,
-    ListFrontends(CommandResponseContent), // the list of frontends
-    ListListeners(CommandResponseContent), // the list of listeners
-    ListWorkers(CommandResponseContent),
+    ListFrontends(ResponseContent), // the list of frontends
+    ListListeners(ResponseContent), // the list of listeners
+    ListWorkers(ResponseContent),
     LoadState(String, usize, usize), // state path, oks, errors
     Logging(String),                 // new logging level
     Metrics(MetricsConfiguration),   // enable / disable / clear metrics on the proxy
@@ -125,10 +125,10 @@ pub enum Success {
     // Metrics,
     NotifiedClient(String), // client id
     PropagatedWorkerEvent,
-    Query(CommandResponseContent),
+    Query(ResponseContent),
     ReloadConfiguration(usize, usize), // ok, errors
     SaveState(usize, String),          // amount of written commands, path of the saved state
-    Status(CommandResponseContent),    // Vec<WorkerInfo>
+    Status(ResponseContent),           // Vec<WorkerInfo>
     SubscribeEvent(String),
     UpgradeMain(i32),         // pid of the new main process
     UpgradeWorker(u32),       // worker id
@@ -747,15 +747,15 @@ impl CommandServer {
         response: WorkerResponse,
     ) -> anyhow::Result<Success> {
         // Notify the client with Processing in case of a proxy event
-        if let Some(CommandResponseContent::WorkerEvent(worker_event)) = response.content {
+        if let Some(ResponseContent::WorkerEvent(worker_event)) = response.content {
             let event: Event = worker_event.into();
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = CommandResponse::new(
                         response.id.to_string(),
-                        CommandStatus::Processing,
+                        RequestStatus::Processing,
                         format!("{worker_id}"),
-                        Some(CommandResponseContent::Event(event.clone())),
+                        Some(ResponseContent::Event(event.clone())),
                     );
                     client_tx
                         .send(event)
@@ -981,7 +981,7 @@ async fn client_loop(
             Ok(msg) => msg,
         };
 
-        match serde_json::from_slice::<CommandRequest>(&message) {
+        match serde_json::from_slice::<Request>(&message) {
             Err(e) => {
                 error!("could not decode client message: {:?}", e);
                 break;

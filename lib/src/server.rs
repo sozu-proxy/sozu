@@ -26,7 +26,7 @@ use crate::{
     pool::Pool,
     sozu_command::{
         channel::Channel,
-        command::CommandResponseContent,
+        command::ResponseContent,
         config::Config,
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
@@ -66,7 +66,7 @@ pub fn push_event(event: WorkerEvent) {
         (*queue.borrow_mut()).push_back(WorkerResponse {
             id: "EVENT".to_string(),
             status: WorkerResponseStatus::Processing,
-            content: Some(CommandResponseContent::WorkerEvent(event)),
+            content: Some(ResponseContent::WorkerEvent(event)),
         });
     });
 }
@@ -890,14 +890,14 @@ impl Server {
                 push_queue(WorkerResponse {
                     id: message.id.clone(),
                     status: WorkerResponseStatus::Ok,
-                    content: Some(CommandResponseContent::WorkerClustersHashes(
+                    content: Some(ResponseContent::WorkerClustersHashes(
                         self.config_state.hash_state(),
                     )),
                 });
                 return;
             }
             WorkerRequestOrder::QueryClusterById { cluster_id } => {
-                let response_content = CommandResponseContent::WorkerClusters(vec![self
+                let response_content = ResponseContent::WorkerClusters(vec![self
                     .config_state
                     .cluster_state(&cluster_id)]);
                 push_queue(WorkerResponse {
@@ -918,7 +918,7 @@ impl Server {
                 push_queue(WorkerResponse {
                     id: message.id.clone(),
                     status: WorkerResponseStatus::Ok,
-                    content: Some(CommandResponseContent::WorkerClusters(clusters)),
+                    content: Some(ResponseContent::WorkerClusters(clusters)),
                 });
                 return;
             }
@@ -926,7 +926,7 @@ impl Server {
                 push_queue(WorkerResponse {
                     id: message.id.clone(),
                     status: WorkerResponseStatus::Ok,
-                    content: Some(CommandResponseContent::WorkerCertificates(
+                    content: Some(ResponseContent::WorkerCertificates(
                         WorkerCertificates::Fingerprint(get_certificate(&self.config_state, &f)),
                     )),
                 });
@@ -939,7 +939,7 @@ impl Server {
                     push_queue(WorkerResponse {
                         id: message.id.clone(),
                         status: WorkerResponseStatus::Ok,
-                        content: Some(CommandResponseContent::WorkerMetrics(data)),
+                        content: Some(ResponseContent::WorkerMetrics(data)),
                     });
                 });
                 return;

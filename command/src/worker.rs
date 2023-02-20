@@ -15,7 +15,7 @@ use serde::{
 };
 
 use crate::{
-    command::CommandResponseContent,
+    command::ResponseContent,
     config::{
         ProxyProtocolConfig, DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST,
         DEFAULT_RUSTLS_CIPHER_LIST, DEFAULT_SIGNATURE_ALGORITHMS,
@@ -30,7 +30,7 @@ pub type MessageId = String;
 pub struct WorkerResponse {
     pub id: MessageId,
     pub status: WorkerResponseStatus,
-    pub content: Option<CommandResponseContent>,
+    pub content: Option<ResponseContent>,
 }
 
 impl WorkerResponse {
@@ -97,7 +97,7 @@ pub enum WorkerResponseStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedMetrics {
     pub main: BTreeMap<String, FilteredData>,
-    pub workers: BTreeMap<String, CommandResponseContent>,
+    pub workers: BTreeMap<String, ResponseContent>,
 }
 
 /// All metrics of a worker: proxy and clusters
