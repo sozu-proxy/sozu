@@ -15,11 +15,12 @@ use serde::{
 };
 
 use crate::{
+    command::CommandResponseContent,
     config::{
         ProxyProtocolConfig, DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST,
         DEFAULT_RUSTLS_CIPHER_LIST, DEFAULT_SIGNATURE_ALGORITHMS,
     },
-    state::{ClusterId, RouteKey}, command::CommandResponseContent,
+    state::{ClusterId, RouteKey},
 };
 
 pub type MessageId = String;
@@ -91,21 +92,6 @@ pub enum ProxyResponseStatus {
     Processing,
     Error(String),
 }
-
-/*
-// TODO: make those variants of CommandResponseContent
-/// Sent by one worker to the main process
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ProxyResponseContent {
-    WorkerEvent(WorkerEvent),
-    WorkerClusters(Vec<ClusterInformation>),
-    /// cluster id -> hash of cluster information
-    WorkerClustersHashes(BTreeMap<String, u64>),
-    WorkerCertificates(WorkerCertificates),
-    WorkerMetrics(WorkerMetrics),
-}
-*/
 
 /// Aggregated metrics of main process & workers, for the CLI
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +177,7 @@ pub enum WorkerEvent {
     RemovedBackendHasNoConnections(String, SocketAddr),
 }
 
+/// A message receivable by a worker
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequest {
     pub id: MessageId,
@@ -817,17 +804,6 @@ pub struct QueryMetricsOptions {
     pub backend_ids: Vec<String>,
     pub metric_names: Vec<String>,
 }
-
-/// details of an query answer, sent by a worker
-// #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-// #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-// pub enum QueryAnswer {
-//     Clusters(Vec<QueryAnswerCluster>),
-//     /// cluster id -> hash of cluster information
-//     ClustersHashes(BTreeMap<String, u64>),
-//     Certificates(QueryAnswerCertificate),
-//     Metrics(QueryAnswerMetrics),
-// }
 
 /// all information about one cluster, sent by a worker
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
