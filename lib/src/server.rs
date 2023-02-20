@@ -30,7 +30,7 @@ use crate::{
         config::Config,
         proxy::{
             Backend as CommandLibBackend, Cluster, ListenerType, MessageId, WorkerOrder,
-            WorkerRequestOrder, ProxyResponse, ProxyResponseStatus, RemoveBackend,
+            WorkerRequestOrder, WorkerResponse, WorkerResponseStatus, RemoveBackend,
             TcpListenerConfig as CommandTcpListener, WorkerCertificates, WorkerEvent,
         },
         ready::Ready,
@@ -45,17 +45,17 @@ use crate::{
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;
 
-pub type ProxyChannel = Channel<ProxyResponse, WorkerOrder>;
+pub type ProxyChannel = Channel<WorkerResponse, WorkerOrder>;
 
 thread_local! {
-  pub static QUEUE: RefCell<VecDeque<ProxyResponse>> = RefCell::new(VecDeque::new());
+  pub static QUEUE: RefCell<VecDeque<WorkerResponse>> = RefCell::new(VecDeque::new());
 }
 
 thread_local! {
   pub static TIMER: RefCell<Timer<Token>> = RefCell::new(Timer::default());
 }
 
-pub fn push_queue(message: ProxyResponse) {
+pub fn push_queue(message: WorkerResponse) {
     QUEUE.with(|queue| {
         (*queue.borrow_mut()).push_back(message);
     });
@@ -63,9 +63,9 @@ pub fn push_queue(message: ProxyResponse) {
 
 pub fn push_event(event: WorkerEvent) {
     QUEUE.with(|queue| {
-        (*queue.borrow_mut()).push_back(ProxyResponse {
+        (*queue.borrow_mut()).push_back(WorkerResponse {
             id: "EVENT".to_string(),
-            status: ProxyResponseStatus::Processing,
+            status: WorkerResponseStatus::Processing,
             content: Some(CommandResponseContent::WorkerEvent(event)),
         });
     });
@@ -459,7 +459,7 @@ impl Server {
             debug!("got message: {:?}", msg);
 
             if let Ok(msg) = msg {
-                if let Err(e) = server.channel.write_message(&ProxyResponse::ok(msg.id)) {
+                if let Err(e) = server.channel.write_message(&WorkerResponse::ok(msg.id)) {
                     error!("Could not send an ok to the main process: {}", e);
                 }
             }
@@ -671,7 +671,7 @@ impl Server {
                     WorkerRequestOrder::HardStop => {
                         let req_id = request.id.clone();
                         self.notify(request);
-                        if let Err(e) = self.channel.write_message(&ProxyResponse::ok(req_id)) {
+                        if let Err(e) = self.channel.write_message(&WorkerResponse::ok(req_id)) {
                             error!("Could not send ok response to the main process: {}", e);
                         }
                         if let Err(e) = self.channel.run() {
@@ -813,12 +813,12 @@ impl Server {
                 error!("Error while running the server channel: {}", e);
             }
             self.block_channel();
-            let proxy_response = ProxyResponse {
+            let proxy_response = WorkerResponse {
                 id: self
                     .shutting_down
                     .take()
                     .expect("should have shut down correctly"), // panicking here makes sense actually
-                status: ProxyResponseStatus::Ok,
+                status: WorkerResponseStatus::Ok,
                 content: None,
             };
             if let Err(e) = self.channel.write_message(&proxy_response) {
@@ -880,16 +880,16 @@ impl Server {
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).configure(configuration);
 
-                push_queue(ProxyResponse::ok(message.id.clone()));
+                push_queue(WorkerResponse::ok(message.id.clone()));
             });
             return;
         }
 
         match &message.order {
             WorkerRequestOrder::QueryClustersHashes => {
-                push_queue(ProxyResponse {
+                push_queue(WorkerResponse {
                     id: message.id.clone(),
-                    status: ProxyResponseStatus::Ok,
+                    status: WorkerResponseStatus::Ok,
                     content: Some(CommandResponseContent::WorkerClustersHashes(
                         self.config_state.hash_state(),
                     )),
@@ -900,9 +900,9 @@ impl Server {
                 let response_content = CommandResponseContent::WorkerClusters(vec![self
                     .config_state
                     .cluster_state(&cluster_id)]);
-                push_queue(ProxyResponse {
+                push_queue(WorkerResponse {
                     id: message.id.clone(),
-                    status: ProxyResponseStatus::Ok,
+                    status: WorkerResponseStatus::Ok,
                     content: Some(response_content),
                 });
                 return;
@@ -915,17 +915,17 @@ impl Server {
                     .map(|cluster_id| self.config_state.cluster_state(cluster_id))
                     .collect();
 
-                push_queue(ProxyResponse {
+                push_queue(WorkerResponse {
                     id: message.id.clone(),
-                    status: ProxyResponseStatus::Ok,
+                    status: WorkerResponseStatus::Ok,
                     content: Some(CommandResponseContent::WorkerClusters(clusters)),
                 });
                 return;
             }
             WorkerRequestOrder::QueryCertificateByFingerprint(f) => {
-                push_queue(ProxyResponse {
+                push_queue(WorkerResponse {
                     id: message.id.clone(),
-                    status: ProxyResponseStatus::Ok,
+                    status: WorkerResponseStatus::Ok,
                     content: Some(CommandResponseContent::WorkerCertificates(
                         WorkerCertificates::Fingerprint(get_certificate(&self.config_state, &f)),
                     )),
@@ -936,9 +936,9 @@ impl Server {
                 METRICS.with(|metrics| {
                     let data = (*metrics.borrow_mut()).query(&query_metrics_options);
 
-                    push_queue(ProxyResponse {
+                    push_queue(WorkerResponse {
                         id: message.id.clone(),
-                        status: ProxyResponseStatus::Ok,
+                        status: WorkerResponseStatus::Ok,
                         content: Some(CommandResponseContent::WorkerMetrics(data)),
                     });
                 });
@@ -1025,7 +1025,7 @@ impl Server {
             );
     }
 
-    fn add_backend(&mut self, req_id: &str, backend: &CommandLibBackend) -> ProxyResponse {
+    fn add_backend(&mut self, req_id: &str, backend: &CommandLibBackend) -> WorkerResponse {
         let new_backend = Backend::new(
             &backend.backend_id,
             backend.address,
@@ -1037,26 +1037,26 @@ impl Server {
             .borrow_mut()
             .add_backend(&backend.cluster_id, new_backend);
 
-        ProxyResponse::ok(req_id)
+        WorkerResponse::ok(req_id)
     }
 
-    fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> ProxyResponse {
+    fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> WorkerResponse {
         self.backends
             .borrow_mut()
             .remove_backend(&backend.cluster_id, &backend.address);
 
-        ProxyResponse::ok(req_id)
+        WorkerResponse::ok(req_id)
     }
 
     fn notify_add_http_listener(
         &mut self,
         req_id: &str,
         listener: &HttpListenerConfig,
-    ) -> ProxyResponse {
+    ) -> WorkerResponse {
         debug!("{} add http listener {:?}", req_id, listener);
 
         if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-            return ProxyResponse::error(
+            return WorkerResponse::error(
                 req_id.to_string(),
                 "session list is full, cannot add a listener",
             );
@@ -1072,11 +1072,11 @@ impl Server {
                     protocol: Protocol::HTTPListen,
                 })));
                 self.base_sessions_count += 1;
-                ProxyResponse::ok(req_id)
+                WorkerResponse::ok(req_id)
             }
             None => {
                 error!("Couldn't add HTTP listener");
-                ProxyResponse::error(req_id, "cannot add HTTP listener")
+                WorkerResponse::error(req_id, "cannot add HTTP listener")
             }
         }
     }
@@ -1085,11 +1085,11 @@ impl Server {
         &mut self,
         req_id: &str,
         listener: &HttpsListenerConfig,
-    ) -> ProxyResponse {
+    ) -> WorkerResponse {
         debug!("{} add https listener {:?}", req_id, listener);
 
         if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-            return ProxyResponse::error(req_id, "session list is full, cannot add a listener");
+            return WorkerResponse::error(req_id, "session list is full, cannot add a listener");
         }
 
         let mut session_manager = self.sessions.borrow_mut();
@@ -1106,11 +1106,11 @@ impl Server {
                     protocol: Protocol::HTTPSListen,
                 })));
                 self.base_sessions_count += 1;
-                ProxyResponse::ok(req_id)
+                WorkerResponse::ok(req_id)
             }
             None => {
                 error!("Couldn't add HTTPS listener");
-                ProxyResponse::error(req_id, "cannot add HTTPS listener")
+                WorkerResponse::error(req_id, "cannot add HTTPS listener")
             }
         }
     }
@@ -1119,11 +1119,11 @@ impl Server {
         &mut self,
         req_id: &str,
         listener: CommandTcpListener,
-    ) -> ProxyResponse {
+    ) -> WorkerResponse {
         debug!("{} add tcp listener {:?}", req_id, listener);
 
         if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-            return ProxyResponse::error(req_id, "session list is full, cannot add a listener");
+            return WorkerResponse::error(req_id, "session list is full, cannot add a listener");
         }
 
         let mut session_manager = self.sessions.borrow_mut();
@@ -1140,11 +1140,11 @@ impl Server {
                     protocol: Protocol::TCPListen,
                 })));
                 self.base_sessions_count += 1;
-                ProxyResponse::ok(req_id)
+                WorkerResponse::ok(req_id)
             }
             None => {
                 error!("Couldn't add TCP listener");
-                ProxyResponse::error(req_id, "cannot add TCP listener")
+                WorkerResponse::error(req_id, "cannot add TCP listener")
             }
         }
     }
@@ -1153,7 +1153,7 @@ impl Server {
         &mut self,
         req_id: &str,
         activate: &ActivateListener,
-    ) -> ProxyResponse {
+    ) -> WorkerResponse {
         debug!(
             "{} activate {:?} listener {:?}",
             req_id, activate.proxy, activate
@@ -1174,11 +1174,11 @@ impl Server {
                 match activated_token {
                     Ok(token) => {
                         self.accept(ListenToken(token.0), Protocol::HTTPListen);
-                        ProxyResponse::ok(req_id)
+                        WorkerResponse::ok(req_id)
                     }
                     Err(activate_error) => {
                         error!("Could not activate HTTP listener: {:#}", activate_error);
-                        ProxyResponse::error(req_id, format!("{activate_error:#}"))
+                        WorkerResponse::error(req_id, format!("{activate_error:#}"))
                     }
                 }
             }
@@ -1196,11 +1196,11 @@ impl Server {
                 match activated_token {
                     Ok(token) => {
                         self.accept(ListenToken(token.0), Protocol::HTTPSListen);
-                        ProxyResponse::ok(req_id)
+                        WorkerResponse::ok(req_id)
                     }
                     Err(activate_error) => {
                         error!("Could not activate HTTPS listener: {:#}", activate_error);
-                        ProxyResponse::error(req_id, format!("{activate_error:#}"))
+                        WorkerResponse::error(req_id, format!("{activate_error:#}"))
                     }
                 }
             }
@@ -1218,11 +1218,11 @@ impl Server {
                 match listener_token {
                     Some(token) => {
                         self.accept(ListenToken(token.0), Protocol::TCPListen);
-                        ProxyResponse::ok(req_id)
+                        WorkerResponse::ok(req_id)
                     }
                     None => {
                         error!("Could not activate TCP listener");
-                        ProxyResponse::error(req_id, "cannot activate TCP listener")
+                        WorkerResponse::error(req_id, "cannot activate TCP listener")
                     }
                 }
             }
@@ -1233,7 +1233,7 @@ impl Server {
         &mut self,
         req_id: &str,
         deactivate: &DeactivateListener,
-    ) -> ProxyResponse {
+    ) -> WorkerResponse {
         debug!(
             "{} deactivate {:?} listener {:?}",
             req_id, deactivate.proxy, deactivate
@@ -1252,7 +1252,7 @@ impl Server {
                             "Couldn't deactivate HTTP listener at address {:?}",
                             deactivate.address
                         );
-                        return ProxyResponse::error(
+                        return WorkerResponse::error(
                             req_id,
                             format!(
                                 "cannot deactivate HTTP listener at address {:?}",
@@ -1291,7 +1291,7 @@ impl Server {
 
                     info!("sent HTTP listener: {:?}", res);
                 }
-                ProxyResponse::ok(req_id)
+                WorkerResponse::ok(req_id)
             }
             ListenerType::HTTPS => {
                 let (token, mut listener) = match self
@@ -1306,7 +1306,7 @@ impl Server {
                             "Couldn't deactivate HTTPS listener at address {:?}",
                             deactivate.address
                         );
-                        return ProxyResponse::error(
+                        return WorkerResponse::error(
                             req_id,
                             format!(
                                 "cannot deactivate HTTPS listener at address {:?}",
@@ -1340,7 +1340,7 @@ impl Server {
 
                     info!("sent HTTPS listener: {:?}", res);
                 }
-                ProxyResponse::ok(req_id)
+                WorkerResponse::ok(req_id)
             }
             ListenerType::TCP => {
                 let (token, mut listener) =
@@ -1351,7 +1351,7 @@ impl Server {
                                 "Couldn't deactivate TCP listener at address {:?}",
                                 deactivate.address
                             );
-                            return ProxyResponse::error(
+                            return WorkerResponse::error(
                                 req_id,
                                 format!(
                                     "cannot deactivate TCP listener at address {:?}",
@@ -1386,7 +1386,7 @@ impl Server {
 
                     info!("sent TCP listener: {:?}", res);
                 }
-                ProxyResponse::ok(req_id)
+                WorkerResponse::ok(req_id)
             }
         }
     }

@@ -27,20 +27,20 @@ pub type MessageId = String;
 
 /// Sent by a worker
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProxyResponse {
+pub struct WorkerResponse {
     pub id: MessageId,
-    pub status: ProxyResponseStatus,
+    pub status: WorkerResponseStatus,
     pub content: Option<CommandResponseContent>,
 }
 
-impl ProxyResponse {
+impl WorkerResponse {
     pub fn ok<T>(id: T) -> Self
     where
         T: ToString,
     {
         Self {
             id: id.to_string(),
-            status: ProxyResponseStatus::Ok,
+            status: WorkerResponseStatus::Ok,
             content: None,
         }
     }
@@ -52,7 +52,7 @@ impl ProxyResponse {
     {
         Self {
             id: id.to_string(),
-            status: ProxyResponseStatus::Error(error.to_string()),
+            status: WorkerResponseStatus::Error(error.to_string()),
             content: None,
         }
     }
@@ -63,12 +63,12 @@ impl ProxyResponse {
     {
         Self {
             id: id.to_string(),
-            status: ProxyResponseStatus::Processing,
+            status: WorkerResponseStatus::Processing,
             content: None,
         }
     }
 
-    pub fn status<T>(id: T, status: ProxyResponseStatus) -> Self
+    pub fn status<T>(id: T, status: WorkerResponseStatus) -> Self
     where
         T: ToString,
     {
@@ -80,14 +80,14 @@ impl ProxyResponse {
     }
 }
 
-impl fmt::Display for ProxyResponse {
+impl fmt::Display for WorkerResponse {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}-{:?}", self.id, self.status)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ProxyResponseStatus {
+pub enum WorkerResponseStatus {
     Ok,
     Processing,
     Error(String),

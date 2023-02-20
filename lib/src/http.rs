@@ -22,7 +22,7 @@ use crate::{
         logging,
         proxy::{
             Cluster, HttpFrontend, HttpListenerConfig, WorkerOrder, WorkerRequestOrder,
-            ProxyResponse, Route,
+            WorkerResponse, Route,
         },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
@@ -783,7 +783,7 @@ impl HttpListener {
 }
 
 impl ProxyConfiguration for HttpProxy {
-    fn notify(&mut self, request: WorkerOrder) -> ProxyResponse {
+    fn notify(&mut self, request: WorkerOrder) -> WorkerResponse {
         let request_id = request.id.clone();
 
         let result = match request.order {
@@ -821,7 +821,7 @@ impl ProxyConfiguration for HttpProxy {
                 {
                     Ok(()) => {
                         info!("{} soft stop successful", request_id);
-                        return ProxyResponse::processing(request.id);
+                        return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -834,7 +834,7 @@ impl ProxyConfiguration for HttpProxy {
                 {
                     Ok(()) => {
                         info!("{} hard stop successful", request_id);
-                        return ProxyResponse::processing(request.id);
+                        return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -863,11 +863,11 @@ impl ProxyConfiguration for HttpProxy {
         match result {
             Ok(()) => {
                 info!("{} successful", request_id);
-                ProxyResponse::ok(request_id)
+                WorkerResponse::ok(request_id)
             }
             Err(error_message) => {
                 error!("{} unsuccessful: {:#}", request_id, error_message);
-                ProxyResponse::error(request_id, format!("{error_message:#}"))
+                WorkerResponse::error(request_id, format!("{error_message:#}"))
             }
         }
     }

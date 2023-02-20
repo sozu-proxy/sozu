@@ -30,7 +30,7 @@ use sozu_command_lib::{
     },
     config::Config,
     proxy::{
-        MetricsConfiguration, WorkerOrder, WorkerRequestOrder, ProxyResponse, ProxyResponseStatus,
+        MetricsConfiguration, WorkerOrder, WorkerRequestOrder, WorkerResponse, WorkerResponseStatus,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -64,7 +64,7 @@ enum CommandMessage {
     },
     WorkerResponse {
         worker_id: u32,
-        response: ProxyResponse,
+        response: WorkerResponse,
     },
     WorkerClose {
         worker_id: u32,
@@ -231,7 +231,7 @@ pub struct CommandServer {
     in_flight: HashMap<
         String, // the request id
         (
-            futures::channel::mpsc::Sender<(ProxyResponse, u32)>, // (response, worker id) to notify whoever sent the Request
+            futures::channel::mpsc::Sender<(WorkerResponse, u32)>, // (response, worker id) to notify whoever sent the Request
             usize, // the number of expected responses
         ),
     >,
@@ -578,14 +578,14 @@ impl CommandServer {
             let mut i = 0;
             while let Some((proxy_response, _)) = rx.next().await {
                 match proxy_response.status {
-                    ProxyResponseStatus::Ok => {
+                    WorkerResponseStatus::Ok => {
                         ok += 1;
                     }
-                    ProxyResponseStatus::Processing => {
+                    WorkerResponseStatus::Processing => {
                         //info!("metrics processing");
                         continue;
                     }
-                    ProxyResponseStatus::Error(e) => {
+                    WorkerResponseStatus::Error(e) => {
                         error!(
                             "error handling configuration message {}: {}",
                             proxy_response.id, e
@@ -744,7 +744,7 @@ impl CommandServer {
     async fn handle_worker_response(
         &mut self,
         worker_id: u32,
-        response: ProxyResponse,
+        response: WorkerResponse,
     ) -> anyhow::Result<Success> {
         // Notify the client with Processing in case of a proxy event
         if let Some(CommandResponseContent::WorkerEvent(worker_event)) = response.content {
@@ -782,7 +782,7 @@ impl CommandServer {
                 // if a worker returned Ok or Error, we're not expecting any more
                 // messages with this id from it
                 match response.status {
-                    ProxyResponseStatus::Ok | ProxyResponseStatus::Error(_) => {
+                    WorkerResponseStatus::Ok | WorkerResponseStatus::Error(_) => {
                         expected_responses -= 1;
                     }
                     _ => {}
@@ -1018,7 +1018,7 @@ async fn client_loop(
 
 /// the worker loop does two things:
 /// - write everything destined to the worker onto the unix stream
-/// - parse ProxyResponses from the unix stream and send them to the CommandServer
+/// - parse WorkerResponses from the unix stream and send them to the CommandServer
 async fn worker_loop(
     worker_id: u32,
     stream: Async<UnixStream>,
@@ -1056,7 +1056,7 @@ async fn worker_loop(
             Ok(msg) => msg,
         };
 
-        match serde_json::from_slice::<ProxyResponse>(&message) {
+        match serde_json::from_slice::<WorkerResponse>(&message) {
             Err(e) => {
                 error!("could not decode worker message: {:?}", e);
                 break;

@@ -19,7 +19,7 @@ use sozu_command::{
     proxy::{
         Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
         LoadBalancingAlgorithms, LoadBalancingParams, PathRule, WorkerOrder, WorkerRequestOrder,
-        ProxyResponse, Route, RulePosition, TcpFrontend, TcpListenerConfig,
+        WorkerResponse, Route, RulePosition, TcpFrontend, TcpListenerConfig,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -34,7 +34,7 @@ pub struct Worker {
     pub state: ConfigState,
     pub scm_main_to_worker: ScmSocket,
     pub scm_worker_to_main: ScmSocket,
-    pub command_channel: Channel<WorkerOrder, ProxyResponse>,
+    pub command_channel: Channel<WorkerOrder, WorkerResponse>,
     pub command_id: CommandID,
     pub server_job: JoinHandle<()>,
 }
@@ -107,7 +107,7 @@ impl Worker {
         config: Config,
         listeners: Listeners,
         state: ConfigState,
-    ) -> (ScmSocket, Channel<WorkerOrder, ProxyResponse>, Server) {
+    ) -> (ScmSocket, Channel<WorkerOrder, WorkerResponse>, Server) {
         let (scm_main_to_worker, scm_worker_to_main) =
             UnixStream::pair().expect("could not create unix stream pair");
         let (cmd_main_to_worker, cmd_worker_to_main) =
@@ -248,7 +248,7 @@ impl Worker {
             .expect("Could not write message on command channel");
     }
 
-    pub fn read_proxy_response(&mut self) -> Option<ProxyResponse> {
+    pub fn read_proxy_response(&mut self) -> Option<WorkerResponse> {
         let response = self
             .command_channel
             .read_message()

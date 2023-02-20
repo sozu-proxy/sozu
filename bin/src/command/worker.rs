@@ -8,7 +8,7 @@ use sozu_command_lib::{
     channel::Channel,
     command::{RunState, WorkerInfo},
     config::Config,
-    proxy::{WorkerOrder, WorkerRequestOrder, ProxyResponse},
+    proxy::{WorkerOrder, WorkerRequestOrder, WorkerResponse},
     scm_socket::ScmSocket,
 };
 
@@ -16,7 +16,7 @@ use sozu_command_lib::{
 pub struct Worker {
     pub id: u32,
     /// for the worker to receive requests and respond to the main process
-    pub worker_channel: Option<Channel<WorkerOrder, ProxyResponse>>,
+    pub worker_channel: Option<Channel<WorkerOrder, WorkerResponse>>,
     /// file descriptor of the command channel
     pub worker_channel_fd: i32,
     pub pid: pid_t,
@@ -32,7 +32,7 @@ impl Worker {
     pub fn new(
         id: u32,
         pid: pid_t,
-        command_channel: Channel<WorkerOrder, ProxyResponse>,
+        command_channel: Channel<WorkerOrder, WorkerResponse>,
         scm_socket: ScmSocket,
         _: &Config,
     ) -> Worker {

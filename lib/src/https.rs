@@ -54,7 +54,7 @@ use crate::{
         logging,
         proxy::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
-            WorkerOrder, WorkerRequestOrder, ProxyResponse, ProxyResponseStatus, RemoveCertificate,
+            WorkerOrder, WorkerRequestOrder, WorkerResponse, WorkerResponseStatus, RemoveCertificate,
             Route, TlsVersion, WorkerCertificates,
         },
         ready::Ready,
@@ -1262,7 +1262,7 @@ impl ProxyConfiguration for HttpsProxy {
         Ok(())
     }
 
-    fn notify(&mut self, request: WorkerOrder) -> ProxyResponse {
+    fn notify(&mut self, request: WorkerOrder) -> WorkerResponse {
         let request_id = request.id.clone();
 
         let content_result = match request.order {
@@ -1321,7 +1321,7 @@ impl ProxyConfiguration for HttpsProxy {
                 {
                     Ok(_) => {
                         info!("{} soft stop successful", request_id);
-                        return ProxyResponse::processing(request.id);
+                        return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -1334,7 +1334,7 @@ impl ProxyConfiguration for HttpsProxy {
                 {
                     Ok(_) => {
                         info!("{} hard stop successful", request_id);
-                        return ProxyResponse::processing(request.id);
+                        return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -1373,15 +1373,15 @@ impl ProxyConfiguration for HttpsProxy {
         match content_result {
             Ok(content) => {
                 info!("{} successful", request_id);
-                ProxyResponse {
+                WorkerResponse {
                     id: request_id,
-                    status: ProxyResponseStatus::Ok,
+                    status: WorkerResponseStatus::Ok,
                     content,
                 }
             }
             Err(error_message) => {
                 error!("{} unsuccessful: {:#}", request_id, error_message);
-                ProxyResponse::error(request_id, format!("{error_message:#}"))
+                WorkerResponse::error(request_id, format!("{error_message:#}"))
             }
         }
     }

@@ -34,7 +34,7 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     logging::target_to_backend,
-    proxy::{WorkerOrder, WorkerRequestOrder, ProxyResponse},
+    proxy::{WorkerOrder, WorkerRequestOrder, WorkerResponse},
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -116,7 +116,7 @@ pub fn begin_worker_process(
     command_buffer_size: usize,
     max_command_buffer_size: usize,
 ) -> Result<(), anyhow::Error> {
-    let mut worker_to_main_channel: Channel<ProxyResponse, Config> = Channel::new(
+    let mut worker_to_main_channel: Channel<WorkerResponse, Config> = Channel::new(
         unsafe { UnixStream::from_raw_fd(worker_to_main_channel_fd) },
         command_buffer_size,
         max_command_buffer_size,
@@ -165,7 +165,7 @@ pub fn begin_worker_process(
         error!("Could not unblock the worker-to-main channel: {}", e);
     }
 
-    let mut worker_to_main_channel: Channel<ProxyResponse, WorkerOrder> =
+    let mut worker_to_main_channel: Channel<WorkerResponse, WorkerOrder> =
         worker_to_main_channel.into();
     worker_to_main_channel.readiness.insert(Ready::readable());
 
@@ -208,7 +208,7 @@ pub fn fork_main_into_worker(
     executable_path: String,
     state: &ConfigState,
     listeners: Option<Listeners>,
-) -> anyhow::Result<(pid_t, Channel<WorkerOrder, ProxyResponse>, ScmSocket)> {
+) -> anyhow::Result<(pid_t, Channel<WorkerOrder, WorkerResponse>, ScmSocket)> {
     trace!("parent({})", unsafe { libc::getpid() });
 
     let mut state_file =
@@ -231,7 +231,7 @@ pub fn fork_main_into_worker(
     util::disable_close_on_exec(worker_to_main.as_raw_fd())?;
     util::disable_close_on_exec(worker_to_main_scm.as_raw_fd())?;
 
-    let mut main_to_worker_channel: Channel<Config, ProxyResponse> = Channel::new(
+    let mut main_to_worker_channel: Channel<Config, WorkerResponse> = Channel::new(
         main_to_worker,
         config.command_buffer_size,
         config.max_command_buffer_size,
