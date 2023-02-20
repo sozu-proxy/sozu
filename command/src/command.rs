@@ -140,7 +140,7 @@ pub struct ListenersList {
 
 /// Responses of the main process to the CLI (or other client)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandResponse {
+pub struct Response {
     pub id: String,
     pub version: u8,
     pub status: RequestStatus,
@@ -148,14 +148,14 @@ pub struct CommandResponse {
     pub content: Option<ResponseContent>,
 }
 
-impl CommandResponse {
+impl Response {
     pub fn new(
         id: String,
         status: RequestStatus,
         message: String,
         content: Option<ResponseContent>,
-    ) -> CommandResponse {
-        CommandResponse {
+    ) -> Response {
+        Response {
             version: PROTOCOL_VERSION,
             id,
             status,
@@ -277,7 +277,7 @@ mod tests {
         let pretty_print = serde_json::to_string_pretty(&$expected_message).expect("should have serialized");
         assert_eq!(&pretty_print, data, "\nserialized message:\n{}\n\nexpected message:\n{}", pretty_print, data);
 
-        let message: CommandResponse = serde_json::from_str(data).unwrap();
+        let message: Response = serde_json::from_str(data).unwrap();
         assert_eq!(message, $expected_message, "\ndeserialized message:\n{:#?}\n\nexpected message:\n{:#?}", message, $expected_message);
 
       }
@@ -590,7 +590,7 @@ mod tests {
     test_message_answer!(
         answer_workers_status,
         "../assets/answer_workers_status.json",
-        CommandResponse {
+        Response {
             id: "ID_TEST".to_string(),
             version: 0,
             status: RequestStatus::Ok,
@@ -613,7 +613,7 @@ mod tests {
     test_message_answer!(
         answer_metrics,
         "../assets/answer_metrics.json",
-        CommandResponse {
+        Response {
             id: "ID_TEST".to_string(),
             version: 0,
             status: RequestStatus::Ok,

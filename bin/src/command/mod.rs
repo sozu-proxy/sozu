@@ -24,7 +24,7 @@ use nix::{
 use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
-    command::{CommandResponse, Event, Order, Request, RequestStatus, ResponseContent, RunState},
+    command::{Event, Order, Request, RequestStatus, Response, ResponseContent, RunState},
     config::Config,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -50,7 +50,7 @@ pub use worker::*;
 enum CommandMessage {
     ClientNew {
         client_id: String,
-        sender: Sender<CommandResponse>, // to send things back to the client
+        sender: Sender<Response>, // to send things back to the client
     },
     ClientClose {
         client_id: String,
@@ -68,7 +68,7 @@ enum CommandMessage {
     },
     Advancement {
         request_identifier: RequestIdentifier,
-        response: Response,
+        advancement: Advancement,
     },
     MasterStop,
 }
@@ -95,8 +95,9 @@ impl RequestIdentifier {
     }
 }
 
+/// Notifies the CommandServer of a request processing advancement
 #[derive(PartialEq, Eq, Clone, Debug)]
-pub enum Response {
+pub enum Advancement {
     Error(String),
     Processing(String),
     Ok(Success),
@@ -215,7 +216,7 @@ pub struct CommandServer {
     /// where the main loop receives messages
     command_rx: Receiver<CommandMessage>,
     /// All client loops. id -> cloned command_tx
-    clients: HashMap<String, Sender<CommandResponse>>,
+    clients: HashMap<String, Sender<Response>>,
     /// handles to the workers as seen from the main process
     workers: Vec<Worker>,
     /// A map of requests sent to workers.
@@ -345,12 +346,12 @@ impl CommandServer {
                     .with_context(|| "Could not handle worker response"),
                 CommandMessage::Advancement {
                     request_identifier,
-                    response,
+                    advancement,
                 } => {
                     let success_result = self
-                        .notify_advancement_to_client(request_identifier, response.clone())
+                        .notify_advancement_to_client(request_identifier, advancement.clone())
                         .await;
-                    if let Response::Ok(Success::UpgradeMain(_)) = response {
+                    if let Advancement::Ok(Success::UpgradeMain(_)) = advancement {
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         info!("shutting down old main");
                         std::process::exit(0);
@@ -748,7 +749,7 @@ impl CommandServer {
             let event: Event = worker_event.into();
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
-                    let event = CommandResponse::new(
+                    let event = Response::new(
                         response.id.to_string(),
                         RequestStatus::Processing,
                         format!("{worker_id}"),
@@ -946,7 +947,7 @@ async fn client_loop(
     client_id: String,
     stream: Async<UnixStream>,
     mut command_tx: Sender<CommandMessage>,
-    mut client_rx: Receiver<CommandResponse>,
+    mut client_rx: Receiver<Response>,
 ) {
     let read_stream = Arc::new(stream);
     let mut write_stream = read_stream.clone();

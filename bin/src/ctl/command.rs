@@ -4,9 +4,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
 
 use sozu_command_lib::{
-    command::{
-        CommandResponse, Order, Request, RequestStatus, ResponseContent, RunState, WorkerInfo,
-    },
+    command::{Order, Request, RequestStatus, Response, ResponseContent, RunState, WorkerInfo},
     worker::{QueryMetricsOptions, WorkerOrder},
 };
 
@@ -53,7 +51,7 @@ impl CommandManager {
             .with_context(|| "Could not write the request")
     }
 
-    fn read_channel_message_with_timeout(&mut self) -> anyhow::Result<CommandResponse> {
+    fn read_channel_message_with_timeout(&mut self) -> anyhow::Result<Response> {
         self.channel
             .read_message_blocking_timeout(Some(self.timeout))
             .with_context(|| "Command timeout. The proxy didn't send an answer")

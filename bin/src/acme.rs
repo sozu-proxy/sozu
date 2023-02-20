@@ -5,7 +5,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain},
     channel::Channel,
-    command::{CommandResponse, Order, Request, RequestStatus},
+    command::{Order, Request, RequestStatus, Response},
     config::Config,
     worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
@@ -13,7 +13,7 @@ use sozu_command_lib::{
     },
 };
 use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};
-use tiny_http::{Response, Server};
+use tiny_http::{Response as HttpResponse, Server};
 
 use crate::util;
 
@@ -87,7 +87,7 @@ pub fn main(
 
     let tls_versions = vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3];
 
-    let mut channel: Channel<Request, CommandResponse> = Channel::new(stream, 10000, 20000);
+    let mut channel: Channel<Request, Response> = Channel::new(stream, 10000, 20000);
     channel
         .blocking()
         .with_context(|| "Could not block channel")?;
@@ -168,15 +168,15 @@ pub fn main(
                 info!("got request to URL: {}", request.url());
                 if request.url() == path {
                     if let Err(e) = request.respond(
-                        Response::from_data(key_authorization.as_bytes()).with_status_code(200),
+                        HttpResponse::from_data(key_authorization.as_bytes()).with_status_code(200),
                     ) {
                         error!("Error responding with 200 to request: {}", e);
                     }
                     info!("challenge request answered");
                     // the challenge can be called multiple times
                     //return true;
-                } else if let Err(e) =
-                    request.respond(Response::from_data(&b"not found"[..]).with_status_code(404))
+                } else if let Err(e) = request
+                    .respond(HttpResponse::from_data(&b"not found"[..]).with_status_code(404))
                 {
                     error!("Error responding with 404 to request: {}", e);
                 }
@@ -277,7 +277,7 @@ fn generate_app_id(app_id: &str) -> String {
 }
 
 fn set_up_proxying(
-    channel: &mut Channel<Request, CommandResponse>,
+    channel: &mut Channel<Request, Response>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
@@ -310,7 +310,7 @@ fn set_up_proxying(
 }
 
 fn remove_proxying(
-    channel: &mut Channel<Request, CommandResponse>,
+    channel: &mut Channel<Request, Response>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
@@ -340,7 +340,7 @@ fn remove_proxying(
 }
 
 fn add_certificate(
-    channel: &mut Channel<Request, CommandResponse>,
+    channel: &mut Channel<Request, Response>,
     frontend: &SocketAddr,
     hostname: &str,
     certificate_path: &str,
@@ -391,7 +391,7 @@ fn add_certificate(
 }
 
 fn order_command(
-    channel: &mut Channel<Request, CommandResponse>,
+    channel: &mut Channel<Request, Response>,
     order: WorkerOrder,
 ) -> anyhow::Result<()> {
     let id = generate_id();

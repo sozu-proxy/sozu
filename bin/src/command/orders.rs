@@ -15,8 +15,8 @@ use nom::{Err, HexDisplay, Offset};
 use sozu_command_lib::{
     buffer::fixed::Buffer,
     command::{
-        CommandResponse, FrontendFilters, ListedFrontends, ListenersList, Order, Request,
-        RequestStatus, ResponseContent, RunState, WorkerInfo, PROTOCOL_VERSION,
+        FrontendFilters, ListedFrontends, ListenersList, Order, Request, RequestStatus, Response,
+        ResponseContent, RunState, WorkerInfo, PROTOCOL_VERSION,
     },
     config::Config,
     logging,
@@ -31,7 +31,7 @@ use sozu_command_lib::{
 use sozu::metrics::METRICS;
 
 use crate::{
-    command::{CommandMessage, CommandServer, RequestIdentifier, Response, Success, Worker},
+    command::{Advancement, CommandMessage, CommandServer, RequestIdentifier, Success, Worker},
     upgrade::fork_main_into_new_main,
     worker::start_worker,
 };
@@ -1397,15 +1397,15 @@ impl CommandServer {
     pub async fn notify_advancement_to_client(
         &mut self,
         request_identifier: RequestIdentifier,
-        response: Response,
+        advancement: Advancement,
     ) -> anyhow::Result<Success> {
         let RequestIdentifier {
             client: client_id,
             request: request_id,
         } = request_identifier.to_owned();
 
-        let command_response = match response {
-            Response::Ok(success) => {
+        let command_response = match advancement {
+            Advancement::Ok(success) => {
                 let success_message = success.to_string();
 
                 let command_response_data = match success {
@@ -1419,20 +1419,20 @@ impl CommandServer {
                     _ => None,
                 };
 
-                CommandResponse::new(
+                Response::new(
                     request_id.clone(),
                     RequestStatus::Ok,
                     success_message,
                     command_response_data,
                 )
             }
-            Response::Processing(processing_message) => CommandResponse::new(
+            Advancement::Processing(processing_message) => Response::new(
                 request_id.clone(),
                 RequestStatus::Processing,
                 processing_message,
                 None,
             ),
-            Response::Error(error_message) => CommandResponse::new(
+            Advancement::Error(error_message) => Response::new(
                 request_id.clone(),
                 RequestStatus::Error,
                 error_message,
@@ -1475,7 +1475,7 @@ async fn return_error<T>(
 {
     let error_command_message = CommandMessage::Advancement {
         request_identifier,
-        response: Response::Error(error_message.to_string()),
+        advancement: Advancement::Error(error_message.to_string()),
     };
 
     trace!("return_error: sending event to the command server");
@@ -1493,7 +1493,7 @@ async fn return_processing<T>(
 {
     let processing_command_message = CommandMessage::Advancement {
         request_identifier,
-        response: Response::Processing(processing_message.to_string()),
+        advancement: Advancement::Processing(processing_message.to_string()),
     };
 
     trace!("return_processing: sending event to the command server");
@@ -1512,7 +1512,7 @@ async fn return_success(
 ) {
     let success_command_message = CommandMessage::Advancement {
         request_identifier,
-        response: Response::Ok(success),
+        advancement: Advancement::Ok(success),
     };
     trace!("return_success: sending event to the command server");
     if let Err(e) = command_tx.send(success_command_message).await {
