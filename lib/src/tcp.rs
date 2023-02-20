@@ -37,7 +37,7 @@ use crate::{
         config::ProxyProtocolConfig,
         logging,
         proxy::{
-            ProxyEvent, ProxyRequest, ProxyRequestOrder, ProxyResponse, TcpFrontend,
+            WorkerEvent, ProxyRequest, ProxyRequestOrder, ProxyResponse, TcpFrontend,
             TcpListenerConfig,
         },
         ready::Ready,
@@ -500,7 +500,7 @@ impl TcpSession {
                         "backend server {} at {} is up",
                         backend.backend_id, backend.address
                     );
-                    push_event(ProxyEvent::BackendUp(
+                    push_event(WorkerEvent::BackendUp(
                         backend.backend_id.clone(),
                         backend.address,
                     ));
@@ -552,7 +552,7 @@ impl TcpSession {
                     self.metrics.backend_id.as_deref()
                 );
 
-                push_event(ProxyEvent::BackendDown(
+                push_event(WorkerEvent::BackendDown(
                     backend.backend_id.clone(),
                     backend.address,
                 ));

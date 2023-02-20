@@ -105,7 +105,7 @@ impl BackendMap {
                 if self.available {
                     self.available = false;
 
-                    push_event(proxy::ProxyEvent::NoAvailableBackends(
+                    push_event(proxy::WorkerEvent::NoAvailableBackends(
                         cluster_id.to_string(),
                     ));
                 }

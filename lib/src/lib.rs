@@ -217,7 +217,7 @@ use sozu_command::state::ClusterId;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
-    proxy::{Cluster, LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse, Route},
+    proxy::{Cluster, LoadBalancingParams, WorkerEvent, ProxyRequest, ProxyResponse, Route},
     ready::Ready,
 };
 
@@ -714,7 +714,7 @@ impl Backend {
 // can be safely stopped
 impl std::ops::Drop for Backend {
     fn drop(&mut self) {
-        server::push_event(ProxyEvent::RemovedBackendHasNoConnections(
+        server::push_event(WorkerEvent::RemovedBackendHasNoConnections(
             self.backend_id.clone(),
             self.address,
         ));

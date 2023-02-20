@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     proxy::{
-        AggregatedMetrics, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, ProxyEvent,
+        AggregatedMetrics, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, WorkerEvent,
         ProxyRequestOrder, ProxyResponseContent, TcpFrontend, TcpListenerConfig,
     },
     state::ConfigState,
@@ -190,13 +190,13 @@ pub enum Event {
     RemovedBackendHasNoConnections(String, SocketAddr),
 }
 
-impl From<ProxyEvent> for Event {
-    fn from(e: ProxyEvent) -> Self {
+impl From<WorkerEvent> for Event {
+    fn from(e: WorkerEvent) -> Self {
         match e {
-            ProxyEvent::BackendDown(id, addr) => Event::BackendDown(id, addr),
-            ProxyEvent::BackendUp(id, addr) => Event::BackendUp(id, addr),
-            ProxyEvent::NoAvailableBackends(cluster_id) => Event::NoAvailableBackends(cluster_id),
-            ProxyEvent::RemovedBackendHasNoConnections(id, addr) => {
+            WorkerEvent::BackendDown(id, addr) => Event::BackendDown(id, addr),
+            WorkerEvent::BackendUp(id, addr) => Event::BackendUp(id, addr),
+            WorkerEvent::NoAvailableBackends(cluster_id) => Event::NoAvailableBackends(cluster_id),
+            WorkerEvent::RemovedBackendHasNoConnections(id, addr) => {
                 Event::RemovedBackendHasNoConnections(id, addr)
             }
         }

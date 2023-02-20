@@ -28,7 +28,7 @@ use crate::{
         channel::Channel,
         config::Config,
         proxy::{
-            Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyEvent,
+            Backend as CommandLibBackend, Cluster, ListenerType, MessageId, WorkerEvent,
             ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
             ProxyResponseStatus, WorkerCertificates, RemoveBackend,
             TcpListenerConfig as CommandTcpListener,
@@ -61,12 +61,12 @@ pub fn push_queue(message: ProxyResponse) {
     });
 }
 
-pub fn push_event(event: ProxyEvent) {
+pub fn push_event(event: WorkerEvent) {
     QUEUE.with(|queue| {
         (*queue.borrow_mut()).push_back(ProxyResponse {
             id: "EVENT".to_string(),
             status: ProxyResponseStatus::Processing,
-            content: Some(ProxyResponseContent::Event(event)),
+            content: Some(ProxyResponseContent::WorkerEvent(event)),
         });
     });
 }

@@ -97,9 +97,7 @@ pub enum ProxyResponseStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyResponseContent {
-    /// contains proxy & cluster metrics
-    // Metrics(AllWorkerMetrics),
-    Event(ProxyEvent),
+    WorkerEvent(WorkerEvent),
     Clusters(Vec<QueryAnswerCluster>),
     /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
@@ -184,7 +182,7 @@ pub struct BackendMetricsData {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ProxyEvent {
+pub enum WorkerEvent {
     BackendDown(String, SocketAddr),
     BackendUp(String, SocketAddr),
     NoAvailableBackends(String),

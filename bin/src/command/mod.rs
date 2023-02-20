@@ -748,8 +748,8 @@ impl CommandServer {
         response: ProxyResponse,
     ) -> anyhow::Result<Success> {
         // Notify the client with Processing in case of a proxy event
-        if let Some(ProxyResponseContent::Event(proxy_event)) = response.content {
-            let event: Event = proxy_event.into();
+        if let Some(ProxyResponseContent::WorkerEvent(worker_event)) = response.content {
+            let event: Event = worker_event.into();
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = CommandResponse::new(
