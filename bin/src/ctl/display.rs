@@ -223,9 +223,6 @@ fn print_worker_metrics(worker_metrics: &WorkerMetrics) -> anyhow::Result<()> {
             print_proxy_metrics(proxy);
             print_cluster_metrics(clusters);
         }
-        WorkerMetrics::Error(error) => {
-            println!("Error: {error}\nMaybe check your command.")
-        }
         _ => bail!("The query answer is wrong."),
     }
 

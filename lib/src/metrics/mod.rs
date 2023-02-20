@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::Context;
 use mio::net::UdpSocket;
+use sozu_command::command::ResponseContent;
 
 use crate::sozu_command::worker::{
     FilteredData, MetricsConfiguration, QueryMetricsOptions, WorkerMetrics,
@@ -218,7 +219,7 @@ impl Aggregator {
         self.local.dump_proxy_metrics(&Vec::new())
     }
 
-    pub fn query(&mut self, q: &QueryMetricsOptions) -> WorkerMetrics {
+    pub fn query(&mut self, q: &QueryMetricsOptions) -> Result<ResponseContent, String> {
         self.local.query(q)
     }
 

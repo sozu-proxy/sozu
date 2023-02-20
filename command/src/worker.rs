@@ -842,8 +842,6 @@ pub enum WorkerMetrics {
     List((Vec<String>, Vec<String>)),
     /// all worker metrics, proxy & clusters, with Options all around for partial answers
     All(AllWorkerMetrics),
-    /// Use to trickle up errors to the CLI
-    Error(String),
 }
 
 impl WorkerOrder {

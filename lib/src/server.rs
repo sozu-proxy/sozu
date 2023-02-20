@@ -930,12 +930,13 @@ impl Server {
             }
             WorkerOrder::QueryMetrics(query_metrics_options) => {
                 METRICS.with(|metrics| {
-                    let data = (*metrics.borrow_mut()).query(&query_metrics_options);
-
-                    push_queue(WorkerResponse::ok_with_content(
-                        message.id,
-                        ResponseContent::WorkerMetrics(data),
-                    ));
+                    match (*metrics.borrow_mut()).query(&query_metrics_options) {
+                        Ok(metrics_response) => push_queue(WorkerResponse::ok_with_content(
+                            message.id,
+                            metrics_response,
+                        )),
+                        Err(e) => push_queue(WorkerResponse::error(message.id, e)),
+                    }
                 });
                 return;
             }

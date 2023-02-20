@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, str, time::Instant};
 
 use anyhow::Context;
 use hdrhistogram::Histogram;
+use sozu_command::command::ResponseContent;
 
 use crate::sozu_command::worker::{
     AllWorkerMetrics, ClusterMetricsData, FilteredData, MetricsConfiguration, Percentiles,
@@ -174,7 +175,7 @@ impl LocalDrain {
             .collect()
     }
 
-    pub fn query(&mut self, options: &QueryMetricsOptions) -> WorkerMetrics {
+    pub fn query(&mut self, options: &QueryMetricsOptions) -> Result<ResponseContent, String> {
         trace!(
             "The local drain received a metrics query with this options: {:?}",
             options
@@ -188,7 +189,7 @@ impl LocalDrain {
         } = options;
 
         if *list {
-            return self.list_all_metric_names();
+            return Ok(self.list_all_metric_names());
         }
 
         let worker_metrics = match (cluster_ids.is_empty(), backend_ids.is_empty()) {
@@ -198,12 +199,14 @@ impl LocalDrain {
         };
 
         match worker_metrics {
-            Ok(worker_metrics) => WorkerMetrics::All(worker_metrics),
-            Err(e) => WorkerMetrics::Error(e.to_string()),
+            Ok(worker_metrics) => Ok(ResponseContent::WorkerMetrics(WorkerMetrics::All(
+                worker_metrics,
+            ))),
+            Err(e) => Err(e.to_string()),
         }
     }
 
-    fn list_all_metric_names(&self) -> WorkerMetrics {
+    fn list_all_metric_names(&self) -> ResponseContent {
         let proxy_metrics_names = self.proxy_metrics.keys().cloned().collect();
 
         let mut cluster_metrics_names = Vec::new();
@@ -213,7 +216,10 @@ impl LocalDrain {
                 cluster_metrics_names.push(metric_name.to_owned());
             }
         }
-        WorkerMetrics::List((proxy_metrics_names, cluster_metrics_names))
+        ResponseContent::WorkerMetrics(WorkerMetrics::List((
+            proxy_metrics_names,
+            cluster_metrics_names,
+        )))
     }
 
     pub fn dump_all_metrics(
