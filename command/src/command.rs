@@ -6,8 +6,9 @@ use std::{
 
 use crate::{
     proxy::{
-        AggregatedMetrics, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, WorkerEvent,
-        ProxyRequestOrder, ProxyResponseContent, TcpFrontend, TcpListenerConfig,
+        AggregatedMetrics, ClusterInformation, HttpFrontend,
+        HttpListenerConfig, HttpsListenerConfig, ProxyRequestOrder, TcpFrontend, TcpListenerConfig,
+        WorkerCertificates, WorkerEvent, WorkerMetrics,
     },
     state::ConfigState,
 };
@@ -90,7 +91,8 @@ pub enum CommandStatus {
     Error,
 }
 
-/// details of a response sent by the main process to the client
+/// details of a response sent by the main process to the client,
+/// or by a worker to the main process
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandResponseContent {
@@ -99,7 +101,7 @@ pub enum CommandResponseContent {
     /// aggregated metrics of main process and workers
     Metrics(AggregatedMetrics),
     /// worker responses to a same query: worker_id -> query_answer
-    Query(BTreeMap<String, ProxyResponseContent>),
+    Query(BTreeMap<String, CommandResponseContent>),
     /// the state of Sōzu: frontends, backends, listeners, etc.
     State(Box<ConfigState>),
     /// a proxy event
@@ -110,6 +112,14 @@ pub enum CommandResponseContent {
     Status(Vec<WorkerInfo>),
     /// all listeners
     ListenersList(ListenersList),
+
+    // sent by a worker to the main process
+    WorkerEvent(WorkerEvent),
+    WorkerClusters(Vec<ClusterInformation>),
+    /// cluster id -> hash of cluster information
+    WorkerClustersHashes(BTreeMap<String, u64>),
+    WorkerCertificates(WorkerCertificates),
+    WorkerMetrics(WorkerMetrics),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -214,10 +224,10 @@ mod tests {
     use crate::certificate::split_certificate_chain;
     use crate::config::ProxyProtocolConfig;
     use crate::proxy::{
-        AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
-        ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Percentiles, ProxyRequestOrder, AllWorkerMetrics,
-        RemoveBackend, RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
+        AddCertificate, AllWorkerMetrics, Backend, CertificateAndKey, CertificateFingerprint,
+        Cluster, ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
+        LoadBalancingParams, PathRule, Percentiles, ProxyRequestOrder, RemoveBackend,
+        RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
     };
     use hex::FromHex;
     use serde_json;
@@ -633,7 +643,7 @@ mod tests {
                 .collect(),
                 workers: [(
                     String::from("0"),
-                    ProxyResponseContent::WorkerMetrics(WorkerMetrics::All(AllWorkerMetrics {
+                    CommandResponseContent::WorkerMetrics(WorkerMetrics::All(AllWorkerMetrics {
                         proxy: Some(
                             [
                                 (String::from("sozu.gauge"), FilteredData::Gauge(1)),

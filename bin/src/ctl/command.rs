@@ -115,10 +115,15 @@ impl CommandManager {
                     }
                     match response.content {
                         Some(response_content) => match response_content {
-                            CommandResponseContent::Workers(_)
+                            CommandResponseContent::Event(_)
                             | CommandResponseContent::Metrics(_)
                             | CommandResponseContent::Query(_)
-                            | CommandResponseContent::Event(_) => {}
+                            | CommandResponseContent::Workers(_)
+                            | CommandResponseContent::WorkerCertificates(_)
+                            | CommandResponseContent::WorkerClusters(_)
+                            | CommandResponseContent::WorkerClustersHashes(_)
+                            | CommandResponseContent::WorkerEvent(_)
+                            | CommandResponseContent::WorkerMetrics(_) => {}
                             CommandResponseContent::State(state) => match json {
                                 true => print_json_response(&state)?,
                                 false => println!("{state:#?}"),

@@ -30,8 +30,7 @@ use sozu_command_lib::{
     },
     config::Config,
     proxy::{
-        MetricsConfiguration, ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
-        ProxyResponseStatus,
+        MetricsConfiguration, ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseStatus,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -748,7 +747,7 @@ impl CommandServer {
         response: ProxyResponse,
     ) -> anyhow::Result<Success> {
         // Notify the client with Processing in case of a proxy event
-        if let Some(ProxyResponseContent::WorkerEvent(worker_event)) = response.content {
+        if let Some(CommandResponseContent::WorkerEvent(worker_event)) = response.content {
             let event: Event = worker_event.into();
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {

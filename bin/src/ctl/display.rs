@@ -9,8 +9,8 @@ use prettytable::{Row, Table};
 use sozu_command_lib::{
     command::{CommandResponseContent, ListedFrontends, ListenersList, WorkerInfo},
     proxy::{
-        AggregatedMetrics, ClusterMetricsData, FilteredData, ProxyResponseContent,
-        WorkerCertificates, WorkerMetrics, Route, AllWorkerMetrics,
+        AggregatedMetrics, AllWorkerMetrics, ClusterMetricsData, FilteredData, Route,
+        WorkerCertificates, WorkerMetrics,
     },
 };
 
@@ -217,16 +217,16 @@ pub fn print_metrics(
     Ok(())
 }
 
-fn print_worker_metrics(response_content: &ProxyResponseContent) -> anyhow::Result<()> {
+fn print_worker_metrics(response_content: &CommandResponseContent) -> anyhow::Result<()> {
     match response_content {
-        ProxyResponseContent::WorkerMetrics(WorkerMetrics::All(AllWorkerMetrics {
+        CommandResponseContent::WorkerMetrics(WorkerMetrics::All(AllWorkerMetrics {
             proxy,
             clusters,
         })) => {
             print_proxy_metrics(proxy);
             print_cluster_metrics(clusters);
         }
-        ProxyResponseContent::WorkerMetrics(WorkerMetrics::Error(error)) => {
+        CommandResponseContent::WorkerMetrics(WorkerMetrics::Error(error)) => {
             println!("Error: {error}\nMaybe check your command.")
         }
         _ => bail!("The query answer is wrong."),
@@ -381,7 +381,7 @@ pub fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), anyho
 
 pub fn create_queried_cluster_table(
     headers: Vec<&str>,
-    response_content: &BTreeMap<String, ProxyResponseContent>,
+    response_content: &BTreeMap<String, CommandResponseContent>,
 ) -> Table {
     let mut table = Table::new();
     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
@@ -430,7 +430,7 @@ pub fn print_query_response_data(
 
             for (key, metrics) in data.iter() {
                 //let m: u8 = metrics;
-                if let ProxyResponseContent::WorkerClusters(clusters) = metrics {
+                if let CommandResponseContent::WorkerClusters(clusters) = metrics {
                     for cluster in clusters.iter() {
                         let entry = cluster_data.entry(cluster).or_insert(Vec::new());
                         entry.push(key.to_owned());
@@ -596,7 +596,7 @@ pub fn print_query_response_data(
 
         for metrics in data.values() {
             //let m: u8 = metrics;
-            if let ProxyResponseContent::WorkerClustersHashes(clusters) = metrics {
+            if let CommandResponseContent::WorkerClustersHashes(clusters) = metrics {
                 for (key, value) in clusters.iter() {
                     query_data.entry(key).or_insert(Vec::new()).push(value);
                 }
@@ -625,7 +625,7 @@ pub fn print_query_response_data(
 }
 
 pub fn print_certificates(
-    response_content: BTreeMap<String, ProxyResponseContent>,
+    response_content: BTreeMap<String, CommandResponseContent>,
     json: bool,
 ) -> anyhow::Result<()> {
     if json {
@@ -635,7 +635,7 @@ pub fn print_certificates(
 
     //println!("received: {:?}", data);
     let it = response_content.iter().map(|(k, v)| match v {
-        ProxyResponseContent::WorkerCertificates(c) => (k, c),
+        CommandResponseContent::WorkerCertificates(c) => (k, c),
         v => {
             eprintln!("unexpected certificates query answer: {v:?}");
             exit(1);
@@ -693,13 +693,13 @@ fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
 }
 
 pub fn print_available_metrics(
-    response_contents: &BTreeMap<String, ProxyResponseContent>,
+    response_contents: &BTreeMap<String, CommandResponseContent>,
 ) -> anyhow::Result<()> {
     let mut available_metrics: (HashSet<String>, HashSet<String>) =
         (HashSet::new(), HashSet::new());
     for response_content in response_contents.values() {
         match response_content {
-            ProxyResponseContent::WorkerMetrics(WorkerMetrics::List((
+            CommandResponseContent::WorkerMetrics(WorkerMetrics::List((
                 proxy_metric_keys,
                 cluster_metric_keys,
             ))) => {

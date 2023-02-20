@@ -26,12 +26,12 @@ use crate::{
     pool::Pool,
     sozu_command::{
         channel::Channel,
+        command::CommandResponseContent,
         config::Config,
         proxy::{
-            Backend as CommandLibBackend, Cluster, ListenerType, MessageId, WorkerEvent,
-            ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
-            ProxyResponseStatus, WorkerCertificates, RemoveBackend,
-            TcpListenerConfig as CommandTcpListener,
+            Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyRequest,
+            ProxyRequestOrder, ProxyResponse, ProxyResponseStatus, RemoveBackend,
+            TcpListenerConfig as CommandTcpListener, WorkerCertificates, WorkerEvent,
         },
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
@@ -66,7 +66,7 @@ pub fn push_event(event: WorkerEvent) {
         (*queue.borrow_mut()).push_back(ProxyResponse {
             id: "EVENT".to_string(),
             status: ProxyResponseStatus::Processing,
-            content: Some(ProxyResponseContent::WorkerEvent(event)),
+            content: Some(CommandResponseContent::WorkerEvent(event)),
         });
     });
 }
@@ -890,14 +890,14 @@ impl Server {
                 push_queue(ProxyResponse {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::WorkerClustersHashes(
+                    content: Some(CommandResponseContent::WorkerClustersHashes(
                         self.config_state.hash_state(),
                     )),
                 });
                 return;
             }
             ProxyRequestOrder::QueryClusterById { cluster_id } => {
-                let response_content = ProxyResponseContent::WorkerClusters(vec![self
+                let response_content = CommandResponseContent::WorkerClusters(vec![self
                     .config_state
                     .cluster_state(&cluster_id)]);
                 push_queue(ProxyResponse {
@@ -918,7 +918,7 @@ impl Server {
                 push_queue(ProxyResponse {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::WorkerClusters(clusters)),
+                    content: Some(CommandResponseContent::WorkerClusters(clusters)),
                 });
                 return;
             }
@@ -926,11 +926,8 @@ impl Server {
                 push_queue(ProxyResponse {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::WorkerCertificates(
-                        WorkerCertificates::Fingerprint(get_certificate(
-                            &self.config_state,
-                            &f,
-                        )),
+                    content: Some(CommandResponseContent::WorkerCertificates(
+                        WorkerCertificates::Fingerprint(get_certificate(&self.config_state, &f)),
                     )),
                 });
                 return;
@@ -942,7 +939,7 @@ impl Server {
                     push_queue(ProxyResponse {
                         id: message.id.clone(),
                         status: ProxyResponseStatus::Ok,
-                        content: Some(ProxyResponseContent::WorkerMetrics(data)),
+                        content: Some(CommandResponseContent::WorkerMetrics(data)),
                     });
                 });
                 return;

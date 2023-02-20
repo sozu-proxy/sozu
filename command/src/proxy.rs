@@ -19,7 +19,7 @@ use crate::{
         ProxyProtocolConfig, DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST,
         DEFAULT_RUSTLS_CIPHER_LIST, DEFAULT_SIGNATURE_ALGORITHMS,
     },
-    state::{ClusterId, RouteKey},
+    state::{ClusterId, RouteKey}, command::CommandResponseContent,
 };
 
 pub type MessageId = String;
@@ -29,7 +29,7 @@ pub type MessageId = String;
 pub struct ProxyResponse {
     pub id: MessageId,
     pub status: ProxyResponseStatus,
-    pub content: Option<ProxyResponseContent>,
+    pub content: Option<CommandResponseContent>,
 }
 
 impl ProxyResponse {
@@ -92,6 +92,7 @@ pub enum ProxyResponseStatus {
     Error(String),
 }
 
+/*
 // TODO: make those variants of CommandResponseContent
 /// Sent by one worker to the main process
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,12 +105,13 @@ pub enum ProxyResponseContent {
     WorkerCertificates(WorkerCertificates),
     WorkerMetrics(WorkerMetrics),
 }
+*/
 
 /// Aggregated metrics of main process & workers, for the CLI
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedMetrics {
     pub main: BTreeMap<String, FilteredData>,
-    pub workers: BTreeMap<String, ProxyResponseContent>,
+    pub workers: BTreeMap<String, CommandResponseContent>,
 }
 
 /// All metrics of a worker: proxy and clusters
@@ -827,7 +829,7 @@ pub struct QueryMetricsOptions {
 //     Metrics(QueryAnswerMetrics),
 // }
 
-/// all information about one cluster
+/// all information about one cluster, sent by a worker
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterInformation {
     pub configuration: Option<Cluster>,

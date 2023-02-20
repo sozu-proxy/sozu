@@ -24,7 +24,7 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proxy::{
         AggregatedMetrics, MetricsConfiguration, ProxyRequest, ProxyRequestOrder,
-        ProxyResponseContent, ProxyResponseStatus,
+        ProxyResponseStatus,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -1110,12 +1110,12 @@ impl CommandServer {
         let mut main_query_answer = None;
         match &proxy_request_order {
             ProxyRequestOrder::QueryClustersHashes => {
-                main_query_answer = Some(ProxyResponseContent::WorkerClustersHashes(
+                main_query_answer = Some(CommandResponseContent::WorkerClustersHashes(
                     self.state.hash_state(),
                 ));
             }
             ProxyRequestOrder::QueryClusterById { cluster_id } => {
-                main_query_answer = Some(ProxyResponseContent::WorkerClusters(vec![self
+                main_query_answer = Some(CommandResponseContent::WorkerClusters(vec![self
                     .state
                     .cluster_state(cluster_id)]));
             }
@@ -1126,7 +1126,7 @@ impl CommandServer {
                     .iter()
                     .map(|cluster_id| self.state.cluster_state(cluster_id))
                     .collect();
-                main_query_answer = Some(ProxyResponseContent::WorkerClusters(clusters));
+                main_query_answer = Some(CommandResponseContent::WorkerClusters(clusters));
             }
             _ => {}
         }
@@ -1162,7 +1162,7 @@ impl CommandServer {
                 }
             }
 
-            let mut proxy_responses_map: BTreeMap<String, ProxyResponseContent> = responses
+            let mut proxy_responses_map: BTreeMap<String, CommandResponseContent> = responses
                 .into_iter()
                 .filter_map(|(worker_id, proxy_response)| match proxy_response.content {
                     Some(content) => Some((worker_id.to_string(), content)),
