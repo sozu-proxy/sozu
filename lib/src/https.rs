@@ -54,7 +54,7 @@ use crate::{
         proxy::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
             ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
-            ProxyResponseStatus, QueryAnswerCertificate, RemoveCertificate, Route, TlsVersion,
+            ProxyResponseStatus, WorkerCertificates, RemoveCertificate, Route, TlsVersion,
         },
         ready::Ready,
         scm_socket::ScmSocket,
@@ -966,7 +966,7 @@ impl HttpsProxy {
         );
 
         Ok(Some(ProxyResponseContent::Certificates(
-            QueryAnswerCertificate::All(certificates),
+            WorkerCertificates::All(certificates),
         )))
     }
 
@@ -995,7 +995,7 @@ impl HttpsProxy {
         );
 
         Ok(Some(ProxyResponseContent::Certificates(
-            QueryAnswerCertificate::Domain(certificates),
+            WorkerCertificates::Domain(certificates),
         )))
     }
 

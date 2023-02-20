@@ -30,7 +30,7 @@ use crate::{
         proxy::{
             Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyEvent,
             ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
-            ProxyResponseStatus, QueryAnswerCertificate, RemoveBackend,
+            ProxyResponseStatus, WorkerCertificates, RemoveBackend,
             TcpListenerConfig as CommandTcpListener,
         },
         ready::Ready,
@@ -927,7 +927,7 @@ impl Server {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
                     content: Some(ProxyResponseContent::Certificates(
-                        QueryAnswerCertificate::Fingerprint(get_certificate(
+                        WorkerCertificates::Fingerprint(get_certificate(
                             &self.config_state,
                             &f,
                         )),

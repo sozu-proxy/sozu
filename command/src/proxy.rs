@@ -97,12 +97,11 @@ pub enum ProxyResponseStatus {
 pub enum ProxyResponseContent {
     /// contains proxy & cluster metrics
     Metrics(WorkerMetrics),
-    // Query(QueryAnswer),
     Event(ProxyEvent),
     Clusters(Vec<QueryAnswerCluster>),
     /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
-    Certificates(QueryAnswerCertificate),
+    Certificates(WorkerCertificates),
     QueriedMetrics(QueryAnswerMetrics),
 }
 
@@ -839,7 +838,7 @@ pub struct QueryAnswerCluster {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QueryAnswerCertificate {
+pub enum WorkerCertificates {
     /// returns a list of certificates: domain -> fingerprint
     All(HashMap<SocketAddr, BTreeMap<String, Vec<u8>>>),
     /// returns a fingerprint

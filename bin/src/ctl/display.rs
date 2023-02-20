@@ -10,7 +10,7 @@ use sozu_command_lib::{
     command::{CommandResponseContent, ListedFrontends, ListenersList, WorkerInfo},
     proxy::{
         AggregatedMetricsData, ClusterMetricsData, FilteredData, ProxyResponseContent,
-        QueryAnswerCertificate, QueryAnswerMetrics, Route, WorkerMetrics,
+        WorkerCertificates, QueryAnswerMetrics, Route, WorkerMetrics,
     },
 };
 
@@ -646,7 +646,7 @@ pub fn print_certificates(
         println!("process '{k}':");
 
         match value {
-            QueryAnswerCertificate::All(h) => {
+            WorkerCertificates::All(h) => {
                 for (addr, h2) in h.iter() {
                     println!("\t{addr}:");
 
@@ -657,7 +657,7 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            QueryAnswerCertificate::Domain(h) => {
+            WorkerCertificates::Domain(h) => {
                 for (addr, opt) in h.iter() {
                     println!("\t{addr}:");
                     if let Some((key, fingerprint)) = opt {
@@ -669,7 +669,7 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            QueryAnswerCertificate::Fingerprint(opt) => {
+            WorkerCertificates::Fingerprint(opt) => {
                 if let Some((s, v)) = opt {
                     println!("\tfrontends: {v:?}\ncertificate:\n{s}");
                 } else {
