@@ -430,7 +430,7 @@ pub fn print_query_response_data(
 
             for (key, metrics) in data.iter() {
                 //let m: u8 = metrics;
-                if let ProxyResponseContent::Clusters(clusters) = metrics {
+                if let ProxyResponseContent::WorkerClusters(clusters) = metrics {
                     for cluster in clusters.iter() {
                         let entry = cluster_data.entry(cluster).or_insert(Vec::new());
                         entry.push(key.to_owned());
@@ -635,7 +635,7 @@ pub fn print_certificates(
 
     //println!("received: {:?}", data);
     let it = response_content.iter().map(|(k, v)| match v {
-        ProxyResponseContent::Certificates(c) => (k, c),
+        ProxyResponseContent::WorkerCertificates(c) => (k, c),
         v => {
             eprintln!("unexpected certificates query answer: {v:?}");
             exit(1);

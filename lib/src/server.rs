@@ -897,7 +897,7 @@ impl Server {
                 return;
             }
             ProxyRequestOrder::QueryClusterById { cluster_id } => {
-                let response_content = ProxyResponseContent::Clusters(vec![self
+                let response_content = ProxyResponseContent::WorkerClusters(vec![self
                     .config_state
                     .cluster_state(&cluster_id)]);
                 push_queue(ProxyResponse {
@@ -918,7 +918,7 @@ impl Server {
                 push_queue(ProxyResponse {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::Clusters(clusters)),
+                    content: Some(ProxyResponseContent::WorkerClusters(clusters)),
                 });
                 return;
             }
@@ -926,7 +926,7 @@ impl Server {
                 push_queue(ProxyResponse {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::Certificates(
+                    content: Some(ProxyResponseContent::WorkerCertificates(
                         WorkerCertificates::Fingerprint(get_certificate(
                             &self.config_state,
                             &f,

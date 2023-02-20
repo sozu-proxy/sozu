@@ -1115,7 +1115,7 @@ impl CommandServer {
                 ));
             }
             ProxyRequestOrder::QueryClusterById { cluster_id } => {
-                main_query_answer = Some(ProxyResponseContent::Clusters(vec![self
+                main_query_answer = Some(ProxyResponseContent::WorkerClusters(vec![self
                     .state
                     .cluster_state(cluster_id)]));
             }
@@ -1126,7 +1126,7 @@ impl CommandServer {
                     .iter()
                     .map(|cluster_id| self.state.cluster_state(cluster_id))
                     .collect();
-                main_query_answer = Some(ProxyResponseContent::Clusters(clusters));
+                main_query_answer = Some(ProxyResponseContent::WorkerClusters(clusters));
             }
             _ => {}
         }

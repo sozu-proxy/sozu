@@ -98,10 +98,10 @@ pub enum ProxyResponseStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyResponseContent {
     WorkerEvent(WorkerEvent),
-    Clusters(Vec<QueryAnswerCluster>),
+    WorkerClusters(Vec<QueryAnswerCluster>),
     /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
-    Certificates(WorkerCertificates),
+    WorkerCertificates(WorkerCertificates),
     QueriedMetrics(WorkerMetrics),
 }
 

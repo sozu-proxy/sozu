@@ -965,7 +965,7 @@ impl HttpsProxy {
             certificates
         );
 
-        Ok(Some(ProxyResponseContent::Certificates(
+        Ok(Some(ProxyResponseContent::WorkerCertificates(
             WorkerCertificates::All(certificates),
         )))
     }
@@ -994,7 +994,7 @@ impl HttpsProxy {
             domain, certificates
         );
 
-        Ok(Some(ProxyResponseContent::Certificates(
+        Ok(Some(ProxyResponseContent::WorkerCertificates(
             WorkerCertificates::Domain(certificates),
         )))
     }
