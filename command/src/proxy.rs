@@ -92,11 +92,13 @@ pub enum ProxyResponseStatus {
     Error(String),
 }
 
+// TODO: make those variants of CommandResponseContent
+/// Sent by one worker to the main process
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyResponseContent {
     /// contains proxy & cluster metrics
-    Metrics(AllWorkerMetrics),
+    // Metrics(AllWorkerMetrics),
     Event(ProxyEvent),
     Clusters(Vec<QueryAnswerCluster>),
     /// cluster id -> hash of cluster information

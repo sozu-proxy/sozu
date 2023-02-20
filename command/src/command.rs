@@ -216,8 +216,8 @@ mod tests {
     use crate::proxy::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
         ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Percentiles, ProxyRequestOrder, WorkerMetrics,
-        RemoveBackend, RemoveCertificate, Route, RulePosition, TlsVersion, AllWorkerMetrics,
+        LoadBalancingParams, PathRule, Percentiles, ProxyRequestOrder, AllWorkerMetrics,
+        RemoveBackend, RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
     };
     use hex::FromHex;
     use serde_json;
