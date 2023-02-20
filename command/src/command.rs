@@ -7,7 +7,7 @@ use std::{
 use crate::{
     state::ConfigState,
     worker::{
-        AggregatedMetrics, ClusterInformation, HttpFrontend, HttpListenerConfig,
+        AvailableWorkerMetrics, ClusterInformation, FilteredData, HttpFrontend, HttpListenerConfig,
         HttpsListenerConfig, TcpFrontend, TcpListenerConfig, WorkerCertificates, WorkerEvent,
         WorkerMetrics, WorkerOrder,
     },
@@ -100,6 +100,8 @@ pub enum ResponseContent {
     Workers(Vec<WorkerInfo>),
     /// aggregated metrics of main process and workers
     Metrics(AggregatedMetrics),
+    /// list available metrics of main process and workers
+    AvailableMetrics(AvailableMetrics), // maybe useless
     /// worker responses to a same query: worker_id -> query_answer
     Query(BTreeMap<String, ResponseContent>),
     /// the state of Sōzu: frontends, backends, listeners, etc.
@@ -120,6 +122,21 @@ pub enum ResponseContent {
     WorkerClustersHashes(BTreeMap<String, u64>),
     WorkerCertificates(WorkerCertificates),
     WorkerMetrics(WorkerMetrics),
+    AvailableWorkerMetrics(AvailableWorkerMetrics),
+}
+
+/// Aggregated metrics of main process & workers, for the CLI
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregatedMetrics {
+    pub main: BTreeMap<String, FilteredData>,
+    pub workers: BTreeMap<String, WorkerMetrics>,
+}
+
+/// lists of available metrics in the main process and the workers
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AvailableMetrics {
+    pub main: Vec<String>,
+    pub workers: BTreeMap<String, AvailableWorkerMetrics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -224,8 +241,8 @@ mod tests {
     use crate::certificate::split_certificate_chain;
     use crate::config::ProxyProtocolConfig;
     use crate::worker::{
-        AddCertificate, AllWorkerMetrics, Backend, CertificateAndKey, CertificateFingerprint,
-        Cluster, ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
+        AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
+        ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
         LoadBalancingParams, PathRule, Percentiles, RemoveBackend, RemoveCertificate, Route,
         RulePosition, TlsVersion, WorkerMetrics, WorkerOrder,
     };
@@ -629,7 +646,7 @@ mod tests {
                 .collect(),
                 workers: [(
                     String::from("0"),
-                    WorkerMetrics::All(AllWorkerMetrics {
+                    WorkerMetrics {
                         proxy: Some(
                             [
                                 (String::from("sozu.gauge"), FilteredData::Gauge(1)),
@@ -702,7 +719,7 @@ mod tests {
                             .cloned()
                             .collect()
                         )
-                    })
+                    }
                 )]
                 .iter()
                 .cloned()

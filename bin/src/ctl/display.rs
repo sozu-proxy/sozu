@@ -7,11 +7,11 @@ use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::{
-    command::{ListedFrontends, ListenersList, ResponseContent, WorkerInfo},
-    worker::{
-        AggregatedMetrics, AllWorkerMetrics, ClusterMetricsData, FilteredData, Route,
-        WorkerCertificates, WorkerMetrics,
+    command::{
+        AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, ResponseContent,
+        WorkerInfo,
     },
+    worker::{ClusterMetricsData, FilteredData, Route, WorkerCertificates, WorkerMetrics},
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -218,13 +218,8 @@ pub fn print_metrics(
 }
 
 fn print_worker_metrics(worker_metrics: &WorkerMetrics) -> anyhow::Result<()> {
-    match worker_metrics {
-        WorkerMetrics::All(AllWorkerMetrics { proxy, clusters }) => {
-            print_proxy_metrics(proxy);
-            print_cluster_metrics(clusters);
-        }
-        _ => bail!("The query answer is wrong."),
-    }
+    print_proxy_metrics(&worker_metrics.proxy);
+    print_cluster_metrics(&worker_metrics.clusters);
 
     Ok(())
 }
@@ -686,49 +681,15 @@ fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
     .unwrap_or_default()
 }
 
-pub fn print_available_metrics(
-    response_contents: &BTreeMap<String, ResponseContent>,
-) -> anyhow::Result<()> {
-    let mut available_metrics: (HashSet<String>, HashSet<String>) =
-        (HashSet::new(), HashSet::new());
-    for response_content in response_contents.values() {
-        match response_content {
-            ResponseContent::WorkerMetrics(WorkerMetrics::List((
-                proxy_metric_keys,
-                cluster_metric_keys,
-            ))) => {
-                for key in proxy_metric_keys {
-                    available_metrics
-                        .0
-                        .insert(key.replace('\t', ".").to_owned());
-                }
-                for key in cluster_metric_keys {
-                    available_metrics
-                        .1
-                        .insert(key.replace('\t', ".").to_owned());
-                }
-            }
-            _ => bail!("The proxy responded nonsense instead of metric names"),
-        }
+pub fn print_available_metrics(available_metrics: &AvailableMetrics) -> anyhow::Result<()> {
+    println!("Available metrics on the main process:");
+    for metric in available_metrics.main.iter() {
+        println!("\t{}", metric);
     }
-    let proxy_metrics_names = available_metrics
-        .0
-        .iter()
-        .map(|s| s.to_owned())
-        .collect::<Vec<String>>();
-    let cluster_metrics_names = available_metrics
-        .1
-        .iter()
-        .map(|s| s.to_owned())
-        .collect::<Vec<String>>();
-
-    println!("Available metrics on the proxy level:");
-    for metric_name in proxy_metrics_names {
-        println!("\t{metric_name}");
-    }
-    println!("Available metrics on the cluster level:");
-    for metric_name in cluster_metrics_names {
-        println!("\t{metric_name}");
+    for worker in available_metrics.workers.iter() {
+        println!("Available metrics on worker {}:", worker.0);
+        println!("\tProxy metrics: {:?}", worker.1.proxy_metrics);
+        println!("\tCluster metrics: {:?}", worker.1.cluster_metrics);
     }
     Ok(())
 }

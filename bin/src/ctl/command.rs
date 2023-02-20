@@ -108,15 +108,18 @@ impl CommandManager {
                     }
                     match response.content {
                         Some(response_content) => match response_content {
-                            ResponseContent::Event(_)
+                            ResponseContent::AvailableMetrics(_)
+                            | ResponseContent::AvailableWorkerMetrics(_)
+                            | ResponseContent::Event(_)
+                            | ResponseContent::ListenersList(_)
                             | ResponseContent::Metrics(_)
                             | ResponseContent::Query(_)
-                            | ResponseContent::Workers(_)
                             | ResponseContent::WorkerCertificates(_)
                             | ResponseContent::WorkerClusters(_)
                             | ResponseContent::WorkerClustersHashes(_)
                             | ResponseContent::WorkerEvent(_)
-                            | ResponseContent::WorkerMetrics(_) => {}
+                            | ResponseContent::WorkerMetrics(_)
+                            | ResponseContent::Workers(_) => {}
                             ResponseContent::State(state) => match json {
                                 true => print_json_response(&state)?,
                                 false => println!("{state:#?}"),
@@ -131,7 +134,6 @@ impl CommandManager {
                                     print_status(worker_info_vec);
                                 }
                             }
-                            ResponseContent::ListenersList(list) => print_listeners(list),
                         },
                         None => {}
                     }
@@ -323,10 +325,10 @@ impl CommandManager {
                             Some(ResponseContent::Metrics(aggregated_metrics_data)) => {
                                 print_metrics(aggregated_metrics_data, json)?
                             }
-                            Some(ResponseContent::Query(lists_of_metrics)) => {
-                                print_available_metrics(&lists_of_metrics)?;
+                            Some(ResponseContent::AvailableMetrics(available_metrics)) => {
+                                print_available_metrics(&available_metrics)?;
                             }
-                            _ => println!("Wrong kind of response here"),
+                            _ => println!("Wrong kind of response here {:?}", response),
                         }
                         break;
                     }

@@ -103,17 +103,17 @@ impl fmt::Display for WorkerResponse {
     }
 }
 
-/// Aggregated metrics of main process & workers, for the CLI
+/// lists of available metrics in a worker
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AggregatedMetrics {
-    pub main: BTreeMap<String, FilteredData>,
-    pub workers: BTreeMap<String, WorkerMetrics>,
+pub struct AvailableWorkerMetrics {
+    pub proxy_metrics: Vec<String>,
+    pub cluster_metrics: Vec<String>,
 }
 
 /// All metrics of a worker: proxy and clusters
 /// Populated by Options so partial results can be sent
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AllWorkerMetrics {
+pub struct WorkerMetrics {
     /// Metrics of the worker process, key -> value
     pub proxy: Option<BTreeMap<String, FilteredData>>,
     /// cluster_id -> cluster_metrics
@@ -833,15 +833,6 @@ pub enum WorkerCertificates {
     Domain(HashMap<SocketAddr, Option<(String, Vec<u8>)>>),
     /// returns the certificate
     Fingerprint(Option<(String, Vec<String>)>),
-}
-
-/// Returned by the local drain
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WorkerMetrics {
-    /// (list of proxy metrics, list of cluster metrics)
-    List((Vec<String>, Vec<String>)),
-    /// all worker metrics, proxy & clusters, with Options all around for partial answers
-    All(AllWorkerMetrics),
 }
 
 impl WorkerOrder {

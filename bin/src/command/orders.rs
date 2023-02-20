@@ -15,15 +15,16 @@ use nom::{Err, HexDisplay, Offset};
 use sozu_command_lib::{
     buffer::fixed::Buffer,
     command::{
-        FrontendFilters, ListedFrontends, ListenersList, Order, Request, RequestStatus, Response,
-        ResponseContent, RunState, WorkerInfo, PROTOCOL_VERSION,
+        AggregatedMetrics, AvailableMetrics, FrontendFilters, ListedFrontends, ListenersList,
+        Order, Request, RequestStatus, Response, ResponseContent, RunState, WorkerInfo,
+        PROTOCOL_VERSION,
     },
     config::Config,
     logging,
     parser::parse_several_commands,
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
-    worker::{AggregatedMetrics, MetricsConfiguration, WorkerOrder, WorkerRequest},
+    worker::{MetricsConfiguration, WorkerOrder, WorkerRequest},
 };
 
 use sozu::metrics::METRICS;
@@ -1195,9 +1196,21 @@ impl CommandServer {
                     debug!("metrics query answer received: {:?}", worker_responses_map);
 
                     if options.list {
-                        Success::Query(ResponseContent::Query(worker_responses_map))
-                    } else {
                         let workers = worker_responses_map
+                            .into_iter()
+                            .filter_map(|(worker_id, worker_response)| match worker_response {
+                                ResponseContent::AvailableWorkerMetrics(available) => {
+                                    Some((worker_id, available))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        Success::Query(ResponseContent::AvailableMetrics(AvailableMetrics {
+                            main: vec![],
+                            workers,
+                        }))
+                    } else {
+                        let workers_metrics = worker_responses_map
                             .into_iter()
                             .filter_map(|(worker_id, worker_response)| match worker_response {
                                 ResponseContent::WorkerMetrics(worker_metrics) => {
@@ -1208,7 +1221,7 @@ impl CommandServer {
                             .collect();
                         Success::Query(ResponseContent::Metrics(AggregatedMetrics {
                             main: main_metrics,
-                            workers,
+                            workers: workers_metrics,
                         }))
                     }
                 }
