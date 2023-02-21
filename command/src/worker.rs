@@ -15,93 +15,13 @@ use serde::{
 };
 
 use crate::{
-    command::{RequestStatus, ResponseContent},
+    command::{RequestStatus, ResponseContent, MessageId},
     config::{
         ProxyProtocolConfig, DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST,
         DEFAULT_RUSTLS_CIPHER_LIST, DEFAULT_SIGNATURE_ALGORITHMS,
     },
     state::{ClusterId, RouteKey},
 };
-
-pub type MessageId = String;
-
-/// Sent by a worker
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerResponse {
-    pub id: MessageId,
-    pub status: RequestStatus,
-    pub error: Option<String>,
-    pub content: Option<ResponseContent>,
-}
-
-impl WorkerResponse {
-    pub fn ok<T>(id: T) -> Self
-    where
-        T: ToString,
-    {
-        Self {
-            id: id.to_string(),
-            status: RequestStatus::Ok,
-            error: None,
-            content: None,
-        }
-    }
-
-    pub fn ok_with_content<T>(id: T, content: ResponseContent) -> Self
-    where
-        T: ToString,
-    {
-        Self {
-            id: id.to_string(),
-            status: RequestStatus::Ok,
-            error: None,
-            content: Some(content),
-        }
-    }
-
-    pub fn error<T, U>(id: T, error: U) -> Self
-    where
-        T: ToString,
-        U: ToString,
-    {
-        Self {
-            id: id.to_string(),
-            status: RequestStatus::Error,
-            error: Some(error.to_string()),
-            content: None,
-        }
-    }
-
-    pub fn processing<T>(id: T) -> Self
-    where
-        T: ToString,
-    {
-        Self {
-            id: id.to_string(),
-            status: RequestStatus::Processing,
-            error: None,
-            content: None,
-        }
-    }
-
-    pub fn status<T>(id: T, status: RequestStatus) -> Self
-    where
-        T: ToString,
-    {
-        Self {
-            id: id.to_string(),
-            status,
-            error: None,
-            content: None,
-        }
-    }
-}
-
-impl fmt::Display for WorkerResponse {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}-{:?}", self.id, self.status)
-    }
-}
 
 /// lists of available metrics in a worker
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -97,14 +97,14 @@ impl CommandManager {
                 );
             }
             match response.status {
-                RequestStatus::Processing => println!("Proxy is processing: {}", response.message),
-                RequestStatus::Error => bail!("Order failed: {}", response.message),
+                RequestStatus::Processing => println!("Proxy is processing: {}", response),
+                RequestStatus::Error => bail!("Order failed: {}", response),
                 RequestStatus::Ok => {
                     if json {
                         // why do we need to print a success message in json?
-                        print_json_response(&response.message)?;
+                        print_json_response(&response)?;
                     } else {
-                        println!("Success: {}", response.message);
+                        println!("Success: {}", response);
                     }
                     match response.content {
                         Some(response_content) => match response_content {
@@ -162,13 +162,10 @@ impl CommandManager {
             }
             match response.status {
                 RequestStatus::Processing => {
-                    println!("Processing: {}", response.message);
+                    println!("Processing: {}", response);
                 }
                 RequestStatus::Error => {
-                    bail!(
-                        "Error: failed to get the list of worker: {}",
-                        response.message
-                    );
+                    bail!("Error: failed to get the list of worker: {}", response);
                 }
                 RequestStatus::Ok => {
                     if let Some(ResponseContent::Workers(ref workers)) = response.content {
@@ -200,16 +197,10 @@ impl CommandManager {
                                     println!("Main process is upgrading");
                                 }
                                 RequestStatus::Error => {
-                                    bail!(
-                                        "Error: failed to upgrade the main: {}",
-                                        response.message
-                                    );
+                                    bail!("Error: failed to upgrade the main: {}", response);
                                 }
                                 RequestStatus::Ok => {
-                                    println!(
-                                        "Main process upgrade succeeded: {}",
-                                        response.message
-                                    );
+                                    println!("Main process upgrade succeeded: {}", response);
                                     break;
                                 }
                             }
@@ -261,16 +252,14 @@ impl CommandManager {
             let response = self.read_channel_message_with_timeout()?;
 
             match response.status {
-                RequestStatus::Processing => info!("Proxy is processing: {}", response.message),
-                RequestStatus::Error => bail!(
-                    "could not stop the worker {}: {}",
-                    worker_id,
-                    response.message
-                ),
+                RequestStatus::Processing => info!("Proxy is processing: {}", response),
+                RequestStatus::Error => {
+                    bail!("could not stop the worker {}: {}", worker_id, response)
+                }
                 RequestStatus::Ok => {
                     // this is necessary because we may receive responses about other workers
                     if id == response.id {
-                        info!("Worker {} shut down: {}", worker_id, response.message);
+                        info!("Worker {} shut down: {}", worker_id, response);
                     }
                     break;
                 }
@@ -311,13 +300,13 @@ impl CommandManager {
                 }
                 match response.status {
                     RequestStatus::Processing => {
-                        println!("Proxy is processing: {}", response.message);
+                        println!("Proxy is processing: {}", response);
                     }
                     RequestStatus::Error => {
                         if json {
                             return print_json_response(&response.message);
                         } else {
-                            bail!("could not query proxy state: {}", response.message);
+                            bail!("could not query proxy state: {}", response);
                         }
                     }
                     RequestStatus::Ok => {
@@ -399,13 +388,13 @@ impl CommandManager {
             }
             match response.status {
                 RequestStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
+                    println!("Proxy is processing: {}", response);
                 }
                 RequestStatus::Error => {
                     if json {
                         print_json_response(&response.message)?;
                     }
-                    bail!("could not query proxy state: {}", response.message);
+                    bail!("could not query proxy state: {}", response);
                 }
                 RequestStatus::Ok => {
                     print_query_response_data(cluster_id, domain, response.content, json)?;
@@ -451,14 +440,14 @@ impl CommandManager {
             }
             match response.status {
                 RequestStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
+                    println!("Proxy is processing: {}", response);
                 }
                 RequestStatus::Error => {
                     if json {
                         print_json_response(&response.message)?;
                         bail!("We received an error message");
                     } else {
-                        bail!("could not query proxy state: {}", response.message);
+                        bail!("could not query proxy state: {}", response);
                     }
                 }
                 RequestStatus::Ok => {

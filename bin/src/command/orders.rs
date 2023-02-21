@@ -311,7 +311,7 @@ impl CommandServer {
                         }
                         RequestStatus::Processing => {}
                         RequestStatus::Error => {
-                            error!("{:?}", worker_response.error);
+                            error!("{}", worker_response);
                             error += 1;
                         }
                     };
@@ -676,7 +676,7 @@ impl CommandServer {
                             info!("returnsockets processing");
                         }
                         RequestStatus::Error => {
-                            return_error(cloned_command_tx, cloned_req_id, worker_response.error)
+                            return_error(cloned_command_tx, cloned_req_id, worker_response.message)
                                 .await;
                             break;
                         }
@@ -744,7 +744,7 @@ impl CommandServer {
                             info!("softstop processing");
                         }
                         RequestStatus::Error => {
-                            info!("softstop error: {:?}", worker_response.error);
+                            info!("softstop error: {}", worker_response);
                             break;
                         }
                     };
@@ -870,7 +870,7 @@ impl CommandServer {
                         }
                         RequestStatus::Processing => {}
                         RequestStatus::Error => {
-                            error!("{:?}", worker_response.error);
+                            error!("{}", worker_response);
                             error += 1;
                         }
                     };
@@ -1053,7 +1053,7 @@ impl CommandServer {
             for response in responses.iter() {
                 match response.1.status {
                     RequestStatus::Error => {
-                        messages.push(format!("{}: {:?}", response.0, response.1.error));
+                        messages.push(format!("{}: {:?}", response.0, response.1.message));
                         has_error = true;
                     }
                     _ => messages.push(format!("{}: OK", response.0)),
@@ -1375,7 +1375,7 @@ impl CommandServer {
             for response in responses.iter() {
                 match response.1.status {
                     RequestStatus::Error => {
-                        messages.push(format!("{}: {:?}", response.0, response.1.error));
+                        messages.push(format!("{}: {:?}", response.0, response.1.message));
                         has_error = true;
                     }
                     _ => messages.push(format!("{}: OK", response.0)),

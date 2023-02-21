@@ -158,12 +158,16 @@ pub struct ListenersList {
 /// Responses of the main process to the CLI (or other client)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
-    pub id: String,
+    pub id: MessageId,
     pub version: u8,
+    /// OK | processing | failure
     pub status: RequestStatus,
-    pub message: String,
+    /// a success or error message
+    pub message: Option<String>,
     pub content: Option<ResponseContent>,
 }
+
+pub type MessageId = String;
 
 impl Response {
     pub fn new(
@@ -176,8 +180,96 @@ impl Response {
             version: PROTOCOL_VERSION,
             id,
             status,
-            message,
+            message: Some(message),
             content,
+        }
+    }
+
+    pub fn ok<T>(id: T) -> Self
+    where
+        T: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            version: PROTOCOL_VERSION,
+            status: RequestStatus::Ok,
+            message: None,
+            content: None,
+        }
+    }
+
+    pub fn ok_with_content<T>(id: T, content: ResponseContent) -> Self
+    where
+        T: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            version: PROTOCOL_VERSION,
+            status: RequestStatus::Ok,
+            message: None,
+            content: Some(content),
+        }
+    }
+
+    pub fn error<T, U>(id: T, error: U) -> Self
+    where
+        T: ToString,
+        U: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            version: PROTOCOL_VERSION,
+            status: RequestStatus::Error,
+            message: Some(error.to_string()),
+            content: None,
+        }
+    }
+
+    pub fn processing<T>(id: T) -> Self
+    where
+        T: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            version: PROTOCOL_VERSION,
+            status: RequestStatus::Processing,
+            message: None,
+            content: None,
+        }
+    }
+
+    pub fn processing_with_content<T>(id: T, content: ResponseContent) -> Self
+    where
+        T: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            version: PROTOCOL_VERSION,
+            status: RequestStatus::Processing,
+            message: None,
+            content: Some(content),
+        }
+    }
+
+    pub fn status<T>(id: T, status: RequestStatus) -> Self
+    where
+        T: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            version: PROTOCOL_VERSION,
+            status,
+            message: None,
+            content: None,
+        }
+    }
+}
+
+impl fmt::Display for Response {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match &self.message {
+            Some(message) => write!(f, "{}-{:?}: {}", self.id, self.status, message),
+            None => write!(f, "{}-{:?}", self.id, self.status),
         }
     }
 }
@@ -611,7 +703,7 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             status: RequestStatus::Ok,
-            message: String::from(""),
+            message: Some(String::from("")),
             content: Some(ResponseContent::Workers(vec!(
                 WorkerInfo {
                     id: 1,
@@ -634,7 +726,7 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             status: RequestStatus::Ok,
-            message: String::from(""),
+            message: Some(String::from("")),
             content: Some(ResponseContent::Metrics(AggregatedMetrics {
                 main: [
                     (String::from("sozu.gauge"), FilteredData::Gauge(1)),

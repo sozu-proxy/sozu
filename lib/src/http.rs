@@ -12,7 +12,7 @@ use anyhow::{bail, Context};
 use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::worker::RemoveListener;
+use sozu_command::{command::Response, worker::RemoveListener};
 use time::{Duration, Instant};
 
 use crate::{
@@ -22,10 +22,7 @@ use crate::{
         logging,
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
-        worker::{
-            Cluster, HttpFrontend, HttpListenerConfig, Route, WorkerOrder, WorkerRequest,
-            WorkerResponse,
-        },
+        worker::{Cluster, HttpFrontend, HttpListenerConfig, Route, WorkerOrder, WorkerRequest},
     },
     timer::TimeoutContainer,
     util::UnwrapLog,
@@ -783,7 +780,7 @@ impl HttpListener {
 }
 
 impl ProxyConfiguration for HttpProxy {
-    fn notify(&mut self, request: WorkerRequest) -> WorkerResponse {
+    fn notify(&mut self, request: WorkerRequest) -> Response {
         let request_id = request.id.clone();
 
         let result = match request.order {
@@ -821,7 +818,7 @@ impl ProxyConfiguration for HttpProxy {
                 {
                     Ok(()) => {
                         info!("{} soft stop successful", request_id);
-                        return WorkerResponse::processing(request.id);
+                        return Response::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -834,7 +831,7 @@ impl ProxyConfiguration for HttpProxy {
                 {
                     Ok(()) => {
                         info!("{} hard stop successful", request_id);
-                        return WorkerResponse::processing(request.id);
+                        return Response::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -863,11 +860,11 @@ impl ProxyConfiguration for HttpProxy {
         match result {
             Ok(()) => {
                 info!("{} successful", request_id);
-                WorkerResponse::ok(request_id)
+                Response::ok(request_id)
             }
             Err(error_message) => {
                 error!("{} unsuccessful: {:#}", request_id, error_message);
-                WorkerResponse::error(request_id, format!("{error_message:#}"))
+                Response::error(request_id, format!("{error_message:#}"))
             }
         }
     }
@@ -1123,8 +1120,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (mut command, channel) =
-            Channel::generate(1000, 10000).expect("should create a channel");
+        let (mut command, channel) = Channel::generate(1000, 10000)
+            .expect("should create a channel");
         let _jg = thread::spawn(move || {
             setup_test_logger!();
             start_http_worker(config, channel, 10, 16384).expect("could not start the http server");

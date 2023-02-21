@@ -34,14 +34,13 @@ use crate::{
     },
     socket::server_bind,
     sozu_command::{
+        command::Response,
         config::ProxyProtocolConfig,
         logging,
         ready::Ready,
         scm_socket::ScmSocket,
         state::ClusterId,
-        worker::{
-            TcpFrontend, TcpListenerConfig, WorkerEvent, WorkerOrder, WorkerRequest, WorkerResponse,
-        },
+        worker::{TcpFrontend, TcpListenerConfig, WorkerEvent, WorkerOrder, WorkerRequest},
     },
     timer::TimeoutContainer,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, Protocol,
@@ -1320,21 +1319,21 @@ impl TcpProxy {
 }
 
 impl ProxyConfiguration for TcpProxy {
-    fn notify(&mut self, message: WorkerRequest) -> WorkerResponse {
+    fn notify(&mut self, message: WorkerRequest) -> Response {
         match message.order {
             WorkerOrder::AddTcpFrontend(front) => {
                 if let Err(err) = self.add_tcp_front(front) {
-                    return WorkerResponse::error(message.id, err);
+                    return Response::error(message.id, err);
                 }
 
-                WorkerResponse::ok(message.id)
+                Response::ok(message.id)
             }
             WorkerOrder::RemoveTcpFrontend(front) => {
                 if let Err(err) = self.remove_tcp_front(&front) {
-                    return WorkerResponse::error(message.id, err);
+                    return Response::error(message.id, err);
                 }
 
-                WorkerResponse::ok(message.id)
+                Response::ok(message.id)
             }
             WorkerOrder::SoftStop => {
                 info!("{} processing soft shutdown", message.id);
@@ -1345,7 +1344,7 @@ impl ProxyConfiguration for TcpProxy {
                         .take()
                         .map(|mut sock| self.registry.deregister(&mut sock));
                 }
-                WorkerResponse::processing(message.id)
+                Response::processing(message.id)
             }
             WorkerOrder::HardStop => {
                 info!("{} hard shutdown", message.id);
@@ -1356,11 +1355,11 @@ impl ProxyConfiguration for TcpProxy {
                         .take()
                         .map(|mut sock| self.registry.deregister(&mut sock));
                 }
-                WorkerResponse::ok(message.id)
+                Response::ok(message.id)
             }
             WorkerOrder::Status => {
                 info!("{} status", message.id);
-                WorkerResponse::ok(message.id)
+                Response::ok(message.id)
             }
             WorkerOrder::Logging(logging_filter) => {
                 info!(
@@ -1371,7 +1370,7 @@ impl ProxyConfiguration for TcpProxy {
                     let directives = logging::parse_logging_spec(&logging_filter);
                     l.borrow_mut().set_directives(directives);
                 });
-                WorkerResponse::ok(message.id)
+                Response::ok(message.id)
             }
             WorkerOrder::AddCluster(cluster) => {
                 let config = ClusterConfiguration {
@@ -1379,20 +1378,20 @@ impl ProxyConfiguration for TcpProxy {
                     //load_balancing: cluster.load_balancing,
                 };
                 self.configs.insert(cluster.cluster_id, config);
-                WorkerResponse::ok(message.id)
+                Response::ok(message.id)
             }
             WorkerOrder::RemoveCluster { cluster_id } => {
                 self.configs.remove(&cluster_id);
-                WorkerResponse::ok(message.id)
+                Response::ok(message.id)
             }
             WorkerOrder::RemoveListener(remove) => {
                 if !self.remove_listener(remove.address) {
-                    WorkerResponse::error(
+                    Response::error(
                         message.id,
                         format!("no TCP listener to remove at address {:?}", remove.address),
                     )
                 } else {
-                    WorkerResponse::ok(message.id)
+                    Response::ok(message.id)
                 }
             }
             command => {
@@ -1400,7 +1399,7 @@ impl ProxyConfiguration for TcpProxy {
                     "{} unsupported message for TCP proxy, ignoring {:?}",
                     message.id, command
                 );
-                WorkerResponse::error(message.id, "unsupported message")
+                Response::error(message.id, "unsupported message")
             }
         }
     }
@@ -1733,7 +1732,7 @@ mod tests {
     }
 
     /// used in tests only
-    pub fn start_proxy() -> anyhow::Result<Channel<WorkerRequest, WorkerResponse>> {
+    pub fn start_proxy() -> anyhow::Result<Channel<WorkerRequest, Response>> {
         use crate::server;
 
         info!("listen for connections");

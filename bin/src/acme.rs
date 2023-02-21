@@ -408,7 +408,7 @@ fn order_command(
             .read_message()
             .with_context(|| "Could not read response on channel")?;
         if id != response.id {
-            panic!("received message with invalid id: {response:?}");
+            panic!("received message with invalid id: {response}");
         }
         match response.status {
             RequestStatus::Processing => {
@@ -417,27 +417,27 @@ fn order_command(
                 // until an error or ok message was sent
             }
             RequestStatus::Error => {
-                bail!("could not execute order: {}", response.message);
+                bail!("could not execute order: {}", response);
             }
             RequestStatus::Ok => {
                 match order {
                     WorkerOrder::AddBackend(_) => {
-                        info!("backend added : {}", response.message)
+                        info!("backend added : {}", response)
                     }
                     WorkerOrder::RemoveBackend(_) => {
-                        info!("backend removed : {} ", response.message)
+                        info!("backend removed : {} ", response)
                     }
                     WorkerOrder::AddCertificate(_) => {
-                        info!("certificate added: {}", response.message)
+                        info!("certificate added: {}", response)
                     }
                     WorkerOrder::RemoveCertificate(_) => {
-                        info!("certificate removed: {}", response.message)
+                        info!("certificate removed: {}", response)
                     }
                     WorkerOrder::AddHttpFrontend(_) => {
-                        info!("front added: {}", response.message)
+                        info!("front added: {}", response)
                     }
                     WorkerOrder::RemoveHttpFrontend(_) => {
-                        info!("front removed: {}", response.message)
+                        info!("front removed: {}", response)
                     }
                     _ => {
                         // do nothing for now

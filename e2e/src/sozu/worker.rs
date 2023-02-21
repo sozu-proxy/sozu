@@ -14,6 +14,7 @@ use sozu_lib as sozu;
 use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
+    command::Response,
     config::{Config, FileConfig},
     logging::{Logger, LoggerBackend},
     scm_socket::{Listeners, ScmSocket},
@@ -21,7 +22,7 @@ use sozu_command::{
     worker::{
         Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
         LoadBalancingAlgorithms, LoadBalancingParams, PathRule, Route, RulePosition, TcpFrontend,
-        TcpListenerConfig, WorkerOrder, WorkerRequest, WorkerResponse,
+        TcpListenerConfig, WorkerOrder, WorkerRequest,
     },
 };
 
@@ -34,7 +35,7 @@ pub struct Worker {
     pub state: ConfigState,
     pub scm_main_to_worker: ScmSocket,
     pub scm_worker_to_main: ScmSocket,
-    pub command_channel: Channel<WorkerRequest, WorkerResponse>,
+    pub command_channel: Channel<WorkerRequest, Response>,
     pub command_id: CommandID,
     pub server_job: JoinHandle<()>,
 }
@@ -107,7 +108,7 @@ impl Worker {
         config: Config,
         listeners: Listeners,
         state: ConfigState,
-    ) -> (ScmSocket, Channel<WorkerRequest, WorkerResponse>, Server) {
+    ) -> (ScmSocket, Channel<WorkerRequest, Response>, Server) {
         let (scm_main_to_worker, scm_worker_to_main) =
             UnixStream::pair().expect("could not create unix stream pair");
         let (cmd_main_to_worker, cmd_worker_to_main) =
@@ -248,7 +249,7 @@ impl Worker {
             .expect("Could not write message on command channel");
     }
 
-    pub fn read_proxy_response(&mut self) -> Option<WorkerResponse> {
+    pub fn read_proxy_response(&mut self) -> Option<Response> {
         let response = self
             .command_channel
             .read_message()

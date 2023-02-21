@@ -26,15 +26,15 @@ use crate::{
     pool::Pool,
     sozu_command::{
         channel::Channel,
-        command::{RequestStatus, ResponseContent},
+        command::{MessageId, Response, ResponseContent},
         config::Config,
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
         state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
         worker::{
-            Backend as CommandLibBackend, Cluster, ListenerType, MessageId, RemoveBackend,
+            Backend as CommandLibBackend, Cluster, ListenerType, RemoveBackend,
             TcpListenerConfig as CommandTcpListener, WorkerCertificates, WorkerEvent, WorkerOrder,
-            WorkerRequest, WorkerResponse,
+            WorkerRequest,
         },
     },
     tcp,
@@ -45,17 +45,17 @@ use crate::{
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;
 
-pub type ProxyChannel = Channel<WorkerResponse, WorkerRequest>;
+pub type ProxyChannel = Channel<Response, WorkerRequest>;
 
 thread_local! {
-  pub static QUEUE: RefCell<VecDeque<WorkerResponse>> = RefCell::new(VecDeque::new());
+  pub static QUEUE: RefCell<VecDeque<Response>> = RefCell::new(VecDeque::new());
 }
 
 thread_local! {
   pub static TIMER: RefCell<Timer<Token>> = RefCell::new(Timer::default());
 }
 
-pub fn push_queue(message: WorkerResponse) {
+pub fn push_queue(message: Response) {
     QUEUE.with(|queue| {
         (*queue.borrow_mut()).push_back(message);
     });
@@ -63,12 +63,10 @@ pub fn push_queue(message: WorkerResponse) {
 
 pub fn push_event(event: WorkerEvent) {
     QUEUE.with(|queue| {
-        (*queue.borrow_mut()).push_back(WorkerResponse {
-            id: "EVENT".to_string(),
-            status: RequestStatus::Processing,
-            error: None,
-            content: Some(ResponseContent::WorkerEvent(event)),
-        });
+        (*queue.borrow_mut()).push_back(Response::processing_with_content(
+            "EVENT",
+            ResponseContent::WorkerEvent(event),
+        ))
     });
 }
 
@@ -460,7 +458,7 @@ impl Server {
             debug!("got message: {:?}", msg);
 
             if let Ok(msg) = msg {
-                if let Err(e) = server.channel.write_message(&WorkerResponse::ok(msg.id)) {
+                if let Err(e) = server.channel.write_message(&Response::ok(msg.id)) {
                     error!("Could not send an ok to the main process: {}", e);
                 }
             }
@@ -672,7 +670,7 @@ impl Server {
                     WorkerOrder::HardStop => {
                         let req_id = request.id.clone();
                         self.notify(request);
-                        if let Err(e) = self.channel.write_message(&WorkerResponse::ok(req_id)) {
+                        if let Err(e) = self.channel.write_message(&Response::ok(req_id)) {
                             error!("Could not send ok response to the main process: {}", e);
                         }
                         if let Err(e) = self.channel.run() {
@@ -814,16 +812,12 @@ impl Server {
                 error!("Error while running the server channel: {}", e);
             }
             self.block_channel();
-            let proxy_response = WorkerResponse {
-                id: self
-                    .shutting_down
-                    .take()
-                    .expect("should have shut down correctly"), // panicking here makes sense actually
-                status: RequestStatus::Ok,
-                error: None,
-                content: None,
-            };
-            if let Err(e) = self.channel.write_message(&proxy_response) {
+            let response_id = self
+                .shutting_down
+                .take()
+                .expect("should have shut down correctly"); // panicking here makes sense actually
+            let response = Response::ok(response_id);
+            if let Err(e) = self.channel.write_message(&response) {
                 error!("Could not write response to the main process: {}", e);
             }
             return true;
@@ -882,14 +876,14 @@ impl Server {
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).configure(configuration);
 
-                push_queue(WorkerResponse::ok(message.id.clone()));
+                push_queue(Response::ok(message.id.clone()));
             });
             return;
         }
 
         match &message.order {
             WorkerOrder::QueryClustersHashes => {
-                push_queue(WorkerResponse::ok_with_content(
+                push_queue(Response::ok_with_content(
                     message.id,
                     ResponseContent::WorkerClustersHashes(self.config_state.hash_state()),
                 ));
@@ -899,10 +893,7 @@ impl Server {
                 let response_content = ResponseContent::WorkerClusters(vec![self
                     .config_state
                     .cluster_state(&cluster_id)]);
-                push_queue(WorkerResponse::ok_with_content(
-                    message.id,
-                    response_content,
-                ));
+                push_queue(Response::ok_with_content(message.id, response_content));
                 return;
             }
             WorkerOrder::QueryClusterByDomain { hostname, path } => {
@@ -913,14 +904,14 @@ impl Server {
                     .map(|cluster_id| self.config_state.cluster_state(cluster_id))
                     .collect();
 
-                push_queue(WorkerResponse::ok_with_content(
+                push_queue(Response::ok_with_content(
                     message.id,
                     ResponseContent::WorkerClusters(clusters),
                 ));
                 return;
             }
             WorkerOrder::QueryCertificateByFingerprint(f) => {
-                push_queue(WorkerResponse::ok_with_content(
+                push_queue(Response::ok_with_content(
                     message.id,
                     ResponseContent::WorkerCertificates(WorkerCertificates::Fingerprint(
                         get_certificate(&self.config_state, &f),
@@ -931,11 +922,10 @@ impl Server {
             WorkerOrder::QueryMetrics(query_metrics_options) => {
                 METRICS.with(|metrics| {
                     match (*metrics.borrow_mut()).query(&query_metrics_options) {
-                        Ok(metrics_response) => push_queue(WorkerResponse::ok_with_content(
-                            message.id,
-                            metrics_response,
-                        )),
-                        Err(e) => push_queue(WorkerResponse::error(message.id, e)),
+                        Ok(metrics_response) => {
+                            push_queue(Response::ok_with_content(message.id, metrics_response))
+                        }
+                        Err(e) => push_queue(Response::error(message.id, e)),
                     }
                 });
                 return;
@@ -1021,7 +1011,7 @@ impl Server {
             );
     }
 
-    fn add_backend(&mut self, req_id: &str, backend: &CommandLibBackend) -> WorkerResponse {
+    fn add_backend(&mut self, req_id: &str, backend: &CommandLibBackend) -> Response {
         let new_backend = Backend::new(
             &backend.backend_id,
             backend.address,
@@ -1033,26 +1023,26 @@ impl Server {
             .borrow_mut()
             .add_backend(&backend.cluster_id, new_backend);
 
-        WorkerResponse::ok(req_id)
+        Response::ok(req_id)
     }
 
-    fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> WorkerResponse {
+    fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> Response {
         self.backends
             .borrow_mut()
             .remove_backend(&backend.cluster_id, &backend.address);
 
-        WorkerResponse::ok(req_id)
+        Response::ok(req_id)
     }
 
     fn notify_add_http_listener(
         &mut self,
         req_id: &str,
         listener: &HttpListenerConfig,
-    ) -> WorkerResponse {
+    ) -> Response {
         debug!("{} add http listener {:?}", req_id, listener);
 
         if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-            return WorkerResponse::error(
+            return Response::error(
                 req_id.to_string(),
                 "session list is full, cannot add a listener",
             );
@@ -1068,11 +1058,11 @@ impl Server {
                     protocol: Protocol::HTTPListen,
                 })));
                 self.base_sessions_count += 1;
-                WorkerResponse::ok(req_id)
+                Response::ok(req_id)
             }
             None => {
                 error!("Couldn't add HTTP listener");
-                WorkerResponse::error(req_id, "cannot add HTTP listener")
+                Response::error(req_id, "cannot add HTTP listener")
             }
         }
     }
@@ -1081,11 +1071,11 @@ impl Server {
         &mut self,
         req_id: &str,
         listener: &HttpsListenerConfig,
-    ) -> WorkerResponse {
+    ) -> Response {
         debug!("{} add https listener {:?}", req_id, listener);
 
         if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-            return WorkerResponse::error(req_id, "session list is full, cannot add a listener");
+            return Response::error(req_id, "session list is full, cannot add a listener");
         }
 
         let mut session_manager = self.sessions.borrow_mut();
@@ -1102,24 +1092,20 @@ impl Server {
                     protocol: Protocol::HTTPSListen,
                 })));
                 self.base_sessions_count += 1;
-                WorkerResponse::ok(req_id)
+                Response::ok(req_id)
             }
             None => {
                 error!("Couldn't add HTTPS listener");
-                WorkerResponse::error(req_id, "cannot add HTTPS listener")
+                Response::error(req_id, "cannot add HTTPS listener")
             }
         }
     }
 
-    fn notify_add_tcp_listener(
-        &mut self,
-        req_id: &str,
-        listener: CommandTcpListener,
-    ) -> WorkerResponse {
+    fn notify_add_tcp_listener(&mut self, req_id: &str, listener: CommandTcpListener) -> Response {
         debug!("{} add tcp listener {:?}", req_id, listener);
 
         if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
-            return WorkerResponse::error(req_id, "session list is full, cannot add a listener");
+            return Response::error(req_id, "session list is full, cannot add a listener");
         }
 
         let mut session_manager = self.sessions.borrow_mut();
@@ -1136,20 +1122,16 @@ impl Server {
                     protocol: Protocol::TCPListen,
                 })));
                 self.base_sessions_count += 1;
-                WorkerResponse::ok(req_id)
+                Response::ok(req_id)
             }
             None => {
                 error!("Couldn't add TCP listener");
-                WorkerResponse::error(req_id, "cannot add TCP listener")
+                Response::error(req_id, "cannot add TCP listener")
             }
         }
     }
 
-    fn notify_activate_listener(
-        &mut self,
-        req_id: &str,
-        activate: &ActivateListener,
-    ) -> WorkerResponse {
+    fn notify_activate_listener(&mut self, req_id: &str, activate: &ActivateListener) -> Response {
         debug!(
             "{} activate {:?} listener {:?}",
             req_id, activate.proxy, activate
@@ -1170,11 +1152,11 @@ impl Server {
                 match activated_token {
                     Ok(token) => {
                         self.accept(ListenToken(token.0), Protocol::HTTPListen);
-                        WorkerResponse::ok(req_id)
+                        Response::ok(req_id)
                     }
                     Err(activate_error) => {
                         error!("Could not activate HTTP listener: {:#}", activate_error);
-                        WorkerResponse::error(req_id, format!("{activate_error:#}"))
+                        Response::error(req_id, format!("{activate_error:#}"))
                     }
                 }
             }
@@ -1192,11 +1174,11 @@ impl Server {
                 match activated_token {
                     Ok(token) => {
                         self.accept(ListenToken(token.0), Protocol::HTTPSListen);
-                        WorkerResponse::ok(req_id)
+                        Response::ok(req_id)
                     }
                     Err(activate_error) => {
                         error!("Could not activate HTTPS listener: {:#}", activate_error);
-                        WorkerResponse::error(req_id, format!("{activate_error:#}"))
+                        Response::error(req_id, format!("{activate_error:#}"))
                     }
                 }
             }
@@ -1214,11 +1196,11 @@ impl Server {
                 match listener_token {
                     Some(token) => {
                         self.accept(ListenToken(token.0), Protocol::TCPListen);
-                        WorkerResponse::ok(req_id)
+                        Response::ok(req_id)
                     }
                     None => {
                         error!("Could not activate TCP listener");
-                        WorkerResponse::error(req_id, "cannot activate TCP listener")
+                        Response::error(req_id, "cannot activate TCP listener")
                     }
                 }
             }
@@ -1229,7 +1211,7 @@ impl Server {
         &mut self,
         req_id: &str,
         deactivate: &DeactivateListener,
-    ) -> WorkerResponse {
+    ) -> Response {
         debug!(
             "{} deactivate {:?} listener {:?}",
             req_id, deactivate.proxy, deactivate
@@ -1248,7 +1230,7 @@ impl Server {
                             "Couldn't deactivate HTTP listener at address {:?}",
                             deactivate.address
                         );
-                        return WorkerResponse::error(
+                        return Response::error(
                             req_id,
                             format!(
                                 "cannot deactivate HTTP listener at address {:?}",
@@ -1287,7 +1269,7 @@ impl Server {
 
                     info!("sent HTTP listener: {:?}", res);
                 }
-                WorkerResponse::ok(req_id)
+                Response::ok(req_id)
             }
             ListenerType::HTTPS => {
                 let (token, mut listener) = match self
@@ -1302,7 +1284,7 @@ impl Server {
                             "Couldn't deactivate HTTPS listener at address {:?}",
                             deactivate.address
                         );
-                        return WorkerResponse::error(
+                        return Response::error(
                             req_id,
                             format!(
                                 "cannot deactivate HTTPS listener at address {:?}",
@@ -1336,7 +1318,7 @@ impl Server {
 
                     info!("sent HTTPS listener: {:?}", res);
                 }
-                WorkerResponse::ok(req_id)
+                Response::ok(req_id)
             }
             ListenerType::TCP => {
                 let (token, mut listener) =
@@ -1347,7 +1329,7 @@ impl Server {
                                 "Couldn't deactivate TCP listener at address {:?}",
                                 deactivate.address
                             );
-                            return WorkerResponse::error(
+                            return Response::error(
                                 req_id,
                                 format!(
                                     "cannot deactivate TCP listener at address {:?}",
@@ -1382,7 +1364,7 @@ impl Server {
 
                     info!("sent TCP listener: {:?}", res);
                 }
-                WorkerResponse::ok(req_id)
+                Response::ok(req_id)
             }
         }
     }

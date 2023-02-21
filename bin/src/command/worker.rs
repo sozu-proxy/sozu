@@ -6,17 +6,17 @@ use nix::{sys::signal::kill, unistd::Pid};
 
 use sozu_command_lib::{
     channel::Channel,
-    command::{RunState, WorkerInfo},
+    command::{Response, RunState, WorkerInfo},
     config::Config,
     scm_socket::ScmSocket,
-    worker::{WorkerOrder, WorkerRequest, WorkerResponse},
+    worker::{WorkerOrder, WorkerRequest},
 };
 
 /// An instance of Sōzu, as seen from the main process
 pub struct Worker {
     pub id: u32,
     /// for the worker to receive requests and respond to the main process
-    pub worker_channel: Option<Channel<WorkerRequest, WorkerResponse>>,
+    pub worker_channel: Option<Channel<WorkerRequest, Response>>,
     /// file descriptor of the command channel
     pub worker_channel_fd: i32,
     pub pid: pid_t,
@@ -32,7 +32,7 @@ impl Worker {
     pub fn new(
         id: u32,
         pid: pid_t,
-        command_channel: Channel<WorkerRequest, WorkerResponse>,
+        command_channel: Channel<WorkerRequest, Response>,
         scm_socket: ScmSocket,
         _: &Config,
     ) -> Worker {

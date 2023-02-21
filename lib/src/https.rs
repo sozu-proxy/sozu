@@ -26,10 +26,6 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::{
-    config::DEFAULT_CIPHER_SUITES,
-    worker::{RemoveListener, ReplaceCertificate},
-};
 use time::{Duration, Instant};
 
 use crate::{
@@ -50,7 +46,8 @@ use crate::{
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     sozu_command::{
-        command::{RequestStatus, ResponseContent},
+        command::{Response, ResponseContent},
+        config::DEFAULT_CIPHER_SUITES,
         logging,
         ready::Ready,
         scm_socket::ScmSocket,
@@ -58,8 +55,8 @@ use crate::{
         worker::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
             RemoveCertificate, Route, TlsVersion, WorkerCertificates, WorkerOrder, WorkerRequest,
-            WorkerResponse,
         },
+        worker::{RemoveListener, ReplaceCertificate},
     },
     timer::TimeoutContainer,
     tls::{
@@ -1258,7 +1255,7 @@ impl ProxyConfiguration for HttpsProxy {
         Ok(())
     }
 
-    fn notify(&mut self, request: WorkerRequest) -> WorkerResponse {
+    fn notify(&mut self, request: WorkerRequest) -> Response {
         let request_id = request.id.clone();
 
         let content_result = match request.order {
@@ -1317,7 +1314,7 @@ impl ProxyConfiguration for HttpsProxy {
                 {
                     Ok(_) => {
                         info!("{} soft stop successful", request_id);
-                        return WorkerResponse::processing(request.id);
+                        return Response::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -1330,7 +1327,7 @@ impl ProxyConfiguration for HttpsProxy {
                 {
                     Ok(_) => {
                         info!("{} hard stop successful", request_id);
-                        return WorkerResponse::processing(request.id);
+                        return Response::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -1369,16 +1366,14 @@ impl ProxyConfiguration for HttpsProxy {
         match content_result {
             Ok(content) => {
                 info!("{} successful", request_id);
-                WorkerResponse {
-                    id: request_id,
-                    status: RequestStatus::Ok,
-                    error: None,
-                    content,
+                match content {
+                    Some(content) => Response::ok_with_content(request_id, content),
+                    None => Response::ok(request_id),
                 }
             }
             Err(error_message) => {
                 error!("{} unsuccessful: {:#}", request_id, error_message);
-                WorkerResponse::error(request_id, format!("{error_message:#}"))
+                Response::error(request_id, format!("{error_message:#}"))
             }
         }
     }
