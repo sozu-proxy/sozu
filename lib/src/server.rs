@@ -26,14 +26,14 @@ use crate::{
     pool::Pool,
     sozu_command::{
         channel::Channel,
-        command::{MessageId, Response, ResponseContent},
+        command::{MessageId, Response, ResponseContent, Event},
         config::Config,
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
         state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
         worker::{
             Backend as CommandLibBackend, Cluster, ListenerType, RemoveBackend,
-            TcpListenerConfig as CommandTcpListener, WorkerCertificates, WorkerEvent, WorkerOrder,
+            TcpListenerConfig as CommandTcpListener, WorkerCertificates, WorkerOrder,
             WorkerRequest,
         },
     },
@@ -61,11 +61,11 @@ pub fn push_queue(message: Response) {
     });
 }
 
-pub fn push_event(event: WorkerEvent) {
+pub fn push_event(event: Event) {
     QUEUE.with(|queue| {
         (*queue.borrow_mut()).push_back(Response::processing_with_content(
             "EVENT",
-            ResponseContent::WorkerEvent(event),
+            ResponseContent::Event(event),
         ))
     });
 }

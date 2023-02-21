@@ -34,13 +34,13 @@ use crate::{
     },
     socket::server_bind,
     sozu_command::{
-        command::Response,
+        command::{Event, Response},
         config::ProxyProtocolConfig,
         logging,
         ready::Ready,
         scm_socket::ScmSocket,
         state::ClusterId,
-        worker::{TcpFrontend, TcpListenerConfig, WorkerEvent, WorkerOrder, WorkerRequest},
+        worker::{TcpFrontend, TcpListenerConfig, WorkerOrder, WorkerRequest},
     },
     timer::TimeoutContainer,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, Protocol,
@@ -503,7 +503,7 @@ impl TcpSession {
                         "backend server {} at {} is up",
                         backend.backend_id, backend.address
                     );
-                    push_event(WorkerEvent::BackendUp(
+                    push_event(Event::BackendUp(
                         backend.backend_id.clone(),
                         backend.address,
                     ));
@@ -555,7 +555,7 @@ impl TcpSession {
                     self.metrics.backend_id.as_deref()
                 );
 
-                push_event(WorkerEvent::BackendDown(
+                push_event(Event::BackendDown(
                     backend.backend_id.clone(),
                     backend.address,
                 ));

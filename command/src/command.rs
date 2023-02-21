@@ -8,8 +8,8 @@ use crate::{
     state::ConfigState,
     worker::{
         AvailableWorkerMetrics, ClusterInformation, FilteredData, HttpFrontend, HttpListenerConfig,
-        HttpsListenerConfig, TcpFrontend, TcpListenerConfig, WorkerCertificates, WorkerEvent,
-        WorkerMetrics, WorkerOrder,
+        HttpsListenerConfig, TcpFrontend, TcpListenerConfig, WorkerCertificates, WorkerMetrics,
+        WorkerOrder,
     },
 };
 
@@ -116,7 +116,6 @@ pub enum ResponseContent {
     ListenersList(ListenersList),
 
     // sent by a worker to the main process
-    WorkerEvent(WorkerEvent),
     WorkerClusters(Vec<ClusterInformation>),
     /// cluster id -> hash of cluster information
     WorkerClustersHashes(BTreeMap<String, u64>),
@@ -307,19 +306,6 @@ pub enum Event {
     /// indicates a backend that was removed from configuration has no lingering connections
     /// so it can be safely stopped
     RemovedBackendHasNoConnections(String, SocketAddr),
-}
-
-impl From<WorkerEvent> for Event {
-    fn from(e: WorkerEvent) -> Self {
-        match e {
-            WorkerEvent::BackendDown(id, addr) => Event::BackendDown(id, addr),
-            WorkerEvent::BackendUp(id, addr) => Event::BackendUp(id, addr),
-            WorkerEvent::NoAvailableBackends(cluster_id) => Event::NoAvailableBackends(cluster_id),
-            WorkerEvent::RemovedBackendHasNoConnections(id, addr) => {
-                Event::RemovedBackendHasNoConnections(id, addr)
-            }
-        }
-    }
 }
 
 #[derive(Serialize)]

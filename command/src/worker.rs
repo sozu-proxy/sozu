@@ -15,7 +15,7 @@ use serde::{
 };
 
 use crate::{
-    command::{ResponseStatus, ResponseContent, MessageId},
+    command::{MessageId, ResponseContent, ResponseStatus},
     config::{
         ProxyProtocolConfig, DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST,
         DEFAULT_RUSTLS_CIPHER_LIST, DEFAULT_SIGNATURE_ALGORITHMS,
@@ -96,15 +96,6 @@ pub struct BackendMetricsData {
     pub bytes_in: usize,
     pub bytes_out: usize,
     pub percentiles: Percentiles,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum WorkerEvent {
-    BackendDown(String, SocketAddr),
-    BackendUp(String, SocketAddr),
-    NoAvailableBackends(String),
-    RemovedBackendHasNoConnections(String, SocketAddr),
 }
 
 /// A message receivable by a worker

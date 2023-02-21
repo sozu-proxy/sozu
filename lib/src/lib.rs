@@ -217,9 +217,9 @@ use sozu_command::state::ClusterId;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
-    command::Response,
+    command::{Event, Response},
     ready::Ready,
-    worker::{Cluster, LoadBalancingParams, Route, WorkerEvent, WorkerRequest},
+    worker::{Cluster, LoadBalancingParams, Route, WorkerRequest},
 };
 
 use self::{backends::BackendMap, retry::RetryPolicy};
@@ -715,7 +715,7 @@ impl Backend {
 // can be safely stopped
 impl std::ops::Drop for Backend {
     fn drop(&mut self) {
-        server::push_event(WorkerEvent::RemovedBackendHasNoConnections(
+        server::push_event(Event::RemovedBackendHasNoConnections(
             self.backend_id.clone(),
             self.address,
         ));

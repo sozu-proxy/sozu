@@ -6,6 +6,7 @@ use mio::net::TcpStream;
 use crate::{
     server::push_event,
     sozu_command::{
+        command::Event,
         state::ClusterId,
         worker::{self, LoadBalancingAlgorithms},
     },
@@ -105,9 +106,7 @@ impl BackendMap {
                 if self.available {
                     self.available = false;
 
-                    push_event(worker::WorkerEvent::NoAvailableBackends(
-                        cluster_id.to_string(),
-                    ));
+                    push_event(Event::NoAvailableBackends(cluster_id.to_string()));
                 }
                 bail!("No more backend available for cluster {}", cluster_id);
             }

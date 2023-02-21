@@ -14,7 +14,6 @@ use std::{
 use anyhow::{bail, Context};
 use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
-use sozu_command::worker::{Route, WorkerEvent};
 use time::{Duration, Instant};
 
 use crate::{
@@ -24,7 +23,7 @@ use crate::{
     retry::RetryPolicy,
     server::{push_event, CONN_RETRIES},
     socket::{SocketHandler, SocketResult, TransportProtocol},
-    sozu_command::ready::Ready,
+    sozu_command::{command::Event, ready::Ready, worker::Route},
     timer::TimeoutContainer,
     util::UnwrapLog,
     Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler, L7Proxy,
@@ -2240,7 +2239,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         backend.backend_id, backend.address
                     );
 
-                    push_event(WorkerEvent::BackendUp(
+                    push_event(Event::BackendUp(
                         backend.backend_id.clone(),
                         backend.address,
                     ));
@@ -2281,7 +2280,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     metrics.backend_id.as_deref()
                 );
 
-                push_event(WorkerEvent::BackendDown(
+                push_event(Event::BackendDown(
                     backend.backend_id.clone(),
                     backend.address,
                 ));
