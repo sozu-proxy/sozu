@@ -35,7 +35,7 @@ pub struct AvailableWorkerMetrics {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerMetrics {
     /// Metrics of the worker process, key -> value
-    pub proxy: Option<BTreeMap<String, FilteredData>>,
+    pub proxy: Option<BTreeMap<String, FilteredMetrics>>,
     /// cluster_id -> cluster_metrics
     pub clusters: Option<BTreeMap<String, ClusterMetrics>>,
 }
@@ -44,14 +44,14 @@ pub struct WorkerMetrics {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterMetrics {
     /// metric name -> metric value
-    pub cluster: Option<BTreeMap<String, FilteredData>>,
+    pub cluster: Option<BTreeMap<String, FilteredMetrics>>,
     /// backend_id -> (metric name-> metric value)
-    pub backends: Option<BTreeMap<String, BTreeMap<String, FilteredData>>>,
+    pub backends: Option<BTreeMap<String, BTreeMap<String, FilteredMetrics>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum FilteredData {
+pub enum FilteredMetrics {
     Gauge(usize),
     Count(i64),
     Time(usize),

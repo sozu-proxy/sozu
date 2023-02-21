@@ -7,9 +7,9 @@ use std::{
 use crate::{
     state::ConfigState,
     worker::{
-        AvailableWorkerMetrics, ClusterInformation, FilteredData, HttpFrontend, HttpListenerConfig,
-        HttpsListenerConfig, TcpFrontend, TcpListenerConfig, WorkerCertificates, WorkerMetrics,
-        WorkerOrder,
+        AvailableWorkerMetrics, ClusterInformation, FilteredMetrics, HttpFrontend,
+        HttpListenerConfig, HttpsListenerConfig, TcpFrontend, TcpListenerConfig,
+        WorkerCertificates, WorkerMetrics, WorkerOrder,
     },
 };
 
@@ -127,7 +127,7 @@ pub enum ResponseContent {
 /// Aggregated metrics of main process & workers, for the CLI
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedMetrics {
-    pub main: BTreeMap<String, FilteredData>,
+    pub main: BTreeMap<String, FilteredMetrics>,
     pub workers: BTreeMap<String, WorkerMetrics>,
 }
 
@@ -320,9 +320,9 @@ mod tests {
     use crate::config::ProxyProtocolConfig;
     use crate::worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
-        ClusterMetrics, FilteredData, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, Percentiles, RemoveBackend, RemoveCertificate, Route, RulePosition, TlsVersion,
-        WorkerMetrics, WorkerOrder,
+        ClusterMetrics, FilteredMetrics, HttpFrontend, LoadBalancingAlgorithms,
+        LoadBalancingParams, PathRule, Percentiles, RemoveBackend, RemoveCertificate, Route,
+        RulePosition, TlsVersion, WorkerMetrics, WorkerOrder,
     };
     use hex::FromHex;
     use serde_json;
@@ -715,9 +715,9 @@ mod tests {
             message: Some(String::from("")),
             content: Some(ResponseContent::Metrics(AggregatedMetrics {
                 main: [
-                    (String::from("sozu.gauge"), FilteredData::Gauge(1)),
-                    (String::from("sozu.count"), FilteredData::Count(-2)),
-                    (String::from("sozu.time"), FilteredData::Time(1234)),
+                    (String::from("sozu.gauge"), FilteredMetrics::Gauge(1)),
+                    (String::from("sozu.count"), FilteredMetrics::Count(-2)),
+                    (String::from("sozu.time"), FilteredMetrics::Time(1234)),
                 ]
                 .iter()
                 .cloned()
@@ -727,9 +727,9 @@ mod tests {
                     WorkerMetrics {
                         proxy: Some(
                             [
-                                (String::from("sozu.gauge"), FilteredData::Gauge(1)),
-                                (String::from("sozu.count"), FilteredData::Count(-2)),
-                                (String::from("sozu.time"), FilteredData::Time(1234)),
+                                (String::from("sozu.gauge"), FilteredMetrics::Gauge(1)),
+                                (String::from("sozu.count"), FilteredMetrics::Count(-2)),
+                                (String::from("sozu.time"), FilteredMetrics::Time(1234)),
                             ]
                             .iter()
                             .cloned()
@@ -742,7 +742,7 @@ mod tests {
                                     cluster: Some(
                                         [(
                                             String::from("request_time"),
-                                            FilteredData::Percentiles(Percentiles {
+                                            FilteredMetrics::Percentiles(Percentiles {
                                                 samples: 42,
                                                 p_50: 1,
                                                 p_90: 2,
@@ -763,15 +763,15 @@ mod tests {
                                             [
                                                 (
                                                     String::from("bytes_in"),
-                                                    FilteredData::Count(256)
+                                                    FilteredMetrics::Count(256)
                                                 ),
                                                 (
                                                     String::from("bytes_out"),
-                                                    FilteredData::Count(128)
+                                                    FilteredMetrics::Count(128)
                                                 ),
                                                 (
                                                     String::from("percentiles"),
-                                                    FilteredData::Percentiles(Percentiles {
+                                                    FilteredMetrics::Percentiles(Percentiles {
                                                         samples: 42,
                                                         p_50: 1,
                                                         p_90: 2,

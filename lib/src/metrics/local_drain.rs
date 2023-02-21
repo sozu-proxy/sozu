@@ -6,7 +6,7 @@ use hdrhistogram::Histogram;
 use sozu_command::{command::ResponseContent, worker::AvailableWorkerMetrics};
 
 use crate::sozu_command::worker::{
-    ClusterMetrics, FilteredData, MetricsConfiguration, Percentiles, QueryMetricsOptions,
+    ClusterMetrics, FilteredMetrics, MetricsConfiguration, Percentiles, QueryMetricsOptions,
     WorkerMetrics,
 };
 
@@ -62,12 +62,12 @@ impl AggregatedMetric {
         }
     }
 
-    pub fn to_filtered(&self) -> FilteredData {
+    pub fn to_filtered(&self) -> FilteredMetrics {
         match *self {
-            AggregatedMetric::Gauge(i) => FilteredData::Gauge(i),
-            AggregatedMetric::Count(i) => FilteredData::Count(i),
+            AggregatedMetric::Gauge(i) => FilteredMetrics::Gauge(i),
+            AggregatedMetric::Count(i) => FilteredMetrics::Count(i),
             AggregatedMetric::Time(ref hist) => {
-                FilteredData::Percentiles(histogram_to_percentiles(hist))
+                FilteredMetrics::Percentiles(histogram_to_percentiles(hist))
             }
         }
     }
@@ -233,7 +233,7 @@ impl LocalDrain {
     pub fn dump_proxy_metrics(
         &mut self,
         metric_names: &Vec<String>,
-    ) -> BTreeMap<String, FilteredData> {
+    ) -> BTreeMap<String, FilteredMetrics> {
         self.proxy_metrics
             .iter()
             .filter(|(key, _)| {
@@ -275,7 +275,7 @@ impl LocalDrain {
             .get(cluster_id)
             .context(format!("No metrics found for cluster with id {cluster_id}"))?;
 
-        let cluster: BTreeMap<String, FilteredData> = raw_metrics
+        let cluster: BTreeMap<String, FilteredMetrics> = raw_metrics
             .iter()
             .filter(|entry| {
                 if metric_names.is_empty() {
@@ -285,7 +285,7 @@ impl LocalDrain {
                 }
             })
             .map(|entry| (entry.0.to_owned(), entry.1.to_filtered()))
-            .collect::<BTreeMap<String, FilteredData>>();
+            .collect::<BTreeMap<String, FilteredMetrics>>();
 
         let mut backends = BTreeMap::new();
         for backend_id in self.get_backend_ids(cluster_id) {
@@ -306,7 +306,7 @@ impl LocalDrain {
         &self,
         backend_id: &str,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<BTreeMap<String, FilteredData>> {
+    ) -> anyhow::Result<BTreeMap<String, FilteredMetrics>> {
         let backend_metrics = self
             .cluster_metrics
             .get(backend_id)
@@ -322,7 +322,7 @@ impl LocalDrain {
                 }
             })
             .map(|entry| (entry.0.to_owned(), entry.1.to_filtered()))
-            .collect::<BTreeMap<String, FilteredData>>();
+            .collect::<BTreeMap<String, FilteredMetrics>>();
 
         Ok(filtered_backend_metrics)
     }
@@ -363,7 +363,8 @@ impl LocalDrain {
                 .context(format!("No metrics found for backend with id {backend_id}"))?
                 .to_owned();
 
-            let mut backend_map: BTreeMap<String, BTreeMap<String, FilteredData>> = BTreeMap::new();
+            let mut backend_map: BTreeMap<String, BTreeMap<String, FilteredMetrics>> =
+                BTreeMap::new();
             backend_map.insert(
                 backend_id.to_owned(),
                 self.metrics_of_one_backend(backend_id, metric_names)?,

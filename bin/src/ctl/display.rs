@@ -11,7 +11,7 @@ use sozu_command_lib::{
         AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, ResponseContent,
         WorkerInfo,
     },
-    worker::{ClusterMetrics, FilteredData, Route, WorkerCertificates, WorkerMetrics},
+    worker::{ClusterMetrics, FilteredMetrics, Route, WorkerCertificates, WorkerMetrics},
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -224,7 +224,7 @@ fn print_worker_metrics(worker_metrics: &WorkerMetrics) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_proxy_metrics(proxy_metrics: &Option<BTreeMap<String, FilteredData>>) {
+fn print_proxy_metrics(proxy_metrics: &Option<BTreeMap<String, FilteredMetrics>>) {
     if let Some(metrics) = proxy_metrics {
         let filtered = filter_metrics(metrics);
         print_gauges_and_counts(&filtered);
@@ -255,7 +255,9 @@ fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetric
     }
 }
 
-fn filter_metrics(metrics: &BTreeMap<String, FilteredData>) -> BTreeMap<String, FilteredData> {
+fn filter_metrics(
+    metrics: &BTreeMap<String, FilteredMetrics>,
+) -> BTreeMap<String, FilteredMetrics> {
     let mut filtered_metrics = BTreeMap::new();
 
     for (metric_key, filtered_value) in metrics.iter() {
@@ -267,11 +269,11 @@ fn filter_metrics(metrics: &BTreeMap<String, FilteredData>) -> BTreeMap<String, 
     filtered_metrics
 }
 
-fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredData>) {
+fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     let mut titles: Vec<String> = filtered_metrics
         .iter()
         .filter_map(|(title, filtered_data)| match filtered_data {
-            FilteredData::Count(_) | FilteredData::Gauge(_) => Some(title.to_owned()),
+            FilteredMetrics::Count(_) | FilteredMetrics::Gauge(_) => Some(title.to_owned()),
             _ => None,
         })
         .collect();
@@ -291,11 +293,11 @@ fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredData>) {
     for title in titles {
         let mut row = vec![cell!(title)];
         match filtered_metrics.get(&title) {
-            Some(FilteredData::Count(c)) => {
+            Some(FilteredMetrics::Count(c)) => {
                 row.push(cell!(""));
                 row.push(cell!(c))
             }
-            Some(FilteredData::Gauge(c)) => {
+            Some(FilteredMetrics::Gauge(c)) => {
                 row.push(cell!(c));
                 row.push(cell!(""))
             }
@@ -307,11 +309,11 @@ fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredData>) {
     table.printstd();
 }
 
-fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredData>) {
+fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     let mut percentile_titles: Vec<String> = filtered_metrics
         .iter()
         .filter_map(|(title, filtered_data)| match filtered_data {
-            FilteredData::Percentiles(_) => Some(title.to_owned()),
+            FilteredMetrics::Percentiles(_) => Some(title.to_owned()),
             _ => None,
         })
         .collect();
@@ -340,7 +342,7 @@ fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredData>) {
 
     for title in percentile_titles {
         match filtered_metrics.get(&title) {
-            Some(FilteredData::Percentiles(p)) => {
+            Some(FilteredMetrics::Percentiles(p)) => {
                 percentile_table.add_row(Row::new(vec![
                     cell!(title),
                     cell!(p.samples),
