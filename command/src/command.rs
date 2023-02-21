@@ -102,7 +102,7 @@ pub enum ResponseContent {
     Metrics(AggregatedMetrics),
     /// list available metrics of main process and workers
     AvailableMetrics(AvailableMetrics), // maybe useless
-    /// worker responses to a same query: worker_id -> query_answer
+    /// worker responses to a same query: worker_id -> response_content
     Query(BTreeMap<String, ResponseContent>),
     /// the state of Sōzu: frontends, backends, listeners, etc.
     State(Box<ConfigState>),

@@ -15,7 +15,7 @@ use serde::{
 };
 
 use crate::{
-    command::{MessageId, ResponseContent, ResponseStatus},
+    command::MessageId,
     config::{
         ProxyProtocolConfig, DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST,
         DEFAULT_RUSTLS_CIPHER_LIST, DEFAULT_SIGNATURE_ALGORITHMS,

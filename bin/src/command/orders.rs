@@ -16,7 +16,7 @@ use sozu_command_lib::{
     buffer::fixed::Buffer,
     command::{
         AggregatedMetrics, AvailableMetrics, FrontendFilters, ListedFrontends, ListenersList,
-        Order, Request, ResponseStatus, Response, ResponseContent, RunState, WorkerInfo,
+        Order, Request, Response, ResponseContent, ResponseStatus, RunState, WorkerInfo,
         PROTOCOL_VERSION,
     },
     config::Config,
@@ -1141,12 +1141,11 @@ impl CommandServer {
 
             let mut worker_responses_map: BTreeMap<String, ResponseContent> = responses
                 .into_iter()
-                .filter_map(
-                    |(worker_id, worker_response)| match worker_response.content {
-                        Some(content) => Some((worker_id.to_string(), content)),
-                        None => None,
-                    },
-                )
+                .filter_map(|(worker_id, worker_response)| {
+                    worker_response
+                        .content
+                        .map(|content| (worker_id.to_string(), content))
+                })
                 .collect();
 
             let success = match &order {
@@ -1156,8 +1155,8 @@ impl CommandServer {
                     hostname: _,
                     path: _,
                 } => {
-                    let query_answer = response_of_main.unwrap(); // we should refactor to avoid this unwrap()
-                    worker_responses_map.insert(String::from("main"), query_answer);
+                    let response_content = response_of_main.unwrap(); // we should refactor to avoid this unwrap()
+                    worker_responses_map.insert(String::from("main"), response_content);
                     Success::Query(ResponseContent::Query(worker_responses_map))
                 }
                 WorkerOrder::QueryCertificateByDomain(_)
@@ -1442,14 +1441,13 @@ impl CommandServer {
             Advancement::Ok(success) => {
                 let success_message = success.to_string();
 
-                let command_response_data = match success {
-                    // should list Success::Metrics(crd) as well
-                    Success::DumpState(crd)
-                    | Success::ListFrontends(crd)
-                    | Success::ListWorkers(crd)
-                    | Success::Query(crd)
-                    | Success::ListListeners(crd)
-                    | Success::Status(crd) => Some(crd),
+                let response_content = match success {
+                    Success::DumpState(content)
+                    | Success::ListFrontends(content)
+                    | Success::ListWorkers(content)
+                    | Success::Query(content)
+                    | Success::ListListeners(content)
+                    | Success::Status(content) => Some(content),
                     _ => None,
                 };
 
@@ -1457,7 +1455,7 @@ impl CommandServer {
                     request_id.clone(),
                     ResponseStatus::Ok,
                     success_message,
-                    command_response_data,
+                    response_content,
                 )
             }
             Advancement::Processing(processing_message) => Response::new(
@@ -1466,12 +1464,7 @@ impl CommandServer {
                 processing_message,
                 None,
             ),
-            Advancement::Error(error_message) => Response::new(
-                request_id.clone(),
-                ResponseStatus::Error,
-                error_message,
-                None,
-            ),
+            Advancement::Error(error_message) => Response::error(request_id.clone(), error_message),
         };
 
         trace!(

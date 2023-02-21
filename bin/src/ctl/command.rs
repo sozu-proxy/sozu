@@ -4,7 +4,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
 
 use sozu_command_lib::{
-    command::{Order, Request, ResponseStatus, Response, ResponseContent, RunState, WorkerInfo},
+    command::{Order, Request, Response, ResponseContent, ResponseStatus, RunState, WorkerInfo},
     worker::{QueryMetricsOptions, WorkerOrder},
 };
 
@@ -97,14 +97,14 @@ impl CommandManager {
                 );
             }
             match response.status {
-                ResponseStatus::Processing => println!("Proxy is processing: {}", response),
+                ResponseStatus::Processing => println!("Proxy is processing: {response}"),
                 ResponseStatus::Error => bail!("Order failed: {}", response),
                 ResponseStatus::Ok => {
                     if json {
                         // why do we need to print a success message in json?
                         print_json_response(&response)?;
                     } else {
-                        println!("Success: {}", response);
+                        println!("Success: {response}");
                     }
                     match response.content {
                         Some(response_content) => match response_content {
@@ -161,7 +161,7 @@ impl CommandManager {
             }
             match response.status {
                 ResponseStatus::Processing => {
-                    println!("Processing: {}", response);
+                    println!("Processing: {response}");
                 }
                 ResponseStatus::Error => {
                     bail!("Error: failed to get the list of worker: {}", response);
@@ -199,7 +199,7 @@ impl CommandManager {
                                     bail!("Error: failed to upgrade the main: {}", response);
                                 }
                                 ResponseStatus::Ok => {
-                                    println!("Main process upgrade succeeded: {}", response);
+                                    println!("Main process upgrade succeeded: {response}");
                                     break;
                                 }
                             }
@@ -299,7 +299,7 @@ impl CommandManager {
                 }
                 match response.status {
                     ResponseStatus::Processing => {
-                        println!("Proxy is processing: {}", response);
+                        println!("Proxy is processing: {response}");
                     }
                     ResponseStatus::Error => {
                         if json {
@@ -310,13 +310,13 @@ impl CommandManager {
                     }
                     ResponseStatus::Ok => {
                         match response.content {
-                            Some(ResponseContent::Metrics(aggregated_metrics_data)) => {
-                                print_metrics(aggregated_metrics_data, json)?
+                            Some(ResponseContent::Metrics(aggregated_metrics)) => {
+                                print_metrics(aggregated_metrics, json)?
                             }
                             Some(ResponseContent::AvailableMetrics(available_metrics)) => {
                                 print_available_metrics(&available_metrics)?;
                             }
-                            _ => println!("Wrong kind of response here {:?}", response),
+                            _ => println!("Wrong kind of response here {response:?}"),
                         }
                         break;
                     }
@@ -387,7 +387,7 @@ impl CommandManager {
             }
             match response.status {
                 ResponseStatus::Processing => {
-                    println!("Proxy is processing: {}", response);
+                    println!("Proxy is processing: {response}");
                 }
                 ResponseStatus::Error => {
                     if json {
@@ -439,7 +439,7 @@ impl CommandManager {
             }
             match response.status {
                 ResponseStatus::Processing => {
-                    println!("Proxy is processing: {}", response);
+                    println!("Proxy is processing: {response}");
                 }
                 ResponseStatus::Error => {
                     if json {

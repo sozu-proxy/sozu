@@ -3,7 +3,7 @@ use std::{
     process::exit,
 };
 
-use anyhow::{self, bail, Context};
+use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::{
@@ -684,7 +684,7 @@ fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
 pub fn print_available_metrics(available_metrics: &AvailableMetrics) -> anyhow::Result<()> {
     println!("Available metrics on the main process:");
     for metric in available_metrics.main.iter() {
-        println!("\t{}", metric);
+        println!("\t{metric}");
     }
     for worker in available_metrics.workers.iter() {
         println!("Available metrics on worker {}:", worker.0);
