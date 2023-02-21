@@ -320,9 +320,9 @@ mod tests {
     use crate::config::ProxyProtocolConfig;
     use crate::worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
-        ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Percentiles, RemoveBackend, RemoveCertificate, Route,
-        RulePosition, TlsVersion, WorkerMetrics, WorkerOrder,
+        ClusterMetrics, FilteredData, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams,
+        PathRule, Percentiles, RemoveBackend, RemoveCertificate, Route, RulePosition, TlsVersion,
+        WorkerMetrics, WorkerOrder,
     };
     use hex::FromHex;
     use serde_json;
@@ -738,7 +738,7 @@ mod tests {
                         clusters: Some(
                             [(
                                 String::from("cluster_1"),
-                                ClusterMetricsData {
+                                ClusterMetrics {
                                     cluster: Some(
                                         [(
                                             String::from("request_time"),

@@ -37,12 +37,12 @@ pub struct WorkerMetrics {
     /// Metrics of the worker process, key -> value
     pub proxy: Option<BTreeMap<String, FilteredData>>,
     /// cluster_id -> cluster_metrics
-    pub clusters: Option<BTreeMap<String, ClusterMetricsData>>,
+    pub clusters: Option<BTreeMap<String, ClusterMetrics>>,
 }
 
 /// the metrics of a given cluster, with several backends
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusterMetricsData {
+pub struct ClusterMetrics {
     /// metric name -> metric value
     pub cluster: Option<BTreeMap<String, FilteredData>>,
     /// backend_id -> (metric name-> metric value)

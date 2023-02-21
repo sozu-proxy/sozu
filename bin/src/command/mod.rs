@@ -24,7 +24,7 @@ use nix::{
 use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
-    command::{Event, Order, Request, ResponseStatus, Response, ResponseContent, RunState},
+    command::{Event, Order, Request, Response, ResponseContent, ResponseStatus, RunState},
     config::Config,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,

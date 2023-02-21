@@ -1120,8 +1120,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (mut command, channel) = Channel::generate(1000, 10000)
-            .expect("should create a channel");
+        let (mut command, channel) =
+            Channel::generate(1000, 10000).expect("should create a channel");
         let _jg = thread::spawn(move || {
             setup_test_logger!();
             start_http_worker(config, channel, 10, 16384).expect("could not start the http server");

@@ -5,7 +5,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain},
     channel::Channel,
-    command::{Order, Request, ResponseStatus, Response},
+    command::{Order, Request, Response, ResponseStatus},
     config::Config,
     worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,

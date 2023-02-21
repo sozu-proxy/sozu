@@ -26,7 +26,7 @@ use crate::{
     pool::Pool,
     sozu_command::{
         channel::Channel,
-        command::{MessageId, Response, ResponseContent, Event},
+        command::{Event, MessageId, Response, ResponseContent},
         config::Config,
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},

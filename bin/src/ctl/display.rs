@@ -11,7 +11,7 @@ use sozu_command_lib::{
         AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, ResponseContent,
         WorkerInfo,
     },
-    worker::{ClusterMetricsData, FilteredData, Route, WorkerCertificates, WorkerMetrics},
+    worker::{ClusterMetrics, FilteredData, Route, WorkerCertificates, WorkerMetrics},
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -232,7 +232,7 @@ fn print_proxy_metrics(proxy_metrics: &Option<BTreeMap<String, FilteredData>>) {
     }
 }
 
-fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetricsData>>) {
+fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetrics>>) {
     if let Some(cluster_metrics) = cluster_metrics {
         for (cluster_id, cluster_metrics_data) in cluster_metrics.iter() {
             println!("\nCluster {cluster_id}\n--------");
