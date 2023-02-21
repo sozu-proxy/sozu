@@ -5,7 +5,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain},
     channel::Channel,
-    command::{Order, Request, RequestStatus, Response},
+    command::{Order, Request, ResponseStatus, Response},
     config::Config,
     worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
@@ -411,15 +411,15 @@ fn order_command(
             panic!("received message with invalid id: {response}");
         }
         match response.status {
-            RequestStatus::Processing => {
+            ResponseStatus::Processing => {
                 // do nothing here
                 // for other messages, we would loop over read_message
                 // until an error or ok message was sent
             }
-            RequestStatus::Error => {
+            ResponseStatus::Error => {
                 bail!("could not execute order: {}", response);
             }
-            RequestStatus::Ok => {
+            ResponseStatus::Ok => {
                 match order {
                     WorkerOrder::AddBackend(_) => {
                         info!("backend added : {}", response)

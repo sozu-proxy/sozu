@@ -24,7 +24,7 @@ use nix::{
 use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
-    command::{Event, Order, Request, RequestStatus, Response, ResponseContent, RunState},
+    command::{Event, Order, Request, ResponseStatus, Response, ResponseContent, RunState},
     config::Config,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -574,14 +574,14 @@ impl CommandServer {
             let mut i = 0;
             while let Some((response, _)) = rx.next().await {
                 match response.status {
-                    RequestStatus::Ok => {
+                    ResponseStatus::Ok => {
                         ok += 1;
                     }
-                    RequestStatus::Processing => {
+                    ResponseStatus::Processing => {
                         //info!("metrics processing");
                         continue;
                     }
-                    RequestStatus::Error => {
+                    ResponseStatus::Error => {
                         error!("error handling configuration message: {}", response);
                         error += 1;
                     }
@@ -746,7 +746,7 @@ impl CommandServer {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = Response::new(
                         response.id.to_string(),
-                        RequestStatus::Processing,
+                        ResponseStatus::Processing,
                         format!("{worker_id}"),
                         Some(ResponseContent::Event(event.clone())),
                     );
@@ -775,7 +775,7 @@ impl CommandServer {
                 // if a worker returned Ok or Error, we're not expecting any more
                 // messages with this id from it
                 match response.status {
-                    RequestStatus::Ok | RequestStatus::Error => {
+                    ResponseStatus::Ok | ResponseStatus::Error => {
                         expected_responses -= 1;
                     }
                     _ => {}

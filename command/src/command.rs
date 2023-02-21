@@ -85,7 +85,7 @@ impl Request {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RequestStatus {
+pub enum ResponseStatus {
     Ok,
     Processing,
     Error,
@@ -161,7 +161,7 @@ pub struct Response {
     pub id: MessageId,
     pub version: u8,
     /// OK | processing | failure
-    pub status: RequestStatus,
+    pub status: ResponseStatus,
     /// a success or error message
     pub message: Option<String>,
     pub content: Option<ResponseContent>,
@@ -172,7 +172,7 @@ pub type MessageId = String;
 impl Response {
     pub fn new(
         id: String,
-        status: RequestStatus,
+        status: ResponseStatus,
         message: String,
         content: Option<ResponseContent>,
     ) -> Response {
@@ -192,7 +192,7 @@ impl Response {
         Self {
             id: id.to_string(),
             version: PROTOCOL_VERSION,
-            status: RequestStatus::Ok,
+            status: ResponseStatus::Ok,
             message: None,
             content: None,
         }
@@ -205,7 +205,7 @@ impl Response {
         Self {
             id: id.to_string(),
             version: PROTOCOL_VERSION,
-            status: RequestStatus::Ok,
+            status: ResponseStatus::Ok,
             message: None,
             content: Some(content),
         }
@@ -219,7 +219,7 @@ impl Response {
         Self {
             id: id.to_string(),
             version: PROTOCOL_VERSION,
-            status: RequestStatus::Error,
+            status: ResponseStatus::Error,
             message: Some(error.to_string()),
             content: None,
         }
@@ -232,7 +232,7 @@ impl Response {
         Self {
             id: id.to_string(),
             version: PROTOCOL_VERSION,
-            status: RequestStatus::Processing,
+            status: ResponseStatus::Processing,
             message: None,
             content: None,
         }
@@ -245,13 +245,13 @@ impl Response {
         Self {
             id: id.to_string(),
             version: PROTOCOL_VERSION,
-            status: RequestStatus::Processing,
+            status: ResponseStatus::Processing,
             message: None,
             content: Some(content),
         }
     }
 
-    pub fn status<T>(id: T, status: RequestStatus) -> Self
+    pub fn status<T>(id: T, status: ResponseStatus) -> Self
     where
         T: ToString,
     {
@@ -702,7 +702,7 @@ mod tests {
         Response {
             id: "ID_TEST".to_string(),
             version: 0,
-            status: RequestStatus::Ok,
+            status: ResponseStatus::Ok,
             message: Some(String::from("")),
             content: Some(ResponseContent::Workers(vec!(
                 WorkerInfo {
@@ -725,7 +725,7 @@ mod tests {
         Response {
             id: "ID_TEST".to_string(),
             version: 0,
-            status: RequestStatus::Ok,
+            status: ResponseStatus::Ok,
             message: Some(String::from("")),
             content: Some(ResponseContent::Metrics(AggregatedMetrics {
                 main: [
