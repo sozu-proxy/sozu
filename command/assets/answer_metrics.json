@@ -53,31 +53,34 @@
                   }
                 }
               },
-              "backends": {
-                "cluster_1-0": {
-                  "bytes_in": {
-                    "type": "COUNT",
-                    "data": 256
-                  },
-                  "bytes_out": {
-                    "type": "COUNT",
-                    "data": 128
-                  },
-                  "percentiles": {
-                    "type": "PERCENTILES",
-                    "data": {
-                      "samples": 42,
-                      "p_50": 1,
-                      "p_90": 2,
-                      "p_99": 10,
-                      "p_99_9": 12,
-                      "p_99_99": 20,
-                      "p_99_999": 22,
-                      "p_100": 30
+              "backends": [
+                {
+                  "backend_id": "cluster_1-0",
+                  "metrics": {
+                    "bytes_in": {
+                      "type": "COUNT",
+                      "data": 256
+                    },
+                    "bytes_out": {
+                      "type": "COUNT",
+                      "data": 128
+                    },
+                    "percentiles": {
+                      "type": "PERCENTILES",
+                      "data": {
+                        "samples": 42,
+                        "p_50": 1,
+                        "p_90": 2,
+                        "p_99": 10,
+                        "p_99_9": 12,
+                        "p_99_99": 20,
+                        "p_99_999": 22,
+                        "p_100": 30
+                      }
                     }
                   }
                 }
-              }
+              ]
             }
           }
         }

@@ -120,6 +120,8 @@ pub enum ResponseContent {
     /// cluster id -> hash of cluster information
     WorkerClustersHashes(BTreeMap<String, u64>),
     WorkerCertificates(WorkerCertificates),
+    // WorkerCertificatesByDomain(Vec<DomainCertificate>),
+    // WorkerCertificatesByFingerprint(CertificatesByFingerprint),
     WorkerMetrics(WorkerMetrics),
     AvailableWorkerMetrics(AvailableWorkerMetrics),
 }
@@ -127,7 +129,9 @@ pub enum ResponseContent {
 /// Aggregated metrics of main process & workers, for the CLI
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedMetrics {
+    /// metric-name -> metric
     pub main: BTreeMap<String, FilteredMetrics>,
+    /// worker_id -> worker_metrics
     pub workers: BTreeMap<String, WorkerMetrics>,
 }
 
@@ -319,8 +323,8 @@ mod tests {
     use crate::certificate::split_certificate_chain;
     use crate::config::ProxyProtocolConfig;
     use crate::worker::{
-        AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
-        ClusterMetrics, FilteredMetrics, HttpFrontend, LoadBalancingAlgorithms,
+        AddCertificate, Backend, BackendMetrics, CertificateAndKey, CertificateFingerprint,
+        Cluster, ClusterMetrics, FilteredMetrics, HttpFrontend, LoadBalancingAlgorithms,
         LoadBalancingParams, PathRule, Percentiles, RemoveBackend, RemoveCertificate, Route,
         RulePosition, TlsVersion, WorkerMetrics, WorkerOrder,
     };
@@ -758,9 +762,9 @@ mod tests {
                                         .collect()
                                     ),
                                     backends: Some(
-                                        [(
-                                            String::from("cluster_1-0"),
-                                            [
+                                        [BackendMetrics {
+                                            backend_id: String::from("cluster_1-0"),
+                                            metrics: [
                                                 (
                                                     String::from("bytes_in"),
                                                     FilteredMetrics::Count(256)
@@ -786,11 +790,11 @@ mod tests {
                                             .iter()
                                             .cloned()
                                             .collect()
-                                        )]
+                                        }]
                                         .iter()
                                         .cloned()
-                                        .collect()
-                                    ),
+                                        .collect(),
+                                    )
                                 }
                             )]
                             .iter()

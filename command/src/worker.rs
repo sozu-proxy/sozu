@@ -46,7 +46,15 @@ pub struct ClusterMetrics {
     /// metric name -> metric value
     pub cluster: Option<BTreeMap<String, FilteredMetrics>>,
     /// backend_id -> (metric name-> metric value)
-    pub backends: Option<BTreeMap<String, BTreeMap<String, FilteredMetrics>>>,
+    pub backends: Option<Vec<BackendMetrics>>,
+}
+
+/// the metrics of a given backend
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendMetrics {
+    pub backend_id: String,
+    /// metric name -> metric value
+    pub metrics: BTreeMap<String, FilteredMetrics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -739,8 +747,14 @@ pub struct ClusterInformation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkerCertificates {
     /// returns a list of certificates: domain -> fingerprint
+    /// // TODO: replace with a vec
     All(HashMap<SocketAddr, BTreeMap<String, CertificateFingerprint>>),
     /// returns a fingerprint
+    // Vec<struct {
+    //    address: SocketAddr,
+    //    domain: String,
+    //    fingerprint: Fingerprint,
+    // }>
     Domain(HashMap<SocketAddr, Option<(String, CertificateFingerprint)>>),
     /// returns the certificate
     Fingerprint(Option<(String, Vec<String>)>),
