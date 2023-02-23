@@ -748,16 +748,17 @@ pub struct ClusterInformation {
 pub enum WorkerCertificates {
     /// returns a list of certificates: domain -> fingerprint
     /// // TODO: replace with a vec
-    All(HashMap<SocketAddr, BTreeMap<String, CertificateFingerprint>>),
+    All(HashMap<SocketAddr, Vec<DomainAndFingerprint>>),
 
     /// returns the certificate
     Fingerprint(Option<(String, Vec<String>)>),
 }
 
-// #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-// pub struct AllCertificates {
-
-// }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainAndFingerprint {
+    pub domain: String,
+    pub fingerprint: CertificateFingerprint,
+}
 
 /// TODO: rename me
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

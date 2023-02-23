@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    process::exit,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{self, Context};
 use prettytable::{Row, Table};
@@ -629,11 +626,15 @@ pub fn print_certificates(
 
         match response_content {
             ResponseContent::WorkerCertificates(WorkerCertificates::All(h)) => {
-                for (addr, h2) in h.iter() {
+                for (addr, domain_and_fingerprint) in h.iter() {
                     println!("\t{addr}:");
 
-                    for (domain, fingerprint) in h2.iter() {
-                        println!("\t\t{}:\t{}", domain, hex::encode(fingerprint.0.clone()));
+                    for d_and_f in domain_and_fingerprint.iter() {
+                        println!(
+                            "\t\t{}:\t{}",
+                            d_and_f.domain,
+                            hex::encode(d_and_f.fingerprint.0.clone())
+                        );
                     }
 
                     println!();

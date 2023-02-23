@@ -26,7 +26,7 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::worker::ReturnedCertificate;
+use sozu_command::worker::{DomainAndFingerprint, ReturnedCertificate};
 use time::{Duration, Instant};
 
 use crate::{
@@ -949,7 +949,10 @@ impl HttpsProxy {
                     .domains
                     .to_hashmap()
                     .drain()
-                    .map(|(domain, fingerprint)| (String::from_utf8(domain).unwrap(), fingerprint))
+                    .map(|(domain, fingerprint)| DomainAndFingerprint {
+                        domain: String::from_utf8(domain).unwrap(),
+                        fingerprint,
+                    })
                     .collect();
 
                 (owned.address, res)
