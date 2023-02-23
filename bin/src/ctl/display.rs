@@ -626,10 +626,13 @@ pub fn print_certificates(
 
         match response_content {
             ResponseContent::WorkerCertificates(WorkerCertificates::All(h)) => {
-                for (addr, domain_and_fingerprint) in h.iter() {
-                    println!("\t{addr}:");
+                for all_domains_and_fingerprints_for_an_address in h.iter() {
+                    println!("\t{}:", all_domains_and_fingerprints_for_an_address.address);
 
-                    for d_and_f in domain_and_fingerprint.iter() {
+                    for d_and_f in all_domains_and_fingerprints_for_an_address
+                        .domains_and_fingerprints
+                        .iter()
+                    {
                         println!(
                             "\t\t{}:\t{}",
                             d_and_f.domain,

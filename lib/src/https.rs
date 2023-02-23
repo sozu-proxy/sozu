@@ -26,7 +26,9 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::worker::{DomainAndFingerprint, ReturnedCertificate};
+use sozu_command::worker::{
+    AllDomainsAndFingerprintsForAnAddress, DomainAndFingerprint, ReturnedCertificate,
+};
 use time::{Duration, Instant};
 
 use crate::{
@@ -939,13 +941,13 @@ impl HttpsProxy {
     }
 
     pub fn query_all_certificates(&mut self) -> anyhow::Result<Option<ResponseContent>> {
-        let certificates = self
+        let certificates: Vec<AllDomainsAndFingerprintsForAnAddress> = self
             .listeners
             .values()
             .map(|listener| {
                 let owned = listener.borrow();
                 let resolver = unwrap_msg!(owned.resolver.0.lock());
-                let res = resolver
+                let domains_and_fingerprints = resolver
                     .domains
                     .to_hashmap()
                     .drain()
@@ -955,9 +957,12 @@ impl HttpsProxy {
                     })
                     .collect();
 
-                (owned.address, res)
+                AllDomainsAndFingerprintsForAnAddress {
+                    address: owned.address,
+                    domains_and_fingerprints,
+                }
             })
-            .collect::<HashMap<_, _>>();
+            .collect();
 
         info!(
             "got Certificates::All query, answering with {:?}",

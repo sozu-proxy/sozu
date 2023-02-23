@@ -8,8 +8,8 @@ use crate::{
     state::ConfigState,
     worker::{
         AvailableWorkerMetrics, ClusterInformation, FilteredMetrics, HttpFrontend,
-        HttpListenerConfig, HttpsListenerConfig, TcpFrontend, TcpListenerConfig,
-        WorkerCertificates, WorkerMetrics, WorkerOrder, ReturnedCertificate,
+        HttpListenerConfig, HttpsListenerConfig, ReturnedCertificate, TcpFrontend,
+        TcpListenerConfig, WorkerCertificates, WorkerMetrics, WorkerOrder,
     },
 };
 
