@@ -1,11 +1,6 @@
 use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, HashMap},
-    convert::From,
-    default::Default,
-    error, fmt,
-    net::SocketAddr,
-    str::FromStr,
+    cmp::Ordering, collections::BTreeMap, convert::From, default::Default, error, fmt,
+    net::SocketAddr, str::FromStr,
 };
 
 use hex::{self, FromHex};
@@ -746,9 +741,6 @@ pub struct ClusterInformation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkerCertificates {
-    /// returns a list of certificates: domain -> fingerprint
-    All(Vec<AllDomainsAndFingerprintsForAnAddress>),
-
     /// returns the certificate
     Fingerprint(Option<(String, Vec<String>)>),
 }

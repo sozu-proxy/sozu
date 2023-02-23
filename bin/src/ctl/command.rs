@@ -108,9 +108,10 @@ impl CommandManager {
                     }
                     match response.content {
                         Some(response_content) => match response_content {
-                            ResponseContent::AvailableMetrics(_)
+                            ResponseContent::AllWorkerCertificates(_)
+                            | ResponseContent::AvailableMetrics(_)
                             | ResponseContent::AvailableWorkerMetrics(_)
-                            | ResponseContent::CertificatesByDomain(_) // TODO: make sure this isn't returned by the main process but summed up in ResponseContent::Query
+                            | ResponseContent::CertificatesByDomain(_)
                             | ResponseContent::Event(_)
                             | ResponseContent::Metrics(_)
                             | ResponseContent::Query(_)

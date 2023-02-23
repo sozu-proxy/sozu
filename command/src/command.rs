@@ -7,9 +7,10 @@ use std::{
 use crate::{
     state::ConfigState,
     worker::{
-        AvailableWorkerMetrics, ClusterInformation, FilteredMetrics, HttpFrontend,
-        HttpListenerConfig, HttpsListenerConfig, ReturnedCertificate, TcpFrontend,
-        TcpListenerConfig, WorkerCertificates, WorkerMetrics, WorkerOrder,
+        AllDomainsAndFingerprintsForAnAddress, AvailableWorkerMetrics, ClusterInformation,
+        FilteredMetrics, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
+        ReturnedCertificate, TcpFrontend, TcpListenerConfig, WorkerCertificates, WorkerMetrics,
+        WorkerOrder,
     },
 };
 
@@ -120,6 +121,7 @@ pub enum ResponseContent {
     /// cluster id -> hash of cluster information
     WorkerClustersHashes(BTreeMap<String, u64>),
     WorkerCertificates(WorkerCertificates),
+    AllWorkerCertificates(Vec<AllDomainsAndFingerprintsForAnAddress>),
     // WorkerCertificatesByDomain(Vec<DomainCertificate>),
     // WorkerCertificatesByFingerprint(CertificatesByFingerprint),
     WorkerMetrics(WorkerMetrics),

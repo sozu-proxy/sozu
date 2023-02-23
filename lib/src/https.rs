@@ -57,7 +57,7 @@ use crate::{
         state::ClusterId,
         worker::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
-            RemoveCertificate, Route, TlsVersion, WorkerCertificates, WorkerOrder, WorkerRequest,
+            RemoveCertificate, Route, TlsVersion, WorkerOrder, WorkerRequest,
         },
         worker::{RemoveListener, ReplaceCertificate},
     },
@@ -969,9 +969,7 @@ impl HttpsProxy {
             certificates
         );
 
-        Ok(Some(ResponseContent::WorkerCertificates(
-            WorkerCertificates::All(certificates),
-        )))
+        Ok(Some(ResponseContent::AllWorkerCertificates(certificates)))
     }
 
     pub fn query_certificate_for_domain(

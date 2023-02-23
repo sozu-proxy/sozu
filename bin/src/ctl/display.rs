@@ -625,7 +625,7 @@ pub fn print_certificates(
         println!("process '{worker_id}':");
 
         match response_content {
-            ResponseContent::WorkerCertificates(WorkerCertificates::All(h)) => {
+            ResponseContent::AllWorkerCertificates(h) => {
                 for all_domains_and_fingerprints_for_an_address in h.iter() {
                     println!("\t{}:", all_domains_and_fingerprints_for_an_address.address);
 
