@@ -1080,6 +1080,7 @@ pub fn get_cluster_ids_by_domain(
     cluster_ids
 }
 
+/// returns the certificate and the list of names
 pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(String, Vec<String>)> {
     state
         .certificates

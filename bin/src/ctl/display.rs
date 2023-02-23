@@ -648,14 +648,14 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            WorkerCertificates::Domain(h) => {
-                for (addr, opt) in h.iter() {
-                    println!("\t{addr}:");
-                    if let Some((key, fingerprint)) = opt {
-                        println!("\t\t{}:\t{}", key, hex::encode(fingerprint.0.clone()));
-                    } else {
-                        println!("\t\tnot found");
-                    }
+            WorkerCertificates::CertificatesByDomain(certificates) => {
+                for certificate in certificates.iter() {
+                    println!("\t{}:", certificate.address);
+                    println!(
+                        "\t\t{}:\t{}",
+                        certificate.domain,
+                        hex::encode(certificate.fingerprint.0.clone())
+                    );
 
                     println!();
                 }

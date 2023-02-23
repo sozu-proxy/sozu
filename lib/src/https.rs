@@ -26,6 +26,7 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
+use sozu_command::worker::ReturnedCertificate;
 use time::{Duration, Instant};
 
 use crate::{
@@ -969,25 +970,21 @@ impl HttpsProxy {
         &mut self,
         domain: String,
     ) -> anyhow::Result<Option<ResponseContent>> {
-        let certificates = self
-            .listeners
-            .values()
-            .map(|listener| {
-                let owned = listener.borrow();
-                let resolver = unwrap_msg!(owned.resolver.0.lock());
-                (
-                    owned.address,
-                    resolver
-                        .domain_lookup(domain.as_bytes(), true)
-                        .map(|(domain, fingerprint)| {
-                            (
-                                String::from_utf8(domain.to_vec()).unwrap(),
-                                fingerprint.clone(),
-                            )
-                        }),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let mut certificates = Vec::new();
+        for listener in self.listeners.values() {
+            let owned = listener.borrow();
+            let resolver = unwrap_msg!(owned.resolver.0.lock());
+
+            if let Some((domain, fingerprint)) = resolver.domain_lookup(domain.as_bytes(), true) {
+                certificates.push(ReturnedCertificate {
+                    address: owned.address,
+                    domain: String::from_utf8(domain.to_vec()).unwrap(),
+                    fingerprint: fingerprint.clone(),
+                });
+            }
+            // TODO: should we returned addresses with no domain and fingerprint if none are found?
+            // see TODOs in ReturnedCertificate
+        }
 
         info!(
             "got Certificates::Domain({}) query, answering with {:?}",
@@ -995,7 +992,7 @@ impl HttpsProxy {
         );
 
         Ok(Some(ResponseContent::WorkerCertificates(
-            WorkerCertificates::Domain(certificates),
+            WorkerCertificates::CertificatesByDomain(certificates),
         )))
     }
 
