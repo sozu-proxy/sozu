@@ -26,9 +26,7 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::worker::{
-    AllDomainsAndFingerprintsForAnAddress, DomainAndFingerprint, ReturnedCertificate,
-};
+use sozu_command::worker::{CertificateSummary, CertificatesByAddress};
 use time::{Duration, Instant};
 
 use crate::{
@@ -941,7 +939,7 @@ impl HttpsProxy {
     }
 
     pub fn query_all_certificates(&mut self) -> anyhow::Result<Option<ResponseContent>> {
-        let certificates: Vec<AllDomainsAndFingerprintsForAnAddress> = self
+        let certificates: Vec<CertificatesByAddress> = self
             .listeners
             .values()
             .map(|listener| {
@@ -951,15 +949,15 @@ impl HttpsProxy {
                     .domains
                     .to_hashmap()
                     .drain()
-                    .map(|(domain, fingerprint)| DomainAndFingerprint {
+                    .map(|(domain, fingerprint)| CertificateSummary {
                         domain: String::from_utf8(domain).unwrap(),
                         fingerprint,
                     })
                     .collect();
 
-                AllDomainsAndFingerprintsForAnAddress {
+                CertificatesByAddress {
                     address: owned.address,
-                    domains_and_fingerprints,
+                    summaries: domains_and_fingerprints,
                 }
             })
             .collect();
@@ -981,15 +979,21 @@ impl HttpsProxy {
             let owned = listener.borrow();
             let resolver = unwrap_msg!(owned.resolver.0.lock());
 
-            if let Some((domain, fingerprint)) = resolver.domain_lookup(domain.as_bytes(), true) {
-                certificates.push(ReturnedCertificate {
+            match resolver.domain_lookup(domain.as_bytes(), true) {
+                Some((domain, fingerprint)) => {
+                    certificates.push(CertificatesByAddress {
+                        address: owned.address,
+                        summaries: vec![CertificateSummary {
+                            domain: String::from_utf8(domain.to_vec()).unwrap(),
+                            fingerprint: fingerprint.clone(),
+                        }],
+                    });
+                }
+                None => certificates.push(CertificatesByAddress {
                     address: owned.address,
-                    domain: String::from_utf8(domain.to_vec()).unwrap(),
-                    fingerprint: fingerprint.clone(),
-                });
+                    summaries: vec![],
+                }),
             }
-            // TODO: should we returned addresses with no domain and fingerprint if none are found?
-            // see TODOs in ReturnedCertificate
         }
 
         info!(

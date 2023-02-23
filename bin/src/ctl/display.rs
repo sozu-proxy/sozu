@@ -632,10 +632,7 @@ pub fn print_certificates(
                 for all_domains_and_fingerprints_for_an_address in h.iter() {
                     println!("\t{}:", all_domains_and_fingerprints_for_an_address.address);
 
-                    for d_and_f in all_domains_and_fingerprints_for_an_address
-                        .domains_and_fingerprints
-                        .iter()
-                    {
+                    for d_and_f in all_domains_and_fingerprints_for_an_address.summaries.iter() {
                         println!(
                             "\t\t{}:\t{}",
                             d_and_f.domain,
@@ -648,12 +645,14 @@ pub fn print_certificates(
             }
             ResponseContent::CertificatesByDomain(certificates) => {
                 for certificate in certificates.iter() {
-                    println!("\t{}:", certificate.address);
-                    println!(
-                        "\t\t{}:\t{}",
-                        certificate.domain,
-                        hex::encode(certificate.fingerprint.0.clone())
-                    );
+                    for summary in certificate.summaries.iter() {
+                        println!("\t{}:", certificate.address);
+                        println!(
+                            "\t\t{}:\t{}",
+                            summary.domain,
+                            hex::encode(summary.fingerprint.0.clone())
+                        );
+                    }
 
                     println!();
                 }

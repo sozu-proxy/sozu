@@ -370,6 +370,7 @@ pub struct CertificateAndKey {
 pub struct AddCertificate {
     pub address: SocketAddr,
     pub certificate: CertificateAndKey,
+    /// hostnames linked to the certificate
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
     pub names: Vec<String>,
     /// The `expired_at` override certificate expiration, the value of the field
@@ -389,6 +390,7 @@ pub struct ReplaceCertificate {
     pub address: SocketAddr,
     pub new_certificate: CertificateAndKey,
     pub old_fingerprint: CertificateFingerprint,
+    /// hostnames linked to the certificate
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
     pub new_names: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -743,29 +745,22 @@ pub struct ClusterInformation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertificateWithNames {
     pub certificate: String,
-    pub names: Vec<String>,
+    /// hostnames linked to the certificate
+    pub names: Vec<String>, // TODO: check if this corresponds to Common Name
 }
 
-/// TODO: rename me
+/// all certificate summaries for a given address
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AllDomainsAndFingerprintsForAnAddress {
+pub struct CertificatesByAddress {
     pub address: SocketAddr,
-    pub domains_and_fingerprints: Vec<DomainAndFingerprint>,
+    pub summaries: Vec<CertificateSummary>,
 }
 
-/// TODO: rename me
+/// domain name and fingerprint of a certificate
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DomainAndFingerprint {
+pub struct CertificateSummary {
     pub domain: String,
     pub fingerprint: CertificateFingerprint,
-}
-
-/// TODO: rename me
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReturnedCertificate {
-    pub address: SocketAddr,
-    pub domain: String,                      // TODO: should this be an option
-    pub fingerprint: CertificateFingerprint, // TODO: should this be an option?
 }
 
 impl WorkerOrder {

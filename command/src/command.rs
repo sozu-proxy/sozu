@@ -7,9 +7,9 @@ use std::{
 use crate::{
     state::{ClusterId, ConfigState},
     worker::{
-        AllDomainsAndFingerprintsForAnAddress, AvailableWorkerMetrics, CertificateWithNames,
+        CertificatesByAddress, AvailableWorkerMetrics, CertificateWithNames,
         ClusterInformation, FilteredMetrics, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        ReturnedCertificate, TcpFrontend, TcpListenerConfig, WorkerMetrics, WorkerOrder,
+        TcpFrontend, TcpListenerConfig, WorkerMetrics, WorkerOrder,
     },
 };
 
@@ -120,11 +120,11 @@ pub enum ResponseContent {
     // sent by a worker to the main process
     WorkerClusters(Vec<ClusterInformation>),
     WorkerCertificateWithNames(Option<CertificateWithNames>),
-    AllWorkerCertificates(Vec<AllDomainsAndFingerprintsForAnAddress>),
+    AllWorkerCertificates(Vec<CertificatesByAddress>),
     WorkerMetrics(WorkerMetrics),
     AvailableWorkerMetrics(AvailableWorkerMetrics),
     /// returns certificates that match a QueryCertificateByDomain
-    CertificatesByDomain(Vec<ReturnedCertificate>),
+    CertificatesByDomain(Vec<CertificatesByAddress>),
 }
 
 /// cluster id -> hash of cluster information
