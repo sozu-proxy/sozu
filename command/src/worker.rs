@@ -742,7 +742,13 @@ pub struct ClusterInformation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkerCertificates {
     /// returns the certificate
-    Fingerprint(Option<(String, Vec<String>)>),
+    Fingerprint(Option<CertificateWithNames>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertificateWithNames {
+    pub certificate: String,
+    pub names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

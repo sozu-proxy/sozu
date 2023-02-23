@@ -17,9 +17,10 @@ use crate::{
     certificate::calculate_fingerprint,
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
-        Cluster, ClusterInformation, DeactivateListener, HttpFrontend, HttpListenerConfig,
-        HttpsListenerConfig, ListenerType, PathRule, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, Route, TcpFrontend, TcpListenerConfig, WorkerOrder,
+        CertificateWithNames, Cluster, ClusterInformation, DeactivateListener, HttpFrontend,
+        HttpListenerConfig, HttpsListenerConfig, ListenerType, PathRule, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, Route, TcpFrontend,
+        TcpListenerConfig, WorkerOrder,
     },
 };
 
@@ -1081,12 +1082,15 @@ pub fn get_cluster_ids_by_domain(
 }
 
 /// returns the certificate and the list of names
-pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(String, Vec<String>)> {
+pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<CertificateWithNames> {
     state
         .certificates
         .values()
         .filter_map(|h| h.get(&CertificateFingerprint(fingerprint.to_vec())))
-        .map(|(c, names)| (c.certificate.clone(), names.clone()))
+        .map(|(c, names)| CertificateWithNames {
+            certificate: c.certificate.clone(),
+            names: names.clone(),
+        })
         .next()
 }
 

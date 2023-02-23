@@ -656,8 +656,11 @@ pub fn print_certificates(
                 }
             }
             ResponseContent::WorkerCertificates(WorkerCertificates::Fingerprint(opt)) => {
-                if let Some((s, v)) = opt {
-                    println!("\tfrontends: {v:?}\ncertificate:\n{s}");
+                if let Some(cert) = opt {
+                    println!(
+                        "\tfrontends: {:?}\ncertificate:\n{}",
+                        cert.names, cert.certificate
+                    );
                 } else {
                     println!("\tnot found");
                 }
