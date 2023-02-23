@@ -15,6 +15,7 @@ use serde::de::{self, Visitor};
 
 use crate::{
     certificate::calculate_fingerprint,
+    command::ClusterHash,
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         CertificateWithNames, Cluster, ClusterInformation, DeactivateListener, HttpFrontend,
@@ -951,7 +952,7 @@ impl ConfigState {
     }
 
     // FIXME: what about deny rules?
-    pub fn hash_state(&self) -> BTreeMap<ClusterId, u64> {
+    pub fn hash_state(&self) -> Vec<ClusterHash> {
         let mut h: HashMap<_, _> = self
             .clusters
             .keys()
@@ -985,7 +986,10 @@ impl ConfigState {
         }
 
         h.drain()
-            .map(|(cluster_id, hasher)| (cluster_id, hasher.finish()))
+            .map(|(cluster_id, hasher)| ClusterHash {
+                cluster_id,
+                hash: hasher.finish(),
+            })
             .collect()
     }
 

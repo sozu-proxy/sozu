@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    state::ConfigState,
+    state::{ClusterId, ConfigState},
     worker::{
         AllDomainsAndFingerprintsForAnAddress, AvailableWorkerMetrics, CertificateWithNames,
         ClusterInformation, FilteredMetrics, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
@@ -115,18 +115,23 @@ pub enum ResponseContent {
     /// all listeners
     ListenersList(ListenersList),
 
+    ClusterHashes(Vec<ClusterHash>),
+
     // sent by a worker to the main process
     WorkerClusters(Vec<ClusterInformation>),
-    /// cluster id -> hash of cluster information
-    WorkerClustersHashes(BTreeMap<String, u64>),
     WorkerCertificateWithNames(Option<CertificateWithNames>),
     AllWorkerCertificates(Vec<AllDomainsAndFingerprintsForAnAddress>),
-    // WorkerCertificatesByDomain(Vec<DomainCertificate>),
-    // WorkerCertificatesByFingerprint(CertificatesByFingerprint),
     WorkerMetrics(WorkerMetrics),
     AvailableWorkerMetrics(AvailableWorkerMetrics),
     /// returns certificates that match a QueryCertificateByDomain
     CertificatesByDomain(Vec<ReturnedCertificate>),
+}
+
+/// cluster id -> hash of cluster information
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterHash {
+    pub cluster_id: ClusterId,
+    pub hash: u64,
 }
 
 /// Aggregated metrics of main process & workers, for the CLI

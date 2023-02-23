@@ -117,7 +117,7 @@ impl CommandManager {
                             | ResponseContent::Query(_)
                             | ResponseContent::WorkerCertificateWithNames(_)
                             | ResponseContent::WorkerClusters(_)
-                            | ResponseContent::WorkerClustersHashes(_)
+                            | ResponseContent::ClusterHashes(_)
                             | ResponseContent::WorkerMetrics(_)
                             | ResponseContent::Workers(_) => {}
                             ResponseContent::ListenersList(list) => print_listeners(list),

@@ -584,9 +584,12 @@ pub fn print_query_response_data(
 
         for metrics in data.values() {
             //let m: u8 = metrics;
-            if let ResponseContent::WorkerClustersHashes(clusters) = metrics {
-                for (key, value) in clusters.iter() {
-                    query_data.entry(key).or_insert(Vec::new()).push(value);
+            if let ResponseContent::ClusterHashes(clusters) = metrics {
+                for cluster_hash in clusters.iter() {
+                    query_data
+                        .entry(&cluster_hash.cluster_id)
+                        .or_insert(Vec::new())
+                        .push(&cluster_hash.hash);
                 }
             }
         }

@@ -1214,9 +1214,9 @@ impl CommandServer {
 
     fn query_main_process(&self, order: &WorkerOrder) -> Option<ResponseContent> {
         match order {
-            WorkerOrder::QueryClustersHashes => Some(ResponseContent::WorkerClustersHashes(
-                self.state.hash_state(),
-            )),
+            WorkerOrder::QueryClustersHashes => {
+                Some(ResponseContent::ClusterHashes(self.state.hash_state()))
+            }
             WorkerOrder::QueryClusterById { cluster_id } => {
                 Some(ResponseContent::WorkerClusters(vec![self
                     .state

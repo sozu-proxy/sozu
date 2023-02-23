@@ -884,7 +884,7 @@ impl Server {
             WorkerOrder::QueryClustersHashes => {
                 push_queue(Response::ok_with_content(
                     message.id,
-                    ResponseContent::WorkerClustersHashes(self.config_state.hash_state()),
+                    ResponseContent::ClusterHashes(self.config_state.hash_state()),
                 ));
                 return;
             }
