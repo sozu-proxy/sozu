@@ -115,7 +115,7 @@ impl CommandManager {
                             | ResponseContent::Event(_)
                             | ResponseContent::Metrics(_)
                             | ResponseContent::Query(_)
-                            | ResponseContent::WorkerCertificates(_)
+                            | ResponseContent::WorkerCertificateWithNames(_)
                             | ResponseContent::WorkerClusters(_)
                             | ResponseContent::WorkerClustersHashes(_)
                             | ResponseContent::WorkerMetrics(_)

@@ -739,24 +739,21 @@ pub struct ClusterInformation {
     pub backends: Vec<Backend>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WorkerCertificates {
-    /// returns the certificate
-    Fingerprint(Option<CertificateWithNames>),
-}
-
+/// TODO: rename me
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertificateWithNames {
     pub certificate: String,
     pub names: Vec<String>,
 }
 
+/// TODO: rename me
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllDomainsAndFingerprintsForAnAddress {
     pub address: SocketAddr,
     pub domains_and_fingerprints: Vec<DomainAndFingerprint>,
 }
 
+/// TODO: rename me
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainAndFingerprint {
     pub domain: String,

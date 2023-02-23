@@ -8,7 +8,7 @@ use sozu_command_lib::{
         AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, ResponseContent,
         WorkerInfo,
     },
-    worker::{ClusterMetrics, FilteredMetrics, Route, WorkerCertificates, WorkerMetrics},
+    worker::{ClusterMetrics, FilteredMetrics, Route, WorkerMetrics},
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -655,7 +655,7 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            ResponseContent::WorkerCertificates(WorkerCertificates::Fingerprint(opt)) => {
+            ResponseContent::WorkerCertificateWithNames(opt) => {
                 if let Some(cert) = opt {
                     println!(
                         "\tfrontends: {:?}\ncertificate:\n{}",

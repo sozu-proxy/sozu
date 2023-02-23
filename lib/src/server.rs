@@ -33,8 +33,7 @@ use crate::{
         state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
         worker::{
             Backend as CommandLibBackend, Cluster, ListenerType, RemoveBackend,
-            TcpListenerConfig as CommandTcpListener, WorkerCertificates, WorkerOrder,
-            WorkerRequest,
+            TcpListenerConfig as CommandTcpListener, WorkerOrder, WorkerRequest,
         },
     },
     tcp,
@@ -910,11 +909,12 @@ impl Server {
                 ));
                 return;
             }
-            WorkerOrder::QueryCertificateByFingerprint(f) => {
+            WorkerOrder::QueryCertificateByFingerprint(fingerprint) => {
                 push_queue(Response::ok_with_content(
                     message.id,
-                    ResponseContent::WorkerCertificates(WorkerCertificates::Fingerprint(
-                        get_certificate(&self.config_state, &f),
+                    ResponseContent::WorkerCertificateWithNames(get_certificate(
+                        &self.config_state,
+                        &fingerprint,
                     )),
                 ));
                 return;
