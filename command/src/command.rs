@@ -9,7 +9,7 @@ use crate::{
     worker::{
         AvailableWorkerMetrics, ClusterInformation, FilteredMetrics, HttpFrontend,
         HttpListenerConfig, HttpsListenerConfig, TcpFrontend, TcpListenerConfig,
-        WorkerCertificates, WorkerMetrics, WorkerOrder,
+        WorkerCertificates, WorkerMetrics, WorkerOrder, ReturnedCertificate,
     },
 };
 
@@ -124,6 +124,8 @@ pub enum ResponseContent {
     // WorkerCertificatesByFingerprint(CertificatesByFingerprint),
     WorkerMetrics(WorkerMetrics),
     AvailableWorkerMetrics(AvailableWorkerMetrics),
+    /// returns certificates that match a QueryCertificateByDomain
+    CertificatesByDomain(Vec<ReturnedCertificate>),
 }
 
 /// Aggregated metrics of main process & workers, for the CLI

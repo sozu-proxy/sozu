@@ -1139,7 +1139,7 @@ impl CommandServer {
                 }
             }
 
-            let mut worker_responses_map: BTreeMap<String, ResponseContent> = responses
+            let mut response_map: BTreeMap<String, ResponseContent> = responses
                 .into_iter()
                 .filter_map(|(worker_id, worker_response)| {
                     worker_response
@@ -1148,7 +1148,7 @@ impl CommandServer {
                 })
                 .collect();
 
-            let success = match &order {
+            let response_content = match &order {
                 WorkerOrder::QueryClustersHashes
                 | WorkerOrder::QueryClusterById { cluster_id: _ }
                 | WorkerOrder::QueryClusterByDomain {
@@ -1156,22 +1156,19 @@ impl CommandServer {
                     path: _,
                 } => {
                     let response_content = response_of_main.unwrap(); // we should refactor to avoid this unwrap()
-                    worker_responses_map.insert(String::from("main"), response_content);
-                    Success::Query(ResponseContent::Query(worker_responses_map))
+                    response_map.insert(String::from("main"), response_content);
+                    ResponseContent::Query(response_map)
                 }
                 WorkerOrder::QueryCertificateByDomain(_)
                 | WorkerOrder::QueryCertificateByFingerprint(_) => {
-                    info!(
-                        "certificates query answer received: {:?}",
-                        worker_responses_map
-                    );
-                    Success::Query(ResponseContent::Query(worker_responses_map))
+                    info!("certificates query answer received: {:?}", response_map);
+                    ResponseContent::Query(response_map)
                 }
                 WorkerOrder::QueryMetrics(options) => {
-                    debug!("metrics query answer received: {:?}", worker_responses_map);
+                    debug!("metrics query answer received: {:?}", response_map);
 
                     if options.list {
-                        let workers = worker_responses_map
+                        let workers = response_map
                             .into_iter()
                             .filter_map(|(worker_id, worker_response)| match worker_response {
                                 ResponseContent::AvailableWorkerMetrics(available) => {
@@ -1180,12 +1177,12 @@ impl CommandServer {
                                 _ => None,
                             })
                             .collect();
-                        Success::Query(ResponseContent::AvailableMetrics(AvailableMetrics {
+                        ResponseContent::AvailableMetrics(AvailableMetrics {
                             main: vec![], // TODO: get available metrics of main process in CommandServer::query_main_process()
                             workers,
-                        }))
+                        })
                     } else {
-                        let workers_metrics = worker_responses_map
+                        let workers_metrics = response_map
                             .into_iter()
                             .filter_map(|(worker_id, worker_response)| match worker_response {
                                 ResponseContent::WorkerMetrics(worker_metrics) => {
@@ -1194,16 +1191,21 @@ impl CommandServer {
                                 _ => None,
                             })
                             .collect();
-                        Success::Query(ResponseContent::Metrics(AggregatedMetrics {
+                        ResponseContent::Metrics(AggregatedMetrics {
                             main: main_metrics,
                             workers: workers_metrics,
-                        }))
+                        })
                     }
                 }
                 _ => return, // very very unlikely
             };
 
-            return_success(command_tx, cloned_identifier, success).await;
+            return_success(
+                command_tx,
+                cloned_identifier,
+                Success::Query(response_content),
+            )
+            .await;
         })
         .detach();
 

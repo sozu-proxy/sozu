@@ -749,12 +749,17 @@ pub enum WorkerCertificates {
     /// returns a list of certificates: domain -> fingerprint
     /// // TODO: replace with a vec
     All(HashMap<SocketAddr, BTreeMap<String, CertificateFingerprint>>),
-    /// returns certificates that match a QueryCertificateByDomain
-    CertificatesByDomain(Vec<ReturnedCertificate>),
+
     /// returns the certificate
     Fingerprint(Option<(String, Vec<String>)>),
 }
 
+// #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// pub struct AllCertificates {
+
+// }
+
+/// TODO: rename me
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReturnedCertificate {
     pub address: SocketAddr,

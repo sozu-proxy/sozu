@@ -991,9 +991,7 @@ impl HttpsProxy {
             domain, certificates
         );
 
-        Ok(Some(ResponseContent::WorkerCertificates(
-            WorkerCertificates::CertificatesByDomain(certificates),
-        )))
+        Ok(Some(ResponseContent::CertificatesByDomain(certificates)))
     }
 
     pub fn activate_listener(

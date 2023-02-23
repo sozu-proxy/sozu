@@ -616,28 +616,19 @@ pub fn print_query_response_data(
 }
 
 pub fn print_certificates(
-    response_content: BTreeMap<String, ResponseContent>,
+    response_contents: BTreeMap<String, ResponseContent>,
     json: bool,
 ) -> anyhow::Result<()> {
     if json {
-        print_json_response(&response_content)?;
+        print_json_response(&response_contents)?;
         return Ok(());
     }
 
-    //println!("received: {:?}", data);
-    let it = response_content.iter().map(|(k, v)| match v {
-        ResponseContent::WorkerCertificates(c) => (k, c),
-        v => {
-            eprintln!("unexpected certificates query answer: {v:?}");
-            exit(1);
-        }
-    });
+    for (worker_id, response_content) in response_contents.iter() {
+        println!("process '{worker_id}':");
 
-    for (k, value) in it {
-        println!("process '{k}':");
-
-        match value {
-            WorkerCertificates::All(h) => {
+        match response_content {
+            ResponseContent::WorkerCertificates(WorkerCertificates::All(h)) => {
                 for (addr, h2) in h.iter() {
                     println!("\t{addr}:");
 
@@ -648,7 +639,7 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            WorkerCertificates::CertificatesByDomain(certificates) => {
+            ResponseContent::CertificatesByDomain(certificates) => {
                 for certificate in certificates.iter() {
                     println!("\t{}:", certificate.address);
                     println!(
@@ -660,13 +651,17 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            WorkerCertificates::Fingerprint(opt) => {
+            ResponseContent::WorkerCertificates(WorkerCertificates::Fingerprint(opt)) => {
                 if let Some((s, v)) = opt {
                     println!("\tfrontends: {v:?}\ncertificate:\n{s}");
                 } else {
                     println!("\tnot found");
                 }
             }
+            _ => bail!(
+                "Unexpected response for process {worker_id}: {:?}",
+                response_content,
+            ),
         }
         println!();
     }
