@@ -5,8 +5,9 @@ use prettytable::{Row, Table};
 
 use sozu_command_lib::{
     command::{
-        AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, ResponseContent,
-        WorkerInfo,
+        AggregatedMetrics, AvailableMetrics, CertificatesByDomain, ClusterHashes,
+        ClusterInformations, ListedFrontends, ListenersList, QueryResponses, ResponseContent,
+        WorkerCertificates, WorkerInfo,
     },
     worker::{ClusterMetrics, FilteredMetrics, Route, WorkerMetrics},
 };
@@ -388,27 +389,27 @@ pub fn print_query_response_data(
     json: bool,
 ) -> anyhow::Result<()> {
     if let Some(needle) = cluster_id.or(domain) {
-        if let Some(ResponseContent::Query(data)) = &data {
+        if let Some(ResponseContent::QueryResponses(QueryResponses { inner: responses })) = &data {
             if json {
-                return print_json_response(data);
+                return print_json_response(responses);
             }
 
             let cluster_headers = vec!["id", "sticky_session", "https_redirect"];
-            let mut cluster_table = create_queried_cluster_table(cluster_headers, data);
+            let mut cluster_table = create_queried_cluster_table(cluster_headers, responses);
 
             let http_headers = vec!["id", "hostname", "path"];
-            let mut frontend_table = create_queried_cluster_table(http_headers, data);
+            let mut frontend_table = create_queried_cluster_table(http_headers, responses);
 
             let https_headers = vec!["id", "hostname", "path"];
-            let mut https_frontend_table = create_queried_cluster_table(https_headers, data);
+            let mut https_frontend_table = create_queried_cluster_table(https_headers, responses);
 
             let tcp_headers = vec!["id", "address"];
-            let mut tcp_frontend_table = create_queried_cluster_table(tcp_headers, data);
+            let mut tcp_frontend_table = create_queried_cluster_table(tcp_headers, responses);
 
             let backend_headers = vec!["backend id", "IP address", "Backup"];
-            let mut backend_table = create_queried_cluster_table(backend_headers, data);
+            let mut backend_table = create_queried_cluster_table(backend_headers, responses);
 
-            let keys: HashSet<&String> = data.keys().collect();
+            let keys: HashSet<&String> = responses.keys().collect();
 
             let mut cluster_data = HashMap::new();
             let mut frontend_data = HashMap::new();
@@ -416,9 +417,12 @@ pub fn print_query_response_data(
             let mut tcp_frontend_data = HashMap::new();
             let mut backend_data = HashMap::new();
 
-            for (key, metrics) in data.iter() {
+            for (key, metrics) in responses.iter() {
                 //let m: u8 = metrics;
-                if let ResponseContent::WorkerClusters(clusters) = metrics {
+                if let ResponseContent::ClusterInformations(ClusterInformations {
+                    inner: clusters,
+                }) = metrics
+                {
                     for cluster in clusters.iter() {
                         let entry = cluster_data.entry(cluster).or_insert(Vec::new());
                         entry.push(key.to_owned());
@@ -570,11 +574,12 @@ pub fn print_query_response_data(
 
             backend_table.printstd();
         }
-    } else if let Some(ResponseContent::Query(data)) = &data {
+    } else if let Some(ResponseContent::QueryResponses(QueryResponses { inner: responses })) = &data
+    {
         let mut table = Table::new();
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         let mut header = vec![cell!("key")];
-        for key in data.keys() {
+        for key in responses.keys() {
             header.push(cell!(&key));
         }
         header.push(cell!("desynchronized"));
@@ -582,9 +587,9 @@ pub fn print_query_response_data(
 
         let mut query_data = HashMap::new();
 
-        for metrics in data.values() {
+        for metrics in responses.values() {
             //let m: u8 = metrics;
-            if let ResponseContent::ClusterHashes(clusters) = metrics {
+            if let ResponseContent::ClusterHashes(ClusterHashes { inner: clusters }) = metrics {
                 for cluster_hash in clusters.iter() {
                     query_data
                         .entry(&cluster_hash.cluster_id)
@@ -628,11 +633,13 @@ pub fn print_certificates(
         println!("process '{worker_id}':");
 
         match response_content {
-            ResponseContent::AllWorkerCertificates(h) => {
-                for all_domains_and_fingerprints_for_an_address in h.iter() {
-                    println!("\t{}:", all_domains_and_fingerprints_for_an_address.address);
+            ResponseContent::WorkerCertificates(WorkerCertificates {
+                inner: certificates_by_address,
+            }) => {
+                for certificates in certificates_by_address.iter() {
+                    println!("\t{}:", certificates.address);
 
-                    for d_and_f in all_domains_and_fingerprints_for_an_address.summaries.iter() {
+                    for d_and_f in certificates.summaries.iter() {
                         println!(
                             "\t\t{}:\t{}",
                             d_and_f.domain,
@@ -643,7 +650,9 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            ResponseContent::CertificatesByDomain(certificates) => {
+            ResponseContent::CertificatesByDomain(CertificatesByDomain {
+                inner: certificates,
+            }) => {
                 for certificate in certificates.iter() {
                     for summary in certificate.summaries.iter() {
                         println!("\t{}:", certificate.address);
@@ -657,15 +666,11 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            ResponseContent::WorkerCertificateWithNames(opt) => {
-                if let Some(cert) = opt {
-                    println!(
-                        "\tfrontends: {:?}\ncertificate:\n{}",
-                        cert.names, cert.certificate
-                    );
-                } else {
-                    println!("\tnot found");
-                }
+            ResponseContent::CertificateWithNames(cert) => {
+                println!(
+                    "\tfrontends: {:?}\ncertificate:\n{}",
+                    cert.names, cert.certificate
+                );
             }
             _ => bail!(
                 "Unexpected response for process {worker_id}: {:?}",

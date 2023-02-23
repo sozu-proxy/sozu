@@ -26,7 +26,10 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::worker::{CertificateSummary, CertificatesByAddress};
+use sozu_command::{
+    command::{CertificatesByDomain, WorkerCertificates},
+    worker::{CertificateSummary, CertificatesByAddress},
+};
 use time::{Duration, Instant};
 
 use crate::{
@@ -967,7 +970,11 @@ impl HttpsProxy {
             certificates
         );
 
-        Ok(Some(ResponseContent::AllWorkerCertificates(certificates)))
+        Ok(Some(ResponseContent::WorkerCertificates(
+            WorkerCertificates {
+                inner: certificates,
+            },
+        )))
     }
 
     pub fn query_certificate_for_domain(
@@ -1001,7 +1008,11 @@ impl HttpsProxy {
             domain, certificates
         );
 
-        Ok(Some(ResponseContent::CertificatesByDomain(certificates)))
+        Ok(Some(ResponseContent::CertificatesByDomain(
+            CertificatesByDomain {
+                inner: certificates,
+            },
+        )))
     }
 
     pub fn activate_listener(

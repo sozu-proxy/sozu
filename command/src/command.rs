@@ -7,9 +7,9 @@ use std::{
 use crate::{
     state::{ClusterId, ConfigState},
     worker::{
-        CertificatesByAddress, AvailableWorkerMetrics, CertificateWithNames,
-        ClusterInformation, FilteredMetrics, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        TcpFrontend, TcpListenerConfig, WorkerMetrics, WorkerOrder,
+        AvailableWorkerMetrics, CertificateWithNames, CertificatesByAddress, ClusterInformation,
+        FilteredMetrics, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, TcpFrontend,
+        TcpListenerConfig, WorkerMetrics, WorkerOrder,
     },
 };
 
@@ -97,34 +97,85 @@ pub enum ResponseStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ResponseContent {
     /// a list of workers, with ids, pids, statuses
-    Workers(Vec<WorkerInfo>),
+    WorkerInfos(WorkerInfos),
+
     /// aggregated metrics of main process and workers
     Metrics(AggregatedMetrics),
+
     /// list available metrics of main process and workers
     AvailableMetrics(AvailableMetrics), // maybe useless
-    /// worker responses to a same query: worker_id -> response_content
-    Query(BTreeMap<String, ResponseContent>),
+
+    /// main and worker responses to a same query: worker_id -> response_content
+    QueryResponses(QueryResponses),
+
     /// the state of Sōzu: frontends, backends, listeners, etc.
     State(Box<ConfigState>),
+
     /// a proxy event
     Event(Event),
+
     /// a filtered list of frontend
     FrontendList(ListedFrontends),
-    // this is new
-    Status(Vec<WorkerInfo>),
+
     /// all listeners
     ListenersList(ListenersList),
 
-    ClusterHashes(Vec<ClusterHash>),
+    /// A list of cluster id and their hashes
+    ClusterHashes(ClusterHashes),
 
-    // sent by a worker to the main process
-    WorkerClusters(Vec<ClusterInformation>),
-    WorkerCertificateWithNames(Option<CertificateWithNames>),
-    AllWorkerCertificates(Vec<CertificatesByAddress>),
+    /// A list of clusters with their details
+    ClusterInformations(ClusterInformations),
+
+    /// One certificate with its names
+    CertificateWithNames(CertificateWithNames),
+
+    /// All certificates used by by a worker
+    WorkerCertificates(WorkerCertificates),
+
+    /// All metrics of a worker
     WorkerMetrics(WorkerMetrics),
+
+    /// All metrics names available in a worker
     AvailableWorkerMetrics(AvailableWorkerMetrics),
+
     /// returns certificates that match a QueryCertificateByDomain
-    CertificatesByDomain(Vec<CertificatesByAddress>),
+    CertificatesByDomain(CertificatesByDomain),
+}
+
+/// a list of workers, with ids, pids, statuses
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerInfos {
+    pub inner: Vec<WorkerInfo>,
+}
+
+/// main and worker responses to a same query: worker_id -> response_content
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryResponses {
+    pub inner: BTreeMap<String, ResponseContent>,
+}
+
+/// A list of cluster id and their hashes
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterHashes {
+    pub inner: Vec<ClusterHash>,
+}
+
+/// A list of clusters with their details
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterInformations {
+    pub inner: Vec<ClusterInformation>,
+}
+
+/// returns certificates that match a QueryCertificateByDomain
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertificatesByDomain {
+    pub inner: Vec<CertificatesByAddress>,
+}
+
+/// All certificates used by by a worker
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCertificates {
+    pub inner: Vec<CertificatesByAddress>,
 }
 
 /// cluster id -> hash of cluster information
@@ -702,18 +753,20 @@ mod tests {
             version: 0,
             status: ResponseStatus::Ok,
             message: Some(String::from("")),
-            content: Some(ResponseContent::Workers(vec!(
-                WorkerInfo {
-                    id: 1,
-                    pid: 5678,
-                    run_state: RunState::Running,
-                },
-                WorkerInfo {
-                    id: 0,
-                    pid: 1234,
-                    run_state: RunState::Stopping,
-                },
-            ))),
+            content: Some(ResponseContent::WorkerInfos(WorkerInfos {
+                inner: vec!(
+                    WorkerInfo {
+                        id: 1,
+                        pid: 5678,
+                        run_state: RunState::Running,
+                    },
+                    WorkerInfo {
+                        id: 0,
+                        pid: 1234,
+                        run_state: RunState::Stopping,
+                    },
+                )
+            })),
         }
     );
 

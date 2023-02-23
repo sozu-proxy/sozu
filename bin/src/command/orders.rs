@@ -15,9 +15,9 @@ use nom::{Err, HexDisplay, Offset};
 use sozu_command_lib::{
     buffer::fixed::Buffer,
     command::{
-        AggregatedMetrics, AvailableMetrics, FrontendFilters, ListedFrontends, ListenersList,
-        Order, Request, Response, ResponseContent, ResponseStatus, RunState, WorkerInfo,
-        PROTOCOL_VERSION,
+        AggregatedMetrics, AvailableMetrics, ClusterHashes, ClusterInformations, FrontendFilters,
+        ListedFrontends, ListenersList, Order, QueryResponses, Request, Response, ResponseContent,
+        ResponseStatus, RunState, WorkerInfo, WorkerInfos, PROTOCOL_VERSION,
     },
     config::Config,
     logging,
@@ -448,8 +448,8 @@ impl CommandServer {
 
         debug!("workers: {:#?}", workers);
 
-        Ok(Some(Success::ListWorkers(ResponseContent::Workers(
-            workers,
+        Ok(Some(Success::ListWorkers(ResponseContent::WorkerInfos(
+            WorkerInfos { inner: workers },
         ))))
     }
 
@@ -978,7 +978,7 @@ impl CommandServer {
                 }
             }
 
-            let worker_info_vec: Vec<WorkerInfo> = worker_info_map
+            let worker_infos: Vec<WorkerInfo> = worker_info_map
                 .values()
                 .map(|worker_info| worker_info.to_owned())
                 .collect();
@@ -986,7 +986,9 @@ impl CommandServer {
             return_success(
                 command_tx,
                 thread_request_identifier,
-                Success::Status(ResponseContent::Status(worker_info_vec)),
+                Success::Status(ResponseContent::WorkerInfos(WorkerInfos {
+                    inner: worker_infos,
+                })),
             )
             .await;
         })
@@ -1157,12 +1159,16 @@ impl CommandServer {
                 } => {
                     let response_content = response_of_main.unwrap(); // we should refactor to avoid this unwrap()
                     response_map.insert(String::from("main"), response_content);
-                    ResponseContent::Query(response_map)
+                    ResponseContent::QueryResponses(QueryResponses {
+                        inner: response_map,
+                    })
                 }
                 WorkerOrder::QueryCertificateByDomain(_)
                 | WorkerOrder::QueryCertificateByFingerprint(_) => {
                     info!("certificates query answer received: {:?}", response_map);
-                    ResponseContent::Query(response_map)
+                    ResponseContent::QueryResponses(QueryResponses {
+                        inner: response_map,
+                    })
                 }
                 WorkerOrder::QueryMetrics(options) => {
                     debug!("metrics query answer received: {:?}", response_map);
@@ -1215,12 +1221,14 @@ impl CommandServer {
     fn query_main_process(&self, order: &WorkerOrder) -> Option<ResponseContent> {
         match order {
             WorkerOrder::QueryClustersHashes => {
-                Some(ResponseContent::ClusterHashes(self.state.hash_state()))
+                Some(ResponseContent::ClusterHashes(ClusterHashes {
+                    inner: self.state.hash_state(),
+                }))
             }
             WorkerOrder::QueryClusterById { cluster_id } => {
-                Some(ResponseContent::WorkerClusters(vec![self
-                    .state
-                    .cluster_state(cluster_id)]))
+                Some(ResponseContent::ClusterInformations(ClusterInformations {
+                    inner: vec![self.state.cluster_state(cluster_id)],
+                }))
             }
             WorkerOrder::QueryClusterByDomain { hostname, path } => {
                 let cluster_ids =
@@ -1229,7 +1237,9 @@ impl CommandServer {
                     .iter()
                     .map(|cluster_id| self.state.cluster_state(cluster_id))
                     .collect();
-                Some(ResponseContent::WorkerClusters(clusters))
+                Some(ResponseContent::ClusterInformations(ClusterInformations {
+                    inner: clusters,
+                }))
             }
             _ => None,
         }

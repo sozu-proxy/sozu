@@ -4,7 +4,10 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
 
 use sozu_command_lib::{
-    command::{Order, Request, Response, ResponseContent, ResponseStatus, RunState, WorkerInfo},
+    command::{
+        Order, QueryResponses, Request, Response, ResponseContent, ResponseStatus, RunState,
+        WorkerInfo, WorkerInfos,
+    },
     worker::{QueryMetricsOptions, WorkerOrder},
 };
 
@@ -108,18 +111,17 @@ impl CommandManager {
                     }
                     match response.content {
                         Some(response_content) => match response_content {
-                            ResponseContent::AllWorkerCertificates(_)
+                            ResponseContent::WorkerCertificates(_)
                             | ResponseContent::AvailableMetrics(_)
                             | ResponseContent::AvailableWorkerMetrics(_)
                             | ResponseContent::CertificatesByDomain(_)
                             | ResponseContent::Event(_)
                             | ResponseContent::Metrics(_)
-                            | ResponseContent::Query(_)
-                            | ResponseContent::WorkerCertificateWithNames(_)
-                            | ResponseContent::WorkerClusters(_)
+                            | ResponseContent::QueryResponses(_)
+                            | ResponseContent::CertificateWithNames(_)
+                            | ResponseContent::ClusterInformations(_)
                             | ResponseContent::ClusterHashes(_)
-                            | ResponseContent::WorkerMetrics(_)
-                            | ResponseContent::Workers(_) => {}
+                            | ResponseContent::WorkerMetrics(_) => {}
                             ResponseContent::ListenersList(list) => print_listeners(list),
                             ResponseContent::State(state) => match json {
                                 true => print_json_response(&state)?,
@@ -128,7 +130,9 @@ impl CommandManager {
                             ResponseContent::FrontendList(frontends) => {
                                 print_frontend_list(frontends)
                             }
-                            ResponseContent::Status(worker_info_vec) => {
+                            ResponseContent::WorkerInfos(WorkerInfos {
+                                inner: worker_info_vec,
+                            }) => {
                                 if json {
                                     print_json_response(&worker_info_vec)?;
                                 } else {
@@ -169,7 +173,9 @@ impl CommandManager {
                     bail!("Error: failed to get the list of worker: {}", response);
                 }
                 ResponseStatus::Ok => {
-                    if let Some(ResponseContent::Workers(ref workers)) = response.content {
+                    if let Some(ResponseContent::WorkerInfos(WorkerInfos { inner: ref workers })) =
+                        response.content
+                    {
                         let mut table = Table::new();
                         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
                         table.add_row(row!["Worker", "pid", "run state"]);
@@ -453,7 +459,9 @@ impl CommandManager {
                 }
                 ResponseStatus::Ok => {
                     match response.content {
-                        Some(ResponseContent::Query(data)) => print_certificates(data, json)?,
+                        Some(ResponseContent::QueryResponses(QueryResponses {
+                            inner: responses,
+                        })) => print_certificates(responses, json)?,
                         _ => bail!("unexpected response: {:?}", response.content),
                     }
                     break;

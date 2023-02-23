@@ -13,8 +13,9 @@ use mio::{
     Events, Interest, Poll, Token,
 };
 use slab::Slab;
-use sozu_command::worker::{
-    ActivateListener, DeactivateListener, HttpListenerConfig, HttpsListenerConfig,
+use sozu_command::{
+    command::{ClusterHashes, ClusterInformations},
+    worker::{ActivateListener, DeactivateListener, HttpListenerConfig, HttpsListenerConfig},
 };
 use time::{Duration, Instant};
 
@@ -884,14 +885,16 @@ impl Server {
             WorkerOrder::QueryClustersHashes => {
                 push_queue(Response::ok_with_content(
                     message.id,
-                    ResponseContent::ClusterHashes(self.config_state.hash_state()),
+                    ResponseContent::ClusterHashes(ClusterHashes {
+                        inner: self.config_state.hash_state(),
+                    }),
                 ));
                 return;
             }
             WorkerOrder::QueryClusterById { cluster_id } => {
-                let response_content = ResponseContent::WorkerClusters(vec![self
-                    .config_state
-                    .cluster_state(&cluster_id)]);
+                let response_content = ResponseContent::ClusterInformations(ClusterInformations {
+                    inner: vec![self.config_state.cluster_state(&cluster_id)],
+                });
                 push_queue(Response::ok_with_content(message.id, response_content));
                 return;
             }
@@ -905,18 +908,19 @@ impl Server {
 
                 push_queue(Response::ok_with_content(
                     message.id,
-                    ResponseContent::WorkerClusters(clusters),
+                    ResponseContent::ClusterInformations(ClusterInformations { inner: clusters }),
                 ));
                 return;
             }
             WorkerOrder::QueryCertificateByFingerprint(fingerprint) => {
-                push_queue(Response::ok_with_content(
-                    message.id,
-                    ResponseContent::WorkerCertificateWithNames(get_certificate(
-                        &self.config_state,
-                        &fingerprint,
-                    )),
-                ));
+                let response = match get_certificate(&self.config_state, &fingerprint) {
+                    Some(certificate) => Response::ok_with_content(
+                        message.id,
+                        ResponseContent::CertificateWithNames(certificate),
+                    ),
+                    None => Response::error(message.id, "No certificate for this fingerprint"),
+                };
+                push_queue(response);
                 return;
             }
             WorkerOrder::QueryMetrics(query_metrics_options) => {
