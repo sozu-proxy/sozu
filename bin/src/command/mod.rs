@@ -563,7 +563,7 @@ impl CommandServer {
 
         self.backends_count = self.state.count_backends();
         self.frontends_count = self.state.count_frontends();
-        gauge!("configuration.clusters", self.state.clusters.len());
+        gauge!("configuration.clusters", self.state.count_clusters());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
 
@@ -878,7 +878,7 @@ pub fn start_server(
                 .await
                 .with_context(|| format!("Loading {:?} failed", &path))?;
         }
-        gauge!("configuration.clusters", server.state.clusters.len());
+        gauge!("configuration.clusters", server.state.count_clusters());
         gauge!("configuration.backends", server.backends_count);
         gauge!("configuration.frontends", server.frontends_count);
 

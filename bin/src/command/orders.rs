@@ -366,7 +366,7 @@ impl CommandServer {
 
         self.backends_count = self.state.count_backends();
         self.frontends_count = self.state.count_frontends();
-        gauge!("configuration.clusters", self.state.clusters.len());
+        gauge!("configuration.clusters", self.state.count_clusters());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
         Ok(None)
@@ -902,7 +902,7 @@ impl CommandServer {
 
         self.backends_count = self.state.count_backends();
         self.frontends_count = self.state.count_frontends();
-        gauge!("configuration.clusters", self.state.clusters.len());
+        gauge!("configuration.clusters", self.state.count_clusters());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
 
@@ -1432,7 +1432,7 @@ impl CommandServer {
             _ => {}
         };
 
-        gauge!("configuration.clusters", self.state.clusters.len());
+        gauge!("configuration.clusters", self.state.count_clusters());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
 

@@ -44,9 +44,24 @@ pub struct HttpsProxy {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendsToACluster {
+    pub cluster_id: ClusterId,
+    pub backends: Vec<Backend>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteKeyToHttpFrontend {
+    route_key: RouteKey,
+    frontend: HttpFrontend,
+}
+
+/// A representation of the entire state of a Sōzu worker
+/// Those fields are never accessed
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigState {
-    pub clusters: BTreeMap<ClusterId, Cluster>,
-    pub backends: BTreeMap<ClusterId, Vec<Backend>>,
+    clusters: BTreeMap<ClusterId, Cluster>,
+    backends: BTreeMap<ClusterId, Vec<Backend>>,
+    //pub backends: Vec<BackendsToACluster>, // TODO: maybe put the backends in the Cluster struct
     /// the bool indicates if it is active or not
     pub http_listeners: HashMap<SocketAddr, (HttpListenerConfig, bool)>,
     pub https_listeners: HashMap<SocketAddr, (HttpsListenerConfig, bool)>,
@@ -1029,6 +1044,11 @@ impl ConfigState {
             tcp_frontends: self.tcp_fronts.get(cluster_id).cloned().unwrap_or_default(),
             backends: self.backends.get(cluster_id).cloned().unwrap_or_default(),
         }
+    }
+
+    /// yield the current number of clusters in the state
+    pub fn count_clusters(&self) -> usize {
+        self.clusters.len()
     }
 
     pub fn count_backends(&self) -> usize {
