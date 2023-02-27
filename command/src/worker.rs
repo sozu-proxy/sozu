@@ -270,25 +270,72 @@ impl Default for RulePosition {
 /// A filter for the path of incoming requests
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PathRule {
+pub struct PathRule {
+    pub kind: PathRuleKind,
+    pub value: String,
+}
+
+/// The kind of filter used for path rules
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PathRuleKind {
     /// filters paths that start with a pattern, typically "/api"
-    Prefix(String),
+    Prefix,
     /// filters paths that match a regex pattern
-    Regex(String),
+    Regex,
     /// filters paths that exactly match a pattern, no more, no less
-    Equals(String),
+    Equals,
 }
 
 impl PathRule {
+    pub fn prefix<S>(value: S) -> Self
+    where
+        S: ToString,
+    {
+        Self {
+            kind: PathRuleKind::Prefix,
+            value: value.to_string(),
+        }
+    }
+
+    pub fn regex<S>(value: S) -> Self
+    where
+        S: ToString,
+    {
+        Self {
+            kind: PathRuleKind::Regex,
+            value: value.to_string(),
+        }
+    }
+
+    pub fn equals<S>(value: S) -> Self
+    where
+        S: ToString,
+    {
+        Self {
+            kind: PathRuleKind::Equals,
+            value: value.to_string(),
+        }
+    }
+
     pub fn from_cli_options(
         path_prefix: Option<String>,
         path_regex: Option<String>,
         path_equals: Option<String>,
     ) -> Self {
         match (path_prefix, path_regex, path_equals) {
-            (Some(prefix), _, _) => PathRule::Prefix(prefix),
-            (None, Some(regex), _) => PathRule::Regex(regex),
-            (None, None, Some(equals)) => PathRule::Equals(equals),
+            (Some(prefix), _, _) => PathRule {
+                kind: PathRuleKind::Prefix,
+                value: prefix,
+            },
+            (None, Some(regex), _) => PathRule {
+                kind: PathRuleKind::Regex,
+                value: regex,
+            },
+            (None, None, Some(equals)) => PathRule {
+                kind: PathRuleKind::Equals,
+                value: equals,
+            },
             _ => PathRule::default(),
         }
     }
@@ -296,24 +343,23 @@ impl PathRule {
 
 impl Default for PathRule {
     fn default() -> Self {
-        PathRule::Prefix(String::new())
+        PathRule {
+            kind: PathRuleKind::Prefix,
+            value: String::new(),
+        }
     }
 }
 
 fn is_default_path_rule(p: &PathRule) -> bool {
-    match p {
-        PathRule::Regex(_) => false,
-        PathRule::Equals(_) => false,
-        PathRule::Prefix(s) => s.is_empty(),
-    }
+    p.kind == PathRuleKind::Prefix && p.value.is_empty()
 }
 
 impl std::fmt::Display for PathRule {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            PathRule::Prefix(s) => write!(f, "prefix '{s}'"),
-            PathRule::Regex(r) => write!(f, "regexp '{}'", r.as_str()),
-            PathRule::Equals(s) => write!(f, "equals '{s}'"),
+        match self.kind {
+            PathRuleKind::Prefix => write!(f, "prefix '{}'", self.value),
+            PathRuleKind::Regex => write!(f, "regexp '{}'", self.value),
+            PathRuleKind::Equals => write!(f, "equals '{}'", self.value),
         }
     }
 }
@@ -865,7 +911,7 @@ mod tests {
 
     #[test]
     fn add_front_test() {
-        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"cluster_id": "xxx", "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"cluster_id": "xxx", "hostname": "yyy", "path": {"KIND": "PREFIX", "VALUE": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
         let command: WorkerOrder = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
@@ -873,7 +919,7 @@ mod tests {
                 == WorkerOrder::AddHttpFrontend(HttpFrontend {
                     cluster_id: Some(String::from("xxx")),
                     hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
+                    path: PathRule::prefix("xxx"),
                     method: None,
                     address: "127.0.0.1:4242".parse().unwrap(),
                     position: RulePosition::Tree,
@@ -884,7 +930,7 @@ mod tests {
 
     #[test]
     fn remove_front_test() {
-        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "data": {"cluster_id": "xxx", "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "data": {"cluster_id": "xxx", "hostname": "yyy", "path": {"KIND": "PREFIX", "VALUE": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: WorkerOrder = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
@@ -892,7 +938,7 @@ mod tests {
                 == WorkerOrder::RemoveHttpFrontend(HttpFrontend {
                     cluster_id: Some(String::from("xxx")),
                     hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
+                    path: PathRule::prefix("xxx"),
                     method: None,
                     address: "127.0.0.1:4242".parse().unwrap(),
                     position: RulePosition::Tree,
@@ -939,7 +985,7 @@ mod tests {
 
     #[test]
     fn http_front_crash_test() {
-        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"cluster_id": "aa", "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"cluster_id": "aa", "hostname": "cltdl.fr", "path": {"KIND": "PREFIX", "VALUE": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: WorkerOrder = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
@@ -947,7 +993,7 @@ mod tests {
                 == WorkerOrder::AddHttpFrontend(HttpFrontend {
                     cluster_id: Some(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
-                    path: PathRule::Prefix(String::from("")),
+                    path: PathRule::default(),
                     method: None,
                     address: "127.0.0.1:4242".parse().unwrap(),
                     position: RulePosition::Tree,
@@ -961,7 +1007,7 @@ mod tests {
 
     #[test]
     fn http_front_crash_test2() {
-        let raw_json = r#"{"cluster_id": "aa", "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242" }"#;
+        let raw_json = r#"{"cluster_id": "aa", "hostname": "cltdl.fr", "path": {"KIND": "PREFIX", "VALUE": ""}, "address": "127.0.0.1:4242" }"#;
         let front: HttpFrontend = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{front:?}");
         assert!(
@@ -969,7 +1015,7 @@ mod tests {
                 == HttpFrontend {
                     cluster_id: Some(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
-                    path: PathRule::Prefix(String::from("")),
+                    path: PathRule::default(),
                     method: None,
                     address: "127.0.0.1:4242".parse().unwrap(),
                     position: RulePosition::Tree,

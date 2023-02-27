@@ -18,8 +18,8 @@ use crate::{
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, PathRule, RulePosition, TcpFrontend, TcpListenerConfig,
-        TlsVersion, WorkerOrder,
+        LoadBalancingParams, LoadMetric, PathRule, PathRuleKind, RulePosition, TcpFrontend,
+        TcpListenerConfig, TlsVersion, WorkerOrder,
     },
 };
 
@@ -347,15 +347,6 @@ pub enum ProxyProtocolConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[serde(deny_unknown_fields)]
-pub enum PathRuleType {
-    Prefix,
-    Regex,
-    Equals,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileClusterFrontendConfig {
     pub address: SocketAddr,
@@ -363,7 +354,7 @@ pub struct FileClusterFrontendConfig {
     /// creates a path routing rule where the request URL path has to match this
     pub path: Option<String>,
     /// declares whether the path rule is Prefix (default), Regex, or Equals
-    pub path_type: Option<PathRuleType>,
+    pub path_type: Option<PathRuleKind>,
     pub method: Option<String>,
     pub certificate: Option<String>,
     pub key: Option<String>,
@@ -433,11 +424,11 @@ impl FileClusterFrontendConfig {
         };
 
         let path = match (self.path.as_ref(), self.path_type.as_ref()) {
-            (None, _) => PathRule::Prefix("".to_string()),
-            (Some(s), Some(PathRuleType::Prefix)) => PathRule::Prefix(s.to_string()),
-            (Some(s), Some(PathRuleType::Regex)) => PathRule::Regex(s.to_string()),
-            (Some(s), Some(PathRuleType::Equals)) => PathRule::Equals(s.to_string()),
-            (Some(s), None) => PathRule::Prefix(s.clone()),
+            (None, _) => PathRule::default(),
+            (Some(s), Some(PathRuleKind::Prefix)) => PathRule::prefix(s),
+            (Some(s), Some(PathRuleKind::Regex)) => PathRule::regex(s),
+            (Some(s), Some(PathRuleKind::Equals)) => PathRule::equals(s),
+            (Some(s), None) => PathRule::prefix(s),
         };
 
         Ok(HttpFrontendConfig {

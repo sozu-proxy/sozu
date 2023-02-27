@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn config_message_test() {
-        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "WORKER", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "cluster_id": "xxx", "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
+        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "WORKER", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "cluster_id": "xxx", "hostname": "yyy", "path": {"KIND": "PREFIX", "VALUE": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
         let message: Request = serde_json::from_str(raw_json).unwrap();
         println!("{message:?}");
         assert_eq!(
@@ -400,7 +400,7 @@ mod tests {
             Order::Worker(Box::new(WorkerOrder::AddHttpFrontend(HttpFrontend {
                 cluster_id: Some(String::from("xxx")),
                 hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
+                path: PathRule::prefix("xxx"),
                 method: None,
                 address: "0.0.0.0:8080".parse().unwrap(),
                 position: RulePosition::Tree,
@@ -484,7 +484,7 @@ mod tests {
             order: Order::Worker(Box::new(WorkerOrder::AddHttpFrontend(HttpFrontend {
                 cluster_id: Some(String::from("xxx")),
                 hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
+                path: PathRule::prefix("xxx"),
                 method: None,
                 address: "0.0.0.0:8080".parse().unwrap(),
                 position: RulePosition::Tree,
@@ -503,7 +503,7 @@ mod tests {
             order: Order::Worker(Box::new(WorkerOrder::RemoveHttpFrontend(HttpFrontend {
                 cluster_id: Some(String::from("xxx")),
                 hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
+                path: PathRule::prefix("xxx"),
                 method: None,
                 address: "0.0.0.0:8080".parse().unwrap(),
                 position: RulePosition::Tree,
@@ -528,7 +528,7 @@ mod tests {
             order: Order::Worker(Box::new(WorkerOrder::AddHttpsFrontend(HttpFrontend {
                 cluster_id: Some(String::from("xxx")),
                 hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
+                path: PathRule::prefix("xxx"),
                 method: None,
                 address: "0.0.0.0:8443".parse().unwrap(),
                 position: RulePosition::Tree,
@@ -547,7 +547,7 @@ mod tests {
             order: Order::Worker(Box::new(WorkerOrder::RemoveHttpsFrontend(HttpFrontend {
                 cluster_id: Some(String::from("xxx")),
                 hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
+                path: PathRule::prefix("xxx"),
                 method: None,
                 address: "0.0.0.0:8443".parse().unwrap(),
                 position: RulePosition::Tree,

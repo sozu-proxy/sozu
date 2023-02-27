@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
             .parse()
             .with_context(|| "could not parse address")?,
         hostname: String::from("example.com"),
-        path: PathRule::Prefix(String::from("/")),
+        path: PathRule::prefix("/"),
         method: None,
         position: RulePosition::Pre,
         tags: Some(BTreeMap::from([

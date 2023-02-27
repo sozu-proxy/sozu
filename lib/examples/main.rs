@@ -67,7 +67,7 @@ fn main() -> anyhow::Result<()> {
             .parse()
             .with_context(|| "Could not parse frontend address")?,
         hostname: String::from("lolcatho.st"),
-        path: PathRule::Prefix(String::from("/")),
+        path: PathRule::prefix("/"),
         method: None,
         position: RulePosition::Tree,
         tags: None,
@@ -143,7 +143,7 @@ fn main() -> anyhow::Result<()> {
             .parse()
             .with_context(|| "Could not parse frontend address")?,
         hostname: String::from("lolcatho.st"),
-        path: PathRule::Prefix(String::from("/")),
+        path: PathRule::prefix("/"),
         method: None,
         position: RulePosition::Tree,
         tags: None,
@@ -197,7 +197,7 @@ fn main() -> anyhow::Result<()> {
             .parse()
             .with_context(|| "Could not parse frontend address")?,
         hostname: String::from("test.local"),
-        path: PathRule::Prefix(String::from("/")),
+        path: PathRule::prefix("/"),
         method: None,
         position: RulePosition::Tree,
         tags: None,

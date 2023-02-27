@@ -3,7 +3,7 @@ pub mod trie;
 
 use anyhow::{bail, Context};
 use regex::bytes::Regex;
-use sozu_command::state::ClusterId;
+use sozu_command::{state::ClusterId, worker::PathRuleKind};
 use std::str::from_utf8;
 
 use crate::{
@@ -500,10 +500,10 @@ impl PathRule {
     }
 
     pub fn from_config(rule: sozu_command::worker::PathRule) -> Option<Self> {
-        match rule {
-            sozu_command::worker::PathRule::Prefix(s) => Some(PathRule::Prefix(s)),
-            sozu_command::worker::PathRule::Regex(s) => Regex::new(&s).ok().map(PathRule::Regex),
-            sozu_command::worker::PathRule::Equals(s) => Some(PathRule::Equals(s)),
+        match rule.kind {
+            PathRuleKind::Prefix => Some(PathRule::Prefix(rule.value)),
+            PathRuleKind::Regex => Regex::new(&rule.value).ok().map(PathRule::Regex),
+            PathRuleKind::Equals => Some(PathRule::Equals(rule.value)),
         }
     }
 }

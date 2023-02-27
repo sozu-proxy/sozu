@@ -357,7 +357,7 @@ impl Worker {
             cluster_id: Some(cluster_id.into()),
             address,
             hostname: String::from("localhost"),
-            path: PathRule::Prefix(String::from("/")),
+            path: PathRule::prefix("/"),
             method: None,
             position: RulePosition::Tree,
             tags: None,
