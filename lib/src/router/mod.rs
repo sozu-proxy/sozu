@@ -3,19 +3,20 @@ pub mod trie;
 
 use anyhow::{bail, Context};
 use regex::bytes::Regex;
+use sozu_command::state::ClusterId;
 use std::str::from_utf8;
 
 use crate::{
     protocol::http::parser::Method,
-    sozu_command::worker::{HttpFrontend, Route, RulePosition},
+    sozu_command::worker::{HttpFrontend, RulePosition},
 };
 
 use self::pattern_trie::TrieNode;
 
 pub struct Router {
-    pre: Vec<(DomainRule, PathRule, MethodRule, Route)>,
-    pub tree: TrieNode<Vec<(PathRule, MethodRule, Route)>>,
-    post: Vec<(DomainRule, PathRule, MethodRule, Route)>,
+    pre: Vec<(DomainRule, PathRule, MethodRule, Option<ClusterId>)>,
+    pub tree: TrieNode<Vec<(PathRule, MethodRule, Option<ClusterId>)>>,
+    post: Vec<(DomainRule, PathRule, MethodRule, Option<ClusterId>)>,
 }
 
 impl Default for Router {
@@ -33,7 +34,17 @@ impl Router {
         }
     }
 
-    pub fn lookup(&self, hostname: &[u8], path: &[u8], method: &Method) -> Option<Route> {
+    /// Looks up a cluster id from request details. It returns:
+    ///
+    /// - `None` if error,
+    /// - `Option<None>` if the route is DENY,
+    /// - `Some(cluster_id)` if a cluster is found
+    pub fn lookup(
+        &self,
+        hostname: &[u8],
+        path: &[u8],
+        method: &Method,
+    ) -> Option<Option<ClusterId>> {
         for (domain_rule, path_rule, method_rule, cluster_id) in &self.pre {
             if domain_rule.matches(hostname)
                 && path_rule.matches(path) != PathRuleResult::None
@@ -108,18 +119,22 @@ impl Router {
 
         let success = match front.position {
             RulePosition::Pre => match front.hostname.parse::<DomainRule>() {
-                Ok(domain) => self.add_pre_rule(&domain, &path_rule, &method_rule, &front.route),
+                Ok(domain) => {
+                    self.add_pre_rule(&domain, &path_rule, &method_rule, &front.cluster_id)
+                }
                 Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
             },
             RulePosition::Post => match front.hostname.parse::<DomainRule>() {
-                Ok(domain) => self.add_post_rule(&domain, &path_rule, &method_rule, &front.route),
+                Ok(domain) => {
+                    self.add_post_rule(&domain, &path_rule, &method_rule, &front.cluster_id)
+                }
                 Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
             },
             RulePosition::Tree => self.add_tree_rule(
                 front.hostname.as_bytes(),
                 &path_rule,
                 &method_rule,
-                &front.route,
+                &front.cluster_id,
             ),
         };
         match success {
@@ -163,7 +178,7 @@ impl Router {
         hostname: &[u8],
         path: &PathRule,
         method: &MethodRule,
-        cluster: &Route,
+        cluster: &Option<ClusterId>,
     ) -> bool {
         let hostname = match from_utf8(hostname) {
             Err(_) => return false,
@@ -240,7 +255,7 @@ impl Router {
         domain: &DomainRule,
         path: &PathRule,
         method: &MethodRule,
-        cluster_id: &Route,
+        cluster_id: &Option<ClusterId>,
     ) -> bool {
         if !self
             .pre
@@ -264,7 +279,7 @@ impl Router {
         domain: &DomainRule,
         path: &PathRule,
         method: &MethodRule,
-        cluster_id: &Route,
+        cluster_id: &Option<ClusterId>,
     ) -> bool {
         if !self
             .post
@@ -556,7 +571,6 @@ impl MethodRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sozu_command::worker::Route;
 
     #[test]
     fn convert_regex() {
@@ -663,25 +677,25 @@ mod tests {
             &"*".parse::<DomainRule>().unwrap(),
             &PathRule::Prefix("/.well-known/acme-challenge".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("acme".to_string())
+            &Some("acme".to_string())
         ));
         assert!(router.add_tree_rule(
             "www.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("example".to_string())
+            &Some("example".to_string())
         ));
         assert!(router.add_tree_rule(
             "*.test.example.com".as_bytes(),
             &PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("examplewildcard".to_string())
+            &Some("examplewildcard".to_string())
         ));
         assert!(router.add_tree_rule(
             "/test[0-9]/.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("exampleregex".to_string())
+            &Some("exampleregex".to_string())
         ));
 
         assert_eq!(
@@ -690,7 +704,7 @@ mod tests {
                 "/helloA".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("example".to_string()))
+            Some(Some("example".to_string()))
         );
         assert_eq!(
             router.lookup(
@@ -698,7 +712,7 @@ mod tests {
                 "/.well-known/acme-challenge".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("acme".to_string()))
+            Some(Some("acme".to_string()))
         );
         assert_eq!(
             router.lookup(
@@ -714,7 +728,7 @@ mod tests {
                 "/helloAB/".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("examplewildcard".to_string()))
+            Some(Some("examplewildcard".to_string()))
         );
         assert_eq!(
             router.lookup(
@@ -722,7 +736,7 @@ mod tests {
                 "/helloAB/".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("exampleregex".to_string()))
+            Some(Some("exampleregex".to_string()))
         );
     }
 }

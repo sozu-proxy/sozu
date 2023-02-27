@@ -12,7 +12,7 @@ use crate::sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
     worker,
-    worker::{LoadBalancingParams, PathRule, Route, RulePosition},
+    worker::{LoadBalancingParams, PathRule, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let http_front = worker::HttpFrontend {
-        route: Route::ClusterId(String::from("test")),
+        cluster_id: Some(String::from("test")),
         address: "127.0.0.1:8080"
             .parse()
             .with_context(|| "could not parse address")?,

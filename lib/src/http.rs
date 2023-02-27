@@ -22,7 +22,7 @@ use crate::{
         logging,
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
-        worker::{Cluster, HttpFrontend, HttpListenerConfig, Route, WorkerOrder, WorkerRequest},
+        worker::{Cluster, HttpFrontend, HttpListenerConfig, WorkerOrder, WorkerRequest},
     },
     timer::TimeoutContainer,
     util::UnwrapLog,
@@ -465,7 +465,7 @@ impl L7ListenerHandler for HttpListener {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> anyhow::Result<Route> {
+    ) -> anyhow::Result<Option<ClusterId>> {
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
             Err(parse_error) => {
@@ -1083,7 +1083,7 @@ mod tests {
     use crate::sozu_command::channel::Channel;
     use crate::sozu_command::worker::{
         Backend, HttpFrontend, HttpListenerConfig, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, Route, RulePosition, WorkerOrder, WorkerRequest,
+        PathRule, RulePosition, WorkerOrder, WorkerRequest,
     };
     use std::io::{Read, Write};
     use std::net::SocketAddr;
@@ -1128,7 +1128,7 @@ mod tests {
         });
 
         let front = HttpFrontend {
-            route: Route::ClusterId(String::from("cluster_1")),
+            cluster_id: Some(String::from("cluster_1")),
             address: "127.0.0.1:1024".parse().unwrap(),
             hostname: String::from("localhost"),
             path: PathRule::Prefix(String::from("/")),
@@ -1221,7 +1221,7 @@ mod tests {
             method: None,
             path: PathRule::Prefix(String::from("/")),
             position: RulePosition::Tree,
-            route: Route::ClusterId(String::from("cluster_1")),
+            cluster_id: Some(String::from("cluster_1")),
             tags: None,
         };
         command
@@ -1349,7 +1349,7 @@ mod tests {
             method: None,
             path: PathRule::Prefix(String::from("/")),
             position: RulePosition::Tree,
-            route: Route::ClusterId(String::from("cluster_1")),
+            cluster_id: Some(String::from("cluster_1")),
             tags: None,
         };
         command
@@ -1456,7 +1456,7 @@ mod tests {
                 method: None,
                 path: PathRule::Prefix(uri1),
                 position: RulePosition::Tree,
-                route: Route::ClusterId(cluster_id1),
+                cluster_id: Some(cluster_id1),
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1467,7 +1467,7 @@ mod tests {
                 method: None,
                 path: PathRule::Prefix(uri2),
                 position: RulePosition::Tree,
-                route: Route::ClusterId(cluster_id2),
+                cluster_id: Some(cluster_id2),
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1478,7 +1478,7 @@ mod tests {
                 method: None,
                 path: PathRule::Prefix(uri3),
                 position: RulePosition::Tree,
-                route: Route::ClusterId(cluster_id3),
+                cluster_id: Some(cluster_id3),
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1489,7 +1489,7 @@ mod tests {
                 method: None,
                 path: PathRule::Prefix("/test".to_owned()),
                 position: RulePosition::Tree,
-                route: Route::ClusterId("cluster_1".to_owned()),
+                cluster_id: Some("cluster_1".to_owned()),
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1517,19 +1517,19 @@ mod tests {
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
         assert_eq!(
             frontend1.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            Some("cluster_1".to_string())
         );
         assert_eq!(
             frontend2.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            Some("cluster_1".to_string())
         );
         assert_eq!(
             frontend3.expect("should find frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            Some("cluster_2".to_string())
         );
         assert_eq!(
             frontend4.expect("should find frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            Some("cluster_3".to_string())
         );
         assert!(frontend5.is_err());
     }

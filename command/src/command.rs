@@ -384,21 +384,21 @@ mod tests {
     use crate::worker::{
         AddCertificate, Backend, BackendMetrics, CertificateAndKey, CertificateFingerprint,
         Cluster, ClusterMetrics, FilteredMetrics, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Percentiles, RemoveBackend, RemoveCertificate, Route,
-        RulePosition, TlsVersion, WorkerMetrics, WorkerOrder,
+        LoadBalancingParams, PathRule, Percentiles, RemoveBackend, RemoveCertificate, RulePosition,
+        TlsVersion, WorkerMetrics, WorkerOrder,
     };
     use hex::FromHex;
     use serde_json;
 
     #[test]
     fn config_message_test() {
-        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "WORKER", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
+        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "WORKER", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "cluster_id": "xxx", "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
         let message: Request = serde_json::from_str(raw_json).unwrap();
         println!("{message:?}");
         assert_eq!(
             message.order,
             Order::Worker(Box::new(WorkerOrder::AddHttpFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
+                cluster_id: Some(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
                 method: None,
@@ -482,7 +482,7 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             order: Order::Worker(Box::new(WorkerOrder::AddHttpFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
+                cluster_id: Some(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
                 method: None,
@@ -501,7 +501,7 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             order: Order::Worker(Box::new(WorkerOrder::RemoveHttpFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
+                cluster_id: Some(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
                 method: None,
@@ -526,7 +526,7 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             order: Order::Worker(Box::new(WorkerOrder::AddHttpsFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
+                cluster_id: Some(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
                 method: None,
@@ -545,7 +545,7 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             order: Order::Worker(Box::new(WorkerOrder::RemoveHttpsFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
+                cluster_id: Some(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
                 method: None,

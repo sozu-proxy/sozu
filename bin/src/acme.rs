@@ -9,7 +9,7 @@ use sozu_command_lib::{
     config::Config,
     worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
-        RemoveBackend, ReplaceCertificate, Route, RulePosition, TlsVersion, WorkerOrder,
+        RemoveBackend, ReplaceCertificate, RulePosition, TlsVersion, WorkerOrder,
     },
 };
 use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};
@@ -285,7 +285,7 @@ fn set_up_proxying(
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
     let add_http_front = WorkerOrder::AddHttpFrontend(HttpFrontend {
-        route: Route::ClusterId(cluster_id.to_owned()),
+        cluster_id: Some(cluster_id.to_owned()),
         hostname: String::from(hostname),
         address: *frontend,
         path: PathRule::Prefix(path_begin.to_owned()),
@@ -318,7 +318,7 @@ fn remove_proxying(
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
     let remove_http_front_order = WorkerOrder::RemoveHttpFrontend(HttpFrontend {
-        route: Route::ClusterId(cluster_id.to_owned()),
+        cluster_id: Some(cluster_id.to_owned()),
         address: *frontend,
         hostname: String::from(hostname),
         path: PathRule::Prefix(path_begin.to_owned()),

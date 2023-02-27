@@ -14,7 +14,7 @@ use crate::sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
     worker,
-    worker::{LoadBalancingParams, PathRule, Route, RulePosition},
+    worker::{LoadBalancingParams, PathRule, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -62,7 +62,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let http_front = worker::HttpFrontend {
-        route: Route::ClusterId(String::from("cluster_1")),
+        cluster_id: Some(String::from("cluster_1")),
         address: "127.0.0.1:8080"
             .parse()
             .with_context(|| "Could not parse frontend address")?,
@@ -138,7 +138,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let tls_front = worker::HttpFrontend {
-        route: Route::ClusterId(String::from("cluster_1")),
+        cluster_id: Some(String::from("cluster_1")),
         address: "127.0.0.1:8443"
             .parse()
             .with_context(|| "Could not parse frontend address")?,
@@ -192,7 +192,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let tls_front2 = worker::HttpFrontend {
-        route: Route::ClusterId(String::from("cluster_2")),
+        cluster_id: Some(String::from("cluster_2")),
         address: "127.0.0.1:8443"
             .parse()
             .with_context(|| "Could not parse frontend address")?,

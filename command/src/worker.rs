@@ -318,19 +318,11 @@ impl std::fmt::Display for PathRule {
     }
 }
 
-/// The cluster to which the traffic will be redirected
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Route {
-    /// send a 401 default answer
-    Deny,
-    /// the cluster to which the frontend belongs
-    ClusterId(ClusterId),
-}
-
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpFrontend {
-    pub route: Route,
+    /// The cluster to which the frontend belongs
+    /// If None, send a 401 default answer
+    pub cluster_id: Option<ClusterId>,
     pub address: SocketAddr,
     pub hostname: String,
     #[serde(default)]
@@ -347,12 +339,19 @@ pub struct HttpFrontend {
 impl HttpFrontend {
     /// `is_cluster_id` check if the frontend is dedicated to the given cluster_id
     pub fn is_cluster_id(&self, cluster_id: &str) -> bool {
-        matches!(&self.route, Route::ClusterId(id) if id == cluster_id)
+        matches!(&self.cluster_id, Some(id) if id == cluster_id)
     }
 
     /// `route_key` returns a representation of the frontend as a route key
     pub fn route_key(&self) -> RouteKey {
         self.into()
+    }
+
+    pub fn display_cluster_id(&self) -> String {
+        match &self.cluster_id {
+            Some(id) => id.clone(),
+            None => String::from("deny"),
+        }
     }
 }
 
@@ -847,14 +846,17 @@ fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     t == &T::default()
 }
 
+/*
+TODO: make sure HttpFrontend.cluster_id is printed as "deny" when None
 impl std::fmt::Display for Route {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Route::Deny => write!(f, "deny"),
-            Route::ClusterId(string) => write!(f, "{string}"),
+            None => write!(f, "deny"),
+            Some(string) => write!(f, "{string}"),
         }
     }
 }
+*/
 
 #[cfg(test)]
 mod tests {
@@ -863,13 +865,13 @@ mod tests {
 
     #[test]
     fn add_front_test() {
-        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": { "CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"cluster_id": "xxx", "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
         let command: WorkerOrder = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
             command
                 == WorkerOrder::AddHttpFrontend(HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
+                    cluster_id: Some(String::from("xxx")),
                     hostname: String::from("yyy"),
                     path: PathRule::Prefix(String::from("xxx")),
                     method: None,
@@ -882,13 +884,13 @@ mod tests {
 
     #[test]
     fn remove_front_test() {
-        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "data": {"cluster_id": "xxx", "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: WorkerOrder = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
             command
                 == WorkerOrder::RemoveHttpFrontend(HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
+                    cluster_id: Some(String::from("xxx")),
                     hostname: String::from("yyy"),
                     path: PathRule::Prefix(String::from("xxx")),
                     method: None,
@@ -937,13 +939,13 @@ mod tests {
 
     #[test]
     fn http_front_crash_test() {
-        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"cluster_id": "aa", "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: WorkerOrder = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
             command
                 == WorkerOrder::AddHttpFrontend(HttpFrontend {
-                    route: Route::ClusterId(String::from("aa")),
+                    cluster_id: Some(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
                     path: PathRule::Prefix(String::from("")),
                     method: None,
@@ -959,13 +961,13 @@ mod tests {
 
     #[test]
     fn http_front_crash_test2() {
-        let raw_json = r#"{"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242" }"#;
+        let raw_json = r#"{"cluster_id": "aa", "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242" }"#;
         let front: HttpFrontend = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{front:?}");
         assert!(
             front
                 == HttpFrontend {
-                    route: Route::ClusterId(String::from("aa")),
+                    cluster_id: Some(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
                     path: PathRule::Prefix(String::from("")),
                     method: None,

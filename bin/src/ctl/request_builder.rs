@@ -212,11 +212,11 @@ impl CommandManager {
                 path_equals,
                 address,
                 method,
-                route,
+                cluster_id,
                 tags,
             } => self.order_command(Order::Worker(Box::new(WorkerOrder::AddHttpFrontend(
                 HttpFrontend {
-                    route: route.into(),
+                    cluster_id,
                     address,
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
@@ -233,10 +233,10 @@ impl CommandManager {
                 path_equals,
                 address,
                 method,
-                route,
+                cluster_id,
             } => self.order_command(Order::Worker(Box::new(WorkerOrder::RemoveHttpFrontend(
                 HttpFrontend {
-                    route: route.into(),
+                    cluster_id,
                     address,
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
@@ -257,11 +257,11 @@ impl CommandManager {
                 path_equals,
                 address,
                 method,
-                route,
+                cluster_id,
                 tags,
             } => self.order_command(Order::Worker(Box::new(WorkerOrder::AddHttpsFrontend(
                 HttpFrontend {
-                    route: route.into(),
+                    cluster_id,
                     address,
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
@@ -277,10 +277,10 @@ impl CommandManager {
                 path_equals,
                 address,
                 method,
-                route,
+                cluster_id,
             } => self.order_command(Order::Worker(Box::new(WorkerOrder::RemoveHttpsFrontend(
                 HttpFrontend {
-                    route: route.into(),
+                    cluster_id,
                     address,
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),

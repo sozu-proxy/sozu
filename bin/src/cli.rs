@@ -1,7 +1,10 @@
 use std::{collections::BTreeMap, net::SocketAddr};
 
 use clap::{Parser, Subcommand};
-use sozu_command_lib::worker::{LoadBalancingAlgorithms, TlsVersion};
+use sozu_command_lib::{
+    state::ClusterId,
+    worker::{LoadBalancingAlgorithms, TlsVersion},
+};
 
 #[derive(Parser, PartialEq, Eq, Clone, Debug)]
 #[clap(author, version, about)]
@@ -427,27 +430,6 @@ pub enum FrontendCmd {
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
-pub enum Route {
-    /// traffic will go to the backend servers with this cluster id
-    Id {
-        /// traffic will go to the backend servers with this cluster id
-        id: String,
-    },
-    /// traffic to this frontend will be rejected with HTTP 401
-    Deny,
-}
-
-#[allow(clippy::from_over_into)]
-impl std::convert::Into<sozu_command_lib::worker::Route> for Route {
-    fn into(self) -> sozu_command_lib::worker::Route {
-        match self {
-            Route::Deny => sozu_command_lib::worker::Route::Deny,
-            Route::Id { id } => sozu_command_lib::worker::Route::ClusterId(id),
-        }
-    }
-}
-
-#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum HttpFrontendCmd {
     #[clap(name = "add")]
     Add {
@@ -457,8 +439,8 @@ pub enum HttpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
-        #[clap(subcommand, name = "route")]
-        route: Route,
+        #[clap(long = "cluster-id", help = "if none, traffic will be denied")]
+        cluster_id: Option<ClusterId>,
         #[clap(long = "hostname", aliases = &["host"])]
         hostname: String,
         #[clap(short = 'p', long = "path-prefix", help = "URL prefix of the frontend")]
@@ -486,8 +468,8 @@ pub enum HttpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
-        #[clap(subcommand, name = "route")]
-        route: Route,
+        #[clap(long = "cluster-id", help = "None if traffic is denied")]
+        cluster_id: Option<ClusterId>,
         #[clap(long = "hostname", aliases = &["host"])]
         hostname: String,
         #[clap(short = 'p', long = "path-prefix", help = "URL prefix of the frontend")]

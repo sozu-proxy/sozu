@@ -21,7 +21,7 @@ use sozu_command::{
     state::ConfigState,
     worker::{
         Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, Route, RulePosition, TcpFrontend,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RulePosition, TcpFrontend,
         TcpListenerConfig, WorkerOrder, WorkerRequest,
     },
 };
@@ -354,7 +354,7 @@ impl Worker {
         address: SocketAddr,
     ) -> HttpFrontend {
         HttpFrontend {
-            route: Route::ClusterId(cluster_id.into()),
+            cluster_id: Some(cluster_id.into()),
             address,
             hostname: String::from("localhost"),
             path: PathRule::Prefix(String::from("/")),

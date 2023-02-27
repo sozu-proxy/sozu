@@ -219,7 +219,7 @@ use time::{Duration, Instant};
 use crate::sozu_command::{
     command::{Event, Response},
     ready::Ready,
-    worker::{Cluster, LoadBalancingParams, Route, WorkerRequest},
+    worker::{Cluster, LoadBalancingParams, WorkerRequest},
 };
 
 use self::{backends::BackendMap, retry::RetryPolicy};
@@ -405,7 +405,7 @@ pub trait L7ListenerHandler {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> anyhow::Result<Route>;
+    ) -> anyhow::Result<Option<ClusterId>>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

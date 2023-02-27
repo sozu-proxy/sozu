@@ -23,7 +23,7 @@ use crate::{
     retry::RetryPolicy,
     server::{push_event, CONN_RETRIES},
     socket::{SocketHandler, SocketResult, TransportProtocol},
-    sozu_command::{command::Event, ready::Ready, worker::Route},
+    sozu_command::{command::Event, ready::Ready},
     timer::TimeoutContainer,
     util::UnwrapLog,
     Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler, L7Proxy,
@@ -1968,8 +1968,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         let cluster_id = match cluster_id_res {
             Ok(route) => match route {
-                Route::ClusterId(cluster_id) => cluster_id,
-                Route::Deny => {
+                Some(cluster_id) => cluster_id,
+                None => {
                     self.set_answer(DefaultAnswerStatus::Answer401, None);
                     bail!("Unauthorized route");
                 }

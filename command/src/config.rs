@@ -18,8 +18,8 @@ use crate::{
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, PathRule, Route, RulePosition, TcpFrontend,
-        TcpListenerConfig, TlsVersion, WorkerOrder,
+        LoadBalancingParams, LoadMetric, PathRule, RulePosition, TcpFrontend, TcpListenerConfig,
+        TlsVersion, WorkerOrder,
     },
 };
 
@@ -615,7 +615,7 @@ impl HttpFrontendConfig {
             }));
 
             v.push(WorkerOrder::AddHttpsFrontend(HttpFrontend {
-                route: Route::ClusterId(cluster_id.to_string()),
+                cluster_id: Some(cluster_id.to_string()),
                 address: self.address,
                 hostname: self.hostname.clone(),
                 path: self.path.clone(),
@@ -626,7 +626,7 @@ impl HttpFrontendConfig {
         } else {
             //create the front both for HTTP and HTTPS if possible
             v.push(WorkerOrder::AddHttpFrontend(HttpFrontend {
-                route: Route::ClusterId(cluster_id.to_string()),
+                cluster_id: Some(cluster_id.to_string()),
                 address: self.address,
                 hostname: self.hostname.clone(),
                 path: self.path.clone(),
