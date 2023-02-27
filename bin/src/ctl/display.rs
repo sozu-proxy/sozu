@@ -15,7 +15,7 @@ use sozu_command_lib::{
 pub fn print_listeners(listeners_list: ListenersList) {
     println!("\nHTTP LISTENERS\n================");
 
-    for (_, (http_listener, activated)) in listeners_list.http_listeners.iter() {
+    for (_, http_listener) in listeners_list.http_listeners.iter() {
         let mut table = Table::new();
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         table.add_row(row![
@@ -34,7 +34,7 @@ pub fn print_listeners(listeners_list: ListenersList) {
         table.add_row(row!["back timeout", http_listener.back_timeout]);
         table.add_row(row!["connect timeout", http_listener.connect_timeout]);
         table.add_row(row!["request timeout", http_listener.request_timeout]);
-        table.add_row(row!["activated", activated]);
+        table.add_row(row!["activated", http_listener.activated]);
         table.printstd();
     }
 

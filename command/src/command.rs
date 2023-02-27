@@ -212,7 +212,7 @@ pub struct ListedFrontends {
 /// the bool indicates if it is active or not
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ListenersList {
-    pub http_listeners: HashMap<SocketAddr, (HttpListenerConfig, bool)>,
+    pub http_listeners: HashMap<SocketAddr, HttpListenerConfig>,
     pub https_listeners: HashMap<SocketAddr, (HttpsListenerConfig, bool)>,
     pub tcp_listeners: HashMap<SocketAddr, (TcpListenerConfig, bool)>,
 }

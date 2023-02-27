@@ -63,7 +63,7 @@ pub struct ConfigState {
     backends: BTreeMap<ClusterId, Vec<Backend>>,
     //pub backends: Vec<BackendsToACluster>, // TODO: maybe put the backends in the Cluster struct
     /// the bool indicates if it is active or not
-    pub http_listeners: HashMap<SocketAddr, (HttpListenerConfig, bool)>,
+    pub http_listeners: HashMap<SocketAddr, HttpListenerConfig>,
     pub https_listeners: HashMap<SocketAddr, (HttpsListenerConfig, bool)>,
     pub tcp_listeners: HashMap<SocketAddr, (TcpListenerConfig, bool)>,
     /// indexed by (address, hostname, path)
@@ -187,7 +187,8 @@ impl ConfigState {
 
     fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> anyhow::Result<()> {
         match self.http_listeners.entry(listener.address) {
-            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
+            // HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
+            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()), // TODO: should we deactivate here?
             HashMapEntry::Occupied(_) => {
                 bail!("The entry is occupied for address {}", listener.address)
             }
@@ -250,7 +251,7 @@ impl ConfigState {
                 if self
                     .http_listeners
                     .get_mut(&activate.address)
-                    .map(|t| t.1 = true)
+                    .map(|listener| listener.activated = true)
                     .is_none()
                 {
                     bail!("No http listener found with address {}", activate.address)
@@ -286,7 +287,7 @@ impl ConfigState {
                 if self
                     .http_listeners
                     .get_mut(&deactivate.address)
-                    .map(|t| t.1 = false)
+                    .map(|listener| listener.activated = false)
                     .is_none()
                 {
                     bail!("No http listener found with address {}", deactivate.address)
@@ -475,9 +476,9 @@ impl ConfigState {
     pub fn generate_orders(&self) -> Vec<WorkerOrder> {
         let mut v = Vec::new();
 
-        for &(ref listener, active) in self.http_listeners.values() {
+        for listener in self.http_listeners.values() {
             v.push(WorkerOrder::AddHttpListener(listener.clone()));
-            if active {
+            if listener.activated {
                 v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::HTTP,
@@ -551,7 +552,7 @@ impl ConfigState {
         for front in self
             .http_listeners
             .iter()
-            .filter(|(_, t)| t.1)
+            .filter(|(_, listener)| listener.activated)
             .map(|(k, _)| k)
         {
             v.push(WorkerOrder::ActivateListener(ActivateListener {
@@ -606,30 +607,30 @@ impl ConfigState {
         let removed_https_listeners = my_https_listeners.difference(&their_https_listeners);
         let added_https_listeners = their_https_listeners.difference(&my_https_listeners);
 
-        let mut v = vec![];
+        let mut diff_orders = vec![];
 
         for address in removed_tcp_listeners {
             if self.tcp_listeners[address].1 {
-                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
+                diff_orders.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::TCP,
                     to_scm: false,
                 }));
             }
 
-            v.push(WorkerOrder::RemoveListener(RemoveListener {
+            diff_orders.push(WorkerOrder::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::TCP,
             }));
         }
 
         for address in added_tcp_listeners.clone() {
-            v.push(WorkerOrder::AddTcpListener(
+            diff_orders.push(WorkerOrder::AddTcpListener(
                 other.tcp_listeners[address].0.clone(),
             ));
 
             if other.tcp_listeners[address].1 {
-                v.push(WorkerOrder::ActivateListener(ActivateListener {
+                diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -638,27 +639,27 @@ impl ConfigState {
         }
 
         for address in removed_http_listeners {
-            if self.http_listeners[address].1 {
-                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
+            if self.http_listeners[address].activated {
+                diff_orders.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::HTTP,
                     to_scm: false,
                 }));
             }
 
-            v.push(WorkerOrder::RemoveListener(RemoveListener {
+            diff_orders.push(WorkerOrder::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::HTTP,
             }));
         }
 
         for address in added_http_listeners.clone() {
-            v.push(WorkerOrder::AddHttpListener(
-                other.http_listeners[address].0.clone(),
+            diff_orders.push(WorkerOrder::AddHttpListener(
+                other.http_listeners[address].clone(),
             ));
 
-            if other.http_listeners[address].1 {
-                v.push(WorkerOrder::ActivateListener(ActivateListener {
+            if other.http_listeners[address].activated {
+                diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
@@ -668,26 +669,26 @@ impl ConfigState {
 
         for address in removed_https_listeners {
             if self.https_listeners[address].1 {
-                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
+                diff_orders.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::HTTPS,
                     to_scm: false,
                 }));
             }
 
-            v.push(WorkerOrder::RemoveListener(RemoveListener {
+            diff_orders.push(WorkerOrder::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::HTTPS,
             }));
         }
 
         for address in added_https_listeners.clone() {
-            v.push(WorkerOrder::AddHttpsListener(
+            diff_orders.push(WorkerOrder::AddHttpsListener(
                 other.https_listeners[address].0.clone(),
             ));
 
             if other.https_listeners[address].1 {
-                v.push(WorkerOrder::ActivateListener(ActivateListener {
+                diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
@@ -700,16 +701,16 @@ impl ConfigState {
             let (their_listener, their_active) = &other.tcp_listeners[addr];
 
             if my_listener != their_listener {
-                v.push(WorkerOrder::RemoveListener(RemoveListener {
+                diff_orders.push(WorkerOrder::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                 }));
 
-                v.push(WorkerOrder::AddTcpListener(their_listener.clone()));
+                diff_orders.push(WorkerOrder::AddTcpListener(their_listener.clone()));
             }
 
             if *my_active && !*their_active {
-                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
+                diff_orders.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                     to_scm: false,
@@ -717,7 +718,7 @@ impl ConfigState {
             }
 
             if !*my_active && *their_active {
-                v.push(WorkerOrder::ActivateListener(ActivateListener {
+                diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -726,28 +727,31 @@ impl ConfigState {
         }
 
         for addr in my_http_listeners.intersection(&their_http_listeners) {
-            let (my_listener, my_active) = &self.http_listeners[addr];
-            let (their_listener, their_active) = &other.http_listeners[addr];
+            let my_listener = &self.http_listeners[addr];
+            let their_listener = other.http_listeners[addr].clone();
 
-            if my_listener != their_listener {
-                v.push(WorkerOrder::RemoveListener(RemoveListener {
+            if my_listener != &their_listener {
+                diff_orders.push(WorkerOrder::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                 }));
 
-                v.push(WorkerOrder::AddHttpListener(their_listener.clone()));
+                diff_orders.push(WorkerOrder::AddHttpListener(HttpListenerConfig {
+                    activated: false,
+                    ..their_listener.clone()
+                }))
             }
 
-            if *my_active && !*their_active {
-                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
+            if my_listener.activated && !their_listener.activated {
+                diff_orders.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                     to_scm: false,
                 }));
             }
 
-            if !*my_active && *their_active {
-                v.push(WorkerOrder::ActivateListener(ActivateListener {
+            if !my_listener.activated && their_listener.activated {
+                diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
@@ -760,16 +764,16 @@ impl ConfigState {
             let (their_listener, their_active) = &other.https_listeners[addr];
 
             if my_listener != their_listener {
-                v.push(WorkerOrder::RemoveListener(RemoveListener {
+                diff_orders.push(WorkerOrder::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                 }));
 
-                v.push(WorkerOrder::AddHttpsListener(their_listener.clone()));
+                diff_orders.push(WorkerOrder::AddHttpsListener(their_listener.clone()));
             }
 
             if *my_active && !*their_active {
-                v.push(WorkerOrder::DeactivateListener(DeactivateListener {
+                diff_orders.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                     to_scm: false,
@@ -777,7 +781,7 @@ impl ConfigState {
             }
 
             if !*my_active && *their_active {
-                v.push(WorkerOrder::ActivateListener(ActivateListener {
+                diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
@@ -787,10 +791,10 @@ impl ConfigState {
 
         for (cluster_id, res) in diff_map(self.clusters.iter(), other.clusters.iter()) {
             match res {
-                DiffResult::Added | DiffResult::Changed => v.push(WorkerOrder::AddCluster(
-                    other.clusters.get(cluster_id).unwrap().clone(),
-                )),
-                DiffResult::Removed => v.push(WorkerOrder::RemoveCluster {
+                DiffResult::Added | DiffResult::Changed => diff_orders.push(
+                    WorkerOrder::AddCluster(other.clusters.get(cluster_id).unwrap().clone()),
+                ),
+                DiffResult::Removed => diff_orders.push(WorkerOrder::RemoveCluster {
                     cluster_id: cluster_id.to_string(),
                 }),
             }
@@ -813,7 +817,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(WorkerOrder::AddBackend(backend.clone()));
+                    diff_orders.push(WorkerOrder::AddBackend(backend.clone()));
                 }
                 DiffResult::Removed => {
                     let backend = self
@@ -822,7 +826,7 @@ impl ConfigState {
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
-                    v.push(WorkerOrder::RemoveBackend(RemoveBackend {
+                    diff_orders.push(WorkerOrder::RemoveBackend(RemoveBackend {
                         cluster_id: backend.cluster_id.clone(),
                         backend_id: backend.backend_id.clone(),
                         address: backend.address,
@@ -835,7 +839,7 @@ impl ConfigState {
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
-                    v.push(WorkerOrder::RemoveBackend(RemoveBackend {
+                    diff_orders.push(WorkerOrder::RemoveBackend(RemoveBackend {
                         cluster_id: backend.cluster_id.clone(),
                         backend_id: backend.backend_id.clone(),
                         address: backend.address,
@@ -846,7 +850,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(WorkerOrder::AddBackend(backend.clone()));
+                    diff_orders.push(WorkerOrder::AddBackend(backend.clone()));
                 }
             }
         }
@@ -864,11 +868,11 @@ impl ConfigState {
         let added_http_fronts = their_http_fronts.difference(&my_http_fronts);
 
         for &(_, front) in removed_http_fronts {
-            v.push(WorkerOrder::RemoveHttpFrontend(front.clone()));
+            diff_orders.push(WorkerOrder::RemoveHttpFrontend(front.clone()));
         }
 
         for &(_, front) in added_http_fronts {
-            v.push(WorkerOrder::AddHttpFrontend(front.clone()));
+            diff_orders.push(WorkerOrder::AddHttpFrontend(front.clone()));
         }
 
         let mut my_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
@@ -883,11 +887,11 @@ impl ConfigState {
         let added_https_fronts = their_https_fronts.difference(&my_https_fronts);
 
         for &(_, front) in removed_https_fronts {
-            v.push(WorkerOrder::RemoveHttpsFrontend(front.clone()));
+            diff_orders.push(WorkerOrder::RemoveHttpsFrontend(front.clone()));
         }
 
         for &(_, front) in added_https_fronts {
-            v.push(WorkerOrder::AddHttpsFrontend(front.clone()));
+            diff_orders.push(WorkerOrder::AddHttpsFrontend(front.clone()));
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
@@ -907,11 +911,11 @@ impl ConfigState {
         let added_tcp_fronts = their_tcp_fronts.difference(&my_tcp_fronts);
 
         for &(_, front) in removed_tcp_fronts {
-            v.push(WorkerOrder::RemoveTcpFrontend(front.clone()));
+            diff_orders.push(WorkerOrder::RemoveTcpFrontend(front.clone()));
         }
 
         for &(_, front) in added_tcp_fronts {
-            v.push(WorkerOrder::AddTcpFrontend(front.clone()));
+            diff_orders.push(WorkerOrder::AddTcpFrontend(front.clone()));
         }
 
         //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -931,7 +935,7 @@ impl ConfigState {
         let added_certificates = their_certificates.difference(&my_certificates);
 
         for &(address, fingerprint) in removed_certificates {
-            v.push(WorkerOrder::RemoveCertificate(RemoveCertificate {
+            diff_orders.push(WorkerOrder::RemoveCertificate(RemoveCertificate {
                 address,
                 fingerprint: fingerprint.clone(),
             }));
@@ -943,7 +947,7 @@ impl ConfigState {
                 .get(&address)
                 .and_then(|certs| certs.get(fingerprint))
             {
-                v.push(WorkerOrder::AddCertificate(AddCertificate {
+                diff_orders.push(WorkerOrder::AddCertificate(AddCertificate {
                     address,
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
@@ -955,7 +959,7 @@ impl ConfigState {
         for address in added_tcp_listeners {
             let listener = &other.tcp_listeners[address];
             if listener.1 {
-                v.push(WorkerOrder::ActivateListener(ActivateListener {
+                diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: listener.0.address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -963,7 +967,7 @@ impl ConfigState {
             }
         }
 
-        v
+        diff_orders
     }
 
     // FIXME: what about deny rules?
@@ -1607,11 +1611,7 @@ mod tests {
         state
             .dispatch(&WorkerOrder::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
-                front_timeout: 60,
-                back_timeout: 30,
-                connect_timeout: 3,
+                ..Default::default()
             }))
             .expect("Could not execute order");
         state
@@ -1624,22 +1624,15 @@ mod tests {
         state
             .dispatch(&WorkerOrder::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
                 answer_404: String::new(),
                 answer_503: String::new(),
                 sticky_name: String::new(),
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
+                ..Default::default()
             }))
             .expect("Could not execute order");
         state
             .dispatch(&WorkerOrder::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
                 answer_404: String::new(),
                 answer_503: String::new(),
                 sticky_name: String::new(),
@@ -1648,13 +1641,7 @@ mod tests {
                 cipher_suites: vec![],
                 signature_algorithms: vec![],
                 groups_list: vec![],
-                certificate: None,
-                certificate_chain: vec![],
-                key: None,
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
+                ..Default::default()
             }))
             .expect("Could not execute order");
         state
@@ -1669,25 +1656,17 @@ mod tests {
         state2
             .dispatch(&WorkerOrder::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
-                public_address: None,
-                expect_proxy: true,
-                front_timeout: 60,
-                back_timeout: 30,
-                connect_timeout: 3,
+                expect_proxy: true, // the difference is here
+                ..Default::default()
             }))
             .expect("Could not execute order");
         state2
             .dispatch(&WorkerOrder::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
-                answer_404: "test".to_string(),
+                answer_404: "test".to_string(), // the difference is here
                 answer_503: String::new(),
                 sticky_name: String::new(),
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
+                ..Default::default()
             }))
             .expect("Could not execute order");
         state2
@@ -1700,9 +1679,7 @@ mod tests {
         state2
             .dispatch(&WorkerOrder::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
-                answer_404: String::from("test"),
+                answer_404: String::from("test"), // the difference is here
                 answer_503: String::new(),
                 sticky_name: String::new(),
                 versions: vec![],
@@ -1710,13 +1687,7 @@ mod tests {
                 cipher_suites: vec![],
                 signature_algorithms: vec![],
                 groups_list: vec![],
-                certificate: None,
-                certificate_chain: vec![],
-                key: None,
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
+                ..Default::default()
             }))
             .expect("Could not execute order");
         state2
@@ -1727,18 +1698,15 @@ mod tests {
             }))
             .expect("Could not execute order");
 
-        let e = vec![
+        let expected_diff = vec![
             WorkerOrder::RemoveListener(RemoveListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
             }),
             WorkerOrder::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
-                public_address: None,
                 expect_proxy: true,
-                front_timeout: 60,
-                back_timeout: 30,
-                connect_timeout: 3,
+                ..Default::default()
             }),
             WorkerOrder::DeactivateListener(DeactivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
@@ -1751,15 +1719,10 @@ mod tests {
             }),
             WorkerOrder::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
                 answer_404: String::from("test"),
                 answer_503: String::new(),
                 sticky_name: String::new(),
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
+                ..Default::default()
             }),
             WorkerOrder::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
@@ -1772,8 +1735,6 @@ mod tests {
             }),
             WorkerOrder::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
                 answer_404: String::from("test"),
                 answer_503: String::new(),
                 sticky_name: String::new(),
@@ -1782,25 +1743,19 @@ mod tests {
                 cipher_suites: vec![],
                 signature_algorithms: vec![],
                 groups_list: vec![],
-                certificate: None,
-                certificate_chain: vec![],
-                key: None,
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
+                ..Default::default()
             }),
         ];
 
-        let diff = state.diff(&state2);
+        let found_diff = state.diff(&state2);
         //let diff: HashSet<&ProxyRequestOrder> = HashSet::from_iter(d.iter());
-        println!("expected diff orders:\n{e:#?}\n");
-        println!("diff orders:\n{diff:#?}\n");
+        println!("expected diff orders:\n{expected_diff:#?}\n");
+        println!("found diff orders:\n{found_diff:#?}\n");
 
         let _hash1 = state.hash_state();
         let _hash2 = state2.hash_state();
 
-        assert_eq!(diff, e);
+        assert_eq!(found_diff, expected_diff);
     }
 }
 
