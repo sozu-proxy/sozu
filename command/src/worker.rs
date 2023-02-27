@@ -713,6 +713,7 @@ pub struct HttpsListenerConfig {
     pub connect_timeout: u32,
     /// max time to send a complete request
     pub request_timeout: u32,
+    pub activated: bool,
 }
 
 impl Default for HttpsListenerConfig {
@@ -736,6 +737,7 @@ impl Default for HttpsListenerConfig {
             back_timeout: 30,
             connect_timeout: 3,
             request_timeout: 10,
+            activated: false,
         }
     }
 }

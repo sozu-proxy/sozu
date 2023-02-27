@@ -40,7 +40,7 @@ pub fn print_listeners(listeners_list: ListenersList) {
 
     println!("\nHTTPS LISTENERS\n================");
 
-    for (_, (https_listener, activated)) in listeners_list.https_listeners.iter() {
+    for (_, https_listener) in listeners_list.https_listeners.iter() {
         let mut table = Table::new();
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         let mut tls_versions = String::new();
@@ -82,7 +82,7 @@ pub fn print_listeners(listeners_list: ListenersList) {
         table.add_row(row!["back timeout", https_listener.back_timeout,]);
         table.add_row(row!["connect timeout", https_listener.connect_timeout,]);
         table.add_row(row!["request timeout", https_listener.request_timeout,]);
-        table.add_row(row!["activated", activated]);
+        table.add_row(row!["activated", https_listener.activated]);
         table.printstd();
     }
 

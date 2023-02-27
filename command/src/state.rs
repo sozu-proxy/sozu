@@ -16,6 +16,7 @@ use serde::de::{self, Visitor};
 use crate::{
     certificate::calculate_fingerprint,
     command::ClusterHash,
+    config::Listener,
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         CertificateWithNames, Cluster, ClusterInformation, DeactivateListener, HttpFrontend,
@@ -64,7 +65,7 @@ pub struct ConfigState {
     //pub backends: Vec<BackendsToACluster>, // TODO: maybe put the backends in the Cluster struct
     /// the bool indicates if it is active or not
     pub http_listeners: HashMap<SocketAddr, HttpListenerConfig>,
-    pub https_listeners: HashMap<SocketAddr, (HttpsListenerConfig, bool)>,
+    pub https_listeners: HashMap<SocketAddr, HttpsListenerConfig>,
     pub tcp_listeners: HashMap<SocketAddr, (TcpListenerConfig, bool)>,
     /// indexed by (address, hostname, path)
     pub http_fronts: BTreeMap<RouteKey, HttpFrontend>,
@@ -198,7 +199,7 @@ impl ConfigState {
 
     fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> anyhow::Result<()> {
         match self.https_listeners.entry(listener.address) {
-            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
+            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()), // TODO: should we deactivate here?
             HashMapEntry::Occupied(_) => {
                 bail!("The entry is occupied for address {}", listener.address)
             }
@@ -261,7 +262,7 @@ impl ConfigState {
                 if self
                     .https_listeners
                     .get_mut(&activate.address)
-                    .map(|t| t.1 = true)
+                    .map(|listener| listener.activated = true)
                     .is_none()
                 {
                     bail!("No https listener found with address {}", activate.address)
@@ -297,7 +298,7 @@ impl ConfigState {
                 if self
                     .https_listeners
                     .get_mut(&deactivate.address)
-                    .map(|t| t.1 = false)
+                    .map(|listener| listener.activated = false)
                     .is_none()
                 {
                     bail!(
@@ -487,9 +488,9 @@ impl ConfigState {
             }
         }
 
-        for &(ref listener, active) in self.https_listeners.values() {
+        for listener in self.https_listeners.values() {
             v.push(WorkerOrder::AddHttpsListener(listener.clone()));
-            if active {
+            if listener.activated {
                 v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::HTTPS,
@@ -565,7 +566,7 @@ impl ConfigState {
         for front in self
             .https_listeners
             .iter()
-            .filter(|(_, t)| t.1)
+            .filter(|(_, listener)| listener.activated)
             .map(|(k, _)| k)
         {
             v.push(WorkerOrder::ActivateListener(ActivateListener {
@@ -668,7 +669,7 @@ impl ConfigState {
         }
 
         for address in removed_https_listeners {
-            if self.https_listeners[address].1 {
+            if self.https_listeners[address].activated {
                 diff_orders.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::HTTPS,
@@ -684,10 +685,10 @@ impl ConfigState {
 
         for address in added_https_listeners.clone() {
             diff_orders.push(WorkerOrder::AddHttpsListener(
-                other.https_listeners[address].0.clone(),
+                other.https_listeners[address].clone(),
             ));
 
-            if other.https_listeners[address].1 {
+            if other.https_listeners[address].activated {
                 diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::HTTPS,
@@ -737,7 +738,7 @@ impl ConfigState {
                 }));
 
                 diff_orders.push(WorkerOrder::AddHttpListener(HttpListenerConfig {
-                    activated: false,
+                    activated: false, // make sure the AddListener order has an unactivated config
                     ..their_listener.clone()
                 }))
             }
@@ -760,19 +761,22 @@ impl ConfigState {
         }
 
         for addr in my_https_listeners.intersection(&their_https_listeners) {
-            let (my_listener, my_active) = &self.https_listeners[addr];
-            let (their_listener, their_active) = &other.https_listeners[addr];
+            let my_listener = &self.https_listeners[addr];
+            let their_listener = other.https_listeners[addr].clone();
 
-            if my_listener != their_listener {
+            if my_listener != &their_listener {
                 diff_orders.push(WorkerOrder::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                 }));
 
-                diff_orders.push(WorkerOrder::AddHttpsListener(their_listener.clone()));
+                diff_orders.push(WorkerOrder::AddHttpsListener(HttpsListenerConfig {
+                    activated: false, // make sure the AddListener order has an unactivated config
+                    ..their_listener.clone()
+                }));
             }
 
-            if *my_active && !*their_active {
+            if my_listener.activated && !their_listener.activated {
                 diff_orders.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
@@ -780,7 +784,7 @@ impl ConfigState {
                 }));
             }
 
-            if !*my_active && *their_active {
+            if !my_listener.activated && their_listener.activated {
                 diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
