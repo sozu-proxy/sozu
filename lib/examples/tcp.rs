@@ -40,11 +40,7 @@ fn main() -> anyhow::Result<()> {
         let buffer_size = 16384;
         let listener = TcpListenerConfig {
             address: "127.0.0.1:8080".parse().expect("could not parse address"),
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
+            ..Default::default()
         };
         Logger::init(
             "TCP".to_string(),

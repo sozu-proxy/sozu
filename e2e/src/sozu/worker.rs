@@ -294,22 +294,13 @@ impl Worker {
     pub fn default_tcp_listener(address: SocketAddr) -> TcpListenerConfig {
         TcpListenerConfig {
             address,
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
+            ..Default::default()
         }
     }
 
     pub fn default_http_listener(address: SocketAddr) -> HttpListenerConfig {
         HttpListenerConfig {
             address,
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
             ..HttpListenerConfig::default()
         }
     }
@@ -317,11 +308,6 @@ impl Worker {
     pub fn default_https_listener(address: SocketAddr) -> HttpsListenerConfig {
         HttpsListenerConfig {
             address,
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
             ..HttpsListenerConfig::default()
         }
     }

@@ -755,6 +755,7 @@ pub struct TcpListenerConfig {
     pub front_timeout: u32,
     pub back_timeout: u32,
     pub connect_timeout: u32,
+    pub activated: bool,
 }
 
 impl Default for TcpListenerConfig {
@@ -766,6 +767,7 @@ impl Default for TcpListenerConfig {
             front_timeout: 60,
             back_timeout: 30,
             connect_timeout: 3,
+            activated: false,
         }
     }
 }

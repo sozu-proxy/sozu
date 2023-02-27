@@ -282,6 +282,7 @@ impl Listener {
             front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
             back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
             connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
+            ..Default::default() // this makes false - is it good?
         })
     }
 

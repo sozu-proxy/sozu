@@ -214,7 +214,7 @@ pub struct ListedFrontends {
 pub struct ListenersList {
     pub http_listeners: HashMap<SocketAddr, HttpListenerConfig>,
     pub https_listeners: HashMap<SocketAddr, HttpsListenerConfig>,
-    pub tcp_listeners: HashMap<SocketAddr, (TcpListenerConfig, bool)>,
+    pub tcp_listeners: HashMap<SocketAddr, TcpListenerConfig>,
 }
 
 /// Responses of the main process to the CLI (or other client)

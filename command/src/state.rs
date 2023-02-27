@@ -16,7 +16,6 @@ use serde::de::{self, Visitor};
 use crate::{
     certificate::calculate_fingerprint,
     command::ClusterHash,
-    config::Listener,
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         CertificateWithNames, Cluster, ClusterInformation, DeactivateListener, HttpFrontend,
@@ -66,7 +65,7 @@ pub struct ConfigState {
     /// the bool indicates if it is active or not
     pub http_listeners: HashMap<SocketAddr, HttpListenerConfig>,
     pub https_listeners: HashMap<SocketAddr, HttpsListenerConfig>,
-    pub tcp_listeners: HashMap<SocketAddr, (TcpListenerConfig, bool)>,
+    pub tcp_listeners: HashMap<SocketAddr, TcpListenerConfig>,
     /// indexed by (address, hostname, path)
     pub http_fronts: BTreeMap<RouteKey, HttpFrontend>,
     /// indexed by (address, hostname, path)
@@ -209,7 +208,7 @@ impl ConfigState {
 
     fn add_tcp_listener(&mut self, listener: &TcpListenerConfig) -> anyhow::Result<()> {
         match self.tcp_listeners.entry(listener.address) {
-            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
+            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             HashMapEntry::Occupied(_) => {
                 bail!("The entry is occupied for address {}", listener.address)
             }
@@ -272,7 +271,7 @@ impl ConfigState {
                 if self
                     .tcp_listeners
                     .get_mut(&activate.address)
-                    .map(|t| t.1 = true)
+                    .map(|listener| listener.activated = true)
                     .is_none()
                 {
                     bail!("No tcp listener found with address {}", activate.address)
@@ -311,7 +310,7 @@ impl ConfigState {
                 if self
                     .tcp_listeners
                     .get_mut(&deactivate.address)
-                    .map(|t| t.1 = false)
+                    .map(|listener| listener.activated = false)
                     .is_none()
                 {
                     bail!("No tcp listener found with address {}", deactivate.address)
@@ -499,9 +498,9 @@ impl ConfigState {
             }
         }
 
-        for &(ref listener, active) in self.tcp_listeners.values() {
+        for listener in self.tcp_listeners.values() {
             v.push(WorkerOrder::AddTcpListener(listener.clone()));
-            if active {
+            if listener.activated {
                 v.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::TCP,
@@ -578,7 +577,7 @@ impl ConfigState {
         for front in self
             .tcp_listeners
             .iter()
-            .filter(|(_, t)| t.1)
+            .filter(|(_, listener)| listener.activated)
             .map(|(k, _)| k)
         {
             v.push(WorkerOrder::ActivateListener(ActivateListener {
@@ -611,7 +610,7 @@ impl ConfigState {
         let mut diff_orders = vec![];
 
         for address in removed_tcp_listeners {
-            if self.tcp_listeners[address].1 {
+            if self.tcp_listeners[address].activated {
                 diff_orders.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::TCP,
@@ -627,10 +626,10 @@ impl ConfigState {
 
         for address in added_tcp_listeners.clone() {
             diff_orders.push(WorkerOrder::AddTcpListener(
-                other.tcp_listeners[address].0.clone(),
+                other.tcp_listeners[address].clone(),
             ));
 
-            if other.tcp_listeners[address].1 {
+            if other.tcp_listeners[address].activated {
                 diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::TCP,
@@ -698,8 +697,8 @@ impl ConfigState {
         }
 
         for addr in my_tcp_listeners.intersection(&their_tcp_listeners) {
-            let (my_listener, my_active) = &self.tcp_listeners[addr];
-            let (their_listener, their_active) = &other.tcp_listeners[addr];
+            let my_listener = &self.tcp_listeners[addr];
+            let their_listener = &other.tcp_listeners[addr];
 
             if my_listener != their_listener {
                 diff_orders.push(WorkerOrder::RemoveListener(RemoveListener {
@@ -707,10 +706,13 @@ impl ConfigState {
                     proxy: ListenerType::TCP,
                 }));
 
-                diff_orders.push(WorkerOrder::AddTcpListener(their_listener.clone()));
+                diff_orders.push(WorkerOrder::AddTcpListener(TcpListenerConfig {
+                    activated: false,
+                    ..their_listener.clone()
+                }));
             }
 
-            if *my_active && !*their_active {
+            if my_listener.activated && !their_listener.activated {
                 diff_orders.push(WorkerOrder::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
@@ -718,7 +720,7 @@ impl ConfigState {
                 }));
             }
 
-            if !*my_active && *their_active {
+            if !my_listener.activated && their_listener.activated {
                 diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
@@ -962,9 +964,9 @@ impl ConfigState {
 
         for address in added_tcp_listeners {
             let listener = &other.tcp_listeners[address];
-            if listener.1 {
+            if listener.activated {
                 diff_orders.push(WorkerOrder::ActivateListener(ActivateListener {
-                    address: listener.0.address,
+                    address: listener.address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
                 }));

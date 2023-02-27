@@ -404,9 +404,7 @@ impl CommandManager {
                     address,
                     public_address,
                     expect_proxy,
-                    front_timeout: 60,
-                    back_timeout: 30,
-                    connect_timeout: 3,
+                    ..Default::default()
                 },
             )))),
             TcpListenerCmd::Remove { address } => self.remove_listener(address, ListenerType::TCP),
