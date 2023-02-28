@@ -45,7 +45,7 @@ pub struct RouteKeyToHttpFrontend {
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigState {
     clusters: BTreeMap<ClusterId, Cluster>,
-    backends: BTreeMap<ClusterId, Vec<Backend>>,
+    backends: BTreeMap<ClusterId, Backends>,
     //pub backends: Vec<BackendsToACluster>, // TODO: maybe put the backends in the Cluster struct
     pub http_listeners: HashMap<SocketAddr, HttpListenerConfig>,
     pub https_listeners: HashMap<SocketAddr, HttpsListenerConfig>,
@@ -59,11 +59,29 @@ pub struct ConfigState {
     certificates: HashMap<SocketAddr, Certificates>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Backends {
+    vec: Vec<Backend>,
+}
+
+impl Backends {
+    fn new() -> Self {
+        Self { vec: Vec::new() }
+    }
+}
+
 /// Contains a map: fingerprint -> certificate
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Certificates {
     map: HashMap<Fingerprint, Certificate>,
 }
+
+/*
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct TcpFrontends {
+    vec: Vec<TcpFrontend>,
+}
+*/
 
 impl Certificates {
     fn new() -> Self {
@@ -428,12 +446,14 @@ impl ConfigState {
         let backends = self
             .backends
             .entry(backend.cluster_id.clone())
-            .or_insert_with(Vec::new);
+            .or_insert_with(Backends::new);
 
         // we might be modifying the sticky id or load balancing parameters
-        backends.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
-        backends.push(backend.clone());
-        backends.sort();
+        backends
+            .vec
+            .retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
+        backends.vec.push(backend.clone());
+        backends.vec.sort();
 
         Ok(())
     }
@@ -449,10 +469,12 @@ impl ConfigState {
                 )
             })?;
 
-        let len = backend_list.len();
-        backend_list.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
-        backend_list.sort();
-        if backend_list.len() == len {
+        let len = backend_list.vec.len();
+        backend_list
+            .vec
+            .retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
+        backend_list.vec.sort();
+        if backend_list.vec.len() == len {
             bail!("Removed no backend");
         }
         Ok(())
@@ -523,7 +545,7 @@ impl ConfigState {
         }
 
         for backend_list in self.backends.values() {
-            for backend in backend_list {
+            for backend in &backend_list.vec {
                 v.push(WorkerOrder::AddBackend(backend.clone()));
             }
         }
@@ -791,12 +813,16 @@ impl ConfigState {
         }
 
         for ((cluster_id, backend_id), res) in diff_map(
-            self.backends.iter().flat_map(|(cluster_id, v)| {
-                v.iter()
+            self.backends.iter().flat_map(|(cluster_id, backends)| {
+                backends
+                    .vec
+                    .iter()
                     .map(move |backend| ((cluster_id, &backend.backend_id), backend))
             }),
-            other.backends.iter().flat_map(|(cluster_id, v)| {
-                v.iter()
+            other.backends.iter().flat_map(|(cluster_id, backends)| {
+                backends
+                    .vec
+                    .iter()
                     .map(move |backend| ((cluster_id, &backend.backend_id), backend))
             }),
         ) {
@@ -805,7 +831,7 @@ impl ConfigState {
                     let backend = other
                         .backends
                         .get(cluster_id)
-                        .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
+                        .and_then(|b| b.vec.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
                     diff_orders.push(WorkerOrder::AddBackend(backend.clone()));
                 }
@@ -813,7 +839,7 @@ impl ConfigState {
                     let backend = self
                         .backends
                         .get(cluster_id)
-                        .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
+                        .and_then(|b| b.vec.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
                     diff_orders.push(WorkerOrder::RemoveBackend(RemoveBackend {
@@ -826,7 +852,7 @@ impl ConfigState {
                     let backend = self
                         .backends
                         .get(cluster_id)
-                        .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
+                        .and_then(|b| b.vec.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
                     diff_orders.push(WorkerOrder::RemoveBackend(RemoveBackend {
@@ -838,7 +864,7 @@ impl ConfigState {
                     let backend = other
                         .backends
                         .get(cluster_id)
-                        .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
+                        .and_then(|b| b.vec.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
                     diff_orders.push(WorkerOrder::AddBackend(backend.clone()));
                 }
@@ -967,8 +993,8 @@ impl ConfigState {
             .map(|cluster_id| {
                 let mut s = DefaultHasher::new();
                 self.clusters.get(cluster_id).hash(&mut s);
-                if let Some(v) = self.backends.get(cluster_id) {
-                    v.iter().collect::<BTreeSet<_>>().hash(&mut s)
+                if let Some(backends) = self.backends.get(cluster_id) {
+                    backends.vec.iter().collect::<BTreeSet<_>>().hash(&mut s)
                 }
                 if let Some(v) = self.tcp_fronts.get(cluster_id) {
                     v.iter().collect::<BTreeSet<_>>().hash(&mut s)
@@ -1035,7 +1061,12 @@ impl ConfigState {
                 .cloned()
                 .collect(),
             tcp_frontends: self.tcp_fronts.get(cluster_id).cloned().unwrap_or_default(),
-            backends: self.backends.get(cluster_id).cloned().unwrap_or_default(),
+            backends: self
+                .backends
+                .get(cluster_id)
+                .cloned()
+                .unwrap_or_default()
+                .vec,
         }
     }
 
@@ -1045,7 +1076,9 @@ impl ConfigState {
     }
 
     pub fn count_backends(&self) -> usize {
-        self.backends.values().fold(0, |acc, v| acc + v.len())
+        self.backends
+            .values()
+            .fold(0, |acc, backends| acc + backends.vec.len())
     }
 
     pub fn count_frontends(&self) -> usize {
@@ -1591,7 +1624,7 @@ mod tests {
             .dispatch(&WorkerOrder::AddBackend(b.clone()))
             .expect("Could not execute order");
 
-        assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
+        assert_eq!(state.backends.get("cluster_1").unwrap().vec, vec![b]);
     }
 
     #[test]
