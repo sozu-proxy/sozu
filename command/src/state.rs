@@ -15,7 +15,7 @@ use serde::de::{self, Visitor};
 
 use crate::{
     certificate::calculate_fingerprint,
-    command::ClusterHash,
+    command::{ClusterHash, FrontendFilters, ListedFrontends},
     worker::{
         ActivateListener, AddCertificate, Backend, Certificate, CertificateWithNames, Cluster,
         ClusterInformation, DeactivateListener, Fingerprint, HttpFrontend, HttpListenerConfig,
@@ -46,7 +46,6 @@ pub struct RouteKeyToHttpFrontend {
 pub struct ConfigState {
     clusters: BTreeMap<ClusterId, Cluster>,
     backends: BTreeMap<ClusterId, Backends>,
-    //pub backends: Vec<BackendsToACluster>, // TODO: maybe put the backends in the Cluster struct
     pub http_listeners: HashMap<SocketAddr, HttpListenerConfig>,
     pub https_listeners: HashMap<SocketAddr, HttpsListenerConfig>,
     pub tcp_listeners: HashMap<SocketAddr, TcpListenerConfig>,
@@ -54,11 +53,13 @@ pub struct ConfigState {
     pub http_fronts: BTreeMap<String, HttpFrontend>,
     /// HTTPS frontends, indexed by RouteKey, a serialization of (address, hostname, path)
     pub https_fronts: BTreeMap<String, HttpFrontend>,
+    /// TCP frontends, in groups that are indexed by the cluster id
     pub tcp_fronts: HashMap<ClusterId, TcpFrontends>,
     /// socket address -> map of certificate
     certificates: HashMap<SocketAddr, Certificates>,
 }
 
+/// contains a list of backends
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Backends {
     vec: Vec<Backend>,
@@ -84,6 +85,7 @@ impl Certificates {
     }
 }
 
+/// contains a list of TCP frontends
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TcpFrontends {
     pub vec: Vec<TcpFrontend>,
@@ -1098,7 +1100,51 @@ impl ConfigState {
             + self.tcp_fronts.values().fold(0, |acc, t| acc + t.vec.len())
     }
 
-    // pub fn list_frontends() {}
+    pub fn list_frontends(&self, filters: FrontendFilters) -> ListedFrontends {
+        // if no http / https / tcp filter is provided, list all of them
+        let list_all = !filters.http && !filters.https && !filters.tcp;
+
+        let mut listed_frontends = ListedFrontends::default();
+
+        if filters.http || list_all {
+            for http_frontend in self.http_fronts.iter().filter(|f| {
+                if let Some(domain) = &filters.domain {
+                    f.1.hostname.contains(domain)
+                } else {
+                    true
+                }
+            }) {
+                listed_frontends
+                    .http_frontends
+                    .push(http_frontend.1.to_owned());
+            }
+        }
+
+        if filters.https || list_all {
+            for https_frontend in self.https_fronts.iter().filter(|f| {
+                if let Some(domain) = &filters.domain {
+                    f.1.hostname.contains(domain)
+                } else {
+                    true
+                }
+            }) {
+                listed_frontends
+                    .https_frontends
+                    .push(https_frontend.1.to_owned());
+            }
+        }
+
+        if (filters.tcp || list_all) && filters.domain.is_none() {
+            for tcp_frontend in self
+                .tcp_fronts
+                .values()
+                .flat_map(|fronts| fronts.vec.iter())
+            {
+                listed_frontends.tcp_frontends.push(tcp_frontend.to_owned())
+            }
+        }
+        listed_frontends
+    }
 }
 
 fn domain_check(
