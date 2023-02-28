@@ -57,10 +57,6 @@ pub struct ConfigState {
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
     /// socket address -> map of certificate
     certificates: HashMap<SocketAddr, Certificates>,
-    //ip, port
-    pub http_addresses: Vec<SocketAddr>,
-    pub https_addresses: Vec<SocketAddr>,
-    //tcp:
 }
 
 /// Contains a map: fingerprint -> certificate
@@ -80,14 +76,6 @@ impl Certificates {
 impl ConfigState {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn add_http_address(&mut self, address: SocketAddr) {
-        self.http_addresses.push(address)
-    }
-
-    pub fn add_https_address(&mut self, address: SocketAddr) {
-        self.https_addresses.push(address)
     }
 
     pub fn dispatch(&mut self, order: &WorkerOrder) -> anyhow::Result<()> {
