@@ -57,7 +57,7 @@ use crate::{
         scm_socket::ScmSocket,
         state::ClusterId,
         worker::{
-            AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
+            AddCertificate, Cluster, Fingerprint, HttpFrontend, HttpsListenerConfig,
             RemoveCertificate, TlsVersion, WorkerOrder, WorkerRequest,
         },
         worker::{RemoveListener, ReplaceCertificate},
@@ -65,7 +65,7 @@ use crate::{
     timer::TimeoutContainer,
     tls::{
         CertificateResolver, GenericCertificateResolverError, MutexWrappedCertificateResolver,
-        ParsedCertificateAndKey,
+        ParsedCertificate,
     },
     util::UnwrapLog,
     AcceptError, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxyConfiguration,
@@ -647,10 +647,7 @@ impl L7ListenerHandler for HttpsListener {
 impl CertificateResolver for HttpsListener {
     type Error = ListenerError;
 
-    fn get_certificate(
-        &self,
-        fingerprint: &CertificateFingerprint,
-    ) -> Option<ParsedCertificateAndKey> {
+    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<ParsedCertificate> {
         let resolver = self
             .resolver
             .0
@@ -664,7 +661,7 @@ impl CertificateResolver for HttpsListener {
     fn add_certificate(
         &mut self,
         opts: &sozu_command_lib::worker::AddCertificate,
-    ) -> Result<CertificateFingerprint, Self::Error> {
+    ) -> Result<Fingerprint, Self::Error> {
         let mut resolver = self
             .resolver
             .0

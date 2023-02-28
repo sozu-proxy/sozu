@@ -119,7 +119,7 @@ fn main() -> anyhow::Result<()> {
     let cert1 = include_str!("../assets/certificate.pem");
     let key1 = include_str!("../assets/key.pem");
 
-    let certificate_and_key = worker::CertificateAndKey {
+    let certificate = worker::Certificate {
         certificate: String::from(cert1),
         key: String::from(key1),
         certificate_chain: vec![],
@@ -132,7 +132,7 @@ fn main() -> anyhow::Result<()> {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
-            certificate: certificate_and_key,
+            certificate: certificate,
             expired_at: None,
         }),
     });
@@ -172,7 +172,7 @@ fn main() -> anyhow::Result<()> {
     let cert2 = include_str!("../assets/cert_test.pem");
     let key2 = include_str!("../assets/key_test.pem");
 
-    let certificate_and_key2 = worker::CertificateAndKey {
+    let certificate2 = worker::Certificate {
         certificate: String::from(cert2),
         key: String::from(key2),
         certificate_chain: vec![],
@@ -186,7 +186,7 @@ fn main() -> anyhow::Result<()> {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
-            certificate: certificate_and_key2,
+            certificate: certificate2,
             expired_at: None,
         }),
     });

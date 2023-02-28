@@ -16,7 +16,7 @@ use crate::{
     certificate::split_certificate_chain,
     command::{Order, Request, PROTOCOL_VERSION},
     worker::{
-        ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
+        ActivateListener, AddCertificate, Backend, Certificate, Cluster, HttpFrontend,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
         LoadBalancingParams, LoadMetric, PathRule, PathRuleKind, RulePosition, TcpFrontend,
         TcpListenerConfig, TlsVersion, WorkerOrder,
@@ -596,7 +596,7 @@ impl HttpFrontendConfig {
         if self.key.is_some() && self.certificate.is_some() {
             v.push(WorkerOrder::AddCertificate(AddCertificate {
                 address: self.address,
-                certificate: CertificateAndKey {
+                certificate: Certificate {
                     key: self.key.clone().unwrap(),
                     certificate: self.certificate.clone().unwrap(),
                     certificate_chain: self.certificate_chain.clone().unwrap_or_default(),

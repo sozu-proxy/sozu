@@ -7,10 +7,10 @@ use sozu_command_lib::{
     command::{FrontendFilters, Order},
     config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
     worker::{
-        ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
-        Cluster, DeactivateListener, HttpFrontend, ListenerType, LoadBalancingParams,
-        MetricsConfiguration, PathRule, RemoveBackend, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, RulePosition, TcpFrontend, TcpListenerConfig, TlsVersion, WorkerOrder,
+        ActivateListener, AddCertificate, Backend, Certificate, Cluster, DeactivateListener,
+        Fingerprint, HttpFrontend, ListenerType, LoadBalancingParams, MetricsConfiguration,
+        PathRule, RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate,
+        RulePosition, TcpFrontend, TcpListenerConfig, TlsVersion, WorkerOrder,
     },
 };
 
@@ -563,9 +563,7 @@ impl CommandManager {
     }
 }
 
-fn get_fingerprint_from_certificate_path(
-    certificate_path: &str,
-) -> anyhow::Result<CertificateFingerprint> {
+fn get_fingerprint_from_certificate_path(certificate_path: &str) -> anyhow::Result<Fingerprint> {
     let bytes = Config::load_file_bytes(certificate_path)
         .with_context(|| format!("could not load certificate file on path {certificate_path}"))?;
 
@@ -573,13 +571,13 @@ fn get_fingerprint_from_certificate_path(
         format!("could not calculate fingerprint for the certificate at {certificate_path}")
     })?;
 
-    Ok(CertificateFingerprint(parsed_bytes))
+    Ok(Fingerprint(parsed_bytes))
 }
 
-fn decode_fingerprint(fingerprint: &str) -> anyhow::Result<CertificateFingerprint> {
+fn decode_fingerprint(fingerprint: &str) -> anyhow::Result<Fingerprint> {
     let bytes = hex::decode(fingerprint)
         .with_context(|| "Failed at decoding the string (expected hexadecimal data)")?;
-    Ok(CertificateFingerprint(bytes))
+    Ok(Fingerprint(bytes))
 }
 
 fn load_full_certificate(
@@ -588,7 +586,7 @@ fn load_full_certificate(
     key_path: &str,
     versions: Vec<TlsVersion>,
     names: Vec<String>,
-) -> Result<CertificateAndKey, anyhow::Error> {
+) -> Result<Certificate, anyhow::Error> {
     let certificate = Config::load_file(certificate_path)
         .with_context(|| format!("Could not load certificate file on path {certificate_path}"))?;
 
@@ -601,7 +599,7 @@ fn load_full_certificate(
     let key = Config::load_file(key_path)
         .with_context(|| format!("Could not load key file on path {key_path}"))?;
 
-    Ok(CertificateAndKey {
+    Ok(Certificate {
         certificate,
         certificate_chain,
         key,

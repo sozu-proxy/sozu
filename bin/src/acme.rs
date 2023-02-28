@@ -8,8 +8,8 @@ use sozu_command_lib::{
     command::{Order, Request, Response, ResponseStatus},
     config::Config,
     worker::{
-        AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
-        RemoveBackend, ReplaceCertificate, RulePosition, TlsVersion, WorkerOrder,
+        AddCertificate, Backend, Certificate, Fingerprint, HttpFrontend, PathRule, RemoveBackend,
+        ReplaceCertificate, RulePosition, TlsVersion, WorkerOrder,
     },
 };
 use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};
@@ -361,7 +361,7 @@ fn add_certificate(
     let certificate_order = match old_fingerprint {
         None => WorkerOrder::AddCertificate(AddCertificate {
             address: *frontend,
-            certificate: CertificateAndKey {
+            certificate: Certificate {
                 certificate,
                 certificate_chain,
                 key,
@@ -373,14 +373,14 @@ fn add_certificate(
 
         Some(f) => WorkerOrder::ReplaceCertificate(ReplaceCertificate {
             address: *frontend,
-            new_certificate: CertificateAndKey {
+            new_certificate: Certificate {
                 certificate,
                 certificate_chain,
                 key,
                 versions: tls_versions.clone(),
                 names: vec![hostname.to_string()],
             },
-            old_fingerprint: CertificateFingerprint(f),
+            old_fingerprint: Fingerprint(f),
             new_expired_at: None,
         }),
     };

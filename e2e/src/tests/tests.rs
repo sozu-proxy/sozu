@@ -12,8 +12,8 @@ use sozu_command_lib::{
     logging::{Logger, LoggerBackend},
     state::ConfigState,
     worker::{
-        ActivateListener, AddCertificate, CertificateAndKey, HttpFrontend, ListenerType,
-        RemoveBackend, WorkerOrder,
+        ActivateListener, AddCertificate, Certificate, HttpFrontend, ListenerType, RemoveBackend,
+        WorkerOrder,
     },
 };
 
@@ -371,7 +371,7 @@ pub fn try_tls_endpoint() -> State {
         ..Worker::default_http_frontend("cluster_0", front_address)
     }));
 
-    let certificate_and_key = CertificateAndKey {
+    let certificate = Certificate {
         certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
         key: String::from(include_str!("../../../lib/assets/local-key.pem")),
         certificate_chain: vec![],
@@ -380,7 +380,7 @@ pub fn try_tls_endpoint() -> State {
     };
     let add_certificate = AddCertificate {
         address: front_address,
-        certificate: certificate_and_key,
+        certificate: certificate,
         expired_at: None,
     };
     worker.send_proxy_request(WorkerOrder::AddCertificate(add_certificate));

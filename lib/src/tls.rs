@@ -13,7 +13,7 @@ use std::{
 use rustls::{
     server::{ClientHello, ResolvesServerCert},
     sign::{CertifiedKey, RsaSigningKey},
-    Certificate, PrivateKey,
+    Certificate as RustlsCertificate, PrivateKey,
 };
 use sha2::{Digest, Sha256};
 use sozu_command::worker::TlsVersion;
@@ -25,7 +25,7 @@ use x509_parser::{
 use crate::{
     router::trie::*,
     sozu_command::worker::{
-        AddCertificate, CertificateAndKey, CertificateFingerprint, RemoveCertificate,
+        AddCertificate, Certificate as SozuCertificate, Fingerprint, RemoveCertificate,
         ReplaceCertificate,
     },
 };
@@ -37,17 +37,11 @@ pub trait CertificateResolver {
     type Error;
 
     // `get_certificate` returns the certificate, its chain and private key
-    fn get_certificate(
-        &self,
-        fingerprint: &CertificateFingerprint,
-    ) -> Option<ParsedCertificateAndKey>;
+    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<ParsedCertificate>;
 
     // `add_certificate` to the certificate resolver, ensures that it is valid and check if it can
     // replace another certificate
-    fn add_certificate(
-        &mut self,
-        opts: &AddCertificate,
-    ) -> Result<CertificateFingerprint, Self::Error>;
+    fn add_certificate(&mut self, opts: &AddCertificate) -> Result<Fingerprint, Self::Error>;
 
     // `remove_certificate` from the certificate resolver, may fail if there is no alternative for
     // a domain name
@@ -59,7 +53,7 @@ pub trait CertificateResolver {
     fn replace_certificate(
         &mut self,
         opts: &ReplaceCertificate,
-    ) -> Result<CertificateFingerprint, Self::Error> {
+    ) -> Result<Fingerprint, Self::Error> {
         let fingerprint = self.add_certificate(&AddCertificate {
             address: opts.address.to_owned(),
             certificate: opts.new_certificate.to_owned(),
@@ -86,20 +80,18 @@ pub trait CertificateResolverHelper {
     fn find_certificates_by_names(
         &self,
         names: &HashSet<String>,
-    ) -> Result<HashSet<CertificateFingerprint>, Self::Error>;
+    ) -> Result<HashSet<Fingerprint>, Self::Error>;
 
     // `certificate_names` returns the hashset of subjects that the certificate is able to handle by
     // parsing the pem file and scrapping the information
     fn certificate_names(&self, pem: &Pem) -> Result<HashSet<String>, Self::Error>;
 
     // `fingerprint` returns the computed fingerprint for the given certificate
-    fn fingerprint(certificate: &Pem) -> CertificateFingerprint;
+    fn fingerprint(certificate: &Pem) -> Fingerprint;
 
     // `parse` ensures that a certificate, its chain and its private key are valid by parsing them
     // and check that the signature algorithm is supported and return them
-    fn parse(
-        certificate_and_key: &CertificateAndKey,
-    ) -> Result<ParsedCertificateAndKey, Self::Error>;
+    fn parse(certificate: &SozuCertificate) -> Result<ParsedCertificate, Self::Error>;
 }
 
 // -----------------------------------------------------------------------------
@@ -129,14 +121,14 @@ impl From<&AddCertificate> for CertificateOverride {
 // ParsedCertificateAndKey struct
 
 #[derive(Debug)]
-pub struct ParsedCertificateAndKey {
+pub struct ParsedCertificate {
     pub certificate: Pem,
     pub chain: Vec<Pem>,
     pub key: String,
     pub versions: Vec<TlsVersion>,
 }
 
-impl Clone for ParsedCertificateAndKey {
+impl Clone for ParsedCertificate {
     fn clone(&self) -> Self {
         let certificate = Pem {
             label: self.certificate.label.to_owned(),
@@ -181,30 +173,24 @@ pub enum GenericCertificateResolverError {
 
 #[derive(Debug)]
 pub struct GenericCertificateResolver {
-    pub domains: TrieNode<CertificateFingerprint>,
-    certificates: HashMap<CertificateFingerprint, ParsedCertificateAndKey>,
-    name_fingerprint_idx: HashMap<String, HashSet<CertificateFingerprint>>,
-    overrides: HashMap<CertificateFingerprint, CertificateOverride>,
+    pub domains: TrieNode<Fingerprint>,
+    certificates: HashMap<Fingerprint, ParsedCertificate>,
+    name_fingerprint_idx: HashMap<String, HashSet<Fingerprint>>,
+    overrides: HashMap<Fingerprint, CertificateOverride>,
 }
 
 impl CertificateResolver for GenericCertificateResolver {
     type Error = GenericCertificateResolverError;
 
-    fn get_certificate(
-        &self,
-        fingerprint: &CertificateFingerprint,
-    ) -> Option<ParsedCertificateAndKey> {
+    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<ParsedCertificate> {
         self.certificates.get(fingerprint).map(ToOwned::to_owned)
     }
 
-    fn add_certificate(
-        &mut self,
-        opts: &AddCertificate,
-    ) -> Result<CertificateFingerprint, Self::Error> {
+    fn add_certificate(&mut self, opts: &AddCertificate) -> Result<Fingerprint, Self::Error> {
         // Check if we could parse the certificate, chain and private key, if not just throw an
         // error.
-        let parsed_certificate_and_key = Self::parse(&opts.certificate)?;
-        let fingerprint = Self::fingerprint(&parsed_certificate_and_key.certificate);
+        let parsed_certificate = Self::parse(&opts.certificate)?;
+        let fingerprint = Self::fingerprint(&parsed_certificate.certificate);
         if !opts.certificate.names.is_empty() || opts.expired_at.is_some() {
             self.overrides
                 .insert(fingerprint.to_owned(), CertificateOverride::from(opts));
@@ -217,8 +203,7 @@ impl CertificateResolver for GenericCertificateResolver {
             return Ok(fingerprint);
         }
 
-        let (ok, certificates_to_remove) =
-            self.should_insert(&fingerprint, &parsed_certificate_and_key)?;
+        let (ok, certificates_to_remove) = self.should_insert(&fingerprint, &parsed_certificate)?;
         if !ok {
             // if we do not need to insert the fingerprint just return the fingerprint
             return Ok(fingerprint);
@@ -226,11 +211,11 @@ impl CertificateResolver for GenericCertificateResolver {
 
         let new_names = match self.get_names_override(&fingerprint) {
             Some(names) => names,
-            None => self.certificate_names(&parsed_certificate_and_key.certificate)?,
+            None => self.certificate_names(&parsed_certificate.certificate)?,
         };
 
         self.certificates
-            .insert(fingerprint.to_owned(), parsed_certificate_and_key);
+            .insert(fingerprint.to_owned(), parsed_certificate);
         for name in new_names {
             self.domains
                 .insert(name.to_owned().into_bytes(), fingerprint.to_owned());
@@ -255,10 +240,10 @@ impl CertificateResolver for GenericCertificateResolver {
     }
 
     fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error> {
-        if let Some(certificate_and_key) = self.get_certificate(&opts.fingerprint) {
+        if let Some(certificate) = self.get_certificate(&opts.fingerprint) {
             let names = match self.get_names_override(&opts.fingerprint) {
                 Some(names) => names,
-                None => self.certificate_names(&certificate_and_key.certificate)?,
+                None => self.certificate_names(&certificate.certificate)?,
             };
 
             if self.is_required_for_domain(&names, &opts.fingerprint) {
@@ -288,7 +273,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
     fn find_certificates_by_names(
         &self,
         names: &HashSet<String>,
-    ) -> Result<HashSet<CertificateFingerprint>, Self::Error> {
+    ) -> Result<HashSet<Fingerprint>, Self::Error> {
         let mut fingerprints = HashSet::new();
         for name in names {
             if let Some(fprints) = self.name_fingerprint_idx.get(name) {
@@ -339,18 +324,16 @@ impl CertificateResolverHelper for GenericCertificateResolver {
         Ok(names)
     }
 
-    fn fingerprint(pem: &Pem) -> CertificateFingerprint {
-        CertificateFingerprint(Sha256::digest(&pem.contents).iter().cloned().collect())
+    fn fingerprint(pem: &Pem) -> Fingerprint {
+        Fingerprint(Sha256::digest(&pem.contents).iter().cloned().collect())
     }
 
-    fn parse(
-        certificate_and_key: &CertificateAndKey,
-    ) -> Result<ParsedCertificateAndKey, Self::Error> {
-        let (_, certificate) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
+    fn parse(sozu_certificate: &SozuCertificate) -> Result<ParsedCertificate, Self::Error> {
+        let (_, pem_parsed_cert) = parse_x509_pem(sozu_certificate.certificate.as_bytes())
             .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
 
         let mut chains = vec![];
-        for chain in &certificate_and_key.certificate_chain {
+        for chain in &sozu_certificate.certificate_chain {
             let (_, chain) = parse_x509_pem(chain.as_bytes())
                 .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
 
@@ -358,45 +341,45 @@ impl CertificateResolverHelper for GenericCertificateResolver {
         }
 
         // try to parse key as rsa private key
-        let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
+        let mut key_reader = BufReader::new(sozu_certificate.key.as_bytes());
         let parsed_keys = rustls_pemfile::rsa_private_keys(&mut key_reader);
         if let Ok(mut keys) = parsed_keys {
             if !keys.is_empty() {
                 let key = PrivateKey(keys.swap_remove(0));
                 if RsaSigningKey::new(&key).is_ok() {
-                    return Ok(ParsedCertificateAndKey {
-                        certificate,
+                    return Ok(ParsedCertificate {
+                        certificate: pem_parsed_cert,
                         chain: chains,
-                        key: certificate_and_key.key.to_owned(),
-                        versions: certificate_and_key.versions.to_owned(),
+                        key: sozu_certificate.key.to_owned(),
+                        versions: sozu_certificate.versions.to_owned(),
                     });
                 }
             }
         }
 
         // try to parse key as pkcs8-encoded private
-        let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
+        let mut key_reader = BufReader::new(sozu_certificate.key.as_bytes());
         let parsed_keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader);
         if let Ok(mut keys) = parsed_keys {
             if !keys.is_empty() {
                 let key = PrivateKey(keys.swap_remove(0));
                 // try to read as rsa private key
                 if RsaSigningKey::new(&key).is_ok() {
-                    return Ok(ParsedCertificateAndKey {
-                        certificate,
+                    return Ok(ParsedCertificate {
+                        certificate: pem_parsed_cert,
                         chain: chains,
-                        key: certificate_and_key.key.to_owned(),
-                        versions: certificate_and_key.versions.to_owned(),
+                        key: sozu_certificate.key.to_owned(),
+                        versions: sozu_certificate.versions.to_owned(),
                     });
                 }
 
                 // try to read as ecdsa private key
                 if rustls::sign::any_ecdsa_type(&key).is_ok() {
-                    return Ok(ParsedCertificateAndKey {
-                        certificate,
+                    return Ok(ParsedCertificate {
+                        certificate: pem_parsed_cert,
                         chain: chains,
-                        key: certificate_and_key.key.to_owned(),
-                        versions: certificate_and_key.versions.to_owned(),
+                        key: sozu_certificate.key.to_owned(),
+                        versions: sozu_certificate.versions.to_owned(),
                     });
                 }
             }
@@ -422,11 +405,7 @@ impl GenericCertificateResolver {
         Self::default()
     }
 
-    fn is_required_for_domain(
-        &self,
-        names: &HashSet<String>,
-        fingerprint: &CertificateFingerprint,
-    ) -> bool {
+    fn is_required_for_domain(&self, names: &HashSet<String>, fingerprint: &Fingerprint) -> bool {
         for name in names {
             if let Some(fingerprints) = self.name_fingerprint_idx.get(name) {
                 if 1 == fingerprints.len() && fingerprints.get(fingerprint).is_some() {
@@ -440,13 +419,11 @@ impl GenericCertificateResolver {
 
     fn should_insert(
         &self,
-        fingerprint: &CertificateFingerprint,
-        parsed_certificate_and_key: &ParsedCertificateAndKey,
-    ) -> Result<
-        (bool, HashMap<CertificateFingerprint, HashSet<String>>),
-        GenericCertificateResolverError,
-    > {
-        let x509 = parsed_certificate_and_key
+        fingerprint: &Fingerprint,
+        parsed_certificate: &ParsedCertificate,
+    ) -> Result<(bool, HashMap<Fingerprint, HashSet<String>>), GenericCertificateResolverError>
+    {
+        let x509 = parsed_certificate
             .certificate
             .parse_x509()
             .map_err(|err| GenericCertificateResolverError::DerParseError(err.to_string()))?;
@@ -454,7 +431,7 @@ impl GenericCertificateResolver {
         // We need to know if the new certificate can replace an already existing one.
         let new_names = match self.get_names_override(fingerprint) {
             Some(names) => names,
-            None => self.certificate_names(&parsed_certificate_and_key.certificate)?,
+            None => self.certificate_names(&parsed_certificate.certificate)?,
         };
 
         let expiration = self
@@ -464,23 +441,23 @@ impl GenericCertificateResolver {
         let fingerprints = self.find_certificates_by_names(&new_names)?;
         let mut certificates = HashMap::new();
         for fingerprint in &fingerprints {
-            if let Some(certificate_and_key) = self.get_certificate(fingerprint) {
-                certificates.insert(fingerprint, certificate_and_key);
+            if let Some(certificate) = self.get_certificate(fingerprint) {
+                certificates.insert(fingerprint, certificate);
             }
         }
 
         let mut should_insert = false;
         let mut certificates_to_remove = HashMap::new();
         let mut certificates_names = HashSet::new();
-        for (fingerprint, certificate_and_key) in certificates {
-            let certificate = certificate_and_key
+        for (fingerprint, certificate) in certificates {
+            let certificate = certificate
                 .certificate
                 .parse_x509()
                 .map_err(|err| GenericCertificateResolverError::DerParseError(err.to_string()))?;
 
             let certificate_names = match self.get_names_override(fingerprint) {
                 Some(names) => names,
-                None => self.certificate_names(&parsed_certificate_and_key.certificate)?,
+                None => self.certificate_names(&parsed_certificate.certificate)?,
             };
 
             let certificate_expiration = self
@@ -519,11 +496,11 @@ impl GenericCertificateResolver {
         Ok((true, certificates_to_remove))
     }
 
-    fn get_expiration_override(&self, fingerprint: &CertificateFingerprint) -> Option<i64> {
+    fn get_expiration_override(&self, fingerprint: &Fingerprint) -> Option<i64> {
         self.overrides.get(fingerprint).and_then(|co| co.expiration)
     }
 
-    fn get_names_override(&self, fingerprint: &CertificateFingerprint) -> Option<HashSet<String>> {
+    fn get_names_override(&self, fingerprint: &Fingerprint) -> Option<HashSet<String>> {
         self.overrides
             .get(fingerprint)
             .and_then(|co| co.names.to_owned())
@@ -533,7 +510,7 @@ impl GenericCertificateResolver {
         &self,
         domain: &[u8],
         accept_wildcard: bool,
-    ) -> Option<&KeyValue<Key, CertificateFingerprint>> {
+    ) -> Option<&KeyValue<Key, Fingerprint>> {
         self.domains.domain_lookup(domain, accept_wildcard)
     }
 }
@@ -592,17 +569,15 @@ impl MutexWrappedCertificateResolver {
         Self::default()
     }
 
-    fn generate_certified_key(
-        certificate_and_key: &ParsedCertificateAndKey,
-    ) -> Option<CertifiedKey> {
-        let mut chains = vec![Certificate(
-            certificate_and_key.certificate.contents.to_owned(),
+    fn generate_certified_key(certificate: &ParsedCertificate) -> Option<CertifiedKey> {
+        let mut chains = vec![RustlsCertificate(
+            certificate.certificate.contents.to_owned(),
         )];
-        for certificate in &certificate_and_key.chain {
-            chains.push(Certificate(certificate.contents.to_owned()));
+        for certificate in &certificate.chain {
+            chains.push(RustlsCertificate(certificate.contents.to_owned()));
         }
 
-        let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
+        let mut key_reader = BufReader::new(certificate.key.as_bytes());
         let parsed_key = rustls_pemfile::rsa_private_keys(&mut key_reader);
 
         if let Ok(mut keys) = parsed_key {
@@ -614,7 +589,7 @@ impl MutexWrappedCertificateResolver {
                     return Some(certified);
                 }
             } else {
-                let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
+                let mut key_reader = BufReader::new(certificate.key.as_bytes());
                 let parsed_key = rustls_pemfile::pkcs8_private_keys(&mut key_reader);
                 if let Ok(mut keys) = parsed_key {
                     if !keys.is_empty() {
@@ -655,7 +630,7 @@ mod tests {
         GenericCertificateResolverError,
     };
 
-    use crate::sozu_command::worker::{AddCertificate, CertificateAndKey, RemoveCertificate};
+    use crate::sozu_command::worker::{AddCertificate, Certificate, RemoveCertificate};
 
     use rand::{seq::SliceRandom, thread_rng};
     use x509_parser::pem::parse_x509_pem;
@@ -664,7 +639,7 @@ mod tests {
     fn lifecycle() -> Result<(), Box<dyn Error + Send + Sync>> {
         let address = "127.0.0.1:8080".parse()?;
         let mut resolver = GenericCertificateResolver::new();
-        let certificate_and_key = CertificateAndKey {
+        let certificate = Certificate {
             certificate: String::from(include_str!("../assets/certificate.pem")),
             key: String::from(include_str!("../assets/key.pem")),
             certificate_chain: vec![],
@@ -672,12 +647,12 @@ mod tests {
             names: vec![],
         };
 
-        let (_, pem) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
+        let (_, pem) = parse_x509_pem(certificate.certificate.as_bytes())
             .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
 
         let fingerprint = resolver.add_certificate(&AddCertificate {
             address,
-            certificate: certificate_and_key,
+            certificate: certificate,
             expired_at: None,
         })?;
 
@@ -714,7 +689,7 @@ mod tests {
     fn name_override() -> Result<(), Box<dyn Error + Send + Sync>> {
         let address = "127.0.0.1:8080".parse()?;
         let mut resolver = GenericCertificateResolver::new();
-        let certificate_and_key = CertificateAndKey {
+        let certificate = Certificate {
             certificate: String::from(include_str!("../assets/certificate.pem")),
             key: String::from(include_str!("../assets/key.pem")),
             certificate_chain: vec![],
@@ -722,12 +697,12 @@ mod tests {
             names: vec!["localhost".into(), "lolcatho.st".into()],
         };
 
-        let (_, pem) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
+        let (_, pem) = parse_x509_pem(certificate.certificate.as_bytes())
             .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
 
         let fingerprint = resolver.add_certificate(&AddCertificate {
             address,
-            certificate: certificate_and_key,
+            certificate: certificate,
             expired_at: None,
         })?;
 
@@ -778,7 +753,7 @@ mod tests {
 
         // ---------------------------------------------------------------------
         // load first certificate
-        let certificate_and_key_1y = CertificateAndKey {
+        let certificate_1y = Certificate {
             certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
             key: String::from(include_str!("../assets/tests/key-1y.pem")),
             certificate_chain: vec![],
@@ -786,13 +761,13 @@ mod tests {
             names: vec![],
         };
 
-        let (_, pem) = parse_x509_pem(certificate_and_key_1y.certificate.as_bytes())
+        let (_, pem) = parse_x509_pem(certificate_1y.certificate.as_bytes())
             .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
 
         let names_1y = resolver.certificate_names(&pem)?;
         let fingerprint_1y = resolver.add_certificate(&AddCertificate {
             address,
-            certificate: certificate_and_key_1y,
+            certificate: certificate_1y,
             expired_at: None,
         })?;
 
@@ -802,7 +777,7 @@ mod tests {
 
         // ---------------------------------------------------------------------
         // load second certificate
-        let certificate_and_key_2y = CertificateAndKey {
+        let certificate_2y = Certificate {
             certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
             key: String::from(include_str!("../assets/tests/key-2y.pem")),
             certificate_chain: vec![],
@@ -812,7 +787,7 @@ mod tests {
 
         let fingerprint_2y = resolver.add_certificate(&AddCertificate {
             address,
-            certificate: certificate_and_key_2y,
+            certificate: certificate_2y,
             expired_at: None,
         })?;
 
@@ -849,7 +824,7 @@ mod tests {
 
         // ---------------------------------------------------------------------
         // load first certificate
-        let certificate_and_key_1y = CertificateAndKey {
+        let certificate_1y = Certificate {
             certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
             key: String::from(include_str!("../assets/tests/key-1y.pem")),
             certificate_chain: vec![],
@@ -857,13 +832,13 @@ mod tests {
             names: vec![],
         };
 
-        let (_, pem) = parse_x509_pem(certificate_and_key_1y.certificate.as_bytes())
+        let (_, pem) = parse_x509_pem(certificate_1y.certificate.as_bytes())
             .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
 
         let names_1y = resolver.certificate_names(&pem)?;
         let fingerprint_1y = resolver.add_certificate(&AddCertificate {
             address,
-            certificate: certificate_and_key_1y,
+            certificate: certificate_1y,
             expired_at: Some(
                 (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
                     + Duration::from_secs(3 * 365 * 24 * 3600))
@@ -877,7 +852,7 @@ mod tests {
 
         // ---------------------------------------------------------------------
         // load second certificate
-        let certificate_and_key_2y = CertificateAndKey {
+        let certificate_2y = Certificate {
             certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
             key: String::from(include_str!("../assets/tests/key-2y.pem")),
             certificate_chain: vec![],
@@ -887,7 +862,7 @@ mod tests {
 
         let fingerprint_2y = resolver.add_certificate(&AddCertificate {
             address,
-            certificate: certificate_and_key_2y,
+            certificate: certificate_2y,
             expired_at: None,
         })?;
 
@@ -922,42 +897,42 @@ mod tests {
         // ---------------------------------------------------------------------
         // load certificates
         let mut certificates = vec![
-            CertificateAndKey {
+            Certificate {
                 certificate: include_str!("../assets/tests/certificate-1.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],
                 versions: vec![],
                 names: vec![],
             },
-            CertificateAndKey {
+            Certificate {
                 certificate: include_str!("../assets/tests/certificate-2.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],
                 versions: vec![],
                 names: vec![],
             },
-            CertificateAndKey {
+            Certificate {
                 certificate: include_str!("../assets/tests/certificate-3.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],
                 versions: vec![],
                 names: vec![],
             },
-            CertificateAndKey {
+            Certificate {
                 certificate: include_str!("../assets/tests/certificate-4.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],
                 versions: vec![],
                 names: vec![],
             },
-            CertificateAndKey {
+            Certificate {
                 certificate: include_str!("../assets/tests/certificate-5.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],
                 versions: vec![],
                 names: vec![],
             },
-            CertificateAndKey {
+            Certificate {
                 certificate: include_str!("../assets/tests/certificate-6.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],

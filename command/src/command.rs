@@ -382,10 +382,10 @@ mod tests {
     use crate::certificate::split_certificate_chain;
     use crate::config::ProxyProtocolConfig;
     use crate::worker::{
-        AddCertificate, Backend, BackendMetrics, CertificateAndKey, CertificateFingerprint,
-        Cluster, ClusterMetrics, FilteredMetrics, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Percentiles, RemoveBackend, RemoveCertificate, RulePosition,
-        TlsVersion, WorkerMetrics, WorkerOrder,
+        AddCertificate, Backend, BackendMetrics, Certificate, Cluster, ClusterMetrics,
+        FilteredMetrics, Fingerprint, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams,
+        PathRule, Percentiles, RemoveBackend, RemoveCertificate, RulePosition, TlsVersion,
+        WorkerMetrics, WorkerOrder,
     };
     use hex::FromHex;
     use serde_json;
@@ -575,7 +575,7 @@ mod tests {
             version: 0,
             order: Order::Worker(Box::new(WorkerOrder::AddCertificate(AddCertificate {
                 address: "0.0.0.0:443".parse().unwrap(),
-                certificate: CertificateAndKey {
+                certificate: Certificate {
                     certificate: String::from(CERTIFICATE),
                     certificate_chain: split_certificate_chain(String::from(CHAIN)),
                     key: String::from(KEY),
@@ -597,7 +597,7 @@ mod tests {
             order: Order::Worker(Box::new(WorkerOrder::RemoveCertificate(
                 RemoveCertificate {
                     address: "0.0.0.0:443".parse().unwrap(),
-                    fingerprint: CertificateFingerprint(
+                    fingerprint: Fingerprint(
                         FromHex::from_hex(
                             "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
                         )

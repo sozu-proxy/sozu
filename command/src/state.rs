@@ -17,11 +17,11 @@ use crate::{
     certificate::calculate_fingerprint,
     command::ClusterHash,
     worker::{
-        ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
-        CertificateWithNames, Cluster, ClusterInformation, DeactivateListener, HttpFrontend,
-        HttpListenerConfig, HttpsListenerConfig, ListenerType, PathRule, PathRuleKind,
-        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, TcpFrontend,
-        TcpListenerConfig, WorkerOrder,
+        ActivateListener, AddCertificate, Backend, Certificate, CertificateWithNames, Cluster,
+        ClusterInformation, DeactivateListener, Fingerprint, HttpFrontend, HttpListenerConfig,
+        HttpsListenerConfig, ListenerType, PathRule, PathRuleKind, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, TcpFrontend, TcpListenerConfig,
+        WorkerOrder,
     },
 };
 
@@ -55,12 +55,26 @@ pub struct ConfigState {
     /// indexed by (address, hostname, path)
     pub https_fronts: BTreeMap<RouteKey, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
-    /// certificate and names
-    certificates: HashMap<SocketAddr, HashMap<CertificateFingerprint, CertificateAndKey>>,
+    /// socket address -> map of certificate
+    certificates: HashMap<SocketAddr, Certificates>,
     //ip, port
     pub http_addresses: Vec<SocketAddr>,
     pub https_addresses: Vec<SocketAddr>,
     //tcp:
+}
+
+/// Contains a map: fingerprint -> certificate
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Certificates {
+    map: HashMap<Fingerprint, Certificate>,
+}
+
+impl Certificates {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
 }
 
 impl ConfigState {
@@ -170,7 +184,6 @@ impl ConfigState {
 
     fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> anyhow::Result<()> {
         match self.http_listeners.entry(listener.address) {
-            // HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
             HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()), // TODO: should we deactivate here?
             HashMapEntry::Occupied(_) => {
                 bail!("The entry is occupied for address {}", listener.address)
@@ -326,7 +339,7 @@ impl ConfigState {
     }
 
     fn add_certificate(&mut self, add: &AddCertificate) -> anyhow::Result<()> {
-        let fingerprint = CertificateFingerprint(
+        let fingerprint = Fingerprint(
             calculate_fingerprint(add.certificate.certificate.as_bytes())
                 .with_context(|| "cannot calculate the certificate's fingerprint")?,
         );
@@ -334,20 +347,20 @@ impl ConfigState {
         let entry = self
             .certificates
             .entry(add.address)
-            .or_insert_with(HashMap::new);
+            .or_insert_with(Certificates::new);
 
-        if entry.contains_key(&fingerprint) {
+        if entry.map.contains_key(&fingerprint) {
             info!("Skip loading of certificate '{}' for domain '{}' on listener '{}', the certificate is already present.", fingerprint, add.certificate.names.join(", "), add.address);
             return Ok(());
         }
 
-        entry.insert(fingerprint, add.certificate.clone());
+        entry.map.insert(fingerprint, add.certificate.clone());
         Ok(())
     }
 
     fn remove_certificate(&mut self, remove: &RemoveCertificate) -> anyhow::Result<()> {
-        if let Some(index) = self.certificates.get_mut(&remove.address) {
-            index.remove(&remove.fingerprint);
+        if let Some(certificates) = self.certificates.get_mut(&remove.address) {
+            certificates.map.remove(&remove.fingerprint);
         }
 
         Ok(())
@@ -361,16 +374,19 @@ impl ConfigState {
         self.certificates
             .get_mut(&replace.address)
             .with_context(|| format!("No certificate to replace for address {}", replace.address))?
+            .map
             .remove(&replace.old_fingerprint);
 
-        let new_fingerprint = CertificateFingerprint(
+        let new_fingerprint = Fingerprint(
             calculate_fingerprint(replace.new_certificate.certificate.as_bytes())
                 .with_context(|| "cannot obtain the certificate's fingerprint")?,
         );
 
-        self.certificates
-            .get_mut(&replace.address)
-            .map(|certs| certs.insert(new_fingerprint.clone(), replace.new_certificate.clone()));
+        self.certificates.get_mut(&replace.address).map(|certs| {
+            certs
+                .map
+                .insert(new_fingerprint.clone(), replace.new_certificate.clone())
+        });
 
         if !self
             .certificates
@@ -378,6 +394,7 @@ impl ConfigState {
             .with_context(|| {
                 "Unlikely error. This entry in the certificate hashmap should be present"
             })?
+            .map
             .contains_key(&new_fingerprint)
         {
             bail!(format!(
@@ -498,10 +515,10 @@ impl ConfigState {
         }
 
         for (front, certs) in self.certificates.iter() {
-            for certificate_and_key in certs.values() {
+            for certificate in certs.map.values() {
                 v.push(WorkerOrder::AddCertificate(AddCertificate {
                     address: *front,
-                    certificate: certificate_and_key.clone(),
+                    certificate: certificate.clone(),
                     expired_at: None,
                 }));
             }
@@ -904,16 +921,16 @@ impl ConfigState {
         }
 
         //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
-        let my_certificates: HashSet<(SocketAddr, &CertificateFingerprint)> = HashSet::from_iter(
+        let my_certificates: HashSet<(SocketAddr, &Fingerprint)> = HashSet::from_iter(
             self.certificates
                 .iter()
-                .flat_map(|(addr, certs)| repeat(*addr).zip(certs.keys())),
+                .flat_map(|(addr, certs)| repeat(*addr).zip(certs.map.keys())),
         );
-        let their_certificates: HashSet<(SocketAddr, &CertificateFingerprint)> = HashSet::from_iter(
+        let their_certificates: HashSet<(SocketAddr, &Fingerprint)> = HashSet::from_iter(
             other
                 .certificates
                 .iter()
-                .flat_map(|(addr, certs)| repeat(*addr).zip(certs.keys())),
+                .flat_map(|(addr, certs)| repeat(*addr).zip(certs.map.keys())),
         );
 
         let removed_certificates = my_certificates.difference(&their_certificates);
@@ -927,14 +944,14 @@ impl ConfigState {
         }
 
         for &(address, fingerprint) in added_certificates {
-            if let Some(certificate_and_key) = other
+            if let Some(certificate) = other
                 .certificates
                 .get(&address)
-                .and_then(|certs| certs.get(fingerprint))
+                .and_then(|certs| certs.map.get(fingerprint))
             {
                 diff_orders.push(WorkerOrder::AddCertificate(AddCertificate {
                     address,
-                    certificate: certificate_and_key.clone(),
+                    certificate: certificate.clone(),
                     expired_at: None,
                 }));
             }
@@ -1098,7 +1115,7 @@ pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<Certif
     state
         .certificates
         .values()
-        .filter_map(|h| h.get(&CertificateFingerprint(fingerprint.to_vec())))
+        .filter_map(|certs| certs.map.get(&Fingerprint(fingerprint.to_vec())))
         .map(|cert| CertificateWithNames {
             certificate: cert.certificate.clone(),
             names: cert.names.clone(),
