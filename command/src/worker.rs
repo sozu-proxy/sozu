@@ -402,6 +402,7 @@ impl HttpFrontend {
     }
 }
 
+/// Everything necessary to add a certificate
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CertificateAndKey {
     pub certificate: String,
@@ -410,15 +411,15 @@ pub struct CertificateAndKey {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub versions: Vec<TlsVersion>,
+    /// hostnames linked to the certificate
+    #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
+    pub names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AddCertificate {
     pub address: SocketAddr,
     pub certificate: CertificateAndKey,
-    /// hostnames linked to the certificate
-    #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
-    pub names: Vec<String>,
     /// The `expired_at` override certificate expiration, the value of the field
     /// is a unix timestamp
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -436,9 +437,11 @@ pub struct ReplaceCertificate {
     pub address: SocketAddr,
     pub new_certificate: CertificateAndKey,
     pub old_fingerprint: CertificateFingerprint,
+    /*
     /// hostnames linked to the certificate
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
     pub new_names: Vec<String>,
+    */
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_expired_at: Option<i64>,
 }

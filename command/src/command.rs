@@ -580,8 +580,8 @@ mod tests {
                     certificate_chain: split_certificate_chain(String::from(CHAIN)),
                     key: String::from(KEY),
                     versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
+                    names: vec![],
                 },
-                names: vec![],
                 expired_at: None,
             }))),
             worker_id: None

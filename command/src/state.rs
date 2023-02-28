@@ -28,21 +28,6 @@ use crate::{
 /// To use throughout Sōzu
 pub type ClusterId = String;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HttpProxy {
-    address: SocketAddr,
-    fronts: HashMap<ClusterId, Vec<HttpFrontend>>,
-    backends: HashMap<ClusterId, Vec<Backend>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HttpsProxy {
-    address: SocketAddr,
-    certificates: HashMap<CertificateFingerprint, CertificateAndKey>,
-    fronts: HashMap<ClusterId, Vec<HttpFrontend>>,
-    backends: HashMap<ClusterId, Vec<Backend>>,
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendsToACluster {
     pub cluster_id: ClusterId,
@@ -62,7 +47,6 @@ pub struct ConfigState {
     clusters: BTreeMap<ClusterId, Cluster>,
     backends: BTreeMap<ClusterId, Vec<Backend>>,
     //pub backends: Vec<BackendsToACluster>, // TODO: maybe put the backends in the Cluster struct
-    /// the bool indicates if it is active or not
     pub http_listeners: HashMap<SocketAddr, HttpListenerConfig>,
     pub https_listeners: HashMap<SocketAddr, HttpsListenerConfig>,
     pub tcp_listeners: HashMap<SocketAddr, TcpListenerConfig>,
@@ -72,7 +56,7 @@ pub struct ConfigState {
     pub https_fronts: BTreeMap<RouteKey, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
     /// certificate and names
-    pub certificates:
+    certificates:
         HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
     //ip, port
     pub http_addresses: Vec<SocketAddr>,
@@ -354,11 +338,14 @@ impl ConfigState {
             .or_insert_with(HashMap::new);
 
         if entry.contains_key(&fingerprint) {
-            info!("Skip loading of certificate '{}' for domain '{}' on listener '{}', the certificate is already present.", fingerprint, add.names.join(", "), add.address);
+            info!("Skip loading of certificate '{}' for domain '{}' on listener '{}', the certificate is already present.", fingerprint, add.certificate.names.join(", "), add.address);
             return Ok(());
         }
 
-        entry.insert(fingerprint, (add.certificate.clone(), add.names.clone()));
+        entry.insert(
+            fingerprint,
+            (add.certificate.clone(), add.certificate.names.clone()),
+        );
         Ok(())
     }
 
@@ -388,7 +375,10 @@ impl ConfigState {
         self.certificates.get_mut(&replace.address).map(|certs| {
             certs.insert(
                 new_fingerprint.clone(),
-                (replace.new_certificate.clone(), replace.new_names.clone()),
+                (
+                    replace.new_certificate.clone(),
+                    replace.new_certificate.names.clone(),
+                ),
             )
         });
 
@@ -522,7 +512,7 @@ impl ConfigState {
                 v.push(WorkerOrder::AddCertificate(AddCertificate {
                     address: *front,
                     certificate: certificate_and_key.clone(),
-                    names: names.clone(),
+                    // names: names.clone(),
                     expired_at: None,
                 }));
             }
@@ -956,7 +946,6 @@ impl ConfigState {
                 diff_orders.push(WorkerOrder::AddCertificate(AddCertificate {
                     address,
                     certificate: certificate_and_key.clone(),
-                    names: names.clone(),
                     expired_at: None,
                 }));
             }

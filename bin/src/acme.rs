@@ -366,8 +366,8 @@ fn add_certificate(
                 certificate_chain,
                 key,
                 versions: tls_versions.clone(),
+                names: vec![hostname.to_string()],
             },
-            names: vec![hostname.to_string()],
             expired_at: None,
         }),
 
@@ -378,9 +378,9 @@ fn add_certificate(
                 certificate_chain,
                 key,
                 versions: tls_versions.clone(),
+                names: vec![hostname.to_string()],
             },
             old_fingerprint: CertificateFingerprint(f),
-            new_names: vec![hostname.to_string()],
             new_expired_at: None,
         }),
     };

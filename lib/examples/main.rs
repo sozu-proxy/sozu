@@ -124,6 +124,7 @@ fn main() -> anyhow::Result<()> {
         key: String::from(key1),
         certificate_chain: vec![],
         versions: vec![],
+        names: vec![],
     };
     command2.write_message(&worker::WorkerRequest {
         id: String::from("ID_IJKL1"),
@@ -132,7 +133,6 @@ fn main() -> anyhow::Result<()> {
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
             certificate: certificate_and_key,
-            names: vec![],
             expired_at: None,
         }),
     });
@@ -177,6 +177,7 @@ fn main() -> anyhow::Result<()> {
         key: String::from(key2),
         certificate_chain: vec![],
         versions: vec![],
+        names: vec![],
     };
 
     command2.write_message(&worker::WorkerRequest {
@@ -186,7 +187,6 @@ fn main() -> anyhow::Result<()> {
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
             certificate: certificate_and_key2,
-            names: vec![],
             expired_at: None,
         }),
     });
