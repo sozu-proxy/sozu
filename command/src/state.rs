@@ -50,10 +50,10 @@ pub struct ConfigState {
     pub http_listeners: HashMap<SocketAddr, HttpListenerConfig>,
     pub https_listeners: HashMap<SocketAddr, HttpsListenerConfig>,
     pub tcp_listeners: HashMap<SocketAddr, TcpListenerConfig>,
-    /// indexed by (address, hostname, path)
-    pub http_fronts: BTreeMap<RouteKey, HttpFrontend>,
-    /// indexed by (address, hostname, path)
-    pub https_fronts: BTreeMap<RouteKey, HttpFrontend>,
+    /// HTTP frontends, indexed by RouteKey, a serialization of (address, hostname, path)
+    pub http_fronts: BTreeMap<String, HttpFrontend>,
+    /// HTTPS frontends, indexed by RouteKey, a serialization of (address, hostname, path)
+    pub https_fronts: BTreeMap<String, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
     /// socket address -> map of certificate
     certificates: HashMap<SocketAddr, Certificates>,
@@ -317,7 +317,7 @@ impl ConfigState {
     }
 
     fn add_http_frontend(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
-        match self.http_fronts.entry(front.route_key()) {
+        match self.http_fronts.entry(front.route_key()?) {
             BTreeMapEntry::Vacant(e) => e.insert(front.clone()),
             BTreeMapEntry::Occupied(_) => bail!("This frontend is already present: {:?}", front),
         };
@@ -325,7 +325,7 @@ impl ConfigState {
     }
 
     fn remove_http_frontend(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
-        if self.http_fronts.remove(&front.route_key()).is_none() {
+        if self.http_fronts.remove(&front.route_key()?).is_none() {
             let error_msg = match &front.cluster_id {
                 Some(cluster_id) => format!(
                     "No such frontend at {} for the cluster {}",
@@ -857,11 +857,11 @@ impl ConfigState {
             }
         }
 
-        let mut my_http_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
+        let mut my_http_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
         for (route, front) in self.http_fronts.iter() {
             my_http_fronts.insert((route, front));
         }
-        let mut their_http_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
+        let mut their_http_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
         for (route, front) in other.http_fronts.iter() {
             their_http_fronts.insert((route, front));
         }
@@ -877,11 +877,11 @@ impl ConfigState {
             diff_orders.push(WorkerOrder::AddHttpFrontend(front.clone()));
         }
 
-        let mut my_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
+        let mut my_https_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
         for (route, front) in self.https_fronts.iter() {
             my_https_fronts.insert((route, front));
         }
-        let mut their_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
+        let mut their_https_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
         for (route, front) in other.https_fronts.iter() {
             their_https_fronts.insert((route, front));
         }
@@ -1761,6 +1761,7 @@ mod tests {
 }
 
 /// `RouteKey` is the routing key built from the following tuple.
+/// Once serialized, it is used as a unique key in maps to identify a frontend
 #[derive(PartialOrd, Ord, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteKey {
     pub address: SocketAddr,

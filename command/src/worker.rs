@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr, str::FromStr,
 };
 
+use anyhow::Context;
 use hex::{self, FromHex};
 use serde::{
     self,
@@ -390,8 +391,10 @@ impl HttpFrontend {
     }
 
     /// `route_key` returns a representation of the frontend as a route key
-    pub fn route_key(&self) -> RouteKey {
-        self.into()
+    pub fn route_key(&self) -> anyhow::Result<String> {
+        let route_key = RouteKey::from(self);
+        serde_json::to_string(&route_key)
+            .with_context(|| "could not serialize route key for this frontend")
     }
 
     pub fn display_cluster_id(&self) -> String {
