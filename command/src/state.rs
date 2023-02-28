@@ -54,7 +54,7 @@ pub struct ConfigState {
     pub http_fronts: BTreeMap<String, HttpFrontend>,
     /// HTTPS frontends, indexed by RouteKey, a serialization of (address, hostname, path)
     pub https_fronts: BTreeMap<String, HttpFrontend>,
-    pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
+    pub tcp_fronts: HashMap<ClusterId, TcpFrontends>,
     /// socket address -> map of certificate
     certificates: HashMap<SocketAddr, Certificates>,
 }
@@ -76,18 +76,22 @@ struct Certificates {
     map: HashMap<Fingerprint, Certificate>,
 }
 
-/*
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct TcpFrontends {
-    vec: Vec<TcpFrontend>,
-}
-*/
-
 impl Certificates {
     fn new() -> Self {
         Self {
             map: HashMap::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpFrontends {
+    pub vec: Vec<TcpFrontend>,
+}
+
+impl TcpFrontends {
+    fn new() -> Self {
+        Self { vec: Vec::new() }
     }
 }
 
@@ -415,11 +419,11 @@ impl ConfigState {
         let tcp_frontends = self
             .tcp_fronts
             .entry(front.cluster_id.clone())
-            .or_insert_with(Vec::new);
-        if tcp_frontends.contains(front) {
+            .or_insert_with(TcpFrontends::new);
+        if tcp_frontends.vec.contains(front) {
             bail!("This tcp frontend is already present: {:?}", front);
         }
-        tcp_frontends.push(front.clone());
+        tcp_frontends.vec.push(front.clone());
         Ok(())
     }
 
@@ -434,9 +438,11 @@ impl ConfigState {
                 )
             })?;
 
-        let len = tcp_frontends.len();
-        tcp_frontends.retain(|front| front.address != front_to_remove.address);
-        if tcp_frontends.len() == len {
+        let len = tcp_frontends.vec.len();
+        tcp_frontends
+            .vec
+            .retain(|front| front.address != front_to_remove.address);
+        if tcp_frontends.vec.len() == len {
             bail!("Removed no frontend");
         }
         Ok(())
@@ -539,7 +545,7 @@ impl ConfigState {
         }
 
         for front_list in self.tcp_fronts.values() {
-            for front in front_list {
+            for front in &front_list.vec {
                 v.push(WorkerOrder::AddTcpFrontend(front.clone()));
             }
         }
@@ -912,13 +918,13 @@ impl ConfigState {
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
         for (cluster_id, front_list) in self.tcp_fronts.iter() {
-            for front in front_list.iter() {
+            for front in &front_list.vec {
                 my_tcp_fronts.insert((cluster_id, front));
             }
         }
         let mut their_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
         for (cluster_id, front_list) in other.tcp_fronts.iter() {
-            for front in front_list.iter() {
+            for front in &front_list.vec {
                 their_tcp_fronts.insert((cluster_id, front));
             }
         }
@@ -996,8 +1002,8 @@ impl ConfigState {
                 if let Some(backends) = self.backends.get(cluster_id) {
                     backends.vec.iter().collect::<BTreeSet<_>>().hash(&mut s)
                 }
-                if let Some(v) = self.tcp_fronts.get(cluster_id) {
-                    v.iter().collect::<BTreeSet<_>>().hash(&mut s)
+                if let Some(tcp_fronts) = self.tcp_fronts.get(cluster_id) {
+                    tcp_fronts.vec.iter().collect::<BTreeSet<_>>().hash(&mut s)
                 }
                 (cluster_id.to_string(), s)
             })
@@ -1060,7 +1066,12 @@ impl ConfigState {
                 })
                 .cloned()
                 .collect(),
-            tcp_frontends: self.tcp_fronts.get(cluster_id).cloned().unwrap_or_default(),
+            tcp_frontends: self
+                .tcp_fronts
+                .get(cluster_id)
+                .cloned()
+                .unwrap_or_default()
+                .vec,
             backends: self
                 .backends
                 .get(cluster_id)
@@ -1084,8 +1095,10 @@ impl ConfigState {
     pub fn count_frontends(&self) -> usize {
         self.http_fronts.values().count()
             + self.https_fronts.values().count()
-            + self.tcp_fronts.values().fold(0, |acc, v| acc + v.len())
+            + self.tcp_fronts.values().fold(0, |acc, t| acc + t.vec.len())
     }
+
+    // pub fn list_frontends() {}
 }
 
 fn domain_check(

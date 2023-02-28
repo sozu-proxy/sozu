@@ -415,7 +415,12 @@ impl CommandServer {
         }
 
         if (filters.tcp || list_all) && filters.domain.is_none() {
-            for tcp_frontend in self.state.tcp_fronts.values().flat_map(|v| v.iter()) {
+            for tcp_frontend in self
+                .state
+                .tcp_fronts
+                .values()
+                .flat_map(|fronts| fronts.vec.iter())
+            {
                 listed_frontends.tcp_frontends.push(tcp_frontend.to_owned())
             }
         }
