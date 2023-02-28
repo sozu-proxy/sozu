@@ -56,8 +56,7 @@ pub struct ConfigState {
     pub https_fronts: BTreeMap<RouteKey, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
     /// certificate and names
-    certificates:
-        HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
+    certificates: HashMap<SocketAddr, HashMap<CertificateFingerprint, CertificateAndKey>>,
     //ip, port
     pub http_addresses: Vec<SocketAddr>,
     pub https_addresses: Vec<SocketAddr>,
@@ -342,10 +341,7 @@ impl ConfigState {
             return Ok(());
         }
 
-        entry.insert(
-            fingerprint,
-            (add.certificate.clone(), add.certificate.names.clone()),
-        );
+        entry.insert(fingerprint, add.certificate.clone());
         Ok(())
     }
 
@@ -372,15 +368,9 @@ impl ConfigState {
                 .with_context(|| "cannot obtain the certificate's fingerprint")?,
         );
 
-        self.certificates.get_mut(&replace.address).map(|certs| {
-            certs.insert(
-                new_fingerprint.clone(),
-                (
-                    replace.new_certificate.clone(),
-                    replace.new_certificate.names.clone(),
-                ),
-            )
-        });
+        self.certificates
+            .get_mut(&replace.address)
+            .map(|certs| certs.insert(new_fingerprint.clone(), replace.new_certificate.clone()));
 
         if !self
             .certificates
@@ -508,11 +498,10 @@ impl ConfigState {
         }
 
         for (front, certs) in self.certificates.iter() {
-            for (certificate_and_key, names) in certs.values() {
+            for certificate_and_key in certs.values() {
                 v.push(WorkerOrder::AddCertificate(AddCertificate {
                     address: *front,
                     certificate: certificate_and_key.clone(),
-                    // names: names.clone(),
                     expired_at: None,
                 }));
             }
@@ -938,7 +927,7 @@ impl ConfigState {
         }
 
         for &(address, fingerprint) in added_certificates {
-            if let Some((ref certificate_and_key, ref names)) = other
+            if let Some(certificate_and_key) = other
                 .certificates
                 .get(&address)
                 .and_then(|certs| certs.get(fingerprint))
@@ -1110,9 +1099,9 @@ pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<Certif
         .certificates
         .values()
         .filter_map(|h| h.get(&CertificateFingerprint(fingerprint.to_vec())))
-        .map(|(c, names)| CertificateWithNames {
-            certificate: c.certificate.clone(),
-            names: names.clone(),
+        .map(|cert| CertificateWithNames {
+            certificate: cert.certificate.clone(),
+            names: cert.names.clone(),
         })
         .next()
 }

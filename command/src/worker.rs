@@ -437,11 +437,6 @@ pub struct ReplaceCertificate {
     pub address: SocketAddr,
     pub new_certificate: CertificateAndKey,
     pub old_fingerprint: CertificateFingerprint,
-    /*
-    /// hostnames linked to the certificate
-    #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
-    pub new_names: Vec<String>,
-    */
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_expired_at: Option<i64>,
 }
