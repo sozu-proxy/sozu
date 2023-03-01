@@ -328,7 +328,7 @@ pub fn get_executable_path() -> anyhow::Result<String> {
 }
 
 #[cfg(target_os = "freebsd")]
-pub unsafe fn get_executable_path() -> String {
+pub unsafe fn get_executable_path() -> anyhow::Result<String> {
     let mut capacity = PATH_MAX as usize;
     let mut path: Vec<u8> = Vec::with_capacity(capacity);
     path.extend(repeat(0).take(capacity));
@@ -349,5 +349,5 @@ pub unsafe fn get_executable_path() -> String {
         panic!("Could not retrieve the path of the executable");
     }
 
-    String::from_raw_parts(path.as_mut_ptr(), capacity - 1, path.len())
+    Ok(String::from_raw_parts(path.as_mut_ptr(), capacity - 1, path.len()))
 }
