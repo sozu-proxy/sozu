@@ -22,7 +22,7 @@ Parameters in the global section allow you to define the global settings shared 
 | `log_level`                | possible values are                                                                 | `debug`, `trace`, `error`, `warn`, `info`|
 | `log_target`               | possible values are                                                                 | `stdout, tcp or udp address`             |
 | `log_access_target`        | possible values are (if activated, sends access logs to a separate target)          | `stdout`, `tcp` or `udp address`         |
-| `command_socket`           | path to the unix socket command (see sozuctl for more information)                  |                                          |
+| `command_socket`           | path to the unix socket command                  |                                          |
 | `command_buffer_size`      | size, in bytes, of the buffer used by the main process to handle commands.          |                                          |
 | `max_command_buffer_size`  | maximum size of the buffer used by the main process to handle commands.             |                                          |
 | `worker_count`             | number of workers                                                                   |                                          |
@@ -32,7 +32,7 @@ Parameters in the global section allow you to define the global settings shared 
 | `max_buffers`              | maximum number of buffers use to proxying                                           |                                          |
 | `min_buffers`              | minimum number of buffers preallocated for proxying                                 |                                          |
 | `buffer_size`              | size, in bytes, of requests buffer use by the workers                               |                                          |
-| `ctl_command_timeout`      | maximum time sozuctl will wait for a command to complete                            |                                          |
+| `ctl_command_timeout`      | maximum time the command line will wait for a command to complete                            |                                          |
 | `pid_file_path`            | stores the pid in a specific file location                                          |                                          |
 | `front_timeout`            | maximum time of inactivity for a front socket                                       |                                          |
 | `connect_timeout`          | maximum time of inactivity for a request to connect                                 |                                          |

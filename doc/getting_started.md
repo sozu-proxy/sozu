@@ -9,15 +9,11 @@ After you did that, `Rust` should be fully installed.
 
 ## Setting up Sōzu
 
-### Required dependencies
-
-- libssl-dev
-
 ### Install
 
 `sozu` is published on [crates.io][cr].
 
-To install them, you only have to do `cargo install sozu sozuctl`.
+To install them, you only have to do `cargo install sozu`.
 
 They will be built and available in the `~/.cargo/bin` folder.
 

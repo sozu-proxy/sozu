@@ -4,7 +4,7 @@ Sozu provides logs and metrics allowing detection of most production issues.
 
 ## Gathering information
 
-### Dumping the state through sozuctl
+### Dumping the state through sozu command line
 
 It is useful to gather information on the configuration state in a production system.
 Here are some commands you can use to take a snapshot of the current state:
@@ -39,7 +39,7 @@ unless you set the compilation features `logs-debug` and `logs-trace`.
 
 Various metrics are generated while sozu is running. They can be accessed in two ways:
 
-* through `sozuctl metrics`, which will display metrics for the main process and workers. Counters are refreshed between each call
+* through `sozu metrics get`, which will display metrics for the main process and workers. Counters are refreshed between each call
 * by UDP, following the statsd protocol (optionally with support for InfluxDB's tags)
 
 Here is how you can set up metrics with statsd in the configuration file:
@@ -232,13 +232,13 @@ Normal traffic (`sozu.http.requests`) drops while 404 (`sozu.http.404.errors`) a
 Check the configuration state with;
 
 ```bash
-sozuctl -c /etc/config.toml query clusters
+sozu -c /etc/config.toml query clusters
 ```
 
 And, for the complete configuration for a specific cluster id:
 
 ```bash
-sozuctl -c /etc/config.toml query clusters -i cluster_id
+sozu -c /etc/config.toml query clusters -i cluster_id
 ```
 
 ### Backend server unavailable

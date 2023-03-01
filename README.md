@@ -21,7 +21,7 @@ To get started check out our [documentation](./doc/README.md) !
 
 Copyright (C) 2015-2021 Geoffroy Couprie, Clément Delafargue and Clever Cloud
 
-### sozu-lib, sozu and sozuctl
+### sozu-lib, sozu
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU Affero General Public License as published by the Free
