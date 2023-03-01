@@ -597,12 +597,12 @@ mod tests {
             order: Order::Worker(Box::new(WorkerOrder::RemoveCertificate(
                 RemoveCertificate {
                     address: "0.0.0.0:443".parse().unwrap(),
-                    fingerprint: Fingerprint(
-                        FromHex::from_hex(
+                    fingerprint: Fingerprint {
+                        inner: FromHex::from_hex(
                             "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
                         )
                         .unwrap()
-                    ),
+                    },
                 }
             ))),
             worker_id: None

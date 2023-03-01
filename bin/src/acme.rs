@@ -380,7 +380,7 @@ fn add_certificate(
                 versions: tls_versions.clone(),
                 names: vec![hostname.to_string()],
             },
-            old_fingerprint: Fingerprint(f),
+            old_fingerprint: Fingerprint { inner: f },
             new_expired_at: None,
         }),
     };

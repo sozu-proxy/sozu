@@ -643,7 +643,7 @@ pub fn print_certificates(
                         println!(
                             "\t\t{}:\t{}",
                             d_and_f.domain,
-                            hex::encode(d_and_f.fingerprint.0.clone())
+                            hex::encode(d_and_f.fingerprint.inner.clone())
                         );
                     }
 
@@ -659,7 +659,7 @@ pub fn print_certificates(
                         println!(
                             "\t\t{}:\t{}",
                             summary.domain,
-                            hex::encode(summary.fingerprint.0.clone())
+                            hex::encode(summary.fingerprint.inner.clone())
                         );
                     }
 

@@ -351,10 +351,10 @@ impl ConfigState {
     }
 
     fn add_certificate(&mut self, add: &AddCertificate) -> anyhow::Result<()> {
-        let fingerprint = Fingerprint(
-            calculate_fingerprint(add.certificate.certificate.as_bytes())
+        let fingerprint = Fingerprint {
+            inner: calculate_fingerprint(add.certificate.certificate.as_bytes())
                 .with_context(|| "cannot calculate the certificate's fingerprint")?,
-        );
+        };
 
         let entry = self
             .certificates
@@ -389,10 +389,10 @@ impl ConfigState {
             .map
             .remove(&replace.old_fingerprint);
 
-        let new_fingerprint = Fingerprint(
-            calculate_fingerprint(replace.new_certificate.certificate.as_bytes())
+        let new_fingerprint = Fingerprint {
+            inner: calculate_fingerprint(replace.new_certificate.certificate.as_bytes())
                 .with_context(|| "cannot obtain the certificate's fingerprint")?,
-        );
+        };
 
         self.certificates.get_mut(&replace.address).map(|certs| {
             certs
@@ -1195,7 +1195,11 @@ pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<Certif
     state
         .certificates
         .values()
-        .filter_map(|certs| certs.map.get(&Fingerprint(fingerprint.to_vec())))
+        .filter_map(|certs| {
+            certs.map.get(&Fingerprint {
+                inner: fingerprint.to_vec(),
+            })
+        })
         .map(|cert| CertificateWithNames {
             certificate: cert.certificate.clone(),
             names: cert.names.clone(),

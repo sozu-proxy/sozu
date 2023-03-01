@@ -325,7 +325,9 @@ impl CertificateResolverHelper for GenericCertificateResolver {
     }
 
     fn fingerprint(pem: &Pem) -> Fingerprint {
-        Fingerprint(Sha256::digest(&pem.contents).iter().cloned().collect())
+        Fingerprint {
+            inner: Sha256::digest(&pem.contents).iter().cloned().collect(),
+        }
     }
 
     fn parse(sozu_certificate: &SozuCertificate) -> Result<ParsedCertificate, Self::Error> {

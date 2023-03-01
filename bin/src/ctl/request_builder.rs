@@ -571,13 +571,15 @@ fn get_fingerprint_from_certificate_path(certificate_path: &str) -> anyhow::Resu
         format!("could not calculate fingerprint for the certificate at {certificate_path}")
     })?;
 
-    Ok(Fingerprint(parsed_bytes))
+    Ok(Fingerprint {
+        inner: parsed_bytes,
+    })
 }
 
 fn decode_fingerprint(fingerprint: &str) -> anyhow::Result<Fingerprint> {
     let bytes = hex::decode(fingerprint)
         .with_context(|| "Failed at decoding the string (expected hexadecimal data)")?;
-    Ok(Fingerprint(bytes))
+    Ok(Fingerprint { inner: bytes })
 }
 
 fn load_full_certificate(

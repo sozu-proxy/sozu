@@ -176,17 +176,19 @@ pub enum WorkerOrder {
 
 //FIXME: make fixed size depending on hash algorithm
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Fingerprint(pub Vec<u8>);
+pub struct Fingerprint {
+    pub inner: Vec<u8>,
+}
 
 impl fmt::Debug for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "CertificateFingerprint({})", hex::encode(&self.0))
+        write!(f, "CertificateFingerprint({})", hex::encode(&self.inner))
     }
 }
 
 impl fmt::Display for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "{}", hex::encode(&self.0))
+        write!(f, "{}", hex::encode(&self.inner))
     }
 }
 
@@ -195,7 +197,7 @@ impl serde::Serialize for Fingerprint {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&hex::encode(&self.0))
+        serializer.serialize_str(&hex::encode(&self.inner))
     }
 }
 
@@ -214,7 +216,7 @@ impl<'de> Visitor<'de> for FingerprintVisitor {
     {
         FromHex::from_hex(value)
             .map_err(|e| E::custom(format!("could not deserialize hex: {e:?}")))
-            .map(Fingerprint)
+            .map(|v| Fingerprint { inner: v })
     }
 }
 
