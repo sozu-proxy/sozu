@@ -416,7 +416,7 @@ fn order_command(
                 // for other messages, we would loop over read_message
                 // until an error or ok message was sent
             }
-            ResponseStatus::Error => {
+            ResponseStatus::Failure => {
                 bail!("could not execute order: {}", response);
             }
             ResponseStatus::Ok => {

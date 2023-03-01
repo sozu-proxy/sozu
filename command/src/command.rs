@@ -88,7 +88,7 @@ impl Request {
 pub enum ResponseStatus {
     Ok,
     Processing,
-    Error,
+    Failure,
 }
 
 /// details of a response sent by the main process to the client,
@@ -281,7 +281,7 @@ impl Response {
         Self {
             id: id.to_string(),
             version: PROTOCOL_VERSION,
-            status: ResponseStatus::Error,
+            status: ResponseStatus::Failure,
             message: Some(error.to_string()),
             content: None,
         }

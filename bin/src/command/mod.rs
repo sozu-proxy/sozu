@@ -581,7 +581,7 @@ impl CommandServer {
                         //info!("metrics processing");
                         continue;
                     }
-                    ResponseStatus::Error => {
+                    ResponseStatus::Failure => {
                         error!("error handling configuration message: {}", response);
                         error += 1;
                     }
@@ -775,7 +775,7 @@ impl CommandServer {
                 // if a worker returned Ok or Error, we're not expecting any more
                 // messages with this id from it
                 match response.status {
-                    ResponseStatus::Ok | ResponseStatus::Error => {
+                    ResponseStatus::Ok | ResponseStatus::Failure => {
                         expected_responses -= 1;
                     }
                     _ => {}

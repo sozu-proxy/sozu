@@ -101,7 +101,7 @@ impl CommandManager {
             }
             match response.status {
                 ResponseStatus::Processing => println!("Proxy is processing: {response}"),
-                ResponseStatus::Error => bail!("Order failed: {}", response),
+                ResponseStatus::Failure => bail!("Order failed: {}", response),
                 ResponseStatus::Ok => {
                     if json {
                         // why do we need to print a success message in json?
@@ -169,7 +169,7 @@ impl CommandManager {
                 ResponseStatus::Processing => {
                     println!("Processing: {response}");
                 }
-                ResponseStatus::Error => {
+                ResponseStatus::Failure => {
                     bail!("Error: failed to get the list of worker: {}", response);
                 }
                 ResponseStatus::Ok => {
@@ -203,7 +203,7 @@ impl CommandManager {
                                 ResponseStatus::Processing => {
                                     println!("Main process is upgrading");
                                 }
-                                ResponseStatus::Error => {
+                                ResponseStatus::Failure => {
                                     bail!("Error: failed to upgrade the main: {}", response);
                                 }
                                 ResponseStatus::Ok => {
@@ -260,7 +260,7 @@ impl CommandManager {
 
             match response.status {
                 ResponseStatus::Processing => info!("Proxy is processing: {}", response),
-                ResponseStatus::Error => {
+                ResponseStatus::Failure => {
                     bail!("could not stop the worker {}: {}", worker_id, response)
                 }
                 ResponseStatus::Ok => {
@@ -309,7 +309,7 @@ impl CommandManager {
                     ResponseStatus::Processing => {
                         println!("Proxy is processing: {response}");
                     }
-                    ResponseStatus::Error => {
+                    ResponseStatus::Failure => {
                         if json {
                             return print_json_response(&response.message);
                         } else {
@@ -397,7 +397,7 @@ impl CommandManager {
                 ResponseStatus::Processing => {
                     println!("Proxy is processing: {response}");
                 }
-                ResponseStatus::Error => {
+                ResponseStatus::Failure => {
                     if json {
                         print_json_response(&response.message)?;
                     }
@@ -449,7 +449,7 @@ impl CommandManager {
                 ResponseStatus::Processing => {
                     println!("Proxy is processing: {response}");
                 }
-                ResponseStatus::Error => {
+                ResponseStatus::Failure => {
                     if json {
                         print_json_response(&response.message)?;
                         bail!("We received an error message");

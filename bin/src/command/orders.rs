@@ -310,7 +310,7 @@ impl CommandServer {
                             ok += 1;
                         }
                         ResponseStatus::Processing => {}
-                        ResponseStatus::Error => {
+                        ResponseStatus::Failure => {
                             error!("{}", worker_response);
                             error += 1;
                         }
@@ -638,7 +638,7 @@ impl CommandServer {
                         ResponseStatus::Processing => {
                             info!("returnsockets processing");
                         }
-                        ResponseStatus::Error => {
+                        ResponseStatus::Failure => {
                             return_error(cloned_command_tx, cloned_req_id, worker_response.message)
                                 .await;
                             break;
@@ -706,7 +706,7 @@ impl CommandServer {
                         ResponseStatus::Processing => {
                             info!("softstop processing");
                         }
-                        ResponseStatus::Error => {
+                        ResponseStatus::Failure => {
                             info!("softstop error: {}", worker_response);
                             break;
                         }
@@ -832,7 +832,7 @@ impl CommandServer {
                             ok += 1;
                         }
                         ResponseStatus::Processing => {}
-                        ResponseStatus::Error => {
+                        ResponseStatus::Failure => {
                             error!("{}", worker_response);
                             error += 1;
                         }
@@ -929,7 +929,7 @@ impl CommandServer {
                 let new_run_state = match worker_response.status {
                     ResponseStatus::Ok => RunState::Running,
                     ResponseStatus::Processing => continue,
-                    ResponseStatus::Error => RunState::NotAnswering,
+                    ResponseStatus::Failure => RunState::NotAnswering,
                 };
                 worker_info_map
                     .entry(worker_response.id)
@@ -1001,7 +1001,7 @@ impl CommandServer {
                         //info!("metrics processing");
                         continue;
                     }
-                    ResponseStatus::Error => {
+                    ResponseStatus::Failure => {
                         let tag = worker_response.id.trim_start_matches(&prefix).to_string();
                         responses.push((tag, worker_response));
                     }
@@ -1017,7 +1017,7 @@ impl CommandServer {
             let mut has_error = false;
             for response in responses.iter() {
                 match response.1.status {
-                    ResponseStatus::Error => {
+                    ResponseStatus::Failure => {
                         messages.push(format!("{}: {:?}", response.0, response.1.message));
                         has_error = true;
                     }
@@ -1093,7 +1093,7 @@ impl CommandServer {
                         info!("metrics processing");
                         continue;
                     }
-                    ResponseStatus::Error => {
+                    ResponseStatus::Failure => {
                         responses.push((worker_id, worker_response));
                     }
                 };
@@ -1326,7 +1326,7 @@ impl CommandServer {
                         info!("Order is processing");
                         continue;
                     }
-                    ResponseStatus::Error => {
+                    ResponseStatus::Failure => {
                         responses.push((worker_id, worker_response));
                     }
                 };
@@ -1348,7 +1348,7 @@ impl CommandServer {
             let mut has_error = false;
             for response in responses.iter() {
                 match response.1.status {
-                    ResponseStatus::Error => {
+                    ResponseStatus::Failure => {
                         messages.push(format!("{}: {:?}", response.0, response.1.message));
                         has_error = true;
                     }
