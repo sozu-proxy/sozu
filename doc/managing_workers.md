@@ -7,7 +7,7 @@ How do we solve this challenge? Unix sockets and channels.
 
 ## Architecture
 
-`sozuctl` sends commands on a unix socket.
+`sozu` command line sends commands on a unix socket.
 In the `command::start_server()` function of the main process,
 there is a thread running in the background where a unix listener accepts new
 connection and spawns client loops.

@@ -2,7 +2,7 @@
 
 # path to a file sozu can use to load an initial configuration state for its
 # routing. You can generate this file from sozu's current routing by running
-# the command `sozuctl state save -f state.json`
+# the command `sozu state save -f state.json`
 # this must be RELATIVE to config.toml
 # saved_state = "./state.json"
 
@@ -86,7 +86,7 @@ max_buffers = 20000
 # defaults to 16393 (minimum size for HTTP/2 is a 16384 bytes frame + 9 bytes of header
 buffer_size = 16393
 
-# how much time (in milliseconds) sozuctl will wait for a command to complete.
+# how much time (in milliseconds) sozu command line will wait for a command to complete.
 # Defaults to 1000 milliseconds
 # ctl_command_timeout = 1000
 
@@ -126,8 +126,8 @@ zombie_check_interval = 1800
 activate_listeners = true
 
 # various statistics can be sent to a server that supports the statsd protocol
-# You can see those statistics with sozuctl, like this: `sozuctl metrics` or
-# `sozuctl metrics --json` for machine consumption
+# You can see those statistics with sozu command line, like this: `sozu metrics get` or
+# `sozu metrics get --json` for machine consumption
 #
 #[metrics]
 # address = "127.0.0.1:8125"

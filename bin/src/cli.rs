@@ -92,7 +92,7 @@ pub enum SubCmd {
         max_command_buffer_size: Option<usize>,
     },
 
-    // sozuctl commands
+    // sozu command line
     #[clap(name = "shutdown", about = "shuts down the proxy")]
     Shutdown {
         #[clap(long = "hard", help = "do not wait for connections to finish")]

@@ -4,11 +4,11 @@
 
 ## Run it
 
-If you used the `cargo install` way, `sozu` and `sozuctl` are already in your `$PATH`.
+If you used the `cargo install` way, `sozu` is already in your `$PATH`.
 
 `sozu start -c <path/to/your/config.toml>`
 
-However, if you built the project from source, `sozu` and `sozuctl` are placed in the `target` directory.
+However, if you built the project from source, `sozu` is placed in the `target` directory.
 
 `./target/release/sozu start -c <path/to/your/config.toml>`
 
@@ -66,9 +66,9 @@ If `/my/custom/config.toml` is the path and name of your custom configuration fi
 
 `docker run -v /my/custom:/etc/sozu sozu`
 
-### Using sozuctl with the docker container
+### Using sozu command line with the docker container
 
-To use `sozuctl` CLI from the host with the docker container you have to bind `/run/sozu` with the host by using a docker volume:
+To use `sozu` CLI from the host with the docker container you have to bind `/run/sozu` with the host by using a docker volume:
 
 `docker run -v /run/sozu:/run/sozu sozu`
 
