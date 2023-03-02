@@ -1,8 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt,
-    net::SocketAddr,
-};
+use std::{collections::BTreeMap, fmt, net::SocketAddr};
 
 use crate::{
     state::{ClusterId, ConfigState},
@@ -212,9 +208,9 @@ pub struct ListedFrontends {
 /// the bool indicates if it is active or not
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ListenersList {
-    pub http_listeners: HashMap<SocketAddr, HttpListenerConfig>,
-    pub https_listeners: HashMap<SocketAddr, HttpsListenerConfig>,
-    pub tcp_listeners: HashMap<SocketAddr, TcpListenerConfig>,
+    pub http_listeners: BTreeMap<SocketAddr, HttpListenerConfig>,
+    pub https_listeners: BTreeMap<SocketAddr, HttpsListenerConfig>,
+    pub tcp_listeners: BTreeMap<SocketAddr, TcpListenerConfig>,
 }
 
 /// Responses of the main process to the CLI (or other client)

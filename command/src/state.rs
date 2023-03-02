@@ -1,8 +1,7 @@
 use std::{
     collections::{
-        btree_map::Entry as BTreeMapEntry,
-        hash_map::{DefaultHasher, Entry as HashMapEntry},
-        BTreeMap, BTreeSet, HashMap, HashSet,
+        btree_map::Entry as BTreeMapEntry, hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap,
+        HashSet,
     },
     fmt,
     hash::{Hash, Hasher},
@@ -46,17 +45,17 @@ pub struct RouteKeyToHttpFrontend {
 pub struct ConfigState {
     clusters: BTreeMap<ClusterId, Cluster>,
     backends: BTreeMap<ClusterId, Backends>,
-    pub http_listeners: HashMap<SocketAddr, HttpListenerConfig>,
-    pub https_listeners: HashMap<SocketAddr, HttpsListenerConfig>,
-    pub tcp_listeners: HashMap<SocketAddr, TcpListenerConfig>,
+    pub http_listeners: BTreeMap<SocketAddr, HttpListenerConfig>,
+    pub https_listeners: BTreeMap<SocketAddr, HttpsListenerConfig>,
+    pub tcp_listeners: BTreeMap<SocketAddr, TcpListenerConfig>,
     /// HTTP frontends, indexed by RouteKey, a serialization of (address, hostname, path)
     pub http_fronts: BTreeMap<String, HttpFrontend>,
     /// HTTPS frontends, indexed by RouteKey, a serialization of (address, hostname, path)
     pub https_fronts: BTreeMap<String, HttpFrontend>,
     /// TCP frontends, in groups that are indexed by the cluster id
-    pub tcp_fronts: HashMap<ClusterId, TcpFrontends>,
+    pub tcp_fronts: BTreeMap<ClusterId, TcpFrontends>,
     /// socket address -> map of certificate
-    certificates: HashMap<SocketAddr, Certificates>,
+    certificates: BTreeMap<SocketAddr, Certificates>,
 }
 
 /// contains a list of backends
@@ -196,8 +195,8 @@ impl ConfigState {
 
     fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> anyhow::Result<()> {
         match self.http_listeners.entry(listener.address) {
-            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()), // TODO: should we deactivate here?
-            HashMapEntry::Occupied(_) => {
+            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()), // TODO: should we deactivate here?
+            BTreeMapEntry::Occupied(_) => {
                 bail!("The entry is occupied for address {}", listener.address)
             }
         };
@@ -206,8 +205,8 @@ impl ConfigState {
 
     fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> anyhow::Result<()> {
         match self.https_listeners.entry(listener.address) {
-            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()), // TODO: should we deactivate here?
-            HashMapEntry::Occupied(_) => {
+            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()), // TODO: should we deactivate here?
+            BTreeMapEntry::Occupied(_) => {
                 bail!("The entry is occupied for address {}", listener.address)
             }
         };
@@ -216,8 +215,8 @@ impl ConfigState {
 
     fn add_tcp_listener(&mut self, listener: &TcpListenerConfig) -> anyhow::Result<()> {
         match self.tcp_listeners.entry(listener.address) {
-            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
-            HashMapEntry::Occupied(_) => {
+            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
+            BTreeMapEntry::Occupied(_) => {
                 bail!("The entry is occupied for address {}", listener.address)
             }
         };
