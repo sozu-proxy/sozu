@@ -8,6 +8,10 @@ pub fn main() {
     let mut config = prost_build::Config::new();
 
     config.btree_map(["."]);
+    config.message_attribute(".", "#[derive(Hash, Eq)]");
+    config.enum_attribute("Order", "#[derive(Hash, Eq)]");
+    config.enum_attribute("inner", "#[derive(Hash, Eq)]");
+    // config.enum_attribute("worker_order.Inner", "#[derive(Hash, Eq)]");
 
     tonic_build::configure()
         .build_client(true)

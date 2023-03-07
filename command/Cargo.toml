@@ -58,5 +58,5 @@ logs-trace = []
 travis-ci = { repository = "sozu-proxy/sozu" }
 
 [build-dependencies]
-prost-build = { version = "^0.11.2" }
+prost-build = { version = "^0.11.8" }
 tonic-build = "^0.8.2"
