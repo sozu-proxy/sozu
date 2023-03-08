@@ -6,7 +6,7 @@ use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain},
     command::{CommandRequestOrder, FrontendFilters},
     config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
-    proxy::{
+    worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, DeactivateListener, HttpFrontend, ListenerType, LoadBalancingParams,
         MetricsConfiguration, PathRule, ProxyRequestOrder, RemoveBackend, RemoveCertificate,

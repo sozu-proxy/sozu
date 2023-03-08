@@ -4,7 +4,7 @@ use std::{io::stdin, net::SocketAddr};
 
 use sozu_command_lib::{
     config::Config,
-    proxy::{ActivateListener, ListenerType, ProxyRequestOrder},
+    worker::{ActivateListener, ListenerType, ProxyRequestOrder},
     scm_socket::Listeners,
     state::ConfigState,
 };

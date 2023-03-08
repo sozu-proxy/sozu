@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::tempfile;
 
 use sozu_command_lib::{
-    channel::Channel, command::RunState, config::Config, proxy::ProxyRequest, state::ConfigState,
+    channel::Channel, command::RunState, config::Config, worker::ProxyRequest, state::ConfigState,
 };
 
 use crate::{

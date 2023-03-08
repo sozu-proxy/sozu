@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, str, time::Instant};
 use anyhow::Context;
 use hdrhistogram::Histogram;
 
-use crate::sozu_command::proxy::{
+use crate::sozu_command::worker::{
     ClusterMetricsData, FilteredData, MetricsConfiguration, Percentiles, QueryAnswerMetrics,
     QueryMetricsOptions, WorkerMetrics,
 };

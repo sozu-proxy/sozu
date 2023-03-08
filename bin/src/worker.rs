@@ -34,7 +34,7 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     logging::target_to_backend,
-    proxy::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
+    worker::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,

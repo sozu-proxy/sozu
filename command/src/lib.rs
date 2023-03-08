@@ -9,7 +9,7 @@ pub mod channel;
 pub mod command;
 pub mod config;
 pub mod parser;
-pub mod proxy;
+pub mod worker;
 pub mod ready;
 pub mod scm_socket;
 pub mod state;

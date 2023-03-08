@@ -13,7 +13,7 @@ use mio::{
     Events, Interest, Poll, Token,
 };
 use slab::Slab;
-use sozu_command::proxy::{
+use sozu_command::worker::{
     ActivateListener, DeactivateListener, HttpListenerConfig, HttpsListenerConfig,
 };
 use time::{Duration, Instant};
@@ -27,7 +27,7 @@ use crate::{
     sozu_command::{
         channel::Channel,
         config::Config,
-        proxy::{
+        worker::{
             Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyEvent,
             ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
             ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,

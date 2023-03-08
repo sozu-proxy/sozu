@@ -6,7 +6,7 @@ use mio::net::TcpStream;
 use crate::{
     server::push_event,
     sozu_command::{
-        proxy::{self, LoadBalancingAlgorithms},
+        worker::{self, LoadBalancingAlgorithms},
         state::ClusterId,
     },
 };
@@ -37,7 +37,7 @@ impl BackendMap {
 
     pub fn import_configuration_state(
         &mut self,
-        backends: &HashMap<ClusterId, Vec<proxy::Backend>>,
+        backends: &HashMap<ClusterId, Vec<worker::Backend>>,
     ) {
         self.backends
             .extend(backends.iter().map(|(cluster_id, backend_vec)| {
@@ -105,7 +105,7 @@ impl BackendMap {
                 if self.available {
                     self.available = false;
 
-                    push_event(proxy::ProxyEvent::NoAvailableBackends(
+                    push_event(worker::ProxyEvent::NoAvailableBackends(
                         cluster_id.to_string(),
                     ));
                 }
@@ -174,8 +174,8 @@ impl BackendMap {
     pub fn set_load_balancing_policy_for_cluster(
         &mut self,
         cluster_id: &str,
-        lb_algo: proxy::LoadBalancingAlgorithms,
-        metric: Option<proxy::LoadMetric>,
+        lb_algo: worker::LoadBalancingAlgorithms,
+        metric: Option<worker::LoadMetric>,
     ) {
         // The cluster can be created before the backends were registered because of the async config messages.
         // So when we set the load balancing policy, we have to create the backend list if if it doesn't exist yet.
@@ -212,7 +212,7 @@ impl BackendList {
         }
     }
 
-    pub fn import_configuration_state(backend_vec: &[proxy::Backend]) -> BackendList {
+    pub fn import_configuration_state(backend_vec: &[worker::Backend]) -> BackendList {
         let mut list = BackendList::new();
         for backend in backend_vec {
             let backend = Backend::new(
@@ -303,7 +303,7 @@ impl BackendList {
     pub fn set_load_balancing_policy(
         &mut self,
         load_balancing_policy: LoadBalancingAlgorithms,
-        metric: Option<proxy::LoadMetric>,
+        metric: Option<worker::LoadMetric>,
     ) {
         match load_balancing_policy {
             LoadBalancingAlgorithms::RoundRobin => {
@@ -312,12 +312,12 @@ impl BackendList {
             LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(Random {}),
             LoadBalancingAlgorithms::LeastLoaded => {
                 self.load_balancing = Box::new(LeastLoaded {
-                    metric: metric.unwrap_or(proxy::LoadMetric::Connections),
+                    metric: metric.unwrap_or(worker::LoadMetric::Connections),
                 })
             }
             LoadBalancingAlgorithms::PowerOfTwo => {
                 self.load_balancing = Box::new(PowerOfTwo {
-                    metric: metric.unwrap_or(proxy::LoadMetric::Connections),
+                    metric: metric.unwrap_or(worker::LoadMetric::Connections),
                 })
             }
         }

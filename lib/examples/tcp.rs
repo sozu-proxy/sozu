@@ -11,7 +11,7 @@ use anyhow::Context;
 use crate::sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    proxy::{self, LoadBalancingParams, TcpListenerConfig},
+    worker::{self, LoadBalancingParams, TcpListenerConfig},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -55,14 +55,14 @@ fn main() -> anyhow::Result<()> {
         sozu::tcp::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 
-    let tcp_front = proxy::TcpFrontend {
+    let tcp_front = worker::TcpFrontend {
         cluster_id: String::from("test"),
         address: "127.0.0.1:8080"
             .parse()
             .with_context(|| "could not parse address")?,
         tags: None,
     };
-    let tcp_backend = proxy::Backend {
+    let tcp_backend = worker::Backend {
         cluster_id: String::from("test"),
         backend_id: String::from("test-0"),
         address: "127.0.0.1:1026"
@@ -73,14 +73,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&proxy::ProxyRequest {
+    command.write_message(&worker::ProxyRequest {
         id: String::from("ID_ABCD"),
-        order: proxy::ProxyRequestOrder::AddTcpFrontend(tcp_front),
+        order: worker::ProxyRequestOrder::AddTcpFrontend(tcp_front),
     });
 
-    command.write_message(&proxy::ProxyRequest {
+    command.write_message(&worker::ProxyRequest {
         id: String::from("ID_EFGH"),
-        order: proxy::ProxyRequestOrder::AddBackend(tcp_backend),
+        order: worker::ProxyRequestOrder::AddBackend(tcp_backend),
     });
 
     info!("TCP -> {:?}", command.read_message());

@@ -8,7 +8,7 @@ use sozu_command_lib::{
     channel::Channel,
     command::{RunState, WorkerInfo},
     config::Config,
-    proxy::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
+    worker::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
     scm_socket::ScmSocket,
 };
 

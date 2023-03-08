@@ -14,7 +14,7 @@ use std::{
 use anyhow::Context;
 use mio::net::UdpSocket;
 
-use crate::sozu_command::proxy::{
+use crate::sozu_command::worker::{
     FilteredData, MetricsConfiguration, QueryAnswerMetrics, QueryMetricsOptions,
 };
 

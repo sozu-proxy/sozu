@@ -8,7 +8,7 @@ use sozu_command_lib::{
         CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
         CommandStatus, RunState, WorkerInfo,
     },
-    proxy::{
+    worker::{
         ProxyRequestOrder, Query, QueryCertificateType, QueryClusterDomain, QueryClusterType,
         QueryMetricsOptions,
     },

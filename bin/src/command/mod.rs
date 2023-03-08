@@ -29,7 +29,7 @@ use sozu_command_lib::{
         CommandStatus, Event, RunState,
     },
     config::Config,
-    proxy::{
+    worker::{
         MetricsConfiguration, ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
         ProxyResponseStatus,
     },

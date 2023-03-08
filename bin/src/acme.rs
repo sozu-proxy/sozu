@@ -7,7 +7,7 @@ use sozu_command_lib::{
     channel::Channel,
     command::{CommandRequest, CommandRequestOrder, CommandResponse, CommandStatus},
     config::Config,
-    proxy::{
+    worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
         ProxyRequestOrder, RemoveBackend, ReplaceCertificate, Route, RulePosition, TlsVersion,
     },

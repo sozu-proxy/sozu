@@ -12,7 +12,7 @@ use anyhow::{bail, Context};
 use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::proxy::RemoveListener;
+use sozu_command::worker::RemoveListener;
 use time::{Duration, Instant};
 
 use crate::{
@@ -20,7 +20,7 @@ use crate::{
     router::Router,
     sozu_command::{
         logging,
-        proxy::{
+        worker::{
             Cluster, HttpFrontend, HttpListenerConfig, ProxyRequest, ProxyRequestOrder,
             ProxyResponse, Route,
         },
@@ -1084,7 +1084,7 @@ mod tests {
     extern crate tiny_http;
     use super::*;
     use crate::sozu_command::channel::Channel;
-    use crate::sozu_command::proxy::{
+    use crate::sozu_command::worker::{
         Backend, HttpFrontend, HttpListenerConfig, LoadBalancingAlgorithms, LoadBalancingParams,
         PathRule, ProxyRequest, ProxyRequestOrder, Route, RulePosition,
     };

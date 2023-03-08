@@ -14,7 +14,7 @@ use std::{
 use anyhow::{bail, Context};
 use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
-use sozu_command::proxy::{ProxyEvent, Route};
+use sozu_command::worker::{ProxyEvent, Route};
 use time::{Duration, Instant};
 
 use crate::{

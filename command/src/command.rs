@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    proxy::{
+    worker::{
         AggregatedMetricsData, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, ProxyEvent,
         ProxyRequestOrder, QueryAnswer, TcpFrontend, TcpListenerConfig,
     },
@@ -213,7 +213,7 @@ mod tests {
     use super::*;
     use crate::certificate::split_certificate_chain;
     use crate::config::ProxyProtocolConfig;
-    use crate::proxy::{
+    use crate::worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
         ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
         LoadBalancingParams, PathRule, Percentiles, ProxyRequestOrder, QueryAnswerMetrics,

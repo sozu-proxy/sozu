@@ -11,8 +11,8 @@ use anyhow::Context;
 use crate::sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    proxy,
-    proxy::{LoadBalancingParams, PathRule, Route, RulePosition},
+    worker,
+    worker::{LoadBalancingParams, PathRule, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
 
     info!("starting up");
 
-    let config = proxy::HttpListenerConfig {
+    let config = worker::HttpListenerConfig {
         address: "127.0.0.1:8080"
             .parse()
             .with_context(|| "could not parse address")?,
@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
         sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
     });
 
-    let http_front = proxy::HttpFrontend {
+    let http_front = worker::HttpFrontend {
         route: Route::ClusterId(String::from("test")),
         address: "127.0.0.1:8080"
             .parse()
@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
             ("id".to_owned(), "my-own-http-front".to_owned()),
         ])),
     };
-    let http_backend = proxy::Backend {
+    let http_backend = worker::Backend {
         cluster_id: String::from("test"),
         backend_id: String::from("test-0"),
         address: "127.0.0.1:8000"
@@ -75,14 +75,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&proxy::ProxyRequest {
+    command.write_message(&worker::ProxyRequest {
         id: String::from("ID_ABCD"),
-        order: proxy::ProxyRequestOrder::AddHttpFrontend(http_front),
+        order: worker::ProxyRequestOrder::AddHttpFrontend(http_front),
     });
 
-    command.write_message(&proxy::ProxyRequest {
+    command.write_message(&worker::ProxyRequest {
         id: String::from("ID_EFGH"),
-        order: proxy::ProxyRequestOrder::AddBackend(http_backend),
+        order: worker::ProxyRequestOrder::AddBackend(http_backend),
     });
 
     println!("HTTP -> {:?}", command.read_message());
