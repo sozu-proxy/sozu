@@ -5,7 +5,8 @@ use std::{
     fs::File,
     io::{self, Error, ErrorKind, Read},
     net::SocketAddr,
-    path::PathBuf, ops::Range,
+    ops::Range,
+    path::PathBuf,
 };
 
 use anyhow::{bail, Context};
@@ -1195,7 +1196,7 @@ impl Config {
             v.push(CommandRequest {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
-                worker_id: None,
+
                 order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpListener(
                     listener.clone(),
                 ))),
@@ -1207,7 +1208,7 @@ impl Config {
             v.push(CommandRequest {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
-                worker_id: None,
+
                 order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpsListener(
                     listener.clone(),
                 ))),
@@ -1219,7 +1220,7 @@ impl Config {
             v.push(CommandRequest {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
-                worker_id: None,
+
                 order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddTcpListener(
                     listener.clone(),
                 ))),
@@ -1233,7 +1234,7 @@ impl Config {
                 v.push(CommandRequest {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
-                    worker_id: None,
+
                     order: CommandRequestOrder::Proxy(Box::new(order)),
                 });
                 count += 1;
@@ -1245,7 +1246,7 @@ impl Config {
                 v.push(CommandRequest {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
-                    worker_id: None,
+
                     order: CommandRequestOrder::Proxy(Box::new(
                         ProxyRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
@@ -1261,7 +1262,7 @@ impl Config {
                 v.push(CommandRequest {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
-                    worker_id: None,
+
                     order: CommandRequestOrder::Proxy(Box::new(
                         ProxyRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
@@ -1277,7 +1278,7 @@ impl Config {
                 v.push(CommandRequest {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
-                    worker_id: None,
+
                     order: CommandRequestOrder::Proxy(Box::new(
                         ProxyRequestOrder::ActivateListener(ActivateListener {
                             address: listener.address,
@@ -1372,7 +1373,7 @@ impl Config {
 
 pub fn display_toml_error(file: &str, error: &toml::de::Error) {
     println!("error parsing the configuration file '{file}': {error}");
-    if let Some(Range { start, end}) = error.span() {
+    if let Some(Range { start, end }) = error.span() {
         print!("error parsing the configuration file '{file}' at position: {start}, {end}");
     }
 }

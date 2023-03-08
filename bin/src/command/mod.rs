@@ -29,12 +29,12 @@ use sozu_command_lib::{
         CommandStatus, Event, RunState,
     },
     config::Config,
+    scm_socket::{Listeners, ScmSocket},
+    state::ConfigState,
     worker::{
         MetricsConfiguration, ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
         ProxyResponseStatus,
     },
-    scm_socket::{Listeners, ScmSocket},
-    state::ConfigState,
 };
 
 use crate::{
@@ -131,11 +131,11 @@ pub enum Success {
     SaveState(usize, String),          // amount of written commands, path of the saved state
     Status(CommandResponseContent),    // Vec<WorkerInfo>
     SubscribeEvent(String),
-    UpgradeMain(i32),         // pid of the new main process
-    UpgradeWorker(u32),       // worker id
-    WorkerKilled(u32),        // worker id
-    WorkerLaunched(u32),      // worker id
-    WorkerOrder(Option<u32>), // worker id
+    UpgradeMain(i32),    // pid of the new main process
+    UpgradeWorker(u32),  // worker id
+    WorkerKilled(u32),   // worker id
+    WorkerLaunched(u32), // worker id
+    WorkerOrder,
     WorkerResponse,
     WorkerRestarted(u32), // worker id
     WorkerStopped(u32),   // worker id
@@ -192,12 +192,7 @@ impl std::fmt::Display for Success {
             }
             Self::WorkerKilled(id) => write!(f, "Successfully killed worker {id}"),
             Self::WorkerLaunched(id) => write!(f, "Successfully launched worker {id}"),
-            Self::WorkerOrder(worker) => match worker {
-                Some(worker_id) => {
-                    write!(f, "Successfully executed the order on worker {worker_id}")
-                }
-                None => write!(f, "Successfully executed the order on all workers"),
-            },
+            Self::WorkerOrder => write!(f, "Successfully executed the order on all workers"),
             Self::WorkerResponse => write!(f, "Successfully handled worker response"),
             Self::WorkerRestarted(id) => write!(f, "Successfully restarted worker {id}"),
             Self::WorkerStopped(id) => write!(f, "Successfully stopped worker {id}"),

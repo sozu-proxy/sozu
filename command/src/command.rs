@@ -5,11 +5,11 @@ use std::{
 };
 
 use crate::{
+    state::ConfigState,
     worker::{
         AggregatedMetricsData, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, ProxyEvent,
         ProxyRequestOrder, QueryAnswer, TcpFrontend, TcpListenerConfig,
     },
-    state::ConfigState,
 };
 
 pub const PROTOCOL_VERSION: u8 = 0;
@@ -65,19 +65,16 @@ pub struct FrontendFilters {
 pub struct CommandRequest {
     pub id: String,
     pub version: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_id: Option<u32>,
     #[serde(flatten)]
     pub order: CommandRequestOrder,
 }
 
 impl CommandRequest {
-    pub fn new(id: String, order: CommandRequestOrder, worker_id: Option<u32>) -> CommandRequest {
+    pub fn new(id: String, order: CommandRequestOrder) -> CommandRequest {
         CommandRequest {
             version: PROTOCOL_VERSION,
             id,
             order,
-            worker_id,
         }
     }
 }
@@ -292,7 +289,6 @@ mod tests {
                 load_metric: None,
                 answer_503: None,
             }))),
-            worker_id: None
         }
     );
 
@@ -305,7 +301,6 @@ mod tests {
             order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::RemoveCluster {
                 cluster_id: String::from("xxx")
             })),
-            worker_id: None
         }
     );
 
@@ -326,7 +321,6 @@ mod tests {
                     tags: None,
                 }
             ))),
-            worker_id: None
         }
     );
 
@@ -353,7 +347,6 @@ mod tests {
                     ]))
                 }
             ))),
-            worker_id: None
         }
     );
 
@@ -374,7 +367,6 @@ mod tests {
                     tags: None,
                 }
             ))),
-            worker_id: None
         }
     );
 
@@ -401,7 +393,6 @@ mod tests {
                     ]))
                 }
             ))),
-            worker_id: None
         }
     );
 
@@ -428,7 +419,6 @@ mod tests {
                     expired_at: None,
                 }
             ))),
-            worker_id: None
         }
     );
 
@@ -449,7 +439,6 @@ mod tests {
                     ),
                 }
             ))),
-            worker_id: None
         }
     );
 
@@ -467,7 +456,6 @@ mod tests {
                 sticky_id: Some(String::from("xxx-0")),
                 backup: Some(false),
             }))),
-            worker_id: None
         }
     );
 
@@ -484,7 +472,6 @@ mod tests {
                     address: "127.0.0.1:8080".parse().unwrap(),
                 }
             ))),
-            worker_id: None
         }
     );
 
@@ -495,7 +482,6 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::SoftStop)),
-            worker_id: Some(0),
         }
     );
 
@@ -506,7 +492,6 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::HardStop)),
-            worker_id: Some(0),
         }
     );
 
@@ -517,7 +502,6 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Status)),
-            worker_id: Some(0),
         }
     );
 
@@ -530,7 +514,6 @@ mod tests {
             order: CommandRequestOrder::LoadState {
                 path: String::from("./config_dump.json")
             },
-            worker_id: None
         }
     );
 
@@ -543,7 +526,6 @@ mod tests {
             order: CommandRequestOrder::SaveState {
                 path: String::from("./config_dump.json")
             },
-            worker_id: None
         }
     );
 
@@ -554,7 +536,6 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::DumpState,
-            worker_id: None
         }
     );
 
@@ -565,7 +546,6 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::ListWorkers,
-            worker_id: None
         }
     );
 
@@ -576,7 +556,6 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::UpgradeMain,
-            worker_id: None
         }
     );
 
@@ -587,7 +566,6 @@ mod tests {
             id: "ID_TEST".to_string(),
             version: 0,
             order: CommandRequestOrder::UpgradeWorker(0),
-            worker_id: None
         }
     );
 

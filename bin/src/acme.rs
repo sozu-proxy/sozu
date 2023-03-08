@@ -399,7 +399,6 @@ fn order_command(
         .write_message(&CommandRequest::new(
             id.clone(),
             CommandRequestOrder::Proxy(Box::new(order.clone())),
-            None,
         ))
         .with_context(|| "Could not write message on the channel")?;
 

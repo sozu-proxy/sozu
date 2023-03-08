@@ -20,12 +20,12 @@ use crate::{
     router::Router,
     sozu_command::{
         logging,
+        ready::Ready,
+        scm_socket::{Listeners, ScmSocket},
         worker::{
             Cluster, HttpFrontend, HttpListenerConfig, ProxyRequest, ProxyRequestOrder,
             ProxyResponse, Route,
         },
-        ready::Ready,
-        scm_socket::{Listeners, ScmSocket},
     },
     timer::TimeoutContainer,
     util::UnwrapLog,

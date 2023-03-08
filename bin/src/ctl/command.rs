@@ -54,7 +54,7 @@ impl CommandManager {
         id: &str,
         command_request_order: CommandRequestOrder,
     ) -> anyhow::Result<()> {
-        let command_request = CommandRequest::new(id.to_string(), command_request_order, None);
+        let command_request = CommandRequest::new(id.to_string(), command_request_order);
 
         self.channel
             .write_message(&command_request)
@@ -68,7 +68,7 @@ impl CommandManager {
     }
 
     pub fn order_command(&mut self, order: CommandRequestOrder) -> Result<(), anyhow::Error> {
-        self.order_command_with_worker_id(order, None, false)
+        self.order_command_to_all_workers(order, false)
     }
 
     pub fn order_command_with_json(
@@ -76,18 +76,17 @@ impl CommandManager {
         command_request_order: CommandRequestOrder,
         json: bool,
     ) -> Result<(), anyhow::Error> {
-        self.order_command_with_worker_id(command_request_order, None, json)
+        self.order_command_to_all_workers(command_request_order, json)
     }
 
-    pub fn order_command_with_worker_id(
+    pub fn order_command_to_all_workers(
         &mut self,
         command_request_order: CommandRequestOrder,
-        worker_id: Option<u32>,
         json: bool,
     ) -> Result<(), anyhow::Error> {
         let id = generate_id();
 
-        let command_request = CommandRequest::new(id, command_request_order, worker_id);
+        let command_request = CommandRequest::new(id, command_request_order);
 
         println!("Sending command : {command_request:?}");
 

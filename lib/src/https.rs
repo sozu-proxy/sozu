@@ -51,15 +51,15 @@ use crate::{
     socket::{server_bind, FrontRustls},
     sozu_command::{
         logging,
+        ready::Ready,
+        scm_socket::ScmSocket,
+        state::ClusterId,
         worker::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
             ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
             ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,
             RemoveCertificate, Route, TlsVersion,
         },
-        ready::Ready,
-        scm_socket::ScmSocket,
-        state::ClusterId,
     },
     timer::TimeoutContainer,
     tls::{

@@ -36,13 +36,13 @@ use crate::{
     sozu_command::{
         config::ProxyProtocolConfig,
         logging,
+        ready::Ready,
+        scm_socket::ScmSocket,
+        state::ClusterId,
         worker::{
             ProxyEvent, ProxyRequest, ProxyRequestOrder, ProxyResponse, TcpFrontend,
             TcpListenerConfig,
         },
-        ready::Ready,
-        scm_socket::ScmSocket,
-        state::ClusterId,
     },
     timer::TimeoutContainer,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, Protocol,
@@ -333,7 +333,9 @@ impl TcpSession {
             TcpStateMachine::SendProxyProtocol(pp) => {
                 res = pp.back_writable(&mut self.metrics);
             }
-            TcpStateMachine::ExpectProxyProtocol(_) | TcpStateMachine::FailedUpgrade(_) => unreachable!(),
+            TcpStateMachine::ExpectProxyProtocol(_) | TcpStateMachine::FailedUpgrade(_) => {
+                unreachable!()
+            }
         };
 
         if let SessionResult::Upgrade = res.0 {
@@ -404,7 +406,10 @@ impl TcpSession {
         None
     }
 
-    fn upgrade_expect(&mut self, epp: ExpectProxyProtocol<MioTcpStream>) -> Option<TcpStateMachine> {
+    fn upgrade_expect(
+        &mut self,
+        epp: ExpectProxyProtocol<MioTcpStream>,
+    ) -> Option<TcpStateMachine> {
         if self.frontend_buffer.is_some() && self.backend_buffer.is_some() {
             let mut pipe = epp.into_pipe(
                 self.frontend_buffer.take().unwrap(),
@@ -1604,8 +1609,8 @@ pub fn start_tcp_worker(
 mod tests {
     use super::*;
     use crate::sozu_command::channel::Channel;
-    use crate::sozu_command::worker::{self, LoadBalancingParams, TcpFrontend};
     use crate::sozu_command::scm_socket::Listeners;
+    use crate::sozu_command::worker::{self, LoadBalancingParams, TcpFrontend};
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::os::unix::io::IntoRawFd;

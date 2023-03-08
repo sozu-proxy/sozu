@@ -27,15 +27,15 @@ use crate::{
     sozu_command::{
         channel::Channel,
         config::Config,
+        ready::Ready,
+        scm_socket::{Listeners, ScmSocket},
+        state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
         worker::{
             Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyEvent,
             ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
             ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,
             QueryClusterType, RemoveBackend, TcpListenerConfig as CommandTcpListener,
         },
-        ready::Ready,
-        scm_socket::{Listeners, ScmSocket},
-        state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
     },
     tcp,
     timer::Timer,

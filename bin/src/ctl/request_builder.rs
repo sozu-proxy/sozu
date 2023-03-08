@@ -42,22 +42,20 @@ impl CommandManager {
         self.order_command_with_json(CommandRequestOrder::DumpState, json)
     }
 
-    pub fn soft_stop(&mut self, worker_id: Option<u32>) -> anyhow::Result<()> {
+    pub fn soft_stop(&mut self) -> anyhow::Result<()> {
         println!("shutting down proxy softly");
 
-        self.order_command_with_worker_id(
+        self.order_command_to_all_workers(
             CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::SoftStop)),
-            worker_id,
             false,
         )
     }
 
-    pub fn hard_stop(&mut self, worker_id: Option<u32>) -> anyhow::Result<()> {
+    pub fn hard_stop(&mut self) -> anyhow::Result<()> {
         println!("shutting down proxy the hard way");
 
-        self.order_command_with_worker_id(
+        self.order_command_to_all_workers(
             CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::HardStop)),
-            worker_id,
             false,
         )
     }

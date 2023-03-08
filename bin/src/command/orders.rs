@@ -22,12 +22,12 @@ use sozu_command_lib::{
     config::Config,
     logging,
     parser::parse_several_commands,
+    scm_socket::Listeners,
+    state::get_cluster_ids_by_domain,
     worker::{
         AggregatedMetricsData, MetricsConfiguration, ProxyRequest, ProxyRequestOrder,
         ProxyResponseContent, ProxyResponseStatus, Query, QueryAnswer, QueryClusterType,
     },
-    scm_socket::Listeners,
-    state::get_cluster_ids_by_domain,
 };
 
 use sozu::metrics::METRICS;
@@ -84,10 +84,7 @@ impl CommandServer {
                 // ProxyRequestOrder::SoftStop => self.do_something(),
                 // ProxyRequestOrder::HardStop => self.do_nothing_and_return_early(),
                 // but it goes in there instead:
-                order => {
-                    self.worker_order(request_identifier, order, request.worker_id)
-                        .await
-                }
+                order => self.worker_order(request_identifier, order).await,
             },
             CommandRequestOrder::SubscribeEvents => {
                 self.event_subscribers.insert(client_id.clone());
@@ -141,7 +138,6 @@ impl CommandServer {
                 let message = CommandRequest::new(
                     format!("SAVE-{counter}"),
                     CommandRequestOrder::Proxy(Box::new(command)),
-                    None,
                 );
 
                 file.write_all(
@@ -1214,7 +1210,6 @@ impl CommandServer {
         &mut self,
         request_identifier: RequestIdentifier,
         order: ProxyRequestOrder,
-        worker_id: Option<u32>,
     ) -> anyhow::Result<Option<Success>> {
         if let &ProxyRequestOrder::AddCertificate(_) = &order {
             debug!("workerconfig client order AddCertificate()");
@@ -1247,10 +1242,7 @@ impl CommandServer {
         return_processing(
             self.command_tx.clone(),
             request_identifier.clone(),
-            match worker_id {
-                Some(id) => format!("Sending the order to worker {id}"),
-                None => "Sending the order to all workers".to_owned(),
-            },
+            "Sending the order to all workers".to_owned(),
         )
         .await;
 
@@ -1262,13 +1254,6 @@ impl CommandServer {
         for ref mut worker in self.workers.iter_mut().filter(|worker| {
             worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
         }) {
-            // sort out the specifically targeted worker, if provided
-            if let Some(id) = worker_id {
-                if id != worker.id {
-                    continue;
-                }
-            }
-
             let should_stop_worker =
                 order == ProxyRequestOrder::SoftStop || order == ProxyRequestOrder::HardStop;
             if should_stop_worker {
@@ -1285,9 +1270,8 @@ impl CommandServer {
             worker_count += 1;
         }
 
-        let should_stop_main = (order == ProxyRequestOrder::SoftStop
-            || order == ProxyRequestOrder::HardStop)
-            && worker_id.is_none();
+        let should_stop_main =
+            order == ProxyRequestOrder::SoftStop || order == ProxyRequestOrder::HardStop;
 
         let mut command_tx = self.command_tx.clone();
         let thread_request_identifier = request_identifier.clone();
@@ -1349,12 +1333,7 @@ impl CommandServer {
             if has_error {
                 return_error(command_tx, thread_request_identifier, messages.join(", ")).await;
             } else {
-                return_success(
-                    command_tx,
-                    thread_request_identifier,
-                    Success::WorkerOrder(worker_id),
-                )
-                .await;
+                return_success(command_tx, thread_request_identifier, Success::WorkerOrder).await;
             }
         })
         .detach();

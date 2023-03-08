@@ -4,9 +4,9 @@ use std::{io::stdin, net::SocketAddr};
 
 use sozu_command_lib::{
     config::Config,
-    worker::{ActivateListener, ListenerType, ProxyRequestOrder},
     scm_socket::Listeners,
     state::ConfigState,
+    worker::{ActivateListener, ListenerType, ProxyRequestOrder},
 };
 
 use crate::{

@@ -78,11 +78,8 @@ mod test {
 
     #[test]
     fn parse_one_command_request_works() {
-        let command_request = CommandRequest::new(
-            "Some request".to_string(),
-            CommandRequestOrder::DumpState,
-            Some(5),
-        );
+        let command_request =
+            CommandRequest::new("Some request".to_string(), CommandRequestOrder::DumpState);
 
         let mut string = serde_json::ser::to_string(&command_request).unwrap();
 
@@ -108,17 +105,14 @@ mod test {
                 CommandRequestOrder::SaveState {
                     path: "/some/path".to_string(),
                 },
-                Some(5),
             ),
             CommandRequest::new(
                 "Some other request".to_string(),
                 CommandRequestOrder::SubscribeEvents,
-                Some(4),
             ),
             CommandRequest::new(
                 "Yet another request".to_string(),
                 CommandRequestOrder::DumpState,
-                None,
             ),
         ];
 

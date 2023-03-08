@@ -1,7 +1,6 @@
 {
   "id": "ID_TEST",
   "version": 0,
-  "worker_id": 0,
   "type": "PROXY",
   "data": {
     "type": "STATUS"

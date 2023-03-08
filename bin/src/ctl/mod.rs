@@ -55,15 +55,14 @@ pub fn ctl(args: cli::Args) -> Result<(), anyhow::Error> {
 impl CommandManager {
     fn handle_command(&mut self, command: SubCmd) -> anyhow::Result<()> {
         match command {
-            SubCmd::Shutdown { hard, worker } => {
+            SubCmd::Shutdown { hard } => {
                 if hard {
-                    self.hard_stop(worker)
+                    self.hard_stop()
                 } else {
-                    self.soft_stop(worker)
+                    self.soft_stop()
                 }
             }
-            SubCmd::Upgrade { worker: None } => self.upgrade_main(),
-            SubCmd::Upgrade { worker: Some(id) } => self.upgrade_worker(id),
+            SubCmd::Upgrade => self.upgrade_main(),
             SubCmd::Status { json } => self.status(json),
             SubCmd::Metrics { cmd, json } => match cmd {
                 MetricsCmd::Get {

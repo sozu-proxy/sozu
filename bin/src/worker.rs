@@ -34,10 +34,10 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     logging::target_to_backend,
-    worker::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
+    worker::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
 };
 
 use crate::{command::Worker, logging, util};
@@ -349,5 +349,9 @@ pub unsafe fn get_executable_path() -> anyhow::Result<String> {
         panic!("Could not retrieve the path of the executable");
     }
 
-    Ok(String::from_raw_parts(path.as_mut_ptr(), capacity - 1, path.len()))
+    Ok(String::from_raw_parts(
+        path.as_mut_ptr(),
+        capacity - 1,
+        path.len(),
+    ))
 }

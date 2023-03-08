@@ -97,18 +97,10 @@ pub enum SubCmd {
     Shutdown {
         #[clap(long = "hard", help = "do not wait for connections to finish")]
         hard: bool,
-        #[clap(
-            short = 'w',
-            long = "worker",
-            help = "shuts down the worker with this id"
-        )]
-        worker: Option<u32>,
     },
     #[clap(name = "upgrade", about = "upgrade the proxy")]
-    Upgrade {
-        #[clap(short = 'w', long = "worker", help = "Upgrade the worker with this id")]
-        worker: Option<u32>,
-    },
+    Upgrade,
+
     #[clap(name = "status", about = "gets information on the running workers")]
     Status {
         #[clap(

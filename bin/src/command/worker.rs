@@ -8,8 +8,8 @@ use sozu_command_lib::{
     channel::Channel,
     command::{RunState, WorkerInfo},
     config::Config,
-    worker::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
     scm_socket::ScmSocket,
+    worker::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
 };
 
 /// An instance of Sōzu, as seen from the main process
