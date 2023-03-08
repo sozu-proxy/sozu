@@ -17,7 +17,7 @@ pub const PROTOCOL_VERSION: u8 = 0;
 /// Details of a request sent by the CLI (or other) to the main process
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CommandRequestOrder {
+pub enum RequestContent {
     /// an order to forward to workers
     Proxy(Box<ProxyRequestOrder>),
     /// save Sōzu's parseable state as a file
@@ -62,19 +62,19 @@ pub struct FrontendFilters {
 
 /// Sent to the main process by the CLI (or other) through the unix socket
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CommandRequest {
+pub struct ClientRequest {
     pub id: String,
     pub version: u8,
     #[serde(flatten)]
-    pub order: CommandRequestOrder,
+    pub content: RequestContent,
 }
 
-impl CommandRequest {
-    pub fn new(id: String, order: CommandRequestOrder) -> CommandRequest {
-        CommandRequest {
+impl ClientRequest {
+    pub fn new(id: String, content: RequestContent) -> ClientRequest {
+        ClientRequest {
             version: PROTOCOL_VERSION,
             id,
-            order,
+            content,
         }
     }
 }
@@ -222,21 +222,19 @@ mod tests {
     #[test]
     fn config_message_test() {
         let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
-        let message: CommandRequest = serde_json::from_str(raw_json).unwrap();
+        let message: ClientRequest = serde_json::from_str(raw_json).unwrap();
         println!("{message:?}");
         assert_eq!(
-            message.order,
-            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpFrontend(
-                HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
-                    hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
-                    method: None,
-                    address: "0.0.0.0:8080".parse().unwrap(),
-                    position: RulePosition::Tree,
-                    tags: None,
-                }
-            )))
+            message.content,
+            RequestContent::Proxy(Box::new(ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("xxx")),
+                hostname: String::from("yyy"),
+                path: PathRule::Prefix(String::from("xxx")),
+                method: None,
+                address: "0.0.0.0:8080".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: None,
+            })))
         );
     }
 
@@ -249,7 +247,7 @@ mod tests {
         let pretty_print = serde_json::to_string_pretty(&$expected_message).expect("should have serialized");
         assert_eq!(&pretty_print, data, "\nserialized message:\n{}\n\nexpected message:\n{}", pretty_print, data);
 
-        let message: CommandRequest = serde_json::from_str(data).unwrap();
+        let message: ClientRequest = serde_json::from_str(data).unwrap();
         assert_eq!(message, $expected_message, "\ndeserialized message:\n{:#?}\n\nexpected message:\n{:#?}", message, $expected_message);
 
       }
@@ -277,10 +275,10 @@ mod tests {
     test_message!(
         add_cluster,
         "../assets/add_cluster.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddCluster(Cluster {
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddCluster(Cluster {
                 cluster_id: String::from("xxx"),
                 sticky_session: true,
                 https_redirect: true,
@@ -295,10 +293,10 @@ mod tests {
     test_message!(
         remove_cluster,
         "../assets/remove_cluster.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::RemoveCluster {
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::RemoveCluster {
                 cluster_id: String::from("xxx")
             })),
         }
@@ -307,10 +305,10 @@ mod tests {
     test_message!(
         add_http_front,
         "../assets/add_http_front.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpFrontend(
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddHttpFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -327,10 +325,10 @@ mod tests {
     test_message!(
         remove_http_front,
         "../assets/remove_http_front.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::RemoveHttpFrontend(
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::RemoveHttpFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -353,10 +351,10 @@ mod tests {
     test_message!(
         add_https_front,
         "../assets/add_https_front.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpsFrontend(
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddHttpsFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -373,10 +371,10 @@ mod tests {
     test_message!(
         remove_https_front,
         "../assets/remove_https_front.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::RemoveHttpsFrontend(
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::RemoveHttpsFrontend(
                 HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
@@ -403,10 +401,10 @@ mod tests {
     test_message!(
         add_certificate,
         "../assets/add_certificate.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddCertificate(
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddCertificate(
                 AddCertificate {
                     address: "0.0.0.0:443".parse().unwrap(),
                     certificate: CertificateAndKey {
@@ -425,10 +423,10 @@ mod tests {
     test_message!(
         remove_certificate,
         "../assets/remove_certificate.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::RemoveCertificate(
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::RemoveCertificate(
                 RemoveCertificate {
                     address: "0.0.0.0:443".parse().unwrap(),
                     fingerprint: CertificateFingerprint(
@@ -445,10 +443,10 @@ mod tests {
     test_message!(
         add_backend,
         "../assets/add_backend.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddBackend(Backend {
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddBackend(Backend {
                 cluster_id: String::from("xxx"),
                 backend_id: String::from("xxx-0"),
                 address: "127.0.0.1:8080".parse().unwrap(),
@@ -462,10 +460,10 @@ mod tests {
     test_message!(
         remove_backend,
         "../assets/remove_backend.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::RemoveBackend(
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::RemoveBackend(
                 RemoveBackend {
                     cluster_id: String::from("xxx"),
                     backend_id: String::from("xxx-0"),
@@ -478,40 +476,40 @@ mod tests {
     test_message!(
         soft_stop,
         "../assets/soft_stop.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::SoftStop)),
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::SoftStop)),
         }
     );
 
     test_message!(
         hard_stop,
         "../assets/hard_stop.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::HardStop)),
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::HardStop)),
         }
     );
 
     test_message!(
         status,
         "../assets/status.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Status)),
+            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::Status)),
         }
     );
 
     test_message!(
         load_state,
         "../assets/load_state.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::LoadState {
+            content: RequestContent::LoadState {
                 path: String::from("./config_dump.json")
             },
         }
@@ -520,10 +518,10 @@ mod tests {
     test_message!(
         save_state,
         "../assets/save_state.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::SaveState {
+            content: RequestContent::SaveState {
                 path: String::from("./config_dump.json")
             },
         }
@@ -532,40 +530,40 @@ mod tests {
     test_message!(
         dump_state,
         "../assets/dump_state.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::DumpState,
+            content: RequestContent::DumpState,
         }
     );
 
     test_message!(
         list_workers,
         "../assets/list_workers.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::ListWorkers,
+            content: RequestContent::ListWorkers,
         }
     );
 
     test_message!(
         upgrade_main,
         "../assets/upgrade_main.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::UpgradeMain,
+            content: RequestContent::UpgradeMain,
         }
     );
 
     test_message!(
         upgrade_worker,
         "../assets/upgrade_worker.json",
-        CommandRequest {
+        ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            order: CommandRequestOrder::UpgradeWorker(0),
+            content: RequestContent::UpgradeWorker(0),
         }
     );
 

@@ -5,7 +5,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain},
     channel::Channel,
-    command::{CommandRequest, CommandRequestOrder, CommandResponse, CommandStatus},
+    command::{ClientRequest, CommandResponse, CommandStatus, RequestContent},
     config::Config,
     worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
@@ -87,7 +87,7 @@ pub fn main(
 
     let tls_versions = vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3];
 
-    let mut channel: Channel<CommandRequest, CommandResponse> = Channel::new(stream, 10000, 20000);
+    let mut channel: Channel<ClientRequest, CommandResponse> = Channel::new(stream, 10000, 20000);
     channel
         .blocking()
         .with_context(|| "Could not block channel")?;
@@ -277,7 +277,7 @@ fn generate_app_id(app_id: &str) -> String {
 }
 
 fn set_up_proxying(
-    channel: &mut Channel<CommandRequest, CommandResponse>,
+    channel: &mut Channel<ClientRequest, CommandResponse>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
@@ -310,7 +310,7 @@ fn set_up_proxying(
 }
 
 fn remove_proxying(
-    channel: &mut Channel<CommandRequest, CommandResponse>,
+    channel: &mut Channel<ClientRequest, CommandResponse>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
@@ -340,7 +340,7 @@ fn remove_proxying(
 }
 
 fn add_certificate(
-    channel: &mut Channel<CommandRequest, CommandResponse>,
+    channel: &mut Channel<ClientRequest, CommandResponse>,
     frontend: &SocketAddr,
     hostname: &str,
     certificate_path: &str,
@@ -391,14 +391,14 @@ fn add_certificate(
 }
 
 fn order_command(
-    channel: &mut Channel<CommandRequest, CommandResponse>,
+    channel: &mut Channel<ClientRequest, CommandResponse>,
     order: ProxyRequestOrder,
 ) -> anyhow::Result<()> {
     let id = generate_id();
     channel
-        .write_message(&CommandRequest::new(
+        .write_message(&ClientRequest::new(
             id.clone(),
-            CommandRequestOrder::Proxy(Box::new(order.clone())),
+            RequestContent::Proxy(Box::new(order.clone())),
         ))
         .with_context(|| "Could not write message on the channel")?;
 

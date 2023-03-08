@@ -14,7 +14,7 @@ use toml;
 
 use crate::{
     certificate::split_certificate_chain,
-    command::{CommandRequest, CommandRequestOrder, PROTOCOL_VERSION},
+    command::{ClientRequest, RequestContent, PROTOCOL_VERSION},
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
@@ -1188,16 +1188,16 @@ impl Config {
         Ok(config)
     }
 
-    pub fn generate_config_messages(&self) -> Vec<CommandRequest> {
+    pub fn generate_config_messages(&self) -> Vec<ClientRequest> {
         let mut v = Vec::new();
         let mut count = 0u8;
 
         for listener in &self.http_listeners {
-            v.push(CommandRequest {
+            v.push(ClientRequest {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
 
-                order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpListener(
+                content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddHttpListener(
                     listener.clone(),
                 ))),
             });
@@ -1205,11 +1205,11 @@ impl Config {
         }
 
         for listener in &self.https_listeners {
-            v.push(CommandRequest {
+            v.push(ClientRequest {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
 
-                order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddHttpsListener(
+                content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddHttpsListener(
                     listener.clone(),
                 ))),
             });
@@ -1217,11 +1217,11 @@ impl Config {
         }
 
         for listener in &self.tcp_listeners {
-            v.push(CommandRequest {
+            v.push(ClientRequest {
                 id: format!("CONFIG-{count}"),
                 version: PROTOCOL_VERSION,
 
-                order: CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::AddTcpListener(
+                content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddTcpListener(
                     listener.clone(),
                 ))),
             });
@@ -1231,11 +1231,11 @@ impl Config {
         for cluster in self.clusters.values() {
             let mut orders = cluster.generate_orders();
             for order in orders.drain(..) {
-                v.push(CommandRequest {
+                v.push(ClientRequest {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
 
-                    order: CommandRequestOrder::Proxy(Box::new(order)),
+                    content: RequestContent::Proxy(Box::new(order)),
                 });
                 count += 1;
             }
@@ -1243,49 +1243,49 @@ impl Config {
 
         if self.activate_listeners {
             for listener in &self.http_listeners {
-                v.push(CommandRequest {
+                v.push(ClientRequest {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
 
-                    order: CommandRequestOrder::Proxy(Box::new(
-                        ProxyRequestOrder::ActivateListener(ActivateListener {
+                    content: RequestContent::Proxy(Box::new(ProxyRequestOrder::ActivateListener(
+                        ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::HTTP,
                             from_scm: false,
-                        }),
-                    )),
+                        },
+                    ))),
                 });
                 count += 1;
             }
 
             for listener in &self.https_listeners {
-                v.push(CommandRequest {
+                v.push(ClientRequest {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
 
-                    order: CommandRequestOrder::Proxy(Box::new(
-                        ProxyRequestOrder::ActivateListener(ActivateListener {
+                    content: RequestContent::Proxy(Box::new(ProxyRequestOrder::ActivateListener(
+                        ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::HTTPS,
                             from_scm: false,
-                        }),
-                    )),
+                        },
+                    ))),
                 });
                 count += 1;
             }
 
             for listener in &self.tcp_listeners {
-                v.push(CommandRequest {
+                v.push(ClientRequest {
                     id: format!("CONFIG-{count}"),
                     version: PROTOCOL_VERSION,
 
-                    order: CommandRequestOrder::Proxy(Box::new(
-                        ProxyRequestOrder::ActivateListener(ActivateListener {
+                    content: RequestContent::Proxy(Box::new(ProxyRequestOrder::ActivateListener(
+                        ActivateListener {
                             address: listener.address,
                             proxy: ListenerType::TCP,
                             from_scm: false,
-                        }),
-                    )),
+                        },
+                    ))),
                 });
                 count += 1;
             }

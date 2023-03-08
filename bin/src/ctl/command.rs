@@ -5,8 +5,8 @@ use serde::Serialize;
 
 use sozu_command_lib::{
     command::{
-        CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
-        CommandStatus, RunState, WorkerInfo,
+        ClientRequest, CommandResponse, CommandResponseContent, CommandStatus, RequestContent,
+        RunState, WorkerInfo,
     },
     worker::{
         ProxyRequestOrder, Query, QueryCertificateType, QueryClusterDomain, QueryClusterType,
@@ -52,9 +52,9 @@ impl CommandManager {
     fn send_request(
         &mut self,
         id: &str,
-        command_request_order: CommandRequestOrder,
+        command_request_order: RequestContent,
     ) -> anyhow::Result<()> {
-        let command_request = CommandRequest::new(id.to_string(), command_request_order);
+        let command_request = ClientRequest::new(id.to_string(), command_request_order);
 
         self.channel
             .write_message(&command_request)
@@ -67,13 +67,13 @@ impl CommandManager {
             .with_context(|| "Command timeout. The proxy didn't send an answer")
     }
 
-    pub fn order_command(&mut self, order: CommandRequestOrder) -> Result<(), anyhow::Error> {
+    pub fn order_command(&mut self, order: RequestContent) -> Result<(), anyhow::Error> {
         self.order_command_to_all_workers(order, false)
     }
 
     pub fn order_command_with_json(
         &mut self,
-        command_request_order: CommandRequestOrder,
+        command_request_order: RequestContent,
         json: bool,
     ) -> Result<(), anyhow::Error> {
         self.order_command_to_all_workers(command_request_order, json)
@@ -81,12 +81,12 @@ impl CommandManager {
 
     pub fn order_command_to_all_workers(
         &mut self,
-        command_request_order: CommandRequestOrder,
+        command_request_order: RequestContent,
         json: bool,
     ) -> Result<(), anyhow::Error> {
         let id = generate_id();
 
-        let command_request = CommandRequest::new(id, command_request_order);
+        let command_request = ClientRequest::new(id, command_request_order);
 
         println!("Sending command : {command_request:?}");
 
@@ -154,7 +154,7 @@ impl CommandManager {
 
         let id = generate_tagged_id("LIST-WORKERS");
 
-        self.send_request(&id, CommandRequestOrder::ListWorkers)?;
+        self.send_request(&id, RequestContent::ListWorkers)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -186,7 +186,7 @@ impl CommandManager {
                         println!();
 
                         let id = generate_tagged_id("UPGRADE-MAIN");
-                        self.send_request(&id, CommandRequestOrder::UpgradeMain)?;
+                        self.send_request(&id, RequestContent::UpgradeMain)?;
 
                         println!("Upgrading main process");
 
@@ -257,7 +257,7 @@ impl CommandManager {
         let id = generate_id();
 
         //FIXME: we should be able to soft stop one specific worker
-        self.send_request(&id, CommandRequestOrder::UpgradeWorker(worker_id))?;
+        self.send_request(&id, RequestContent::UpgradeWorker(worker_id))?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -290,14 +290,14 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(
-            Query::Metrics(QueryMetricsOptions {
+        let command = RequestContent::Proxy(Box::new(ProxyRequestOrder::Query(Query::Metrics(
+            QueryMetricsOptions {
                 list,
                 cluster_ids,
                 backend_ids,
                 metric_names,
-            }),
-        )));
+            },
+        ))));
 
         // a loop to reperform the query every refresh time
         loop {
@@ -365,7 +365,7 @@ impl CommandManager {
         }
 
         let command = if let Some(ref cluster_id) = cluster_id {
-            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(Query::Clusters(
+            RequestContent::Proxy(Box::new(ProxyRequestOrder::Query(Query::Clusters(
                 QueryClusterType::ClusterId(cluster_id.to_string()),
             ))))
         } else if let Some(ref domain) = domain {
@@ -384,11 +384,11 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
             };
 
-            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(Query::Clusters(
+            RequestContent::Proxy(Box::new(ProxyRequestOrder::Query(Query::Clusters(
                 QueryClusterType::Domain(query_domain),
             ))))
         } else {
-            CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(Query::ClustersHashes)))
+            RequestContent::Proxy(Box::new(ProxyRequestOrder::Query(Query::ClustersHashes)))
         };
 
         let id = generate_id();
@@ -440,7 +440,7 @@ impl CommandManager {
             }
         };
 
-        let command = CommandRequestOrder::Proxy(Box::new(ProxyRequestOrder::Query(
+        let command = RequestContent::Proxy(Box::new(ProxyRequestOrder::Query(
             Query::Certificates(query),
         )));
 

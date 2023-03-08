@@ -15,9 +15,8 @@ use nom::{Err, HexDisplay, Offset};
 use sozu_command_lib::{
     buffer::fixed::Buffer,
     command::{
-        CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
-        CommandStatus, FrontendFilters, ListedFrontends, ListenersList, RunState, WorkerInfo,
-        PROTOCOL_VERSION,
+        ClientRequest, CommandResponse, CommandResponseContent, CommandStatus, FrontendFilters,
+        ListedFrontends, ListenersList, RequestContent, RunState, WorkerInfo, PROTOCOL_VERSION,
     },
     config::Config,
     logging,
@@ -42,7 +41,7 @@ impl CommandServer {
     pub async fn handle_client_request(
         &mut self,
         client_id: String,
-        request: CommandRequest,
+        request: ClientRequest,
     ) -> anyhow::Result<Success> {
         trace!("Received order {:?}", request);
         let request_identifier = RequestIdentifier {
@@ -51,13 +50,13 @@ impl CommandServer {
         };
         let cloned_identifier = request_identifier.clone();
 
-        let result: anyhow::Result<Option<Success>> = match request.order {
-            CommandRequestOrder::SaveState { path } => self.save_state(&path).await,
-            CommandRequestOrder::DumpState => self.dump_state().await,
-            CommandRequestOrder::ListWorkers => self.list_workers().await,
-            CommandRequestOrder::ListFrontends(filters) => self.list_frontends(filters).await,
-            CommandRequestOrder::ListListeners => self.list_listeners(),
-            CommandRequestOrder::LoadState { path } => {
+        let result: anyhow::Result<Option<Success>> = match request.content {
+            RequestContent::SaveState { path } => self.save_state(&path).await,
+            RequestContent::DumpState => self.dump_state().await,
+            RequestContent::ListWorkers => self.list_workers().await,
+            RequestContent::ListFrontends(filters) => self.list_frontends(filters).await,
+            RequestContent::ListListeners => self.list_listeners(),
+            RequestContent::LoadState { path } => {
                 self.load_state(
                     Some(request_identifier.client),
                     request_identifier.request,
@@ -65,14 +64,12 @@ impl CommandServer {
                 )
                 .await
             }
-            CommandRequestOrder::LaunchWorker(tag) => {
-                self.launch_worker(request_identifier, &tag).await
-            }
-            CommandRequestOrder::UpgradeMain => self.upgrade_main(request_identifier).await,
-            CommandRequestOrder::UpgradeWorker(worker_id) => {
+            RequestContent::LaunchWorker(tag) => self.launch_worker(request_identifier, &tag).await,
+            RequestContent::UpgradeMain => self.upgrade_main(request_identifier).await,
+            RequestContent::UpgradeWorker(worker_id) => {
                 self.upgrade_worker(request_identifier, worker_id).await
             }
-            CommandRequestOrder::Proxy(proxy_request_order) => match *proxy_request_order {
+            RequestContent::Proxy(proxy_request_order) => match *proxy_request_order {
                 ProxyRequestOrder::ConfigureMetrics(config) => {
                     self.configure_metrics(request_identifier, config).await
                 }
@@ -86,14 +83,14 @@ impl CommandServer {
                 // but it goes in there instead:
                 order => self.worker_order(request_identifier, order).await,
             },
-            CommandRequestOrder::SubscribeEvents => {
+            RequestContent::SubscribeEvents => {
                 self.event_subscribers.insert(client_id.clone());
                 Ok(Some(Success::SubscribeEvent(client_id.clone())))
             }
-            CommandRequestOrder::ReloadConfiguration { path } => {
+            RequestContent::ReloadConfiguration { path } => {
                 self.reload_configuration(request_identifier, path).await
             }
-            CommandRequestOrder::Status => self.status(request_identifier).await,
+            RequestContent::Status => self.status(request_identifier).await,
         };
 
         // Notify the command server by sending using his command_tx
@@ -135,9 +132,9 @@ impl CommandServer {
 
         let result: anyhow::Result<usize> = (move || {
             for command in orders {
-                let message = CommandRequest::new(
+                let message = ClientRequest::new(
                     format!("SAVE-{counter}"),
-                    CommandRequestOrder::Proxy(Box::new(command)),
+                    RequestContent::Proxy(Box::new(command)),
                 );
 
                 file.write_all(
@@ -211,7 +208,7 @@ impl CommandServer {
             }
 
             let mut offset = 0usize;
-            match parse_several_commands::<CommandRequest>(buffer.data()) {
+            match parse_several_commands::<ClientRequest>(buffer.data()) {
                 Ok((i, requests)) => {
                     if !i.is_empty() {
                         debug!("could not parse {} bytes", i.len());
@@ -233,7 +230,7 @@ impl CommandServer {
                     }
 
                     for request in requests {
-                        if let CommandRequestOrder::Proxy(order) = request.order {
+                        if let RequestContent::Proxy(order) = request.content {
                             message_counter += 1;
 
                             if self.state.dispatch(&order).is_ok() {
@@ -808,7 +805,7 @@ impl CommandServer {
         .await;
 
         for message in new_config.generate_config_messages() {
-            if let CommandRequestOrder::Proxy(order) = message.order {
+            if let RequestContent::Proxy(order) = message.content {
                 if self.state.dispatch(&order).is_ok() {
                     diff_counter += 1;
 

@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
     command::{
-        CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
-        CommandStatus, Event, RunState,
+        ClientRequest, CommandResponse, CommandResponseContent, CommandStatus, Event,
+        RequestContent, RunState,
     },
     config::Config,
     scm_socket::{Listeners, ScmSocket},
@@ -61,7 +61,7 @@ enum CommandMessage {
     },
     ClientRequest {
         client_id: String,
-        request: CommandRequest,
+        request: ClientRequest,
     },
     WorkerResponse {
         worker_id: u32,
@@ -531,7 +531,7 @@ impl CommandServer {
 
         //FIXME: too many loops, this could be cleaner
         for message in self.config.generate_config_messages() {
-            if let CommandRequestOrder::Proxy(order) = message.order {
+            if let RequestContent::Proxy(order) = message.content {
                 if let Err(e) = self.state.dispatch(&order) {
                     error!("Could not execute order on state: {:#}", e);
                 }
@@ -977,7 +977,7 @@ async fn client_loop(
             Ok(msg) => msg,
         };
 
-        match serde_json::from_slice::<CommandRequest>(&message) {
+        match serde_json::from_slice::<ClientRequest>(&message) {
             Err(e) => {
                 error!("could not decode client message: {:?}", e);
                 break;

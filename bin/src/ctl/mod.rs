@@ -8,7 +8,7 @@ use anyhow::Context;
 
 use sozu_command_lib::{
     channel::Channel,
-    command::{CommandRequest, CommandResponse},
+    command::{ClientRequest, CommandResponse},
     config::Config,
 };
 
@@ -18,7 +18,7 @@ use crate::{
 };
 
 pub struct CommandManager {
-    channel: Channel<CommandRequest, CommandResponse>,
+    channel: Channel<ClientRequest, CommandResponse>,
     timeout: Duration,
     config: Config,
 }
@@ -150,7 +150,7 @@ impl CommandManager {
 }
 
 /// creates a blocking channel
-pub fn create_channel(config: &Config) -> anyhow::Result<Channel<CommandRequest, CommandResponse>> {
+pub fn create_channel(config: &Config) -> anyhow::Result<Channel<ClientRequest, CommandResponse>> {
     let mut channel = Channel::from_path(
         &config.command_socket_path()?,
         config.command_buffer_size,
