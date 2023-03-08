@@ -9,8 +9,7 @@ use sozu_command_lib::{
         RunState, WorkerInfo,
     },
     worker::{
-        ProxyRequestOrder, Query, QueryCertificateType, QueryClusterDomain, QueryClusterType,
-        QueryMetricsOptions,
+        Query, QueryCertificateType, QueryClusterDomain, QueryClusterType, QueryMetricsOptions,
     },
 };
 
@@ -290,14 +289,12 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = RequestContent::Proxy(Box::new(ProxyRequestOrder::Query(Query::Metrics(
-            QueryMetricsOptions {
-                list,
-                cluster_ids,
-                backend_ids,
-                metric_names,
-            },
-        ))));
+        let command = RequestContent::Query(Query::Metrics(QueryMetricsOptions {
+            list,
+            cluster_ids,
+            backend_ids,
+            metric_names,
+        }));
 
         // a loop to reperform the query every refresh time
         loop {
@@ -365,9 +362,9 @@ impl CommandManager {
         }
 
         let command = if let Some(ref cluster_id) = cluster_id {
-            RequestContent::Proxy(Box::new(ProxyRequestOrder::Query(Query::Clusters(
-                QueryClusterType::ClusterId(cluster_id.to_string()),
-            ))))
+            RequestContent::Query(Query::Clusters(QueryClusterType::ClusterId(
+                cluster_id.to_string(),
+            )))
         } else if let Some(ref domain) = domain {
             let splitted: Vec<String> =
                 domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
@@ -384,11 +381,9 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
             };
 
-            RequestContent::Proxy(Box::new(ProxyRequestOrder::Query(Query::Clusters(
-                QueryClusterType::Domain(query_domain),
-            ))))
+            RequestContent::Query(Query::Clusters(QueryClusterType::Domain(query_domain)))
         } else {
-            RequestContent::Proxy(Box::new(ProxyRequestOrder::Query(Query::ClustersHashes)))
+            RequestContent::Query(Query::ClustersHashes)
         };
 
         let id = generate_id();
@@ -440,9 +435,7 @@ impl CommandManager {
             }
         };
 
-        let command = RequestContent::Proxy(Box::new(ProxyRequestOrder::Query(
-            Query::Certificates(query),
-        )));
+        let command = RequestContent::Query(Query::Certificates(query));
 
         let id = generate_id();
 

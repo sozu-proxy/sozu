@@ -26,15 +26,16 @@ use crate::{
     pool::Pool,
     sozu_command::{
         channel::Channel,
+        command::RequestContent,
         config::Config,
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
         state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
         worker::{
             Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyEvent,
-            ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
-            ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,
-            QueryClusterType, RemoveBackend, TcpListenerConfig as CommandTcpListener,
+            ProxyRequest, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, Query,
+            QueryAnswer, QueryAnswerCertificate, QueryCertificateType, QueryClusterType,
+            RemoveBackend, TcpListenerConfig as CommandTcpListener,
         },
     },
     tcp,
@@ -438,7 +439,7 @@ impl Server {
                 let id = format!("INIT-{counter}");
                 let message = ProxyRequest {
                     id,
-                    order: order.to_owned(),
+                    content: order.to_owned(),
                 };
 
                 trace!("generating initial config order: {:#?}", message);
@@ -667,8 +668,8 @@ impl Server {
 
         loop {
             match self.channel.read_message() {
-                Ok(request) => match request.order {
-                    ProxyRequestOrder::HardStop => {
+                Ok(request) => match request.content {
+                    RequestContent::HardStop => {
                         let req_id = request.id.clone();
                         self.notify(request);
                         if let Err(e) = self.channel.write_message(&ProxyResponse::ok(req_id)) {
@@ -679,12 +680,12 @@ impl Server {
                         }
                         return true;
                     }
-                    ProxyRequestOrder::SoftStop => {
+                    RequestContent::SoftStop => {
                         self.shutting_down = Some(request.id.clone());
                         self.last_sessions_len = self.sessions.borrow().slab.len();
                         self.notify(request);
                     }
-                    ProxyRequestOrder::ReturnListenSockets => {
+                    RequestContent::ReturnListenSockets => {
                         info!("received ReturnListenSockets order");
                         self.return_listen_sockets();
                     }
@@ -875,7 +876,7 @@ impl Server {
     }
 
     fn notify(&mut self, message: ProxyRequest) {
-        if let ProxyRequestOrder::ConfigureMetrics(configuration) = &message.order {
+        if let RequestContent::ConfigureMetrics(configuration) = &message.content {
             //let id = message.id.clone();
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).configure(configuration);
@@ -885,7 +886,7 @@ impl Server {
             return;
         }
 
-        if let ProxyRequestOrder::Query(ref query) = message.order {
+        if let RequestContent::Query(ref query) = message.content {
             match query {
                 Query::ClustersHashes => {
                     push_queue(ProxyResponse {
@@ -962,29 +963,29 @@ impl Server {
     }
 
     pub fn notify_proxys(&mut self, request: ProxyRequest) {
-        if let Err(e) = self.config_state.dispatch(&request.order) {
+        if let Err(e) = self.config_state.dispatch(&request.content) {
             error!("Could not execute order on config state: {:#}", e);
         }
 
         let req_id = request.id.clone();
 
-        match request.order {
-            ProxyRequestOrder::AddCluster(ref cluster) => {
+        match request.content {
+            RequestContent::AddCluster(ref cluster) => {
                 self.add_cluster(cluster);
                 //not returning because the message must still be handled by each proxy
             }
-            ProxyRequestOrder::AddBackend(ref backend) => {
+            RequestContent::AddBackend(ref backend) => {
                 push_queue(self.add_backend(&req_id, backend));
                 return;
             }
-            ProxyRequestOrder::RemoveBackend(ref remove_backend) => {
+            RequestContent::RemoveBackend(ref remove_backend) => {
                 push_queue(self.remove_backend(&req_id, remove_backend));
                 return;
             }
             _ => {}
         };
 
-        let proxy_destinations = request.order.get_destinations();
+        let proxy_destinations = request.content.get_destinations();
         if proxy_destinations.to_http_proxy {
             push_queue(self.http.borrow_mut().notify(request.clone()));
         }
@@ -995,18 +996,18 @@ impl Server {
             push_queue(self.tcp.borrow_mut().notify(request.clone()));
         }
 
-        match request.order {
+        match request.content {
             // special case for adding listeners, because we need to register a listener
-            ProxyRequestOrder::AddHttpListener(ref listener) => {
+            RequestContent::AddHttpListener(ref listener) => {
                 push_queue(self.notify_add_http_listener(&req_id, listener));
             }
-            ProxyRequestOrder::AddHttpsListener(ref listener) => {
+            RequestContent::AddHttpsListener(ref listener) => {
                 push_queue(self.notify_add_https_listener(&req_id, listener));
             }
-            ProxyRequestOrder::AddTcpListener(listener) => {
+            RequestContent::AddTcpListener(listener) => {
                 push_queue(self.notify_add_tcp_listener(&req_id, listener));
             }
-            ProxyRequestOrder::RemoveListener(ref remove) => {
+            RequestContent::RemoveListener(ref remove) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
                 let response = match remove.proxy {
@@ -1016,10 +1017,10 @@ impl Server {
                 };
                 push_queue(response);
             }
-            ProxyRequestOrder::ActivateListener(ref activate) => {
+            RequestContent::ActivateListener(ref activate) => {
                 push_queue(self.notify_activate_listener(&req_id, activate));
             }
-            ProxyRequestOrder::DeactivateListener(ref deactivate) => {
+            RequestContent::DeactivateListener(ref deactivate) => {
                 push_queue(self.notify_deactivate_listener(&req_id, deactivate));
             }
             _other_order => {}

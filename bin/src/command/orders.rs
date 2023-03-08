@@ -24,8 +24,8 @@ use sozu_command_lib::{
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
     worker::{
-        AggregatedMetricsData, MetricsConfiguration, ProxyRequest, ProxyRequestOrder,
-        ProxyResponseContent, ProxyResponseStatus, Query, QueryAnswer, QueryClusterType,
+        AggregatedMetricsData, MetricsConfiguration, ProxyRequest, ProxyResponseContent,
+        ProxyResponseStatus, Query, QueryAnswer, QueryClusterType,
     },
 };
 
@@ -69,20 +69,11 @@ impl CommandServer {
             RequestContent::UpgradeWorker(worker_id) => {
                 self.upgrade_worker(request_identifier, worker_id).await
             }
-            RequestContent::Proxy(proxy_request_order) => match *proxy_request_order {
-                ProxyRequestOrder::ConfigureMetrics(config) => {
-                    self.configure_metrics(request_identifier, config).await
-                }
-                ProxyRequestOrder::Query(query) => self.query(request_identifier, query).await,
-                ProxyRequestOrder::Logging(logging_filter) => {
-                    self.set_logging_level(logging_filter)
-                }
-                // we should have something like
-                // ProxyRequestOrder::SoftStop => self.do_something(),
-                // ProxyRequestOrder::HardStop => self.do_nothing_and_return_early(),
-                // but it goes in there instead:
-                order => self.worker_order(request_identifier, order).await,
-            },
+            RequestContent::ConfigureMetrics(config) => {
+                self.configure_metrics(request_identifier, config).await
+            }
+            RequestContent::Query(query) => self.query(request_identifier, query).await,
+            RequestContent::Logging(logging_filter) => self.set_logging_level(logging_filter),
             RequestContent::SubscribeEvents => {
                 self.event_subscribers.insert(client_id.clone());
                 Ok(Some(Success::SubscribeEvent(client_id.clone())))
@@ -91,6 +82,12 @@ impl CommandServer {
                 self.reload_configuration(request_identifier, path).await
             }
             RequestContent::Status => self.status(request_identifier).await,
+            // any other case is an order for a worker, except for SoftStop and HardStop.
+            // we should have something like:
+            // RequestContent::SoftStop => self.do_something(),
+            // RequestContent::HardStop => self.do_nothing_and_return_early(),
+            // but it goes in there instead:
+            worker_order => self.worker_order(request_identifier, worker_order).await,
         };
 
         // Notify the command server by sending using his command_tx
@@ -131,11 +128,8 @@ impl CommandServer {
         let orders = self.state.generate_orders();
 
         let result: anyhow::Result<usize> = (move || {
-            for command in orders {
-                let message = ClientRequest::new(
-                    format!("SAVE-{counter}"),
-                    RequestContent::Proxy(Box::new(command)),
-                );
+            for order in orders {
+                let message = ClientRequest::new(format!("SAVE-{counter}"), order);
 
                 file.write_all(
                     &serde_json::to_string(&message)
@@ -230,30 +224,30 @@ impl CommandServer {
                     }
 
                     for request in requests {
-                        if let RequestContent::Proxy(order) = request.content {
-                            message_counter += 1;
+                        message_counter += 1;
 
-                            if self.state.dispatch(&order).is_ok() {
-                                diff_counter += 1;
+                        if self.state.dispatch(&request.content).is_ok() {
+                            diff_counter += 1;
 
-                                let mut found = false;
-                                let id = format!("LOAD-STATE-{request_id}-{diff_counter}");
+                            let mut found = false;
+                            let id = format!("LOAD-STATE-{request_id}-{diff_counter}");
 
-                                for ref mut worker in self.workers.iter_mut().filter(|worker| {
-                                    worker.run_state != RunState::Stopping
-                                        && worker.run_state != RunState::Stopped
-                                }) {
-                                    let worker_message_id = format!("{}-{}", id, worker.id);
-                                    worker.send(worker_message_id.clone(), *order.clone()).await;
-                                    self.in_flight
-                                        .insert(worker_message_id, (load_state_tx.clone(), 1));
+                            for ref mut worker in self.workers.iter_mut().filter(|worker| {
+                                worker.run_state != RunState::Stopping
+                                    && worker.run_state != RunState::Stopped
+                            }) {
+                                let worker_message_id = format!("{}-{}", id, worker.id);
+                                worker
+                                    .send(worker_message_id.clone(), request.content.clone())
+                                    .await;
+                                self.in_flight
+                                    .insert(worker_message_id, (load_state_tx.clone(), 1));
 
-                                    found = true;
-                                }
+                                found = true;
+                            }
 
-                                if !found {
-                                    bail!("no worker found");
-                                }
+                            if !found {
+                                bail!("no worker found");
                             }
                         }
                     }
@@ -615,7 +609,7 @@ impl CommandServer {
             .with_context(|| "No sender on new worker".to_string())?
             .send(ProxyRequest {
                 id: format!("UPGRADE-{id}-STATUS"),
-                order: ProxyRequestOrder::Status,
+                content: RequestContent::Status,
             })
             .await
             .with_context(|| {
@@ -635,7 +629,7 @@ impl CommandServer {
 
             /*
             old_worker.channel.set_blocking(true);
-            old_worker.channel.write_message(&ProxyRequest { id: String::from(message_id), order: ProxyRequestOrder::ReturnListenSockets });
+            old_worker.channel.write_message(&ProxyRequest { id: String::from(message_id), order: RequestContent::ReturnListenSockets });
             info!("sent returnlistensockets message to worker");
             old_worker.channel.set_blocking(false);
             */
@@ -643,7 +637,7 @@ impl CommandServer {
             let id = format!("{}-return-sockets", request_identifier.client);
             self.in_flight.insert(id.clone(), (sockets_return_tx, 1));
             old_worker
-                .send(id.clone(), ProxyRequestOrder::ReturnListenSockets)
+                .send(id.clone(), RequestContent::ReturnListenSockets)
                 .await;
 
             info!("sent ReturnListenSockets to old worker");
@@ -701,7 +695,7 @@ impl CommandServer {
             let softstop_id = format!("{}-softstop", request_identifier.client);
             self.in_flight.insert(softstop_id.clone(), (softstop_tx, 1));
             old_worker
-                .send(softstop_id.clone(), ProxyRequestOrder::SoftStop)
+                .send(softstop_id.clone(), RequestContent::SoftStop)
                 .await;
 
             let mut command_tx = self.command_tx.clone();
@@ -805,32 +799,30 @@ impl CommandServer {
         .await;
 
         for message in new_config.generate_config_messages() {
-            if let RequestContent::Proxy(order) = message.content {
-                if self.state.dispatch(&order).is_ok() {
-                    diff_counter += 1;
+            let order = message.content;
+            if self.state.dispatch(&order).is_ok() {
+                diff_counter += 1;
 
-                    let mut found = false;
-                    let id = format!(
-                        "LOAD-STATE-{}-{}",
-                        &request_identifier.request, diff_counter
-                    );
+                let mut found = false;
+                let id = format!(
+                    "LOAD-STATE-{}-{}",
+                    &request_identifier.request, diff_counter
+                );
 
-                    for ref mut worker in self.workers.iter_mut().filter(|worker| {
-                        worker.run_state != RunState::Stopping
-                            && worker.run_state != RunState::Stopped
-                    }) {
-                        let worker_message_id = format!("{}-{}", id, worker.id);
-                        worker.send(worker_message_id.clone(), *order.clone()).await;
-                        self.in_flight
-                            .insert(worker_message_id, (load_state_tx.clone(), 1));
+                for ref mut worker in self.workers.iter_mut().filter(|worker| {
+                    worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
+                }) {
+                    let worker_message_id = format!("{}-{}", id, worker.id);
+                    worker.send(worker_message_id.clone(), order.clone()).await;
+                    self.in_flight
+                        .insert(worker_message_id, (load_state_tx.clone(), 1));
 
-                        found = true;
-                    }
+                    found = true;
+                }
 
-                    if !found {
-                        // FIXME: should send back error here
-                        error!("no worker found");
-                    }
+                if !found {
+                    // FIXME: should send back error here
+                    error!("no worker found");
                 }
             }
         }
@@ -925,7 +917,7 @@ impl CommandServer {
             if worker.run_state == RunState::Running {
                 info!("Summoning status of worker {}", worker.id);
                 worker
-                    .send(worker_request_id.clone(), ProxyRequestOrder::Status)
+                    .send(worker_request_id.clone(), RequestContent::Status)
                     .await;
                 count += 1;
                 self.in_flight
@@ -996,7 +988,7 @@ impl CommandServer {
             worker
                 .send(
                     req_id.clone(),
-                    ProxyRequestOrder::ConfigureMetrics(config.clone()),
+                    RequestContent::ConfigureMetrics(config.clone()),
                 )
                 .await;
             count += 1;
@@ -1074,7 +1066,7 @@ impl CommandServer {
         {
             let req_id = format!("{}-query-{}", request_identifier.client, worker.id);
             worker
-                .send(req_id.clone(), ProxyRequestOrder::Query(query.clone()))
+                .send(req_id.clone(), RequestContent::Query(query.clone()))
                 .await;
             count += 1;
             self.in_flight.insert(req_id, (query_tx.clone(), 1));
@@ -1206,9 +1198,9 @@ impl CommandServer {
     pub async fn worker_order(
         &mut self,
         request_identifier: RequestIdentifier,
-        order: ProxyRequestOrder,
+        order: RequestContent,
     ) -> anyhow::Result<Option<Success>> {
-        if let &ProxyRequestOrder::AddCertificate(_) = &order {
+        if let &RequestContent::AddCertificate(_) = &order {
             debug!("workerconfig client order AddCertificate()");
         } else {
             debug!("workerconfig client order {:?}", order);
@@ -1219,7 +1211,7 @@ impl CommandServer {
             .with_context(|| "Could not execute order on the state")?;
 
         if self.config.automatic_state_save
-            & (order != ProxyRequestOrder::SoftStop || order != ProxyRequestOrder::HardStop)
+            & (order != RequestContent::SoftStop || order != RequestContent::HardStop)
         {
             if let Some(path) = self.config.saved_state.clone() {
                 return_processing(
@@ -1252,7 +1244,7 @@ impl CommandServer {
             worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
         }) {
             let should_stop_worker =
-                order == ProxyRequestOrder::SoftStop || order == ProxyRequestOrder::HardStop;
+                order == RequestContent::SoftStop || order == RequestContent::HardStop;
             if should_stop_worker {
                 worker.run_state = RunState::Stopping;
                 stopping_workers.insert(worker.id);
@@ -1268,7 +1260,7 @@ impl CommandServer {
         }
 
         let should_stop_main =
-            order == ProxyRequestOrder::SoftStop || order == ProxyRequestOrder::HardStop;
+            order == RequestContent::SoftStop || order == RequestContent::HardStop;
 
         let mut command_tx = self.command_tx.clone();
         let thread_request_identifier = request_identifier.clone();
@@ -1342,15 +1334,15 @@ impl CommandServer {
         }
 
         match order {
-            ProxyRequestOrder::AddBackend(_) | ProxyRequestOrder::RemoveBackend(_) => {
+            RequestContent::AddBackend(_) | RequestContent::RemoveBackend(_) => {
                 self.backends_count = self.state.count_backends()
             }
-            ProxyRequestOrder::AddHttpFrontend(_)
-            | ProxyRequestOrder::AddHttpsFrontend(_)
-            | ProxyRequestOrder::AddTcpFrontend(_)
-            | ProxyRequestOrder::RemoveHttpFrontend(_)
-            | ProxyRequestOrder::RemoveHttpsFrontend(_)
-            | ProxyRequestOrder::RemoveTcpFrontend(_) => {
+            RequestContent::AddHttpFrontend(_)
+            | RequestContent::AddHttpsFrontend(_)
+            | RequestContent::AddTcpFrontend(_)
+            | RequestContent::RemoveHttpFrontend(_)
+            | RequestContent::RemoveHttpsFrontend(_)
+            | RequestContent::RemoveTcpFrontend(_) => {
                 self.frontends_count = self.state.count_frontends()
             }
             _ => {}

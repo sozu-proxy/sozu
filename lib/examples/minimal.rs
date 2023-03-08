@@ -7,6 +7,7 @@ extern crate time;
 use std::{collections::BTreeMap, env, io::stdout, thread};
 
 use anyhow::Context;
+use sozu_command::command::RequestContent;
 
 use crate::sozu_command::{
     channel::Channel,
@@ -77,12 +78,12 @@ fn main() -> anyhow::Result<()> {
 
     command.write_message(&worker::ProxyRequest {
         id: String::from("ID_ABCD"),
-        order: worker::ProxyRequestOrder::AddHttpFrontend(http_front),
+        content: RequestContent::AddHttpFrontend(http_front),
     });
 
     command.write_message(&worker::ProxyRequest {
         id: String::from("ID_EFGH"),
-        order: worker::ProxyRequestOrder::AddBackend(http_backend),
+        content: RequestContent::AddBackend(http_backend),
     });
 
     println!("HTTP -> {:?}", command.read_message());

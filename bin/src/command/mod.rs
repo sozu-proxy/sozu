@@ -32,7 +32,7 @@ use sozu_command_lib::{
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
     worker::{
-        MetricsConfiguration, ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
+        MetricsConfiguration, ProxyRequest, ProxyResponse, ProxyResponseContent,
         ProxyResponseStatus,
     },
 };
@@ -531,33 +531,32 @@ impl CommandServer {
 
         //FIXME: too many loops, this could be cleaner
         for message in self.config.generate_config_messages() {
-            if let RequestContent::Proxy(order) = message.content {
-                if let Err(e) = self.state.dispatch(&order) {
-                    error!("Could not execute order on state: {:#}", e);
-                }
+            let order = message.content;
+            if let Err(e) = self.state.dispatch(&order) {
+                error!("Could not execute order on state: {:#}", e);
+            }
 
-                if let &ProxyRequestOrder::AddCertificate(_) = &*order {
-                    debug!("config generated AddCertificate( ... )");
-                } else {
-                    debug!("config generated {:?}", order);
-                }
+            if let &RequestContent::AddCertificate(_) = &order {
+                debug!("config generated AddCertificate( ... )");
+            } else {
+                debug!("config generated {:?}", order);
+            }
 
-                let mut count = 0usize;
-                for ref mut worker in self.workers.iter_mut().filter(|worker| {
-                    worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
-                }) {
-                    worker.send(message.id.clone(), *order.clone()).await;
-                    count += 1;
-                }
+            let mut count = 0usize;
+            for ref mut worker in self.workers.iter_mut().filter(|worker| {
+                worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
+            }) {
+                worker.send(message.id.clone(), order.clone()).await;
+                count += 1;
+            }
 
-                if count == 0 {
-                    // FIXME: should send back error here
-                    error!("no worker found");
-                } else {
-                    self.in_flight
-                        .insert(message.id.clone(), (tx.clone(), count));
-                    total_message_count += count;
-                }
+            if count == 0 {
+                // FIXME: should send back error here
+                error!("no worker found");
+            } else {
+                self.in_flight
+                    .insert(message.id.clone(), (tx.clone(), count));
+                total_message_count += count;
             }
         }
 
@@ -688,7 +687,7 @@ impl CommandServer {
         new_worker
             .send(
                 format!("RESTART-{new_worker_id}-STATUS"),
-                ProxyRequestOrder::Status,
+                RequestContent::Status,
             )
             .await;
 

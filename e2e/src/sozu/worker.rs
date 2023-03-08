@@ -14,14 +14,15 @@ use sozu_lib as sozu;
 use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
+    command::RequestContent,
     config::{Config, FileConfig},
     logging::{Logger, LoggerBackend},
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
     worker::{
         Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, ProxyRequest, ProxyRequestOrder,
-        ProxyResponse, Route, RulePosition, TcpFrontend, TcpListenerConfig,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, ProxyRequest, ProxyResponse, Route,
+        RulePosition, TcpFrontend, TcpListenerConfig,
     },
 };
 
@@ -202,7 +203,7 @@ impl Worker {
     }
 
     pub fn upgrade<S: Into<String>>(&mut self, name: S) -> Self {
-        self.send_proxy_request(ProxyRequestOrder::ReturnListenSockets);
+        self.send_proxy_request(RequestContent::ReturnListenSockets);
         self.read_to_last();
 
         self.scm_main_to_worker
@@ -214,7 +215,7 @@ impl Worker {
             .expect("receive listeners");
         println!("Listeners from old worker: {listeners:?}");
         println!("State from old worker: {:?}", self.state);
-        self.send_proxy_request(ProxyRequestOrder::SoftStop);
+        self.send_proxy_request(RequestContent::SoftStop);
 
         let mut worker = Worker::start_new_worker(
             name,
@@ -238,12 +239,12 @@ impl Worker {
         worker
     }
 
-    pub fn send_proxy_request(&mut self, order: ProxyRequestOrder) {
+    pub fn send_proxy_request(&mut self, order: RequestContent) {
         //self.state.handle_order(&order);
         self.command_channel
             .write_message(&ProxyRequest {
                 id: self.command_id.next(),
-                order,
+                content: order,
             })
             .expect("Could not write message on command channel");
     }

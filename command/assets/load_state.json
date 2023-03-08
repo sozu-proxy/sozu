@@ -2,7 +2,7 @@
   "id": "ID_TEST",
   "version": 0,
   "type": "LOAD_STATE",
-  "data": {
+  "content": {
     "path": "./config_dump.json"
   }
 }

@@ -7,8 +7,10 @@ use std::{
 use crate::{
     state::ConfigState,
     worker::{
-        AggregatedMetricsData, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, ProxyEvent,
-        ProxyRequestOrder, QueryAnswer, TcpFrontend, TcpListenerConfig,
+        ActivateListener, AddCertificate, AggregatedMetricsData, Backend, Cluster,
+        DeactivateListener, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
+        MetricsConfiguration, ProxyEvent, Query, QueryAnswer, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, TcpFrontend, TcpListenerConfig,
     },
 };
 
@@ -16,10 +18,8 @@ pub const PROTOCOL_VERSION: u8 = 0;
 
 /// Details of a request sent by the CLI (or other) to the main process
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(tag = "type", content = "content", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RequestContent {
-    /// an order to forward to workers
-    Proxy(Box<ProxyRequestOrder>),
     /// save Sōzu's parseable state as a file
     SaveState {
         path: String,
@@ -50,6 +50,46 @@ pub enum RequestContent {
     },
     /// give status of main process and all workers
     Status,
+
+    AddCluster(Cluster),
+    RemoveCluster {
+        cluster_id: String,
+    },
+
+    AddHttpFrontend(HttpFrontend),
+    RemoveHttpFrontend(HttpFrontend),
+
+    AddHttpsFrontend(HttpFrontend),
+    RemoveHttpsFrontend(HttpFrontend),
+
+    AddCertificate(AddCertificate),
+    ReplaceCertificate(ReplaceCertificate),
+    RemoveCertificate(RemoveCertificate),
+
+    AddTcpFrontend(TcpFrontend),
+    RemoveTcpFrontend(TcpFrontend),
+
+    AddBackend(Backend),
+    RemoveBackend(RemoveBackend),
+
+    AddHttpListener(HttpListenerConfig),
+    AddHttpsListener(HttpsListenerConfig),
+    AddTcpListener(TcpListenerConfig),
+
+    RemoveListener(RemoveListener),
+
+    ActivateListener(ActivateListener),
+    DeactivateListener(DeactivateListener),
+
+    Query(Query),
+
+    SoftStop,
+    HardStop,
+
+    ConfigureMetrics(MetricsConfiguration),
+    Logging(String),
+
+    ReturnListenSockets,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -63,8 +103,8 @@ pub struct FrontendFilters {
 /// Sent to the main process by the CLI (or other) through the unix socket
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClientRequest {
-    pub id: String,
-    pub version: u8,
+    pub id: String,  // TODO: should we keep this?
+    pub version: u8, // TODO: should we keep this?
     #[serde(flatten)]
     pub content: RequestContent,
 }
@@ -213,20 +253,20 @@ mod tests {
     use crate::worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
         ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Percentiles, ProxyRequestOrder, QueryAnswerMetrics,
-        RemoveBackend, RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
+        LoadBalancingParams, PathRule, Percentiles, QueryAnswerMetrics, RemoveBackend,
+        RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
     };
     use hex::FromHex;
     use serde_json;
 
     #[test]
     fn config_message_test() {
-        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
+        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "ADD_HTTP_FRONTEND", "content":{"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}}"#;
         let message: ClientRequest = serde_json::from_str(raw_json).unwrap();
         println!("{message:?}");
         assert_eq!(
             message.content,
-            RequestContent::Proxy(Box::new(ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+            RequestContent::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
@@ -234,7 +274,7 @@ mod tests {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 position: RulePosition::Tree,
                 tags: None,
-            })))
+            })
         );
     }
 
@@ -278,7 +318,7 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddCluster(Cluster {
+            content: RequestContent::AddCluster(Cluster {
                 cluster_id: String::from("xxx"),
                 sticky_session: true,
                 https_redirect: true,
@@ -286,7 +326,7 @@ mod tests {
                 load_balancing: LoadBalancingAlgorithms::RoundRobin,
                 load_metric: None,
                 answer_503: None,
-            }))),
+            }),
         }
     );
 
@@ -296,9 +336,9 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::RemoveCluster {
+            content: RequestContent::RemoveCluster {
                 cluster_id: String::from("xxx")
-            })),
+            },
         }
     );
 
@@ -308,17 +348,15 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddHttpFrontend(
-                HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
-                    hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
-                    method: None,
-                    address: "0.0.0.0:8080".parse().unwrap(),
-                    position: RulePosition::Tree,
-                    tags: None,
-                }
-            ))),
+            content: RequestContent::AddHttpFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("xxx")),
+                hostname: String::from("yyy"),
+                path: PathRule::Prefix(String::from("xxx")),
+                method: None,
+                address: "0.0.0.0:8080".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: None,
+            }),
         }
     );
 
@@ -328,23 +366,21 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::RemoveHttpFrontend(
-                HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
-                    hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
-                    method: None,
-                    address: "0.0.0.0:8080".parse().unwrap(),
-                    position: RulePosition::Tree,
-                    tags: Some(BTreeMap::from([
-                        ("owner".to_owned(), "John".to_owned()),
-                        (
-                            "uuid".to_owned(),
-                            "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
-                        )
-                    ]))
-                }
-            ))),
+            content: RequestContent::RemoveHttpFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("xxx")),
+                hostname: String::from("yyy"),
+                path: PathRule::Prefix(String::from("xxx")),
+                method: None,
+                address: "0.0.0.0:8080".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: Some(BTreeMap::from([
+                    ("owner".to_owned(), "John".to_owned()),
+                    (
+                        "uuid".to_owned(),
+                        "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
+                    )
+                ]))
+            }),
         }
     );
 
@@ -354,17 +390,15 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddHttpsFrontend(
-                HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
-                    hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
-                    method: None,
-                    address: "0.0.0.0:8443".parse().unwrap(),
-                    position: RulePosition::Tree,
-                    tags: None,
-                }
-            ))),
+            content: RequestContent::AddHttpsFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("xxx")),
+                hostname: String::from("yyy"),
+                path: PathRule::Prefix(String::from("xxx")),
+                method: None,
+                address: "0.0.0.0:8443".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: None,
+            }),
         }
     );
 
@@ -374,23 +408,21 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::RemoveHttpsFrontend(
-                HttpFrontend {
-                    route: Route::ClusterId(String::from("xxx")),
-                    hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
-                    method: None,
-                    address: "0.0.0.0:8443".parse().unwrap(),
-                    position: RulePosition::Tree,
-                    tags: Some(BTreeMap::from([
-                        ("owner".to_owned(), "John".to_owned()),
-                        (
-                            "uuid".to_owned(),
-                            "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
-                        )
-                    ]))
-                }
-            ))),
+            content: RequestContent::RemoveHttpsFrontend(HttpFrontend {
+                route: Route::ClusterId(String::from("xxx")),
+                hostname: String::from("yyy"),
+                path: PathRule::Prefix(String::from("xxx")),
+                method: None,
+                address: "0.0.0.0:8443".parse().unwrap(),
+                position: RulePosition::Tree,
+                tags: Some(BTreeMap::from([
+                    ("owner".to_owned(), "John".to_owned()),
+                    (
+                        "uuid".to_owned(),
+                        "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
+                    )
+                ]))
+            }),
         }
     );
 
@@ -404,19 +436,17 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddCertificate(
-                AddCertificate {
-                    address: "0.0.0.0:443".parse().unwrap(),
-                    certificate: CertificateAndKey {
-                        certificate: String::from(CERTIFICATE),
-                        certificate_chain: split_certificate_chain(String::from(CHAIN)),
-                        key: String::from(KEY),
-                        versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
-                    },
-                    names: vec![],
-                    expired_at: None,
-                }
-            ))),
+            content: RequestContent::AddCertificate(AddCertificate {
+                address: "0.0.0.0:443".parse().unwrap(),
+                certificate: CertificateAndKey {
+                    certificate: String::from(CERTIFICATE),
+                    certificate_chain: split_certificate_chain(String::from(CHAIN)),
+                    key: String::from(KEY),
+                    versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
+                },
+                names: vec![],
+                expired_at: None,
+            }),
         }
     );
 
@@ -426,17 +456,15 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::RemoveCertificate(
-                RemoveCertificate {
-                    address: "0.0.0.0:443".parse().unwrap(),
-                    fingerprint: CertificateFingerprint(
-                        FromHex::from_hex(
-                            "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
-                        )
-                        .unwrap()
-                    ),
-                }
-            ))),
+            content: RequestContent::RemoveCertificate(RemoveCertificate {
+                address: "0.0.0.0:443".parse().unwrap(),
+                fingerprint: CertificateFingerprint(
+                    FromHex::from_hex(
+                        "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
+                    )
+                    .unwrap()
+                ),
+            }),
         }
     );
 
@@ -446,14 +474,14 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::AddBackend(Backend {
+            content: RequestContent::AddBackend(Backend {
                 cluster_id: String::from("xxx"),
                 backend_id: String::from("xxx-0"),
                 address: "127.0.0.1:8080".parse().unwrap(),
                 load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
                 sticky_id: Some(String::from("xxx-0")),
                 backup: Some(false),
-            }))),
+            }),
         }
     );
 
@@ -463,13 +491,11 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::RemoveBackend(
-                RemoveBackend {
-                    cluster_id: String::from("xxx"),
-                    backend_id: String::from("xxx-0"),
-                    address: "127.0.0.1:8080".parse().unwrap(),
-                }
-            ))),
+            content: RequestContent::RemoveBackend(RemoveBackend {
+                cluster_id: String::from("xxx"),
+                backend_id: String::from("xxx-0"),
+                address: "127.0.0.1:8080".parse().unwrap(),
+            }),
         }
     );
 
@@ -479,7 +505,7 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::SoftStop)),
+            content: RequestContent::SoftStop,
         }
     );
 
@@ -489,7 +515,7 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::HardStop)),
+            content: RequestContent::HardStop,
         }
     );
 
@@ -499,7 +525,7 @@ mod tests {
         ClientRequest {
             id: "ID_TEST".to_string(),
             version: 0,
-            content: RequestContent::Proxy(Box::new(ProxyRequestOrder::Status)),
+            content: RequestContent::Status,
         }
     );
 

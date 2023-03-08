@@ -1,8 +1,5 @@
 {
   "id": "ID_TEST",
   "version": 0,
-  "type": "PROXY",
-  "data": {
-    "type": "STATUS"
-  }
+  "type": "STATUS"
 }

@@ -32,12 +32,13 @@ use tempfile::tempfile;
 use sozu::{metrics, server::Server};
 use sozu_command_lib::{
     channel::Channel,
+    command::RequestContent,
     config::Config,
     logging::target_to_backend,
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
-    worker::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
+    worker::{ProxyRequest, ProxyResponse},
 };
 
 use crate::{command::Worker, logging, util};
@@ -71,7 +72,7 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
             worker_channel
                 .write_message(&ProxyRequest {
                     id: format!("start-status-{index}"),
-                    order: ProxyRequestOrder::Status,
+                    content: RequestContent::Status,
                 })
                 .with_context(|| "Could not send status request to the worker")?;
 

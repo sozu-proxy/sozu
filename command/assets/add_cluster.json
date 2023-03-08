@@ -1,14 +1,11 @@
 {
   "id": "ID_TEST",
   "version": 0,
-  "type": "PROXY",
-  "data": {
-    "type": "ADD_CLUSTER",
-    "data": {
-      "cluster_id": "xxx",
-      "sticky_session": true,
-      "https_redirect": true,
-      "proxy_protocol": "EXPECT_HEADER"
-    }
+  "type": "ADD_CLUSTER",
+  "content": {
+    "cluster_id": "xxx",
+    "sticky_session": true,
+    "https_redirect": true,
+    "proxy_protocol": "EXPECT_HEADER"
   }
 }

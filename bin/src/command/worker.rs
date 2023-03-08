@@ -6,10 +6,10 @@ use nix::{sys::signal::kill, unistd::Pid};
 
 use sozu_command_lib::{
     channel::Channel,
-    command::{RunState, WorkerInfo},
+    command::{RequestContent, RunState, WorkerInfo},
     config::Config,
     scm_socket::ScmSocket,
-    worker::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
+    worker::{ProxyRequest, ProxyResponse},
 };
 
 /// An instance of Sōzu, as seen from the main process
@@ -49,12 +49,12 @@ impl Worker {
     }
 
     /// send proxy request to the worker, via the mpsc sender
-    pub async fn send(&mut self, request_id: String, data: ProxyRequestOrder) {
+    pub async fn send(&mut self, request_id: String, content: RequestContent) {
         if let Some(worker_tx) = self.sender.as_mut() {
             if let Err(e) = worker_tx
                 .send(ProxyRequest {
                     id: request_id.clone(),
-                    order: data,
+                    content,
                 })
                 .await
             {
