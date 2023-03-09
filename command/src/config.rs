@@ -14,10 +14,10 @@ use toml;
 
 use crate::{
     certificate::split_certificate_chain,
-    command::{ClientRequest, RequestContent, PROTOCOL_VERSION},
+    command::{Order, PROTOCOL_VERSION},
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
-        HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
+        HttpListenerConfig, HttpsListenerConfig, InnerOrder, ListenerType, LoadBalancingAlgorithms,
         LoadBalancingParams, LoadMetric, PathRule, Route, RulePosition, TcpFrontend,
         TcpListenerConfig, TlsVersion,
     },
@@ -598,11 +598,11 @@ pub struct HttpFrontendConfig {
 }
 
 impl HttpFrontendConfig {
-    pub fn generate_orders(&self, cluster_id: &str) -> Vec<RequestContent> {
+    pub fn generate_orders(&self, cluster_id: &str) -> Vec<Order> {
         let mut v = Vec::new();
 
         if self.key.is_some() && self.certificate.is_some() {
-            v.push(RequestContent::AddCertificate(AddCertificate {
+            v.push(Order::AddCertificate(AddCertificate {
                 address: self.address,
                 certificate: CertificateAndKey {
                     key: self.key.clone().unwrap(),
@@ -614,7 +614,7 @@ impl HttpFrontendConfig {
                 expired_at: None,
             }));
 
-            v.push(RequestContent::AddHttpsFrontend(HttpFrontend {
+            v.push(Order::AddHttpsFrontend(HttpFrontend {
                 route: Route::ClusterId(cluster_id.to_string()),
                 address: self.address,
                 hostname: self.hostname.clone(),
@@ -625,7 +625,7 @@ impl HttpFrontendConfig {
             }));
         } else {
             //create the front both for HTTP and HTTPS if possible
-            v.push(RequestContent::AddHttpFrontend(HttpFrontend {
+            v.push(Order::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(cluster_id.to_string()),
                 address: self.address,
                 hostname: self.hostname.clone(),
@@ -654,8 +654,8 @@ pub struct HttpClusterConfig {
 }
 
 impl HttpClusterConfig {
-    pub fn generate_orders(&self) -> Vec<RequestContent> {
-        let mut v = vec![RequestContent::AddCluster(Cluster {
+    pub fn generate_orders(&self) -> Vec<Order> {
+        let mut v = vec![Order::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: self.sticky_session,
             https_redirect: self.https_redirect,
@@ -675,7 +675,7 @@ impl HttpClusterConfig {
                 weight: backend.weight.unwrap_or(100),
             });
 
-            v.push(RequestContent::AddBackend(Backend {
+            v.push(Order::AddBackend(Backend {
                 cluster_id: self.cluster_id.clone(),
                 backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                     format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
@@ -709,8 +709,8 @@ pub struct TcpClusterConfig {
 }
 
 impl TcpClusterConfig {
-    pub fn generate_orders(&self) -> Vec<RequestContent> {
-        let mut v = vec![RequestContent::AddCluster(Cluster {
+    pub fn generate_orders(&self) -> Vec<Order> {
+        let mut v = vec![Order::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: false,
             https_redirect: false,
@@ -721,7 +721,7 @@ impl TcpClusterConfig {
         })];
 
         for frontend in &self.frontends {
-            v.push(RequestContent::AddTcpFrontend(TcpFrontend {
+            v.push(Order::AddTcpFrontend(TcpFrontend {
                 cluster_id: self.cluster_id.clone(),
                 address: frontend.address,
                 tags: frontend.tags.clone(),
@@ -733,7 +733,7 @@ impl TcpClusterConfig {
                 weight: backend.weight.unwrap_or(100),
             });
 
-            v.push(RequestContent::AddBackend(Backend {
+            v.push(Order::AddBackend(Backend {
                 cluster_id: self.cluster_id.clone(),
                 backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                     format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
@@ -756,7 +756,7 @@ pub enum ClusterConfig {
 }
 
 impl ClusterConfig {
-    pub fn generate_orders(&self) -> Vec<RequestContent> {
+    pub fn generate_orders(&self) -> Vec<Order> {
         match *self {
             ClusterConfig::Http(ref http) => http.generate_orders(),
             ClusterConfig::Tcp(ref tcp) => tcp.generate_orders(),
@@ -1188,36 +1188,33 @@ impl Config {
         Ok(config)
     }
 
-    pub fn generate_config_messages(&self) -> Vec<ClientRequest> {
+    pub fn generate_config_messages(&self) -> Vec<InnerOrder> {
         let mut v = Vec::new();
         let mut count = 0u8;
 
         for listener in &self.http_listeners {
-            v.push(ClientRequest {
+            v.push(InnerOrder {
                 id: format!("CONFIG-{count}"),
-                version: PROTOCOL_VERSION,
 
-                content: RequestContent::AddHttpListener(listener.clone()),
+                content: Order::AddHttpListener(listener.clone()),
             });
             count += 1;
         }
 
         for listener in &self.https_listeners {
-            v.push(ClientRequest {
+            v.push(InnerOrder {
                 id: format!("CONFIG-{count}"),
-                version: PROTOCOL_VERSION,
 
-                content: RequestContent::AddHttpsListener(listener.clone()),
+                content: Order::AddHttpsListener(listener.clone()),
             });
             count += 1;
         }
 
         for listener in &self.tcp_listeners {
-            v.push(ClientRequest {
+            v.push(InnerOrder {
                 id: format!("CONFIG-{count}"),
-                version: PROTOCOL_VERSION,
 
-                content: RequestContent::AddTcpListener(listener.clone()),
+                content: Order::AddTcpListener(listener.clone()),
             });
             count += 1;
         }
@@ -1225,9 +1222,8 @@ impl Config {
         for cluster in self.clusters.values() {
             let mut orders = cluster.generate_orders();
             for content in orders.drain(..) {
-                v.push(ClientRequest {
+                v.push(InnerOrder {
                     id: format!("CONFIG-{count}"),
-                    version: PROTOCOL_VERSION,
                     content,
                 });
                 count += 1;
@@ -1236,11 +1232,9 @@ impl Config {
 
         if self.activate_listeners {
             for listener in &self.http_listeners {
-                v.push(ClientRequest {
+                v.push(InnerOrder {
                     id: format!("CONFIG-{count}"),
-                    version: PROTOCOL_VERSION,
-
-                    content: RequestContent::ActivateListener(ActivateListener {
+                    content: Order::ActivateListener(ActivateListener {
                         address: listener.address,
                         proxy: ListenerType::HTTP,
                         from_scm: false,
@@ -1250,11 +1244,9 @@ impl Config {
             }
 
             for listener in &self.https_listeners {
-                v.push(ClientRequest {
+                v.push(InnerOrder {
                     id: format!("CONFIG-{count}"),
-                    version: PROTOCOL_VERSION,
-
-                    content: RequestContent::ActivateListener(ActivateListener {
+                    content: Order::ActivateListener(ActivateListener {
                         address: listener.address,
                         proxy: ListenerType::HTTPS,
                         from_scm: false,
@@ -1264,11 +1256,9 @@ impl Config {
             }
 
             for listener in &self.tcp_listeners {
-                v.push(ClientRequest {
+                v.push(InnerOrder {
                     id: format!("CONFIG-{count}"),
-                    version: PROTOCOL_VERSION,
-
-                    content: RequestContent::ActivateListener(ActivateListener {
+                    content: Order::ActivateListener(ActivateListener {
                         address: listener.address,
                         proxy: ListenerType::TCP,
                         from_scm: false,

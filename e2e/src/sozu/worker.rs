@@ -14,14 +14,14 @@ use sozu_lib as sozu;
 use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
-    command::RequestContent,
+    command::Order,
     config::{Config, FileConfig},
     logging::{Logger, LoggerBackend},
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
     worker::{
         Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, ProxyRequest, ProxyResponse, Route,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, InnerOrder, ProxyResponse, Route,
         RulePosition, TcpFrontend, TcpListenerConfig,
     },
 };
@@ -35,7 +35,7 @@ pub struct Worker {
     pub state: ConfigState,
     pub scm_main_to_worker: ScmSocket,
     pub scm_worker_to_main: ScmSocket,
-    pub command_channel: Channel<ProxyRequest, ProxyResponse>,
+    pub command_channel: Channel<InnerOrder, ProxyResponse>,
     pub command_id: CommandID,
     pub server_job: JoinHandle<()>,
 }
@@ -108,7 +108,7 @@ impl Worker {
         config: Config,
         listeners: Listeners,
         state: ConfigState,
-    ) -> (ScmSocket, Channel<ProxyRequest, ProxyResponse>, Server) {
+    ) -> (ScmSocket, Channel<InnerOrder, ProxyResponse>, Server) {
         let (scm_main_to_worker, scm_worker_to_main) =
             UnixStream::pair().expect("could not create unix stream pair");
         let (cmd_main_to_worker, cmd_worker_to_main) =
@@ -203,7 +203,7 @@ impl Worker {
     }
 
     pub fn upgrade<S: Into<String>>(&mut self, name: S) -> Self {
-        self.send_proxy_request(RequestContent::ReturnListenSockets);
+        self.send_proxy_order(Order::ReturnListenSockets);
         self.read_to_last();
 
         self.scm_main_to_worker
@@ -215,7 +215,7 @@ impl Worker {
             .expect("receive listeners");
         println!("Listeners from old worker: {listeners:?}");
         println!("State from old worker: {:?}", self.state);
-        self.send_proxy_request(RequestContent::SoftStop);
+        self.send_proxy_order(Order::SoftStop);
 
         let mut worker = Worker::start_new_worker(
             name,
@@ -230,7 +230,7 @@ impl Worker {
         listeners.close();
         worker.command_id.prefix = "ACTIVATE_".to_string();
         for order in self.state.generate_activate_orders() {
-            worker.send_proxy_request(order);
+            worker.send_proxy_order(order);
         }
         worker.command_id.prefix = "ID_".to_string();
         worker.read_to_last();
@@ -239,10 +239,10 @@ impl Worker {
         worker
     }
 
-    pub fn send_proxy_request(&mut self, order: RequestContent) {
+    pub fn send_proxy_order(&mut self, order: Order) {
         //self.state.handle_order(&order);
         self.command_channel
-            .write_message(&ProxyRequest {
+            .write_message(&InnerOrder {
                 id: self.command_id.next(),
                 content: order,
             })

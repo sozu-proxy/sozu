@@ -7,7 +7,7 @@ extern crate time;
 use std::{io::stdout, thread};
 
 use anyhow::Context;
-use sozu_command::command::RequestContent;
+use sozu_command::command::Order;
 
 use crate::sozu_command::{
     channel::Channel,
@@ -74,14 +74,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&worker::ProxyRequest {
+    command.write_message(&worker::InnerOrder {
         id: String::from("ID_ABCD"),
-        content: RequestContent::AddTcpFrontend(tcp_front),
+        content: Order::AddTcpFrontend(tcp_front),
     });
 
-    command.write_message(&worker::ProxyRequest {
+    command.write_message(&worker::InnerOrder {
         id: String::from("ID_EFGH"),
-        content: RequestContent::AddBackend(tcp_backend),
+        content: Order::AddBackend(tcp_backend),
     });
 
     info!("TCP -> {:?}", command.read_message());

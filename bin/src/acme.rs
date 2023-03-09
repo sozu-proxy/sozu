@@ -5,7 +5,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain},
     channel::Channel,
-    command::{ClientRequest, CommandResponse, CommandStatus, RequestContent},
+    command::{CommandResponse, CommandStatus, Order},
     config::Config,
     worker::{
         AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
@@ -87,7 +87,7 @@ pub fn main(
 
     let tls_versions = vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3];
 
-    let mut channel: Channel<ClientRequest, CommandResponse> = Channel::new(stream, 10000, 20000);
+    let mut channel: Channel<Order, CommandResponse> = Channel::new(stream, 10000, 20000);
     channel
         .blocking()
         .with_context(|| "Could not block channel")?;
@@ -277,14 +277,14 @@ fn generate_app_id(app_id: &str) -> String {
 }
 
 fn set_up_proxying(
-    channel: &mut Channel<ClientRequest, CommandResponse>,
+    channel: &mut Channel<Order, CommandResponse>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let add_http_front = RequestContent::AddHttpFrontend(HttpFrontend {
+    let add_http_front = Order::AddHttpFrontend(HttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         hostname: String::from(hostname),
         address: *frontend,
@@ -296,7 +296,7 @@ fn set_up_proxying(
 
     order_command(channel, add_http_front).with_context(|| "Order AddHttpFront failed")?;
 
-    let add_backend = RequestContent::AddBackend(Backend {
+    let add_backend = Order::AddBackend(Backend {
         cluster_id: String::from(cluster_id),
         backend_id: format!("{cluster_id}-0"),
         address: server_address,
@@ -310,14 +310,14 @@ fn set_up_proxying(
 }
 
 fn remove_proxying(
-    channel: &mut Channel<ClientRequest, CommandResponse>,
+    channel: &mut Channel<Order, CommandResponse>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let remove_http_front_order = RequestContent::RemoveHttpFrontend(HttpFrontend {
+    let remove_http_front_order = Order::RemoveHttpFrontend(HttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         address: *frontend,
         hostname: String::from(hostname),
@@ -329,7 +329,7 @@ fn remove_proxying(
     order_command(channel, remove_http_front_order)
         .with_context(|| "RemoveHttpFront order failed")?;
 
-    let remove_backend_order = RequestContent::RemoveBackend(RemoveBackend {
+    let remove_backend_order = Order::RemoveBackend(RemoveBackend {
         cluster_id: String::from(cluster_id),
         backend_id: format!("{cluster_id}-0"),
         address: server_address,
@@ -340,7 +340,7 @@ fn remove_proxying(
 }
 
 fn add_certificate(
-    channel: &mut Channel<ClientRequest, CommandResponse>,
+    channel: &mut Channel<Order, CommandResponse>,
     frontend: &SocketAddr,
     hostname: &str,
     certificate_path: &str,
@@ -359,7 +359,7 @@ fn add_certificate(
         .with_context(|| "could not load certificate chain".to_string())?;
 
     let certificate_order = match old_fingerprint {
-        None => RequestContent::AddCertificate(AddCertificate {
+        None => Order::AddCertificate(AddCertificate {
             address: *frontend,
             certificate: CertificateAndKey {
                 certificate,
@@ -371,7 +371,7 @@ fn add_certificate(
             expired_at: None,
         }),
 
-        Some(f) => RequestContent::ReplaceCertificate(ReplaceCertificate {
+        Some(f) => Order::ReplaceCertificate(ReplaceCertificate {
             address: *frontend,
             new_certificate: CertificateAndKey {
                 certificate,
@@ -391,21 +391,18 @@ fn add_certificate(
 }
 
 fn order_command(
-    channel: &mut Channel<ClientRequest, CommandResponse>,
-    order: RequestContent,
+    channel: &mut Channel<Order, CommandResponse>,
+    order: Order,
 ) -> anyhow::Result<()> {
-    let id = generate_id();
     channel
-        .write_message(&ClientRequest::new(id.clone(), order.clone()))
+        .write_message(&order.clone())
         .with_context(|| "Could not write message on the channel")?;
 
     loop {
         let response = channel
             .read_message()
             .with_context(|| "Could not read response on channel")?;
-        if id != response.id {
-            panic!("received message with invalid id: {response:?}");
-        }
+
         match response.status {
             CommandStatus::Processing => {
                 // do nothing here
@@ -418,22 +415,22 @@ fn order_command(
             CommandStatus::Ok => {
                 // TODO: remove the pattern matching and only display the response message
                 match order {
-                    RequestContent::AddBackend(_) => {
+                    Order::AddBackend(_) => {
                         info!("backend added : {}", response.message)
                     }
-                    RequestContent::RemoveBackend(_) => {
+                    Order::RemoveBackend(_) => {
                         info!("backend removed : {} ", response.message)
                     }
-                    RequestContent::AddCertificate(_) => {
+                    Order::AddCertificate(_) => {
                         info!("certificate added: {}", response.message)
                     }
-                    RequestContent::RemoveCertificate(_) => {
+                    Order::RemoveCertificate(_) => {
                         info!("certificate removed: {}", response.message)
                     }
-                    RequestContent::AddHttpFrontend(_) => {
+                    Order::AddHttpFrontend(_) => {
                         info!("front added: {}", response.message)
                     }
-                    RequestContent::RemoveHttpFrontend(_) => {
+                    Order::RemoveHttpFrontend(_) => {
                         info!("front removed: {}", response.message)
                     }
                     _ => {

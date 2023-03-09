@@ -1,6 +1,4 @@
 {
-  "id": "ID_TEST",
-  "version": 0,
   "type": "LOAD_STATE",
   "content": {
     "path": "./config_dump.json"

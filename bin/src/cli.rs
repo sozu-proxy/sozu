@@ -99,7 +99,10 @@ pub enum SubCmd {
         hard: bool,
     },
     #[clap(name = "upgrade", about = "upgrade the proxy")]
-    Upgrade,
+    Upgrade {
+        #[clap(long = "worker", help = "upgrade a specific worker")]
+        worker: Option<u32>,
+    },
 
     #[clap(name = "status", about = "gets information on the running workers")]
     Status {

@@ -1,6 +1,4 @@
 {
-  "id": "ID_TEST",
-  "version": 0,
   "type": "REMOVE_CERTIFICATE",
   "content": {
     "address": "0.0.0.0:443",

@@ -15,7 +15,7 @@ use serde::de::{self, Visitor};
 
 use crate::{
     certificate::calculate_fingerprint,
-    command::RequestContent,
+    command::Order,
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, DeactivateListener, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
@@ -77,71 +77,71 @@ impl ConfigState {
         self.https_addresses.push(address)
     }
 
-    pub fn dispatch(&mut self, order: &RequestContent) -> anyhow::Result<()> {
+    pub fn dispatch(&mut self, order: &Order) -> anyhow::Result<()> {
         match order {
-            RequestContent::AddCluster(cluster) => self
+            Order::AddCluster(cluster) => self
                 .add_cluster(cluster)
                 .with_context(|| "Could not add cluster"),
-            RequestContent::RemoveCluster { cluster_id } => self
+            Order::RemoveCluster { cluster_id } => self
                 .remove_cluster(cluster_id)
                 .with_context(|| "Could not remove cluster"),
-            RequestContent::AddHttpListener(listener) => self
+            Order::AddHttpListener(listener) => self
                 .add_http_listener(listener)
                 .with_context(|| "Could not add HTTP listener"),
-            RequestContent::AddHttpsListener(listener) => self
+            Order::AddHttpsListener(listener) => self
                 .add_https_listener(listener)
                 .with_context(|| "Could not add HTTPS listener"),
-            RequestContent::AddTcpListener(listener) => self
+            Order::AddTcpListener(listener) => self
                 .add_tcp_listener(listener)
                 .with_context(|| "Could not add TCP listener"),
-            RequestContent::RemoveListener(remove) => self
+            Order::RemoveListener(remove) => self
                 .remove_listener(remove)
                 .with_context(|| "Could not remove listener"),
-            RequestContent::ActivateListener(activate) => self
+            Order::ActivateListener(activate) => self
                 .activate_listener(activate)
                 .with_context(|| "Could not activate listener"),
-            RequestContent::DeactivateListener(deactivate) => self
+            Order::DeactivateListener(deactivate) => self
                 .deactivate_listener(deactivate)
                 .with_context(|| "Could not deactivate listener"),
-            RequestContent::AddHttpFrontend(front) => self
+            Order::AddHttpFrontend(front) => self
                 .add_http_frontend(front)
                 .with_context(|| "Could not add HTTP frontend"),
-            RequestContent::RemoveHttpFrontend(front) => self
+            Order::RemoveHttpFrontend(front) => self
                 .remove_http_frontend(front)
                 .with_context(|| "Could not remove HTTP frontend"),
-            RequestContent::AddCertificate(add) => self
+            Order::AddCertificate(add) => self
                 .add_certificate(add)
                 .with_context(|| "Could not add certificate"),
-            RequestContent::RemoveCertificate(remove) => self
+            Order::RemoveCertificate(remove) => self
                 .remove_certificate(remove)
                 .with_context(|| "Could not remove certificate"),
-            RequestContent::ReplaceCertificate(replace) => self
+            Order::ReplaceCertificate(replace) => self
                 .replace_certificate(replace)
                 .with_context(|| "Could not replace certificate"),
-            RequestContent::AddHttpsFrontend(front) => self
+            Order::AddHttpsFrontend(front) => self
                 .add_http_frontend(front)
                 .with_context(|| "Could not add HTTPS frontend"),
-            RequestContent::RemoveHttpsFrontend(front) => self
+            Order::RemoveHttpsFrontend(front) => self
                 .remove_http_frontend(front)
                 .with_context(|| "Could not remove HTTPS frontend"),
-            RequestContent::AddTcpFrontend(front) => self
+            Order::AddTcpFrontend(front) => self
                 .add_tcp_frontend(front)
                 .with_context(|| "Could not add TCP frontend"),
-            RequestContent::RemoveTcpFrontend(front) => self
+            Order::RemoveTcpFrontend(front) => self
                 .remove_tcp_frontend(front)
                 .with_context(|| "Could not remove TCP frontend"),
-            RequestContent::AddBackend(backend) => self
+            Order::AddBackend(backend) => self
                 .add_backend(backend)
                 .with_context(|| "Could not add backend"),
-            RequestContent::RemoveBackend(backend) => self
+            Order::RemoveBackend(backend) => self
                 .remove_backend(backend)
                 .with_context(|| "Could not remove backend"),
             // This is to avoid the error message
-            &RequestContent::Logging(_)
-            | &RequestContent::Status
-            | &RequestContent::Query(_)
-            | &RequestContent::SoftStop
-            | &RequestContent::HardStop => Ok(()),
+            &Order::Logging(_)
+            | &Order::Status
+            | &Order::Query(_)
+            | &Order::SoftStop
+            | &Order::HardStop => Ok(()),
             other_order => {
                 bail!("state cannot handle order message: {:#?}", other_order);
             }
@@ -448,13 +448,13 @@ impl ConfigState {
         Ok(())
     }
 
-    pub fn generate_orders(&self) -> Vec<RequestContent> {
+    pub fn generate_orders(&self) -> Vec<Order> {
         let mut v = Vec::new();
 
         for &(ref listener, active) in self.http_listeners.values() {
-            v.push(RequestContent::AddHttpListener(listener.clone()));
+            v.push(Order::AddHttpListener(listener.clone()));
             if active {
-                v.push(RequestContent::ActivateListener(ActivateListener {
+                v.push(Order::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
@@ -463,9 +463,9 @@ impl ConfigState {
         }
 
         for &(ref listener, active) in self.https_listeners.values() {
-            v.push(RequestContent::AddHttpsListener(listener.clone()));
+            v.push(Order::AddHttpsListener(listener.clone()));
             if active {
-                v.push(RequestContent::ActivateListener(ActivateListener {
+                v.push(Order::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
@@ -474,9 +474,9 @@ impl ConfigState {
         }
 
         for &(ref listener, active) in self.tcp_listeners.values() {
-            v.push(RequestContent::AddTcpListener(listener.clone()));
+            v.push(Order::AddTcpListener(listener.clone()));
             if active {
-                v.push(RequestContent::ActivateListener(ActivateListener {
+                v.push(Order::ActivateListener(ActivateListener {
                     address: listener.address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -485,16 +485,16 @@ impl ConfigState {
         }
 
         for cluster in self.clusters.values() {
-            v.push(RequestContent::AddCluster(cluster.clone()));
+            v.push(Order::AddCluster(cluster.clone()));
         }
 
         for front in self.http_fronts.values() {
-            v.push(RequestContent::AddHttpFrontend(front.clone()));
+            v.push(Order::AddHttpFrontend(front.clone()));
         }
 
         for (front, certs) in self.certificates.iter() {
             for (certificate_and_key, names) in certs.values() {
-                v.push(RequestContent::AddCertificate(AddCertificate {
+                v.push(Order::AddCertificate(AddCertificate {
                     address: *front,
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
@@ -504,25 +504,25 @@ impl ConfigState {
         }
 
         for front in self.https_fronts.values() {
-            v.push(RequestContent::AddHttpsFrontend(front.clone()));
+            v.push(Order::AddHttpsFrontend(front.clone()));
         }
 
         for front_list in self.tcp_fronts.values() {
             for front in front_list {
-                v.push(RequestContent::AddTcpFrontend(front.clone()));
+                v.push(Order::AddTcpFrontend(front.clone()));
             }
         }
 
         for backend_list in self.backends.values() {
             for backend in backend_list {
-                v.push(RequestContent::AddBackend(backend.clone()));
+                v.push(Order::AddBackend(backend.clone()));
             }
         }
 
         v
     }
 
-    pub fn generate_activate_orders(&self) -> Vec<RequestContent> {
+    pub fn generate_activate_orders(&self) -> Vec<Order> {
         let mut v = Vec::new();
         for front in self
             .http_listeners
@@ -530,7 +530,7 @@ impl ConfigState {
             .filter(|(_, t)| t.1)
             .map(|(k, _)| k)
         {
-            v.push(RequestContent::ActivateListener(ActivateListener {
+            v.push(Order::ActivateListener(ActivateListener {
                 address: *front,
                 proxy: ListenerType::HTTP,
                 from_scm: false,
@@ -543,7 +543,7 @@ impl ConfigState {
             .filter(|(_, t)| t.1)
             .map(|(k, _)| k)
         {
-            v.push(RequestContent::ActivateListener(ActivateListener {
+            v.push(Order::ActivateListener(ActivateListener {
                 address: *front,
                 proxy: ListenerType::HTTPS,
                 from_scm: false,
@@ -555,7 +555,7 @@ impl ConfigState {
             .filter(|(_, t)| t.1)
             .map(|(k, _)| k)
         {
-            v.push(RequestContent::ActivateListener(ActivateListener {
+            v.push(Order::ActivateListener(ActivateListener {
                 address: *front,
                 proxy: ListenerType::TCP,
                 from_scm: false,
@@ -565,7 +565,7 @@ impl ConfigState {
         v
     }
 
-    pub fn diff(&self, other: &ConfigState) -> Vec<RequestContent> {
+    pub fn diff(&self, other: &ConfigState) -> Vec<Order> {
         //pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
         let my_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
         let their_tcp_listeners: HashSet<&SocketAddr> = other.tcp_listeners.keys().collect();
@@ -586,26 +586,26 @@ impl ConfigState {
 
         for address in removed_tcp_listeners {
             if self.tcp_listeners[address].1 {
-                v.push(RequestContent::DeactivateListener(DeactivateListener {
+                v.push(Order::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::TCP,
                     to_scm: false,
                 }));
             }
 
-            v.push(RequestContent::RemoveListener(RemoveListener {
+            v.push(Order::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::TCP,
             }));
         }
 
         for address in added_tcp_listeners.clone() {
-            v.push(RequestContent::AddTcpListener(
+            v.push(Order::AddTcpListener(
                 other.tcp_listeners[address].0.clone(),
             ));
 
             if other.tcp_listeners[address].1 {
-                v.push(RequestContent::ActivateListener(ActivateListener {
+                v.push(Order::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -615,26 +615,26 @@ impl ConfigState {
 
         for address in removed_http_listeners {
             if self.http_listeners[address].1 {
-                v.push(RequestContent::DeactivateListener(DeactivateListener {
+                v.push(Order::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::HTTP,
                     to_scm: false,
                 }));
             }
 
-            v.push(RequestContent::RemoveListener(RemoveListener {
+            v.push(Order::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::HTTP,
             }));
         }
 
         for address in added_http_listeners.clone() {
-            v.push(RequestContent::AddHttpListener(
+            v.push(Order::AddHttpListener(
                 other.http_listeners[address].0.clone(),
             ));
 
             if other.http_listeners[address].1 {
-                v.push(RequestContent::ActivateListener(ActivateListener {
+                v.push(Order::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
@@ -644,26 +644,26 @@ impl ConfigState {
 
         for address in removed_https_listeners {
             if self.https_listeners[address].1 {
-                v.push(RequestContent::DeactivateListener(DeactivateListener {
+                v.push(Order::DeactivateListener(DeactivateListener {
                     address: **address,
                     proxy: ListenerType::HTTPS,
                     to_scm: false,
                 }));
             }
 
-            v.push(RequestContent::RemoveListener(RemoveListener {
+            v.push(Order::RemoveListener(RemoveListener {
                 address: **address,
                 proxy: ListenerType::HTTPS,
             }));
         }
 
         for address in added_https_listeners.clone() {
-            v.push(RequestContent::AddHttpsListener(
+            v.push(Order::AddHttpsListener(
                 other.https_listeners[address].0.clone(),
             ));
 
             if other.https_listeners[address].1 {
-                v.push(RequestContent::ActivateListener(ActivateListener {
+                v.push(Order::ActivateListener(ActivateListener {
                     address: **address,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
@@ -676,16 +676,16 @@ impl ConfigState {
             let (their_listener, their_active) = &other.tcp_listeners[addr];
 
             if my_listener != their_listener {
-                v.push(RequestContent::RemoveListener(RemoveListener {
+                v.push(Order::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                 }));
 
-                v.push(RequestContent::AddTcpListener(their_listener.clone()));
+                v.push(Order::AddTcpListener(their_listener.clone()));
             }
 
             if *my_active && !*their_active {
-                v.push(RequestContent::DeactivateListener(DeactivateListener {
+                v.push(Order::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                     to_scm: false,
@@ -693,7 +693,7 @@ impl ConfigState {
             }
 
             if !*my_active && *their_active {
-                v.push(RequestContent::ActivateListener(ActivateListener {
+                v.push(Order::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -706,16 +706,16 @@ impl ConfigState {
             let (their_listener, their_active) = &other.http_listeners[addr];
 
             if my_listener != their_listener {
-                v.push(RequestContent::RemoveListener(RemoveListener {
+                v.push(Order::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                 }));
 
-                v.push(RequestContent::AddHttpListener(their_listener.clone()));
+                v.push(Order::AddHttpListener(their_listener.clone()));
             }
 
             if *my_active && !*their_active {
-                v.push(RequestContent::DeactivateListener(DeactivateListener {
+                v.push(Order::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                     to_scm: false,
@@ -723,7 +723,7 @@ impl ConfigState {
             }
 
             if !*my_active && *their_active {
-                v.push(RequestContent::ActivateListener(ActivateListener {
+                v.push(Order::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTP,
                     from_scm: false,
@@ -736,16 +736,16 @@ impl ConfigState {
             let (their_listener, their_active) = &other.https_listeners[addr];
 
             if my_listener != their_listener {
-                v.push(RequestContent::RemoveListener(RemoveListener {
+                v.push(Order::RemoveListener(RemoveListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                 }));
 
-                v.push(RequestContent::AddHttpsListener(their_listener.clone()));
+                v.push(Order::AddHttpsListener(their_listener.clone()));
             }
 
             if *my_active && !*their_active {
-                v.push(RequestContent::DeactivateListener(DeactivateListener {
+                v.push(Order::DeactivateListener(DeactivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                     to_scm: false,
@@ -753,7 +753,7 @@ impl ConfigState {
             }
 
             if !*my_active && *their_active {
-                v.push(RequestContent::ActivateListener(ActivateListener {
+                v.push(Order::ActivateListener(ActivateListener {
                     address: **addr,
                     proxy: ListenerType::HTTPS,
                     from_scm: false,
@@ -763,10 +763,10 @@ impl ConfigState {
 
         for (cluster_id, res) in diff_map(self.clusters.iter(), other.clusters.iter()) {
             match res {
-                DiffResult::Added | DiffResult::Changed => v.push(RequestContent::AddCluster(
+                DiffResult::Added | DiffResult::Changed => v.push(Order::AddCluster(
                     other.clusters.get(cluster_id).unwrap().clone(),
                 )),
-                DiffResult::Removed => v.push(RequestContent::RemoveCluster {
+                DiffResult::Removed => v.push(Order::RemoveCluster {
                     cluster_id: cluster_id.to_string(),
                 }),
             }
@@ -789,7 +789,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(RequestContent::AddBackend(backend.clone()));
+                    v.push(Order::AddBackend(backend.clone()));
                 }
                 DiffResult::Removed => {
                     let backend = self
@@ -798,7 +798,7 @@ impl ConfigState {
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
-                    v.push(RequestContent::RemoveBackend(RemoveBackend {
+                    v.push(Order::RemoveBackend(RemoveBackend {
                         cluster_id: backend.cluster_id.clone(),
                         backend_id: backend.backend_id.clone(),
                         address: backend.address,
@@ -811,7 +811,7 @@ impl ConfigState {
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
-                    v.push(RequestContent::RemoveBackend(RemoveBackend {
+                    v.push(Order::RemoveBackend(RemoveBackend {
                         cluster_id: backend.cluster_id.clone(),
                         backend_id: backend.backend_id.clone(),
                         address: backend.address,
@@ -822,7 +822,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(RequestContent::AddBackend(backend.clone()));
+                    v.push(Order::AddBackend(backend.clone()));
                 }
             }
         }
@@ -840,11 +840,11 @@ impl ConfigState {
         let added_http_fronts = their_http_fronts.difference(&my_http_fronts);
 
         for &(_, front) in removed_http_fronts {
-            v.push(RequestContent::RemoveHttpFrontend(front.clone()));
+            v.push(Order::RemoveHttpFrontend(front.clone()));
         }
 
         for &(_, front) in added_http_fronts {
-            v.push(RequestContent::AddHttpFrontend(front.clone()));
+            v.push(Order::AddHttpFrontend(front.clone()));
         }
 
         let mut my_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
@@ -859,11 +859,11 @@ impl ConfigState {
         let added_https_fronts = their_https_fronts.difference(&my_https_fronts);
 
         for &(_, front) in removed_https_fronts {
-            v.push(RequestContent::RemoveHttpsFrontend(front.clone()));
+            v.push(Order::RemoveHttpsFrontend(front.clone()));
         }
 
         for &(_, front) in added_https_fronts {
-            v.push(RequestContent::AddHttpsFrontend(front.clone()));
+            v.push(Order::AddHttpsFrontend(front.clone()));
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
@@ -883,11 +883,11 @@ impl ConfigState {
         let added_tcp_fronts = their_tcp_fronts.difference(&my_tcp_fronts);
 
         for &(_, front) in removed_tcp_fronts {
-            v.push(RequestContent::RemoveTcpFrontend(front.clone()));
+            v.push(Order::RemoveTcpFrontend(front.clone()));
         }
 
         for &(_, front) in added_tcp_fronts {
-            v.push(RequestContent::AddTcpFrontend(front.clone()));
+            v.push(Order::AddTcpFrontend(front.clone()));
         }
 
         //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -907,7 +907,7 @@ impl ConfigState {
         let added_certificates = their_certificates.difference(&my_certificates);
 
         for &(address, fingerprint) in removed_certificates {
-            v.push(RequestContent::RemoveCertificate(RemoveCertificate {
+            v.push(Order::RemoveCertificate(RemoveCertificate {
                 address,
                 fingerprint: fingerprint.clone(),
             }));
@@ -919,7 +919,7 @@ impl ConfigState {
                 .get(&address)
                 .and_then(|certs| certs.get(fingerprint))
             {
-                v.push(RequestContent::AddCertificate(AddCertificate {
+                v.push(Order::AddCertificate(AddCertificate {
                     address,
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
@@ -931,7 +931,7 @@ impl ConfigState {
         for address in added_tcp_listeners {
             let listener = &other.tcp_listeners[address];
             if listener.1 {
-                v.push(RequestContent::ActivateListener(ActivateListener {
+                v.push(Order::ActivateListener(ActivateListener {
                     address: listener.0.address,
                     proxy: ListenerType::TCP,
                     from_scm: false,
@@ -1168,7 +1168,7 @@ impl<
 mod tests {
     use super::*;
     use crate::{
-        command::RequestContent,
+        command::Order,
         worker::{
             Backend, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams, PathRule, Route,
             RulePosition,
@@ -1179,7 +1179,7 @@ mod tests {
     fn serialize() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&RequestContent::AddHttpFrontend(HttpFrontend {
+            .dispatch(&Order::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
@@ -1190,7 +1190,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddHttpFrontend(HttpFrontend {
+            .dispatch(&Order::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
@@ -1201,7 +1201,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1211,7 +1211,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1221,7 +1221,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
@@ -1231,7 +1231,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-3"),
                 address: "192.168.1.3:1027".parse().unwrap(),
@@ -1241,7 +1241,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::RemoveBackend(RemoveBackend {
+            .dispatch(&Order::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-3"),
                 address: "192.168.1.3:1027".parse().unwrap(),
@@ -1263,7 +1263,7 @@ mod tests {
     fn diff() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&RequestContent::AddHttpFrontend(HttpFrontend {
+            .dispatch(&Order::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
@@ -1274,7 +1274,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddHttpFrontend(HttpFrontend {
+            .dispatch(&Order::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
@@ -1285,7 +1285,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1295,7 +1295,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1305,7 +1305,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
@@ -1315,7 +1315,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddCluster(Cluster {
+            .dispatch(&Order::AddCluster(Cluster {
                 cluster_id: String::from("cluster_2"),
                 sticky_session: true,
                 https_redirect: true,
@@ -1328,7 +1328,7 @@ mod tests {
 
         let mut state2: ConfigState = Default::default();
         state2
-            .dispatch(&RequestContent::AddHttpFrontend(HttpFrontend {
+            .dispatch(&Order::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
@@ -1339,7 +1339,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1349,7 +1349,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1359,7 +1359,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1369,7 +1369,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&RequestContent::AddCluster(Cluster {
+            .dispatch(&Order::AddCluster(Cluster {
                 cluster_id: String::from("cluster_3"),
                 sticky_session: false,
                 https_redirect: false,
@@ -1381,7 +1381,7 @@ mod tests {
             .expect("Could not execute order");
 
         let e = vec![
-            RequestContent::RemoveHttpFrontend(HttpFrontend {
+            Order::RemoveHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
@@ -1390,12 +1390,12 @@ mod tests {
                 position: RulePosition::Tree,
                 tags: None,
             }),
-            RequestContent::RemoveBackend(RemoveBackend {
+            Order::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
             }),
-            RequestContent::AddBackend(Backend {
+            Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1403,10 +1403,10 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }),
-            RequestContent::RemoveCluster {
+            Order::RemoveCluster {
                 cluster_id: String::from("cluster_2"),
             },
-            RequestContent::AddCluster(Cluster {
+            Order::AddCluster(Cluster {
                 cluster_id: String::from("cluster_3"),
                 sticky_session: false,
                 https_redirect: false,
@@ -1416,7 +1416,7 @@ mod tests {
                 answer_503: None,
             }),
         ];
-        let expected_diff: HashSet<&RequestContent> = HashSet::from_iter(e.iter());
+        let expected_diff: HashSet<&Order> = HashSet::from_iter(e.iter());
 
         let d = state.diff(&state2);
         let diff = HashSet::from_iter(d.iter());
@@ -1427,7 +1427,7 @@ mod tests {
         let hash2 = state2.hash_state();
         let mut state3 = state.clone();
         state3
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1487,10 +1487,10 @@ mod tests {
             tags: None,
         };
 
-        let add_http_front_order_cluster1 = RequestContent::AddHttpFrontend(http_front_cluster1);
-        let add_http_front_order_cluster2 = RequestContent::AddHttpFrontend(http_front_cluster2);
-        let add_https_front_order_cluster1 = RequestContent::AddHttpsFrontend(https_front_cluster1);
-        let add_https_front_order_cluster2 = RequestContent::AddHttpsFrontend(https_front_cluster2);
+        let add_http_front_order_cluster1 = Order::AddHttpFrontend(http_front_cluster1);
+        let add_http_front_order_cluster2 = Order::AddHttpFrontend(http_front_cluster2);
+        let add_https_front_order_cluster1 = Order::AddHttpsFrontend(https_front_cluster1);
+        let add_https_front_order_cluster2 = Order::AddHttpsFrontend(https_front_cluster2);
         config
             .dispatch(&add_http_front_order_cluster1)
             .expect("Could not execute order");
@@ -1542,7 +1542,7 @@ mod tests {
     fn duplicate_backends() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&RequestContent::AddBackend(Backend {
+            .dispatch(&Order::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1562,7 +1562,7 @@ mod tests {
         };
 
         state
-            .dispatch(&RequestContent::AddBackend(b.clone()))
+            .dispatch(&Order::AddBackend(b.clone()))
             .expect("Could not execute order");
 
         assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
@@ -1572,7 +1572,7 @@ mod tests {
     fn listener_diff() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&RequestContent::AddTcpListener(TcpListenerConfig {
+            .dispatch(&Order::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1582,14 +1582,14 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::ActivateListener(ActivateListener {
+            .dispatch(&Order::ActivateListener(ActivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
                 from_scm: false,
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddHttpListener(HttpListenerConfig {
+            .dispatch(&Order::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1603,7 +1603,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::AddHttpsListener(HttpsListenerConfig {
+            .dispatch(&Order::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1625,7 +1625,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state
-            .dispatch(&RequestContent::ActivateListener(ActivateListener {
+            .dispatch(&Order::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
                 from_scm: false,
@@ -1634,7 +1634,7 @@ mod tests {
 
         let mut state2: ConfigState = Default::default();
         state2
-            .dispatch(&RequestContent::AddTcpListener(TcpListenerConfig {
+            .dispatch(&Order::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: true,
@@ -1644,7 +1644,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&RequestContent::AddHttpListener(HttpListenerConfig {
+            .dispatch(&Order::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1658,14 +1658,14 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&RequestContent::ActivateListener(ActivateListener {
+            .dispatch(&Order::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 proxy: ListenerType::HTTP,
                 from_scm: false,
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&RequestContent::AddHttpsListener(HttpsListenerConfig {
+            .dispatch(&Order::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1687,7 +1687,7 @@ mod tests {
             }))
             .expect("Could not execute order");
         state2
-            .dispatch(&RequestContent::ActivateListener(ActivateListener {
+            .dispatch(&Order::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
                 from_scm: false,
@@ -1695,11 +1695,11 @@ mod tests {
             .expect("Could not execute order");
 
         let e = vec![
-            RequestContent::RemoveListener(RemoveListener {
+            Order::RemoveListener(RemoveListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
             }),
-            RequestContent::AddTcpListener(TcpListenerConfig {
+            Order::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 public_address: None,
                 expect_proxy: true,
@@ -1707,16 +1707,16 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }),
-            RequestContent::DeactivateListener(DeactivateListener {
+            Order::DeactivateListener(DeactivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
                 to_scm: false,
             }),
-            RequestContent::RemoveListener(RemoveListener {
+            Order::RemoveListener(RemoveListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 proxy: ListenerType::HTTP,
             }),
-            RequestContent::AddHttpListener(HttpListenerConfig {
+            Order::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,
@@ -1728,16 +1728,16 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }),
-            RequestContent::ActivateListener(ActivateListener {
+            Order::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 proxy: ListenerType::HTTP,
                 from_scm: false,
             }),
-            RequestContent::RemoveListener(RemoveListener {
+            Order::RemoveListener(RemoveListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
             }),
-            RequestContent::AddHttpsListener(HttpsListenerConfig {
+            Order::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 public_address: None,
                 expect_proxy: false,

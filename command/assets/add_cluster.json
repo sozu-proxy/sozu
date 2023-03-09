@@ -1,6 +1,4 @@
 {
-  "id": "ID_TEST",
-  "version": 0,
   "type": "ADD_CLUSTER",
   "content": {
     "cluster_id": "xxx",

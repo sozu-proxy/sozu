@@ -12,7 +12,7 @@ use sozu_command::config::DEFAULT_RUSTLS_CIPHER_LIST;
 
 use crate::sozu_command::{
     channel::Channel,
-    command::RequestContent,
+    command::Order,
     logging::{Logger, LoggerBackend},
     worker,
     worker::{LoadBalancingParams, PathRule, Route, RulePosition},
@@ -85,14 +85,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&worker::ProxyRequest {
+    command.write_message(&worker::InnerOrder {
         id: String::from("ID_ABCD"),
-        content: RequestContent::AddHttpFrontend(http_front),
+        content: Order::AddHttpFrontend(http_front),
     });
 
-    command.write_message(&worker::ProxyRequest {
+    command.write_message(&worker::InnerOrder {
         id: String::from("ID_EFGH"),
-        content: RequestContent::AddBackend(http_backend),
+        content: Order::AddBackend(http_backend),
     });
 
     info!("MAIN\tHTTP -> {:?}", command.read_message());
@@ -126,9 +126,9 @@ fn main() -> anyhow::Result<()> {
         certificate_chain: vec![],
         versions: vec![],
     };
-    command2.write_message(&worker::ProxyRequest {
+    command2.write_message(&worker::InnerOrder {
         id: String::from("ID_IJKL1"),
-        content: RequestContent::AddCertificate(worker::AddCertificate {
+        content: Order::AddCertificate(worker::AddCertificate {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
@@ -150,9 +150,9 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    command2.write_message(&worker::ProxyRequest {
+    command2.write_message(&worker::InnerOrder {
         id: String::from("ID_IJKL2"),
-        content: RequestContent::AddHttpsFrontend(tls_front),
+        content: Order::AddHttpsFrontend(tls_front),
     });
     let tls_backend = worker::Backend {
         cluster_id: String::from("cluster_1"),
@@ -165,9 +165,9 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command2.write_message(&worker::ProxyRequest {
+    command2.write_message(&worker::InnerOrder {
         id: String::from("ID_MNOP"),
-        content: RequestContent::AddBackend(tls_backend),
+        content: Order::AddBackend(tls_backend),
     });
 
     let cert2 = include_str!("../assets/cert_test.pem");
@@ -180,9 +180,9 @@ fn main() -> anyhow::Result<()> {
         versions: vec![],
     };
 
-    command2.write_message(&worker::ProxyRequest {
+    command2.write_message(&worker::InnerOrder {
         id: String::from("ID_QRST1"),
-        content: RequestContent::AddCertificate(worker::AddCertificate {
+        content: Order::AddCertificate(worker::AddCertificate {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
@@ -204,9 +204,9 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    command2.write_message(&worker::ProxyRequest {
+    command2.write_message(&worker::InnerOrder {
         id: String::from("ID_QRST2"),
-        content: RequestContent::AddHttpsFrontend(tls_front2),
+        content: Order::AddHttpsFrontend(tls_front2),
     });
 
     let tls_backend2 = worker::Backend {
@@ -220,9 +220,9 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command2.write_message(&worker::ProxyRequest {
+    command2.write_message(&worker::InnerOrder {
         id: String::from("ID_UVWX"),
-        content: RequestContent::AddBackend(tls_backend2),
+        content: Order::AddBackend(tls_backend2),
     });
 
     info!("MAIN\tTLS -> {:?}", command2.read_message());

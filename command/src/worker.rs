@@ -15,7 +15,7 @@ use serde::{
 };
 
 use crate::{
-    command::RequestContent,
+    command::Order,
     config::{
         ProxyProtocolConfig, DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST,
         DEFAULT_RUSTLS_CIPHER_LIST, DEFAULT_SIGNATURE_ALGORITHMS,
@@ -185,63 +185,24 @@ pub enum ProxyEvent {
     RemovedBackendHasNoConnections(String, SocketAddr),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProxyRequest {
+/// This is sent only from Sōzu to Sōzu
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Deserialize)]
+pub struct InnerOrder {
     pub id: MessageId,
-    pub content: RequestContent,
+    pub content: Order,
 }
 
-impl fmt::Display for ProxyRequest {
+impl InnerOrder {
+    pub fn new(id: String, content: Order) -> Self {
+        Self { id, content }
+    }
+}
+
+impl fmt::Display for InnerOrder {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}-{:?}", self.id, self.content)
     }
 }
-
-/*
-/// An order sent by the main process to the workers
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ProxyRequestOrder {
-    AddCluster(Cluster),
-    RemoveCluster { cluster_id: String },
-
-    AddHttpFrontend(HttpFrontend),
-    RemoveHttpFrontend(HttpFrontend),
-
-    AddHttpsFrontend(HttpFrontend),
-    RemoveHttpsFrontend(HttpFrontend),
-
-    AddCertificate(AddCertificate),
-    ReplaceCertificate(ReplaceCertificate),
-    RemoveCertificate(RemoveCertificate),
-
-    AddTcpFrontend(TcpFrontend),
-    RemoveTcpFrontend(TcpFrontend),
-
-    AddBackend(Backend),
-    RemoveBackend(RemoveBackend),
-
-    AddHttpListener(HttpListenerConfig),
-    AddHttpsListener(HttpsListenerConfig),
-    AddTcpListener(TcpListenerConfig),
-
-    RemoveListener(RemoveListener),
-
-    ActivateListener(ActivateListener),
-    DeactivateListener(DeactivateListener),
-
-    Query(Query),
-
-    SoftStop,
-    HardStop,
-
-    Status,
-    ConfigureMetrics(MetricsConfiguration),
-    Logging(String),
-
-    ReturnListenSockets,
-}
-*/
 
 //FIXME: make fixed size depending on hash algorithm
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -870,7 +831,7 @@ pub enum QueryAnswerMetrics {
     Error(String),
 }
 
-impl RequestContent {
+impl Order {
     /// determine to which of the three proxies (HTTP, HTTPS, TCP) a request is destined
     pub fn get_destinations(&self) -> ProxyDestinations {
         let mut proxy_destination = ProxyDestinations {
@@ -880,29 +841,29 @@ impl RequestContent {
         };
 
         match *self {
-            RequestContent::AddHttpFrontend(_) | RequestContent::RemoveHttpFrontend(_) => {
+            Order::AddHttpFrontend(_) | Order::RemoveHttpFrontend(_) => {
                 proxy_destination.to_http_proxy = true
             }
 
-            RequestContent::AddHttpsFrontend(_)
-            | RequestContent::RemoveHttpsFrontend(_)
-            | RequestContent::AddCertificate(_)
-            | RequestContent::ReplaceCertificate(_)
-            | RequestContent::RemoveCertificate(_)
-            | RequestContent::Query(_) => proxy_destination.to_https_proxy = true,
+            Order::AddHttpsFrontend(_)
+            | Order::RemoveHttpsFrontend(_)
+            | Order::AddCertificate(_)
+            | Order::ReplaceCertificate(_)
+            | Order::RemoveCertificate(_)
+            | Order::Query(_) => proxy_destination.to_https_proxy = true,
 
-            RequestContent::AddTcpFrontend(_) | RequestContent::RemoveTcpFrontend(_) => {
+            Order::AddTcpFrontend(_) | Order::RemoveTcpFrontend(_) => {
                 proxy_destination.to_tcp_proxy = true
             }
 
-            RequestContent::AddCluster(_)
-            | RequestContent::AddBackend(_)
-            | RequestContent::RemoveCluster { cluster_id: _ }
-            | RequestContent::RemoveBackend(_)
-            | RequestContent::SoftStop
-            | RequestContent::HardStop
-            | RequestContent::Status
-            | RequestContent::Logging(_) => {
+            Order::AddCluster(_)
+            | Order::AddBackend(_)
+            | Order::RemoveCluster { cluster_id: _ }
+            | Order::RemoveBackend(_)
+            | Order::SoftStop
+            | Order::HardStop
+            | Order::Status
+            | Order::Logging(_) => {
                 proxy_destination.to_http_proxy = true;
                 proxy_destination.to_https_proxy = true;
                 proxy_destination.to_tcp_proxy = true;
@@ -910,27 +871,27 @@ impl RequestContent {
 
             // the Add***Listener and other Listener orders will be handled separately
             // by the notify_proxys function, so we don't give them destinations
-            RequestContent::AddHttpsListener(_)
-            | RequestContent::AddHttpListener(_)
-            | RequestContent::AddTcpListener(_)
-            | RequestContent::RemoveListener(_)
-            | RequestContent::ActivateListener(_)
-            | RequestContent::DeactivateListener(_)
-            | RequestContent::ConfigureMetrics(_)
-            | RequestContent::ReturnListenSockets => {}
+            Order::AddHttpsListener(_)
+            | Order::AddHttpListener(_)
+            | Order::AddTcpListener(_)
+            | Order::RemoveListener(_)
+            | Order::ActivateListener(_)
+            | Order::DeactivateListener(_)
+            | Order::ConfigureMetrics(_)
+            | Order::ReturnListenSockets => {}
 
             // These won't ever reach a worker anyway
-            RequestContent::SaveState { path: _ }
-            | RequestContent::LoadState { path: _ }
-            | RequestContent::DumpState
-            | RequestContent::ListWorkers
-            | RequestContent::ListFrontends(_)
-            | RequestContent::ListListeners
-            | RequestContent::LaunchWorker(_)
-            | RequestContent::UpgradeMain
-            | RequestContent::UpgradeWorker(_)
-            | RequestContent::SubscribeEvents
-            | RequestContent::ReloadConfiguration { path: _ } => {}
+            Order::SaveState { path: _ }
+            | Order::LoadState { path: _ }
+            | Order::DumpState
+            | Order::ListWorkers
+            | Order::ListFrontends(_)
+            | Order::ListListeners
+            | Order::LaunchWorker(_)
+            | Order::UpgradeMain
+            | Order::UpgradeWorker(_)
+            | Order::SubscribeEvents
+            | Order::ReloadConfiguration { path: _ } => {}
         }
         proxy_destination
     }
@@ -973,11 +934,11 @@ mod tests {
     #[test]
     fn add_front_test() {
         let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": { "CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
-        let command: RequestContent = serde_json::from_str(raw_json).expect("could not parse json");
+        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
             command
-                == RequestContent::AddHttpFrontend(HttpFrontend {
+                == Order::AddHttpFrontend(HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
                     path: PathRule::Prefix(String::from("xxx")),
@@ -992,11 +953,11 @@ mod tests {
     #[test]
     fn remove_front_test() {
         let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
-        let command: RequestContent = serde_json::from_str(raw_json).expect("could not parse json");
+        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
             command
-                == RequestContent::RemoveHttpFrontend(HttpFrontend {
+                == Order::RemoveHttpFrontend(HttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
                     path: PathRule::Prefix(String::from("xxx")),
@@ -1014,11 +975,11 @@ mod tests {
     #[test]
     fn add_backend_test() {
         let raw_json = r#"{"type": "ADD_BACKEND", "content": {"cluster_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080", "load_balancing_parameters": { "weight": 0 }}}"#;
-        let command: RequestContent = serde_json::from_str(raw_json).expect("could not parse json");
+        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
             command
-                == RequestContent::AddBackend(Backend {
+                == Order::AddBackend(Backend {
                     cluster_id: String::from("xxx"),
                     backend_id: String::from("xxx-0"),
                     address: "0.0.0.0:8080".parse().unwrap(),
@@ -1032,11 +993,11 @@ mod tests {
     #[test]
     fn remove_backend_test() {
         let raw_json = r#"{"type": "REMOVE_BACKEND", "content": {"cluster_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080"}}"#;
-        let command: RequestContent = serde_json::from_str(raw_json).expect("could not parse json");
+        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
             command
-                == RequestContent::RemoveBackend(RemoveBackend {
+                == Order::RemoveBackend(RemoveBackend {
                     cluster_id: String::from("xxx"),
                     backend_id: String::from("xxx-0"),
                     address: "0.0.0.0:8080".parse().unwrap(),
@@ -1047,11 +1008,11 @@ mod tests {
     #[test]
     fn http_front_crash_test() {
         let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
-        let command: RequestContent = serde_json::from_str(raw_json).expect("could not parse json");
+        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
             command
-                == RequestContent::AddHttpFrontend(HttpFrontend {
+                == Order::AddHttpFrontend(HttpFrontend {
                     route: Route::ClusterId(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
                     path: PathRule::Prefix(String::from("")),

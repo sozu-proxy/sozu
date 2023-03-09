@@ -74,14 +74,13 @@ where
 mod test {
     use super::*;
 
-    use crate::command::{ClientRequest, RequestContent};
+    use crate::{command::Order, worker::InnerOrder};
 
     #[test]
-    fn parse_one_command_request_works() {
-        let command_request =
-            ClientRequest::new("Some request".to_string(), RequestContent::DumpState);
+    fn parse_one_inner_order_works() {
+        let inner_order = InnerOrder::new("Some request".to_string(), Order::DumpState);
 
-        let mut string = serde_json::ser::to_string(&command_request).unwrap();
+        let mut string = serde_json::ser::to_string(&inner_order).unwrap();
 
         string.push('\0');
 
@@ -93,41 +92,38 @@ mod test {
 
         assert_eq!(
             parse_one_command(bytes).unwrap(),
-            (&empty_vec[..], command_request)
+            (&empty_vec[..], inner_order)
         )
     }
 
     #[test]
-    fn parse_several_command_requests_works() {
-        let commands = vec![
-            ClientRequest::new(
+    fn parse_several_inner_orders_works() {
+        let orders = vec![
+            InnerOrder::new(
                 "Some request".to_string(),
-                RequestContent::SaveState {
+                Order::SaveState {
                     path: "/some/path".to_string(),
                 },
             ),
-            ClientRequest::new(
-                "Some other request".to_string(),
-                RequestContent::SubscribeEvents,
-            ),
-            ClientRequest::new("Yet another request".to_string(), RequestContent::DumpState),
+            InnerOrder::new("Some other request".to_string(), Order::SubscribeEvents),
+            InnerOrder::new("Yet another request".to_string(), Order::DumpState),
         ];
 
-        let mut serialized_commands = String::new();
+        let mut serialized_orders = String::new();
 
-        for command in commands.iter() {
-            serialized_commands += &serde_json::ser::to_string(&command).unwrap();
-            serialized_commands.push('\0');
+        for order in orders.iter() {
+            serialized_orders += &serde_json::ser::to_string(&order).unwrap();
+            serialized_orders.push('\0');
         }
 
-        let bytes_to_parse = &serialized_commands.as_bytes();
+        let bytes_to_parse = &serialized_orders.as_bytes();
 
-        let parsed_commands = parse_several_commands(bytes_to_parse).unwrap();
+        let parsed_orders = parse_several_commands(bytes_to_parse).unwrap();
 
-        println!("parsed commands: {parsed_commands:?}");
+        println!("parsed commands: {parsed_orders:?}");
 
         let empty_vec: Vec<u8> = vec![];
 
-        assert_eq!(parsed_commands, (&empty_vec[..], commands))
+        assert_eq!(parsed_orders, (&empty_vec[..], orders))
     }
 }

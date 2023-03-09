@@ -7,7 +7,7 @@ use std::{
 use serial_test::serial;
 
 use sozu_command_lib::{
-    command::RequestContent,
+    command::Order,
     config::FileConfig,
     info,
     logging::{Logger, LoggerBackend},
@@ -70,7 +70,7 @@ pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> S
         }
     }
 
-    worker.send_proxy_request(RequestContent::SoftStop);
+    worker.send_proxy_order(Order::SoftStop);
     worker.wait_for_server_stop();
 
     for client in &clients {
@@ -141,7 +141,7 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
         }
     }
 
-    worker.send_proxy_request(RequestContent::SoftStop);
+    worker.send_proxy_order(Order::SoftStop);
     worker.wait_for_server_stop();
 
     for client in &clients {
@@ -207,7 +207,7 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
     }
     let duration = Instant::now().duration_since(start);
 
-    worker.send_proxy_request(RequestContent::SoftStop);
+    worker.send_proxy_order(Order::SoftStop);
     let success = worker.wait_for_server_stop();
 
     println!(
@@ -252,7 +252,7 @@ pub fn try_issue_810_timeout() -> State {
     backend.send(0);
     client.receive();
 
-    worker.send_proxy_request(RequestContent::SoftStop);
+    worker.send_proxy_order(Order::SoftStop);
     let start = Instant::now();
     let success = worker.wait_for_server_stop();
     let duration = Instant::now().duration_since(start);
@@ -285,22 +285,22 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("810-PANIC", config, &listeners, state);
 
-    worker.send_proxy_request(RequestContent::AddTcpListener(
+    worker.send_proxy_order(Order::AddTcpListener(
         Worker::default_tcp_listener(front_address),
     ));
-    worker.send_proxy_request(RequestContent::ActivateListener(ActivateListener {
+    worker.send_proxy_order(Order::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::TCP,
         from_scm: false,
     }));
-    worker.send_proxy_request(RequestContent::AddCluster(Worker::default_cluster(
+    worker.send_proxy_order(Order::AddCluster(Worker::default_cluster(
         "cluster_0",
     )));
-    worker.send_proxy_request(RequestContent::AddTcpFrontend(
+    worker.send_proxy_order(Order::AddTcpFrontend(
         Worker::default_tcp_frontend("cluster_0", front_address),
     ));
 
-    worker.send_proxy_request(RequestContent::AddBackend(Worker::default_backend(
+    worker.send_proxy_order(Order::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0",
         back_address,
@@ -321,7 +321,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
         println!("Response: {response:?}");
     }
 
-    worker.send_proxy_request(RequestContent::SoftStop);
+    worker.send_proxy_order(Order::SoftStop);
     let success = worker.wait_for_server_stop();
 
     println!(
@@ -352,21 +352,21 @@ pub fn try_tls_endpoint() -> State {
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
 
-    worker.send_proxy_request(RequestContent::AddHttpsListener(
+    worker.send_proxy_order(Order::AddHttpsListener(
         Worker::default_https_listener(front_address),
     ));
-    worker.send_proxy_request(RequestContent::ActivateListener(ActivateListener {
+    worker.send_proxy_order(Order::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::HTTPS,
         from_scm: false,
     }));
 
-    worker.send_proxy_request(RequestContent::AddCluster(Worker::default_cluster(
+    worker.send_proxy_order(Order::AddCluster(Worker::default_cluster(
         "cluster_0",
     )));
 
     let hostname = "localhost".to_string();
-    worker.send_proxy_request(RequestContent::AddHttpsFrontend(HttpFrontend {
+    worker.send_proxy_order(Order::AddHttpsFrontend(HttpFrontend {
         hostname: hostname.to_owned(),
         ..Worker::default_http_frontend("cluster_0", front_address)
     }));
@@ -383,9 +383,9 @@ pub fn try_tls_endpoint() -> State {
         names: vec![],
         expired_at: None,
     };
-    worker.send_proxy_request(RequestContent::AddCertificate(add_certificate));
+    worker.send_proxy_order(Order::AddCertificate(add_certificate));
 
-    worker.send_proxy_request(RequestContent::AddBackend(Worker::default_backend(
+    worker.send_proxy_order(Order::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0",
         back_address,
@@ -408,7 +408,7 @@ pub fn try_tls_endpoint() -> State {
         return State::Fail;
     }
 
-    worker.send_proxy_request(RequestContent::SoftStop);
+    worker.send_proxy_order(Order::SoftStop);
     let success = worker.wait_for_server_stop();
 
     let aggregator = backend
@@ -473,7 +473,7 @@ pub fn test_upgrade() -> State {
         None => return State::Fail,
     }
 
-    new_worker.send_proxy_request(RequestContent::SoftStop);
+    new_worker.send_proxy_order(Order::SoftStop);
     if !worker.wait_for_server_stop() {
         return State::Fail;
     }
@@ -571,10 +571,10 @@ pub fn try_hard_or_soft_stop(soft: bool) -> State {
     // stop sōzu
     if soft {
         // the worker will wait for backends to respond before shutting down
-        worker.send_proxy_request(RequestContent::SoftStop);
+        worker.send_proxy_order(Order::SoftStop);
     } else {
         // the worker will shut down without waiting for backends to finish
-        worker.send_proxy_request(RequestContent::HardStop);
+        worker.send_proxy_order(Order::HardStop);
     }
     thread::sleep(Duration::from_millis(100));
 
@@ -633,10 +633,10 @@ fn try_http_behaviors() -> State {
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("BEHAVE-WORKER", config, &listeners, state);
 
-    worker.send_proxy_request(RequestContent::AddHttpListener(
+    worker.send_proxy_order(Order::AddHttpListener(
         Worker::default_http_listener(front_address),
     ));
-    worker.send_proxy_request(RequestContent::ActivateListener(ActivateListener {
+    worker.send_proxy_order(Order::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::HTTP,
         from_scm: false,
@@ -660,7 +660,7 @@ fn try_http_behaviors() -> State {
     assert_eq!(response, Some(expected_response));
     assert_eq!(client.receive(), None);
 
-    worker.send_proxy_request(RequestContent::AddHttpFrontend(HttpFrontend {
+    worker.send_proxy_order(Order::AddHttpFrontend(HttpFrontend {
         hostname: String::from("example.com"),
         ..Worker::default_http_frontend("cluster_0", front_address)
     }));
@@ -680,7 +680,7 @@ fn try_http_behaviors() -> State {
     let back_address = "127.0.0.1:2002"
         .parse()
         .expect("could not parse back address");
-    worker.send_proxy_request(RequestContent::AddBackend(Worker::default_backend(
+    worker.send_proxy_order(Order::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
         back_address,
@@ -720,12 +720,12 @@ fn try_http_behaviors() -> State {
     assert_eq!(client.receive(), None);
 
     info!("expecting 200");
-    worker.send_proxy_request(RequestContent::RemoveBackend(RemoveBackend {
+    worker.send_proxy_order(Order::RemoveBackend(RemoveBackend {
         cluster_id: String::from("cluster_0"),
         backend_id: String::from("cluster_0-0"),
         address: back_address,
     }));
-    worker.send_proxy_request(RequestContent::AddBackend(Worker::default_backend(
+    worker.send_proxy_order(Order::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
         back_address,
@@ -781,12 +781,12 @@ fn try_http_behaviors() -> State {
     assert_eq!(response, Some(expected_response));
     assert_eq!(client.receive(), None);
 
-    worker.send_proxy_request(RequestContent::RemoveBackend(RemoveBackend {
+    worker.send_proxy_order(Order::RemoveBackend(RemoveBackend {
         cluster_id: String::from("cluster_0"),
         backend_id: String::from("cluster_0-0"),
         address: back_address,
     }));
-    worker.send_proxy_request(RequestContent::AddBackend(Worker::default_backend(
+    worker.send_proxy_order(Order::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
         back_address,
@@ -846,7 +846,7 @@ fn try_http_behaviors() -> State {
             && response.ends_with(&expected_response_end)
     );
 
-    worker.send_proxy_request(RequestContent::HardStop);
+    worker.send_proxy_order(Order::HardStop);
     worker.wait_for_server_stop();
 
     info!("good bye");
@@ -883,7 +883,7 @@ fn try_msg_close() -> State {
 
     thread::sleep(std::time::Duration::from_millis(100));
 
-    worker.send_proxy_request(RequestContent::SoftStop);
+    worker.send_proxy_order(Order::SoftStop);
     worker.wait_for_server_stop();
     State::Success
 }

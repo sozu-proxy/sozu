@@ -24,16 +24,12 @@ use nix::{
 use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
-    command::{
-        ClientRequest, CommandResponse, CommandResponseContent, CommandStatus, Event,
-        RequestContent, RunState,
-    },
+    command::{CommandResponse, CommandResponseContent, CommandStatus, Event, Order, RunState},
     config::Config,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
     worker::{
-        MetricsConfiguration, ProxyRequest, ProxyResponse, ProxyResponseContent,
-        ProxyResponseStatus,
+        InnerOrder, MetricsConfiguration, ProxyResponse, ProxyResponseContent, ProxyResponseStatus,
     },
 };
 
@@ -50,7 +46,7 @@ mod worker;
 pub use worker::*;
 
 /// The CommandServer receives these CommandMessages, either from within Sōzu,
-/// or from without, in which case they are ALWAYS of the ClientRequest variant.
+/// or from without, in which case they are ALWAYS of the ClientOrder variant.
 enum CommandMessage {
     ClientNew {
         client_id: String,
@@ -59,9 +55,9 @@ enum CommandMessage {
     ClientClose {
         client_id: String,
     },
-    ClientRequest {
+    ClientOrder {
         client_id: String,
-        request: ClientRequest,
+        order: Order,
     },
     WorkerResponse {
         worker_id: u32,
@@ -71,32 +67,10 @@ enum CommandMessage {
         worker_id: u32,
     },
     Advancement {
-        request_identifier: RequestIdentifier,
+        client_id: String,
         response: Response,
     },
     MasterStop,
-}
-
-/// identifies a request only within the command server
-/// the request part does NOT get sent to a worker
-#[derive(PartialEq, Eq, Clone, Debug)]
-pub struct RequestIdentifier {
-    /// the client who sent the request (ex: "CL-0")
-    client: String,
-    // the request id (ex: "ID-MAN9QF")
-    request: String,
-}
-
-impl RequestIdentifier {
-    pub fn new<T>(client: T, request: T) -> Self
-    where
-        T: ToString,
-    {
-        Self {
-            client: client.to_string(),
-            request: request.to_string(),
-        }
-    }
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
@@ -113,7 +87,7 @@ pub enum Success {
     ClientClose(String),               // the client id
     ClientNew(String),                 // the client id
     DumpState(CommandResponseContent), // the cloned state
-    HandledClientRequest,
+    HandledClientOrder,
     ListFrontends(CommandResponseContent), // the list of frontends
     ListListeners(CommandResponseContent), // the list of listeners
     ListWorkers(CommandResponseContent),
@@ -148,7 +122,7 @@ impl std::fmt::Display for Success {
             Self::ClientClose(id) => write!(f, "Close client: {id}"),
             Self::ClientNew(id) => write!(f, "New client successfully added: {id}"),
             Self::DumpState(_) => write!(f, "Successfully gathered state from the main process"),
-            Self::HandledClientRequest => write!(f, "Successfully handled the client request"),
+            Self::HandledClientOrder => write!(f, "Successfully handled the client request"),
             Self::ListFrontends(_) => write!(f, "Successfully gathered the list of frontends"),
             Self::ListListeners(_) => write!(f, "Successfully listed all listeners"),
             Self::ListWorkers(_) => write!(f, "Successfully listed all workers"),
@@ -328,8 +302,8 @@ impl CommandServer {
                     self.event_subscribers.remove(&client_id);
                     Ok(Success::ClientClose(client_id))
                 }
-                CommandMessage::ClientRequest { client_id, request } => {
-                    self.handle_client_request(client_id, request).await
+                CommandMessage::ClientOrder { client_id, order } => {
+                    self.handle_client_order(client_id, order).await
                 }
                 CommandMessage::WorkerClose { worker_id } => self
                     .handle_worker_close(worker_id)
@@ -343,11 +317,11 @@ impl CommandServer {
                     .await
                     .with_context(|| "Could not handle worker response"),
                 CommandMessage::Advancement {
-                    request_identifier,
+                    client_id,
                     response,
                 } => {
                     let success_result = self
-                        .notify_advancement_to_client(request_identifier, response.clone())
+                        .notify_advancement_to_client(client_id, response.clone())
                         .await;
                     if let Response::Ok(Success::UpgradeMain(_)) = response {
                         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -536,7 +510,7 @@ impl CommandServer {
                 error!("Could not execute order on state: {:#}", e);
             }
 
-            if let &RequestContent::AddCertificate(_) = &order {
+            if let &Order::AddCertificate(_) = &order {
                 debug!("config generated AddCertificate( ... )");
             } else {
                 debug!("config generated {:?}", order);
@@ -685,10 +659,7 @@ impl CommandServer {
         }
 
         new_worker
-            .send(
-                format!("RESTART-{new_worker_id}-STATUS"),
-                RequestContent::Status,
-            )
+            .send(format!("RESTART-{new_worker_id}-STATUS"), Order::Status)
             .await;
 
         self.workers.push(new_worker);
@@ -747,7 +718,7 @@ impl CommandServer {
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = CommandResponse::new(
-                        response.id.to_string(),
+                        // response.id.to_string(),
                         CommandStatus::Processing,
                         format!("{worker_id}"),
                         Some(CommandResponseContent::Event(event.clone())),
@@ -876,7 +847,7 @@ pub fn start_server(
 
         if let Some(path) = saved_state_path {
             server
-                .load_state(None, "INITIALIZATION".to_string(), &path)
+                .load_state(None, &path)
                 .await
                 .with_context(|| format!("Loading {:?} failed", &path))?;
         }
@@ -976,19 +947,16 @@ async fn client_loop(
             Ok(msg) => msg,
         };
 
-        match serde_json::from_slice::<ClientRequest>(&message) {
+        match serde_json::from_slice::<Order>(&message) {
             Err(e) => {
                 error!("could not decode client message: {:?}", e);
                 break;
             }
-            Ok(command_request) => {
-                debug!("got command request: {:?}", command_request);
+            Ok(order) => {
+                debug!("got command request: {:?}", order);
                 let client_id = client_id.clone();
                 if let Err(e) = command_tx
-                    .send(CommandMessage::ClientRequest {
-                        client_id,
-                        request: command_request,
-                    })
+                    .send(CommandMessage::ClientOrder { client_id, order })
                     .await
                 {
                     error!("error sending client request to command server: {:?}", e);
@@ -1018,16 +986,16 @@ async fn worker_loop(
     worker_id: u32,
     stream: Async<UnixStream>,
     mut command_tx: Sender<CommandMessage>,
-    mut worker_rx: Receiver<ProxyRequest>,
+    mut worker_rx: Receiver<InnerOrder>,
 ) {
     let read_stream = Arc::new(stream);
     let mut write_stream = read_stream.clone();
 
     smol::spawn(async move {
         debug!("will start sending messages to worker {}", worker_id);
-        while let Some(request) = worker_rx.next().await {
-            debug!("sending to worker {}: {:?}", worker_id, request);
-            let mut message: Vec<u8> = serde_json::to_string(&request)
+        while let Some(inner_order) = worker_rx.next().await {
+            debug!("sending to worker {}: {:?}", worker_id, inner_order);
+            let mut message: Vec<u8> = serde_json::to_string(&inner_order)
                 .map(|string| string.into_bytes())
                 .unwrap_or_else(|_| Vec::new());
 
@@ -1056,13 +1024,13 @@ async fn worker_loop(
                 error!("could not decode worker message: {:?}", e);
                 break;
             }
-            Ok(proxy_response) => {
-                debug!("worker {} replied message: {:?}", worker_id, proxy_response);
+            Ok(response) => {
+                debug!("worker {} replied message: {:?}", worker_id, response);
                 let worker_id = worker_id;
                 if let Err(e) = command_tx
                     .send(CommandMessage::WorkerResponse {
                         worker_id,
-                        response: proxy_response,
+                        response,
                     })
                     .await
                 {

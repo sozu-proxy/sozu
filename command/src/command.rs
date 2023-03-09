@@ -16,10 +16,10 @@ use crate::{
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
-/// Details of a request sent by the CLI (or other) to the main process
+/// A request sent by the CLI (or other) to the main process
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "content", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RequestContent {
+pub enum Order {
     /// save Sōzu's parseable state as a file
     SaveState {
         path: String,
@@ -100,25 +100,6 @@ pub struct FrontendFilters {
     pub domain: Option<String>,
 }
 
-/// Sent to the main process by the CLI (or other) through the unix socket
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ClientRequest {
-    pub id: String,  // TODO: should we keep this?
-    pub version: u8, // TODO: should we keep this?
-    #[serde(flatten)]
-    pub content: RequestContent,
-}
-
-impl ClientRequest {
-    pub fn new(id: String, content: RequestContent) -> ClientRequest {
-        ClientRequest {
-            version: PROTOCOL_VERSION,
-            id,
-            content,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandStatus {
@@ -177,14 +158,14 @@ pub struct CommandResponse {
 
 impl CommandResponse {
     pub fn new(
-        id: String,
+        // id: String,
         status: CommandStatus,
         message: String,
         content: Option<CommandResponseContent>,
     ) -> CommandResponse {
         CommandResponse {
             version: PROTOCOL_VERSION,
-            id,
+            id: "generic-response-id-to-be-removed".to_string(),
             status,
             message,
             content,
@@ -262,11 +243,11 @@ mod tests {
     #[test]
     fn config_message_test() {
         let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "ADD_HTTP_FRONTEND", "content":{"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}}"#;
-        let message: ClientRequest = serde_json::from_str(raw_json).unwrap();
+        let message: Order = serde_json::from_str(raw_json).unwrap();
         println!("{message:?}");
         assert_eq!(
-            message.content,
-            RequestContent::AddHttpFrontend(HttpFrontend {
+            message,
+            Order::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
@@ -287,7 +268,7 @@ mod tests {
         let pretty_print = serde_json::to_string_pretty(&$expected_message).expect("should have serialized");
         assert_eq!(&pretty_print, data, "\nserialized message:\n{}\n\nexpected message:\n{}", pretty_print, data);
 
-        let message: ClientRequest = serde_json::from_str(data).unwrap();
+        let message: Order = serde_json::from_str(data).unwrap();
         assert_eq!(message, $expected_message, "\ndeserialized message:\n{:#?}\n\nexpected message:\n{:#?}", message, $expected_message);
 
       }
@@ -315,115 +296,91 @@ mod tests {
     test_message!(
         add_cluster,
         "../assets/add_cluster.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::AddCluster(Cluster {
-                cluster_id: String::from("xxx"),
-                sticky_session: true,
-                https_redirect: true,
-                proxy_protocol: Some(ProxyProtocolConfig::ExpectHeader),
-                load_balancing: LoadBalancingAlgorithms::RoundRobin,
-                load_metric: None,
-                answer_503: None,
-            }),
-        }
+        Order::AddCluster(Cluster {
+            cluster_id: String::from("xxx"),
+            sticky_session: true,
+            https_redirect: true,
+            proxy_protocol: Some(ProxyProtocolConfig::ExpectHeader),
+            load_balancing: LoadBalancingAlgorithms::RoundRobin,
+            load_metric: None,
+            answer_503: None,
+        })
     );
 
     test_message!(
         remove_cluster,
         "../assets/remove_cluster.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::RemoveCluster {
-                cluster_id: String::from("xxx")
-            },
+        Order::RemoveCluster {
+            cluster_id: String::from("xxx")
         }
     );
 
     test_message!(
         add_http_front,
         "../assets/add_http_front.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::AddHttpFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
-                hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
-                method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
-                position: RulePosition::Tree,
-                tags: None,
-            }),
-        }
+        Order::AddHttpFrontend(HttpFrontend {
+            route: Route::ClusterId(String::from("xxx")),
+            hostname: String::from("yyy"),
+            path: PathRule::Prefix(String::from("xxx")),
+            method: None,
+            address: "0.0.0.0:8080".parse().unwrap(),
+            position: RulePosition::Tree,
+            tags: None,
+        })
     );
 
     test_message!(
         remove_http_front,
         "../assets/remove_http_front.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::RemoveHttpFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
-                hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
-                method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
-                position: RulePosition::Tree,
-                tags: Some(BTreeMap::from([
-                    ("owner".to_owned(), "John".to_owned()),
-                    (
-                        "uuid".to_owned(),
-                        "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
-                    )
-                ]))
-            }),
-        }
+        Order::RemoveHttpFrontend(HttpFrontend {
+            route: Route::ClusterId(String::from("xxx")),
+            hostname: String::from("yyy"),
+            path: PathRule::Prefix(String::from("xxx")),
+            method: None,
+            address: "0.0.0.0:8080".parse().unwrap(),
+            position: RulePosition::Tree,
+            tags: Some(BTreeMap::from([
+                ("owner".to_owned(), "John".to_owned()),
+                (
+                    "uuid".to_owned(),
+                    "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
+                )
+            ]))
+        })
     );
 
     test_message!(
         add_https_front,
         "../assets/add_https_front.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::AddHttpsFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
-                hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
-                method: None,
-                address: "0.0.0.0:8443".parse().unwrap(),
-                position: RulePosition::Tree,
-                tags: None,
-            }),
-        }
+        Order::AddHttpsFrontend(HttpFrontend {
+            route: Route::ClusterId(String::from("xxx")),
+            hostname: String::from("yyy"),
+            path: PathRule::Prefix(String::from("xxx")),
+            method: None,
+            address: "0.0.0.0:8443".parse().unwrap(),
+            position: RulePosition::Tree,
+            tags: None,
+        })
     );
 
     test_message!(
         remove_https_front,
         "../assets/remove_https_front.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::RemoveHttpsFrontend(HttpFrontend {
-                route: Route::ClusterId(String::from("xxx")),
-                hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
-                method: None,
-                address: "0.0.0.0:8443".parse().unwrap(),
-                position: RulePosition::Tree,
-                tags: Some(BTreeMap::from([
-                    ("owner".to_owned(), "John".to_owned()),
-                    (
-                        "uuid".to_owned(),
-                        "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
-                    )
-                ]))
-            }),
-        }
+        Order::RemoveHttpsFrontend(HttpFrontend {
+            route: Route::ClusterId(String::from("xxx")),
+            hostname: String::from("yyy"),
+            path: PathRule::Prefix(String::from("xxx")),
+            method: None,
+            address: "0.0.0.0:8443".parse().unwrap(),
+            position: RulePosition::Tree,
+            tags: Some(BTreeMap::from([
+                ("owner".to_owned(), "John".to_owned()),
+                (
+                    "uuid".to_owned(),
+                    "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
+                )
+            ]))
+        })
     );
 
     const KEY: &str = include_str!("../../lib/assets/key.pem");
@@ -433,164 +390,96 @@ mod tests {
     test_message!(
         add_certificate,
         "../assets/add_certificate.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::AddCertificate(AddCertificate {
-                address: "0.0.0.0:443".parse().unwrap(),
-                certificate: CertificateAndKey {
-                    certificate: String::from(CERTIFICATE),
-                    certificate_chain: split_certificate_chain(String::from(CHAIN)),
-                    key: String::from(KEY),
-                    versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
-                },
-                names: vec![],
-                expired_at: None,
-            }),
-        }
+        Order::AddCertificate(AddCertificate {
+            address: "0.0.0.0:443".parse().unwrap(),
+            certificate: CertificateAndKey {
+                certificate: String::from(CERTIFICATE),
+                certificate_chain: split_certificate_chain(String::from(CHAIN)),
+                key: String::from(KEY),
+                versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
+            },
+            names: vec![],
+            expired_at: None,
+        })
     );
 
     test_message!(
         remove_certificate,
         "../assets/remove_certificate.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::RemoveCertificate(RemoveCertificate {
-                address: "0.0.0.0:443".parse().unwrap(),
-                fingerprint: CertificateFingerprint(
-                    FromHex::from_hex(
-                        "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
-                    )
-                    .unwrap()
-                ),
-            }),
-        }
+        Order::RemoveCertificate(RemoveCertificate {
+            address: "0.0.0.0:443".parse().unwrap(),
+            fingerprint: CertificateFingerprint(
+                FromHex::from_hex(
+                    "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
+                )
+                .unwrap()
+            ),
+        })
     );
 
     test_message!(
         add_backend,
         "../assets/add_backend.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::AddBackend(Backend {
-                cluster_id: String::from("xxx"),
-                backend_id: String::from("xxx-0"),
-                address: "127.0.0.1:8080".parse().unwrap(),
-                load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
-                sticky_id: Some(String::from("xxx-0")),
-                backup: Some(false),
-            }),
-        }
+        Order::AddBackend(Backend {
+            cluster_id: String::from("xxx"),
+            backend_id: String::from("xxx-0"),
+            address: "127.0.0.1:8080".parse().unwrap(),
+            load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
+            sticky_id: Some(String::from("xxx-0")),
+            backup: Some(false),
+        })
     );
 
     test_message!(
         remove_backend,
         "../assets/remove_backend.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::RemoveBackend(RemoveBackend {
-                cluster_id: String::from("xxx"),
-                backend_id: String::from("xxx-0"),
-                address: "127.0.0.1:8080".parse().unwrap(),
-            }),
-        }
+        Order::RemoveBackend(RemoveBackend {
+            cluster_id: String::from("xxx"),
+            backend_id: String::from("xxx-0"),
+            address: "127.0.0.1:8080".parse().unwrap(),
+        })
     );
 
-    test_message!(
-        soft_stop,
-        "../assets/soft_stop.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::SoftStop,
-        }
-    );
+    test_message!(soft_stop, "../assets/soft_stop.json", Order::SoftStop);
 
-    test_message!(
-        hard_stop,
-        "../assets/hard_stop.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::HardStop,
-        }
-    );
+    test_message!(hard_stop, "../assets/hard_stop.json", Order::HardStop);
 
-    test_message!(
-        status,
-        "../assets/status.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::Status,
-        }
-    );
+    test_message!(status, "../assets/status.json", Order::Status);
 
     test_message!(
         load_state,
         "../assets/load_state.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::LoadState {
-                path: String::from("./config_dump.json")
-            },
+        Order::LoadState {
+            path: String::from("./config_dump.json")
         }
     );
 
     test_message!(
         save_state,
         "../assets/save_state.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::SaveState {
-                path: String::from("./config_dump.json")
-            },
+        Order::SaveState {
+            path: String::from("./config_dump.json")
         }
     );
 
-    test_message!(
-        dump_state,
-        "../assets/dump_state.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::DumpState,
-        }
-    );
+    test_message!(dump_state, "../assets/dump_state.json", Order::DumpState);
 
     test_message!(
         list_workers,
         "../assets/list_workers.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::ListWorkers,
-        }
+        Order::ListWorkers
     );
 
     test_message!(
         upgrade_main,
         "../assets/upgrade_main.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::UpgradeMain,
-        }
+        Order::UpgradeMain
     );
 
     test_message!(
         upgrade_worker,
         "../assets/upgrade_worker.json",
-        ClientRequest {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            content: RequestContent::UpgradeWorker(0),
-        }
+        Order::UpgradeWorker(0)
     );
 
     test_message_answer!(

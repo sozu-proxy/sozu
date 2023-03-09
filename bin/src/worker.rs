@@ -32,13 +32,13 @@ use tempfile::tempfile;
 use sozu::{metrics, server::Server};
 use sozu_command_lib::{
     channel::Channel,
-    command::RequestContent,
+    command::Order,
     config::Config,
     logging::target_to_backend,
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
-    worker::{ProxyRequest, ProxyResponse},
+    worker::{InnerOrder, ProxyResponse},
 };
 
 use crate::{command::Worker, logging, util};
@@ -70,9 +70,9 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
             }
 
             worker_channel
-                .write_message(&ProxyRequest {
+                .write_message(&InnerOrder {
                     id: format!("start-status-{index}"),
-                    content: RequestContent::Status,
+                    content: Order::Status,
                 })
                 .with_context(|| "Could not send status request to the worker")?;
 
@@ -166,7 +166,7 @@ pub fn begin_worker_process(
         error!("Could not unblock the worker-to-main channel: {}", e);
     }
 
-    let mut worker_to_main_channel: Channel<ProxyResponse, ProxyRequest> =
+    let mut worker_to_main_channel: Channel<ProxyResponse, InnerOrder> =
         worker_to_main_channel.into();
     worker_to_main_channel.readiness.insert(Ready::readable());
 
@@ -209,7 +209,7 @@ pub fn fork_main_into_worker(
     executable_path: String,
     state: &ConfigState,
     listeners: Option<Listeners>,
-) -> anyhow::Result<(pid_t, Channel<ProxyRequest, ProxyResponse>, ScmSocket)> {
+) -> anyhow::Result<(pid_t, Channel<InnerOrder, ProxyResponse>, ScmSocket)> {
     trace!("parent({})", unsafe { libc::getpid() });
 
     let mut state_file =

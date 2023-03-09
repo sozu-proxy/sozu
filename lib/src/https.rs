@@ -50,14 +50,14 @@ use crate::{
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     sozu_command::{
-        command::RequestContent,
+        command::Order,
         logging,
         ready::Ready,
         scm_socket::ScmSocket,
         state::ClusterId,
         worker::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
-            ProxyRequest, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, Query,
+            InnerOrder, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, Query,
             QueryAnswer, QueryAnswerCertificate, QueryCertificateType, RemoveCertificate, Route,
             TlsVersion,
         },
@@ -1263,36 +1263,36 @@ impl ProxyConfiguration for HttpsProxy {
         Ok(())
     }
 
-    fn notify(&mut self, request: ProxyRequest) -> ProxyResponse {
+    fn notify(&mut self, request: InnerOrder) -> ProxyResponse {
         let request_id = request.id.clone();
 
         let content_result = match request.content {
-            RequestContent::AddCluster(cluster) => {
+            Order::AddCluster(cluster) => {
                 info!("{} add cluster {:?}", request_id, cluster);
                 self.add_cluster(cluster.clone())
                     .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
-            RequestContent::RemoveCluster { cluster_id } => {
+            Order::RemoveCluster { cluster_id } => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
                     .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
-            RequestContent::AddHttpsFrontend(front) => {
+            Order::AddHttpsFrontend(front) => {
                 info!("{} add https front {:?}", request_id, front);
                 self.add_https_frontend(front)
                     .with_context(|| "Could not add https frontend")
             }
-            RequestContent::RemoveHttpsFrontend(front) => {
+            Order::RemoveHttpsFrontend(front) => {
                 info!("{} remove https front {:?}", request_id, front);
                 self.remove_https_frontend(front)
                     .with_context(|| "Could not remove https frontend")
             }
-            RequestContent::AddCertificate(add_certificate) => {
+            Order::AddCertificate(add_certificate) => {
                 info!("{} add certificate: {:?}", request_id, add_certificate);
                 self.add_certificate(add_certificate)
                     .with_context(|| "Could not add certificate")
             }
-            RequestContent::RemoveCertificate(remove_certificate) => {
+            Order::RemoveCertificate(remove_certificate) => {
                 info!(
                     "{} remove certificate: {:?}",
                     request_id, remove_certificate
@@ -1300,7 +1300,7 @@ impl ProxyConfiguration for HttpsProxy {
                 self.remove_certificate(remove_certificate)
                     .with_context(|| "Could not remove certificate")
             }
-            RequestContent::ReplaceCertificate(replace_certificate) => {
+            Order::ReplaceCertificate(replace_certificate) => {
                 info!(
                     "{} replace certificate: {:?}",
                     request_id, replace_certificate
@@ -1308,13 +1308,13 @@ impl ProxyConfiguration for HttpsProxy {
                 self.replace_certificate(replace_certificate)
                     .with_context(|| "Could not replace certificate")
             }
-            RequestContent::RemoveListener(remove) => {
+            Order::RemoveListener(remove) => {
                 info!("removing HTTPS listener at address {:?}", remove.address);
                 self.remove_listener(remove.clone()).with_context(|| {
                     format!("Could not remove listener at address {:?}", remove.address)
                 })
             }
-            RequestContent::SoftStop => {
+            Order::SoftStop => {
                 info!("{} processing soft shutdown", request_id);
                 match self
                     .soft_stop()
@@ -1327,7 +1327,7 @@ impl ProxyConfiguration for HttpsProxy {
                     Err(e) => Err(e),
                 }
             }
-            RequestContent::HardStop => {
+            Order::HardStop => {
                 info!("{} processing hard shutdown", request_id);
                 match self
                     .hard_stop()
@@ -1340,11 +1340,11 @@ impl ProxyConfiguration for HttpsProxy {
                     Err(e) => Err(e),
                 }
             }
-            RequestContent::Status => {
+            Order::Status => {
                 info!("{} status", request_id);
                 Ok(None)
             }
-            RequestContent::Logging(logging_filter) => {
+            Order::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     request_id, logging_filter
@@ -1352,12 +1352,12 @@ impl ProxyConfiguration for HttpsProxy {
                 self.logging(logging_filter.clone())
                     .with_context(|| format!("Could not set logging level to {logging_filter}"))
             }
-            RequestContent::Query(Query::Certificates(QueryCertificateType::All)) => {
+            Order::Query(Query::Certificates(QueryCertificateType::All)) => {
                 info!("{} query all certificates", request_id);
                 self.query_all_certificates()
                     .with_context(|| "Could not query all certificates")
             }
-            RequestContent::Query(Query::Certificates(QueryCertificateType::Domain(domain))) => {
+            Order::Query(Query::Certificates(QueryCertificateType::Domain(domain))) => {
                 info!("{} query certificate for domain {}", request_id, domain);
                 self.query_certificate_for_domain(domain.clone())
                     .with_context(|| format!("Could not query certificate for domain {domain}"))

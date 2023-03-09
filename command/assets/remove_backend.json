@@ -1,6 +1,4 @@
 {
-  "id": "ID_TEST",
-  "version": 0,
   "type": "REMOVE_BACKEND",
   "content": {
     "cluster_id": "xxx",
