@@ -258,6 +258,7 @@ pub fn main(
     Ok(())
 }
 
+/*
 fn generate_id() -> String {
     let s: String = iter::repeat(())
         .map(|()| thread_rng().sample(Alphanumeric))
@@ -266,6 +267,7 @@ fn generate_id() -> String {
         .collect();
     format!("ID-{s}")
 }
+*/
 
 fn generate_app_id(app_id: &str) -> String {
     let s: String = iter::repeat(())

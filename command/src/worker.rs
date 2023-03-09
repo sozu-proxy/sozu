@@ -749,16 +749,6 @@ pub enum MetricsConfiguration {
     Clear,
 }
 
-/// Details of a query for information, sent to a worker
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Query {
-    Clusters(QueryClusterType),
-    Certificates(QueryCertificateType),
-    Metrics(QueryMetricsOptions),
-    ClustersHashes,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryClusterType {
@@ -850,7 +840,7 @@ impl Order {
             | Order::AddCertificate(_)
             | Order::ReplaceCertificate(_)
             | Order::RemoveCertificate(_)
-            | Order::Query(_) => proxy_destination.to_https_proxy = true,
+            | Order::QueryCertificates(_) => proxy_destination.to_https_proxy = true,
 
             Order::AddTcpFrontend(_) | Order::RemoveTcpFrontend(_) => {
                 proxy_destination.to_tcp_proxy = true
@@ -863,6 +853,9 @@ impl Order {
             | Order::SoftStop
             | Order::HardStop
             | Order::Status
+            | Order::QueryClusters(_)
+            | Order::QueryClustersHashes
+            | Order::QueryMetrics(_)
             | Order::Logging(_) => {
                 proxy_destination.to_http_proxy = true;
                 proxy_destination.to_https_proxy = true;

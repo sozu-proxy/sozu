@@ -9,8 +9,9 @@ use crate::{
     worker::{
         ActivateListener, AddCertificate, AggregatedMetricsData, Backend, Cluster,
         DeactivateListener, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        MetricsConfiguration, ProxyEvent, Query, QueryAnswer, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, TcpFrontend, TcpListenerConfig,
+        MetricsConfiguration, ProxyEvent, QueryAnswer, QueryCertificateType, QueryClusterType,
+        QueryMetricsOptions, RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate,
+        TcpFrontend, TcpListenerConfig,
     },
 };
 
@@ -81,7 +82,10 @@ pub enum Order {
     ActivateListener(ActivateListener),
     DeactivateListener(DeactivateListener),
 
-    Query(Query),
+    QueryCertificates(QueryCertificateType),
+    QueryClusters(QueryClusterType),
+    QueryClustersHashes,
+    QueryMetrics(QueryMetricsOptions),
 
     SoftStop,
     HardStop,

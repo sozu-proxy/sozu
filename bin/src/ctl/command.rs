@@ -7,9 +7,7 @@ use sozu_command_lib::{
     command::{
         CommandResponse, CommandResponseContent, CommandStatus, Order, RunState, WorkerInfo,
     },
-    worker::{
-        Query, QueryCertificateType, QueryClusterDomain, QueryClusterType, QueryMetricsOptions,
-    },
+    worker::{QueryCertificateType, QueryClusterDomain, QueryClusterType, QueryMetricsOptions},
 };
 
 use crate::ctl::{
@@ -261,12 +259,12 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = Order::Query(Query::Metrics(QueryMetricsOptions {
+        let command = Order::QueryMetrics(QueryMetricsOptions {
             list,
             cluster_ids,
             backend_ids,
             metric_names,
-        }));
+        });
 
         // a loop to reperform the query every refresh time
         loop {
@@ -330,9 +328,7 @@ impl CommandManager {
         }
 
         let command = if let Some(ref cluster_id) = cluster_id {
-            Order::Query(Query::Clusters(QueryClusterType::ClusterId(
-                cluster_id.to_string(),
-            )))
+            Order::QueryClusters(QueryClusterType::ClusterId(cluster_id.to_string()))
         } else if let Some(ref domain) = domain {
             let splitted: Vec<String> =
                 domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
@@ -349,9 +345,9 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
             };
 
-            Order::Query(Query::Clusters(QueryClusterType::Domain(query_domain)))
+            Order::QueryClusters(QueryClusterType::Domain(query_domain))
         } else {
-            Order::Query(Query::ClustersHashes)
+            Order::QueryClustersHashes
         };
 
         self.send_order(command)?;
@@ -399,9 +395,9 @@ impl CommandManager {
             }
         };
 
-        let command = Order::Query(Query::Certificates(query));
+        let order = Order::QueryCertificates(query);
 
-        self.send_order(command)?;
+        self.send_order(order)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;

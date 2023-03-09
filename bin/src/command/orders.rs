@@ -25,7 +25,7 @@ use sozu_command_lib::{
     state::get_cluster_ids_by_domain,
     worker::{
         AggregatedMetricsData, InnerOrder, MetricsConfiguration, ProxyResponseContent,
-        ProxyResponseStatus, Query, QueryAnswer, QueryClusterType,
+        ProxyResponseStatus, QueryAnswer, QueryClusterType,
     },
 };
 
@@ -58,7 +58,7 @@ impl CommandServer {
             Order::UpgradeMain => self.upgrade_main(client_id).await,
             Order::UpgradeWorker(worker_id) => self.upgrade_worker(client_id, worker_id).await,
             Order::ConfigureMetrics(config) => self.configure_metrics(client_id, config).await,
-            Order::Query(query) => self.query(client_id, query).await,
+            // Order::Query(query) => self.query(client_id, query).await,
             Order::Logging(logging_filter) => self.set_logging_level(logging_filter),
             Order::SubscribeEvents => {
                 self.event_subscribers.insert(client_id.clone());
@@ -66,6 +66,12 @@ impl CommandServer {
             }
             Order::ReloadConfiguration { path } => self.reload_configuration(client_id, path).await,
             Order::Status => self.status(client_id).await,
+
+            Order::QueryCertificates(_)
+            | Order::QueryClusters(_)
+            | Order::QueryClustersHashes
+            | Order::QueryMetrics(_) => self.query(client_id, order).await,
+
             // any other case is an order for the workers, except for SoftStop and HardStop.
             // TODO: we should have something like:
             // RequestContent::SoftStop => self.do_something(),
@@ -1017,9 +1023,9 @@ impl CommandServer {
     pub async fn query(
         &mut self,
         client_id: String,
-        query: Query,
+        order: Order,
     ) -> anyhow::Result<Option<Success>> {
-        debug!("Received this query: {:?}", query);
+        debug!("Received this query: {:?}", order);
         let (query_tx, mut query_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
@@ -1028,9 +1034,7 @@ impl CommandServer {
             .filter(|worker| worker.run_state != RunState::Stopped)
         {
             let req_id = format!("{}-query-{}", client_id, worker.id);
-            worker
-                .send(req_id.clone(), Order::Query(query.clone()))
-                .await;
+            worker.send(req_id.clone(), order.clone()).await;
             count += 1;
             self.in_flight.insert(req_id, (query_tx.clone(), 1));
         }
@@ -1043,11 +1047,11 @@ impl CommandServer {
         .await;
 
         let mut main_query_answer = None;
-        match &query {
-            Query::ClustersHashes => {
+        match &order {
+            Order::QueryClustersHashes => {
                 main_query_answer = Some(QueryAnswer::ClustersHashes(self.state.hash_state()));
             }
-            Query::Clusters(query_type) => {
+            Order::QueryClusters(query_type) => {
                 main_query_answer = Some(QueryAnswer::Clusters(match query_type {
                     QueryClusterType::ClusterId(cluster_id) => {
                         vec![self.state.cluster_state(cluster_id)]
@@ -1065,8 +1069,9 @@ impl CommandServer {
                     }
                 }));
             }
-            Query::Certificates(_) => {}
-            Query::Metrics(_) => {}
+            Order::QueryCertificates(_) => {}
+            Order::QueryMetrics(_) => {}
+            _ => {}
         };
 
         // all these are passed to the thread
@@ -1100,7 +1105,7 @@ impl CommandServer {
                 }
             }
 
-            let mut proxy_responses_map: BTreeMap<String, QueryAnswer> = responses
+            let mut query_answers: BTreeMap<String, QueryAnswer> = responses
                 .into_iter()
                 .filter_map(|(worker_id, proxy_response)| {
                     if let Some(ProxyResponseContent::Query(d)) = proxy_response.content {
@@ -1111,31 +1116,29 @@ impl CommandServer {
                 })
                 .collect();
 
-            let success = match &query {
-                &Query::ClustersHashes | &Query::Clusters(_) => {
+            let success = match &order {
+                &Order::QueryClustersHashes | &Order::QueryClusters(_) => {
                     let main = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
-                    proxy_responses_map.insert(String::from("main"), main);
-                    Success::Query(CommandResponseContent::Query(proxy_responses_map))
+                    query_answers.insert(String::from("main"), main);
+                    Success::Query(CommandResponseContent::Query(query_answers))
                 }
-                &Query::Certificates(_) => {
-                    info!(
-                        "certificates query answer received: {:?}",
-                        proxy_responses_map
-                    );
-                    Success::Query(CommandResponseContent::Query(proxy_responses_map))
+                &Order::QueryCertificates(_) => {
+                    info!("certificates query answer received: {:?}", query_answers);
+                    Success::Query(CommandResponseContent::Query(query_answers))
                 }
-                Query::Metrics(options) => {
-                    debug!("metrics query answer received: {:?}", proxy_responses_map);
+                Order::QueryMetrics(options) => {
+                    debug!("metrics query answer received: {:?}", query_answers);
 
                     if options.list {
-                        Success::Query(CommandResponseContent::Query(proxy_responses_map))
+                        Success::Query(CommandResponseContent::Query(query_answers))
                     } else {
                         Success::Query(CommandResponseContent::Metrics(AggregatedMetricsData {
                             main: main_metrics,
-                            workers: proxy_responses_map,
+                            workers: query_answers,
                         }))
                     }
                 }
+                _ => return, // very very unlikely
             };
 
             return_success(command_tx, cloned_identifier, success).await;

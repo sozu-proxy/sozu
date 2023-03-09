@@ -139,9 +139,15 @@ impl ConfigState {
             // This is to avoid the error message
             &Order::Logging(_)
             | &Order::Status
-            | &Order::Query(_)
             | &Order::SoftStop
+            | &Order::QueryCertificates(_)
+            | &Order::QueryClusters(_)
+            | &Order::QueryMetrics(_)
+            | &Order::QueryClustersHashes
+            | &Order::ConfigureMetrics(_)
+            | &Order::ReturnListenSockets
             | &Order::HardStop => Ok(()),
+
             other_order => {
                 bail!("state cannot handle order message: {:#?}", other_order);
             }

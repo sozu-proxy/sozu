@@ -32,10 +32,10 @@ use crate::{
         scm_socket::{Listeners, ScmSocket},
         state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
         worker::{
-            Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyEvent,
-            InnerOrder, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, Query,
-            QueryAnswer, QueryAnswerCertificate, QueryCertificateType, QueryClusterType,
-            RemoveBackend, TcpListenerConfig as CommandTcpListener,
+            Backend as CommandLibBackend, Cluster, InnerOrder, ListenerType, MessageId, ProxyEvent,
+            ProxyResponse, ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
+            QueryAnswerCertificate, QueryCertificateType, QueryClusterType, RemoveBackend,
+            TcpListenerConfig as CommandTcpListener,
         },
     },
     tcp,
@@ -886,77 +886,77 @@ impl Server {
             return;
         }
 
-        if let Order::Query(ref query) = message.content {
-            match query {
-                Query::ClustersHashes => {
-                    push_queue(ProxyResponse {
-                        id: message.id.clone(),
-                        status: ProxyResponseStatus::Ok,
-                        content: Some(ProxyResponseContent::Query(QueryAnswer::ClustersHashes(
-                            self.config_state.hash_state(),
-                        ))),
-                    });
-                    return;
-                }
-                Query::Clusters(query_type) => {
-                    let query_answer = match query_type {
-                        QueryClusterType::ClusterId(cluster_id) => {
-                            QueryAnswer::Clusters(vec![self.config_state.cluster_state(cluster_id)])
-                        }
-                        QueryClusterType::Domain(domain) => {
-                            let cluster_ids = get_cluster_ids_by_domain(
-                                &self.config_state,
-                                domain.hostname.clone(),
-                                domain.path.clone(),
-                            );
-                            let answer = cluster_ids
-                                .iter()
-                                .map(|cluster_id| self.config_state.cluster_state(cluster_id))
-                                .collect();
-
-                            QueryAnswer::Clusters(answer)
-                        }
-                    };
-                    push_queue(ProxyResponse {
-                        id: message.id.clone(),
-                        status: ProxyResponseStatus::Ok,
-                        content: Some(ProxyResponseContent::Query(query_answer)),
-                    });
-                    return;
-                }
-                Query::Certificates(q) => {
-                    match q {
-                        // forward the query to the TLS implementation
-                        QueryCertificateType::Domain(_) => {}
-                        // forward the query to the TLS implementation
-                        QueryCertificateType::All => {}
-                        QueryCertificateType::Fingerprint(f) => {
-                            push_queue(ProxyResponse {
-                                id: message.id.clone(),
-                                status: ProxyResponseStatus::Ok,
-                                content: Some(ProxyResponseContent::Query(
-                                    QueryAnswer::Certificates(QueryAnswerCertificate::Fingerprint(
-                                        get_certificate(&self.config_state, f),
-                                    )),
-                                )),
-                            });
-                            return;
-                        }
+        match &message.content {
+            Order::QueryClustersHashes => {
+                push_queue(ProxyResponse {
+                    id: message.id.clone(),
+                    status: ProxyResponseStatus::Ok,
+                    content: Some(ProxyResponseContent::Query(QueryAnswer::ClustersHashes(
+                        self.config_state.hash_state(),
+                    ))),
+                });
+                return;
+            }
+            Order::QueryClusters(query_type) => {
+                let query_answer = match query_type {
+                    QueryClusterType::ClusterId(cluster_id) => {
+                        QueryAnswer::Clusters(vec![self.config_state.cluster_state(cluster_id)])
                     }
-                }
-                Query::Metrics(query_metrics_options) => {
-                    METRICS.with(|metrics| {
-                        let data = (*metrics.borrow_mut()).query(query_metrics_options);
+                    QueryClusterType::Domain(domain) => {
+                        let cluster_ids = get_cluster_ids_by_domain(
+                            &self.config_state,
+                            domain.hostname.clone(),
+                            domain.path.clone(),
+                        );
+                        let answer = cluster_ids
+                            .iter()
+                            .map(|cluster_id| self.config_state.cluster_state(cluster_id))
+                            .collect();
 
+                        QueryAnswer::Clusters(answer)
+                    }
+                };
+                push_queue(ProxyResponse {
+                    id: message.id.clone(),
+                    status: ProxyResponseStatus::Ok,
+                    content: Some(ProxyResponseContent::Query(query_answer)),
+                });
+                return;
+            }
+            Order::QueryCertificates(q) => {
+                match q {
+                    // forward the query to the TLS implementation
+                    QueryCertificateType::Domain(_) => {}
+                    // forward the query to the TLS implementation
+                    QueryCertificateType::All => {}
+                    QueryCertificateType::Fingerprint(f) => {
                         push_queue(ProxyResponse {
                             id: message.id.clone(),
                             status: ProxyResponseStatus::Ok,
-                            content: Some(ProxyResponseContent::Query(QueryAnswer::Metrics(data))),
+                            content: Some(ProxyResponseContent::Query(QueryAnswer::Certificates(
+                                QueryAnswerCertificate::Fingerprint(get_certificate(
+                                    &self.config_state,
+                                    f,
+                                )),
+                            ))),
                         });
-                    });
-                    return;
+                        return;
+                    }
                 }
             }
+            Order::QueryMetrics(query_metrics_options) => {
+                METRICS.with(|metrics| {
+                    let data = (*metrics.borrow_mut()).query(query_metrics_options);
+
+                    push_queue(ProxyResponse {
+                        id: message.id.clone(),
+                        status: ProxyResponseStatus::Ok,
+                        content: Some(ProxyResponseContent::Query(QueryAnswer::Metrics(data))),
+                    });
+                });
+                return;
+            }
+            _other_order => {}
         }
 
         self.notify_proxys(message);

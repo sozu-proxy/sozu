@@ -57,9 +57,8 @@ use crate::{
         state::ClusterId,
         worker::{
             AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
-            InnerOrder, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, Query,
-            QueryAnswer, QueryAnswerCertificate, QueryCertificateType, RemoveCertificate, Route,
-            TlsVersion,
+            InnerOrder, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
+            QueryAnswerCertificate, QueryCertificateType, RemoveCertificate, Route, TlsVersion,
         },
     },
     timer::TimeoutContainer,
@@ -1352,12 +1351,12 @@ impl ProxyConfiguration for HttpsProxy {
                 self.logging(logging_filter.clone())
                     .with_context(|| format!("Could not set logging level to {logging_filter}"))
             }
-            Order::Query(Query::Certificates(QueryCertificateType::All)) => {
+            Order::QueryCertificates(QueryCertificateType::All) => {
                 info!("{} query all certificates", request_id);
                 self.query_all_certificates()
                     .with_context(|| "Could not query all certificates")
             }
-            Order::Query(Query::Certificates(QueryCertificateType::Domain(domain))) => {
+            Order::QueryCertificates(QueryCertificateType::Domain(domain)) => {
                 info!("{} query certificate for domain {}", request_id, domain);
                 self.query_certificate_for_domain(domain.clone())
                     .with_context(|| format!("Could not query certificate for domain {domain}"))
