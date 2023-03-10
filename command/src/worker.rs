@@ -15,11 +15,11 @@ use serde::{
 };
 
 use crate::{
-    command::Order,
     config::{
         ProxyProtocolConfig, DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST,
         DEFAULT_RUSTLS_CIPHER_LIST, DEFAULT_SIGNATURE_ALGORITHMS,
     },
+    order::Order,
     state::{ClusterId, RouteKey},
 };
 

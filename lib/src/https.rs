@@ -50,8 +50,8 @@ use crate::{
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     sozu_command::{
-        command::Order,
         logging,
+        order::Order,
         ready::Ready,
         scm_socket::ScmSocket,
         state::ClusterId,

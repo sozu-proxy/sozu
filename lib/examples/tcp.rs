@@ -7,7 +7,7 @@ extern crate time;
 use std::{io::stdout, thread};
 
 use anyhow::Context;
-use sozu_command::command::Order;
+use sozu_command::order::Order;
 
 use crate::sozu_command::{
     channel::Channel,

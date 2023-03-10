@@ -32,9 +32,9 @@ use tempfile::tempfile;
 use sozu::{metrics, server::Server};
 use sozu_command_lib::{
     channel::Channel,
-    command::Order,
     config::Config,
     logging::target_to_backend,
+    order::Order,
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,

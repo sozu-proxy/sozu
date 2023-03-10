@@ -4,8 +4,8 @@ use anyhow::{bail, Context};
 
 use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain},
-    command::{FrontendFilters, Order},
     config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
+    order::{FrontendFilters, Order},
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, DeactivateListener, HttpFrontend, ListenerType, LoadBalancingParams,

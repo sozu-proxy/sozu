@@ -19,8 +19,8 @@ use crate::{
     protocol::SessionState,
     router::Router,
     sozu_command::{
-        command::Order,
         logging,
+        order::Order,
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
         worker::{Cluster, HttpFrontend, HttpListenerConfig, InnerOrder, ProxyResponse, Route},
@@ -1082,10 +1082,10 @@ mod tests {
     extern crate tiny_http;
     use super::*;
     use crate::sozu_command::channel::Channel;
-    use crate::sozu_command::command::Order;
+    use crate::sozu_command::order::Order;
     use crate::sozu_command::worker::{
-        Backend, HttpFrontend, HttpListenerConfig, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, InnerOrder, Route, RulePosition,
+        Backend, HttpFrontend, HttpListenerConfig, InnerOrder, LoadBalancingAlgorithms,
+        LoadBalancingParams, PathRule, Route, RulePosition,
     };
     use std::io::{Read, Write};
     use std::net::SocketAddr;

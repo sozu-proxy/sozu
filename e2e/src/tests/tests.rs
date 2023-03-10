@@ -7,10 +7,10 @@ use std::{
 use serial_test::serial;
 
 use sozu_command_lib::{
-    command::Order,
     config::FileConfig,
     info,
     logging::{Logger, LoggerBackend},
+    order::Order,
     state::ConfigState,
     worker::{
         ActivateListener, AddCertificate, CertificateAndKey, HttpFrontend, ListenerType,
@@ -285,20 +285,19 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("810-PANIC", config, &listeners, state);
 
-    worker.send_proxy_order(Order::AddTcpListener(
-        Worker::default_tcp_listener(front_address),
-    ));
+    worker.send_proxy_order(Order::AddTcpListener(Worker::default_tcp_listener(
+        front_address,
+    )));
     worker.send_proxy_order(Order::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::TCP,
         from_scm: false,
     }));
-    worker.send_proxy_order(Order::AddCluster(Worker::default_cluster(
+    worker.send_proxy_order(Order::AddCluster(Worker::default_cluster("cluster_0")));
+    worker.send_proxy_order(Order::AddTcpFrontend(Worker::default_tcp_frontend(
         "cluster_0",
+        front_address,
     )));
-    worker.send_proxy_order(Order::AddTcpFrontend(
-        Worker::default_tcp_frontend("cluster_0", front_address),
-    ));
 
     worker.send_proxy_order(Order::AddBackend(Worker::default_backend(
         "cluster_0",
@@ -352,18 +351,16 @@ pub fn try_tls_endpoint() -> State {
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
 
-    worker.send_proxy_order(Order::AddHttpsListener(
-        Worker::default_https_listener(front_address),
-    ));
+    worker.send_proxy_order(Order::AddHttpsListener(Worker::default_https_listener(
+        front_address,
+    )));
     worker.send_proxy_order(Order::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::HTTPS,
         from_scm: false,
     }));
 
-    worker.send_proxy_order(Order::AddCluster(Worker::default_cluster(
-        "cluster_0",
-    )));
+    worker.send_proxy_order(Order::AddCluster(Worker::default_cluster("cluster_0")));
 
     let hostname = "localhost".to_string();
     worker.send_proxy_order(Order::AddHttpsFrontend(HttpFrontend {
@@ -633,9 +630,9 @@ fn try_http_behaviors() -> State {
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("BEHAVE-WORKER", config, &listeners, state);
 
-    worker.send_proxy_order(Order::AddHttpListener(
-        Worker::default_http_listener(front_address),
-    ));
+    worker.send_proxy_order(Order::AddHttpListener(Worker::default_http_listener(
+        front_address,
+    )));
     worker.send_proxy_order(Order::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::HTTP,

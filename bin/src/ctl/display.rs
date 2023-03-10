@@ -7,7 +7,7 @@ use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::{
-    command::{CommandResponseContent, ListedFrontends, ListenersList, WorkerInfo},
+    order::{CommandResponseContent, ListedFrontends, ListenersList, WorkerInfo},
     worker::{
         AggregatedMetricsData, ClusterMetricsData, FilteredData, QueryAnswer,
         QueryAnswerCertificate, QueryAnswerMetrics, Route, WorkerMetrics,

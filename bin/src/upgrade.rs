@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::tempfile;
 
 use sozu_command_lib::{
-    channel::Channel, command::RunState, config::Config, state::ConfigState, worker::InnerOrder,
+    channel::Channel, config::Config, order::RunState, state::ConfigState, worker::InnerOrder,
 };
 
 use crate::{

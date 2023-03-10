@@ -12,8 +12,8 @@ use sozu_command::config::DEFAULT_RUSTLS_CIPHER_LIST;
 
 use crate::sozu_command::{
     channel::Channel,
-    command::Order,
     logging::{Logger, LoggerBackend},
+    order::Order,
     worker,
     worker::{LoadBalancingParams, PathRule, Route, RulePosition},
 };

@@ -14,15 +14,15 @@ use sozu_lib as sozu;
 use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
-    command::Order,
     config::{Config, FileConfig},
     logging::{Logger, LoggerBackend},
+    order::Order,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
     worker::{
-        Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, InnerOrder, ProxyResponse, Route,
-        RulePosition, TcpFrontend, TcpListenerConfig,
+        Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, InnerOrder,
+        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, ProxyResponse, Route, RulePosition,
+        TcpFrontend, TcpListenerConfig,
     },
 };
 

@@ -14,12 +14,12 @@ use nom::{Err, HexDisplay, Offset};
 
 use sozu_command_lib::{
     buffer::fixed::Buffer,
-    command::{
+    config::Config,
+    logging,
+    order::{
         CommandResponse, CommandResponseContent, CommandStatus, FrontendFilters, ListedFrontends,
         ListenersList, Order, RunState, WorkerInfo,
     },
-    config::Config,
-    logging,
     parser::parse_several_commands,
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,

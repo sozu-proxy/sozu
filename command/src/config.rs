@@ -14,7 +14,7 @@ use toml;
 
 use crate::{
     certificate::split_certificate_chain,
-    command::Order,
+    order::Order,
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, Cluster, HttpFrontend,
         HttpListenerConfig, HttpsListenerConfig, InnerOrder, ListenerType, LoadBalancingAlgorithms,

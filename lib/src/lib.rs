@@ -218,7 +218,7 @@ use time::{Duration, Instant};
 
 use crate::sozu_command::{
     ready::Ready,
-    worker::{Cluster, LoadBalancingParams, ProxyEvent, InnerOrder, ProxyResponse, Route},
+    worker::{Cluster, InnerOrder, LoadBalancingParams, ProxyEvent, ProxyResponse, Route},
 };
 
 use self::{backends::BackendMap, retry::RetryPolicy};

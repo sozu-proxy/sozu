@@ -74,7 +74,7 @@ where
 mod test {
     use super::*;
 
-    use crate::{command::Order, worker::InnerOrder};
+    use crate::{order::Order, worker::InnerOrder};
 
     #[test]
     fn parse_one_inner_order_works() {

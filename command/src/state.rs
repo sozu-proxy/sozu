@@ -15,7 +15,7 @@ use serde::de::{self, Visitor};
 
 use crate::{
     certificate::calculate_fingerprint,
-    command::Order,
+    order::Order,
     worker::{
         ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
         Cluster, DeactivateListener, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
@@ -1174,7 +1174,7 @@ impl<
 mod tests {
     use super::*;
     use crate::{
-        command::Order,
+        order::Order,
         worker::{
             Backend, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams, PathRule, Route,
             RulePosition,

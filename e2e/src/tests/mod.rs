@@ -3,8 +3,8 @@ mod tests;
 use std::{io::stdin, net::SocketAddr};
 
 use sozu_command_lib::{
-    command::Order,
     config::Config,
+    order::Order,
     scm_socket::Listeners,
     state::ConfigState,
     worker::{ActivateListener, ListenerType},
@@ -43,20 +43,19 @@ pub fn setup_test<S: Into<String>>(
 ) -> (Worker, Vec<SocketAddr>) {
     let mut worker = Worker::start_new_worker(name, config, &listeners, state);
 
-    worker.send_proxy_order(Order::AddHttpListener(
-        Worker::default_http_listener(front_address),
-    ));
+    worker.send_proxy_order(Order::AddHttpListener(Worker::default_http_listener(
+        front_address,
+    )));
     worker.send_proxy_order(Order::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::HTTP,
         from_scm: false,
     }));
-    worker.send_proxy_order(Order::AddCluster(Worker::default_cluster(
+    worker.send_proxy_order(Order::AddCluster(Worker::default_cluster("cluster_0")));
+    worker.send_proxy_order(Order::AddHttpFrontend(Worker::default_http_frontend(
         "cluster_0",
+        front_address,
     )));
-    worker.send_proxy_order(Order::AddHttpFrontend(
-        Worker::default_http_frontend("cluster_0", front_address),
-    ));
 
     let mut backends = Vec::new();
     for i in 0..nb_backends {

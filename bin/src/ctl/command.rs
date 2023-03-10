@@ -4,9 +4,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
 
 use sozu_command_lib::{
-    command::{
-        CommandResponse, CommandResponseContent, CommandStatus, Order, RunState, WorkerInfo,
-    },
+    order::{CommandResponse, CommandResponseContent, CommandStatus, Order, RunState, WorkerInfo},
     worker::{QueryCertificateType, QueryClusterDomain, QueryClusterType, QueryMetricsOptions},
 };
 

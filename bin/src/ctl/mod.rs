@@ -8,8 +8,8 @@ use anyhow::Context;
 
 use sozu_command_lib::{
     channel::Channel,
-    command::{CommandResponse, Order},
     config::Config,
+    order::{CommandResponse, Order},
 };
 
 use crate::{

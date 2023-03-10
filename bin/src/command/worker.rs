@@ -6,8 +6,8 @@ use nix::{sys::signal::kill, unistd::Pid};
 
 use sozu_command_lib::{
     channel::Channel,
-    command::{Order, RunState, WorkerInfo},
     config::Config,
+    order::{Order, RunState, WorkerInfo},
     scm_socket::ScmSocket,
     worker::{InnerOrder, ProxyResponse},
 };

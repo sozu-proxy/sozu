@@ -26,8 +26,8 @@ use crate::{
     pool::Pool,
     sozu_command::{
         channel::Channel,
-        command::Order,
         config::Config,
+        order::Order,
         ready::Ready,
         scm_socket::{Listeners, ScmSocket},
         state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
