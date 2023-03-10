@@ -3,15 +3,18 @@ use std::net::SocketAddr;
 use anyhow::{bail, Context};
 
 use sozu_command_lib::{
-    certificate::{calculate_fingerprint, split_certificate_chain},
-    config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
-    order::{FrontendFilters, Order},
-    worker::{
-        ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
-        Cluster, DeactivateListener, HttpFrontend, ListenerType, LoadBalancingParams,
-        MetricsConfiguration, PathRule, RemoveBackend, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, RulePosition, TcpFrontend, TcpListenerConfig, TlsVersion,
+    certificate::{
+        calculate_fingerprint, split_certificate_chain, CertificateAndKey, CertificateFingerprint,
+        TlsVersion,
     },
+    config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
+    order::{
+        ActivateListener, AddCertificate, Cluster, DeactivateListener, ListenerType,
+        LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate,
+    },
+    order::{FrontendFilters, Order},
+    response::{Backend, HttpFrontend, PathRule, RulePosition, TcpFrontend, TcpListenerConfig},
 };
 
 use crate::{

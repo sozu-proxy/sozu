@@ -7,12 +7,11 @@ extern crate time;
 use std::{io::stdout, thread};
 
 use anyhow::Context;
-use sozu_command::order::Order;
-
-use crate::sozu_command::{
+use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    worker::{self, LoadBalancingParams, TcpListenerConfig},
+    order::{InnerOrder, LoadBalancingParams, Order},
+    response::{Backend, TcpFrontend, TcpListenerConfig},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -56,14 +55,14 @@ fn main() -> anyhow::Result<()> {
         sozu::tcp::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 
-    let tcp_front = worker::TcpFrontend {
+    let tcp_front = TcpFrontend {
         cluster_id: String::from("test"),
         address: "127.0.0.1:8080"
             .parse()
             .with_context(|| "could not parse address")?,
         tags: None,
     };
-    let tcp_backend = worker::Backend {
+    let tcp_backend = Backend {
         cluster_id: String::from("test"),
         backend_id: String::from("test-0"),
         address: "127.0.0.1:1026"
@@ -74,12 +73,12 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&worker::InnerOrder {
+    command.write_message(&InnerOrder {
         id: String::from("ID_ABCD"),
         content: Order::AddTcpFrontend(tcp_front),
     });
 
-    command.write_message(&worker::InnerOrder {
+    command.write_message(&InnerOrder {
         id: String::from("ID_EFGH"),
         content: Order::AddBackend(tcp_backend),
     });

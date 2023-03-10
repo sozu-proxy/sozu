@@ -13,34 +13,28 @@ use mio::{
     Events, Interest, Poll, Token,
 };
 use slab::Slab;
-use sozu_command::worker::{
-    ActivateListener, DeactivateListener, HttpListenerConfig, HttpsListenerConfig,
+use sozu_command::{
+    channel::Channel,
+    config::Config,
+    order::{
+        ActivateListener, Cluster, DeactivateListener, InnerOrder, ListenerType, Order,
+        QueryCertificateType, QueryClusterType, RemoveBackend,
+    },
+    ready::Ready,
+    response::{
+        Backend as CommandLibBackend, HttpListenerConfig, HttpsListenerConfig, MessageId,
+        ProxyEvent, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
+        QueryAnswerCertificate, TcpListenerConfig as CommandTcpListener,
+    },
+    scm_socket::{Listeners, ScmSocket},
+    state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
 };
 use time::{Duration, Instant};
 
 use crate::{
-    backends::BackendMap,
-    features::FEATURES,
-    http, https,
-    metrics::METRICS,
-    pool::Pool,
-    sozu_command::{
-        channel::Channel,
-        config::Config,
-        order::Order,
-        ready::Ready,
-        scm_socket::{Listeners, ScmSocket},
-        state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
-        worker::{
-            Backend as CommandLibBackend, Cluster, InnerOrder, ListenerType, MessageId, ProxyEvent,
-            ProxyResponse, ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
-            QueryAnswerCertificate, QueryCertificateType, QueryClusterType, RemoveBackend,
-            TcpListenerConfig as CommandTcpListener,
-        },
-    },
-    tcp,
-    timer::Timer,
-    AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed,
+    backends::BackendMap, features::FEATURES, http, https, metrics::METRICS, pool::Pool, tcp,
+    timer::Timer, AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession,
+    SessionIsToBeClosed,
 };
 
 // Number of retries to perform on a server after a connection failure

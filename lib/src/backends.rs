@@ -3,13 +3,13 @@ use std::{cell::RefCell, collections::HashMap, net::SocketAddr, rc::Rc};
 use anyhow::{bail, Context};
 use mio::net::TcpStream;
 
-use crate::{
-    server::push_event,
-    sozu_command::{
-        state::ClusterId,
-        worker::{self, LoadBalancingAlgorithms},
-    },
+use sozu_command::{
+    order::{LoadBalancingAlgorithms, LoadMetric},
+    response::ProxyEvent,
+    state::ClusterId,
 };
+
+use crate::server::push_event;
 
 use super::{load_balancing::*, Backend};
 
@@ -37,7 +37,7 @@ impl BackendMap {
 
     pub fn import_configuration_state(
         &mut self,
-        backends: &HashMap<ClusterId, Vec<worker::Backend>>,
+        backends: &HashMap<ClusterId, Vec<sozu_command::response::Backend>>,
     ) {
         self.backends
             .extend(backends.iter().map(|(cluster_id, backend_vec)| {
@@ -105,9 +105,7 @@ impl BackendMap {
                 if self.available {
                     self.available = false;
 
-                    push_event(worker::ProxyEvent::NoAvailableBackends(
-                        cluster_id.to_string(),
-                    ));
+                    push_event(ProxyEvent::NoAvailableBackends(cluster_id.to_string()));
                 }
                 bail!("No more backend available for cluster {}", cluster_id);
             }
@@ -174,8 +172,8 @@ impl BackendMap {
     pub fn set_load_balancing_policy_for_cluster(
         &mut self,
         cluster_id: &str,
-        lb_algo: worker::LoadBalancingAlgorithms,
-        metric: Option<worker::LoadMetric>,
+        lb_algo: LoadBalancingAlgorithms,
+        metric: Option<LoadMetric>,
     ) {
         // The cluster can be created before the backends were registered because of the async config messages.
         // So when we set the load balancing policy, we have to create the backend list if if it doesn't exist yet.
@@ -212,7 +210,9 @@ impl BackendList {
         }
     }
 
-    pub fn import_configuration_state(backend_vec: &[worker::Backend]) -> BackendList {
+    pub fn import_configuration_state(
+        backend_vec: &[sozu_command_lib::response::Backend],
+    ) -> BackendList {
         let mut list = BackendList::new();
         for backend in backend_vec {
             let backend = Backend::new(
@@ -303,7 +303,7 @@ impl BackendList {
     pub fn set_load_balancing_policy(
         &mut self,
         load_balancing_policy: LoadBalancingAlgorithms,
-        metric: Option<worker::LoadMetric>,
+        metric: Option<LoadMetric>,
     ) {
         match load_balancing_policy {
             LoadBalancingAlgorithms::RoundRobin => {
@@ -312,12 +312,12 @@ impl BackendList {
             LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(Random {}),
             LoadBalancingAlgorithms::LeastLoaded => {
                 self.load_balancing = Box::new(LeastLoaded {
-                    metric: metric.unwrap_or(worker::LoadMetric::Connections),
+                    metric: metric.unwrap_or(LoadMetric::Connections),
                 })
             }
             LoadBalancingAlgorithms::PowerOfTwo => {
                 self.load_balancing = Box::new(PowerOfTwo {
-                    metric: metric.unwrap_or(worker::LoadMetric::Connections),
+                    metric: metric.unwrap_or(LoadMetric::Connections),
                 })
             }
         }

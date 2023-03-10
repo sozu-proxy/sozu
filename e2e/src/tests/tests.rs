@@ -7,15 +7,13 @@ use std::{
 use serial_test::serial;
 
 use sozu_command_lib::{
+    certificate::CertificateAndKey,
     config::FileConfig,
     info,
     logging::{Logger, LoggerBackend},
-    order::Order,
+    order::{ActivateListener, AddCertificate, ListenerType, Order, RemoveBackend},
+    response::HttpFrontend,
     state::ConfigState,
-    worker::{
-        ActivateListener, AddCertificate, CertificateAndKey, HttpFrontend, ListenerType,
-        RemoveBackend,
-    },
 };
 
 use crate::{

@@ -17,13 +17,13 @@ use sozu_command::{
     config::{Config, FileConfig},
     logging::{Logger, LoggerBackend},
     order::Order,
+    order::{Cluster, InnerOrder, LoadBalancingAlgorithms, LoadBalancingParams},
+    response::{
+        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, ProxyResponse,
+        Route, RulePosition, TcpFrontend, TcpListenerConfig,
+    },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
-    worker::{
-        Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, InnerOrder,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, ProxyResponse, Route, RulePosition,
-        TcpFrontend, TcpListenerConfig,
-    },
 };
 
 use crate::sozu::command_id::CommandID;

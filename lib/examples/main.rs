@@ -8,14 +8,17 @@ extern crate time;
 use std::{env, io::stdout, thread};
 
 use anyhow::Context;
-use sozu_command::config::DEFAULT_RUSTLS_CIPHER_LIST;
 
-use crate::sozu_command::{
+use sozu_command::{
+    certificate::CertificateAndKey,
     channel::Channel,
+    config::DEFAULT_RUSTLS_CIPHER_LIST,
     logging::{Logger, LoggerBackend},
-    order::Order,
-    worker,
-    worker::{LoadBalancingParams, PathRule, Route, RulePosition},
+    order::{AddCertificate, InnerOrder, LoadBalancingParams, Order},
+    response::{
+        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, Route,
+        RulePosition,
+    },
 };
 
 fn main() -> anyhow::Result<()> {
@@ -47,7 +50,7 @@ fn main() -> anyhow::Result<()> {
     );
     gauge!("sozu.TEST", 42);
 
-    let config = worker::HttpListenerConfig {
+    let config = HttpListenerConfig {
         address: "127.0.0.1:8080"
             .parse()
             .with_context(|| "could not parse address")?,
@@ -62,7 +65,7 @@ fn main() -> anyhow::Result<()> {
         sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
     });
 
-    let http_front = worker::HttpFrontend {
+    let http_front = HttpFrontend {
         route: Route::ClusterId(String::from("cluster_1")),
         address: "127.0.0.1:8080"
             .parse()
@@ -74,7 +77,7 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    let http_backend = worker::Backend {
+    let http_backend = Backend {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
@@ -85,12 +88,12 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&worker::InnerOrder {
+    command.write_message(&InnerOrder {
         id: String::from("ID_ABCD"),
         content: Order::AddHttpFrontend(http_front),
     });
 
-    command.write_message(&worker::InnerOrder {
+    command.write_message(&InnerOrder {
         id: String::from("ID_EFGH"),
         content: Order::AddBackend(http_backend),
     });
@@ -98,7 +101,7 @@ fn main() -> anyhow::Result<()> {
     info!("MAIN\tHTTP -> {:?}", command.read_message());
     info!("MAIN\tHTTP -> {:?}", command.read_message());
 
-    let config = worker::HttpsListenerConfig {
+    let config = HttpsListenerConfig {
         address: "127.0.0.1:8443"
             .parse()
             .with_context(|| "could not parse address")?,
@@ -120,15 +123,15 @@ fn main() -> anyhow::Result<()> {
     let cert1 = include_str!("../assets/certificate.pem");
     let key1 = include_str!("../assets/key.pem");
 
-    let certificate_and_key = worker::CertificateAndKey {
+    let certificate_and_key = CertificateAndKey {
         certificate: String::from(cert1),
         key: String::from(key1),
         certificate_chain: vec![],
         versions: vec![],
     };
-    command2.write_message(&worker::InnerOrder {
+    command2.write_message(&InnerOrder {
         id: String::from("ID_IJKL1"),
-        content: Order::AddCertificate(worker::AddCertificate {
+        content: Order::AddCertificate(AddCertificate {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
@@ -138,7 +141,7 @@ fn main() -> anyhow::Result<()> {
         }),
     });
 
-    let tls_front = worker::HttpFrontend {
+    let tls_front = HttpFrontend {
         route: Route::ClusterId(String::from("cluster_1")),
         address: "127.0.0.1:8443"
             .parse()
@@ -150,11 +153,11 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    command2.write_message(&worker::InnerOrder {
+    command2.write_message(&InnerOrder {
         id: String::from("ID_IJKL2"),
         content: Order::AddHttpsFrontend(tls_front),
     });
-    let tls_backend = worker::Backend {
+    let tls_backend = Backend {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
@@ -165,7 +168,7 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command2.write_message(&worker::InnerOrder {
+    command2.write_message(&InnerOrder {
         id: String::from("ID_MNOP"),
         content: Order::AddBackend(tls_backend),
     });
@@ -173,16 +176,16 @@ fn main() -> anyhow::Result<()> {
     let cert2 = include_str!("../assets/cert_test.pem");
     let key2 = include_str!("../assets/key_test.pem");
 
-    let certificate_and_key2 = worker::CertificateAndKey {
+    let certificate_and_key2 = CertificateAndKey {
         certificate: String::from(cert2),
         key: String::from(key2),
         certificate_chain: vec![],
         versions: vec![],
     };
 
-    command2.write_message(&worker::InnerOrder {
+    command2.write_message(&InnerOrder {
         id: String::from("ID_QRST1"),
-        content: Order::AddCertificate(worker::AddCertificate {
+        content: Order::AddCertificate(AddCertificate {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
@@ -192,7 +195,7 @@ fn main() -> anyhow::Result<()> {
         }),
     });
 
-    let tls_front2 = worker::HttpFrontend {
+    let tls_front2 = HttpFrontend {
         route: Route::ClusterId(String::from("cluster_2")),
         address: "127.0.0.1:8443"
             .parse()
@@ -204,12 +207,12 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    command2.write_message(&worker::InnerOrder {
+    command2.write_message(&InnerOrder {
         id: String::from("ID_QRST2"),
         content: Order::AddHttpsFrontend(tls_front2),
     });
 
-    let tls_backend2 = worker::Backend {
+    let tls_backend2 = Backend {
         cluster_id: String::from("cluster_2"),
         backend_id: String::from("cluster_2-0"),
         sticky_id: None,
@@ -220,7 +223,7 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command2.write_message(&worker::InnerOrder {
+    command2.write_message(&InnerOrder {
         id: String::from("ID_UVWX"),
         content: Order::AddBackend(tls_backend2),
     });

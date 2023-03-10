@@ -14,13 +14,14 @@ use anyhow::{bail, Context};
 use serde::de::{self, Visitor};
 
 use crate::{
-    certificate::calculate_fingerprint,
-    order::Order,
-    worker::{
-        ActivateListener, AddCertificate, Backend, CertificateAndKey, CertificateFingerprint,
-        Cluster, DeactivateListener, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        ListenerType, PathRule, QueryAnswerCluster, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, Route, TcpFrontend, TcpListenerConfig,
+    certificate::{calculate_fingerprint, CertificateAndKey, CertificateFingerprint},
+    order::{
+        ActivateListener, AddCertificate, Cluster, DeactivateListener, ListenerType, Order,
+        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate,
+    },
+    response::{
+        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule,
+        QueryAnswerCluster, Route, TcpFrontend, TcpListenerConfig,
     },
 };
 
@@ -1174,11 +1175,8 @@ impl<
 mod tests {
     use super::*;
     use crate::{
-        order::Order,
-        worker::{
-            Backend, HttpFrontend, LoadBalancingAlgorithms, LoadBalancingParams, PathRule, Route,
-            RulePosition,
-        },
+        order::{LoadBalancingAlgorithms, LoadBalancingParams, Order},
+        response::RulePosition,
     };
 
     #[test]

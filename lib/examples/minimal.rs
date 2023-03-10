@@ -7,13 +7,11 @@ extern crate time;
 use std::{collections::BTreeMap, env, io::stdout, thread};
 
 use anyhow::Context;
-use sozu_command::order::Order;
-
-use crate::sozu_command::{
+use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    worker,
-    worker::{LoadBalancingParams, PathRule, Route, RulePosition},
+    order::{InnerOrder, LoadBalancingParams, Order},
+    response::{Backend, HttpFrontend, HttpListenerConfig, PathRule, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -35,7 +33,7 @@ fn main() -> anyhow::Result<()> {
 
     info!("starting up");
 
-    let config = worker::HttpListenerConfig {
+    let config = HttpListenerConfig {
         address: "127.0.0.1:8080"
             .parse()
             .with_context(|| "could not parse address")?,
@@ -51,7 +49,7 @@ fn main() -> anyhow::Result<()> {
         sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
     });
 
-    let http_front = worker::HttpFrontend {
+    let http_front = HttpFrontend {
         route: Route::ClusterId(String::from("test")),
         address: "127.0.0.1:8080"
             .parse()
@@ -65,7 +63,7 @@ fn main() -> anyhow::Result<()> {
             ("id".to_owned(), "my-own-http-front".to_owned()),
         ])),
     };
-    let http_backend = worker::Backend {
+    let http_backend = Backend {
         cluster_id: String::from("test"),
         backend_id: String::from("test-0"),
         address: "127.0.0.1:8000"
@@ -76,12 +74,12 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&worker::InnerOrder {
+    command.write_message(&InnerOrder {
         id: String::from("ID_ABCD"),
         content: Order::AddHttpFrontend(http_front),
     });
 
-    command.write_message(&worker::InnerOrder {
+    command.write_message(&InnerOrder {
         id: String::from("ID_EFGH"),
         content: Order::AddBackend(http_backend),
     });

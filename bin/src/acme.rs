@@ -1,19 +1,23 @@
+use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};
+
 use acme_lib::{create_p384_key, persist::FilePersist, Directory, DirectoryUrl};
 use anyhow::{bail, Context};
 use mio::net::UnixStream;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use tiny_http::{Response, Server};
+
 use sozu_command_lib::{
-    certificate::{calculate_fingerprint, split_certificate_chain},
+    certificate::{
+        calculate_fingerprint, split_certificate_chain, CertificateAndKey, CertificateFingerprint,
+        TlsVersion,
+    },
     channel::Channel,
     config::Config,
-    order::{CommandResponse, CommandStatus, Order},
-    worker::{
-        AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
-        RemoveBackend, ReplaceCertificate, Route, RulePosition, TlsVersion,
+    order::{AddCertificate, Order, RemoveBackend, ReplaceCertificate},
+    response::{
+        Backend, CommandResponse, CommandStatus, HttpFrontend, PathRule, Route, RulePosition,
     },
 };
-use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};
-use tiny_http::{Response, Server};
 
 use crate::util;
 

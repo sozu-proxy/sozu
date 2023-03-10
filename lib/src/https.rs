@@ -26,10 +26,7 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::{
-    config::DEFAULT_CIPHER_SUITES,
-    worker::{RemoveListener, ReplaceCertificate},
-};
+use sozu_command::config::DEFAULT_CIPHER_SUITES;
 use time::{Duration, Instant};
 
 use crate::{
@@ -50,16 +47,19 @@ use crate::{
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     sozu_command::{
+        certificate::{CertificateFingerprint, TlsVersion},
         logging,
-        order::Order,
+        order::{
+            AddCertificate, Cluster, InnerOrder, Order, QueryCertificateType, RemoveCertificate,
+            RemoveListener, ReplaceCertificate,
+        },
         ready::Ready,
+        response::{
+            HttpFrontend, HttpsListenerConfig, ProxyResponse, ProxyResponseContent,
+            ProxyResponseStatus, QueryAnswer, QueryAnswerCertificate, Route,
+        },
         scm_socket::ScmSocket,
         state::ClusterId,
-        worker::{
-            AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
-            InnerOrder, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
-            QueryAnswerCertificate, QueryCertificateType, RemoveCertificate, Route, TlsVersion,
-        },
     },
     timer::TimeoutContainer,
     tls::{
@@ -662,7 +662,7 @@ impl CertificateResolver for HttpsListener {
 
     fn add_certificate(
         &mut self,
-        opts: &sozu_command_lib::worker::AddCertificate,
+        opts: &AddCertificate,
     ) -> Result<CertificateFingerprint, Self::Error> {
         let mut resolver = self
             .resolver
@@ -675,10 +675,7 @@ impl CertificateResolver for HttpsListener {
             .map_err(ListenerError::ResolverError)
     }
 
-    fn remove_certificate(
-        &mut self,
-        opts: &sozu_command_lib::worker::RemoveCertificate,
-    ) -> Result<(), Self::Error> {
+    fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error> {
         let mut resolver = self
             .resolver
             .0
@@ -1561,7 +1558,7 @@ mod tests {
     use std::{str::FromStr, sync::Arc};
 
     use crate::router::{trie::TrieNode, MethodRule, PathRule, Router};
-    use crate::sozu_command::worker::Route;
+    use crate::sozu_command::response::Route;
 
     use super::*;
 

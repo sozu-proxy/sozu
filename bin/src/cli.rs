@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, net::SocketAddr};
 
 use clap::{Parser, Subcommand};
-use sozu_command_lib::worker::{LoadBalancingAlgorithms, TlsVersion};
+
+use sozu_command_lib::{certificate::TlsVersion, order::LoadBalancingAlgorithms};
 
 #[derive(Parser, PartialEq, Eq, Clone, Debug)]
 #[clap(author, version, about)]
@@ -433,11 +434,11 @@ pub enum Route {
 }
 
 #[allow(clippy::from_over_into)]
-impl std::convert::Into<sozu_command_lib::worker::Route> for Route {
-    fn into(self) -> sozu_command_lib::worker::Route {
+impl std::convert::Into<sozu_command_lib::response::Route> for Route {
+    fn into(self) -> sozu_command_lib::response::Route {
         match self {
-            Route::Deny => sozu_command_lib::worker::Route::Deny,
-            Route::Id { id } => sozu_command_lib::worker::Route::ClusterId(id),
+            Route::Deny => sozu_command_lib::response::Route::Deny,
+            Route::Id { id } => sozu_command_lib::response::Route::ClusterId(id),
         }
     }
 }

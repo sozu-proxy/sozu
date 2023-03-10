@@ -16,17 +16,15 @@ use sozu_command_lib::{
     buffer::fixed::Buffer,
     config::Config,
     logging,
-    order::{
-        CommandResponse, CommandResponseContent, CommandStatus, FrontendFilters, ListedFrontends,
-        ListenersList, Order, RunState, WorkerInfo,
-    },
+    order::{FrontendFilters, InnerOrder, MetricsConfiguration, Order, QueryClusterType},
     parser::parse_several_commands,
+    response::{
+        AggregatedMetricsData, CommandResponse, CommandResponseContent, CommandStatus,
+        ListedFrontends, ListenersList, ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
+        RunState, WorkerInfo,
+    },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
-    worker::{
-        AggregatedMetricsData, InnerOrder, MetricsConfiguration, ProxyResponseContent,
-        ProxyResponseStatus, QueryAnswer, QueryClusterType,
-    },
 };
 
 use sozu::metrics::METRICS;

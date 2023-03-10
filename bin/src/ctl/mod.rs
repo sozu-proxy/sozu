@@ -6,11 +6,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use sozu_command_lib::{
-    channel::Channel,
-    config::Config,
-    order::{CommandResponse, Order},
-};
+use sozu_command_lib::{channel::Channel, config::Config, order::Order, response::CommandResponse};
 
 use crate::{
     cli::{self, *},

@@ -1,18 +1,13 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt,
-    net::SocketAddr,
-};
+use std::{error, fmt, net::SocketAddr, str::FromStr};
 
 use crate::{
-    state::ConfigState,
-    worker::{
-        ActivateListener, AddCertificate, AggregatedMetricsData, Backend, Cluster,
-        DeactivateListener, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        MetricsConfiguration, ProxyEvent, QueryAnswer, QueryCertificateType, QueryClusterType,
-        QueryMetricsOptions, RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate,
-        TcpFrontend, TcpListenerConfig,
+    certificate::{CertificateAndKey, CertificateFingerprint},
+    config::ProxyProtocolConfig,
+    response::{
+        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpFrontend,
+        TcpListenerConfig,
     },
+    state::ClusterId,
 };
 
 pub const PROTOCOL_VERSION: u8 = 0;
@@ -96,6 +91,168 @@ pub enum Order {
     ReturnListenSockets,
 }
 
+impl Order {
+    /// determine to which of the three proxies (HTTP, HTTPS, TCP) a request is destined
+    pub fn get_destinations(&self) -> ProxyDestinations {
+        let mut proxy_destination = ProxyDestinations {
+            to_http_proxy: false,
+            to_https_proxy: false,
+            to_tcp_proxy: false,
+        };
+
+        match *self {
+            Order::AddHttpFrontend(_) | Order::RemoveHttpFrontend(_) => {
+                proxy_destination.to_http_proxy = true
+            }
+
+            Order::AddHttpsFrontend(_)
+            | Order::RemoveHttpsFrontend(_)
+            | Order::AddCertificate(_)
+            | Order::ReplaceCertificate(_)
+            | Order::RemoveCertificate(_)
+            | Order::QueryCertificates(_) => proxy_destination.to_https_proxy = true,
+
+            Order::AddTcpFrontend(_) | Order::RemoveTcpFrontend(_) => {
+                proxy_destination.to_tcp_proxy = true
+            }
+
+            Order::AddCluster(_)
+            | Order::AddBackend(_)
+            | Order::RemoveCluster { cluster_id: _ }
+            | Order::RemoveBackend(_)
+            | Order::SoftStop
+            | Order::HardStop
+            | Order::Status
+            | Order::QueryClusters(_)
+            | Order::QueryClustersHashes
+            | Order::QueryMetrics(_)
+            | Order::Logging(_) => {
+                proxy_destination.to_http_proxy = true;
+                proxy_destination.to_https_proxy = true;
+                proxy_destination.to_tcp_proxy = true;
+            }
+
+            // the Add***Listener and other Listener orders will be handled separately
+            // by the notify_proxys function, so we don't give them destinations
+            Order::AddHttpsListener(_)
+            | Order::AddHttpListener(_)
+            | Order::AddTcpListener(_)
+            | Order::RemoveListener(_)
+            | Order::ActivateListener(_)
+            | Order::DeactivateListener(_)
+            | Order::ConfigureMetrics(_)
+            | Order::ReturnListenSockets => {}
+
+            // These won't ever reach a worker anyway
+            Order::SaveState { path: _ }
+            | Order::LoadState { path: _ }
+            | Order::DumpState
+            | Order::ListWorkers
+            | Order::ListFrontends(_)
+            | Order::ListListeners
+            | Order::LaunchWorker(_)
+            | Order::UpgradeMain
+            | Order::UpgradeWorker(_)
+            | Order::SubscribeEvents
+            | Order::ReloadConfiguration { path: _ } => {}
+        }
+        proxy_destination
+    }
+}
+
+/// This is sent only from Sōzu to Sōzu
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Deserialize)]
+pub struct InnerOrder {
+    pub id: MessageId,
+    pub content: Order,
+}
+
+impl InnerOrder {
+    pub fn new(id: String, content: Order) -> Self {
+        Self { id, content }
+    }
+}
+
+impl fmt::Display for InnerOrder {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}-{:?}", self.id, self.content)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProxyDestinations {
+    pub to_http_proxy: bool,
+    pub to_https_proxy: bool,
+    pub to_tcp_proxy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Cluster {
+    pub cluster_id: ClusterId,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_false")]
+    pub sticky_session: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_false")]
+    pub https_redirect: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_default")]
+    pub proxy_protocol: Option<ProxyProtocolConfig>,
+    #[serde(rename = "load_balancing")]
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_default")]
+    pub load_balancing: LoadBalancingAlgorithms,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_default")]
+    pub answer_503: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_metric: Option<LoadMetric>,
+}
+
+/// how sozu measures which backend is less loaded
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadMetric {
+    /// number of TCP connections
+    Connections,
+    /// number of active HTTP requests
+    Requests,
+    /// time to connect to the backend, weighted by the number of active connections (peak EWMA)
+    ConnectionTime,
+}
+
+pub fn default_sticky_name() -> String {
+    String::from("SOZUBALANCEID")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenerType {
+    HTTP,
+    HTTPS,
+    TCP,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RemoveListener {
+    pub address: SocketAddr,
+    pub proxy: ListenerType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ActivateListener {
+    pub address: SocketAddr,
+    pub proxy: ListenerType,
+    pub from_scm: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DeactivateListener {
+    pub address: SocketAddr,
+    pub proxy: ListenerType,
+    pub to_scm: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FrontendFilters {
     pub http: bool,
@@ -105,142 +262,146 @@ pub struct FrontendFilters {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CommandStatus {
-    Ok,
-    Processing,
-    Error,
-}
-
-/// details of a response sent by the main process to the client
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CommandResponseContent {
-    /// a list of workers, with ids, pids, statuses
-    Workers(Vec<WorkerInfo>),
-    /// aggregated metrics of main process and workers
-    Metrics(AggregatedMetricsData),
-    /// worker responses to a same query: worker_id -> query_answer
-    Query(BTreeMap<String, QueryAnswer>),
-    /// the state of Sōzu: frontends, backends, listeners, etc.
-    State(Box<ConfigState>),
-    /// a proxy event
-    Event(Event),
-    /// a filtered list of frontend
-    FrontendList(ListedFrontends),
-    // this is new
-    Status(Vec<WorkerInfo>),
-    /// all listeners
-    ListenersList(ListenersList),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ListedFrontends {
-    pub http_frontends: Vec<HttpFrontend>,
-    pub https_frontends: Vec<HttpFrontend>,
-    pub tcp_frontends: Vec<TcpFrontend>,
-}
-
-/// All listeners, listed for the CLI.
-/// the bool indicates if it is active or not
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ListenersList {
-    pub http_listeners: HashMap<SocketAddr, (HttpListenerConfig, bool)>,
-    pub https_listeners: HashMap<SocketAddr, (HttpsListenerConfig, bool)>,
-    pub tcp_listeners: HashMap<SocketAddr, (TcpListenerConfig, bool)>,
-}
-
-/// Responses of the main process to the CLI (or other client)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandResponse {
-    pub id: String,
-    pub version: u8,
-    pub status: CommandStatus,
-    pub message: String,
-    pub content: Option<CommandResponseContent>,
-}
-
-impl CommandResponse {
-    pub fn new(
-        // id: String,
-        status: CommandStatus,
-        message: String,
-        content: Option<CommandResponseContent>,
-    ) -> CommandResponse {
-        CommandResponse {
-            version: PROTOCOL_VERSION,
-            id: "generic-response-id-to-be-removed".to_string(),
-            status,
-            message,
-            content,
-        }
-    }
-}
-
-/// Runstate of a worker
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RunState {
-    Running,
-    Stopping,
-    Stopped,
-    NotAnswering,
-}
-
-impl fmt::Display for RunState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
-    }
+pub struct AddCertificate {
+    pub address: SocketAddr,
+    pub certificate: CertificateAndKey,
+    #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
+    pub names: Vec<String>,
+    /// The `expired_at` override certificate expiration, the value of the field
+    /// is a unix timestamp
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expired_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WorkerInfo {
-    pub id: u32,
-    pub pid: i32,
-    pub run_state: RunState,
+pub struct RemoveCertificate {
+    pub address: SocketAddr,
+    pub fingerprint: CertificateFingerprint,
 }
 
-/// a backend event that happened on a proxy
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReplaceCertificate {
+    pub address: SocketAddr,
+    pub new_certificate: CertificateAndKey,
+    pub old_fingerprint: CertificateFingerprint,
+    #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
+    pub new_names: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_expired_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RemoveBackend {
+    pub cluster_id: String,
+    pub backend_id: String,
+    pub address: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MetricsConfiguration {
+    Enabled(bool),
+    Clear,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Event {
-    BackendDown(String, SocketAddr),
-    BackendUp(String, SocketAddr),
-    NoAvailableBackends(String),
-    /// indicates a backend that was removed from configuration has no lingering connections
-    /// so it can be safely stopped
-    RemovedBackendHasNoConnections(String, SocketAddr),
+pub enum QueryClusterType {
+    ClusterId(String),
+    Domain(QueryClusterDomain),
 }
 
-impl From<ProxyEvent> for Event {
-    fn from(e: ProxyEvent) -> Self {
-        match e {
-            ProxyEvent::BackendDown(id, addr) => Event::BackendDown(id, addr),
-            ProxyEvent::BackendUp(id, addr) => Event::BackendUp(id, addr),
-            ProxyEvent::NoAvailableBackends(cluster_id) => Event::NoAvailableBackends(cluster_id),
-            ProxyEvent::RemovedBackendHasNoConnections(id, addr) => {
-                Event::RemovedBackendHasNoConnections(id, addr)
-            }
-        }
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct QueryClusterDomain {
+    pub hostname: String,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QueryCertificateType {
+    All,
+    Domain(String),
+    Fingerprint(Vec<u8>),
+}
+
+/// Options originating from the command line
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct QueryMetricsOptions {
+    pub list: bool,
+    pub cluster_ids: Vec<String>,
+    pub backend_ids: Vec<String>,
+    pub metric_names: Vec<String>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalancingAlgorithms {
+    RoundRobin,
+    Random,
+    LeastLoaded,
+    PowerOfTwo,
+}
+
+impl Default for LoadBalancingAlgorithms {
+    fn default() -> Self {
+        LoadBalancingAlgorithms::RoundRobin
     }
 }
 
-#[derive(Serialize)]
-struct StatePath {
-    path: String,
+#[derive(Debug)]
+pub struct ParseErrorLoadBalancing;
+
+impl fmt::Display for ParseErrorLoadBalancing {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Cannot find the load balancing policy asked")
+    }
+}
+
+impl error::Error for ParseErrorLoadBalancing {
+    fn description(&self) -> &str {
+        "Cannot find the load balancing policy asked"
+    }
+
+    fn cause(&self) -> Option<&dyn error::Error> {
+        None
+    }
+}
+
+impl FromStr for LoadBalancingAlgorithms {
+    type Err = ParseErrorLoadBalancing;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "round_robin" => Ok(LoadBalancingAlgorithms::RoundRobin),
+            "random" => Ok(LoadBalancingAlgorithms::Random),
+            "power_of_two" => Ok(LoadBalancingAlgorithms::PowerOfTwo),
+            "least_loaded" => Ok(LoadBalancingAlgorithms::LeastLoaded),
+            _ => Err(ParseErrorLoadBalancing {}),
+        }
+    }
+}
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LoadBalancingParams {
+    pub weight: u8,
+}
+
+pub fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+    t == &T::default()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
-    use crate::certificate::split_certificate_chain;
+    use crate::certificate::{split_certificate_chain, TlsVersion};
     use crate::config::ProxyProtocolConfig;
-    use crate::worker::{
-        AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, Cluster,
-        ClusterMetricsData, FilteredData, HttpFrontend, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Percentiles, QueryAnswerMetrics, RemoveBackend,
-        RemoveCertificate, Route, RulePosition, TlsVersion, WorkerMetrics,
-    };
+    use crate::response::{Backend, HttpFrontend, PathRule, Route, RulePosition};
     use hex::FromHex;
     use serde_json;
 
@@ -273,23 +434,6 @@ mod tests {
         assert_eq!(&pretty_print, data, "\nserialized message:\n{}\n\nexpected message:\n{}", pretty_print, data);
 
         let message: Order = serde_json::from_str(data).unwrap();
-        assert_eq!(message, $expected_message, "\ndeserialized message:\n{:#?}\n\nexpected message:\n{:#?}", message, $expected_message);
-
-      }
-
-    )
-  );
-
-    macro_rules! test_message_answer (
-    ($name: ident, $filename: expr, $expected_message: expr) => (
-
-      #[test]
-      fn $name() {
-        let data = include_str!($filename);
-        let pretty_print = serde_json::to_string_pretty(&$expected_message).expect("should have serialized");
-        assert_eq!(&pretty_print, data, "\nserialized message:\n{}\n\nexpected message:\n{}", pretty_print, data);
-
-        let message: CommandResponse = serde_json::from_str(data).unwrap();
         assert_eq!(message, $expected_message, "\ndeserialized message:\n{:#?}\n\nexpected message:\n{:#?}", message, $expected_message);
 
       }
@@ -486,127 +630,118 @@ mod tests {
         Order::UpgradeWorker(0)
     );
 
-    test_message_answer!(
-        answer_workers_status,
-        "../assets/answer_workers_status.json",
-        CommandResponse {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            status: CommandStatus::Ok,
-            message: String::from(""),
-            content: Some(CommandResponseContent::Workers(vec!(
-                WorkerInfo {
-                    id: 1,
-                    pid: 5678,
-                    run_state: RunState::Running,
-                },
-                WorkerInfo {
-                    id: 0,
-                    pid: 1234,
-                    run_state: RunState::Stopping,
-                },
-            ))),
-        }
-    );
+    #[test]
+    fn add_front_test() {
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": { "CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
+        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+        println!("{command:?}");
+        assert!(
+            command
+                == Order::AddHttpFrontend(HttpFrontend {
+                    route: Route::ClusterId(String::from("xxx")),
+                    hostname: String::from("yyy"),
+                    path: PathRule::Prefix(String::from("xxx")),
+                    method: None,
+                    address: "127.0.0.1:4242".parse().unwrap(),
+                    position: RulePosition::Tree,
+                    tags: None,
+                })
+        );
+    }
 
-    test_message_answer!(
-        answer_metrics,
-        "../assets/answer_metrics.json",
-        CommandResponse {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            status: CommandStatus::Ok,
-            message: String::from(""),
-            content: Some(CommandResponseContent::Metrics(AggregatedMetricsData {
-                main: [
-                    (String::from("sozu.gauge"), FilteredData::Gauge(1)),
-                    (String::from("sozu.count"), FilteredData::Count(-2)),
-                    (String::from("sozu.time"), FilteredData::Time(1234)),
-                ]
-                .iter()
-                .cloned()
-                .collect(),
-                workers: [(
-                    String::from("0"),
-                    QueryAnswer::Metrics(QueryAnswerMetrics::All(WorkerMetrics {
-                        proxy: Some(
-                            [
-                                (String::from("sozu.gauge"), FilteredData::Gauge(1)),
-                                (String::from("sozu.count"), FilteredData::Count(-2)),
-                                (String::from("sozu.time"), FilteredData::Time(1234)),
-                            ]
-                            .iter()
-                            .cloned()
-                            .collect()
-                        ),
-                        clusters: Some(
-                            [(
-                                String::from("cluster_1"),
-                                ClusterMetricsData {
-                                    cluster: Some(
-                                        [(
-                                            String::from("request_time"),
-                                            FilteredData::Percentiles(Percentiles {
-                                                samples: 42,
-                                                p_50: 1,
-                                                p_90: 2,
-                                                p_99: 10,
-                                                p_99_9: 12,
-                                                p_99_99: 20,
-                                                p_99_999: 22,
-                                                p_100: 30,
-                                            })
-                                        )]
-                                        .iter()
-                                        .cloned()
-                                        .collect()
-                                    ),
-                                    backends: Some(
-                                        [(
-                                            String::from("cluster_1-0"),
-                                            [
-                                                (
-                                                    String::from("bytes_in"),
-                                                    FilteredData::Count(256)
-                                                ),
-                                                (
-                                                    String::from("bytes_out"),
-                                                    FilteredData::Count(128)
-                                                ),
-                                                (
-                                                    String::from("percentiles"),
-                                                    FilteredData::Percentiles(Percentiles {
-                                                        samples: 42,
-                                                        p_50: 1,
-                                                        p_90: 2,
-                                                        p_99: 10,
-                                                        p_99_9: 12,
-                                                        p_99_99: 20,
-                                                        p_99_999: 22,
-                                                        p_100: 30,
-                                                    })
-                                                )
-                                            ]
-                                            .iter()
-                                            .cloned()
-                                            .collect()
-                                        )]
-                                        .iter()
-                                        .cloned()
-                                        .collect()
-                                    ),
-                                }
-                            )]
-                            .iter()
-                            .cloned()
-                            .collect()
-                        )
-                    }))
-                )]
-                .iter()
-                .cloned()
-                .collect()
-            }))
-        }
-    );
+    #[test]
+    fn remove_front_test() {
+        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+        println!("{command:?}");
+        assert!(
+            command
+                == Order::RemoveHttpFrontend(HttpFrontend {
+                    route: Route::ClusterId(String::from("xxx")),
+                    hostname: String::from("yyy"),
+                    path: PathRule::Prefix(String::from("xxx")),
+                    method: None,
+                    address: "127.0.0.1:4242".parse().unwrap(),
+                    position: RulePosition::Tree,
+                    tags: Some(BTreeMap::from([
+                        ("owner".to_owned(), "John".to_owned()),
+                        ("id".to_owned(), "some-long-id".to_owned())
+                    ])),
+                })
+        );
+    }
+
+    #[test]
+    fn add_backend_test() {
+        let raw_json = r#"{"type": "ADD_BACKEND", "content": {"cluster_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080", "load_balancing_parameters": { "weight": 0 }}}"#;
+        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+        println!("{command:?}");
+        assert!(
+            command
+                == Order::AddBackend(Backend {
+                    cluster_id: String::from("xxx"),
+                    backend_id: String::from("xxx-0"),
+                    address: "0.0.0.0:8080".parse().unwrap(),
+                    sticky_id: None,
+                    load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
+                    backup: None,
+                })
+        );
+    }
+
+    #[test]
+    fn remove_backend_test() {
+        let raw_json = r#"{"type": "REMOVE_BACKEND", "content": {"cluster_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080"}}"#;
+        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+        println!("{command:?}");
+        assert!(
+            command
+                == Order::RemoveBackend(RemoveBackend {
+                    cluster_id: String::from("xxx"),
+                    backend_id: String::from("xxx-0"),
+                    address: "0.0.0.0:8080".parse().unwrap(),
+                })
+        );
+    }
+
+    #[test]
+    fn http_front_crash_test() {
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+        println!("{command:?}");
+        assert!(
+            command
+                == Order::AddHttpFrontend(HttpFrontend {
+                    route: Route::ClusterId(String::from("aa")),
+                    hostname: String::from("cltdl.fr"),
+                    path: PathRule::Prefix(String::from("")),
+                    method: None,
+                    address: "127.0.0.1:4242".parse().unwrap(),
+                    position: RulePosition::Tree,
+                    tags: Some(BTreeMap::from([
+                        ("owner".to_owned(), "John".to_owned()),
+                        ("id".to_owned(), "some-long-id".to_owned())
+                    ])),
+                })
+        );
+    }
+
+    #[test]
+    fn http_front_crash_test2() {
+        let raw_json = r#"{"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242" }"#;
+        let front: HttpFrontend = serde_json::from_str(raw_json).expect("could not parse json");
+        println!("{front:?}");
+        assert!(
+            front
+                == HttpFrontend {
+                    route: Route::ClusterId(String::from("aa")),
+                    hostname: String::from("cltdl.fr"),
+                    path: PathRule::Prefix(String::from("")),
+                    method: None,
+                    address: "127.0.0.1:4242".parse().unwrap(),
+                    position: RulePosition::Tree,
+                    tags: None,
+                }
+        );
+    }
 }

@@ -7,9 +7,9 @@ use nix::{sys::signal::kill, unistd::Pid};
 use sozu_command_lib::{
     channel::Channel,
     config::Config,
-    order::{Order, RunState, WorkerInfo},
+    order::{InnerOrder, Order},
+    response::{ProxyResponse, RunState, WorkerInfo},
     scm_socket::ScmSocket,
-    worker::{InnerOrder, ProxyResponse},
 };
 
 /// An instance of Sōzu, as seen from the main process

@@ -36,11 +36,11 @@ use crate::{
     sozu_command::{
         config::ProxyProtocolConfig,
         logging,
-        order::Order,
+        order::{InnerOrder, Order},
         ready::Ready,
+        response::{ProxyEvent, ProxyResponse, TcpFrontend, TcpListenerConfig},
         scm_socket::ScmSocket,
         state::ClusterId,
-        worker::{InnerOrder, ProxyEvent, ProxyResponse, TcpFrontend, TcpListenerConfig},
     },
     timer::TimeoutContainer,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, Protocol,
@@ -1607,8 +1607,8 @@ pub fn start_tcp_worker(
 mod tests {
     use super::*;
     use crate::sozu_command::channel::Channel;
+    use crate::sozu_command::order::LoadBalancingParams;
     use crate::sozu_command::scm_socket::Listeners;
-    use crate::sozu_command::worker::{self, LoadBalancingParams, TcpFrontend};
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::os::unix::io::IntoRawFd;
@@ -1848,7 +1848,7 @@ mod tests {
                     .with_context(|| "Could not parse address")?,
                 tags: None,
             };
-            let backend = worker::Backend {
+            let backend = sozu_command_lib::response::Backend {
                 cluster_id: String::from("yolo"),
                 backend_id: String::from("yolo-0"),
                 address: "127.0.0.1:5678"
@@ -1880,7 +1880,7 @@ mod tests {
                     .with_context(|| "Could not parse address")?,
                 tags: None,
             };
-            let backend = worker::Backend {
+            let backend = sozu_command::response::Backend {
                 cluster_id: String::from("yolo"),
                 backend_id: String::from("yolo-0"),
                 address: "127.0.0.1:5678"

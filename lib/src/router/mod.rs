@@ -7,7 +7,7 @@ use std::str::from_utf8;
 
 use crate::{
     protocol::http::parser::Method,
-    sozu_command::worker::{HttpFrontend, Route, RulePosition},
+    sozu_command::response::{HttpFrontend, PathRule as CommandPathRule, Route, RulePosition},
 };
 
 use self::pattern_trie::TrieNode;
@@ -484,11 +484,11 @@ impl PathRule {
         }
     }
 
-    pub fn from_config(rule: sozu_command::worker::PathRule) -> Option<Self> {
+    pub fn from_config(rule: CommandPathRule) -> Option<Self> {
         match rule {
-            sozu_command::worker::PathRule::Prefix(s) => Some(PathRule::Prefix(s)),
-            sozu_command::worker::PathRule::Regex(s) => Regex::new(&s).ok().map(PathRule::Regex),
-            sozu_command::worker::PathRule::Equals(s) => Some(PathRule::Equals(s)),
+            CommandPathRule::Prefix(s) => Some(PathRule::Prefix(s)),
+            CommandPathRule::Regex(s) => Regex::new(&s).ok().map(PathRule::Regex),
+            CommandPathRule::Equals(s) => Some(PathRule::Equals(s)),
         }
     }
 }
@@ -556,7 +556,7 @@ impl MethodRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sozu_command::worker::Route;
+    use crate::sozu_command::response::Route;
 
     #[test]
     fn convert_regex() {

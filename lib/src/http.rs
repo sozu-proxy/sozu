@@ -12,21 +12,18 @@ use anyhow::{bail, Context};
 use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::worker::RemoveListener;
 use time::{Duration, Instant};
 
+use sozu_command::{
+    logging,
+    order::{Cluster, InnerOrder, Order, RemoveListener},
+    ready::Ready,
+    response::{HttpFrontend, HttpListenerConfig, ProxyResponse, Route},
+    scm_socket::{Listeners, ScmSocket},
+};
+
 use crate::{
-    protocol::SessionState,
-    router::Router,
-    sozu_command::{
-        logging,
-        order::Order,
-        ready::Ready,
-        scm_socket::{Listeners, ScmSocket},
-        worker::{Cluster, HttpFrontend, HttpListenerConfig, InnerOrder, ProxyResponse, Route},
-    },
-    timer::TimeoutContainer,
-    util::UnwrapLog,
+    protocol::SessionState, router::Router, timer::TimeoutContainer, util::UnwrapLog,
     L7ListenerHandler, L7Proxy, ListenerHandler, SessionIsToBeClosed, SessionResult,
     StateMachineBuilder,
 };
@@ -1081,12 +1078,12 @@ pub fn start_http_worker(
 mod tests {
     extern crate tiny_http;
     use super::*;
-    use crate::sozu_command::channel::Channel;
-    use crate::sozu_command::order::Order;
-    use crate::sozu_command::worker::{
-        Backend, HttpFrontend, HttpListenerConfig, InnerOrder, LoadBalancingAlgorithms,
-        LoadBalancingParams, PathRule, Route, RulePosition,
+    use crate::sozu_command::{
+        channel::Channel,
+        order::{InnerOrder, LoadBalancingAlgorithms, LoadBalancingParams, Order},
+        response::{Backend, HttpFrontend, HttpListenerConfig, PathRule, Route, RulePosition},
     };
+
     use std::io::{Read, Write};
     use std::net::SocketAddr;
     use std::net::TcpStream;

@@ -5,9 +5,9 @@ use std::{io::stdin, net::SocketAddr};
 use sozu_command_lib::{
     config::Config,
     order::Order,
+    order::{ActivateListener, ListenerType},
     scm_socket::Listeners,
     state::ConfigState,
-    worker::{ActivateListener, ListenerType},
 };
 
 use crate::{

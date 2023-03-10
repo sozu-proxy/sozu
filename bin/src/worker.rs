@@ -34,11 +34,11 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     logging::target_to_backend,
-    order::Order,
+    order::{InnerOrder, Order},
     ready::Ready,
+    response::ProxyResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
-    worker::{InnerOrder, ProxyResponse},
 };
 
 use crate::{command::Worker, logging, util};

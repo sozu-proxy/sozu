@@ -25,12 +25,13 @@ use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
     config::Config,
-    order::{CommandResponse, CommandResponseContent, CommandStatus, Event, Order, RunState},
+    order::{InnerOrder, MetricsConfiguration, Order},
+    response::{
+        CommandResponse, CommandResponseContent, CommandStatus, Event, ProxyResponse,
+        ProxyResponseContent, ProxyResponseStatus, RunState,
+    },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
-    worker::{
-        InnerOrder, MetricsConfiguration, ProxyResponse, ProxyResponseContent, ProxyResponseStatus,
-    },
 };
 
 use crate::{
