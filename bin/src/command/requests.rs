@@ -224,10 +224,11 @@ impl CommandServer {
                             let mut found = false;
                             let id = format!("LOAD-STATE-{}-{diff_counter}", request.id);
 
-                            for ref mut worker in self.workers.iter_mut().filter(|worker| {
-                                worker.run_state != RunState::Stopping
-                                    && worker.run_state != RunState::Stopped
-                            }) {
+                            for worker in self
+                                .workers
+                                .iter_mut()
+                                .filter(|worker| worker.is_not_stopped_or_stopping())
+                            {
                                 let worker_message_id = format!("{}-{}", id, worker.id);
                                 worker
                                     .send(worker_message_id.clone(), request.content.clone())
@@ -791,9 +792,11 @@ impl CommandServer {
                 let mut found = false;
                 let id = format!("LOAD-STATE-{}-{}", &request.id, diff_counter);
 
-                for ref mut worker in self.workers.iter_mut().filter(|worker| {
-                    worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
-                }) {
+                for worker in self
+                    .workers
+                    .iter_mut()
+                    .filter(|worker| worker.is_not_stopped_or_stopping())
+                {
                     let worker_message_id = format!("{}-{}", id, worker.id);
                     worker
                         .send(worker_message_id.clone(), request.content.clone())
@@ -889,7 +892,7 @@ impl CommandServer {
         .await;
 
         let mut count = 0usize;
-        for ref mut worker in self.workers.iter_mut() {
+        for worker in self.workers.iter_mut() {
             info!("Worker {} is {}", worker.id, worker.run_state);
 
             // create request ids even if we don't send any request, as keys in the tree map
@@ -960,7 +963,7 @@ impl CommandServer {
     ) -> anyhow::Result<Option<Success>> {
         let (metrics_tx, mut metrics_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
-        for ref mut worker in self
+        for worker in self
             .workers
             .iter_mut()
             .filter(|worker| worker.run_state != RunState::Stopped)
@@ -1032,7 +1035,7 @@ impl CommandServer {
         debug!("Received this query: {:?}", request);
         let (query_tx, mut query_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
-        for ref mut worker in self
+        for worker in self
             .workers
             .iter_mut()
             .filter(|worker| worker.run_state != RunState::Stopped)
@@ -1210,9 +1213,11 @@ impl CommandServer {
         let mut found = false;
         let mut stopping_workers = HashSet::new();
         let mut worker_count = 0usize;
-        for ref mut worker in self.workers.iter_mut().filter(|worker| {
-            worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
-        }) {
+        for worker in self
+            .workers
+            .iter_mut()
+            .filter(|worker| worker.is_not_stopped_or_stopping())
+        {
             let should_stop_worker = request == Request::SoftStop || request == Request::HardStop;
             if should_stop_worker {
                 worker.run_state = RunState::Stopping;

@@ -116,6 +116,10 @@ impl Worker {
         }
     }
 
+    pub fn is_not_stopped_or_stopping(&self) -> bool {
+        self.run_state != RunState::Stopping && self.run_state != RunState::Stopped
+    }
+
     /*
     pub fn push_message(&mut self, message: ProxyRequest) {
       self.queue.push_back(message);

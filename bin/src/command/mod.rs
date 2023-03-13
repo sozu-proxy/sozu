@@ -463,7 +463,7 @@ impl CommandServer {
     }
 
     pub fn disable_cloexec_before_upgrade(&mut self) -> anyhow::Result<()> {
-        for ref mut worker in self.workers.iter_mut() {
+        for worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
                 let _ = util::disable_close_on_exec(worker.worker_channel_fd).map_err(|e| {
                     error!(
@@ -482,7 +482,7 @@ impl CommandServer {
     }
 
     pub fn enable_cloexec_after_upgrade(&mut self) -> anyhow::Result<()> {
-        for ref mut worker in self.workers.iter_mut() {
+        for worker in self.workers.iter_mut() {
             if worker.run_state == RunState::Running {
                 let _ = util::enable_close_on_exec(worker.worker_channel_fd).map_err(|e| {
                     error!(
@@ -515,9 +515,11 @@ impl CommandServer {
             }
 
             let mut count = 0usize;
-            for ref mut worker in self.workers.iter_mut().filter(|worker| {
-                worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
-            }) {
+            for worker in self
+                .workers
+                .iter_mut()
+                .filter(|worker| worker.is_not_stopped_or_stopping())
+            {
                 worker.send(message.id.clone(), request.clone()).await;
                 count += 1;
             }
