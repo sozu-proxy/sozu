@@ -202,7 +202,7 @@ impl CommandServer {
                     offset = buffer.data().offset(i);
 
                     /*
-                    TODO: maybe we should put on Innerrequest the version field we had on CommandRequest: a u32 to track versionning
+                    TODO: maybe we should put on WorkerRequest the version field we had on CommandRequest: a u32 to track versionning
                     if requests.iter().any(|o| {
                         if o.version > PROTOCOL_VERSION {
                             error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, o.version);
@@ -1233,7 +1233,7 @@ impl CommandServer {
             worker_count += 1;
         }
 
-        let should_stop_main = request == Request::SoftStop || request == Request::HardStop;
+        let should_stop_main = request.is_a_stop();
 
         let mut command_tx = self.command_tx.clone();
         let thread_client_id = client_id.clone();

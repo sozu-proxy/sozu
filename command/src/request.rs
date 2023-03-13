@@ -158,6 +158,11 @@ impl Request {
         }
         proxy_destination
     }
+
+    /// True if the request is a SoftStop or a HardStop
+    pub fn is_a_stop(&self) -> bool {
+        self == &Self::SoftStop || self == &Self::HardStop
+    }
 }
 
 /// This is sent only from Sōzu to Sōzu
