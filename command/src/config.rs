@@ -600,7 +600,7 @@ pub struct HttpFrontendConfig {
 }
 
 impl HttpFrontendConfig {
-    pub fn generate_orders(&self, cluster_id: &str) -> Vec<Request> {
+    pub fn generate_requests(&self, cluster_id: &str) -> Vec<Request> {
         let mut v = Vec::new();
 
         if self.key.is_some() && self.certificate.is_some() {
@@ -656,7 +656,7 @@ pub struct HttpClusterConfig {
 }
 
 impl HttpClusterConfig {
-    pub fn generate_orders(&self) -> Vec<Request> {
+    pub fn generate_requests(&self) -> Vec<Request> {
         let mut v = vec![Request::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: self.sticky_session,
@@ -668,7 +668,7 @@ impl HttpClusterConfig {
         })];
 
         for frontend in &self.frontends {
-            let mut orders = frontend.generate_orders(&self.cluster_id);
+            let mut orders = frontend.generate_requests(&self.cluster_id);
             v.append(&mut orders);
         }
 
@@ -711,7 +711,7 @@ pub struct TcpClusterConfig {
 }
 
 impl TcpClusterConfig {
-    pub fn generate_orders(&self) -> Vec<Request> {
+    pub fn generate_requests(&self) -> Vec<Request> {
         let mut v = vec![Request::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: false,
@@ -758,10 +758,10 @@ pub enum ClusterConfig {
 }
 
 impl ClusterConfig {
-    pub fn generate_orders(&self) -> Vec<Request> {
+    pub fn generate_requests(&self) -> Vec<Request> {
         match *self {
-            ClusterConfig::Http(ref http) => http.generate_orders(),
-            ClusterConfig::Tcp(ref tcp) => tcp.generate_orders(),
+            ClusterConfig::Http(ref http) => http.generate_requests(),
+            ClusterConfig::Tcp(ref tcp) => tcp.generate_requests(),
         }
     }
 }
@@ -1222,7 +1222,7 @@ impl Config {
         }
 
         for cluster in self.clusters.values() {
-            let mut orders = cluster.generate_orders();
+            let mut orders = cluster.generate_requests();
             for content in orders.drain(..) {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),

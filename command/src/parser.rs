@@ -77,10 +77,10 @@ mod test {
     use crate::request::{Request, WorkerRequest};
 
     #[test]
-    fn parse_one_inner_order_works() {
-        let inner_order = WorkerRequest::new("Some request".to_string(), Request::DumpState);
+    fn parse_one_worker_request() {
+        let worker_request = WorkerRequest::new("Some request".to_string(), Request::DumpState);
 
-        let mut string = serde_json::ser::to_string(&inner_order).unwrap();
+        let mut string = serde_json::ser::to_string(&worker_request).unwrap();
 
         string.push('\0');
 
@@ -92,13 +92,13 @@ mod test {
 
         assert_eq!(
             parse_one_command(bytes).unwrap(),
-            (&empty_vec[..], inner_order)
+            (&empty_vec[..], worker_request)
         )
     }
 
     #[test]
-    fn parse_several_inner_orders_works() {
-        let orders = vec![
+    fn parse_several_worker_requests() {
+        let requests = vec![
             WorkerRequest::new(
                 "Some request".to_string(),
                 Request::SaveState {
@@ -109,21 +109,21 @@ mod test {
             WorkerRequest::new("Yet another request".to_string(), Request::DumpState),
         ];
 
-        let mut serialized_orders = String::new();
+        let mut serialized_requests = String::new();
 
-        for order in orders.iter() {
-            serialized_orders += &serde_json::ser::to_string(&order).unwrap();
-            serialized_orders.push('\0');
+        for request in requests.iter() {
+            serialized_requests += &serde_json::ser::to_string(&request).unwrap();
+            serialized_requests.push('\0');
         }
 
-        let bytes_to_parse = &serialized_orders.as_bytes();
+        let bytes_to_parse = &serialized_requests.as_bytes();
 
-        let parsed_orders = parse_several_commands(bytes_to_parse).unwrap();
+        let parsed_requests = parse_several_commands(bytes_to_parse).unwrap();
 
-        println!("parsed commands: {parsed_orders:?}");
+        println!("parsed commands: {parsed_requests:?}");
 
         let empty_vec: Vec<u8> = vec![];
 
-        assert_eq!(parsed_orders, (&empty_vec[..], orders))
+        assert_eq!(parsed_requests, (&empty_vec[..], requests))
     }
 }

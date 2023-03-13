@@ -29,31 +29,31 @@ impl CommandManager {
     pub fn save_state(&mut self, path: String) -> anyhow::Result<()> {
         println!("Loading the state to file {path}");
 
-        self.order_command(Request::SaveState { path })
+        self.order_request(Request::SaveState { path })
     }
 
     pub fn load_state(&mut self, path: String) -> anyhow::Result<()> {
         println!("Loading the state on path {path}");
 
-        self.order_command(Request::LoadState { path })
+        self.order_request(Request::LoadState { path })
     }
 
     pub fn dump_state(&mut self, json: bool) -> anyhow::Result<()> {
         println!("Dumping the state, json={json}");
 
-        self.order_command_to_all_workers(Request::DumpState, json)
+        self.order_request_to_all_workers(Request::DumpState, json)
     }
 
     pub fn soft_stop(&mut self) -> anyhow::Result<()> {
         println!("shutting down proxy softly");
 
-        self.order_command_to_all_workers(Request::SoftStop, false)
+        self.order_request_to_all_workers(Request::SoftStop, false)
     }
 
     pub fn hard_stop(&mut self) -> anyhow::Result<()> {
         println!("shutting down proxy the hard way");
 
-        self.order_command_to_all_workers(Request::HardStop, false)
+        self.order_request_to_all_workers(Request::HardStop, false)
     }
     /*
     pub fn upgrade_worker(&mut self, worker_id: u32) -> anyhow::Result<()> {
@@ -70,7 +70,7 @@ impl CommandManager {
     pub fn status(&mut self, json: bool) -> anyhow::Result<()> {
         println!("Requesting status…");
 
-        self.order_command_to_all_workers(Request::Status, json)
+        self.order_request_to_all_workers(Request::Status, json)
     }
 
     pub fn configure_metrics(&mut self, cmd: MetricsCmd) -> anyhow::Result<()> {
@@ -83,13 +83,13 @@ impl CommandManager {
             _ => bail!("The command passed to the configure_metrics function is wrong."),
         };
 
-        self.order_command(Request::ConfigureMetrics(configuration))
+        self.order_request(Request::ConfigureMetrics(configuration))
     }
 
     pub fn reload_configuration(&mut self, path: Option<String>, json: bool) -> anyhow::Result<()> {
         println!("Reloading configuration…");
 
-        self.order_command_to_all_workers(Request::ReloadConfiguration { path }, json)
+        self.order_request_to_all_workers(Request::ReloadConfiguration { path }, json)
     }
 
     pub fn list_frontends(
@@ -101,7 +101,7 @@ impl CommandManager {
     ) -> anyhow::Result<()> {
         println!("Listing frontends");
 
-        self.order_command(Request::ListFrontends(FrontendFilters {
+        self.order_request(Request::ListFrontends(FrontendFilters {
             http,
             https,
             tcp,
@@ -110,7 +110,7 @@ impl CommandManager {
     }
 
     pub fn events(&mut self) -> anyhow::Result<()> {
-        self.order_command(Request::SubscribeEvents)
+        self.order_request(Request::SubscribeEvents)
     }
 
     pub fn backend_command(&mut self, cmd: BackendCmd) -> anyhow::Result<()> {
@@ -121,7 +121,7 @@ impl CommandManager {
                 address,
                 sticky_id,
                 backup,
-            } => self.order_command(Request::AddBackend(Backend {
+            } => self.order_request(Request::AddBackend(Backend {
                 cluster_id: id,
                 address,
                 backend_id,
@@ -133,7 +133,7 @@ impl CommandManager {
                 id,
                 backend_id,
                 address,
-            } => self.order_command(Request::RemoveBackend(RemoveBackend {
+            } => self.order_request(Request::RemoveBackend(RemoveBackend {
                 cluster_id: id,
                 address,
                 backend_id,
@@ -157,7 +157,7 @@ impl CommandManager {
                     (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
                     _ => None,
                 };
-                self.order_command(Request::AddCluster(Cluster {
+                self.order_request(Request::AddCluster(Cluster {
                     cluster_id: id,
                     sticky_session,
                     https_redirect,
@@ -168,7 +168,7 @@ impl CommandManager {
                 }))
             }
             ClusterCmd::Remove { id } => {
-                self.order_command(Request::RemoveCluster { cluster_id: id })
+                self.order_request(Request::RemoveCluster { cluster_id: id })
             }
         }
     }
@@ -176,14 +176,14 @@ impl CommandManager {
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> anyhow::Result<()> {
         match cmd {
             TcpFrontendCmd::Add { id, address, tags } => {
-                self.order_command(Request::AddTcpFrontend(TcpFrontend {
+                self.order_request(Request::AddTcpFrontend(TcpFrontend {
                     cluster_id: id,
                     address,
                     tags,
                 }))
             }
             TcpFrontendCmd::Remove { id, address } => {
-                self.order_command(Request::RemoveTcpFrontend(TcpFrontend {
+                self.order_request(Request::RemoveTcpFrontend(TcpFrontend {
                     cluster_id: id,
                     address,
                     tags: None,
@@ -203,7 +203,7 @@ impl CommandManager {
                 method,
                 route,
                 tags,
-            } => self.order_command(Request::AddHttpFrontend(HttpFrontend {
+            } => self.order_request(Request::AddHttpFrontend(HttpFrontend {
                 route: route.into(),
                 address,
                 hostname,
@@ -221,7 +221,7 @@ impl CommandManager {
                 address,
                 method,
                 route,
-            } => self.order_command(Request::RemoveHttpFrontend(HttpFrontend {
+            } => self.order_request(Request::RemoveHttpFrontend(HttpFrontend {
                 route: route.into(),
                 address,
                 hostname,
@@ -244,7 +244,7 @@ impl CommandManager {
                 method,
                 route,
                 tags,
-            } => self.order_command(Request::AddHttpsFrontend(HttpFrontend {
+            } => self.order_request(Request::AddHttpsFrontend(HttpFrontend {
                 route: route.into(),
                 address,
                 hostname,
@@ -261,7 +261,7 @@ impl CommandManager {
                 address,
                 method,
                 route,
-            } => self.order_command(Request::RemoveHttpsFrontend(HttpFrontend {
+            } => self.order_request(Request::RemoveHttpsFrontend(HttpFrontend {
                 route: route.into(),
                 address,
                 hostname,
@@ -311,7 +311,7 @@ impl CommandManager {
                         request_timeout,
                     )
                     .with_context(|| "Error creating HTTPS listener")?;
-                self.order_command(Request::AddHttpsListener(https_listener))
+                self.order_request(Request::AddHttpsListener(https_listener))
             }
             HttpsListenerCmd::Remove { address } => {
                 self.remove_listener(address, ListenerType::HTTPS)
@@ -356,7 +356,7 @@ impl CommandManager {
                         request_timeout,
                     )
                     .with_context(|| "Error creating HTTP listener")?;
-                self.order_command(Request::AddHttpListener(http_listener))
+                self.order_request(Request::AddHttpListener(http_listener))
             }
             HttpListenerCmd::Remove { address } => {
                 self.remove_listener(address, ListenerType::HTTP)
@@ -376,7 +376,7 @@ impl CommandManager {
                 address,
                 public_address,
                 expect_proxy,
-            } => self.order_command(Request::AddTcpListener(TcpListenerConfig {
+            } => self.order_request(Request::AddTcpListener(TcpListenerConfig {
                 address,
                 public_address,
                 expect_proxy,
@@ -395,7 +395,7 @@ impl CommandManager {
     }
 
     pub fn list_listeners(&mut self) -> anyhow::Result<()> {
-        self.order_command(Request::ListListeners)
+        self.order_request(Request::ListListeners)
     }
 
     pub fn remove_listener(
@@ -403,7 +403,7 @@ impl CommandManager {
         address: SocketAddr,
         proxy: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_command(Request::RemoveListener(RemoveListener { address, proxy }))
+        self.order_request(Request::RemoveListener(RemoveListener { address, proxy }))
     }
 
     pub fn activate_listener(
@@ -411,7 +411,7 @@ impl CommandManager {
         address: SocketAddr,
         proxy: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_command(Request::ActivateListener(ActivateListener {
+        self.order_request(Request::ActivateListener(ActivateListener {
             address,
             proxy,
             from_scm: false,
@@ -423,7 +423,7 @@ impl CommandManager {
         address: SocketAddr,
         proxy: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_command(Request::DeactivateListener(DeactivateListener {
+        self.order_request(Request::DeactivateListener(DeactivateListener {
             address,
             proxy,
             to_scm: false,
@@ -431,7 +431,7 @@ impl CommandManager {
     }
 
     pub fn logging_filter(&mut self, filter: &LoggingLevel) -> anyhow::Result<()> {
-        self.order_command(Request::Logging(filter.to_string().to_lowercase()))
+        self.order_request(Request::Logging(filter.to_string().to_lowercase()))
     }
 
     pub fn add_certificate(
@@ -446,7 +446,7 @@ impl CommandManager {
             load_full_certificate(certificate_path, certificate_chain_path, key_path, versions)
                 .with_context(|| "Could not load the full certificate")?;
 
-        self.order_command(Request::AddCertificate(AddCertificate {
+        self.order_request(Request::AddCertificate(AddCertificate {
             address,
             certificate: new_certificate,
             names: vec![],
@@ -485,7 +485,7 @@ impl CommandManager {
         )
         .with_context(|| "Could not load the full certificate")?;
 
-        self.order_command(Request::ReplaceCertificate(ReplaceCertificate {
+        self.order_request(Request::ReplaceCertificate(ReplaceCertificate {
             address,
             new_certificate,
             old_fingerprint,
@@ -515,7 +515,7 @@ impl CommandManager {
                 .with_context(|| "Error decoding the given fingerprint")?,
         };
 
-        self.order_command(Request::RemoveCertificate(RemoveCertificate {
+        self.order_request(Request::RemoveCertificate(RemoveCertificate {
             address,
             fingerprint,
         }))

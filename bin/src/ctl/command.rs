@@ -47,9 +47,9 @@ fn generate_tagged_id(tag: &str) -> String {
 }
 
 impl CommandManager {
-    fn send_order(&mut self, order: Request) -> anyhow::Result<()> {
+    fn send_request(&mut self, request: Request) -> anyhow::Result<()> {
         self.channel
-            .write_message(&order)
+            .write_message(&request)
             .with_context(|| "Could not write the request")
     }
 
@@ -59,21 +59,21 @@ impl CommandManager {
             .with_context(|| "Command timeout. The proxy didn't send an answer")
     }
 
-    pub fn order_command(&mut self, order: Request) -> Result<(), anyhow::Error> {
-        self.order_command_to_all_workers(order, false)
+    pub fn order_request(&mut self, request: Request) -> Result<(), anyhow::Error> {
+        self.order_request_to_all_workers(request, false)
     }
 
-    pub fn order_command_to_all_workers(
+    pub fn order_request_to_all_workers(
         &mut self,
-        order: Request,
+        request: Request,
         json: bool,
     ) -> Result<(), anyhow::Error> {
         // let id = generate_id();
 
-        println!("Sending order : {order:?}");
+        println!("Sending request : {request:?}");
 
         self.channel
-            .write_message(&order)
+            .write_message(&request)
             .with_context(|| "Could not write the request")?;
 
         loop {
@@ -81,7 +81,7 @@ impl CommandManager {
 
             match response.status {
                 ResponseStatus::Processing => println!("Proxy is processing: {}", response.message),
-                ResponseStatus::Failure => bail!("Order failed: {}", response.message),
+                ResponseStatus::Failure => bail!("Request failed: {}", response.message),
                 ResponseStatus::Ok => {
                     if json {
                         // why do we need to print a success message in json?
@@ -126,7 +126,7 @@ impl CommandManager {
     pub fn upgrade_main(&mut self) -> Result<(), anyhow::Error> {
         println!("Preparing to upgrade proxy...");
 
-        self.send_order(Request::ListWorkers)?;
+        self.send_request(Request::ListWorkers)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -155,7 +155,7 @@ impl CommandManager {
                         println!();
 
                         let id = generate_tagged_id("UPGRADE-MAIN");
-                        self.send_order(Request::UpgradeMain)?;
+                        self.send_request(Request::UpgradeMain)?;
 
                         println!("Upgrading main process");
 
@@ -225,7 +225,7 @@ impl CommandManager {
         println!("upgrading worker {worker_id}");
 
         //FIXME: we should be able to soft stop one specific worker
-        self.send_order(Request::UpgradeWorker(worker_id))?;
+        self.send_request(Request::UpgradeWorker(worker_id))?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -259,7 +259,7 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = Request::QueryMetrics(QueryMetricsOptions {
+        let request = Request::QueryMetrics(QueryMetricsOptions {
             list,
             cluster_ids,
             backend_ids,
@@ -268,7 +268,7 @@ impl CommandManager {
 
         // a loop to reperform the query every refresh time
         loop {
-            self.send_order(command.clone())?;
+            self.send_request(request.clone())?;
 
             print!("{}", termion::cursor::Save);
 
@@ -350,7 +350,7 @@ impl CommandManager {
             Request::QueryClustersHashes
         };
 
-        self.send_order(command)?;
+        self.send_request(command)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -395,9 +395,9 @@ impl CommandManager {
             }
         };
 
-        let order = Request::QueryCertificates(query);
+        let request = Request::QueryCertificates(query);
 
-        self.send_order(order)?;
+        self.send_request(request)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;

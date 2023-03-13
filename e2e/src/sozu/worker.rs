@@ -203,7 +203,7 @@ impl Worker {
     }
 
     pub fn upgrade<S: Into<String>>(&mut self, name: S) -> Self {
-        self.send_proxy_order(Request::ReturnListenSockets);
+        self.send_proxy_request(Request::ReturnListenSockets);
         self.read_to_last();
 
         self.scm_main_to_worker
@@ -215,7 +215,7 @@ impl Worker {
             .expect("receive listeners");
         println!("Listeners from old worker: {listeners:?}");
         println!("State from old worker: {:?}", self.state);
-        self.send_proxy_order(Request::SoftStop);
+        self.send_proxy_request(Request::SoftStop);
 
         let mut worker = Worker::start_new_worker(
             name,
@@ -229,8 +229,8 @@ impl Worker {
             .expect("send listeners");
         listeners.close();
         worker.command_id.prefix = "ACTIVATE_".to_string();
-        for order in self.state.generate_activate_orders() {
-            worker.send_proxy_order(order);
+        for request in self.state.generate_activate_requests() {
+            worker.send_proxy_request(request);
         }
         worker.command_id.prefix = "ID_".to_string();
         worker.read_to_last();
@@ -239,12 +239,12 @@ impl Worker {
         worker
     }
 
-    pub fn send_proxy_order(&mut self, order: Request) {
+    pub fn send_proxy_request(&mut self, request: Request) {
         //self.state.handle_order(&order);
         self.command_channel
             .write_message(&WorkerRequest {
                 id: self.command_id.next(),
-                content: order,
+                content: request,
             })
             .expect("Could not write message on command channel");
     }

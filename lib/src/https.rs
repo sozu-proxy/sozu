@@ -1358,10 +1358,10 @@ impl ProxyConfiguration for HttpsProxy {
                 self.query_certificate_for_domain(domain.clone())
                     .with_context(|| format!("Could not query certificate for domain {domain}"))
             }
-            other_order => {
+            other_request => {
                 error!(
-                    "{} unsupported order for HTTPS proxy, ignoring {:?}",
-                    request.id, other_order
+                    "{} unsupported request for HTTPS proxy, ignoring {:?}",
+                    request.id, other_request
                 );
                 Err(anyhow::Error::msg("unsupported message"))
             }

@@ -20,10 +20,7 @@ use sozu_command_lib::{
     state::ConfigState,
 };
 
-use crate::{
-    command::{CommandServer, Worker},
-    util,
-};
+use crate::{command::CommandServer, util, worker::Worker};
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct SerializedWorker {

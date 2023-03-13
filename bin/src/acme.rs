@@ -298,7 +298,7 @@ fn set_up_proxying(
         tags: None,
     });
 
-    order_command(channel, add_http_front).with_context(|| "Order AddHttpFront failed")?;
+    order_request(channel, add_http_front).with_context(|| "Request AddHttpFront failed")?;
 
     let add_backend = Request::AddBackend(Backend {
         cluster_id: String::from(cluster_id),
@@ -309,7 +309,7 @@ fn set_up_proxying(
         backup: None,
     });
 
-    order_command(channel, add_backend).with_context(|| "AddBackend order failed")?;
+    order_request(channel, add_backend).with_context(|| "AddBackend request failed")?;
     Ok(())
 }
 
@@ -321,7 +321,7 @@ fn remove_proxying(
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let remove_http_front_order = Request::RemoveHttpFrontend(HttpFrontend {
+    let remove_http_front = Request::RemoveHttpFrontend(HttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         address: *frontend,
         hostname: String::from(hostname),
@@ -330,16 +330,15 @@ fn remove_proxying(
         position: RulePosition::Tree,
         tags: None,
     });
-    order_command(channel, remove_http_front_order)
-        .with_context(|| "RemoveHttpFront order failed")?;
+    order_request(channel, remove_http_front).with_context(|| "RemoveHttpFront request failed")?;
 
-    let remove_backend_order = Request::RemoveBackend(RemoveBackend {
+    let remove_backend = Request::RemoveBackend(RemoveBackend {
         cluster_id: String::from(cluster_id),
         backend_id: format!("{cluster_id}-0"),
         address: server_address,
     });
 
-    order_command(channel, remove_backend_order).with_context(|| "RemoveBackend order failed")?;
+    order_request(channel, remove_backend).with_context(|| "RemoveBackend request failed")?;
     Ok(())
 }
 
@@ -362,7 +361,7 @@ fn add_certificate(
         .map(split_certificate_chain)
         .with_context(|| "could not load certificate chain".to_string())?;
 
-    let certificate_order = match old_fingerprint {
+    let request = match old_fingerprint {
         None => Request::AddCertificate(AddCertificate {
             address: *frontend,
             certificate: CertificateAndKey {
@@ -389,14 +388,13 @@ fn add_certificate(
         }),
     };
 
-    info!("Sending the certificate order {:?}", certificate_order);
-    order_command(channel, certificate_order)
-        .with_context(|| "Could not send the certificate order")
+    info!("Sending the certificate request {:?}", request);
+    order_request(channel, request).with_context(|| "Could not send the certificate request")
 }
 
-fn order_command(channel: &mut Channel<Request, Response>, order: Request) -> anyhow::Result<()> {
+fn order_request(channel: &mut Channel<Request, Response>, request: Request) -> anyhow::Result<()> {
     channel
-        .write_message(&order.clone())
+        .write_message(&request.clone())
         .with_context(|| "Could not write message on the channel")?;
 
     loop {
@@ -411,11 +409,11 @@ fn order_command(channel: &mut Channel<Request, Response>, order: Request) -> an
                 // until an error or ok message was sent
             }
             ResponseStatus::Failure => {
-                bail!("could not execute order: {}", response.message);
+                bail!("could not execute request: {}", response.message);
             }
             ResponseStatus::Ok => {
                 // TODO: remove the pattern matching and only display the response message
-                match order {
+                match request {
                     Request::AddBackend(_) => {
                         info!("backend added : {}", response.message)
                     }

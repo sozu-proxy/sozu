@@ -38,16 +38,13 @@ use crate::{
     get_executable_path,
     upgrade::{SerializedWorker, UpgradeData},
     util,
-    worker::start_worker,
+    worker::{start_worker, Worker},
 };
 
-mod orders;
-mod worker;
-
-pub use worker::*;
+mod requests;
 
 /// The CommandServer receives these CommandMessages, either from within Sōzu,
-/// or from without, in which case they are ALWAYS of the ClientOrder variant.
+/// or from without, in which case they are ALWAYS of the Clientrequest variant.
 enum CommandMessage {
     ClientNew {
         client_id: String,
@@ -56,9 +53,9 @@ enum CommandMessage {
     ClientClose {
         client_id: String,
     },
-    ClientOrder {
+    ClientRequest {
         client_id: String,
-        order: Request,
+        request: Request,
     },
     WorkerResponse {
         worker_id: u32,
@@ -88,7 +85,7 @@ pub enum Success {
     ClientClose(String),        // the client id
     ClientNew(String),          // the client id
     DumpState(ResponseContent), // the cloned state
-    HandledClientOrder,
+    HandledClientRequest,
     ListFrontends(ResponseContent), // the list of frontends
     ListListeners(ResponseContent), // the list of listeners
     ListWorkers(ResponseContent),
@@ -110,7 +107,7 @@ pub enum Success {
     UpgradeWorker(u32),  // worker id
     WorkerKilled(u32),   // worker id
     WorkerLaunched(u32), // worker id
-    WorkerOrder,
+    WorkerRequest,
     WorkerResponse,
     WorkerRestarted(u32), // worker id
     WorkerStopped(u32),   // worker id
@@ -123,7 +120,7 @@ impl std::fmt::Display for Success {
             Self::ClientClose(id) => write!(f, "Close client: {id}"),
             Self::ClientNew(id) => write!(f, "New client successfully added: {id}"),
             Self::DumpState(_) => write!(f, "Successfully gathered state from the main process"),
-            Self::HandledClientOrder => write!(f, "Successfully handled the client request"),
+            Self::HandledClientRequest => write!(f, "Successfully handled the client request"),
             Self::ListFrontends(_) => write!(f, "Successfully gathered the list of frontends"),
             Self::ListListeners(_) => write!(f, "Successfully listed all listeners"),
             Self::ListWorkers(_) => write!(f, "Successfully listed all workers"),
@@ -167,7 +164,7 @@ impl std::fmt::Display for Success {
             }
             Self::WorkerKilled(id) => write!(f, "Successfully killed worker {id}"),
             Self::WorkerLaunched(id) => write!(f, "Successfully launched worker {id}"),
-            Self::WorkerOrder => write!(f, "Successfully executed the order on all workers"),
+            Self::WorkerRequest => write!(f, "Successfully executed the request on all workers"),
             Self::WorkerResponse => write!(f, "Successfully handled worker response"),
             Self::WorkerRestarted(id) => write!(f, "Successfully restarted worker {id}"),
             Self::WorkerStopped(id) => write!(f, "Successfully stopped worker {id}"),
@@ -303,8 +300,8 @@ impl CommandServer {
                     self.event_subscribers.remove(&client_id);
                     Ok(Success::ClientClose(client_id))
                 }
-                CommandMessage::ClientOrder { client_id, order } => {
-                    self.handle_client_order(client_id, order).await
+                CommandMessage::ClientRequest { client_id, request } => {
+                    self.handle_client_request(client_id, request).await
                 }
                 CommandMessage::WorkerClose { worker_id } => self
                     .handle_worker_close(worker_id)
@@ -338,11 +335,11 @@ impl CommandServer {
             };
 
             match result {
-                Ok(order_success) => {
-                    trace!("Order OK: {}", order_success);
+                Ok(request_success) => {
+                    trace!("request OK: {}", request_success);
 
                     // perform shutdowns
-                    if order_success == Success::MasterStop {
+                    if request_success == Success::MasterStop {
                         // breaking the loop brings run() to return and ends Sōzu
                         // shouldn't we have the same break for both shutdowns?
                         break;
@@ -350,7 +347,7 @@ impl CommandServer {
                 }
                 Err(error) => {
                     // log the error on the main process without stopping it
-                    error!("Failed order: {:#?}", error);
+                    error!("Failed request: {:#?}", error);
                 }
             }
         }
@@ -506,22 +503,22 @@ impl CommandServer {
 
         //FIXME: too many loops, this could be cleaner
         for message in self.config.generate_config_messages() {
-            let order = message.content;
-            if let Err(e) = self.state.dispatch(&order) {
-                error!("Could not execute order on state: {:#}", e);
+            let request = message.content;
+            if let Err(e) = self.state.dispatch(&request) {
+                error!("Could not execute request on state: {:#}", e);
             }
 
-            if let &Request::AddCertificate(_) = &order {
+            if let &Request::AddCertificate(_) = &request {
                 debug!("config generated AddCertificate( ... )");
             } else {
-                debug!("config generated {:?}", order);
+                debug!("config generated {:?}", request);
             }
 
             let mut count = 0usize;
             for ref mut worker in self.workers.iter_mut().filter(|worker| {
                 worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
             }) {
-                worker.send(message.id.clone(), order.clone()).await;
+                worker.send(message.id.clone(), request.clone()).await;
                 count += 1;
             }
 
@@ -652,10 +649,10 @@ impl CommandServer {
         })
         .detach();
 
-        let mut orders = self.state.generate_activate_orders();
-        for (count, order) in orders.drain(..).enumerate() {
+        let mut requests = self.state.generate_activate_requests();
+        for (count, request) in requests.drain(..).enumerate() {
             new_worker
-                .send(format!("RESTART-{new_worker_id}-ACTIVATE-{count}"), order)
+                .send(format!("RESTART-{new_worker_id}-ACTIVATE-{count}"), request)
                 .await;
         }
 
@@ -953,11 +950,11 @@ async fn client_loop(
                 error!("could not decode client message: {:?}", e);
                 break;
             }
-            Ok(order) => {
-                debug!("got command request: {:?}", order);
+            Ok(request) => {
+                debug!("got command request: {:?}", request);
                 let client_id = client_id.clone();
                 if let Err(e) = command_tx
-                    .send(CommandMessage::ClientOrder { client_id, order })
+                    .send(CommandMessage::ClientRequest { client_id, request })
                     .await
                 {
                     error!("error sending client request to command server: {:?}", e);
@@ -966,7 +963,7 @@ async fn client_loop(
         }
     }
 
-    // If the loop breaks, order the command server to close the client
+    // If the loop breaks, request the command server to close the client
     if let Err(send_error) = command_tx
         .send(CommandMessage::ClientClose {
             client_id: client_id.to_owned(),
@@ -994,9 +991,9 @@ async fn worker_loop(
 
     smol::spawn(async move {
         debug!("will start sending messages to worker {}", worker_id);
-        while let Some(inner_order) = worker_rx.next().await {
-            debug!("sending to worker {}: {:?}", worker_id, inner_order);
-            let mut message: Vec<u8> = serde_json::to_string(&inner_order)
+        while let Some(worker_request) = worker_rx.next().await {
+            debug!("sending to worker {}: {:?}", worker_id, worker_request);
+            let mut message: Vec<u8> = serde_json::to_string(&worker_request)
                 .map(|string| string.into_bytes())
                 .unwrap_or_else(|_| Vec::new());
 
@@ -1043,7 +1040,7 @@ async fn worker_loop(
 
     error!("worker loop stopped, will close the worker {}", worker_id);
 
-    // if the loop breaks, order the command server to close the worker
+    // if the loop breaks, request the command server to close the worker
     if let Err(send_error) = command_tx
         .send(CommandMessage::WorkerClose {
             worker_id: worker_id.to_owned(),

@@ -78,8 +78,8 @@ impl ConfigState {
         self.https_addresses.push(address)
     }
 
-    pub fn dispatch(&mut self, order: &Request) -> anyhow::Result<()> {
-        match order {
+    pub fn dispatch(&mut self, request: &Request) -> anyhow::Result<()> {
+        match request {
             Request::AddCluster(cluster) => self
                 .add_cluster(cluster)
                 .with_context(|| "Could not add cluster"),
@@ -149,8 +149,8 @@ impl ConfigState {
             | &Request::ReturnListenSockets
             | &Request::HardStop => Ok(()),
 
-            other_order => {
-                bail!("state cannot handle order message: {:#?}", other_order);
+            other_request => {
+                bail!("state cannot handle request message: {:#?}", other_request);
             }
         }
     }
@@ -455,7 +455,7 @@ impl ConfigState {
         Ok(())
     }
 
-    pub fn generate_orders(&self) -> Vec<Request> {
+    pub fn generate_requests(&self) -> Vec<Request> {
         let mut v = Vec::new();
 
         for &(ref listener, active) in self.http_listeners.values() {
@@ -529,7 +529,7 @@ impl ConfigState {
         v
     }
 
-    pub fn generate_activate_orders(&self) -> Vec<Request> {
+    pub fn generate_activate_requests(&self) -> Vec<Request> {
         let mut v = Vec::new();
         for front in self
             .http_listeners
@@ -1192,7 +1192,7 @@ mod tests {
                 position: RulePosition::Tree,
                 tags: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
@@ -1203,7 +1203,7 @@ mod tests {
                 position: RulePosition::Pre,
                 tags: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
@@ -1213,7 +1213,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
@@ -1223,7 +1223,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddBackend(Backend {
                 cluster_id: String::from("cluster_2"),
@@ -1233,7 +1233,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
@@ -1243,14 +1243,14 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-3"),
                 address: "192.168.1.3:1027".parse().unwrap(),
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
 
         /*
         let encoded = state.encode();
@@ -1276,7 +1276,7 @@ mod tests {
                 position: RulePosition::Post,
                 tags: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddHttpFrontend(HttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
@@ -1287,7 +1287,7 @@ mod tests {
                 position: RulePosition::Tree,
                 tags: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
@@ -1297,7 +1297,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
@@ -1307,7 +1307,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddBackend(Backend {
                 cluster_id: String::from("cluster_2"),
@@ -1317,7 +1317,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddCluster(Cluster {
                 cluster_id: String::from("cluster_2"),
@@ -1328,7 +1328,7 @@ mod tests {
                 load_metric: None,
                 answer_503: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
 
         let mut state2: ConfigState = Default::default();
         state2
@@ -1341,7 +1341,7 @@ mod tests {
                 position: RulePosition::Post,
                 tags: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state2
             .dispatch(&Request::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
@@ -1351,7 +1351,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state2
             .dispatch(&Request::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
@@ -1361,7 +1361,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state2
             .dispatch(&Request::AddBackend(Backend {
                 cluster_id: String::from("cluster_1"),
@@ -1371,7 +1371,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state2
             .dispatch(&Request::AddCluster(Cluster {
                 cluster_id: String::from("cluster_3"),
@@ -1382,7 +1382,7 @@ mod tests {
                 load_metric: None,
                 answer_503: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
 
         let e = vec![
             Request::RemoveHttpFrontend(HttpFrontend {
@@ -1424,8 +1424,8 @@ mod tests {
 
         let d = state.diff(&state2);
         let diff = HashSet::from_iter(d.iter());
-        println!("diff orders:\n{diff:#?}\n");
-        println!("expected diff orders:\n{expected_diff:#?}\n");
+        println!("diff requests:\n{diff:#?}\n");
+        println!("expected diff requests:\n{expected_diff:#?}\n");
 
         let hash1 = state.hash_state();
         let hash2 = state2.hash_state();
@@ -1439,7 +1439,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         let hash3 = state3.hash_state();
         println!("state 1 hashes: {hash1:#?}");
         println!("state 2 hashes: {hash2:#?}");
@@ -1491,22 +1491,22 @@ mod tests {
             tags: None,
         };
 
-        let add_http_front_order_cluster1 = Request::AddHttpFrontend(http_front_cluster1);
-        let add_http_front_order_cluster2 = Request::AddHttpFrontend(http_front_cluster2);
-        let add_https_front_order_cluster1 = Request::AddHttpsFrontend(https_front_cluster1);
-        let add_https_front_order_cluster2 = Request::AddHttpsFrontend(https_front_cluster2);
+        let add_http_front_cluster1 = Request::AddHttpFrontend(http_front_cluster1);
+        let add_http_front_cluster2 = Request::AddHttpFrontend(http_front_cluster2);
+        let add_https_front_cluster1 = Request::AddHttpsFrontend(https_front_cluster1);
+        let add_https_front_cluster2 = Request::AddHttpsFrontend(https_front_cluster2);
         config
-            .dispatch(&add_http_front_order_cluster1)
-            .expect("Could not execute order");
+            .dispatch(&add_http_front_cluster1)
+            .expect("Could not execute request");
         config
-            .dispatch(&add_http_front_order_cluster2)
-            .expect("Could not execute order");
+            .dispatch(&add_http_front_cluster2)
+            .expect("Could not execute request");
         config
-            .dispatch(&add_https_front_order_cluster1)
-            .expect("Could not execute order");
+            .dispatch(&add_https_front_cluster1)
+            .expect("Could not execute request");
         config
-            .dispatch(&add_https_front_order_cluster2)
-            .expect("Could not execute order");
+            .dispatch(&add_https_front_cluster2)
+            .expect("Could not execute request");
 
         let mut cluster1_cluster2: HashSet<ClusterId> = HashSet::new();
         cluster1_cluster2.insert(String::from("MyCluster_1"));
@@ -1554,7 +1554,7 @@ mod tests {
                 sticky_id: None,
                 backup: None,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
 
         let b = Backend {
             cluster_id: String::from("cluster_1"),
@@ -1567,7 +1567,7 @@ mod tests {
 
         state
             .dispatch(&Request::AddBackend(b.clone()))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
 
         assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
     }
@@ -1584,14 +1584,14 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::ActivateListener(ActivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
                 proxy: ListenerType::TCP,
                 from_scm: false,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
@@ -1605,7 +1605,7 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
@@ -1627,14 +1627,14 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state
             .dispatch(&Request::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
                 from_scm: false,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
 
         let mut state2: ConfigState = Default::default();
         state2
@@ -1646,7 +1646,7 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state2
             .dispatch(&Request::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
@@ -1660,14 +1660,14 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state2
             .dispatch(&Request::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 proxy: ListenerType::HTTP,
                 from_scm: false,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state2
             .dispatch(&Request::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
@@ -1689,14 +1689,14 @@ mod tests {
                 back_timeout: 30,
                 connect_timeout: 3,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
         state2
             .dispatch(&Request::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
                 proxy: ListenerType::HTTPS,
                 from_scm: false,
             }))
-            .expect("Could not execute order");
+            .expect("Could not execute request");
 
         let e = vec![
             Request::RemoveListener(RemoveListener {
@@ -1765,8 +1765,8 @@ mod tests {
 
         let diff = state.diff(&state2);
         //let diff: HashSet<&RequestContent> = HashSet::from_iter(d.iter());
-        println!("expected diff orders:\n{e:#?}\n");
-        println!("diff orders:\n{diff:#?}\n");
+        println!("expected diff requests:\n{e:#?}\n");
+        println!("diff requests:\n{diff:#?}\n");
 
         let _hash1 = state.hash_state();
         let _hash2 = state2.hash_state();

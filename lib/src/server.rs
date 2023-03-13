@@ -429,15 +429,15 @@ impl Server {
 
         // initialize the worker with the state we got from a file
         if let Some(state) = config_state {
-            for (counter, order) in state.generate_orders().iter().enumerate() {
+            for (counter, request) in state.generate_requests().iter().enumerate() {
                 let id = format!("INIT-{counter}");
-                let message = WorkerRequest {
+                let worker_request = WorkerRequest {
                     id,
-                    content: order.to_owned(),
+                    content: request.to_owned(),
                 };
 
-                trace!("generating initial config order: {:#?}", message);
-                server.notify_proxys(message);
+                trace!("generating initial config request: {:#?}", worker_request);
+                server.notify_proxys(worker_request);
             }
 
             // do not send back answers to the initialization messages
@@ -950,7 +950,7 @@ impl Server {
                 });
                 return;
             }
-            _other_order => {}
+            _other_request => {}
         }
 
         self.notify_proxys(message);
@@ -1017,7 +1017,7 @@ impl Server {
             Request::DeactivateListener(ref deactivate) => {
                 push_queue(self.notify_deactivate_listener(&req_id, deactivate));
             }
-            _other_order => {}
+            _other_request => {}
         };
     }
 
