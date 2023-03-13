@@ -22,8 +22,8 @@ use sozu_command::{
         QueryClusterType, RemoveBackend, Request, WorkerRequest,
     },
     response::{
-        Backend as CommandLibBackend, HttpListenerConfig, HttpsListenerConfig, MessageId,
-        ProxyEvent, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
+        Backend as CommandLibBackend, Event, HttpListenerConfig, HttpsListenerConfig, MessageId,
+        ProxyResponse, ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
         QueryAnswerCertificate, TcpListenerConfig as CommandTcpListener,
     },
     scm_socket::{Listeners, ScmSocket},
@@ -56,7 +56,7 @@ pub fn push_queue(message: ProxyResponse) {
     });
 }
 
-pub fn push_event(event: ProxyEvent) {
+pub fn push_event(event: Event) {
     QUEUE.with(|queue| {
         (*queue.borrow_mut()).push_back(ProxyResponse {
             id: "EVENT".to_string(),

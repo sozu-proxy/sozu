@@ -38,7 +38,7 @@ use crate::{
         logging,
         ready::Ready,
         request::{Request, WorkerRequest},
-        response::{ProxyEvent, ProxyResponse, TcpFrontend, TcpListenerConfig},
+        response::{Event, ProxyResponse, TcpFrontend, TcpListenerConfig},
         scm_socket::ScmSocket,
         state::ClusterId,
     },
@@ -503,7 +503,7 @@ impl TcpSession {
                         "backend server {} at {} is up",
                         backend.backend_id, backend.address
                     );
-                    push_event(ProxyEvent::BackendUp(
+                    push_event(Event::BackendUp(
                         backend.backend_id.clone(),
                         backend.address,
                     ));
@@ -555,7 +555,7 @@ impl TcpSession {
                     self.metrics.backend_id.as_deref()
                 );
 
-                push_event(ProxyEvent::BackendDown(
+                push_event(Event::BackendDown(
                     backend.backend_id.clone(),
                     backend.address,
                 ));

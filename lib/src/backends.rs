@@ -5,7 +5,7 @@ use mio::net::TcpStream;
 
 use sozu_command::{
     request::{LoadBalancingAlgorithms, LoadMetric},
-    response::ProxyEvent,
+    response::Event,
     state::ClusterId,
 };
 
@@ -105,7 +105,7 @@ impl BackendMap {
                 if self.available {
                     self.available = false;
 
-                    push_event(ProxyEvent::NoAvailableBackends(cluster_id.to_string()));
+                    push_event(Event::NoAvailableBackends(cluster_id.to_string()));
                 }
                 bail!("No more backend available for cluster {}", cluster_id);
             }

@@ -443,19 +443,6 @@ pub enum Event {
     RemovedBackendHasNoConnections(String, SocketAddr),
 }
 
-impl From<ProxyEvent> for Event {
-    fn from(e: ProxyEvent) -> Self {
-        match e {
-            ProxyEvent::BackendDown(id, addr) => Event::BackendDown(id, addr),
-            ProxyEvent::BackendUp(id, addr) => Event::BackendUp(id, addr),
-            ProxyEvent::NoAvailableBackends(cluster_id) => Event::NoAvailableBackends(cluster_id),
-            ProxyEvent::RemovedBackendHasNoConnections(id, addr) => {
-                Event::RemovedBackendHasNoConnections(id, addr)
-            }
-        }
-    }
-}
-
 #[derive(Serialize)]
 struct StatePath {
     path: String,
@@ -536,7 +523,7 @@ pub enum ProxyResponseContent {
     /// contains proxy & cluster metrics
     Metrics(WorkerMetrics),
     Query(QueryAnswer),
-    Event(ProxyEvent),
+    Event(Event),
 }
 
 /// Aggregated metrics of main process & workers, for the CLI
@@ -612,15 +599,6 @@ pub struct BackendMetricsData {
     pub bytes_in: usize,
     pub bytes_out: usize,
     pub percentiles: Percentiles,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ProxyEvent {
-    BackendDown(String, SocketAddr),
-    BackendUp(String, SocketAddr),
-    NoAvailableBackends(String),
-    RemovedBackendHasNoConnections(String, SocketAddr),
 }
 
 fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
