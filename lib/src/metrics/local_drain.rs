@@ -5,7 +5,7 @@ use anyhow::Context;
 use hdrhistogram::Histogram;
 
 use crate::sozu_command::{
-    order::{MetricsConfiguration, QueryMetricsOptions},
+    request::{MetricsConfiguration, QueryMetricsOptions},
     response::{ClusterMetricsData, FilteredData, Percentiles, QueryAnswerMetrics, WorkerMetrics},
 };
 

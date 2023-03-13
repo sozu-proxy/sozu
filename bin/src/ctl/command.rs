@@ -4,8 +4,8 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
 
 use sozu_command_lib::{
-    order::{
-        Order, QueryCertificateType, QueryClusterDomain, QueryClusterType, QueryMetricsOptions,
+    request::{
+        QueryCertificateType, QueryClusterDomain, QueryClusterType, QueryMetricsOptions, Request,
     },
     response::{Response, ResponseContent, ResponseStatus, RunState, WorkerInfo},
 };
@@ -47,7 +47,7 @@ fn generate_tagged_id(tag: &str) -> String {
 }
 
 impl CommandManager {
-    fn send_order(&mut self, order: Order) -> anyhow::Result<()> {
+    fn send_order(&mut self, order: Request) -> anyhow::Result<()> {
         self.channel
             .write_message(&order)
             .with_context(|| "Could not write the request")
@@ -59,13 +59,13 @@ impl CommandManager {
             .with_context(|| "Command timeout. The proxy didn't send an answer")
     }
 
-    pub fn order_command(&mut self, order: Order) -> Result<(), anyhow::Error> {
+    pub fn order_command(&mut self, order: Request) -> Result<(), anyhow::Error> {
         self.order_command_to_all_workers(order, false)
     }
 
     pub fn order_command_to_all_workers(
         &mut self,
-        order: Order,
+        order: Request,
         json: bool,
     ) -> Result<(), anyhow::Error> {
         // let id = generate_id();
@@ -126,7 +126,7 @@ impl CommandManager {
     pub fn upgrade_main(&mut self) -> Result<(), anyhow::Error> {
         println!("Preparing to upgrade proxy...");
 
-        self.send_order(Order::ListWorkers)?;
+        self.send_order(Request::ListWorkers)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -155,7 +155,7 @@ impl CommandManager {
                         println!();
 
                         let id = generate_tagged_id("UPGRADE-MAIN");
-                        self.send_order(Order::UpgradeMain)?;
+                        self.send_order(Request::UpgradeMain)?;
 
                         println!("Upgrading main process");
 
@@ -225,7 +225,7 @@ impl CommandManager {
         println!("upgrading worker {worker_id}");
 
         //FIXME: we should be able to soft stop one specific worker
-        self.send_order(Order::UpgradeWorker(worker_id))?;
+        self.send_order(Request::UpgradeWorker(worker_id))?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -259,7 +259,7 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let command = Order::QueryMetrics(QueryMetricsOptions {
+        let command = Request::QueryMetrics(QueryMetricsOptions {
             list,
             cluster_ids,
             backend_ids,
@@ -328,7 +328,7 @@ impl CommandManager {
         }
 
         let command = if let Some(ref cluster_id) = cluster_id {
-            Order::QueryClusters(QueryClusterType::ClusterId(cluster_id.to_string()))
+            Request::QueryClusters(QueryClusterType::ClusterId(cluster_id.to_string()))
         } else if let Some(ref domain) = domain {
             let splitted: Vec<String> =
                 domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
@@ -345,9 +345,9 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
             };
 
-            Order::QueryClusters(QueryClusterType::Domain(query_domain))
+            Request::QueryClusters(QueryClusterType::Domain(query_domain))
         } else {
-            Order::QueryClustersHashes
+            Request::QueryClustersHashes
         };
 
         self.send_order(command)?;
@@ -395,7 +395,7 @@ impl CommandManager {
             }
         };
 
-        let order = Order::QueryCertificates(query);
+        let order = Request::QueryCertificates(query);
 
         self.send_order(order)?;
 

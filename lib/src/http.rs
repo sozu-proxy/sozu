@@ -16,8 +16,8 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     logging,
-    order::{Cluster, InnerOrder, Order, RemoveListener},
     ready::Ready,
+    request::{Cluster, RemoveListener, Request, WorkerRequest},
     response::{HttpFrontend, HttpListenerConfig, ProxyResponse, Route},
     scm_socket::{Listeners, ScmSocket},
 };
@@ -778,37 +778,37 @@ impl HttpListener {
 }
 
 impl ProxyConfiguration for HttpProxy {
-    fn notify(&mut self, request: InnerOrder) -> ProxyResponse {
+    fn notify(&mut self, request: WorkerRequest) -> ProxyResponse {
         let request_id = request.id.clone();
 
         let result = match request.content {
-            Order::AddCluster(cluster) => {
+            Request::AddCluster(cluster) => {
                 info!("{} add cluster {:?}", request.id, cluster);
                 self.add_cluster(cluster.clone())
                     .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
-            Order::RemoveCluster { cluster_id } => {
+            Request::RemoveCluster { cluster_id } => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
                     .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
-            Order::AddHttpFrontend(front) => {
+            Request::AddHttpFrontend(front) => {
                 info!("{} add front {:?}", request_id, front);
                 self.add_http_frontend(front)
                     .with_context(|| "Could not add http frontend")
             }
-            Order::RemoveHttpFrontend(front) => {
+            Request::RemoveHttpFrontend(front) => {
                 info!("{} remove front {:?}", request_id, front);
                 self.remove_http_frontend(front)
                     .with_context(|| "Could not remove http frontend")
             }
-            Order::RemoveListener(remove) => {
+            Request::RemoveListener(remove) => {
                 info!("removing HTTP listener at address {:?}", remove.address);
                 self.remove_listener(remove.clone()).with_context(|| {
                     format!("Could not remove listener at address {:?}", remove.address)
                 })
             }
-            Order::SoftStop => {
+            Request::SoftStop => {
                 info!("{} processing soft shutdown", request_id);
                 match self
                     .soft_stop()
@@ -821,7 +821,7 @@ impl ProxyConfiguration for HttpProxy {
                     Err(e) => Err(e),
                 }
             }
-            Order::HardStop => {
+            Request::HardStop => {
                 info!("{} processing hard shutdown", request_id);
                 match self
                     .hard_stop()
@@ -834,11 +834,11 @@ impl ProxyConfiguration for HttpProxy {
                     Err(e) => Err(e),
                 }
             }
-            Order::Status => {
+            Request::Status => {
                 info!("{} status", request_id);
                 Ok(())
             }
-            Order::Logging(logging_filter) => {
+            Request::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     request_id, logging_filter
@@ -1080,7 +1080,7 @@ mod tests {
     use super::*;
     use crate::sozu_command::{
         channel::Channel,
-        order::{InnerOrder, LoadBalancingAlgorithms, LoadBalancingParams, Order},
+        request::{LoadBalancingAlgorithms, LoadBalancingParams, Request, WorkerRequest},
         response::{Backend, HttpFrontend, HttpListenerConfig, PathRule, Route, RulePosition},
     };
 
@@ -1136,9 +1136,9 @@ mod tests {
             tags: None,
         };
         command
-            .write_message(&InnerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                content: Order::AddHttpFrontend(front),
+                content: Request::AddHttpFrontend(front),
             })
             .unwrap();
         let backend = Backend {
@@ -1150,9 +1150,9 @@ mod tests {
             backup: None,
         };
         command
-            .write_message(&InnerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Order::AddBackend(backend),
+                content: Request::AddBackend(backend),
             })
             .unwrap();
 
@@ -1224,9 +1224,9 @@ mod tests {
             tags: None,
         };
         command
-            .write_message(&InnerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                content: Order::AddHttpFrontend(front),
+                content: Request::AddHttpFrontend(front),
             })
             .unwrap();
         let backend = Backend {
@@ -1238,9 +1238,9 @@ mod tests {
             sticky_id: None,
         };
         command
-            .write_message(&InnerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Order::AddBackend(backend),
+                content: Request::AddBackend(backend),
             })
             .unwrap();
 
@@ -1337,9 +1337,9 @@ mod tests {
             sticky_session: false,
         };
         command
-            .write_message(&InnerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                content: Order::AddCluster(cluster),
+                content: Request::AddCluster(cluster),
             })
             .unwrap();
         let front = HttpFrontend {
@@ -1352,9 +1352,9 @@ mod tests {
             tags: None,
         };
         command
-            .write_message(&InnerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Order::AddHttpFrontend(front),
+                content: Request::AddHttpFrontend(front),
             })
             .unwrap();
         let backend = Backend {
@@ -1366,9 +1366,9 @@ mod tests {
             sticky_id: None,
         };
         command
-            .write_message(&InnerOrder {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_IJKL"),
-                content: Order::AddBackend(backend),
+                content: Request::AddBackend(backend),
             })
             .unwrap();
 

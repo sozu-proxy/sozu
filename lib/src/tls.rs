@@ -24,7 +24,7 @@ use x509_parser::{
 use crate::router::trie::*;
 use sozu_command::{
     certificate::{CertificateAndKey, CertificateFingerprint, TlsVersion},
-    order::{AddCertificate, RemoveCertificate, ReplaceCertificate},
+    request::{AddCertificate, RemoveCertificate, ReplaceCertificate},
 };
 
 // -----------------------------------------------------------------------------
@@ -653,7 +653,7 @@ mod tests {
         GenericCertificateResolverError,
     };
 
-    use crate::sozu_command::order::{AddCertificate, RemoveCertificate};
+    use crate::sozu_command::request::{AddCertificate, RemoveCertificate};
 
     use rand::{seq::SliceRandom, thread_rng};
     use sozu_command::certificate::CertificateAndKey;

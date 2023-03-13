@@ -13,7 +13,7 @@ use crate::{
         DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST, DEFAULT_RUSTLS_CIPHER_LIST,
         DEFAULT_SIGNATURE_ALGORITHMS,
     },
-    order::{default_sticky_name, is_false, Cluster, LoadBalancingParams, PROTOCOL_VERSION},
+    request::{default_sticky_name, is_false, Cluster, LoadBalancingParams, PROTOCOL_VERSION},
     state::{ClusterId, ConfigState, RouteKey},
 };
 

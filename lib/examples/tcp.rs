@@ -10,7 +10,7 @@ use anyhow::Context;
 use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    order::{InnerOrder, LoadBalancingParams, Order},
+    request::{LoadBalancingParams, Request, WorkerRequest},
     response::{Backend, TcpFrontend, TcpListenerConfig},
 };
 
@@ -73,14 +73,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&InnerOrder {
+    command.write_message(&WorkerRequest {
         id: String::from("ID_ABCD"),
-        content: Order::AddTcpFrontend(tcp_front),
+        content: Request::AddTcpFrontend(tcp_front),
     });
 
-    command.write_message(&InnerOrder {
+    command.write_message(&WorkerRequest {
         id: String::from("ID_EFGH"),
-        content: Order::AddBackend(tcp_backend),
+        content: Request::AddBackend(tcp_backend),
     });
 
     info!("TCP -> {:?}", command.read_message());

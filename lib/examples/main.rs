@@ -14,7 +14,7 @@ use sozu_command::{
     channel::Channel,
     config::DEFAULT_RUSTLS_CIPHER_LIST,
     logging::{Logger, LoggerBackend},
-    order::{AddCertificate, InnerOrder, LoadBalancingParams, Order},
+    request::{AddCertificate, LoadBalancingParams, Request, WorkerRequest},
     response::{
         Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, Route,
         RulePosition,
@@ -88,14 +88,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&InnerOrder {
+    command.write_message(&WorkerRequest {
         id: String::from("ID_ABCD"),
-        content: Order::AddHttpFrontend(http_front),
+        content: Request::AddHttpFrontend(http_front),
     });
 
-    command.write_message(&InnerOrder {
+    command.write_message(&WorkerRequest {
         id: String::from("ID_EFGH"),
-        content: Order::AddBackend(http_backend),
+        content: Request::AddBackend(http_backend),
     });
 
     info!("MAIN\tHTTP -> {:?}", command.read_message());
@@ -129,9 +129,9 @@ fn main() -> anyhow::Result<()> {
         certificate_chain: vec![],
         versions: vec![],
     };
-    command2.write_message(&InnerOrder {
+    command2.write_message(&WorkerRequest {
         id: String::from("ID_IJKL1"),
-        content: Order::AddCertificate(AddCertificate {
+        content: Request::AddCertificate(AddCertificate {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
@@ -153,9 +153,9 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    command2.write_message(&InnerOrder {
+    command2.write_message(&WorkerRequest {
         id: String::from("ID_IJKL2"),
-        content: Order::AddHttpsFrontend(tls_front),
+        content: Request::AddHttpsFrontend(tls_front),
     });
     let tls_backend = Backend {
         cluster_id: String::from("cluster_1"),
@@ -168,9 +168,9 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command2.write_message(&InnerOrder {
+    command2.write_message(&WorkerRequest {
         id: String::from("ID_MNOP"),
-        content: Order::AddBackend(tls_backend),
+        content: Request::AddBackend(tls_backend),
     });
 
     let cert2 = include_str!("../assets/cert_test.pem");
@@ -183,9 +183,9 @@ fn main() -> anyhow::Result<()> {
         versions: vec![],
     };
 
-    command2.write_message(&InnerOrder {
+    command2.write_message(&WorkerRequest {
         id: String::from("ID_QRST1"),
-        content: Order::AddCertificate(AddCertificate {
+        content: Request::AddCertificate(AddCertificate {
             address: "127.0.0.1:8443"
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
@@ -207,9 +207,9 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    command2.write_message(&InnerOrder {
+    command2.write_message(&WorkerRequest {
         id: String::from("ID_QRST2"),
-        content: Order::AddHttpsFrontend(tls_front2),
+        content: Request::AddHttpsFrontend(tls_front2),
     });
 
     let tls_backend2 = Backend {
@@ -223,9 +223,9 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command2.write_message(&InnerOrder {
+    command2.write_message(&WorkerRequest {
         id: String::from("ID_UVWX"),
-        content: Order::AddBackend(tls_backend2),
+        content: Request::AddBackend(tls_backend2),
     });
 
     info!("MAIN\tTLS -> {:?}", command2.read_message());

@@ -13,7 +13,7 @@ use sozu_command_lib::{
     },
     channel::Channel,
     config::Config,
-    order::{AddCertificate, Order, RemoveBackend, ReplaceCertificate},
+    request::{AddCertificate, RemoveBackend, ReplaceCertificate, Request},
     response::{Backend, HttpFrontend, PathRule, Response, ResponseStatus, Route, RulePosition},
 };
 
@@ -89,7 +89,7 @@ pub fn main(
 
     let tls_versions = vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3];
 
-    let mut channel: Channel<Order, Response> = Channel::new(stream, 10000, 20000);
+    let mut channel: Channel<Request, Response> = Channel::new(stream, 10000, 20000);
     channel
         .blocking()
         .with_context(|| "Could not block channel")?;
@@ -281,14 +281,14 @@ fn generate_app_id(app_id: &str) -> String {
 }
 
 fn set_up_proxying(
-    channel: &mut Channel<Order, Response>,
+    channel: &mut Channel<Request, Response>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let add_http_front = Order::AddHttpFrontend(HttpFrontend {
+    let add_http_front = Request::AddHttpFrontend(HttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         hostname: String::from(hostname),
         address: *frontend,
@@ -300,7 +300,7 @@ fn set_up_proxying(
 
     order_command(channel, add_http_front).with_context(|| "Order AddHttpFront failed")?;
 
-    let add_backend = Order::AddBackend(Backend {
+    let add_backend = Request::AddBackend(Backend {
         cluster_id: String::from(cluster_id),
         backend_id: format!("{cluster_id}-0"),
         address: server_address,
@@ -314,14 +314,14 @@ fn set_up_proxying(
 }
 
 fn remove_proxying(
-    channel: &mut Channel<Order, Response>,
+    channel: &mut Channel<Request, Response>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let remove_http_front_order = Order::RemoveHttpFrontend(HttpFrontend {
+    let remove_http_front_order = Request::RemoveHttpFrontend(HttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         address: *frontend,
         hostname: String::from(hostname),
@@ -333,7 +333,7 @@ fn remove_proxying(
     order_command(channel, remove_http_front_order)
         .with_context(|| "RemoveHttpFront order failed")?;
 
-    let remove_backend_order = Order::RemoveBackend(RemoveBackend {
+    let remove_backend_order = Request::RemoveBackend(RemoveBackend {
         cluster_id: String::from(cluster_id),
         backend_id: format!("{cluster_id}-0"),
         address: server_address,
@@ -344,7 +344,7 @@ fn remove_proxying(
 }
 
 fn add_certificate(
-    channel: &mut Channel<Order, Response>,
+    channel: &mut Channel<Request, Response>,
     frontend: &SocketAddr,
     hostname: &str,
     certificate_path: &str,
@@ -363,7 +363,7 @@ fn add_certificate(
         .with_context(|| "could not load certificate chain".to_string())?;
 
     let certificate_order = match old_fingerprint {
-        None => Order::AddCertificate(AddCertificate {
+        None => Request::AddCertificate(AddCertificate {
             address: *frontend,
             certificate: CertificateAndKey {
                 certificate,
@@ -375,7 +375,7 @@ fn add_certificate(
             expired_at: None,
         }),
 
-        Some(f) => Order::ReplaceCertificate(ReplaceCertificate {
+        Some(f) => Request::ReplaceCertificate(ReplaceCertificate {
             address: *frontend,
             new_certificate: CertificateAndKey {
                 certificate,
@@ -394,7 +394,7 @@ fn add_certificate(
         .with_context(|| "Could not send the certificate order")
 }
 
-fn order_command(channel: &mut Channel<Order, Response>, order: Order) -> anyhow::Result<()> {
+fn order_command(channel: &mut Channel<Request, Response>, order: Request) -> anyhow::Result<()> {
     channel
         .write_message(&order.clone())
         .with_context(|| "Could not write message on the channel")?;
@@ -416,22 +416,22 @@ fn order_command(channel: &mut Channel<Order, Response>, order: Order) -> anyhow
             ResponseStatus::Ok => {
                 // TODO: remove the pattern matching and only display the response message
                 match order {
-                    Order::AddBackend(_) => {
+                    Request::AddBackend(_) => {
                         info!("backend added : {}", response.message)
                     }
-                    Order::RemoveBackend(_) => {
+                    Request::RemoveBackend(_) => {
                         info!("backend removed : {} ", response.message)
                     }
-                    Order::AddCertificate(_) => {
+                    Request::AddCertificate(_) => {
                         info!("certificate added: {}", response.message)
                     }
-                    Order::RemoveCertificate(_) => {
+                    Request::RemoveCertificate(_) => {
                         info!("certificate removed: {}", response.message)
                     }
-                    Order::AddHttpFrontend(_) => {
+                    Request::AddHttpFrontend(_) => {
                         info!("front added: {}", response.message)
                     }
-                    Order::RemoveHttpFrontend(_) => {
+                    Request::RemoveHttpFrontend(_) => {
                         info!("front removed: {}", response.message)
                     }
                     _ => {

@@ -10,7 +10,7 @@ use anyhow::Context;
 use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    order::{InnerOrder, LoadBalancingParams, Order},
+    request::{LoadBalancingParams, Request, WorkerRequest},
     response::{Backend, HttpFrontend, HttpListenerConfig, PathRule, Route, RulePosition},
 };
 
@@ -74,14 +74,14 @@ fn main() -> anyhow::Result<()> {
         backup: None,
     };
 
-    command.write_message(&InnerOrder {
+    command.write_message(&WorkerRequest {
         id: String::from("ID_ABCD"),
-        content: Order::AddHttpFrontend(http_front),
+        content: Request::AddHttpFrontend(http_front),
     });
 
-    command.write_message(&InnerOrder {
+    command.write_message(&WorkerRequest {
         id: String::from("ID_EFGH"),
-        content: Order::AddBackend(http_backend),
+        content: Request::AddBackend(http_backend),
     });
 
     println!("HTTP -> {:?}", command.read_message());

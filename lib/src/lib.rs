@@ -217,8 +217,8 @@ use sozu_command::state::ClusterId;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
-    order::{Cluster, InnerOrder, LoadBalancingParams},
     ready::Ready,
+    request::{Cluster, LoadBalancingParams, WorkerRequest},
     response::{ProxyEvent, ProxyResponse, Route},
 };
 
@@ -438,7 +438,7 @@ pub enum AcceptError {
 
 use self::server::ListenToken;
 pub trait ProxyConfiguration {
-    fn notify(&mut self, message: InnerOrder) -> ProxyResponse;
+    fn notify(&mut self, message: WorkerRequest) -> ProxyResponse;
     fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
     fn create_session(
         &mut self,

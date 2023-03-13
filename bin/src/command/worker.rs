@@ -7,7 +7,7 @@ use nix::{sys::signal::kill, unistd::Pid};
 use sozu_command_lib::{
     channel::Channel,
     config::Config,
-    order::{InnerOrder, Order},
+    request::{Request, WorkerRequest},
     response::{ProxyResponse, RunState, WorkerInfo},
     scm_socket::ScmSocket,
 };
@@ -16,23 +16,23 @@ use sozu_command_lib::{
 pub struct Worker {
     pub id: u32,
     /// for the worker to receive requests and respond to the main process
-    pub worker_channel: Option<Channel<InnerOrder, ProxyResponse>>,
+    pub worker_channel: Option<Channel<WorkerRequest, ProxyResponse>>,
     /// file descriptor of the command channel
     pub worker_channel_fd: i32,
     pub pid: pid_t,
     pub run_state: RunState,
-    pub queue: VecDeque<InnerOrder>,
+    pub queue: VecDeque<WorkerRequest>,
     /// Used to send and receive listeners (socket addresses and file descriptors)
     pub scm_socket: ScmSocket,
     /// Used to send proxyrequests to the worker loop
-    pub sender: Option<futures::channel::mpsc::Sender<InnerOrder>>,
+    pub sender: Option<futures::channel::mpsc::Sender<WorkerRequest>>,
 }
 
 impl Worker {
     pub fn new(
         id: u32,
         pid: pid_t,
-        command_channel: Channel<InnerOrder, ProxyResponse>,
+        command_channel: Channel<WorkerRequest, ProxyResponse>,
         scm_socket: ScmSocket,
         _: &Config,
     ) -> Worker {
@@ -49,10 +49,10 @@ impl Worker {
     }
 
     /// send proxy request to the worker, via the mpsc sender
-    pub async fn send(&mut self, order_id: String, content: Order) {
+    pub async fn send(&mut self, order_id: String, content: Request) {
         if let Some(worker_tx) = self.sender.as_mut() {
             if let Err(e) = worker_tx
-                .send(InnerOrder {
+                .send(WorkerRequest {
                     id: order_id.clone(),
                     content,
                 })

@@ -16,8 +16,8 @@ use sozu_command_lib::{
     buffer::fixed::Buffer,
     config::Config,
     logging,
-    order::{FrontendFilters, InnerOrder, MetricsConfiguration, Order, QueryClusterType},
     parser::parse_several_commands,
+    request::{FrontendFilters, MetricsConfiguration, QueryClusterType, Request, WorkerRequest},
     response::{
         AggregatedMetricsData, ListedFrontends, ListenersList, ProxyResponseContent,
         ProxyResponseStatus, QueryAnswer, Response, ResponseContent, ResponseStatus, RunState,
@@ -39,36 +39,38 @@ impl CommandServer {
     pub async fn handle_client_order(
         &mut self,
         client_id: String,
-        order: Order,
+        order: Request,
     ) -> anyhow::Result<Success> {
         trace!("Received order {:?}", order);
 
         let cloned_client_id = client_id.clone();
 
         let result: anyhow::Result<Option<Success>> = match order {
-            Order::SaveState { path } => self.save_state(&path).await,
-            Order::DumpState => self.dump_state().await,
-            Order::ListWorkers => self.list_workers().await,
-            Order::ListFrontends(filters) => self.list_frontends(filters).await,
-            Order::ListListeners => self.list_listeners(),
-            Order::LoadState { path } => self.load_state(Some(client_id), &path).await,
-            Order::LaunchWorker(tag) => self.launch_worker(client_id, &tag).await,
-            Order::UpgradeMain => self.upgrade_main(client_id).await,
-            Order::UpgradeWorker(worker_id) => self.upgrade_worker(client_id, worker_id).await,
-            Order::ConfigureMetrics(config) => self.configure_metrics(client_id, config).await,
+            Request::SaveState { path } => self.save_state(&path).await,
+            Request::DumpState => self.dump_state().await,
+            Request::ListWorkers => self.list_workers().await,
+            Request::ListFrontends(filters) => self.list_frontends(filters).await,
+            Request::ListListeners => self.list_listeners(),
+            Request::LoadState { path } => self.load_state(Some(client_id), &path).await,
+            Request::LaunchWorker(tag) => self.launch_worker(client_id, &tag).await,
+            Request::UpgradeMain => self.upgrade_main(client_id).await,
+            Request::UpgradeWorker(worker_id) => self.upgrade_worker(client_id, worker_id).await,
+            Request::ConfigureMetrics(config) => self.configure_metrics(client_id, config).await,
             // Order::Query(query) => self.query(client_id, query).await,
-            Order::Logging(logging_filter) => self.set_logging_level(logging_filter),
-            Order::SubscribeEvents => {
+            Request::Logging(logging_filter) => self.set_logging_level(logging_filter),
+            Request::SubscribeEvents => {
                 self.event_subscribers.insert(client_id.clone());
                 Ok(Some(Success::SubscribeEvent(client_id.clone())))
             }
-            Order::ReloadConfiguration { path } => self.reload_configuration(client_id, path).await,
-            Order::Status => self.status(client_id).await,
+            Request::ReloadConfiguration { path } => {
+                self.reload_configuration(client_id, path).await
+            }
+            Request::Status => self.status(client_id).await,
 
-            Order::QueryCertificates(_)
-            | Order::QueryClusters(_)
-            | Order::QueryClustersHashes
-            | Order::QueryMetrics(_) => self.query(client_id, order).await,
+            Request::QueryCertificates(_)
+            | Request::QueryClusters(_)
+            | Request::QueryClustersHashes
+            | Request::QueryMetrics(_) => self.query(client_id, order).await,
 
             // any other case is an order for the workers, except for SoftStop and HardStop.
             // TODO: we should have something like:
@@ -117,7 +119,7 @@ impl CommandServer {
 
         let result: anyhow::Result<usize> = (move || {
             for order in orders {
-                let message = InnerOrder::new(format!("SAVE-{counter}"), order);
+                let message = WorkerRequest::new(format!("SAVE-{counter}"), order);
 
                 file.write_all(
                     &serde_json::to_string(&message)
@@ -189,7 +191,7 @@ impl CommandServer {
             }
 
             let mut offset = 0usize;
-            match parse_several_commands::<InnerOrder>(buffer.data()) {
+            match parse_several_commands::<WorkerRequest>(buffer.data()) {
                 Ok((i, requests)) => {
                     if !i.is_empty() {
                         debug!("could not parse {} bytes", i.len());
@@ -594,9 +596,9 @@ impl CommandServer {
             .sender
             .as_mut()
             .with_context(|| "No sender on new worker".to_string())?
-            .send(InnerOrder {
+            .send(WorkerRequest {
                 id: format!("UPGRADE-{worker_id}-STATUS"),
-                content: Order::Status,
+                content: Request::Status,
             })
             .await
             .with_context(|| {
@@ -624,7 +626,7 @@ impl CommandServer {
             let id = format!("{}-return-sockets", client_id);
             self.in_flight.insert(id.clone(), (sockets_return_tx, 1));
             old_worker
-                .send(id.clone(), Order::ReturnListenSockets)
+                .send(id.clone(), Request::ReturnListenSockets)
                 .await;
 
             info!("sent ReturnListenSockets to old worker");
@@ -681,7 +683,9 @@ impl CommandServer {
             let (softstop_tx, mut softstop_rx) = futures::channel::mpsc::channel(10);
             let softstop_id = format!("{}-softstop", client_id);
             self.in_flight.insert(softstop_id.clone(), (softstop_tx, 1));
-            old_worker.send(softstop_id.clone(), Order::SoftStop).await;
+            old_worker
+                .send(softstop_id.clone(), Request::SoftStop)
+                .await;
 
             let mut command_tx = self.command_tx.clone();
             let cloned_client_id = client_id.clone();
@@ -893,7 +897,7 @@ impl CommandServer {
             // send a status request to supposedly running workers to update the list afterwards
             if worker.run_state == RunState::Running {
                 info!("Summoning status of worker {}", worker.id);
-                worker.send(worker_order_id.clone(), Order::Status).await;
+                worker.send(worker_order_id.clone(), Request::Status).await;
                 count += 1;
                 self.in_flight
                     .insert(worker_order_id.clone(), (status_tx.clone(), 1));
@@ -961,7 +965,7 @@ impl CommandServer {
         {
             let req_id = format!("{}-metrics-{}", client_id, worker.id);
             worker
-                .send(req_id.clone(), Order::ConfigureMetrics(config.clone()))
+                .send(req_id.clone(), Request::ConfigureMetrics(config.clone()))
                 .await;
             count += 1;
             self.in_flight.insert(req_id, (metrics_tx.clone(), 1));
@@ -1021,7 +1025,7 @@ impl CommandServer {
     pub async fn query(
         &mut self,
         client_id: String,
-        order: Order,
+        order: Request,
     ) -> anyhow::Result<Option<Success>> {
         debug!("Received this query: {:?}", order);
         let (query_tx, mut query_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
@@ -1046,10 +1050,10 @@ impl CommandServer {
 
         let mut main_query_answer = None;
         match &order {
-            Order::QueryClustersHashes => {
+            Request::QueryClustersHashes => {
                 main_query_answer = Some(QueryAnswer::ClustersHashes(self.state.hash_state()));
             }
-            Order::QueryClusters(query_type) => {
+            Request::QueryClusters(query_type) => {
                 main_query_answer = Some(QueryAnswer::Clusters(match query_type {
                     QueryClusterType::ClusterId(cluster_id) => {
                         vec![self.state.cluster_state(cluster_id)]
@@ -1067,8 +1071,8 @@ impl CommandServer {
                     }
                 }));
             }
-            Order::QueryCertificates(_) => {}
-            Order::QueryMetrics(_) => {}
+            Request::QueryCertificates(_) => {}
+            Request::QueryMetrics(_) => {}
             _ => {}
         };
 
@@ -1115,16 +1119,16 @@ impl CommandServer {
                 .collect();
 
             let success = match &order {
-                &Order::QueryClustersHashes | &Order::QueryClusters(_) => {
+                &Request::QueryClustersHashes | &Request::QueryClusters(_) => {
                     let main = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
                     query_answers.insert(String::from("main"), main);
                     Success::Query(ResponseContent::Query(query_answers))
                 }
-                &Order::QueryCertificates(_) => {
+                &Request::QueryCertificates(_) => {
                     info!("certificates query answer received: {:?}", query_answers);
                     Success::Query(ResponseContent::Query(query_answers))
                 }
-                Order::QueryMetrics(options) => {
+                Request::QueryMetrics(options) => {
                     debug!("metrics query answer received: {:?}", query_answers);
 
                     if options.list {
@@ -1162,9 +1166,9 @@ impl CommandServer {
     pub async fn worker_order(
         &mut self,
         client_id: String,
-        order: Order,
+        order: Request,
     ) -> anyhow::Result<Option<Success>> {
-        if let &Order::AddCertificate(_) = &order {
+        if let &Request::AddCertificate(_) = &order {
             debug!("workerconfig client order AddCertificate()");
         } else {
             debug!("workerconfig client order {:?}", order);
@@ -1174,7 +1178,8 @@ impl CommandServer {
             .dispatch(&order)
             .with_context(|| "Could not execute order on the state")?;
 
-        if self.config.automatic_state_save & (order != Order::SoftStop || order != Order::HardStop)
+        if self.config.automatic_state_save
+            & (order != Request::SoftStop || order != Request::HardStop)
         {
             if let Some(path) = self.config.saved_state.clone() {
                 return_processing(
@@ -1206,7 +1211,7 @@ impl CommandServer {
         for ref mut worker in self.workers.iter_mut().filter(|worker| {
             worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
         }) {
-            let should_stop_worker = order == Order::SoftStop || order == Order::HardStop;
+            let should_stop_worker = order == Request::SoftStop || order == Request::HardStop;
             if should_stop_worker {
                 worker.run_state = RunState::Stopping;
                 stopping_workers.insert(worker.id);
@@ -1220,7 +1225,7 @@ impl CommandServer {
             worker_count += 1;
         }
 
-        let should_stop_main = order == Order::SoftStop || order == Order::HardStop;
+        let should_stop_main = order == Request::SoftStop || order == Request::HardStop;
 
         let mut command_tx = self.command_tx.clone();
         let thread_client_id = client_id.clone();
@@ -1294,15 +1299,15 @@ impl CommandServer {
         }
 
         match order {
-            Order::AddBackend(_) | Order::RemoveBackend(_) => {
+            Request::AddBackend(_) | Request::RemoveBackend(_) => {
                 self.backends_count = self.state.count_backends()
             }
-            Order::AddHttpFrontend(_)
-            | Order::AddHttpsFrontend(_)
-            | Order::AddTcpFrontend(_)
-            | Order::RemoveHttpFrontend(_)
-            | Order::RemoveHttpsFrontend(_)
-            | Order::RemoveTcpFrontend(_) => self.frontends_count = self.state.count_frontends(),
+            Request::AddHttpFrontend(_)
+            | Request::AddHttpsFrontend(_)
+            | Request::AddTcpFrontend(_)
+            | Request::RemoveHttpFrontend(_)
+            | Request::RemoveHttpsFrontend(_)
+            | Request::RemoveTcpFrontend(_) => self.frontends_count = self.state.count_frontends(),
             _ => {}
         };
 

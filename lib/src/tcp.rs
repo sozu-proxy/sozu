@@ -36,8 +36,8 @@ use crate::{
     sozu_command::{
         config::ProxyProtocolConfig,
         logging,
-        order::{InnerOrder, Order},
         ready::Ready,
+        request::{Request, WorkerRequest},
         response::{ProxyEvent, ProxyResponse, TcpFrontend, TcpListenerConfig},
         scm_socket::ScmSocket,
         state::ClusterId,
@@ -1319,23 +1319,23 @@ impl TcpProxy {
 }
 
 impl ProxyConfiguration for TcpProxy {
-    fn notify(&mut self, message: InnerOrder) -> ProxyResponse {
+    fn notify(&mut self, message: WorkerRequest) -> ProxyResponse {
         match message.content {
-            Order::AddTcpFrontend(front) => {
+            Request::AddTcpFrontend(front) => {
                 if let Err(err) = self.add_tcp_front(front) {
                     return ProxyResponse::error(message.id, err);
                 }
 
                 ProxyResponse::ok(message.id)
             }
-            Order::RemoveTcpFrontend(front) => {
+            Request::RemoveTcpFrontend(front) => {
                 if let Err(err) = self.remove_tcp_front(&front) {
                     return ProxyResponse::error(message.id, err);
                 }
 
                 ProxyResponse::ok(message.id)
             }
-            Order::SoftStop => {
+            Request::SoftStop => {
                 info!("{} processing soft shutdown", message.id);
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.iter() {
@@ -1346,7 +1346,7 @@ impl ProxyConfiguration for TcpProxy {
                 }
                 ProxyResponse::processing(message.id)
             }
-            Order::HardStop => {
+            Request::HardStop => {
                 info!("{} hard shutdown", message.id);
                 let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.drain() {
@@ -1357,11 +1357,11 @@ impl ProxyConfiguration for TcpProxy {
                 }
                 ProxyResponse::ok(message.id)
             }
-            Order::Status => {
+            Request::Status => {
                 info!("{} status", message.id);
                 ProxyResponse::ok(message.id)
             }
-            Order::Logging(logging_filter) => {
+            Request::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     message.id, logging_filter
@@ -1372,7 +1372,7 @@ impl ProxyConfiguration for TcpProxy {
                 });
                 ProxyResponse::ok(message.id)
             }
-            Order::AddCluster(cluster) => {
+            Request::AddCluster(cluster) => {
                 let config = ClusterConfiguration {
                     proxy_protocol: cluster.proxy_protocol,
                     //load_balancing: cluster.load_balancing,
@@ -1380,11 +1380,11 @@ impl ProxyConfiguration for TcpProxy {
                 self.configs.insert(cluster.cluster_id, config);
                 ProxyResponse::ok(message.id)
             }
-            Order::RemoveCluster { cluster_id } => {
+            Request::RemoveCluster { cluster_id } => {
                 self.configs.remove(&cluster_id);
                 ProxyResponse::ok(message.id)
             }
-            Order::RemoveListener(remove) => {
+            Request::RemoveListener(remove) => {
                 if !self.remove_listener(remove.address) {
                     ProxyResponse::error(
                         message.id,
@@ -1607,7 +1607,7 @@ pub fn start_tcp_worker(
 mod tests {
     use super::*;
     use crate::sozu_command::channel::Channel;
-    use crate::sozu_command::order::LoadBalancingParams;
+    use crate::sozu_command::request::LoadBalancingParams;
     use crate::sozu_command::scm_socket::Listeners;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
@@ -1732,7 +1732,7 @@ mod tests {
     }
 
     /// used in tests only
-    pub fn start_proxy() -> anyhow::Result<Channel<InnerOrder, ProxyResponse>> {
+    pub fn start_proxy() -> anyhow::Result<Channel<WorkerRequest, ProxyResponse>> {
         use crate::server;
 
         info!("listen for connections");
@@ -1860,15 +1860,15 @@ mod tests {
             };
 
             command
-                .write_message(&InnerOrder {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO1"),
-                    content: Order::AddTcpFrontend(front),
+                    content: Request::AddTcpFrontend(front),
                 })
                 .unwrap();
             command
-                .write_message(&InnerOrder {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO2"),
-                    content: Order::AddBackend(backend),
+                    content: Request::AddBackend(backend),
                 })
                 .unwrap();
         }
@@ -1891,15 +1891,15 @@ mod tests {
                 backup: None,
             };
             command
-                .write_message(&InnerOrder {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO3"),
-                    content: Order::AddTcpFrontend(front),
+                    content: Request::AddTcpFrontend(front),
                 })
                 .unwrap();
             command
-                .write_message(&InnerOrder {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO4"),
-                    content: Order::AddBackend(backend),
+                    content: Request::AddBackend(backend),
                 })
                 .unwrap();
         }

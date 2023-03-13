@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, net::SocketAddr};
 
 use clap::{Parser, Subcommand};
 
-use sozu_command_lib::{certificate::TlsVersion, order::LoadBalancingAlgorithms};
+use sozu_command_lib::{certificate::TlsVersion, request::LoadBalancingAlgorithms};
 
 #[derive(Parser, PartialEq, Eq, Clone, Debug)]
 #[clap(author, version, about)]

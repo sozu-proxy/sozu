@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
     config::Config,
-    order::{InnerOrder, MetricsConfiguration, Order},
+    request::{MetricsConfiguration, Request, WorkerRequest},
     response::{
         Event, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, Response, ResponseContent,
         ResponseStatus, RunState,
@@ -58,7 +58,7 @@ enum CommandMessage {
     },
     ClientOrder {
         client_id: String,
-        order: Order,
+        order: Request,
     },
     WorkerResponse {
         worker_id: u32,
@@ -511,7 +511,7 @@ impl CommandServer {
                 error!("Could not execute order on state: {:#}", e);
             }
 
-            if let &Order::AddCertificate(_) = &order {
+            if let &Request::AddCertificate(_) = &order {
                 debug!("config generated AddCertificate( ... )");
             } else {
                 debug!("config generated {:?}", order);
@@ -660,7 +660,7 @@ impl CommandServer {
         }
 
         new_worker
-            .send(format!("RESTART-{new_worker_id}-STATUS"), Order::Status)
+            .send(format!("RESTART-{new_worker_id}-STATUS"), Request::Status)
             .await;
 
         self.workers.push(new_worker);
@@ -948,7 +948,7 @@ async fn client_loop(
             Ok(msg) => msg,
         };
 
-        match serde_json::from_slice::<Order>(&message) {
+        match serde_json::from_slice::<Request>(&message) {
             Err(e) => {
                 error!("could not decode client message: {:?}", e);
                 break;
@@ -987,7 +987,7 @@ async fn worker_loop(
     worker_id: u32,
     stream: Async<UnixStream>,
     mut command_tx: Sender<CommandMessage>,
-    mut worker_rx: Receiver<InnerOrder>,
+    mut worker_rx: Receiver<WorkerRequest>,
 ) {
     let read_stream = Arc::new(stream);
     let mut write_stream = read_stream.clone();

@@ -74,11 +74,11 @@ where
 mod test {
     use super::*;
 
-    use crate::order::{InnerOrder, Order};
+    use crate::request::{Request, WorkerRequest};
 
     #[test]
     fn parse_one_inner_order_works() {
-        let inner_order = InnerOrder::new("Some request".to_string(), Order::DumpState);
+        let inner_order = WorkerRequest::new("Some request".to_string(), Request::DumpState);
 
         let mut string = serde_json::ser::to_string(&inner_order).unwrap();
 
@@ -99,14 +99,14 @@ mod test {
     #[test]
     fn parse_several_inner_orders_works() {
         let orders = vec![
-            InnerOrder::new(
+            WorkerRequest::new(
                 "Some request".to_string(),
-                Order::SaveState {
+                Request::SaveState {
                     path: "/some/path".to_string(),
                 },
             ),
-            InnerOrder::new("Some other request".to_string(), Order::SubscribeEvents),
-            InnerOrder::new("Yet another request".to_string(), Order::DumpState),
+            WorkerRequest::new("Some other request".to_string(), Request::SubscribeEvents),
+            WorkerRequest::new("Yet another request".to_string(), Request::DumpState),
         ];
 
         let mut serialized_orders = String::new();

@@ -15,7 +15,7 @@ use anyhow::Context;
 use mio::net::UdpSocket;
 
 use crate::sozu_command::{
-    order::{MetricsConfiguration, QueryMetricsOptions},
+    request::{MetricsConfiguration, QueryMetricsOptions},
     response::{FilteredData, QueryAnswerMetrics},
 };
 

@@ -16,11 +16,11 @@ use slab::Slab;
 use sozu_command::{
     channel::Channel,
     config::Config,
-    order::{
-        ActivateListener, Cluster, DeactivateListener, InnerOrder, ListenerType, Order,
-        QueryCertificateType, QueryClusterType, RemoveBackend,
-    },
     ready::Ready,
+    request::{
+        ActivateListener, Cluster, DeactivateListener, ListenerType, QueryCertificateType,
+        QueryClusterType, RemoveBackend, Request, WorkerRequest,
+    },
     response::{
         Backend as CommandLibBackend, HttpListenerConfig, HttpsListenerConfig, MessageId,
         ProxyEvent, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
@@ -40,7 +40,7 @@ use crate::{
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;
 
-pub type ProxyChannel = Channel<ProxyResponse, InnerOrder>;
+pub type ProxyChannel = Channel<ProxyResponse, WorkerRequest>;
 
 thread_local! {
   pub static QUEUE: RefCell<VecDeque<ProxyResponse>> = RefCell::new(VecDeque::new());
@@ -431,7 +431,7 @@ impl Server {
         if let Some(state) = config_state {
             for (counter, order) in state.generate_orders().iter().enumerate() {
                 let id = format!("INIT-{counter}");
-                let message = InnerOrder {
+                let message = WorkerRequest {
                     id,
                     content: order.to_owned(),
                 };
@@ -663,7 +663,7 @@ impl Server {
         loop {
             match self.channel.read_message() {
                 Ok(request) => match request.content {
-                    Order::HardStop => {
+                    Request::HardStop => {
                         let req_id = request.id.clone();
                         self.notify(request);
                         if let Err(e) = self.channel.write_message(&ProxyResponse::ok(req_id)) {
@@ -674,12 +674,12 @@ impl Server {
                         }
                         return true;
                     }
-                    Order::SoftStop => {
+                    Request::SoftStop => {
                         self.shutting_down = Some(request.id.clone());
                         self.last_sessions_len = self.sessions.borrow().slab.len();
                         self.notify(request);
                     }
-                    Order::ReturnListenSockets => {
+                    Request::ReturnListenSockets => {
                         info!("received ReturnListenSockets order");
                         self.return_listen_sockets();
                     }
@@ -869,8 +869,8 @@ impl Server {
         }
     }
 
-    fn notify(&mut self, message: InnerOrder) {
-        if let Order::ConfigureMetrics(configuration) = &message.content {
+    fn notify(&mut self, message: WorkerRequest) {
+        if let Request::ConfigureMetrics(configuration) = &message.content {
             //let id = message.id.clone();
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).configure(configuration);
@@ -881,7 +881,7 @@ impl Server {
         }
 
         match &message.content {
-            Order::QueryClustersHashes => {
+            Request::QueryClustersHashes => {
                 push_queue(ProxyResponse {
                     id: message.id.clone(),
                     status: ProxyResponseStatus::Ok,
@@ -891,7 +891,7 @@ impl Server {
                 });
                 return;
             }
-            Order::QueryClusters(query_type) => {
+            Request::QueryClusters(query_type) => {
                 let query_answer = match query_type {
                     QueryClusterType::ClusterId(cluster_id) => {
                         QueryAnswer::Clusters(vec![self.config_state.cluster_state(cluster_id)])
@@ -917,7 +917,7 @@ impl Server {
                 });
                 return;
             }
-            Order::QueryCertificates(q) => {
+            Request::QueryCertificates(q) => {
                 match q {
                     // forward the query to the TLS implementation
                     QueryCertificateType::Domain(_) => {}
@@ -938,7 +938,7 @@ impl Server {
                     }
                 }
             }
-            Order::QueryMetrics(query_metrics_options) => {
+            Request::QueryMetrics(query_metrics_options) => {
                 METRICS.with(|metrics| {
                     let data = (*metrics.borrow_mut()).query(query_metrics_options);
 
@@ -956,7 +956,7 @@ impl Server {
         self.notify_proxys(message);
     }
 
-    pub fn notify_proxys(&mut self, request: InnerOrder) {
+    pub fn notify_proxys(&mut self, request: WorkerRequest) {
         if let Err(e) = self.config_state.dispatch(&request.content) {
             error!("Could not execute order on config state: {:#}", e);
         }
@@ -964,15 +964,15 @@ impl Server {
         let req_id = request.id.clone();
 
         match request.content {
-            Order::AddCluster(ref cluster) => {
+            Request::AddCluster(ref cluster) => {
                 self.add_cluster(cluster);
                 //not returning because the message must still be handled by each proxy
             }
-            Order::AddBackend(ref backend) => {
+            Request::AddBackend(ref backend) => {
                 push_queue(self.add_backend(&req_id, backend));
                 return;
             }
-            Order::RemoveBackend(ref remove_backend) => {
+            Request::RemoveBackend(ref remove_backend) => {
                 push_queue(self.remove_backend(&req_id, remove_backend));
                 return;
             }
@@ -992,16 +992,16 @@ impl Server {
 
         match request.content {
             // special case for adding listeners, because we need to register a listener
-            Order::AddHttpListener(ref listener) => {
+            Request::AddHttpListener(ref listener) => {
                 push_queue(self.notify_add_http_listener(&req_id, listener));
             }
-            Order::AddHttpsListener(ref listener) => {
+            Request::AddHttpsListener(ref listener) => {
                 push_queue(self.notify_add_https_listener(&req_id, listener));
             }
-            Order::AddTcpListener(listener) => {
+            Request::AddTcpListener(listener) => {
                 push_queue(self.notify_add_tcp_listener(&req_id, listener));
             }
-            Order::RemoveListener(ref remove) => {
+            Request::RemoveListener(ref remove) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
                 let response = match remove.proxy {
@@ -1011,10 +1011,10 @@ impl Server {
                 };
                 push_queue(response);
             }
-            Order::ActivateListener(ref activate) => {
+            Request::ActivateListener(ref activate) => {
                 push_queue(self.notify_activate_listener(&req_id, activate));
             }
-            Order::DeactivateListener(ref deactivate) => {
+            Request::DeactivateListener(ref deactivate) => {
                 push_queue(self.notify_deactivate_listener(&req_id, deactivate));
             }
             _other_order => {}

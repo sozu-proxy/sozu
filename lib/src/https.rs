@@ -49,11 +49,11 @@ use crate::{
     sozu_command::{
         certificate::{CertificateFingerprint, TlsVersion},
         logging,
-        order::{
-            AddCertificate, Cluster, InnerOrder, Order, QueryCertificateType, RemoveCertificate,
-            RemoveListener, ReplaceCertificate,
-        },
         ready::Ready,
+        request::{
+            AddCertificate, Cluster, QueryCertificateType, RemoveCertificate, RemoveListener,
+            ReplaceCertificate, Request, WorkerRequest,
+        },
         response::{
             HttpFrontend, HttpsListenerConfig, ProxyResponse, ProxyResponseContent,
             ProxyResponseStatus, QueryAnswer, QueryAnswerCertificate, Route,
@@ -1259,36 +1259,36 @@ impl ProxyConfiguration for HttpsProxy {
         Ok(())
     }
 
-    fn notify(&mut self, request: InnerOrder) -> ProxyResponse {
+    fn notify(&mut self, request: WorkerRequest) -> ProxyResponse {
         let request_id = request.id.clone();
 
         let content_result = match request.content {
-            Order::AddCluster(cluster) => {
+            Request::AddCluster(cluster) => {
                 info!("{} add cluster {:?}", request_id, cluster);
                 self.add_cluster(cluster.clone())
                     .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
-            Order::RemoveCluster { cluster_id } => {
+            Request::RemoveCluster { cluster_id } => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
                     .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
-            Order::AddHttpsFrontend(front) => {
+            Request::AddHttpsFrontend(front) => {
                 info!("{} add https front {:?}", request_id, front);
                 self.add_https_frontend(front)
                     .with_context(|| "Could not add https frontend")
             }
-            Order::RemoveHttpsFrontend(front) => {
+            Request::RemoveHttpsFrontend(front) => {
                 info!("{} remove https front {:?}", request_id, front);
                 self.remove_https_frontend(front)
                     .with_context(|| "Could not remove https frontend")
             }
-            Order::AddCertificate(add_certificate) => {
+            Request::AddCertificate(add_certificate) => {
                 info!("{} add certificate: {:?}", request_id, add_certificate);
                 self.add_certificate(add_certificate)
                     .with_context(|| "Could not add certificate")
             }
-            Order::RemoveCertificate(remove_certificate) => {
+            Request::RemoveCertificate(remove_certificate) => {
                 info!(
                     "{} remove certificate: {:?}",
                     request_id, remove_certificate
@@ -1296,7 +1296,7 @@ impl ProxyConfiguration for HttpsProxy {
                 self.remove_certificate(remove_certificate)
                     .with_context(|| "Could not remove certificate")
             }
-            Order::ReplaceCertificate(replace_certificate) => {
+            Request::ReplaceCertificate(replace_certificate) => {
                 info!(
                     "{} replace certificate: {:?}",
                     request_id, replace_certificate
@@ -1304,13 +1304,13 @@ impl ProxyConfiguration for HttpsProxy {
                 self.replace_certificate(replace_certificate)
                     .with_context(|| "Could not replace certificate")
             }
-            Order::RemoveListener(remove) => {
+            Request::RemoveListener(remove) => {
                 info!("removing HTTPS listener at address {:?}", remove.address);
                 self.remove_listener(remove.clone()).with_context(|| {
                     format!("Could not remove listener at address {:?}", remove.address)
                 })
             }
-            Order::SoftStop => {
+            Request::SoftStop => {
                 info!("{} processing soft shutdown", request_id);
                 match self
                     .soft_stop()
@@ -1323,7 +1323,7 @@ impl ProxyConfiguration for HttpsProxy {
                     Err(e) => Err(e),
                 }
             }
-            Order::HardStop => {
+            Request::HardStop => {
                 info!("{} processing hard shutdown", request_id);
                 match self
                     .hard_stop()
@@ -1336,11 +1336,11 @@ impl ProxyConfiguration for HttpsProxy {
                     Err(e) => Err(e),
                 }
             }
-            Order::Status => {
+            Request::Status => {
                 info!("{} status", request_id);
                 Ok(None)
             }
-            Order::Logging(logging_filter) => {
+            Request::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     request_id, logging_filter
@@ -1348,12 +1348,12 @@ impl ProxyConfiguration for HttpsProxy {
                 self.logging(logging_filter.clone())
                     .with_context(|| format!("Could not set logging level to {logging_filter}"))
             }
-            Order::QueryCertificates(QueryCertificateType::All) => {
+            Request::QueryCertificates(QueryCertificateType::All) => {
                 info!("{} query all certificates", request_id);
                 self.query_all_certificates()
                     .with_context(|| "Could not query all certificates")
             }
-            Order::QueryCertificates(QueryCertificateType::Domain(domain)) => {
+            Request::QueryCertificates(QueryCertificateType::Domain(domain)) => {
                 info!("{} query certificate for domain {}", request_id, domain);
                 self.query_certificate_for_domain(domain.clone())
                     .with_context(|| format!("Could not query certificate for domain {domain}"))
