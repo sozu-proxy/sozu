@@ -569,12 +569,12 @@ pub enum HttpListenerCmd {
     #[clap(name = "add")]
     Add {
         #[clap(short = 'a')]
-        address: SocketAddr,
+        address: String,
         #[clap(
             long = "public-address",
             help = "a different IP than the one the socket sees, for logs and forwarded headers"
         )]
-        public_address: Option<SocketAddr>,
+        public_address: Option<String>,
         #[clap(
             long = "answer-404",
             help = "path to file of the 404 answer sent to the client when a frontend is not found"
@@ -620,7 +620,7 @@ pub enum HttpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
     },
     #[clap(name = "activate")]
     Activate {
@@ -629,7 +629,7 @@ pub enum HttpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
     },
     #[clap(name = "deactivate")]
     Deactivate {
@@ -638,7 +638,7 @@ pub enum HttpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
     },
 }
 
@@ -647,12 +647,12 @@ pub enum HttpsListenerCmd {
     #[clap(name = "add")]
     Add {
         #[clap(short = 'a')]
-        address: SocketAddr,
+        address: String,
         #[clap(
             long = "public-address",
             help = "a different IP than the one the socket sees, for logs and forwarded headers"
         )]
-        public_address: Option<SocketAddr>,
+        public_address: Option<String>,
         #[clap(
             long = "answer-404",
             help = "path to file of the 404 answer sent to the client when a frontend is not found"
@@ -705,7 +705,7 @@ pub enum HttpsListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
     },
     #[clap(name = "activate")]
     Activate {
@@ -714,7 +714,7 @@ pub enum HttpsListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
     },
     #[clap(name = "deactivate")]
     Deactivate {
@@ -723,7 +723,7 @@ pub enum HttpsListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
     },
 }
 
@@ -736,12 +736,12 @@ pub enum TcpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
         #[clap(
             long = "public-address",
             help = "a different IP than the one the socket sees, for logs and forwarded headers"
         )]
-        public_address: Option<SocketAddr>,
+        public_address: Option<String>,
         #[clap(
             long = "expect-proxy",
             help = "Configures the client socket to receive a PROXY protocol header"
@@ -755,7 +755,7 @@ pub enum TcpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
     },
     #[clap(name = "activate")]
     Activate {
@@ -764,7 +764,7 @@ pub enum TcpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
     },
     #[clap(name = "deactivate")]
     Deactivate {
@@ -773,7 +773,7 @@ pub enum TcpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
     },
 }
 

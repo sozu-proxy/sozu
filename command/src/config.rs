@@ -69,9 +69,9 @@ pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
-    pub address: SocketAddr,
+    pub address: String,
     pub protocol: FileListenerProtocolConfig,
-    pub public_address: Option<SocketAddr>,
+    pub public_address: Option<String>,
     pub answer_404: Option<String>,
     pub answer_503: Option<String>,
     pub tls_versions: Option<Vec<TlsVersion>>,
@@ -97,7 +97,7 @@ fn default_sticky_name() -> String {
 }
 
 impl Listener {
-    pub fn new(address: SocketAddr, protocol: FileListenerProtocolConfig) -> Listener {
+    pub fn new(address: String, protocol: FileListenerProtocolConfig) -> Listener {
         Listener {
             address,
             protocol,
@@ -118,6 +118,22 @@ impl Listener {
         }
     }
 
+    pub fn parse_address(&self) -> anyhow::Result<SocketAddr> {
+        self.address.parse().with_context(|| "wrong socket address")
+    }
+
+    pub fn parse_public_address(&self) -> anyhow::Result<Option<SocketAddr>> {
+        match &self.public_address {
+            Some(a) => {
+                let parsed = a
+                    .parse::<SocketAddr>()
+                    .with_context(|| "wrong socket address")?;
+                Ok(Some(parsed))
+            }
+            None => Ok(None),
+        }
+    }
+
     // TODO: set the default values elsewhere, see #873
     pub fn to_http(
         &self,
@@ -130,24 +146,9 @@ impl Listener {
             bail!("cannot convert listener to HTTP");
         }
 
-        /*FIXME
-        let mut address = self.address.clone();
-        address.push(':');
-        address.push_str(&self.port.to_string());
-
-        let http_proxy_configuration = match address.parse() {
-          Ok(addr) => Some(addr),
-          Err(err) => {
-            error!("Couldn't parse address of HTTP proxy: {}", err);
-            None
-          }
-        };
-        */
-        // let http_proxy_configuration = Some(self.address);
-
         let mut configuration = HttpListenerConfig {
-            address: self.address,
-            public_address: self.public_address,
+            address: self.parse_address()?,
+            public_address: self.parse_public_address()?,
             expect_proxy: self.expect_proxy.unwrap_or(false),
             sticky_name: self.sticky_name.clone(),
             front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
@@ -225,9 +226,9 @@ impl Listener {
         let expect_proxy = self.expect_proxy.unwrap_or(false);
 
         let mut configuration = HttpsListenerConfig {
-            address: self.address,
+            address: self.parse_address()?,
             sticky_name: self.sticky_name.clone(),
-            public_address: self.public_address,
+            public_address: self.parse_public_address()?,
             cipher_list,
             versions,
             expect_proxy,
@@ -260,26 +261,9 @@ impl Listener {
         back_timeout: Option<u32>,
         connect_timeout: Option<u32>,
     ) -> anyhow::Result<TcpListenerConfig> {
-        // what does this code do? should we remove it?
-        /*let mut address = self.address.clone();
-        address.push(':');
-        address.push_str(&self.port.to_string());
-        */
-
-        /*let addr_parsed = match address.parse() {
-          Ok(addr) => Some(addr),
-          Err(err) => {
-            error!("Couldn't parse address of HTTP proxy: {}", err);
-            None
-          }
-        };
-
-        let addr = addr_parsed;
-        */
-
         Ok(TcpListenerConfig {
-            address: self.address,
-            public_address: self.public_address,
+            address: self.parse_address()?,
+            public_address: self.parse_public_address()?,
             expect_proxy: self.expect_proxy.unwrap_or(false),
             front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
             back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
@@ -821,13 +805,13 @@ impl FileConfig {
 
         if let Some(listeners) = config.listeners.as_ref() {
             for listener in listeners.iter() {
-                if reserved_address.contains(&listener.address) {
+                if reserved_address.contains(&listener.parse_address()?) {
                     bail!(format!(
                         "listening address {:?} is already used in the configuration",
                         listener.address
                     ));
                 }
-                reserved_address.insert(listener.address);
+                reserved_address.insert(listener.parse_address()?);
             }
         }
 
@@ -913,17 +897,17 @@ impl ConfigBuilder {
 
     fn populate_listeners(&mut self, listeners: Vec<Listener>) -> anyhow::Result<()> {
         for listener in listeners.iter() {
-            if self.known_addresses.contains_key(&listener.address) {
+            let address = listener.parse_address()?;
+            if self.known_addresses.contains_key(&address) {
                 bail!(format!(
                     "there's already a listener for address {:?}",
                     listener.address
                 ));
             }
 
-            self.known_addresses
-                .insert(listener.address, listener.protocol);
+            self.known_addresses.insert(address, listener.protocol);
             if listener.expect_proxy == Some(true) {
-                self.expect_proxy.insert(listener.address);
+                self.expect_proxy.insert(address);
             }
 
             if listener.public_address.is_some() && listener.expect_proxy == Some(true) {
@@ -988,14 +972,14 @@ impl ConfigBuilder {
                                 // create a default listener for that front
                                 let file_listener_protocol = if frontend.certificate.is_some() {
                                     self.push_tls_listener(Listener::new(
-                                        frontend.address,
+                                        frontend.address.to_string(),
                                         FileListenerProtocolConfig::Https,
                                     ))?;
 
                                     FileListenerProtocolConfig::Https
                                 } else {
                                     self.push_http_listener(Listener::new(
-                                        frontend.address,
+                                        frontend.address.to_string(),
                                         FileListenerProtocolConfig::Http,
                                     ))?;
 
@@ -1019,7 +1003,7 @@ impl ConfigBuilder {
                             None => {
                                 // create a default listener for that front
                                 self.push_tcp_listener(Listener::new(
-                                    frontend.address,
+                                    frontend.address.to_string(),
                                     FileListenerProtocolConfig::Tcp,
                                 ))?;
                                 self.known_addresses

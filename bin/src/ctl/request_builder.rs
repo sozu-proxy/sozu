@@ -9,12 +9,11 @@ use sozu_command_lib::{
     },
     config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
     request::{
-        ActivateListener, AddCertificate, Cluster, DeactivateListener, ListenerType,
-        LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate,
+        ActivateListener, AddCertificate, Cluster, DeactivateListener, FrontendFilters,
+        ListenerType, LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, Request,
     },
-    request::{FrontendFilters, Request},
-    response::{Backend, HttpFrontend, PathRule, RulePosition, TcpFrontend, TcpListenerConfig},
+    response::{Backend, HttpFrontend, PathRule, RulePosition, TcpFrontend},
 };
 
 use crate::{
@@ -376,14 +375,17 @@ impl CommandManager {
                 address,
                 public_address,
                 expect_proxy,
-            } => self.order_request(Request::AddTcpListener(TcpListenerConfig {
-                address,
-                public_address,
-                expect_proxy,
-                front_timeout: 60,
-                back_timeout: 30,
-                connect_timeout: 3,
-            })),
+            } => {
+                let mut listener = Listener::new(address, FileListenerProtocolConfig::Tcp);
+                listener.public_address = public_address;
+                listener.expect_proxy = Some(expect_proxy);
+
+                self.order_request(Request::AddTcpListener(listener.to_tcp(
+                    Some(60),
+                    Some(30),
+                    Some(3),
+                )?))
+            }
             TcpListenerCmd::Remove { address } => self.remove_listener(address, ListenerType::TCP),
             TcpListenerCmd::Activate { address } => {
                 self.activate_listener(address, ListenerType::TCP)
@@ -398,21 +400,20 @@ impl CommandManager {
         self.order_request(Request::ListListeners)
     }
 
-    pub fn remove_listener(
-        &mut self,
-        address: SocketAddr,
-        proxy: ListenerType,
-    ) -> anyhow::Result<()> {
-        self.order_request(Request::RemoveListener(RemoveListener { address, proxy }))
+    pub fn remove_listener(&mut self, address: String, proxy: ListenerType) -> anyhow::Result<()> {
+        self.order_request(Request::RemoveListener(RemoveListener {
+            address: address.parse().with_context(|| "wrong socket address")?,
+            proxy,
+        }))
     }
 
     pub fn activate_listener(
         &mut self,
-        address: SocketAddr,
+        address: String,
         proxy: ListenerType,
     ) -> anyhow::Result<()> {
         self.order_request(Request::ActivateListener(ActivateListener {
-            address,
+            address: address.parse().with_context(|| "wrong socket address")?,
             proxy,
             from_scm: false,
         }))
@@ -420,11 +421,12 @@ impl CommandManager {
 
     pub fn deactivate_listener(
         &mut self,
-        address: SocketAddr,
+        address: String,
         proxy: ListenerType,
     ) -> anyhow::Result<()> {
         self.order_request(Request::DeactivateListener(DeactivateListener {
-            address,
+            // address,
+            address: address.parse().with_context(|| "wrong socket address")?,
             proxy,
             to_scm: false,
         }))
