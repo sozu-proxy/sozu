@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
     fs::File,
-    io::{self, Error, ErrorKind, Read},
+    io::{self, Read},
     net::SocketAddr,
     ops::Range,
     path::PathBuf,
@@ -806,65 +806,53 @@ pub struct FileConfig {
 }
 
 impl FileConfig {
-    pub fn load_from_path(path: &str) -> io::Result<FileConfig> {
+    pub fn load_from_path(path: &str) -> anyhow::Result<FileConfig> {
         let data = Config::load_file(path)?;
 
-        match toml::from_str(&data) {
+        let config: FileConfig = match toml::from_str(&data) {
+            Ok(config) => config,
             Err(e) => {
                 display_toml_error(&data, &e);
-                Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("decoding error: {e}"),
-                ))
+                bail!(format!("toml decoding error: {e}"));
             }
-            Ok(config) => {
-                let config: FileConfig = config;
-                let mut reserved_address: HashSet<SocketAddr> = HashSet::new();
+        };
 
-                if let Some(l) = config.listeners.as_ref() {
-                    for listener in l.iter() {
-                        if reserved_address.contains(&listener.address) {
-                            println!(
-                                "listening address {:?} is already used in the configuration",
-                                listener.address
-                            );
-                            return Err(Error::new(
-                                ErrorKind::InvalidData,
-                                format!(
-                                    "listening address {:?} is already used in the configuration",
-                                    listener.address
-                                ),
-                            ));
-                        } else {
-                            reserved_address.insert(listener.address);
-                        }
-                    }
+        let mut reserved_address: HashSet<SocketAddr> = HashSet::new();
+
+        if let Some(listeners) = config.listeners.as_ref() {
+            for listener in listeners.iter() {
+                if reserved_address.contains(&listener.address) {
+                    bail!(format!(
+                        "listening address {:?} is already used in the configuration",
+                        listener.address
+                    ));
                 }
-
-                //FIXME: verify how clusters and listeners share addresses
-                /*
-                if let Some(ref clusters) = config.clusters {
-                  for (key, cluster) in clusters.iter() {
-                    if let (Some(address), Some(port)) = (cluster.ip_address.clone(), cluster.port) {
-                      let addr = (address, port);
-                      if reserved_address.contains(&addr) {
-                        println!("TCP cluster '{}' listening address ( {}:{} ) is already used in the configuration",
-                          key, addr.0, addr.1);
-                        return Err(Error::new(
-                          ErrorKind::InvalidData,
-                          format!("TCP cluster '{}' listening address ( {}:{} ) is already used in the configuration",
-                            key, addr.0, addr.1)));
-                      } else {
-                        reserved_address.insert(addr.clone());
-                      }
-                    }
-                  }
-                }
-                */
-
-                Ok(config)
+                reserved_address.insert(listener.address);
             }
         }
+
+        //FIXME: verify how clusters and listeners share addresses
+        /*
+        if let Some(ref clusters) = config.clusters {
+          for (key, cluster) in clusters.iter() {
+            if let (Some(address), Some(port)) = (cluster.ip_address.clone(), cluster.port) {
+              let addr = (address, port);
+              if reserved_address.contains(&addr) {
+                println!("TCP cluster '{}' listening address ( {}:{} ) is already used in the configuration",
+                  key, addr.0, addr.1);
+                return Err(Error::new(
+                  ErrorKind::InvalidData,
+                  format!("TCP cluster '{}' listening address ( {}:{} ) is already used in the configuration",
+                    key, addr.0, addr.1)));
+              } else {
+                reserved_address.insert(addr.clone());
+              }
+            }
+          }
+        }
+        */
+
+        Ok(config)
     }
 
     // TODO: split into severa functions
