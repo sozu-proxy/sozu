@@ -30,7 +30,7 @@ use sozu_command_lib::{
 use sozu::metrics::METRICS;
 
 use crate::{
-    command::{CommandMessage, CommandServer, Response, Success, Worker},
+    command::{Advancement, CommandMessage, CommandServer, Success, Worker},
     upgrade::fork_main_into_new_main,
     worker::start_worker,
 };
@@ -1316,10 +1316,10 @@ impl CommandServer {
     pub async fn notify_advancement_to_client(
         &mut self,
         client_id: String,
-        response: Response,
+        response: Advancement,
     ) -> anyhow::Result<Success> {
         let command_response = match response {
-            Response::Ok(success) => {
+            Advancement::Ok(success) => {
                 let success_message = success.to_string();
 
                 let command_response_data = match success {
@@ -1335,10 +1335,10 @@ impl CommandServer {
 
                 CommandResponse::new(CommandStatus::Ok, success_message, command_response_data)
             }
-            Response::Processing(processing_message) => {
+            Advancement::Processing(processing_message) => {
                 CommandResponse::new(CommandStatus::Processing, processing_message, None)
             }
-            Response::Error(error_message) => {
+            Advancement::Error(error_message) => {
                 CommandResponse::new(CommandStatus::Error, error_message, None)
             }
         };
@@ -1374,7 +1374,7 @@ async fn return_error<T>(
 {
     let advancement = CommandMessage::Advancement {
         client_id,
-        response: Response::Error(error_message.to_string()),
+        advancement: Advancement::Error(error_message.to_string()),
     };
 
     trace!("return_error: sending event to the command server");
@@ -1392,7 +1392,7 @@ async fn return_processing<T>(
 {
     let advancement = CommandMessage::Advancement {
         client_id,
-        response: Response::Processing(processing_message.to_string()),
+        advancement: Advancement::Processing(processing_message.to_string()),
     };
 
     trace!("return_processing: sending event to the command server");
@@ -1411,7 +1411,7 @@ async fn return_success(
 ) {
     let advancement = CommandMessage::Advancement {
         client_id,
-        response: Response::Ok(success),
+        advancement: Advancement::Ok(success),
     };
     trace!("return_success: sending event to the command server");
     if let Err(e) = command_tx.send(advancement).await {

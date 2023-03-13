@@ -69,13 +69,13 @@ enum CommandMessage {
     },
     Advancement {
         client_id: String,
-        response: Response,
+        advancement: Advancement,
     },
     MasterStop,
 }
 
 #[derive(PartialEq, Eq, Clone, Debug)]
-pub enum Response {
+pub enum Advancement {
     Error(String),
     Processing(String),
     Ok(Success),
@@ -319,12 +319,12 @@ impl CommandServer {
                     .with_context(|| "Could not handle worker response"),
                 CommandMessage::Advancement {
                     client_id,
-                    response,
+                    advancement: response,
                 } => {
                     let success_result = self
                         .notify_advancement_to_client(client_id, response.clone())
                         .await;
-                    if let Response::Ok(Success::UpgradeMain(_)) = response {
+                    if let Advancement::Ok(Success::UpgradeMain(_)) = response {
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         info!("shutting down old main");
                         std::process::exit(0);
