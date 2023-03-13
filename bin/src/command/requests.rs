@@ -808,8 +808,7 @@ impl CommandServer {
                 }
 
                 if !found {
-                    // FIXME: should send back error here
-                    error!("no worker found");
+                    bail!("no worker found");
                 }
             }
         }
@@ -1301,8 +1300,6 @@ impl CommandServer {
         .detach();
 
         if !found {
-            // FIXME: should send back error here
-            // is this fix OK?
             bail!("no worker found");
         }
 

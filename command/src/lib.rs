@@ -13,5 +13,4 @@ pub mod request;
 pub mod response;
 pub mod scm_socket;
 pub mod state;
-pub mod worker;
 pub mod writer;
