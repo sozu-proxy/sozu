@@ -766,7 +766,7 @@ impl ClusterConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct FileConfig {
     pub command_socket: Option<String>,
     pub command_buffer_size: Option<usize>,
@@ -854,200 +854,197 @@ impl FileConfig {
 
         Ok(config)
     }
+}
 
-    // TODO: split into severa functions
-    pub fn into(self, config_path: &str) -> anyhow::Result<Config> {
-        let mut clusters = HashMap::new();
-        let mut http_listeners = Vec::new();
-        let mut https_listeners = Vec::new();
-        let mut tcp_listeners = Vec::new();
-        let mut known_addresses = HashMap::new();
-        let mut expect_proxy = HashSet::new();
+pub struct ConfigBuilder {
+    file: FileConfig,
+    known_addresses: HashMap<SocketAddr, FileListenerProtocolConfig>,
+    expect_proxy: HashSet<SocketAddr>,
+    built: Config,
+}
 
-        if let Some(listeners) = self.listeners {
-            for listener in listeners.iter() {
-                if known_addresses.contains_key(&listener.address) {
-                    bail!(format!(
-                        "there's already a listener for address {:?}",
-                        listener.address
-                    ));
-                }
+impl ConfigBuilder {
+    pub fn new(file_config: FileConfig) -> Self {
+        Self {
+            file: file_config,
+            known_addresses: HashMap::new(),
+            expect_proxy: HashSet::new(),
+            built: Config::default(),
+        }
+    }
 
-                known_addresses.insert(listener.address, listener.protocol);
-                if listener.expect_proxy == Some(true) {
-                    expect_proxy.insert(listener.address);
-                }
+    fn push_tls_listener(&mut self, listener: Listener) -> anyhow::Result<()> {
+        let listener = listener
+            .to_tls(
+                self.file.front_timeout,
+                self.file.back_timeout,
+                self.file.connect_timeout,
+                self.file.request_timeout,
+            )
+            .with_context(|| "Cannot convert listener to TLS")?;
+        self.built.https_listeners.push(listener);
+        Ok(())
+    }
 
-                if listener.public_address.is_some() && listener.expect_proxy == Some(true) {
-                    bail!(format!(
+    fn push_http_listener(&mut self, listener: Listener) -> anyhow::Result<()> {
+        let listener = listener
+            .to_http(
+                self.file.front_timeout,
+                self.file.back_timeout,
+                self.file.connect_timeout,
+                self.file.request_timeout,
+            )
+            .with_context(|| "Cannot convert listener to HTTP")?;
+        self.built.http_listeners.push(listener);
+        Ok(())
+    }
+
+    fn push_tcp_listener(&mut self, listener: Listener) -> anyhow::Result<()> {
+        let listener = listener
+            .to_tcp(
+                self.file.front_timeout,
+                self.file.back_timeout,
+                self.file.connect_timeout,
+            )
+            .with_context(|| "Cannot convert listener to TCP")?;
+        self.built.tcp_listeners.push(listener);
+        Ok(())
+    }
+
+    fn populate_listeners(&mut self, listeners: Vec<Listener>) -> anyhow::Result<()> {
+        for listener in listeners.iter() {
+            if self.known_addresses.contains_key(&listener.address) {
+                bail!(format!(
+                    "there's already a listener for address {:?}",
+                    listener.address
+                ));
+            }
+
+            self.known_addresses
+                .insert(listener.address, listener.protocol);
+            if listener.expect_proxy == Some(true) {
+                self.expect_proxy.insert(listener.address);
+            }
+
+            if listener.public_address.is_some() && listener.expect_proxy == Some(true) {
+                bail!(format!(
                         "the listener on {} has incompatible options: it cannot use the expect proxy protocol and have a public_address field at the same time",
                         &listener.address
                     ));
-                }
+            }
 
-                match listener.protocol {
-                    FileListenerProtocolConfig::Https => {
-                        let listener = listener
-                            .to_tls(
-                                self.front_timeout,
-                                self.back_timeout,
-                                self.connect_timeout,
-                                self.request_timeout,
-                            )
-                            .with_context(|| "invalid listener")?;
-                        https_listeners.push(listener);
-                    }
-                    FileListenerProtocolConfig::Http => {
-                        let listener = listener
-                            .to_http(
-                                self.front_timeout,
-                                self.back_timeout,
-                                self.connect_timeout,
-                                self.request_timeout,
-                            )
-                            .with_context(|| "invalid listener")?;
-                        http_listeners.push(listener);
-                    }
-                    FileListenerProtocolConfig::Tcp => {
-                        let listener = listener
-                            .to_tcp(self.front_timeout, self.back_timeout, self.connect_timeout)
-                            .with_context(|| "invalid listener")?;
-                        tcp_listeners.push(listener);
-                    }
-                }
+            match listener.protocol {
+                FileListenerProtocolConfig::Https => self.push_tls_listener(listener.clone())?,
+                FileListenerProtocolConfig::Http => self.push_http_listener(listener.clone())?,
+                FileListenerProtocolConfig::Tcp => self.push_tcp_listener(listener.clone())?,
             }
         }
+        Ok(())
+    }
 
-        if let Some(mut file_cluster_configs) = self.clusters {
-            for (id, file_cluster_config) in file_cluster_configs.drain() {
-                let mut cluster_config = file_cluster_config
-                    .to_cluster_config(id.as_str(), &expect_proxy)
-                    .with_context(|| {
-                        format!("error parsing cluster configuration for cluster {id}")
-                    })?;
+    fn populate_clusters(
+        &mut self,
+        mut file_cluster_configs: HashMap<String, FileClusterConfig>,
+    ) -> anyhow::Result<()> {
+        for (id, file_cluster_config) in file_cluster_configs.drain() {
+            let mut cluster_config = file_cluster_config
+                .to_cluster_config(id.as_str(), &self.expect_proxy)
+                .with_context(|| format!("error parsing cluster configuration for cluster {id}"))?;
 
-                match cluster_config {
-                    ClusterConfig::Http(ref mut http) => {
-                        for frontend in http.frontends.iter_mut() {
-                            match known_addresses.get(&frontend.address) {
-                                Some(FileListenerProtocolConfig::Tcp) => {
-                                    bail!(
-                                        "cannot set up a HTTP or HTTPS frontend on a TCP listener"
-                                    );
+            match cluster_config {
+                ClusterConfig::Http(ref mut http) => {
+                    for frontend in http.frontends.iter_mut() {
+                        match self.known_addresses.get(&frontend.address) {
+                            Some(FileListenerProtocolConfig::Tcp) => {
+                                bail!("cannot set up a HTTP or HTTPS frontend on a TCP listener");
+                            }
+                            Some(FileListenerProtocolConfig::Http) => {
+                                if frontend.certificate.is_some() {
+                                    bail!("cannot set up a HTTPS frontend on a HTTP listener");
                                 }
-                                Some(FileListenerProtocolConfig::Http) => {
-                                    if frontend.certificate.is_some() {
-                                        bail!("cannot set up a HTTPS frontend on a HTTP listener");
+                            }
+                            Some(FileListenerProtocolConfig::Https) => {
+                                if frontend.certificate.is_none() {
+                                    if let Some(https_listener) =
+                                        self.built.https_listeners.iter().find(|listener| {
+                                            listener.address == frontend.address
+                                                && listener.certificate.is_some()
+                                        })
+                                    {
+                                        //println!("using listener certificate for {:}", frontend.address);
+                                        frontend.certificate = https_listener.certificate.clone();
+                                        frontend.certificate_chain =
+                                            Some(https_listener.certificate_chain.clone());
+                                        frontend.key = https_listener.key.clone();
                                     }
-                                }
-                                Some(FileListenerProtocolConfig::Https) => {
                                     if frontend.certificate.is_none() {
-                                        if let Some(https_listener) =
-                                            https_listeners.iter().find(|listener| {
-                                                listener.address == frontend.address
-                                                    && listener.certificate.is_some()
-                                            })
-                                        {
-                                            //println!("using listener certificate for {:}", frontend.address);
-                                            frontend.certificate =
-                                                https_listener.certificate.clone();
-                                            frontend.certificate_chain =
-                                                Some(https_listener.certificate_chain.clone());
-                                            frontend.key = https_listener.key.clone();
-                                        }
-                                        if frontend.certificate.is_none() {
-                                            println!("known addresses: {known_addresses:#?}");
-                                            println!("frontend: {frontend:#?}");
-                                            bail!(
-                                                "cannot set up a HTTP frontend on a HTTPS listener"
-                                            );
-                                        }
+                                        println!("known addresses: {:#?}", self.known_addresses);
+                                        println!("frontend: {frontend:#?}");
+                                        bail!("cannot set up a HTTP frontend on a HTTPS listener");
                                     }
                                 }
-                                None => {
-                                    // create a default listener for that front
-                                    let file_listener_protocol = if frontend.certificate.is_some() {
-                                        let listener = Listener::new(
-                                            frontend.address,
-                                            FileListenerProtocolConfig::Https,
-                                        );
-                                        https_listeners.push(
-                                            listener
-                                                .to_tls(
-                                                    self.front_timeout,
-                                                    self.back_timeout,
-                                                    self.connect_timeout,
-                                                    self.request_timeout,
-                                                )
-                                                .with_context(|| {
-                                                    "Cannot convert listener to TLS"
-                                                })?,
-                                        );
-
-                                        FileListenerProtocolConfig::Https
-                                    } else {
-                                        let listener = Listener::new(
-                                            frontend.address,
-                                            FileListenerProtocolConfig::Http,
-                                        );
-                                        http_listeners.push(
-                                            listener
-                                                .to_http(
-                                                    self.front_timeout,
-                                                    self.back_timeout,
-                                                    self.connect_timeout,
-                                                    self.request_timeout,
-                                                )
-                                                .with_context(|| {
-                                                    "Cannot convert listener to HTTP"
-                                                })?,
-                                        );
-
-                                        FileListenerProtocolConfig::Http
-                                    };
-                                    known_addresses
-                                        .insert(frontend.address, file_listener_protocol);
-                                }
                             }
-                        }
-                    }
-                    ClusterConfig::Tcp(ref tcp) => {
-                        //FIXME: verify that different TCP clusters do not request the same address
-                        for frontend in &tcp.frontends {
-                            match known_addresses.get(&frontend.address) {
-                                Some(FileListenerProtocolConfig::Http)
-                                | Some(FileListenerProtocolConfig::Https) => {
-                                    bail!("cannot set up a TCP frontend on a HTTP listener");
-                                }
-                                Some(FileListenerProtocolConfig::Tcp) => {}
-                                None => {
-                                    // create a default listener for that front
-                                    let listener = Listener::new(
+                            None => {
+                                // create a default listener for that front
+                                let file_listener_protocol = if frontend.certificate.is_some() {
+                                    self.push_tls_listener(Listener::new(
                                         frontend.address,
-                                        FileListenerProtocolConfig::Tcp,
-                                    );
-                                    tcp_listeners.push(
-                                        listener
-                                            .to_tcp(
-                                                self.front_timeout,
-                                                self.back_timeout,
-                                                self.connect_timeout,
-                                            )
-                                            .with_context(|| "Cannot convert listener to TCP")?,
-                                    );
-                                    known_addresses
-                                        .insert(frontend.address, FileListenerProtocolConfig::Tcp);
-                                }
+                                        FileListenerProtocolConfig::Https,
+                                    ))?;
+
+                                    FileListenerProtocolConfig::Https
+                                } else {
+                                    self.push_http_listener(Listener::new(
+                                        frontend.address,
+                                        FileListenerProtocolConfig::Http,
+                                    ))?;
+
+                                    FileListenerProtocolConfig::Http
+                                };
+                                self.known_addresses
+                                    .insert(frontend.address, file_listener_protocol);
                             }
                         }
                     }
                 }
-
-                clusters.insert(id, cluster_config);
+                ClusterConfig::Tcp(ref tcp) => {
+                    //FIXME: verify that different TCP clusters do not request the same address
+                    for frontend in &tcp.frontends {
+                        match self.known_addresses.get(&frontend.address) {
+                            Some(FileListenerProtocolConfig::Http)
+                            | Some(FileListenerProtocolConfig::Https) => {
+                                bail!("cannot set up a TCP frontend on a HTTP listener");
+                            }
+                            Some(FileListenerProtocolConfig::Tcp) => {}
+                            None => {
+                                // create a default listener for that front
+                                self.push_tcp_listener(Listener::new(
+                                    frontend.address,
+                                    FileListenerProtocolConfig::Tcp,
+                                ))?;
+                                self.known_addresses
+                                    .insert(frontend.address, FileListenerProtocolConfig::Tcp);
+                            }
+                        }
+                    }
+                }
             }
+
+            self.built.clusters.insert(id, cluster_config);
+        }
+        Ok(())
+    }
+
+    pub fn into_config(&mut self, config_path: &str) -> anyhow::Result<Config> {
+        if let Some(listeners) = &self.file.listeners {
+            self.populate_listeners(listeners.clone())?;
         }
 
-        let command_socket_path = self.command_socket.unwrap_or({
+        if let Some(file_cluster_configs) = &self.file.clusters {
+            self.populate_clusters(file_cluster_configs.clone())?;
+        }
+
+        let command_socket_path = self.file.command_socket.clone().unwrap_or({
             let mut path = env::current_dir().with_context(|| "env path not found")?;
             path.push("sozu.sock");
             let verified_path = path
@@ -1056,51 +1053,60 @@ impl FileConfig {
             verified_path.to_owned()
         });
 
-        if let (None, Some(true)) = (&self.saved_state, &self.automatic_state_save) {
+        if let (None, Some(true)) = (&self.file.saved_state, &self.file.automatic_state_save) {
             bail!("cannot activate automatic state save if the 'saved_state` option is not set");
         }
 
         Ok(Config {
             config_path: config_path.to_string(),
             command_socket: command_socket_path,
-            command_buffer_size: self.command_buffer_size.unwrap_or(1_000_000),
+            command_buffer_size: self.file.command_buffer_size.unwrap_or(1_000_000),
             max_command_buffer_size: self
+                .file
                 .max_command_buffer_size
-                .unwrap_or(self.command_buffer_size.unwrap_or(1_000_000) * 2),
-            max_connections: self.max_connections.unwrap_or(10000),
+                .unwrap_or(self.file.command_buffer_size.unwrap_or(1_000_000) * 2),
+            max_connections: self.file.max_connections.unwrap_or(10000),
             min_buffers: std::cmp::min(
-                self.min_buffers.unwrap_or(1),
-                self.max_buffers.unwrap_or(1000),
+                self.file.min_buffers.unwrap_or(1),
+                self.file.max_buffers.unwrap_or(1000),
             ),
-            max_buffers: self.max_buffers.unwrap_or(1000),
-            buffer_size: self.buffer_size.unwrap_or(16393),
-            saved_state: self.saved_state,
-            automatic_state_save: self.automatic_state_save.unwrap_or(false),
-            log_level: self.log_level.unwrap_or_else(|| String::from("info")),
-            log_target: self.log_target.unwrap_or_else(|| String::from("stdout")),
-            log_access_target: self.log_access_target,
-            worker_count: self.worker_count.unwrap_or(2),
-            worker_automatic_restart: self.worker_automatic_restart.unwrap_or(true),
-            metrics: self.metrics,
-            http_listeners,
-            https_listeners,
-            tcp_listeners,
-            clusters,
-            handle_process_affinity: self.handle_process_affinity.unwrap_or(false),
-            ctl_command_timeout: self.ctl_command_timeout.unwrap_or(1_000),
-            pid_file_path: self.pid_file_path,
-            activate_listeners: self.activate_listeners.unwrap_or(true),
-            front_timeout: self.front_timeout.unwrap_or(60),
-            back_timeout: self.front_timeout.unwrap_or(30),
-            connect_timeout: self.front_timeout.unwrap_or(3),
+            max_buffers: self.file.max_buffers.unwrap_or(1000),
+            buffer_size: self.file.buffer_size.unwrap_or(16393),
+            saved_state: self.file.saved_state.clone(),
+            automatic_state_save: self.file.automatic_state_save.unwrap_or(false),
+            log_level: self
+                .file
+                .log_level
+                .clone()
+                .unwrap_or_else(|| String::from("info")),
+            log_target: self
+                .file
+                .log_target
+                .clone()
+                .unwrap_or_else(|| String::from("stdout")),
+            log_access_target: self.file.log_access_target.clone(),
+            worker_count: self.file.worker_count.unwrap_or(2),
+            worker_automatic_restart: self.file.worker_automatic_restart.unwrap_or(true),
+            metrics: self.file.metrics.clone(),
+            http_listeners: self.built.http_listeners.clone(),
+            https_listeners: self.built.https_listeners.clone(),
+            tcp_listeners: self.built.tcp_listeners.clone(),
+            clusters: self.built.clusters.clone(),
+            handle_process_affinity: self.file.handle_process_affinity.unwrap_or(false),
+            ctl_command_timeout: self.file.ctl_command_timeout.unwrap_or(1_000),
+            pid_file_path: self.file.pid_file_path.clone(),
+            activate_listeners: self.file.activate_listeners.unwrap_or(true),
+            front_timeout: self.file.front_timeout.unwrap_or(60),
+            back_timeout: self.file.front_timeout.unwrap_or(30),
+            connect_timeout: self.file.front_timeout.unwrap_or(3),
             //defaults to 30mn
-            zombie_check_interval: self.zombie_check_interval.unwrap_or(30 * 60),
-            accept_queue_timeout: self.accept_queue_timeout.unwrap_or(60),
+            zombie_check_interval: self.file.zombie_check_interval.unwrap_or(30 * 60),
+            accept_queue_timeout: self.file.accept_queue_timeout.unwrap_or(60),
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct Config {
     pub config_path: String,
     pub command_socket: String,
@@ -1166,9 +1172,11 @@ impl Config {
         let file_config =
             FileConfig::load_from_path(path).with_context(|| "Could not load the config file")?;
 
-        let mut config = file_config
-            .into(path)
-            .with_context(|| "Could not parse config from file")?;
+        let mut config_builder = ConfigBuilder::new(file_config);
+
+        let mut config = config_builder
+            .into_config(path)
+            .with_context(|| "Could not build config from file")?;
 
         // replace saved_state with a verified path
         config.saved_state = config
@@ -1394,36 +1402,19 @@ mod tests {
         let listeners = vec![http, https];
         let config = FileConfig {
             command_socket: Some(String::from("./command_folder/sock")),
-            saved_state: None,
-            automatic_state_save: None,
             worker_count: Some(2),
             worker_automatic_restart: Some(true),
-            handle_process_affinity: None,
-            command_buffer_size: None,
             max_connections: Some(500),
             min_buffers: Some(1),
             max_buffers: Some(500),
             buffer_size: Some(16393),
-            max_command_buffer_size: None,
-            log_level: None,
-            log_target: None,
-            log_access_target: None,
             metrics: Some(MetricsConfig {
                 address: "127.0.0.1:8125".parse().unwrap(),
                 tagged_metrics: false,
                 prefix: Some(String::from("sozu-metrics")),
             }),
             listeners: Some(listeners),
-            clusters: None,
-            ctl_command_timeout: None,
-            pid_file_path: None,
-            activate_listeners: None,
-            front_timeout: None,
-            back_timeout: None,
-            connect_timeout: None,
-            zombie_check_interval: None,
-            accept_queue_timeout: None,
-            request_timeout: None,
+            ..Default::default()
         };
 
         println!("config: {:?}", to_string(&config));

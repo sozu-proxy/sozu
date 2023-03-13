@@ -14,7 +14,7 @@ use sozu_lib as sozu;
 use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
-    config::{Config, FileConfig},
+    config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
     request::Request,
     request::{Cluster, LoadBalancingAlgorithms, LoadBalancingParams, WorkerRequest},
@@ -53,35 +53,7 @@ pub fn set_no_close_exec(fd: i32) {
 
 impl Worker {
     pub fn empty_file_config() -> FileConfig {
-        FileConfig {
-            command_socket: None,
-            saved_state: None,
-            automatic_state_save: None,
-            worker_count: None,
-            worker_automatic_restart: Some(false),
-            handle_process_affinity: None,
-            command_buffer_size: None,
-            max_command_buffer_size: None,
-            max_connections: None,
-            min_buffers: None,
-            max_buffers: None,
-            buffer_size: None,
-            log_level: None,
-            log_target: None,
-            log_access_target: None,
-            metrics: None,
-            listeners: None,
-            clusters: None,
-            ctl_command_timeout: None,
-            pid_file_path: None,
-            activate_listeners: None,
-            request_timeout: None,
-            front_timeout: None,
-            back_timeout: None,
-            connect_timeout: None,
-            zombie_check_interval: None,
-            accept_queue_timeout: None,
-        }
+        FileConfig::default()
     }
 
     pub fn empty_listeners() -> Listeners {
@@ -92,8 +64,11 @@ impl Worker {
         }
     }
 
-    pub fn into_config(config: FileConfig) -> Config {
-        config.into("").expect("could not create Config")
+    pub fn into_config(file_config: FileConfig) -> Config {
+        let mut config_builder = ConfigBuilder::new(file_config);
+        config_builder
+            .into_config("")
+            .expect("could not create Config")
     }
 
     pub fn empty_config() -> (Config, Listeners, ConfigState) {
