@@ -19,22 +19,22 @@ use crate::{
 
 /// Responses of the main process to the CLI (or other client)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandResponse {
+pub struct Response {
     pub id: String,
     pub version: u8,
-    pub status: CommandStatus,
+    pub status: ResponseStatus,
     pub message: String,
-    pub content: Option<CommandResponseContent>,
+    pub content: Option<ResponseContent>,
 }
 
-impl CommandResponse {
+impl Response {
     pub fn new(
         // id: String,
-        status: CommandStatus,
+        status: ResponseStatus,
         message: String,
-        content: Option<CommandResponseContent>,
-    ) -> CommandResponse {
-        CommandResponse {
+        content: Option<ResponseContent>,
+    ) -> Response {
+        Response {
             version: PROTOCOL_VERSION,
             id: "generic-response-id-to-be-removed".to_string(),
             status,
@@ -46,16 +46,16 @@ impl CommandResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CommandStatus {
+pub enum ResponseStatus {
     Ok,
     Processing,
-    Error,
+    Failure,
 }
 
 /// details of a response sent by the main process to the client
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum CommandResponseContent {
+pub enum ResponseContent {
     /// a list of workers, with ids, pids, statuses
     Workers(Vec<WorkerInfo>),
     /// aggregated metrics of main process and workers
@@ -647,7 +647,7 @@ mod tests {
                 data
             );
 
-            let message: CommandResponse = serde_json::from_str(data).unwrap();
+            let message: Response = serde_json::from_str(data).unwrap();
             assert_eq!(
                 message,
                 $expected_message,
@@ -662,12 +662,12 @@ mod tests {
     test_message_answer!(
         answer_workers_status,
         "../assets/answer_workers_status.json",
-        CommandResponse {
+        Response {
             id: "ID_TEST".to_string(),
             version: 0,
-            status: CommandStatus::Ok,
+            status: ResponseStatus::Ok,
             message: String::from(""),
-            content: Some(CommandResponseContent::Workers(vec!(
+            content: Some(ResponseContent::Workers(vec!(
                 WorkerInfo {
                     id: 1,
                     pid: 5678,
@@ -685,12 +685,12 @@ mod tests {
     test_message_answer!(
         answer_metrics,
         "../assets/answer_metrics.json",
-        CommandResponse {
+        Response {
             id: "ID_TEST".to_string(),
             version: 0,
-            status: CommandStatus::Ok,
+            status: ResponseStatus::Ok,
             message: String::from(""),
-            content: Some(CommandResponseContent::Metrics(AggregatedMetricsData {
+            content: Some(ResponseContent::Metrics(AggregatedMetricsData {
                 main: [
                     (String::from("sozu.gauge"), FilteredData::Gauge(1)),
                     (String::from("sozu.count"), FilteredData::Count(-2)),

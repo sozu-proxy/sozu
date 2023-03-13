@@ -19,9 +19,9 @@ use sozu_command_lib::{
     order::{FrontendFilters, InnerOrder, MetricsConfiguration, Order, QueryClusterType},
     parser::parse_several_commands,
     response::{
-        AggregatedMetricsData, CommandResponse, CommandResponseContent, CommandStatus,
-        ListedFrontends, ListenersList, ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
-        RunState, WorkerInfo,
+        AggregatedMetricsData, ListedFrontends, ListenersList, ProxyResponseContent,
+        ProxyResponseStatus, QueryAnswer, Response, ResponseContent, ResponseStatus, RunState,
+        WorkerInfo,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -152,9 +152,9 @@ impl CommandServer {
     pub async fn dump_state(&mut self) -> anyhow::Result<Option<Success>> {
         let state = self.state.clone();
 
-        Ok(Some(Success::DumpState(CommandResponseContent::State(
-            Box::new(state),
-        ))))
+        Ok(Some(Success::DumpState(ResponseContent::State(Box::new(
+            state,
+        )))))
     }
 
     pub async fn load_state(
@@ -389,14 +389,14 @@ impl CommandServer {
             }
         }
 
-        Ok(Some(Success::ListFrontends(
-            CommandResponseContent::FrontendList(listed_frontends),
-        )))
+        Ok(Some(Success::ListFrontends(ResponseContent::FrontendList(
+            listed_frontends,
+        ))))
     }
 
     fn list_listeners(&self) -> anyhow::Result<Option<Success>> {
         Ok(Some(Success::ListListeners(
-            CommandResponseContent::ListenersList(ListenersList {
+            ResponseContent::ListenersList(ListenersList {
                 http_listeners: self.state.http_listeners.clone(),
                 https_listeners: self.state.https_listeners.clone(),
                 tcp_listeners: self.state.tcp_listeners.clone(),
@@ -417,7 +417,7 @@ impl CommandServer {
 
         debug!("workers: {:#?}", workers);
 
-        Ok(Some(Success::ListWorkers(CommandResponseContent::Workers(
+        Ok(Some(Success::ListWorkers(ResponseContent::Workers(
             workers,
         ))))
     }
@@ -937,7 +937,7 @@ impl CommandServer {
             return_success(
                 command_tx,
                 thread_client_id,
-                Success::Status(CommandResponseContent::Status(worker_info_vec)),
+                Success::Status(ResponseContent::Status(worker_info_vec)),
             )
             .await;
         })
@@ -1118,19 +1118,19 @@ impl CommandServer {
                 &Order::QueryClustersHashes | &Order::QueryClusters(_) => {
                     let main = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
                     query_answers.insert(String::from("main"), main);
-                    Success::Query(CommandResponseContent::Query(query_answers))
+                    Success::Query(ResponseContent::Query(query_answers))
                 }
                 &Order::QueryCertificates(_) => {
                     info!("certificates query answer received: {:?}", query_answers);
-                    Success::Query(CommandResponseContent::Query(query_answers))
+                    Success::Query(ResponseContent::Query(query_answers))
                 }
                 Order::QueryMetrics(options) => {
                     debug!("metrics query answer received: {:?}", query_answers);
 
                     if options.list {
-                        Success::Query(CommandResponseContent::Query(query_answers))
+                        Success::Query(ResponseContent::Query(query_answers))
                     } else {
-                        Success::Query(CommandResponseContent::Metrics(AggregatedMetricsData {
+                        Success::Query(ResponseContent::Metrics(AggregatedMetricsData {
                             main: main_metrics,
                             workers: query_answers,
                         }))
@@ -1333,13 +1333,13 @@ impl CommandServer {
                     _ => None,
                 };
 
-                CommandResponse::new(CommandStatus::Ok, success_message, command_response_data)
+                Response::new(ResponseStatus::Ok, success_message, command_response_data)
             }
             Advancement::Processing(processing_message) => {
-                CommandResponse::new(CommandStatus::Processing, processing_message, None)
+                Response::new(ResponseStatus::Processing, processing_message, None)
             }
             Advancement::Error(error_message) => {
-                CommandResponse::new(CommandStatus::Error, error_message, None)
+                Response::new(ResponseStatus::Failure, error_message, None)
             }
         };
 

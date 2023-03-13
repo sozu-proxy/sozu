@@ -27,8 +27,8 @@ use sozu_command_lib::{
     config::Config,
     order::{InnerOrder, MetricsConfiguration, Order},
     response::{
-        CommandResponse, CommandResponseContent, CommandStatus, Event, ProxyResponse,
-        ProxyResponseContent, ProxyResponseStatus, RunState,
+        Event, ProxyResponse, ProxyResponseContent, ProxyResponseStatus, Response, ResponseContent,
+        ResponseStatus, RunState,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -51,7 +51,7 @@ pub use worker::*;
 enum CommandMessage {
     ClientNew {
         client_id: String,
-        sender: Sender<CommandResponse>, // to send things back to the client
+        sender: Sender<Response>, // to send things back to the client
     },
     ClientClose {
         client_id: String,
@@ -85,13 +85,13 @@ pub enum Advancement {
 // in which case Success caries the response data.
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Success {
-    ClientClose(String),               // the client id
-    ClientNew(String),                 // the client id
-    DumpState(CommandResponseContent), // the cloned state
+    ClientClose(String),        // the client id
+    ClientNew(String),          // the client id
+    DumpState(ResponseContent), // the cloned state
     HandledClientOrder,
-    ListFrontends(CommandResponseContent), // the list of frontends
-    ListListeners(CommandResponseContent), // the list of listeners
-    ListWorkers(CommandResponseContent),
+    ListFrontends(ResponseContent), // the list of frontends
+    ListListeners(ResponseContent), // the list of listeners
+    ListWorkers(ResponseContent),
     LoadState(String, usize, usize), // state path, oks, errors
     Logging(String),                 // new logging level
     Metrics(MetricsConfiguration),   // enable / disable / clear metrics on the proxy
@@ -101,10 +101,10 @@ pub enum Success {
     // Metrics,
     NotifiedClient(String), // client id
     PropagatedWorkerEvent,
-    Query(CommandResponseContent),
+    Query(ResponseContent),
     ReloadConfiguration(usize, usize), // ok, errors
     SaveState(usize, String),          // amount of written commands, path of the saved state
-    Status(CommandResponseContent),    // Vec<WorkerInfo>
+    Status(ResponseContent),           // Vec<WorkerInfo>
     SubscribeEvent(String),
     UpgradeMain(i32),    // pid of the new main process
     UpgradeWorker(u32),  // worker id
@@ -189,7 +189,7 @@ pub struct CommandServer {
     /// where the main loop receives messages
     command_rx: Receiver<CommandMessage>,
     /// All client loops. id -> cloned command_tx
-    clients: HashMap<String, Sender<CommandResponse>>,
+    clients: HashMap<String, Sender<Response>>,
     /// handles to the workers as seen from the main process
     workers: Vec<Worker>,
     /// A map of requests sent to workers.
@@ -718,11 +718,11 @@ impl CommandServer {
             let event: Event = proxy_event.into();
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
-                    let event = CommandResponse::new(
+                    let event = Response::new(
                         // response.id.to_string(),
-                        CommandStatus::Processing,
+                        ResponseStatus::Processing,
                         format!("{worker_id}"),
-                        Some(CommandResponseContent::Event(event.clone())),
+                        Some(ResponseContent::Event(event.clone())),
                     );
                     client_tx
                         .send(event)
@@ -916,7 +916,7 @@ async fn client_loop(
     client_id: String,
     stream: Async<UnixStream>,
     mut command_tx: Sender<CommandMessage>,
-    mut client_rx: Receiver<CommandResponse>,
+    mut client_rx: Receiver<Response>,
 ) {
     let read_stream = Arc::new(stream);
     let mut write_stream = read_stream.clone();

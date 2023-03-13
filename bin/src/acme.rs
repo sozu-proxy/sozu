@@ -4,7 +4,7 @@ use acme_lib::{create_p384_key, persist::FilePersist, Directory, DirectoryUrl};
 use anyhow::{bail, Context};
 use mio::net::UnixStream;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
-use tiny_http::{Response, Server};
+use tiny_http::{Response as HttpResponse, Server};
 
 use sozu_command_lib::{
     certificate::{
@@ -14,9 +14,7 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     order::{AddCertificate, Order, RemoveBackend, ReplaceCertificate},
-    response::{
-        Backend, CommandResponse, CommandStatus, HttpFrontend, PathRule, Route, RulePosition,
-    },
+    response::{Backend, HttpFrontend, PathRule, Response, ResponseStatus, Route, RulePosition},
 };
 
 use crate::util;
@@ -91,7 +89,7 @@ pub fn main(
 
     let tls_versions = vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3];
 
-    let mut channel: Channel<Order, CommandResponse> = Channel::new(stream, 10000, 20000);
+    let mut channel: Channel<Order, Response> = Channel::new(stream, 10000, 20000);
     channel
         .blocking()
         .with_context(|| "Could not block channel")?;
@@ -172,15 +170,15 @@ pub fn main(
                 info!("got request to URL: {}", request.url());
                 if request.url() == path {
                     if let Err(e) = request.respond(
-                        Response::from_data(key_authorization.as_bytes()).with_status_code(200),
+                        HttpResponse::from_data(key_authorization.as_bytes()).with_status_code(200),
                     ) {
                         error!("Error responding with 200 to request: {}", e);
                     }
                     info!("challenge request answered");
                     // the challenge can be called multiple times
                     //return true;
-                } else if let Err(e) =
-                    request.respond(Response::from_data(&b"not found"[..]).with_status_code(404))
+                } else if let Err(e) = request
+                    .respond(HttpResponse::from_data(&b"not found"[..]).with_status_code(404))
                 {
                     error!("Error responding with 404 to request: {}", e);
                 }
@@ -283,7 +281,7 @@ fn generate_app_id(app_id: &str) -> String {
 }
 
 fn set_up_proxying(
-    channel: &mut Channel<Order, CommandResponse>,
+    channel: &mut Channel<Order, Response>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
@@ -316,7 +314,7 @@ fn set_up_proxying(
 }
 
 fn remove_proxying(
-    channel: &mut Channel<Order, CommandResponse>,
+    channel: &mut Channel<Order, Response>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
@@ -346,7 +344,7 @@ fn remove_proxying(
 }
 
 fn add_certificate(
-    channel: &mut Channel<Order, CommandResponse>,
+    channel: &mut Channel<Order, Response>,
     frontend: &SocketAddr,
     hostname: &str,
     certificate_path: &str,
@@ -396,10 +394,7 @@ fn add_certificate(
         .with_context(|| "Could not send the certificate order")
 }
 
-fn order_command(
-    channel: &mut Channel<Order, CommandResponse>,
-    order: Order,
-) -> anyhow::Result<()> {
+fn order_command(channel: &mut Channel<Order, Response>, order: Order) -> anyhow::Result<()> {
     channel
         .write_message(&order.clone())
         .with_context(|| "Could not write message on the channel")?;
@@ -410,15 +405,15 @@ fn order_command(
             .with_context(|| "Could not read response on channel")?;
 
         match response.status {
-            CommandStatus::Processing => {
+            ResponseStatus::Processing => {
                 // do nothing here
                 // for other messages, we would loop over read_message
                 // until an error or ok message was sent
             }
-            CommandStatus::Error => {
+            ResponseStatus::Failure => {
                 bail!("could not execute order: {}", response.message);
             }
-            CommandStatus::Ok => {
+            ResponseStatus::Ok => {
                 // TODO: remove the pattern matching and only display the response message
                 match order {
                     Order::AddBackend(_) => {
