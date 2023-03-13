@@ -23,8 +23,8 @@ use sozu_command::{
     },
     response::{
         Backend as CommandLibBackend, Event, HttpListenerConfig, HttpsListenerConfig, MessageId,
-        ProxyResponse, ProxyResponseContent, ProxyResponseStatus, QueryAnswer,
-        QueryAnswerCertificate, TcpListenerConfig as CommandTcpListener,
+        ProxyResponse, ProxyResponseContent, QueryAnswer, QueryAnswerCertificate, ResponseStatus,
+        TcpListenerConfig as CommandTcpListener,
     },
     scm_socket::{Listeners, ScmSocket},
     state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
@@ -60,7 +60,8 @@ pub fn push_event(event: Event) {
     QUEUE.with(|queue| {
         (*queue.borrow_mut()).push_back(ProxyResponse {
             id: "EVENT".to_string(),
-            status: ProxyResponseStatus::Processing,
+            message: String::new(),
+            status: ResponseStatus::Processing,
             content: Some(ProxyResponseContent::Event(event)),
         });
     });
@@ -808,14 +809,11 @@ impl Server {
                 error!("Error while running the server channel: {}", e);
             }
             self.block_channel();
-            let proxy_response = ProxyResponse {
-                id: self
-                    .shutting_down
-                    .take()
-                    .expect("should have shut down correctly"), // panicking here makes sense actually
-                status: ProxyResponseStatus::Ok,
-                content: None,
-            };
+            let id = self
+                .shutting_down
+                .take()
+                .expect("should have shut down correctly"); // panicking here makes sense actually
+            let proxy_response = ProxyResponse::ok(id);
             if let Err(e) = self.channel.write_message(&proxy_response) {
                 error!("Could not write response to the main process: {}", e);
             }
@@ -882,13 +880,12 @@ impl Server {
 
         match &message.content {
             Request::QueryClustersHashes => {
-                push_queue(ProxyResponse {
-                    id: message.id.clone(),
-                    status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::Query(QueryAnswer::ClustersHashes(
+                push_queue(ProxyResponse::ok_with_content(
+                    message.id.clone(),
+                    ProxyResponseContent::Query(QueryAnswer::ClustersHashes(
                         self.config_state.hash_state(),
-                    ))),
-                });
+                    )),
+                ));
                 return;
             }
             Request::QueryClusters(query_type) => {
@@ -910,11 +907,10 @@ impl Server {
                         QueryAnswer::Clusters(answer)
                     }
                 };
-                push_queue(ProxyResponse {
-                    id: message.id.clone(),
-                    status: ProxyResponseStatus::Ok,
-                    content: Some(ProxyResponseContent::Query(query_answer)),
-                });
+                push_queue(ProxyResponse::ok_with_content(
+                    message.id.clone(),
+                    ProxyResponseContent::Query(query_answer),
+                ));
                 return;
             }
             Request::QueryCertificates(q) => {
@@ -924,16 +920,15 @@ impl Server {
                     // forward the query to the TLS implementation
                     QueryCertificateType::All => {}
                     QueryCertificateType::Fingerprint(f) => {
-                        push_queue(ProxyResponse {
-                            id: message.id.clone(),
-                            status: ProxyResponseStatus::Ok,
-                            content: Some(ProxyResponseContent::Query(QueryAnswer::Certificates(
+                        push_queue(ProxyResponse::ok_with_content(
+                            message.id.clone(),
+                            ProxyResponseContent::Query(QueryAnswer::Certificates(
                                 QueryAnswerCertificate::Fingerprint(get_certificate(
                                     &self.config_state,
                                     f,
                                 )),
-                            ))),
-                        });
+                            )),
+                        ));
                         return;
                     }
                 }
@@ -942,11 +937,10 @@ impl Server {
                 METRICS.with(|metrics| {
                     let data = (*metrics.borrow_mut()).query(query_metrics_options);
 
-                    push_queue(ProxyResponse {
-                        id: message.id.clone(),
-                        status: ProxyResponseStatus::Ok,
-                        content: Some(ProxyResponseContent::Query(QueryAnswer::Metrics(data))),
-                    });
+                    push_queue(ProxyResponse::ok_with_content(
+                        message.id.clone(),
+                        ProxyResponseContent::Query(QueryAnswer::Metrics(data)),
+                    ));
                 });
                 return;
             }

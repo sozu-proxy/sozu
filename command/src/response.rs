@@ -453,7 +453,8 @@ pub type MessageId = String;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyResponse {
     pub id: MessageId,
-    pub status: ProxyResponseStatus,
+    pub status: ResponseStatus,
+    pub message: String,
     pub content: Option<ProxyResponseContent>,
 }
 
@@ -464,8 +465,21 @@ impl ProxyResponse {
     {
         Self {
             id: id.to_string(),
-            status: ProxyResponseStatus::Ok,
+            message: String::new(),
+            status: ResponseStatus::Ok,
             content: None,
+        }
+    }
+
+    pub fn ok_with_content<T>(id: T, content: ProxyResponseContent) -> Self
+    where
+        T: ToString,
+    {
+        Self {
+            id: id.to_string(),
+            status: ResponseStatus::Ok,
+            message: String::new(),
+            content: Some(content),
         }
     }
 
@@ -476,7 +490,8 @@ impl ProxyResponse {
     {
         Self {
             id: id.to_string(),
-            status: ProxyResponseStatus::Error(error.to_string()),
+            message: error.to_string(),
+            status: ResponseStatus::Failure,
             content: None,
         }
     }
@@ -487,17 +502,19 @@ impl ProxyResponse {
     {
         Self {
             id: id.to_string(),
-            status: ProxyResponseStatus::Processing,
+            message: String::new(),
+            status: ResponseStatus::Processing,
             content: None,
         }
     }
 
-    pub fn status<T>(id: T, status: ProxyResponseStatus) -> Self
+    pub fn status<T>(id: T, status: ResponseStatus) -> Self
     where
         T: ToString,
     {
         Self {
             id: id.to_string(),
+            message: String::new(),
             status,
             content: None,
         }
@@ -508,13 +525,6 @@ impl fmt::Display for ProxyResponse {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}-{:?}", self.id, self.status)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ProxyResponseStatus {
-    Ok,
-    Processing,
-    Error(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

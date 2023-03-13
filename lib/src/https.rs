@@ -55,8 +55,8 @@ use crate::{
             ReplaceCertificate, Request, WorkerRequest,
         },
         response::{
-            HttpFrontend, HttpsListenerConfig, ProxyResponse, ProxyResponseContent,
-            ProxyResponseStatus, QueryAnswer, QueryAnswerCertificate, Route,
+            HttpFrontend, HttpsListenerConfig, ProxyResponse, ProxyResponseContent, QueryAnswer,
+            QueryAnswerCertificate, Route,
         },
         scm_socket::ScmSocket,
         state::ClusterId,
@@ -1370,10 +1370,9 @@ impl ProxyConfiguration for HttpsProxy {
         match content_result {
             Ok(content) => {
                 info!("{} successful", request_id);
-                ProxyResponse {
-                    id: request_id,
-                    status: ProxyResponseStatus::Ok,
-                    content,
+                match content {
+                    Some(content) => ProxyResponse::ok_with_content(request_id, content),
+                    None => ProxyResponse::ok(request_id),
                 }
             }
             Err(error_message) => {

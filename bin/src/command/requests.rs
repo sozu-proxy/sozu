@@ -19,9 +19,8 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     request::{FrontendFilters, MetricsConfiguration, QueryClusterType, Request, WorkerRequest},
     response::{
-        AggregatedMetricsData, ListedFrontends, ListenersList, ProxyResponseContent,
-        ProxyResponseStatus, QueryAnswer, Response, ResponseContent, ResponseStatus, RunState,
-        WorkerInfo,
+        AggregatedMetricsData, ListedFrontends, ListenersList, ProxyResponseContent, QueryAnswer,
+        Response, ResponseContent, ResponseStatus, RunState, WorkerInfo,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -280,12 +279,12 @@ impl CommandServer {
                 let mut error = 0usize;
                 while let Some((proxy_response, _)) = load_state_rx.next().await {
                     match proxy_response.status {
-                        ProxyResponseStatus::Ok => {
+                        ResponseStatus::Ok => {
                             ok += 1;
                         }
-                        ProxyResponseStatus::Processing => {}
-                        ProxyResponseStatus::Error(message) => {
-                            error!("{}", message);
+                        ResponseStatus::Processing => {}
+                        ResponseStatus::Failure => {
+                            error!("{}", proxy_response.message);
                             error += 1;
                         }
                     };
@@ -637,15 +636,16 @@ impl CommandServer {
             smol::spawn(async move {
                 while let Some((proxy_response, _)) = sockets_return_rx.next().await {
                     match proxy_response.status {
-                        ProxyResponseStatus::Ok => {
+                        ResponseStatus::Ok => {
                             info!("returnsockets OK");
                             break;
                         }
-                        ProxyResponseStatus::Processing => {
+                        ResponseStatus::Processing => {
                             info!("returnsockets processing");
                         }
-                        ProxyResponseStatus::Error(message) => {
-                            return_error(cloned_command_tx, cloned_req_id, message).await;
+                        ResponseStatus::Failure => {
+                            return_error(cloned_command_tx, cloned_req_id, proxy_response.message)
+                                .await;
                             break;
                         }
                     };
@@ -695,7 +695,7 @@ impl CommandServer {
                 while let Some((proxy_response, _)) = softstop_rx.next().await {
                     match proxy_response.status {
                         // should we send all this to the command server?
-                        ProxyResponseStatus::Ok => {
+                        ResponseStatus::Ok => {
                             info!("softstop OK"); // this doesn't display :-(
                             if let Err(e) = command_tx
                                 .send(CommandMessage::WorkerClose { worker_id })
@@ -708,11 +708,11 @@ impl CommandServer {
                             }
                             break;
                         }
-                        ProxyResponseStatus::Processing => {
+                        ResponseStatus::Processing => {
                             info!("softstop processing");
                         }
-                        ProxyResponseStatus::Error(message) => {
-                            info!("softstop error: {:?}", message);
+                        ResponseStatus::Failure => {
+                            info!("softstop error: {:?}", proxy_response.message);
                             break;
                         }
                     };
@@ -827,12 +827,12 @@ impl CommandServer {
                 let mut error = 0usize;
                 while let Some((proxy_response, _)) = load_state_rx.next().await {
                     match proxy_response.status {
-                        ProxyResponseStatus::Ok => {
+                        ResponseStatus::Ok => {
                             ok += 1;
                         }
-                        ProxyResponseStatus::Processing => {}
-                        ProxyResponseStatus::Error(message) => {
-                            error!("{}", message);
+                        ResponseStatus::Processing => {}
+                        ResponseStatus::Failure => {
+                            error!("{}", proxy_response.message);
                             error += 1;
                         }
                     };
@@ -923,9 +923,9 @@ impl CommandServer {
                     proxy_response.id, proxy_response
                 );
                 let new_run_state = match proxy_response.status {
-                    ProxyResponseStatus::Ok => RunState::Running,
-                    ProxyResponseStatus::Processing => continue,
-                    ProxyResponseStatus::Error(_) => RunState::NotAnswering,
+                    ResponseStatus::Ok => RunState::Running,
+                    ResponseStatus::Processing => continue,
+                    ResponseStatus::Failure => RunState::NotAnswering,
                 };
                 worker_info_map
                     .entry(proxy_response.id)
@@ -984,15 +984,15 @@ impl CommandServer {
             let mut i = 0;
             while let Some((proxy_response, _)) = metrics_rx.next().await {
                 match proxy_response.status {
-                    ProxyResponseStatus::Ok => {
+                    ResponseStatus::Ok => {
                         let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
                         responses.push((tag, proxy_response));
                     }
-                    ProxyResponseStatus::Processing => {
+                    ResponseStatus::Processing => {
                         //info!("metrics processing");
                         continue;
                     }
-                    ProxyResponseStatus::Error(_) => {
+                    ResponseStatus::Failure => {
                         let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
                         responses.push((tag, proxy_response));
                     }
@@ -1008,8 +1008,8 @@ impl CommandServer {
             let mut has_error = false;
             for response in responses.iter() {
                 match response.1.status {
-                    ProxyResponseStatus::Error(ref e) => {
-                        messages.push(format!("{}: {}", response.0, e));
+                    ResponseStatus::Failure => {
+                        messages.push(format!("{}: {}", response.0, response.1.message));
                         has_error = true;
                     }
                     _ => messages.push(format!("{}: OK", response.0)),
@@ -1093,14 +1093,14 @@ impl CommandServer {
             let mut i = 0;
             while let Some((proxy_response, worker_id)) = query_rx.next().await {
                 match proxy_response.status {
-                    ProxyResponseStatus::Ok => {
+                    ResponseStatus::Ok => {
                         responses.push((worker_id, proxy_response));
                     }
-                    ProxyResponseStatus::Processing => {
+                    ResponseStatus::Processing => {
                         info!("metrics processing");
                         continue;
                     }
-                    ProxyResponseStatus::Error(_) => {
+                    ResponseStatus::Failure => {
                         responses.push((worker_id, proxy_response));
                     }
                 };
@@ -1242,7 +1242,7 @@ impl CommandServer {
             let mut response_count = 0usize;
             while let Some((proxy_response, worker_id)) = worker_request_rx.next().await {
                 match proxy_response.status {
-                    ProxyResponseStatus::Ok => {
+                    ResponseStatus::Ok => {
                         responses.push((worker_id, proxy_response));
 
                         if stopping_workers.contains(&worker_id) {
@@ -1257,11 +1257,11 @@ impl CommandServer {
                             }
                         }
                     }
-                    ProxyResponseStatus::Processing => {
+                    ResponseStatus::Processing => {
                         info!("request is processing");
                         continue;
                     }
-                    ProxyResponseStatus::Error(_) => {
+                    ResponseStatus::Failure => {
                         responses.push((worker_id, proxy_response));
                     }
                 };
@@ -1283,8 +1283,8 @@ impl CommandServer {
             let mut has_error = false;
             for response in responses.iter() {
                 match response.1.status {
-                    ProxyResponseStatus::Error(ref e) => {
-                        messages.push(format!("{}: {}", response.0, e));
+                    ResponseStatus::Failure => {
+                        messages.push(format!("{}: {}", response.0, response.1.message));
                         has_error = true;
                     }
                     _ => messages.push(format!("{}: OK", response.0)),
