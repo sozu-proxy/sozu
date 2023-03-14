@@ -13,15 +13,14 @@ use anyhow::{bail, Context};
 use toml;
 
 use crate::{
-    certificate::TlsVersion,
-    request::{ActivateListener, Cluster, ListenerType, LoadBalancingParams, WorkerRequest},
-    response::{Backend, HttpListenerConfig, TcpFrontend},
-};
-use crate::{
-    certificate::{split_certificate_chain, CertificateAndKey},
-    request::{AddCertificate, LoadBalancingAlgorithms, LoadMetric, Request},
+    certificate::{split_certificate_chain, CertificateAndKey, TlsVersion},
+    request::{
+        ActivateListener, AddBackend, AddCertificate, Cluster, ListenerType,
+        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, Request, WorkerRequest,
+    },
     response::{
-        HttpFrontend, HttpsListenerConfig, PathRule, Route, RulePosition, TcpListenerConfig,
+        HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, Route, RulePosition,
+        TcpFrontend, TcpListenerConfig,
     },
 };
 
@@ -588,13 +587,8 @@ impl HttpFrontendConfig {
         let mut v = Vec::new();
 
         if self.key.is_some() && self.certificate.is_some() {
-            // <<<<<<< HEAD
             v.push(Request::AddCertificate(AddCertificate {
-                // address: self.address,
-                // =======
-                // v.push(ProxyRequestOrder::AddCertificate(AddCertificate {
                 address: self.address.to_string(),
-                // >>>>>>> b5ce4fb8 (replace SocketAddr with String in certificate requests)
                 certificate: CertificateAndKey {
                     key: self.key.clone().unwrap(),
                     certificate: self.certificate.clone().unwrap(),
@@ -645,7 +639,7 @@ pub struct HttpClusterConfig {
 }
 
 impl HttpClusterConfig {
-    pub fn generate_requests(&self) -> Vec<Request> {
+    pub fn generate_requests(&self) -> anyhow::Result<Vec<Request>> {
         let mut v = vec![Request::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: self.sticky_session,
@@ -666,19 +660,19 @@ impl HttpClusterConfig {
                 weight: backend.weight.unwrap_or(100),
             });
 
-            v.push(Request::AddBackend(Backend {
+            v.push(Request::AddBackend(AddBackend {
                 cluster_id: self.cluster_id.clone(),
                 backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                     format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
                 }),
-                address: backend.address,
+                address: backend.address.to_string(),
                 load_balancing_parameters,
                 sticky_id: backend.sticky_id.clone(),
                 backup: backend.backup,
             }));
         }
 
-        v
+        Ok(v)
     }
 }
 
@@ -700,7 +694,7 @@ pub struct TcpClusterConfig {
 }
 
 impl TcpClusterConfig {
-    pub fn generate_requests(&self) -> Vec<Request> {
+    pub fn generate_requests(&self) -> anyhow::Result<Vec<Request>> {
         let mut v = vec![Request::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: false,
@@ -724,19 +718,19 @@ impl TcpClusterConfig {
                 weight: backend.weight.unwrap_or(100),
             });
 
-            v.push(Request::AddBackend(Backend {
+            v.push(Request::AddBackend(AddBackend {
                 cluster_id: self.cluster_id.clone(),
                 backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                     format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
                 }),
-                address: backend.address,
+                address: backend.address.to_string(),
                 load_balancing_parameters,
                 sticky_id: backend.sticky_id.clone(),
                 backup: backend.backup,
             }));
         }
 
-        v
+        Ok(v)
     }
 }
 
@@ -747,7 +741,7 @@ pub enum ClusterConfig {
 }
 
 impl ClusterConfig {
-    pub fn generate_requests(&self) -> Vec<Request> {
+    pub fn generate_requests(&self) -> anyhow::Result<Vec<Request>> {
         match *self {
             ClusterConfig::Http(ref http) => http.generate_requests(),
             ClusterConfig::Tcp(ref tcp) => tcp.generate_requests(),
@@ -1175,7 +1169,7 @@ impl Config {
         Ok(config)
     }
 
-    pub fn generate_config_messages(&self) -> Vec<WorkerRequest> {
+    pub fn generate_config_messages(&self) -> anyhow::Result<Vec<WorkerRequest>> {
         let mut v = Vec::new();
         let mut count = 0u8;
 
@@ -1207,7 +1201,7 @@ impl Config {
         }
 
         for cluster in self.clusters.values() {
-            let mut orders = cluster.generate_requests();
+            let mut orders = cluster.generate_requests()?;
             for content in orders.drain(..) {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
@@ -1255,7 +1249,7 @@ impl Config {
             }
         }
 
-        v
+        Ok(v)
     }
 
     pub fn command_socket_path(&self) -> anyhow::Result<String> {

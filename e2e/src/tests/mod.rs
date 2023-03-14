@@ -59,13 +59,13 @@ pub fn setup_test<S: Into<String>>(
 
     let mut backends = Vec::new();
     for i in 0..nb_backends {
-        let back_address = format!("127.0.0.1:{}", 2002 + i)
+        let back_address: SocketAddr = format!("127.0.0.1:{}", 2002 + i)
             .parse()
             .expect("could not parse back address");
         worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
             "cluster_0",
             format!("cluster_0-{i}"),
-            back_address,
+            back_address.to_string(),
         )));
         backends.push(back_address);
     }

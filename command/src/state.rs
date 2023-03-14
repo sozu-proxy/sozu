@@ -16,8 +16,8 @@ use serde::de::{self, Visitor};
 use crate::{
     certificate::{calculate_fingerprint, CertificateAndKey, CertificateFingerprint},
     request::{
-        ActivateListener, AddCertificate, Cluster, DeactivateListener, ListenerType, RemoveBackend,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
+        ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, ListenerType,
+        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
     },
     response::{
         Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule,
@@ -131,8 +131,8 @@ impl ConfigState {
             Request::RemoveTcpFrontend(front) => self
                 .remove_tcp_frontend(front)
                 .with_context(|| "Could not remove TCP frontend"),
-            Request::AddBackend(backend) => self
-                .add_backend(backend)
+            Request::AddBackend(add_backend) => self
+                .add_backend(add_backend)
                 .with_context(|| "Could not add backend"),
             Request::RemoveBackend(backend) => self
                 .remove_backend(backend)
@@ -435,7 +435,18 @@ impl ConfigState {
         Ok(())
     }
 
-    fn add_backend(&mut self, backend: &Backend) -> anyhow::Result<()> {
+    fn add_backend(&mut self, add_backend: &AddBackend) -> anyhow::Result<()> {
+        let backend = Backend {
+            address: add_backend
+                .address
+                .parse()
+                .with_context(|| "wrong socket address")?,
+            cluster_id: add_backend.cluster_id.clone(),
+            backend_id: add_backend.backend_id.clone(),
+            sticky_id: add_backend.sticky_id.clone(),
+            load_balancing_parameters: add_backend.load_balancing_parameters.clone(),
+            backup: add_backend.backup.clone(),
+        };
         let backends = self
             .backends
             .entry(backend.cluster_id.clone())
@@ -443,7 +454,7 @@ impl ConfigState {
 
         // we might be modifying the sticky id or load balancing parameters
         backends.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
-        backends.push(backend.clone());
+        backends.push(backend);
         backends.sort();
 
         Ok(())
@@ -461,7 +472,9 @@ impl ConfigState {
             })?;
 
         let len = backend_list.len();
-        backend_list.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
+        backend_list.retain(|b| {
+            b.backend_id != backend.backend_id || b.address.to_string() != backend.address
+        });
         backend_list.sort();
         if backend_list.len() == len {
             bail!("Removed no backend");
@@ -536,7 +549,7 @@ impl ConfigState {
 
         for backend_list in self.backends.values() {
             for backend in backend_list {
-                v.push(Request::AddBackend(backend.clone()));
+                v.push(Request::AddBackend(backend.clone().to_add_backend()));
             }
         }
 
@@ -810,7 +823,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(Request::AddBackend(backend.clone()));
+                    v.push(Request::AddBackend(backend.clone().to_add_backend()));
                 }
                 DiffResult::Removed => {
                     let backend = self
@@ -822,7 +835,7 @@ impl ConfigState {
                     v.push(Request::RemoveBackend(RemoveBackend {
                         cluster_id: backend.cluster_id.clone(),
                         backend_id: backend.backend_id.clone(),
-                        address: backend.address,
+                        address: backend.address.to_string(),
                     }));
                 }
                 DiffResult::Changed => {
@@ -835,7 +848,7 @@ impl ConfigState {
                     v.push(Request::RemoveBackend(RemoveBackend {
                         cluster_id: backend.cluster_id.clone(),
                         backend_id: backend.backend_id.clone(),
-                        address: backend.address,
+                        address: backend.address.to_string(),
                     }));
 
                     let backend = other
@@ -843,7 +856,7 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(Request::AddBackend(backend.clone()));
+                    v.push(Request::AddBackend(backend.clone().to_add_backend()));
                 }
             }
         }
@@ -1219,7 +1232,7 @@ mod tests {
             }))
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1229,7 +1242,7 @@ mod tests {
             }))
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1239,7 +1252,7 @@ mod tests {
             }))
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
@@ -1249,7 +1262,7 @@ mod tests {
             }))
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-3"),
                 address: "192.168.1.3:1027".parse().unwrap(),
@@ -1303,7 +1316,7 @@ mod tests {
             }))
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1313,7 +1326,7 @@ mod tests {
             }))
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1323,7 +1336,7 @@ mod tests {
             }))
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
@@ -1357,7 +1370,7 @@ mod tests {
             }))
             .expect("Could not execute request");
         state2
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1367,7 +1380,7 @@ mod tests {
             }))
             .expect("Could not execute request");
         state2
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
@@ -1377,7 +1390,7 @@ mod tests {
             }))
             .expect("Could not execute request");
         state2
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1413,7 +1426,7 @@ mod tests {
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
             }),
-            Request::AddBackend(Backend {
+            Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1445,7 +1458,7 @@ mod tests {
         let hash2 = state2.hash_state();
         let mut state3 = state.clone();
         state3
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
@@ -1560,7 +1573,7 @@ mod tests {
     fn duplicate_backends() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&Request::AddBackend(Backend {
+            .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
@@ -1580,8 +1593,8 @@ mod tests {
         };
 
         state
-            .dispatch(&Request::AddBackend(b.clone()))
-            .expect("Could not execute request");
+            .dispatch(&Request::AddBackend(b.clone().to_add_backend()))
+            .expect("Could not execute order");
 
         assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
     }

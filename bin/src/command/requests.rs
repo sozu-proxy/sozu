@@ -781,7 +781,7 @@ impl CommandServer {
         )
         .await;
 
-        for request in new_config.generate_config_messages() {
+        for request in new_config.generate_config_messages()? {
             if self.state.dispatch(&request.content).is_ok() {
                 diff_counter += 1;
 

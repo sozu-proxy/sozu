@@ -363,7 +363,7 @@ pub enum BackendCmd {
             long = "address",
             help = "server address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
     },
     #[clap(name = "add", about = "Add a backend")]
     Add {
@@ -376,7 +376,7 @@ pub enum BackendCmd {
             long = "address",
             help = "server address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
         #[clap(
             short = 's',
             long = "sticky-id",

@@ -495,13 +495,13 @@ impl CommandServer {
         Ok(())
     }
 
-    pub async fn load_static_cluster_configuration(&mut self) {
+    pub async fn load_static_cluster_configuration(&mut self) -> anyhow::Result<()> {
         let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
 
         let mut total_message_count = 0usize;
 
         //FIXME: too many loops, this could be cleaner
-        for message in self.config.generate_config_messages() {
+        for message in self.config.generate_config_messages()? {
             let request = message.content;
             if let Err(e) = self.state.dispatch(&request) {
                 error!("Could not execute request on state: {:#}", e);
@@ -571,6 +571,7 @@ impl CommandServer {
             }
         })
         .detach();
+        Ok(())
     }
 
     /// in case a worker has crashed while Running and automatic_worker_restart is set to true
@@ -837,7 +838,10 @@ pub fn start_server(
             workers,
             accept_cancel_tx,
         )?;
-        server.load_static_cluster_configuration().await;
+
+        let _ = server.load_static_cluster_configuration().await.map_err(|load_error|
+            error!("Error loading static cluster configuration: {:#}", load_error)
+        );
 
         if let Some(path) = saved_state_path {
             server

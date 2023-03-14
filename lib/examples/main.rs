@@ -14,9 +14,9 @@ use sozu_command::{
     channel::Channel,
     config::DEFAULT_RUSTLS_CIPHER_LIST,
     logging::{Logger, LoggerBackend},
-    request::{AddCertificate, LoadBalancingParams, Request, WorkerRequest},
+    request::{AddCertificate, LoadBalancingParams, AddBackend, Request, WorkerRequest},
     response::{
-        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, Route,
+         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, Route,
         RulePosition,
     },
 };
@@ -77,13 +77,11 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    let http_backend = Backend {
+    let http_backend = AddBackend {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026"
-            .parse()
-            .with_context(|| "Could not parse backend address")?,
+        address: "127.0.0.1:1026".to_string(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };
@@ -157,13 +155,11 @@ fn main() -> anyhow::Result<()> {
         id: String::from("ID_IJKL2"),
         content: Request::AddHttpsFrontend(tls_front),
     });
-    let tls_backend = Backend {
+    let tls_backend = AddBackend {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026"
-            .parse()
-            .with_context(|| "Could not parse backend address")?,
+        address: "127.0.0.1:1026".to_string(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };
@@ -212,13 +208,11 @@ fn main() -> anyhow::Result<()> {
         content: Request::AddHttpsFrontend(tls_front2),
     });
 
-    let tls_backend2 = Backend {
+    let tls_backend2 = AddBackend {
         cluster_id: String::from("cluster_2"),
         backend_id: String::from("cluster_2-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026"
-            .parse()
-            .with_context(|| "Could not parse backend address")?,
+        address: "127.0.0.1:1026".to_string(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };

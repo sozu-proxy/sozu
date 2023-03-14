@@ -9,9 +9,9 @@ use sozu_command_lib::{
     request::{
         ActivateListener, AddCertificate, Cluster, DeactivateListener, FrontendFilters,
         ListenerType, LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, Request,
+        RemoveListener, ReplaceCertificate, Request, AddBackend,
     },
-    response::{Backend, HttpFrontend, PathRule, RulePosition, TcpFrontend},
+    response::{HttpFrontend, PathRule, RulePosition, TcpFrontend},
 };
 
 use crate::{
@@ -118,7 +118,7 @@ impl CommandManager {
                 address,
                 sticky_id,
                 backup,
-            } => self.order_request(Request::AddBackend(Backend {
+            } => self.order_request(Request::AddBackend(AddBackend {
                 cluster_id: id,
                 address,
                 backend_id,

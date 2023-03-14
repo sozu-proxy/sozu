@@ -10,8 +10,8 @@ use anyhow::Context;
 use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    request::{LoadBalancingParams, Request, WorkerRequest},
-    response::{Backend, HttpFrontend, HttpListenerConfig, PathRule, Route, RulePosition},
+    request::{LoadBalancingParams, Request, WorkerRequest, AddBackend},
+    response::{ HttpFrontend, HttpListenerConfig, PathRule, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -63,12 +63,10 @@ fn main() -> anyhow::Result<()> {
             ("id".to_owned(), "my-own-http-front".to_owned()),
         ])),
     };
-    let http_backend = Backend {
+    let http_backend = AddBackend {
         cluster_id: String::from("test"),
         backend_id: String::from("test-0"),
-        address: "127.0.0.1:8000"
-            .parse()
-            .with_context(|| "could not parse address")?,
+        address: "127.0.0.1:8000".to_string(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id: None,
         backup: None,

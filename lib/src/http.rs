@@ -1152,7 +1152,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Request::AddBackend(backend),
+                content: Request::AddBackend(backend.to_add_backend()),
             })
             .unwrap();
 
@@ -1240,7 +1240,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Request::AddBackend(backend),
+                content: Request::AddBackend(backend.to_add_backend()),
             })
             .unwrap();
 
@@ -1368,7 +1368,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_IJKL"),
-                content: Request::AddBackend(backend),
+                content: Request::AddBackend(backend.to_add_backend()),
             })
             .unwrap();
 

@@ -4,7 +4,7 @@ use crate::{
     certificate::{CertificateAndKey, CertificateFingerprint},
     config::ProxyProtocolConfig,
     response::{
-        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpFrontend,
+        HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpFrontend,
         TcpListenerConfig,
     },
     state::ClusterId,
@@ -65,7 +65,7 @@ pub enum Request {
     AddTcpFrontend(TcpFrontend),
     RemoveTcpFrontend(TcpFrontend),
 
-    AddBackend(Backend),
+    AddBackend(AddBackend),
     RemoveBackend(RemoveBackend),
 
     AddHttpListener(HttpListenerConfig),
@@ -299,7 +299,17 @@ pub struct ReplaceCertificate {
 pub struct RemoveBackend {
     pub cluster_id: String,
     pub backend_id: String,
-    pub address: SocketAddr,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AddBackend {
+    pub cluster_id: String,
+    pub backend_id: String,
+    pub address: String,
+    pub sticky_id: Option<String>,
+    pub load_balancing_parameters: Option<LoadBalancingParams>,
+    pub backup: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -406,7 +416,7 @@ mod tests {
     use super::*;
     use crate::certificate::{split_certificate_chain, TlsVersion};
     use crate::config::ProxyProtocolConfig;
-    use crate::response::{Backend, HttpFrontend, PathRule, Route, RulePosition};
+    use crate::response::{HttpFrontend, PathRule, Route, RulePosition};
     use hex::FromHex;
     use serde_json;
 
@@ -573,10 +583,10 @@ mod tests {
     test_message!(
         add_backend,
         "../assets/add_backend.json",
-        Request::AddBackend(Backend {
+        Request::AddBackend(AddBackend {
             cluster_id: String::from("xxx"),
             backend_id: String::from("xxx-0"),
-            address: "127.0.0.1:8080".parse().unwrap(),
+            address: "127.0.0.1:8080".to_string(),
             load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
             sticky_id: Some(String::from("xxx-0")),
             backup: Some(false),
@@ -683,10 +693,10 @@ mod tests {
         println!("{command:?}");
         assert!(
             command
-                == Request::AddBackend(Backend {
+                == Request::AddBackend(AddBackend {
                     cluster_id: String::from("xxx"),
                     backend_id: String::from("xxx-0"),
-                    address: "0.0.0.0:8080".parse().unwrap(),
+                    address: "0.0.0.0:8080".to_string(),
                     sticky_id: None,
                     load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
                     backup: None,

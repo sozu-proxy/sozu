@@ -276,8 +276,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
         .parse()
         .expect("could not parse front address");
     let back_address = "127.0.0.1:2002"
-        .to_string()
-        .parse()
+        .parse::<std::net::SocketAddr>()
         .expect("could not parse back address");
 
     let (config, listeners, state) = Worker::empty_config();
@@ -300,7 +299,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0",
-        back_address,
+        back_address.to_string(),
     )));
     worker.read_to_last();
 
@@ -342,8 +341,7 @@ pub fn try_tls_endpoint() -> State {
         .parse()
         .expect("could not parse front address");
     let back_address = "127.0.0.1:2002"
-        .to_string()
-        .parse()
+        .parse::<std::net::SocketAddr>()
         .expect("could not parse back address");
 
     let (config, listeners, state) = Worker::empty_config();
@@ -383,7 +381,7 @@ pub fn try_tls_endpoint() -> State {
     worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0",
-        back_address,
+        back_address.to_string(),
     )));
     worker.read_to_last();
 
@@ -673,12 +671,12 @@ fn try_http_behaviors() -> State {
     assert_eq!(client.receive(), None);
 
     let back_address = "127.0.0.1:2002"
-        .parse()
+        .parse::<std::net::SocketAddr>()
         .expect("could not parse back address");
     worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
-        back_address,
+        back_address.to_string(),
     )));
     worker.read_to_last();
 
@@ -718,12 +716,12 @@ fn try_http_behaviors() -> State {
     worker.send_proxy_request(Request::RemoveBackend(RemoveBackend {
         cluster_id: String::from("cluster_0"),
         backend_id: String::from("cluster_0-0"),
-        address: back_address,
+        address: back_address.to_string(),
     }));
     worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
-        back_address,
+        back_address.to_string(),
     )));
     backend.disconnect();
     worker.read_to_last();
@@ -779,12 +777,12 @@ fn try_http_behaviors() -> State {
     worker.send_proxy_request(Request::RemoveBackend(RemoveBackend {
         cluster_id: String::from("cluster_0"),
         backend_id: String::from("cluster_0-0"),
-        address: back_address,
+        address: back_address.to_string(),
     }));
     worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
-        back_address,
+        back_address.to_string(),
     )));
     backend.disconnect();
     worker.read_to_last();

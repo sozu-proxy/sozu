@@ -1868,7 +1868,7 @@ mod tests {
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO2"),
-                    content: Request::AddBackend(backend),
+                    content: Request::AddBackend(backend.to_add_backend()),
                 })
                 .unwrap();
         }
@@ -1899,7 +1899,7 @@ mod tests {
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO4"),
-                    content: Request::AddBackend(backend),
+                    content: Request::AddBackend(backend.to_add_backend()),
                 })
                 .unwrap();
         }

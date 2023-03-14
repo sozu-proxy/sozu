@@ -13,7 +13,7 @@ use crate::{
         DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST, DEFAULT_RUSTLS_CIPHER_LIST,
         DEFAULT_SIGNATURE_ALGORITHMS,
     },
-    request::{default_sticky_name, is_false, Cluster, LoadBalancingParams, PROTOCOL_VERSION},
+    request::{default_sticky_name, is_false, Cluster, LoadBalancingParams, PROTOCOL_VERSION, AddBackend},
     state::{ClusterId, ConfigState, RouteKey},
 };
 
@@ -275,6 +275,19 @@ impl Ord for Backend {
 impl PartialOrd for Backend {
     fn partial_cmp(&self, other: &Backend) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl Backend {
+    pub fn to_add_backend(self) -> AddBackend {
+        AddBackend {
+            cluster_id: self.cluster_id,
+            address: self.address.to_string(),
+            sticky_id: self.sticky_id,
+            backend_id: self.backend_id,
+            load_balancing_parameters: self.load_balancing_parameters,
+            backup: self.backup,
+        }
     }
 }
 

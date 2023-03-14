@@ -16,11 +16,12 @@ use sozu_command::{
     channel::Channel,
     config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
-    request::Request,
-    request::{Cluster, LoadBalancingAlgorithms, LoadBalancingParams, WorkerRequest},
+    request::{
+        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, Request, WorkerRequest,
+    },
     response::{
-        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, ProxyResponse,
-        Route, RulePosition, TcpFrontend, TcpListenerConfig,
+        HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, ProxyResponse, Route,
+        RulePosition, TcpFrontend, TcpListenerConfig,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -342,9 +343,9 @@ impl Worker {
     pub fn default_backend<S1: Into<String>, S2: Into<String>>(
         cluster_id: S1,
         backend_id: S2,
-        address: SocketAddr,
-    ) -> Backend {
-        Backend {
+        address: String,
+    ) -> AddBackend {
+        AddBackend {
             cluster_id: cluster_id.into(),
             backend_id: backend_id.into(),
             address,
