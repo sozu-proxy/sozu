@@ -58,9 +58,7 @@ pub fn main(
     let http = http_frontend_address
         .parse::<SocketAddr>()
         .with_context(|| "invalid HTTP frontend address format")?;
-    let https = https_frontend_address
-        .parse::<SocketAddr>()
-        .with_context(|| "invalid HTTPS frontend address format")?;
+    let https = https_frontend_address;
 
     let old_certificate_file = match old_certificate_path {
         Some(path) => {
@@ -344,7 +342,7 @@ fn remove_proxying(
 
 fn add_certificate(
     channel: &mut Channel<Request, Response>,
-    frontend: &SocketAddr,
+    frontend: &str,
     hostname: &str,
     certificate_path: &str,
     chain_path: &str,
@@ -363,7 +361,7 @@ fn add_certificate(
 
     let request = match old_fingerprint {
         None => Request::AddCertificate(AddCertificate {
-            address: *frontend,
+            address: frontend.to_owned(),
             certificate: CertificateAndKey {
                 certificate,
                 certificate_chain,
@@ -375,7 +373,7 @@ fn add_certificate(
         }),
 
         Some(f) => Request::ReplaceCertificate(ReplaceCertificate {
-            address: *frontend,
+            address: frontend.to_owned(),
             new_certificate: CertificateAndKey {
                 certificate,
                 certificate_chain,

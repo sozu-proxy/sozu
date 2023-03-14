@@ -373,7 +373,7 @@ pub fn try_tls_endpoint() -> State {
         versions: vec![],
     };
     let add_certificate = AddCertificate {
-        address: front_address,
+        address: front_address.to_string(),
         certificate: certificate_and_key,
         names: vec![],
         expired_at: None,

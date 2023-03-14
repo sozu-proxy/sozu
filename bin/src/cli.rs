@@ -786,7 +786,7 @@ pub enum CertificateCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
         #[clap(long = "certificate", help = "path to the certificate")]
         certificate: String,
         #[clap(long = "certificate-chain", help = "path to the certificate chain")]
@@ -804,7 +804,7 @@ pub enum CertificateCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
         #[clap(aliases = &["cert"], long = "certificate", help = "path to the certificate")]
         certificate: Option<String>,
         #[clap(short = 'f', long = "fingerprint", help = "certificate fingerprint")]
@@ -817,7 +817,7 @@ pub enum CertificateCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
         #[clap(long = "new-certificate", help = "path to the new certificate")]
         certificate: String,
         #[clap(

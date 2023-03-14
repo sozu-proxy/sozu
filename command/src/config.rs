@@ -588,8 +588,13 @@ impl HttpFrontendConfig {
         let mut v = Vec::new();
 
         if self.key.is_some() && self.certificate.is_some() {
+            // <<<<<<< HEAD
             v.push(Request::AddCertificate(AddCertificate {
-                address: self.address,
+                // address: self.address,
+                // =======
+                // v.push(ProxyRequestOrder::AddCertificate(AddCertificate {
+                address: self.address.to_string(),
+                // >>>>>>> b5ce4fb8 (replace SocketAddr with String in certificate requests)
                 certificate: CertificateAndKey {
                     key: self.key.clone().unwrap(),
                     certificate: self.certificate.clone().unwrap(),

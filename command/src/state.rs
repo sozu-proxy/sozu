@@ -330,9 +330,14 @@ impl ConfigState {
                 .with_context(|| "cannot calculate the certificate's fingerprint")?,
         );
 
+        let address = add
+            .address
+            .parse()
+            .with_context(|| "Could not parse socket address")?;
+
         let entry = self
             .certificates
-            .entry(add.address)
+            .entry(address)
             .or_insert_with(HashMap::new);
 
         if entry.contains_key(&fingerprint) {
@@ -345,7 +350,11 @@ impl ConfigState {
     }
 
     fn remove_certificate(&mut self, remove: &RemoveCertificate) -> anyhow::Result<()> {
-        if let Some(index) = self.certificates.get_mut(&remove.address) {
+        let address = remove
+            .address
+            .parse()
+            .with_context(|| "Could not parse socket address")?;
+        if let Some(index) = self.certificates.get_mut(&address) {
             index.remove(&remove.fingerprint);
         }
 
@@ -357,8 +366,13 @@ impl ConfigState {
     /// - insert the new certificate with the new fingerprint as key
     /// - check that the new entry is present in the certificates hashmap
     fn replace_certificate(&mut self, replace: &ReplaceCertificate) -> anyhow::Result<()> {
+        let address = replace
+            .address
+            .parse()
+            .with_context(|| "Could not parse socket address")?;
+
         self.certificates
-            .get_mut(&replace.address)
+            .get_mut(&address)
             .with_context(|| format!("No certificate to replace for address {}", replace.address))?
             .remove(&replace.old_fingerprint);
 
@@ -367,7 +381,7 @@ impl ConfigState {
                 .with_context(|| "cannot obtain the certificate's fingerprint")?,
         );
 
-        self.certificates.get_mut(&replace.address).map(|certs| {
+        self.certificates.get_mut(&address).map(|certs| {
             certs.insert(
                 new_fingerprint.clone(),
                 (replace.new_certificate.clone(), replace.new_names.clone()),
@@ -376,7 +390,7 @@ impl ConfigState {
 
         if !self
             .certificates
-            .get(&replace.address)
+            .get(&address)
             .with_context(|| {
                 "Unlikely error. This entry in the certificate hashmap should be present"
             })?
@@ -502,7 +516,7 @@ impl ConfigState {
         for (front, certs) in self.certificates.iter() {
             for (certificate_and_key, names) in certs.values() {
                 v.push(Request::AddCertificate(AddCertificate {
-                    address: *front,
+                    address: front.to_string(),
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
                     expired_at: None,
@@ -915,7 +929,7 @@ impl ConfigState {
 
         for &(address, fingerprint) in removed_certificates {
             v.push(Request::RemoveCertificate(RemoveCertificate {
-                address,
+                address: address.to_string(),
                 fingerprint: fingerprint.clone(),
             }));
         }
@@ -927,7 +941,7 @@ impl ConfigState {
                 .and_then(|certs| certs.get(fingerprint))
             {
                 v.push(Request::AddCertificate(AddCertificate {
-                    address,
+                    address: address.to_string(),
                     certificate: certificate_and_key.clone(),
                     names: names.clone(),
                     expired_at: None,

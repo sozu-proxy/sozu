@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use anyhow::{bail, Context};
 
 use sozu_command_lib::{
@@ -438,7 +436,7 @@ impl CommandManager {
 
     pub fn add_certificate(
         &mut self,
-        address: SocketAddr,
+        address: String,
         certificate_path: &str,
         certificate_chain_path: &str,
         key_path: &str,
@@ -458,7 +456,7 @@ impl CommandManager {
 
     pub fn replace_certificate(
         &mut self,
-        address: SocketAddr,
+        address: String,
         new_certificate_path: &str,
         new_certificate_chain_path: &str,
         new_key_path: &str,
@@ -500,7 +498,7 @@ impl CommandManager {
 
     pub fn remove_certificate(
         &mut self,
-        address: SocketAddr,
+        address: String,
         certificate_path: Option<&str>,
         fingerprint: Option<&str>,
     ) -> anyhow::Result<()> {

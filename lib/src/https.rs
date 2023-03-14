@@ -1122,10 +1122,11 @@ impl HttpsProxy {
         &mut self,
         add_certificate: AddCertificate,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
+        let address = add_certificate.address.parse()?;
         match self
             .listeners
             .values()
-            .find(|l| l.borrow().address == add_certificate.address)
+            .find(|l| l.borrow().address == address)
         {
             Some(listener) => listener
                 .borrow_mut()
@@ -1145,10 +1146,11 @@ impl HttpsProxy {
         &mut self,
         remove_certificate: RemoveCertificate,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
+        let address = remove_certificate.address.parse()?;
         match self
             .listeners
             .values()
-            .find(|l| l.borrow().address == remove_certificate.address)
+            .find(|l| l.borrow().address == address)
         {
             Some(listener) => listener
                 .borrow_mut()
@@ -1168,10 +1170,11 @@ impl HttpsProxy {
         &mut self,
         replace_certificate: ReplaceCertificate,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
+        let address = replace_certificate.address.parse()?;
         match self
             .listeners
             .values()
-            .find(|l| l.borrow().address == replace_certificate.address)
+            .find(|l| l.borrow().address == address)
         {
             Some(listener) => listener
                 .borrow_mut()

@@ -268,7 +268,7 @@ pub struct FrontendFilters {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AddCertificate {
-    pub address: SocketAddr,
+    pub address: String,
     pub certificate: CertificateAndKey,
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
     pub names: Vec<String>,
@@ -280,13 +280,13 @@ pub struct AddCertificate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RemoveCertificate {
-    pub address: SocketAddr,
+    pub address: String,
     pub fingerprint: CertificateFingerprint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReplaceCertificate {
-    pub address: SocketAddr,
+    pub address: String,
     pub new_certificate: CertificateAndKey,
     pub old_fingerprint: CertificateFingerprint,
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
