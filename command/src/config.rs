@@ -19,8 +19,8 @@ use crate::{
         LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, Request, WorkerRequest,
     },
     response::{
-        HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, Route, RulePosition,
-        TcpFrontend, TcpListenerConfig,
+        HttpListenerConfig, HttpsListenerConfig, PathRule, RequestHttpFrontend, RequestTcpFrontend,
+        Route, RulePosition, TcpListenerConfig,
     },
 };
 
@@ -599,9 +599,9 @@ impl HttpFrontendConfig {
                 expired_at: None,
             }));
 
-            v.push(Request::AddHttpsFrontend(HttpFrontend {
+            v.push(Request::AddHttpsFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(cluster_id.to_string()),
-                address: self.address,
+                address: self.address.to_string(),
                 hostname: self.hostname.clone(),
                 path: self.path.clone(),
                 method: self.method.clone(),
@@ -610,9 +610,9 @@ impl HttpFrontendConfig {
             }));
         } else {
             //create the front both for HTTP and HTTPS if possible
-            v.push(Request::AddHttpFrontend(HttpFrontend {
+            v.push(Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(cluster_id.to_string()),
-                address: self.address,
+                address: self.address.to_string(),
                 hostname: self.hostname.clone(),
                 path: self.path.clone(),
                 method: self.method.clone(),
@@ -706,9 +706,9 @@ impl TcpClusterConfig {
         })];
 
         for frontend in &self.frontends {
-            v.push(Request::AddTcpFrontend(TcpFrontend {
+            v.push(Request::AddTcpFrontend(RequestTcpFrontend {
                 cluster_id: self.cluster_id.clone(),
-                address: frontend.address,
+                address: frontend.address.to_string(),
                 tags: frontend.tags.clone(),
             }));
         }

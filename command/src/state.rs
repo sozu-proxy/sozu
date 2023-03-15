@@ -21,7 +21,8 @@ use crate::{
     },
     response::{
         Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule,
-        QueryAnswerCluster, Route, TcpFrontend, TcpListenerConfig,
+        QueryAnswerCluster, RequestHttpFrontend, RequestTcpFrontend, Route, TcpFrontend,
+        TcpListenerConfig,
     },
 };
 
@@ -302,15 +303,15 @@ impl ConfigState {
         Ok(())
     }
 
-    fn add_http_frontend(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
+    fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
         match self.http_fronts.entry(front.route_key()) {
-            BTreeMapEntry::Vacant(e) => e.insert(front.clone()),
+            BTreeMapEntry::Vacant(e) => e.insert(front.clone().to_frontend()?),
             BTreeMapEntry::Occupied(_) => bail!("This frontend is already present: {:?}", front),
         };
         Ok(())
     }
 
-    fn remove_http_frontend(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
+    fn remove_http_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
         if self.http_fronts.remove(&front.route_key()).is_none() {
             let error_msg = match &front.route {
                 Route::ClusterId(cluster_id) => format!(
@@ -404,19 +405,34 @@ impl ConfigState {
         Ok(())
     }
 
-    fn add_tcp_frontend(&mut self, front: &TcpFrontend) -> anyhow::Result<()> {
+    fn add_tcp_frontend(&mut self, front: &RequestTcpFrontend) -> anyhow::Result<()> {
         let tcp_frontends = self
             .tcp_fronts
             .entry(front.cluster_id.clone())
             .or_insert_with(Vec::new);
-        if tcp_frontends.contains(front) {
-            bail!("This tcp frontend is already present: {:?}", front);
+
+        let tcp_frontend = TcpFrontend {
+            cluster_id: front.cluster_id.clone(),
+            address: front
+                .address
+                .parse()
+                .with_context(|| "wrong socket address")?,
+            tags: front.tags.clone(),
+        };
+        if tcp_frontends.contains(&tcp_frontend) {
+            bail!("This tcp frontend is already present: {:?}", tcp_frontend);
         }
-        tcp_frontends.push(front.clone());
+
+        tcp_frontends.push(tcp_frontend.clone());
         Ok(())
     }
 
-    fn remove_tcp_frontend(&mut self, front_to_remove: &TcpFrontend) -> anyhow::Result<()> {
+    fn remove_tcp_frontend(&mut self, front_to_remove: &RequestTcpFrontend) -> anyhow::Result<()> {
+        let address = front_to_remove
+            .address
+            .parse()
+            .with_context(|| "wrong socket address")?;
+
         let tcp_frontends = self
             .tcp_fronts
             .get_mut(&front_to_remove.cluster_id)
@@ -428,7 +444,7 @@ impl ConfigState {
             })?;
 
         let len = tcp_frontends.len();
-        tcp_frontends.retain(|front| front.address != front_to_remove.address);
+        tcp_frontends.retain(|front| front.address != address);
         if tcp_frontends.len() == len {
             bail!("Removed no frontend");
         }
@@ -445,7 +461,7 @@ impl ConfigState {
             backend_id: add_backend.backend_id.clone(),
             sticky_id: add_backend.sticky_id.clone(),
             load_balancing_parameters: add_backend.load_balancing_parameters.clone(),
-            backup: add_backend.backup.clone(),
+            backup: add_backend.backup,
         };
         let backends = self
             .backends
@@ -523,7 +539,7 @@ impl ConfigState {
         }
 
         for front in self.http_fronts.values() {
-            v.push(Request::AddHttpFrontend(front.clone()));
+            v.push(Request::AddHttpFrontend(front.clone().to_request()));
         }
 
         for (front, certs) in self.certificates.iter() {
@@ -538,12 +554,12 @@ impl ConfigState {
         }
 
         for front in self.https_fronts.values() {
-            v.push(Request::AddHttpsFrontend(front.clone()));
+            v.push(Request::AddHttpsFrontend(front.clone().to_request()));
         }
 
         for front_list in self.tcp_fronts.values() {
             for front in front_list {
-                v.push(Request::AddTcpFrontend(front.clone()));
+                v.push(Request::AddTcpFrontend(front.clone().to_request()));
             }
         }
 
@@ -874,11 +890,11 @@ impl ConfigState {
         let added_http_fronts = their_http_fronts.difference(&my_http_fronts);
 
         for &(_, front) in removed_http_fronts {
-            v.push(Request::RemoveHttpFrontend(front.clone()));
+            v.push(Request::RemoveHttpFrontend(front.clone().to_request()));
         }
 
         for &(_, front) in added_http_fronts {
-            v.push(Request::AddHttpFrontend(front.clone()));
+            v.push(Request::AddHttpFrontend(front.clone().to_request()));
         }
 
         let mut my_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
@@ -893,11 +909,11 @@ impl ConfigState {
         let added_https_fronts = their_https_fronts.difference(&my_https_fronts);
 
         for &(_, front) in removed_https_fronts {
-            v.push(Request::RemoveHttpsFrontend(front.clone()));
+            v.push(Request::RemoveHttpsFrontend(front.clone().to_request()));
         }
 
         for &(_, front) in added_https_fronts {
-            v.push(Request::AddHttpsFrontend(front.clone()));
+            v.push(Request::AddHttpsFrontend(front.clone().to_request()));
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
@@ -917,11 +933,11 @@ impl ConfigState {
         let added_tcp_fronts = their_tcp_fronts.difference(&my_tcp_fronts);
 
         for &(_, front) in removed_tcp_fronts {
-            v.push(Request::RemoveTcpFrontend(front.clone()));
+            v.push(Request::RemoveTcpFrontend(front.clone().to_request()));
         }
 
         for &(_, front) in added_tcp_fronts {
-            v.push(Request::AddTcpFrontend(front.clone()));
+            v.push(Request::AddTcpFrontend(front.clone().to_request()));
         }
 
         //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -1203,30 +1219,30 @@ mod tests {
     use super::*;
     use crate::{
         request::{LoadBalancingAlgorithms, LoadBalancingParams, Request},
-        response::RulePosition,
+        response::{RequestHttpFrontend, RulePosition},
     };
 
     #[test]
     fn serialize() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&Request::AddHttpFrontend(HttpFrontend {
+            .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
                 method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
+                address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree,
                 tags: None,
             }))
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddHttpFrontend(HttpFrontend {
+            .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
                 method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
+                address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Pre,
                 tags: None,
             }))
@@ -1294,23 +1310,23 @@ mod tests {
     fn diff() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&Request::AddHttpFrontend(HttpFrontend {
+            .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
                 method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
+                address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Post,
                 tags: None,
             }))
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddHttpFrontend(HttpFrontend {
+            .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
                 method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
+                address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree,
                 tags: None,
             }))
@@ -1359,11 +1375,11 @@ mod tests {
 
         let mut state2: ConfigState = Default::default();
         state2
-            .dispatch(&Request::AddHttpFrontend(HttpFrontend {
+            .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::Prefix(String::from("/")),
-                address: "0.0.0.0:8080".parse().unwrap(),
+                address: "0.0.0.0:8080".to_string(),
                 method: None,
                 position: RulePosition::Post,
                 tags: None,
@@ -1412,24 +1428,24 @@ mod tests {
             .expect("Could not execute request");
 
         let e = vec![
-            Request::RemoveHttpFrontend(HttpFrontend {
+            Request::RemoveHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::Prefix(String::from("/abc")),
                 method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
+                address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree,
                 tags: None,
             }),
             Request::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
-                address: "192.167.1.2:1026".parse().unwrap(),
+                address: "192.167.1.2:1026".to_string(),
             }),
             Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
-                address: "127.0.0.2:1028".parse().unwrap(),
+                address: "127.0.0.2:1028".to_string(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
@@ -1461,7 +1477,7 @@ mod tests {
             .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
-                address: "127.0.0.2:1028".parse().unwrap(),
+                address: "127.0.0.2:1028".to_string(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
@@ -1478,42 +1494,42 @@ mod tests {
     #[test]
     fn cluster_ids_by_domain() {
         let mut config = ConfigState::new();
-        let http_front_cluster1 = HttpFrontend {
+        let http_front_cluster1 = RequestHttpFrontend {
             route: Route::ClusterId(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::Prefix(String::from("")),
             method: None,
-            address: "0.0.0.0:8080".parse().unwrap(),
+            address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
             tags: None,
         };
 
-        let https_front_cluster1 = HttpFrontend {
+        let https_front_cluster1 = RequestHttpFrontend {
             route: Route::ClusterId(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::Prefix(String::from("")),
             method: None,
-            address: "0.0.0.0:8443".parse().unwrap(),
+            address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
             tags: None,
         };
 
-        let http_front_cluster2 = HttpFrontend {
+        let http_front_cluster2 = RequestHttpFrontend {
             route: Route::ClusterId(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::Prefix(String::from("/api")),
             method: None,
-            address: "0.0.0.0:8080".parse().unwrap(),
+            address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
             tags: None,
         };
 
-        let https_front_cluster2 = HttpFrontend {
+        let https_front_cluster2 = RequestHttpFrontend {
             route: Route::ClusterId(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::Prefix(String::from("/api")),
             method: None,
-            address: "0.0.0.0:8443".parse().unwrap(),
+            address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
             tags: None,
         };
@@ -1576,7 +1592,7 @@ mod tests {
             .dispatch(&Request::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
-                address: "127.0.0.1:1026".parse().unwrap(),
+                address: "127.0.0.1:1026".to_string(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
                 backup: None,
@@ -1805,7 +1821,7 @@ mod tests {
 /// `RouteKey` is the routing key built from the following tuple.
 #[derive(PartialOrd, Ord, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteKey {
-    pub address: SocketAddr,
+    pub address: String,
     hostname: String,
     pub path_rule: PathRule,
     pub method: Option<String>,
@@ -1830,8 +1846,8 @@ impl serde::Serialize for RouteKey {
     }
 }
 
-impl From<HttpFrontend> for RouteKey {
-    fn from(frontend: HttpFrontend) -> Self {
+impl From<RequestHttpFrontend> for RouteKey {
+    fn from(frontend: RequestHttpFrontend) -> Self {
         Self {
             address: frontend.address,
             hostname: frontend.hostname,
@@ -1841,10 +1857,10 @@ impl From<HttpFrontend> for RouteKey {
     }
 }
 
-impl From<&HttpFrontend> for RouteKey {
-    fn from(frontend: &HttpFrontend) -> Self {
+impl From<&RequestHttpFrontend> for RouteKey {
+    fn from(frontend: &RequestHttpFrontend) -> Self {
         Self {
-            address: frontend.address,
+            address: frontend.address.clone(),
             hostname: frontend.hostname.clone(),
             path_rule: frontend.path.clone(),
             method: frontend.method.clone(),
@@ -1869,10 +1885,7 @@ impl<'de> Visitor<'de> for RouteKeyVisitor {
         let address = it
             .next()
             .ok_or_else(|| E::custom("invalid format".to_string()))
-            .and_then(|s| {
-                s.parse::<SocketAddr>()
-                    .map_err(|e| E::custom(format!("could not deserialize SocketAddr: {e:?}")))
-            })?;
+            .map(|s| s.to_string())?;
 
         let hostname = it
             .next()

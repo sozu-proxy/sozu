@@ -12,7 +12,7 @@ use sozu_command_lib::{
     info,
     logging::{Logger, LoggerBackend},
     request::{ActivateListener, AddCertificate, ListenerType, RemoveBackend, Request},
-    response::HttpFrontend,
+    response::RequestHttpFrontend,
     state::ConfigState,
 };
 
@@ -293,7 +293,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     worker.send_proxy_request(Request::AddCluster(Worker::default_cluster("cluster_0")));
     worker.send_proxy_request(Request::AddTcpFrontend(Worker::default_tcp_frontend(
         "cluster_0",
-        front_address,
+        front_address.to_string(),
     )));
 
     worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
@@ -359,7 +359,7 @@ pub fn try_tls_endpoint() -> State {
     worker.send_proxy_request(Request::AddCluster(Worker::default_cluster("cluster_0")));
 
     let hostname = "localhost".to_string();
-    worker.send_proxy_request(Request::AddHttpsFrontend(HttpFrontend {
+    worker.send_proxy_request(Request::AddHttpsFrontend(RequestHttpFrontend {
         hostname: hostname.to_owned(),
         ..Worker::default_http_frontend("cluster_0", front_address)
     }));
@@ -653,7 +653,7 @@ fn try_http_behaviors() -> State {
     assert_eq!(response, Some(expected_response));
     assert_eq!(client.receive(), None);
 
-    worker.send_proxy_request(Request::AddHttpFrontend(HttpFrontend {
+    worker.send_proxy_request(Request::AddHttpFrontend(RequestHttpFrontend {
         hostname: String::from("example.com"),
         ..Worker::default_http_frontend("cluster_0", front_address)
     }));

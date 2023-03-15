@@ -20,8 +20,8 @@ use sozu_command::{
         AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, Request, WorkerRequest,
     },
     response::{
-        HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, ProxyResponse, Route,
-        RulePosition, TcpFrontend, TcpListenerConfig,
+        HttpListenerConfig, HttpsListenerConfig, PathRule, ProxyResponse, RequestHttpFrontend,
+        RequestTcpFrontend, Route, RulePosition, TcpListenerConfig,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -316,9 +316,9 @@ impl Worker {
 
     pub fn default_tcp_frontend<S: Into<String>>(
         cluster_id: S,
-        address: SocketAddr,
-    ) -> TcpFrontend {
-        TcpFrontend {
+        address: String,
+    ) -> RequestTcpFrontend {
+        RequestTcpFrontend {
             cluster_id: cluster_id.into(),
             address,
             tags: None,
@@ -328,10 +328,10 @@ impl Worker {
     pub fn default_http_frontend<S: Into<String>>(
         cluster_id: S,
         address: SocketAddr,
-    ) -> HttpFrontend {
-        HttpFrontend {
+    ) -> RequestHttpFrontend {
+        RequestHttpFrontend {
             route: Route::ClusterId(cluster_id.into()),
-            address,
+            address: address.to_string(),
             hostname: String::from("localhost"),
             path: PathRule::Prefix(String::from("/")),
             method: None,

@@ -4,8 +4,8 @@ use crate::{
     certificate::{CertificateAndKey, CertificateFingerprint},
     config::ProxyProtocolConfig,
     response::{
-        HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpFrontend,
-        TcpListenerConfig,
+        HttpListenerConfig, HttpsListenerConfig, MessageId, RequestHttpFrontend,
+        RequestTcpFrontend, TcpListenerConfig,
     },
     state::ClusterId,
 };
@@ -52,18 +52,18 @@ pub enum Request {
         cluster_id: String,
     },
 
-    AddHttpFrontend(HttpFrontend),
-    RemoveHttpFrontend(HttpFrontend),
+    AddHttpFrontend(RequestHttpFrontend),
+    RemoveHttpFrontend(RequestHttpFrontend),
 
-    AddHttpsFrontend(HttpFrontend),
-    RemoveHttpsFrontend(HttpFrontend),
+    AddHttpsFrontend(RequestHttpFrontend),
+    RemoveHttpsFrontend(RequestHttpFrontend),
 
     AddCertificate(AddCertificate),
     ReplaceCertificate(ReplaceCertificate),
     RemoveCertificate(RemoveCertificate),
 
-    AddTcpFrontend(TcpFrontend),
-    RemoveTcpFrontend(TcpFrontend),
+    AddTcpFrontend(RequestTcpFrontend),
+    RemoveTcpFrontend(RequestTcpFrontend),
 
     AddBackend(AddBackend),
     RemoveBackend(RemoveBackend),
@@ -427,12 +427,12 @@ mod tests {
         println!("{message:?}");
         assert_eq!(
             message,
-            Request::AddHttpFrontend(HttpFrontend {
+            Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
                 method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
+                address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree,
                 tags: None,
             })
@@ -481,12 +481,12 @@ mod tests {
     test_message!(
         add_http_front,
         "../assets/add_http_front.json",
-        Request::AddHttpFrontend(HttpFrontend {
+        Request::AddHttpFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::Prefix(String::from("xxx")),
             method: None,
-            address: "0.0.0.0:8080".parse().unwrap(),
+            address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
             tags: None,
         })
@@ -495,12 +495,12 @@ mod tests {
     test_message!(
         remove_http_front,
         "../assets/remove_http_front.json",
-        Request::RemoveHttpFrontend(HttpFrontend {
+        Request::RemoveHttpFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::Prefix(String::from("xxx")),
             method: None,
-            address: "0.0.0.0:8080".parse().unwrap(),
+            address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
             tags: Some(BTreeMap::from([
                 ("owner".to_owned(), "John".to_owned()),
@@ -515,12 +515,12 @@ mod tests {
     test_message!(
         add_https_front,
         "../assets/add_https_front.json",
-        Request::AddHttpsFrontend(HttpFrontend {
+        Request::AddHttpsFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::Prefix(String::from("xxx")),
             method: None,
-            address: "0.0.0.0:8443".parse().unwrap(),
+            address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
             tags: None,
         })
@@ -529,12 +529,12 @@ mod tests {
     test_message!(
         remove_https_front,
         "../assets/remove_https_front.json",
-        Request::RemoveHttpsFrontend(HttpFrontend {
+        Request::RemoveHttpsFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::Prefix(String::from("xxx")),
             method: None,
-            address: "0.0.0.0:8443".parse().unwrap(),
+            address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
             tags: Some(BTreeMap::from([
                 ("owner".to_owned(), "John".to_owned()),
@@ -652,12 +652,12 @@ mod tests {
         println!("{command:?}");
         assert!(
             command
-                == Request::AddHttpFrontend(HttpFrontend {
+                == Request::AddHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
                     path: PathRule::Prefix(String::from("xxx")),
                     method: None,
-                    address: "127.0.0.1:4242".parse().unwrap(),
+                    address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
                     tags: None,
                 })
@@ -671,12 +671,12 @@ mod tests {
         println!("{command:?}");
         assert!(
             command
-                == Request::RemoveHttpFrontend(HttpFrontend {
+                == Request::RemoveHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
                     path: PathRule::Prefix(String::from("xxx")),
                     method: None,
-                    address: "127.0.0.1:4242".parse().unwrap(),
+                    address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
                     tags: Some(BTreeMap::from([
                         ("owner".to_owned(), "John".to_owned()),
@@ -726,12 +726,12 @@ mod tests {
         println!("{command:?}");
         assert!(
             command
-                == Request::AddHttpFrontend(HttpFrontend {
+                == Request::AddHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
                     path: PathRule::Prefix(String::from("")),
                     method: None,
-                    address: "127.0.0.1:4242".parse().unwrap(),
+                    address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
                     tags: Some(BTreeMap::from([
                         ("owner".to_owned(), "John".to_owned()),

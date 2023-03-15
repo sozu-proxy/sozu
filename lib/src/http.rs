@@ -18,7 +18,7 @@ use sozu_command::{
     logging,
     ready::Ready,
     request::{Cluster, RemoveListener, Request, WorkerRequest},
-    response::{HttpFrontend, HttpListenerConfig, ProxyResponse, Route},
+    response::{HttpFrontend, HttpListenerConfig, ProxyResponse, RequestHttpFrontend, Route},
     scm_socket::{Listeners, ScmSocket},
 };
 
@@ -615,7 +615,9 @@ impl HttpProxy {
         Ok(())
     }
 
-    pub fn add_http_frontend(&mut self, front: HttpFrontend) -> anyhow::Result<()> {
+    pub fn add_http_frontend(&mut self, front: RequestHttpFrontend) -> anyhow::Result<()> {
+        let front = front.to_frontend()?;
+
         match self
             .listeners
             .values()
@@ -639,7 +641,9 @@ impl HttpProxy {
         }
     }
 
-    pub fn remove_http_frontend(&mut self, front: HttpFrontend) -> anyhow::Result<()> {
+    pub fn remove_http_frontend(&mut self, front: RequestHttpFrontend) -> anyhow::Result<()> {
+        let front = front.to_frontend()?;
+
         if let Some(listener) = self
             .listeners
             .values()
@@ -1126,9 +1130,9 @@ mod tests {
             start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
         });
 
-        let front = HttpFrontend {
+        let front = RequestHttpFrontend {
             route: Route::ClusterId(String::from("cluster_1")),
-            address: "127.0.0.1:1024".parse().unwrap(),
+            address: "127.0.0.1:1024".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::Prefix(String::from("/")),
             method: None,
@@ -1214,8 +1218,8 @@ mod tests {
             start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
         });
 
-        let front = HttpFrontend {
-            address: "127.0.0.1:1031".parse().unwrap(),
+        let front = RequestHttpFrontend {
+            address: "127.0.0.1:1031".to_string(),
             hostname: String::from("localhost"),
             method: None,
             path: PathRule::Prefix(String::from("/")),
@@ -1342,8 +1346,8 @@ mod tests {
                 content: Request::AddCluster(cluster),
             })
             .unwrap();
-        let front = HttpFrontend {
-            address: "127.0.0.1:1041".parse().unwrap(),
+        let front = RequestHttpFrontend {
+            address: "127.0.0.1:1041".to_string(),
             hostname: String::from("localhost"),
             method: None,
             path: PathRule::Prefix(String::from("/")),

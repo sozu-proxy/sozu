@@ -10,8 +10,8 @@ use anyhow::Context;
 use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    request::{LoadBalancingParams, Request, WorkerRequest, AddBackend},
-    response::{ HttpFrontend, HttpListenerConfig, PathRule, Route, RulePosition},
+    request::{AddBackend, LoadBalancingParams, Request, WorkerRequest},
+    response::{HttpListenerConfig, PathRule, RequestHttpFrontend, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -49,11 +49,9 @@ fn main() -> anyhow::Result<()> {
         sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
     });
 
-    let http_front = HttpFrontend {
+    let http_front = RequestHttpFrontend {
         route: Route::ClusterId(String::from("test")),
-        address: "127.0.0.1:8080"
-            .parse()
-            .with_context(|| "could not parse address")?,
+        address: "127.0.0.1:8080".to_string(),
         hostname: String::from("example.com"),
         path: PathRule::Prefix(String::from("/")),
         method: None,

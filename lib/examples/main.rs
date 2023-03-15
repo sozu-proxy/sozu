@@ -14,10 +14,9 @@ use sozu_command::{
     channel::Channel,
     config::DEFAULT_RUSTLS_CIPHER_LIST,
     logging::{Logger, LoggerBackend},
-    request::{AddCertificate, LoadBalancingParams, AddBackend, Request, WorkerRequest},
+    request::{AddBackend, AddCertificate, LoadBalancingParams, Request, WorkerRequest},
     response::{
-         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, Route,
-        RulePosition,
+        HttpListenerConfig, HttpsListenerConfig, PathRule, RequestHttpFrontend, Route, RulePosition,
     },
 };
 
@@ -65,11 +64,9 @@ fn main() -> anyhow::Result<()> {
         sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
     });
 
-    let http_front = HttpFrontend {
+    let http_front = RequestHttpFrontend {
         route: Route::ClusterId(String::from("cluster_1")),
-        address: "127.0.0.1:8080"
-            .parse()
-            .with_context(|| "Could not parse frontend address")?,
+        address: "127.0.0.1:8080".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::Prefix(String::from("/")),
         method: None,
@@ -139,11 +136,9 @@ fn main() -> anyhow::Result<()> {
         }),
     });
 
-    let tls_front = HttpFrontend {
+    let tls_front = RequestHttpFrontend {
         route: Route::ClusterId(String::from("cluster_1")),
-        address: "127.0.0.1:8443"
-            .parse()
-            .with_context(|| "Could not parse frontend address")?,
+        address: "127.0.0.1:8443".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::Prefix(String::from("/")),
         method: None,
@@ -191,11 +186,9 @@ fn main() -> anyhow::Result<()> {
         }),
     });
 
-    let tls_front2 = HttpFrontend {
+    let tls_front2 = RequestHttpFrontend {
         route: Route::ClusterId(String::from("cluster_2")),
-        address: "127.0.0.1:8443"
-            .parse()
-            .with_context(|| "Could not parse frontend address")?,
+        address: "127.0.0.1:8443".to_string(),
         hostname: String::from("test.local"),
         path: PathRule::Prefix(String::from("/")),
         method: None,

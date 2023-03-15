@@ -14,7 +14,7 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     request::{AddBackend, AddCertificate, RemoveBackend, ReplaceCertificate, Request},
-    response::{HttpFrontend, PathRule, Response, ResponseStatus, Route, RulePosition},
+    response::{PathRule, RequestHttpFrontend, Response, ResponseStatus, Route, RulePosition},
 };
 
 use crate::util;
@@ -286,10 +286,10 @@ fn set_up_proxying(
     path_begin: &str,
     server_address: &SocketAddr,
 ) -> anyhow::Result<()> {
-    let add_http_front = Request::AddHttpFrontend(HttpFrontend {
+    let add_http_front = Request::AddHttpFrontend(RequestHttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         hostname: String::from(hostname),
-        address: *frontend,
+        address: frontend.to_string(),
         path: PathRule::Prefix(path_begin.to_owned()),
         method: None,
         position: RulePosition::Tree,
@@ -319,9 +319,9 @@ fn remove_proxying(
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let remove_http_front = Request::RemoveHttpFrontend(HttpFrontend {
+    let remove_http_front = Request::RemoveHttpFrontend(RequestHttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
-        address: *frontend,
+        address: frontend.to_string(),
         hostname: String::from(hostname),
         path: PathRule::Prefix(path_begin.to_owned()),
         method: None,

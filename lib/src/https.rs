@@ -26,7 +26,7 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::config::DEFAULT_CIPHER_SUITES;
+use sozu_command::{config::DEFAULT_CIPHER_SUITES, response::RequestHttpFrontend};
 use time::{Duration, Instant};
 
 use crate::{
@@ -1081,8 +1081,10 @@ impl HttpsProxy {
 
     pub fn add_https_frontend(
         &mut self,
-        front: HttpFrontend,
+        front: RequestHttpFrontend,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
+        let front = front.to_frontend()?;
+
         match self
             .listeners
             .values()
@@ -1102,8 +1104,10 @@ impl HttpsProxy {
 
     pub fn remove_https_frontend(
         &mut self,
-        front: HttpFrontend,
+        front: RequestHttpFrontend,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
+        let front = front.to_frontend()?;
+
         if let Some(listener) = self
             .listeners
             .values()

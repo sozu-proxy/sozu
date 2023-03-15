@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::collections::BTreeMap;
 
 use clap::{Parser, Subcommand};
 
@@ -452,7 +452,7 @@ pub enum HttpFrontendCmd {
             long = "address",
             help = "frontend address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
         #[clap(subcommand, name = "route")]
         route: Route,
         #[clap(long = "hostname", aliases = &["host"])]
@@ -481,7 +481,7 @@ pub enum HttpFrontendCmd {
             long = "address",
             help = "frontend address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
         #[clap(subcommand, name = "route")]
         route: Route,
         #[clap(long = "hostname", aliases = &["host"])]
@@ -518,7 +518,7 @@ pub enum TcpFrontendCmd {
             long = "address",
             help = "frontend address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
         #[clap(
             long = "tags",
             help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')",
@@ -539,7 +539,7 @@ pub enum TcpFrontendCmd {
             long = "address",
             help = "frontend address, format: IP:port"
         )]
-        address: SocketAddr,
+        address: String,
     },
 }
 

@@ -7,11 +7,11 @@ use sozu_command_lib::{
     },
     config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
     request::{
-        ActivateListener, AddCertificate, Cluster, DeactivateListener, FrontendFilters,
+        ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, FrontendFilters,
         ListenerType, LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, Request, AddBackend,
+        RemoveListener, ReplaceCertificate, Request,
     },
-    response::{HttpFrontend, PathRule, RulePosition, TcpFrontend},
+    response::{PathRule, RequestHttpFrontend, RequestTcpFrontend, RulePosition},
 };
 
 use crate::{
@@ -173,14 +173,14 @@ impl CommandManager {
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> anyhow::Result<()> {
         match cmd {
             TcpFrontendCmd::Add { id, address, tags } => {
-                self.order_request(Request::AddTcpFrontend(TcpFrontend {
+                self.order_request(Request::AddTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address,
                     tags,
                 }))
             }
             TcpFrontendCmd::Remove { id, address } => {
-                self.order_request(Request::RemoveTcpFrontend(TcpFrontend {
+                self.order_request(Request::RemoveTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address,
                     tags: None,
@@ -200,7 +200,7 @@ impl CommandManager {
                 method,
                 route,
                 tags,
-            } => self.order_request(Request::AddHttpFrontend(HttpFrontend {
+            } => self.order_request(Request::AddHttpFrontend(RequestHttpFrontend {
                 route: route.into(),
                 address,
                 hostname,
@@ -218,7 +218,7 @@ impl CommandManager {
                 address,
                 method,
                 route,
-            } => self.order_request(Request::RemoveHttpFrontend(HttpFrontend {
+            } => self.order_request(Request::RemoveHttpFrontend(RequestHttpFrontend {
                 route: route.into(),
                 address,
                 hostname,
@@ -241,7 +241,7 @@ impl CommandManager {
                 method,
                 route,
                 tags,
-            } => self.order_request(Request::AddHttpsFrontend(HttpFrontend {
+            } => self.order_request(Request::AddHttpsFrontend(RequestHttpFrontend {
                 route: route.into(),
                 address,
                 hostname,
@@ -258,7 +258,7 @@ impl CommandManager {
                 address,
                 method,
                 route,
-            } => self.order_request(Request::RemoveHttpsFrontend(HttpFrontend {
+            } => self.order_request(Request::RemoveHttpsFrontend(RequestHttpFrontend {
                 route: route.into(),
                 address,
                 hostname,

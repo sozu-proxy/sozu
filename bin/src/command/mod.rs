@@ -839,9 +839,15 @@ pub fn start_server(
             accept_cancel_tx,
         )?;
 
-        let _ = server.load_static_cluster_configuration().await.map_err(|load_error|
-            error!("Error loading static cluster configuration: {:#}", load_error)
-        );
+        let _ = server
+            .load_static_cluster_configuration()
+            .await
+            .map_err(|load_error| {
+                error!(
+                    "Error loading static cluster configuration: {:#}",
+                    load_error
+                )
+            });
 
         if let Some(path) = saved_state_path {
             server
