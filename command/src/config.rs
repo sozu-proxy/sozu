@@ -1236,15 +1236,15 @@ pub struct Config {
 }
 
 fn default_front_timeout() -> u32 {
-    60
+    DEFAULT_FRONT_TIMEOUT
 }
 
 fn default_back_timeout() -> u32 {
-    30
+    DEFAULT_BACK_TIMEOUT
 }
 
 fn default_connect_timeout() -> u32 {
-    3
+    DEFAULT_CONNECT_TIMEOUT
 }
 
 //defaults to 30mn
