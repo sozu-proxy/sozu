@@ -8,7 +8,7 @@ use serial_test::serial;
 
 use sozu_command_lib::{
     certificate::CertificateAndKey,
-    config::FileConfig,
+    config::{FileConfig, ListenerBuilder},
     info,
     logging::{Logger, LoggerBackend},
     request::{ActivateListener, AddCertificate, ListenerType, RemoveBackend, Request},
@@ -17,7 +17,7 @@ use sozu_command_lib::{
 };
 
 use crate::{
-    http_utils::{http_ok_response, http_request},
+    http_utils::{default_404_answer, default_503_answer, http_ok_response, http_request},
     mock::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
@@ -282,9 +282,9 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("810-PANIC", config, &listeners, state);
 
-    worker.send_proxy_request(Request::AddTcpListener(Worker::default_tcp_listener(
-        front_address,
-    )));
+    worker.send_proxy_request(Request::AddTcpListener(
+        ListenerBuilder::new_tcp(front_address).to_tcp().unwrap(),
+    ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::TCP,
@@ -347,9 +347,10 @@ pub fn try_tls_endpoint() -> State {
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
 
-    worker.send_proxy_request(Request::AddHttpsListener(Worker::default_https_listener(
-        front_address,
-    )));
+    worker.send_proxy_request(Request::AddHttpsListener(
+        ListenerBuilder::new_https(front_address).to_tls().unwrap(),
+    ));
+
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::HTTPS,
@@ -626,9 +627,9 @@ fn try_http_behaviors() -> State {
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("BEHAVE-WORKER", config, &listeners, state);
 
-    worker.send_proxy_request(Request::AddHttpListener(Worker::default_http_listener(
-        front_address,
-    )));
+    worker.send_proxy_request(Request::AddHttpListener(
+        ListenerBuilder::new_http(front_address).to_http().unwrap(),
+    ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::HTTP,
@@ -645,12 +646,10 @@ fn try_http_behaviors() -> State {
     info!("expecting 404");
     client.connect();
     client.send();
-    let expected_response = String::from(
-        "HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-    );
+
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(expected_response));
+    assert_eq!(response, Some(default_404_answer()));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request(Request::AddHttpFrontend(RequestHttpFrontend {
@@ -662,12 +661,10 @@ fn try_http_behaviors() -> State {
     info!("expecting 503");
     client.connect();
     client.send();
-    let expected_response = String::from(
-        "HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-    );
+
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(expected_response));
+    assert_eq!(response, Some(default_503_answer()));
     assert_eq!(client.receive(), None);
 
     let back_address = "127.0.0.1:2002"
@@ -766,12 +763,9 @@ fn try_http_behaviors() -> State {
     backend.receive(0);
     backend.close(0);
 
-    let expected_response = String::from(
-        "HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-    );
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(expected_response));
+    assert_eq!(response, Some(default_503_answer()));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request(Request::RemoveBackend(RemoveBackend {

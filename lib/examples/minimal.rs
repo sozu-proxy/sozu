@@ -7,11 +7,13 @@ extern crate time;
 use std::{collections::BTreeMap, env, io::stdout, thread};
 
 use anyhow::Context;
-use sozu_command::{
+
+use crate::sozu_command::{
     channel::Channel,
+    config::ListenerBuilder,
     logging::{Logger, LoggerBackend},
     request::{AddBackend, LoadBalancingParams, Request, WorkerRequest},
-    response::{HttpListenerConfig, PathRule, RequestHttpFrontend, Route, RulePosition},
+    response::{PathRule, RequestHttpFrontend, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -33,12 +35,7 @@ fn main() -> anyhow::Result<()> {
 
     info!("starting up");
 
-    let config = HttpListenerConfig {
-        address: "127.0.0.1:8080"
-            .parse()
-            .with_context(|| "could not parse address")?,
-        ..Default::default()
-    };
+    let http_listener = ListenerBuilder::new_http("127.0.0.1:8080").to_http()?;
 
     let (mut command, channel) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
@@ -46,7 +43,7 @@ fn main() -> anyhow::Result<()> {
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
+        sozu::http::start_http_worker(http_listener, channel, max_buffers, buffer_size);
     });
 
     let http_front = RequestHttpFrontend {

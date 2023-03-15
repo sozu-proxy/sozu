@@ -5,7 +5,7 @@ use sozu_command_lib::{
         calculate_fingerprint, split_certificate_chain, CertificateAndKey, CertificateFingerprint,
         TlsVersion,
     },
-    config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
+    config::{Config, ListenerBuilder, ProxyProtocolConfig},
     request::{
         ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, FrontendFilters,
         ListenerType, LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
@@ -286,28 +286,21 @@ impl CommandManager {
                 request_timeout,
                 connect_timeout,
             } => {
-                let mut listener = Listener::new(address, FileListenerProtocolConfig::Https);
-                listener.public_address = public_address;
-                listener.answer_404 = answer_404;
-                listener.answer_503 = answer_503;
-                listener.expect_proxy = Some(expect_proxy);
-                if let Some(sticky_name) = sticky_name {
-                    listener.sticky_name = sticky_name;
-                }
-                listener.cipher_list = cipher_list;
-                listener.tls_versions = if tls_versions.is_empty() {
-                    None
-                } else {
-                    Some(tls_versions)
-                };
-                let https_listener = listener
-                    .to_tls(
-                        front_timeout,
-                        back_timeout,
-                        connect_timeout,
-                        request_timeout,
-                    )
+                let https_listener = ListenerBuilder::new_https(address)
+                    .with_public_address(public_address)
+                    .with_answer_404_path(answer_404)
+                    .with_answer_503_path(answer_503)
+                    .with_tls_versions(tls_versions)
+                    .with_cipher_list(cipher_list)
+                    .with_expect_proxy(expect_proxy)
+                    .with_sticky_name(sticky_name)
+                    .with_front_timeout(front_timeout)
+                    .with_back_timeout(back_timeout)
+                    .with_request_timeout(request_timeout)
+                    .with_connect_timeout(connect_timeout)
+                    .to_tls()
                     .with_context(|| "Error creating HTTPS listener")?;
+
                 self.order_request(Request::AddHttpsListener(https_listener))
             }
             HttpsListenerCmd::Remove { address } => {
@@ -336,22 +329,17 @@ impl CommandManager {
                 request_timeout,
                 connect_timeout,
             } => {
-                let mut listener = Listener::new(address, FileListenerProtocolConfig::Http);
-                listener.public_address = public_address;
-                listener.answer_404 = answer_404;
-                listener.answer_503 = answer_503;
-                listener.expect_proxy = Some(expect_proxy);
-                if let Some(sticky_name) = sticky_name {
-                    listener.sticky_name = sticky_name;
-                }
-
-                let http_listener = listener
-                    .to_http(
-                        front_timeout,
-                        back_timeout,
-                        connect_timeout,
-                        request_timeout,
-                    )
+                let http_listener = ListenerBuilder::new_http(address)
+                    .with_public_address(public_address)
+                    .with_answer_404_path(answer_404)
+                    .with_answer_503_path(answer_503)
+                    .with_expect_proxy(expect_proxy)
+                    .with_sticky_name(sticky_name)
+                    .with_front_timeout(front_timeout)
+                    .with_request_timeout(request_timeout)
+                    .with_back_timeout(back_timeout)
+                    .with_connect_timeout(connect_timeout)
+                    .to_http()
                     .with_context(|| "Error creating HTTP listener")?;
                 self.order_request(Request::AddHttpListener(http_listener))
             }
@@ -374,15 +362,13 @@ impl CommandManager {
                 public_address,
                 expect_proxy,
             } => {
-                let mut listener = Listener::new(address, FileListenerProtocolConfig::Tcp);
-                listener.public_address = public_address;
-                listener.expect_proxy = Some(expect_proxy);
+                let listener = ListenerBuilder::new_tcp(address)
+                    .with_public_address(public_address)
+                    .with_expect_proxy(expect_proxy)
+                    .to_tcp()
+                    .with_context(|| "Could not create TCP listener")?;
 
-                self.order_request(Request::AddTcpListener(listener.to_tcp(
-                    Some(60),
-                    Some(30),
-                    Some(3),
-                )?))
+                self.order_request(Request::AddTcpListener(listener))
             }
             TcpListenerCmd::Remove { address } => self.remove_listener(address, ListenerType::TCP),
             TcpListenerCmd::Activate { address } => {

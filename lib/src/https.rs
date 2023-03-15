@@ -1563,6 +1563,8 @@ pub fn start_https_worker(
 mod tests {
     use std::{str::FromStr, sync::Arc};
 
+    use sozu_command::config::ListenerBuilder;
+
     use crate::router::{trie::TrieNode, MethodRule, PathRule, Router};
     use crate::sozu_command::response::Route;
 
@@ -1635,6 +1637,10 @@ mod tests {
 
         let rustls_details = Arc::new(server_config);
 
+        let default_config = ListenerBuilder::new_https(address)
+            .to_tls()
+            .expect("Could not create default HTTPS listener config");
+
         let listener = HttpsListener {
             listener: None,
             address,
@@ -1645,7 +1651,7 @@ mod tests {
                 "HTTP/1.1 404 Not Found\r\n\r\n",
                 "HTTP/1.1 503 Service Unavailable\r\n\r\n",
             ))),
-            config: Default::default(),
+            config: default_config,
             token: Token(0),
             active: true,
             tags: BTreeMap::new(),

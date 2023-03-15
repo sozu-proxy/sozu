@@ -63,18 +63,27 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
 
 pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"];
 
+pub const DEFAULT_FRONT_TIMEOUT: u32 = 60;
+pub const DEFAULT_BACK_TIMEOUT: u32 = 30;
+pub const DEFAULT_CONNECT_TIMEOUT: u32 = 3;
+pub const DEFAULT_REQUEST_TIMEOUT: u32 = 10;
+
 // todo: refactor this with a builder pattern for cleanliness
-/// an HTTP, HTTPS or TCP listener as ordered by a client
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// an HTTP, HTTPS or TCP listener as ordered by a client.
+/// This is used to parse the TOML config.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Listener {
+pub struct ListenerBuilder {
     pub address: String,
-    pub protocol: FileListenerProtocolConfig,
+    pub protocol: Option<ListenerProtocol>,
     pub public_address: Option<String>,
+    /// path to the 404 html file
     pub answer_404: Option<String>,
+    /// path to the 503 html file
     pub answer_503: Option<String>,
     pub tls_versions: Option<Vec<TlsVersion>>,
     pub cipher_list: Option<Vec<String>>,
+    pub cipher_suites: Option<Vec<String>>,
     pub expect_proxy: Option<bool>,
     #[serde(default = "default_sticky_name")]
     pub sticky_name: String,
@@ -95,26 +104,148 @@ fn default_sticky_name() -> String {
     String::from("SOZUBALANCEID")
 }
 
-impl Listener {
-    pub fn new(address: String, protocol: FileListenerProtocolConfig) -> Listener {
-        Listener {
-            address,
-            protocol,
-            public_address: None,
-            answer_404: None,
-            answer_503: None,
-            tls_versions: None,
-            cipher_list: None,
-            expect_proxy: None,
+impl ListenerBuilder {
+    /// starts building an HTTP Listener with default values
+    pub fn new_http<S>(address: S) -> ListenerBuilder
+    where
+        S: ToString,
+    {
+        Self::new(address, ListenerProtocol::Http)
+    }
+
+    /// starts building an HTTPS Listener with default values
+    pub fn new_tcp<S>(address: S) -> ListenerBuilder
+    where
+        S: ToString,
+    {
+        Self::new(address, ListenerProtocol::Tcp)
+    }
+
+    /// starts building a TCP Listener with default values
+    pub fn new_https<S>(address: S) -> ListenerBuilder
+    where
+        S: ToString,
+    {
+        Self::new(address, ListenerProtocol::Https)
+    }
+
+    // TODO: set the default values elsewhere, see #873
+    /// starts building a Listener with default values
+    fn new<S>(address: S, protocol: ListenerProtocol) -> ListenerBuilder
+    where
+        S: ToString,
+    {
+        ListenerBuilder {
+            address: address.to_string(),
+            protocol: Some(protocol),
             sticky_name: String::from("SOZUBALANCEID"),
-            certificate: None,
-            certificate_chain: None,
-            key: None,
-            front_timeout: None,
-            back_timeout: None,
-            connect_timeout: None,
-            request_timeout: None,
+            front_timeout: Some(DEFAULT_FRONT_TIMEOUT),
+            back_timeout: Some(DEFAULT_BACK_TIMEOUT),
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            ..Default::default()
         }
+    }
+
+    pub fn with_public_address<S>(&mut self, public_address: Option<S>) -> &mut Self
+    where
+        S: ToString,
+    {
+        if let Some(address) = public_address {
+            self.public_address = Some(address.to_string());
+        }
+        self
+    }
+
+    pub fn with_answer_404_path<S>(&mut self, answer_404_path: Option<S>) -> &mut Self
+    where
+        S: ToString,
+    {
+        if let Some(path) = answer_404_path {
+            self.answer_404 = Some(path.to_string());
+        }
+        self
+    }
+
+    pub fn with_answer_503_path<S>(&mut self, answer_503_path: Option<S>) -> &mut Self
+    where
+        S: ToString,
+    {
+        if let Some(path) = answer_503_path {
+            self.answer_503 = Some(path.to_string());
+        }
+        self
+    }
+
+    pub fn with_tls_versions(&mut self, tls_versions: Vec<TlsVersion>) -> &mut Self {
+        self.tls_versions = Some(tls_versions);
+        self
+    }
+
+    pub fn with_cipher_list(&mut self, cipher_list: Option<Vec<String>>) -> &mut Self {
+        self.cipher_list = cipher_list;
+        self
+    }
+
+    pub fn with_cipher_suites(&mut self, cipher_suites: Option<Vec<String>>) -> &mut Self {
+        self.cipher_suites = cipher_suites;
+        self
+    }
+
+    pub fn with_expect_proxy(&mut self, expect_proxy: bool) -> &mut Self {
+        self.expect_proxy = Some(expect_proxy);
+        self
+    }
+
+    pub fn with_sticky_name<S>(&mut self, sticky_name: Option<S>) -> &mut Self
+    where
+        S: ToString,
+    {
+        if let Some(name) = sticky_name {
+            self.sticky_name = name.to_string();
+        }
+        self
+    }
+
+    pub fn with_certificate<S>(&mut self, certificate: S) -> &mut Self
+    where
+        S: ToString,
+    {
+        self.certificate = Some(certificate.to_string());
+        self
+    }
+
+    pub fn with_certificate_chain(&mut self, certificate_chain: String) -> &mut Self {
+        self.certificate = Some(certificate_chain);
+        self
+    }
+
+    pub fn with_key<S>(&mut self, key: String) -> &mut Self
+    where
+        S: ToString,
+    {
+        self.key = Some(key);
+        self
+    }
+
+    pub fn with_front_timeout(&mut self, front_timeout: Option<u32>) -> &mut Self {
+        self.front_timeout = front_timeout;
+        self
+    }
+
+    pub fn with_back_timeout(&mut self, back_timeout: Option<u32>) -> &mut Self {
+        self.back_timeout = back_timeout;
+        self
+    }
+
+    pub fn with_connect_timeout(&mut self, connect_timeout: Option<u32>) -> &mut Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
+    pub fn with_request_timeout(&mut self, request_timeout: Option<u32>) -> &mut Self {
+        self.request_timeout = request_timeout;
+        self
     }
 
     pub fn parse_address(&self) -> anyhow::Result<SocketAddr> {
@@ -133,49 +264,31 @@ impl Listener {
         }
     }
 
-    // TODO: set the default values elsewhere, see #873
-    pub fn to_http(
-        &self,
-        front_timeout: Option<u32>,
-        back_timeout: Option<u32>,
-        connect_timeout: Option<u32>,
-        request_timeout: Option<u32>,
-    ) -> anyhow::Result<HttpListenerConfig> {
-        if self.protocol != FileListenerProtocolConfig::Http {
-            bail!("cannot convert listener to HTTP");
-        }
-
-        let mut configuration = HttpListenerConfig {
-            address: self.parse_address()?,
-            public_address: self.parse_public_address()?,
-            expect_proxy: self.expect_proxy.unwrap_or(false),
-            sticky_name: self.sticky_name.clone(),
-            front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
-            back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
-            connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
-            request_timeout: self.request_timeout.or(request_timeout).unwrap_or(10),
-            ..Default::default()
-        };
+    pub fn to_http(&mut self) -> anyhow::Result<HttpListenerConfig> {
+        // TODO: reintroduce the protocol check and bail
 
         let (answer_404, answer_503) = self
             .get_404_503_answers()
             .with_context(|| "Could not get 404 and 503 answers from file system")?;
-        configuration.answer_404 = answer_404;
-        configuration.answer_503 = answer_503;
+
+        let configuration = HttpListenerConfig {
+            address: self.parse_address()?,
+            public_address: self.parse_public_address()?,
+            expect_proxy: self.expect_proxy.unwrap_or(false),
+            sticky_name: self.sticky_name.clone(),
+            front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
+            back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
+            connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+            request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+            answer_404,
+            answer_503,
+        };
 
         Ok(configuration)
     }
 
-    pub fn to_tls(
-        &self,
-        front_timeout: Option<u32>,
-        back_timeout: Option<u32>,
-        connect_timeout: Option<u32>,
-        request_timeout: Option<u32>,
-    ) -> anyhow::Result<HttpsListenerConfig> {
-        if self.protocol != FileListenerProtocolConfig::Https {
-            bail!("cannot convert listener to HTTPS");
-        }
+    pub fn to_tls(&self) -> anyhow::Result<HttpsListenerConfig> {
+        // TODO: reintroduce the protocol check and bail
 
         let default_cipher_list = DEFAULT_RUSTLS_CIPHER_LIST
             .into_iter()
@@ -184,8 +297,19 @@ impl Listener {
 
         let cipher_list = self.cipher_list.clone().unwrap_or(default_cipher_list);
 
-        //FIXME => done. This seems useless now
-        // let tls_proxy_configuration = Some(self.address);
+        let default_cipher_suites = DEFAULT_CIPHER_SUITES
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let cipher_suites = self.cipher_suites.clone().unwrap_or(default_cipher_suites);
+
+        let signature_algorithms: Vec<String> = DEFAULT_SIGNATURE_ALGORITHMS
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        let groups_list: Vec<String> = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
 
         let versions = match self.tls_versions {
             None => vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
@@ -222,51 +346,44 @@ impl Listener {
             .map(split_certificate_chain)
             .unwrap_or_else(Vec::new);
 
-        let expect_proxy = self.expect_proxy.unwrap_or(false);
+        let (answer_404, answer_503) = self
+            .get_404_503_answers()
+            .with_context(|| "Could not get 404 and 503 answers from file system")?;
 
-        let mut configuration = HttpsListenerConfig {
+        let https_listener_config = HttpsListenerConfig {
             address: self.parse_address()?,
             sticky_name: self.sticky_name.clone(),
             public_address: self.parse_public_address()?,
             cipher_list,
             versions,
-            expect_proxy,
+            expect_proxy: self.expect_proxy.unwrap_or(false),
             key,
             certificate,
             certificate_chain,
-            front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
-            back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
-            connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
-            request_timeout: self.request_timeout.or(request_timeout).unwrap_or(10),
-            ..Default::default()
+            front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
+            back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
+            connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+            request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+            answer_404,
+            answer_503,
+            cipher_suites,
+            signature_algorithms,
+            groups_list,
         };
 
-        let (answer_404, answer_503) = self
-            .get_404_503_answers()
-            .with_context(|| "Could not get 404 and 503 answers from file system")?;
-        configuration.answer_404 = answer_404;
-        configuration.answer_503 = answer_503;
-
-        if let Some(cipher_list) = self.cipher_list.as_ref() {
-            configuration.cipher_list = cipher_list.clone();
-        }
-
-        Ok(configuration)
+        Ok(https_listener_config)
     }
 
-    pub fn to_tcp(
-        &self,
-        front_timeout: Option<u32>,
-        back_timeout: Option<u32>,
-        connect_timeout: Option<u32>,
-    ) -> anyhow::Result<TcpListenerConfig> {
+    pub fn to_tcp(&self) -> anyhow::Result<TcpListenerConfig> {
+        // TODO: reintroduce the protocol check and bail
+
         Ok(TcpListenerConfig {
             address: self.parse_address()?,
             public_address: self.parse_public_address()?,
             expect_proxy: self.expect_proxy.unwrap_or(false),
-            front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
-            back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
-            connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
+            front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
+            back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
+            connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
         })
     }
 
@@ -442,7 +559,7 @@ impl FileClusterFrontendConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "lowercase")]
-pub enum FileListenerProtocolConfig {
+pub enum ListenerProtocol {
     Http,
     Https,
     Tcp,
@@ -768,7 +885,7 @@ pub struct FileConfig {
     pub worker_count: Option<u16>,
     pub worker_automatic_restart: Option<bool>,
     pub metrics: Option<MetricsConfig>,
-    pub listeners: Option<Vec<Listener>>,
+    pub listeners: Option<Vec<ListenerBuilder>>,
     pub clusters: Option<HashMap<String, FileClusterConfig>>,
     pub handle_process_affinity: Option<bool>,
     pub ctl_command_timeout: Option<u64>,
@@ -841,8 +958,8 @@ impl FileConfig {
 
 pub struct ConfigBuilder {
     file: FileConfig,
-    known_addresses: HashMap<SocketAddr, FileListenerProtocolConfig>,
-    expect_proxy: HashSet<SocketAddr>,
+    known_addresses: HashMap<SocketAddr, ListenerProtocol>,
+    expect_proxy_addresses: HashSet<SocketAddr>,
     built: Config,
 }
 
@@ -851,50 +968,36 @@ impl ConfigBuilder {
         Self {
             file: file_config,
             known_addresses: HashMap::new(),
-            expect_proxy: HashSet::new(),
+            expect_proxy_addresses: HashSet::new(),
             built: Config::default(),
         }
     }
 
-    fn push_tls_listener(&mut self, listener: Listener) -> anyhow::Result<()> {
+    fn push_tls_listener(&mut self, listener: ListenerBuilder) -> anyhow::Result<()> {
         let listener = listener
-            .to_tls(
-                self.file.front_timeout,
-                self.file.back_timeout,
-                self.file.connect_timeout,
-                self.file.request_timeout,
-            )
+            .to_tls()
             .with_context(|| "Cannot convert listener to TLS")?;
         self.built.https_listeners.push(listener);
         Ok(())
     }
 
-    fn push_http_listener(&mut self, listener: Listener) -> anyhow::Result<()> {
+    fn push_http_listener(&mut self, mut listener: ListenerBuilder) -> anyhow::Result<()> {
         let listener = listener
-            .to_http(
-                self.file.front_timeout,
-                self.file.back_timeout,
-                self.file.connect_timeout,
-                self.file.request_timeout,
-            )
+            .to_http()
             .with_context(|| "Cannot convert listener to HTTP")?;
         self.built.http_listeners.push(listener);
         Ok(())
     }
 
-    fn push_tcp_listener(&mut self, listener: Listener) -> anyhow::Result<()> {
+    fn push_tcp_listener(&mut self, listener: ListenerBuilder) -> anyhow::Result<()> {
         let listener = listener
-            .to_tcp(
-                self.file.front_timeout,
-                self.file.back_timeout,
-                self.file.connect_timeout,
-            )
+            .to_tcp()
             .with_context(|| "Cannot convert listener to TCP")?;
         self.built.tcp_listeners.push(listener);
         Ok(())
     }
 
-    fn populate_listeners(&mut self, listeners: Vec<Listener>) -> anyhow::Result<()> {
+    fn populate_listeners(&mut self, listeners: Vec<ListenerBuilder>) -> anyhow::Result<()> {
         for listener in listeners.iter() {
             let address = listener.parse_address()?;
             if self.known_addresses.contains_key(&address) {
@@ -904,9 +1007,13 @@ impl ConfigBuilder {
                 ));
             }
 
-            self.known_addresses.insert(address, listener.protocol);
+            let protocol = listener
+                .protocol
+                .with_context(|| "No protocol defined for this listener")?;
+
+            self.known_addresses.insert(address, protocol);
             if listener.expect_proxy == Some(true) {
-                self.expect_proxy.insert(address);
+                self.expect_proxy_addresses.insert(address);
             }
 
             if listener.public_address.is_some() && listener.expect_proxy == Some(true) {
@@ -916,10 +1023,10 @@ impl ConfigBuilder {
                     ));
             }
 
-            match listener.protocol {
-                FileListenerProtocolConfig::Https => self.push_tls_listener(listener.clone())?,
-                FileListenerProtocolConfig::Http => self.push_http_listener(listener.clone())?,
-                FileListenerProtocolConfig::Tcp => self.push_tcp_listener(listener.clone())?,
+            match protocol {
+                ListenerProtocol::Https => self.push_tls_listener(listener.clone())?,
+                ListenerProtocol::Http => self.push_http_listener(listener.clone())?,
+                ListenerProtocol::Tcp => self.push_tcp_listener(listener.clone())?,
             }
         }
         Ok(())
@@ -931,22 +1038,22 @@ impl ConfigBuilder {
     ) -> anyhow::Result<()> {
         for (id, file_cluster_config) in file_cluster_configs.drain() {
             let mut cluster_config = file_cluster_config
-                .to_cluster_config(id.as_str(), &self.expect_proxy)
+                .to_cluster_config(id.as_str(), &self.expect_proxy_addresses)
                 .with_context(|| format!("error parsing cluster configuration for cluster {id}"))?;
 
             match cluster_config {
                 ClusterConfig::Http(ref mut http) => {
                     for frontend in http.frontends.iter_mut() {
                         match self.known_addresses.get(&frontend.address) {
-                            Some(FileListenerProtocolConfig::Tcp) => {
+                            Some(ListenerProtocol::Tcp) => {
                                 bail!("cannot set up a HTTP or HTTPS frontend on a TCP listener");
                             }
-                            Some(FileListenerProtocolConfig::Http) => {
+                            Some(ListenerProtocol::Http) => {
                                 if frontend.certificate.is_some() {
                                     bail!("cannot set up a HTTPS frontend on a HTTP listener");
                                 }
                             }
-                            Some(FileListenerProtocolConfig::Https) => {
+                            Some(ListenerProtocol::Https) => {
                                 if frontend.certificate.is_none() {
                                     if let Some(https_listener) =
                                         self.built.https_listeners.iter().find(|listener| {
@@ -970,19 +1077,19 @@ impl ConfigBuilder {
                             None => {
                                 // create a default listener for that front
                                 let file_listener_protocol = if frontend.certificate.is_some() {
-                                    self.push_tls_listener(Listener::new(
+                                    self.push_tls_listener(ListenerBuilder::new(
                                         frontend.address.to_string(),
-                                        FileListenerProtocolConfig::Https,
+                                        ListenerProtocol::Https,
                                     ))?;
 
-                                    FileListenerProtocolConfig::Https
+                                    ListenerProtocol::Https
                                 } else {
-                                    self.push_http_listener(Listener::new(
+                                    self.push_http_listener(ListenerBuilder::new(
                                         frontend.address.to_string(),
-                                        FileListenerProtocolConfig::Http,
+                                        ListenerProtocol::Http,
                                     ))?;
 
-                                    FileListenerProtocolConfig::Http
+                                    ListenerProtocol::Http
                                 };
                                 self.known_addresses
                                     .insert(frontend.address, file_listener_protocol);
@@ -994,19 +1101,18 @@ impl ConfigBuilder {
                     //FIXME: verify that different TCP clusters do not request the same address
                     for frontend in &tcp.frontends {
                         match self.known_addresses.get(&frontend.address) {
-                            Some(FileListenerProtocolConfig::Http)
-                            | Some(FileListenerProtocolConfig::Https) => {
+                            Some(ListenerProtocol::Http) | Some(ListenerProtocol::Https) => {
                                 bail!("cannot set up a TCP frontend on a HTTP listener");
                             }
-                            Some(FileListenerProtocolConfig::Tcp) => {}
+                            Some(ListenerProtocol::Tcp) => {}
                             None => {
                                 // create a default listener for that front
-                                self.push_tcp_listener(Listener::new(
+                                self.push_tcp_listener(ListenerBuilder::new(
                                     frontend.address.to_string(),
-                                    FileListenerProtocolConfig::Tcp,
+                                    ListenerProtocol::Tcp,
                                 ))?;
                                 self.known_addresses
-                                    .insert(frontend.address, FileListenerProtocolConfig::Tcp);
+                                    .insert(frontend.address, ListenerProtocol::Tcp);
                             }
                         }
                     }
@@ -1343,43 +1449,14 @@ mod tests {
 
     #[test]
     fn serialize() {
-        let http = Listener {
-            address: "127.0.0.1:8080".parse().unwrap(),
-            protocol: FileListenerProtocolConfig::Http,
-            answer_404: Some(String::from("404.html")),
-            answer_503: None,
-            public_address: None,
-            tls_versions: None,
-            cipher_list: None,
-            expect_proxy: None,
-            sticky_name: "SOZUBALANCEID".to_string(),
-            certificate: None,
-            certificate_chain: None,
-            key: None,
-            front_timeout: None,
-            back_timeout: None,
-            connect_timeout: None,
-            request_timeout: None,
-        };
+        let http = ListenerBuilder::new("127.0.0.1:8080", ListenerProtocol::Http)
+            .with_answer_404_path(Some("404.html"))
+            .to_owned();
         println!("http: {:?}", to_string(&http));
-        let https = Listener {
-            address: "127.0.0.1:8443".parse().unwrap(),
-            protocol: FileListenerProtocolConfig::Https,
-            answer_404: Some(String::from("404.html")),
-            answer_503: None,
-            public_address: None,
-            tls_versions: None,
-            cipher_list: None,
-            expect_proxy: None,
-            sticky_name: "SOZUBALANCEID".to_string(),
-            certificate: None,
-            certificate_chain: None,
-            key: None,
-            front_timeout: None,
-            back_timeout: None,
-            connect_timeout: None,
-            request_timeout: None,
-        };
+
+        let https = ListenerBuilder::new("127.0.0.1:8443", ListenerProtocol::Https)
+            .with_answer_404_path(Some("404.html"))
+            .to_owned();
         println!("https: {:?}", to_string(&https));
 
         let listeners = vec![http, https];

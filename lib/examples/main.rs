@@ -8,16 +8,14 @@ extern crate time;
 use std::{env, io::stdout, thread};
 
 use anyhow::Context;
+use sozu_command::config::ListenerBuilder;
 
 use sozu_command::{
     certificate::CertificateAndKey,
     channel::Channel,
-    config::DEFAULT_RUSTLS_CIPHER_LIST,
     logging::{Logger, LoggerBackend},
     request::{AddBackend, AddCertificate, LoadBalancingParams, Request, WorkerRequest},
-    response::{
-        HttpListenerConfig, HttpsListenerConfig, PathRule, RequestHttpFrontend, Route, RulePosition,
-    },
+    response::{PathRule, RequestHttpFrontend, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -49,19 +47,14 @@ fn main() -> anyhow::Result<()> {
     );
     gauge!("sozu.TEST", 42);
 
-    let config = HttpListenerConfig {
-        address: "127.0.0.1:8080"
-            .parse()
-            .with_context(|| "could not parse address")?,
-        ..Default::default()
-    };
+    let http_listener = ListenerBuilder::new_http("127.0.0.1:8080").to_http()?;
 
     let (mut command, channel) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
+        sozu::http::start_http_worker(http_listener, channel, max_buffers, buffer_size);
     });
 
     let http_front = RequestHttpFrontend {
@@ -96,23 +89,14 @@ fn main() -> anyhow::Result<()> {
     info!("MAIN\tHTTP -> {:?}", command.read_message());
     info!("MAIN\tHTTP -> {:?}", command.read_message());
 
-    let config = HttpsListenerConfig {
-        address: "127.0.0.1:8443"
-            .parse()
-            .with_context(|| "could not parse address")?,
-        cipher_list: DEFAULT_RUSTLS_CIPHER_LIST
-            .into_iter()
-            .map(String::from)
-            .collect(),
-        ..Default::default()
-    };
+    let https_listener = ListenerBuilder::new_tcp("127.0.0.1:8443").to_tls()?;
 
     let (mut command2, channel2) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
     let jg2 = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::https::start_https_worker(config, channel2, max_buffers, buffer_size)
+        sozu::https::start_https_worker(https_listener, channel2, max_buffers, buffer_size)
     });
 
     let cert1 = include_str!("../assets/certificate.pem");

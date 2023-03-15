@@ -1081,11 +1081,13 @@ pub fn start_http_worker(
 #[cfg(test)]
 mod tests {
     extern crate tiny_http;
+    use sozu_command::config::ListenerBuilder;
+
     use super::*;
     use crate::sozu_command::{
         channel::Channel,
         request::{LoadBalancingAlgorithms, LoadBalancingParams, Request, WorkerRequest},
-        response::{Backend, HttpFrontend, HttpListenerConfig, PathRule, Route, RulePosition},
+        response::{Backend, HttpFrontend, PathRule, Route, RulePosition},
     };
 
     use std::io::{Read, Write};
@@ -1116,12 +1118,9 @@ mod tests {
         start_server(1025, barrier.clone());
         barrier.wait();
 
-        let address: SocketAddr =
-            FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
-        let config = HttpListenerConfig {
-            address,
-            ..Default::default()
-        };
+        let config = ListenerBuilder::new_http("127.0.0.1:1024")
+            .to_http()
+            .expect("could not create listener config");
 
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
@@ -1203,12 +1202,9 @@ mod tests {
         start_server(1028, barrier.clone());
         barrier.wait();
 
-        let address: SocketAddr =
-            FromStr::from_str("127.0.0.1:1031").expect("could not parse address");
-        let config = HttpListenerConfig {
-            address,
-            ..Default::default()
-        };
+        let config = ListenerBuilder::new_http("127.0.0.1:1031")
+            .to_http()
+            .expect("could not create listener config");
 
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
@@ -1317,12 +1313,10 @@ mod tests {
     #[test]
     fn https_redirect() {
         setup_test_logger!();
-        let address: SocketAddr =
-            FromStr::from_str("127.0.0.1:1041").expect("could not parse address");
-        let config = HttpListenerConfig {
-            address,
-            ..Default::default()
-        };
+
+        let config = ListenerBuilder::new_http("127.0.0.1:1041")
+            .to_http()
+            .expect("could not create listener config");
 
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
@@ -1499,6 +1493,11 @@ mod tests {
 
         let address: SocketAddr =
             FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
+
+        let default_config = ListenerBuilder::new_http(address)
+            .to_http()
+            .expect("Could not create default HTTP listener config");
+
         let listener = HttpListener {
             listener: None,
             address,
@@ -1507,7 +1506,7 @@ mod tests {
                 "HTTP/1.1 404 Not Found\r\n\r\n",
                 "HTTP/1.1 503 Service Unavailable\r\n\r\n",
             ))),
-            config: Default::default(),
+            config: default_config,
             token: Token(0),
             active: true,
             tags: BTreeMap::new(),

@@ -20,8 +20,7 @@ use sozu_command::{
         AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, Request, WorkerRequest,
     },
     response::{
-        HttpListenerConfig, HttpsListenerConfig, PathRule, ProxyResponse, RequestHttpFrontend,
-        RequestTcpFrontend, Route, RulePosition, TcpListenerConfig,
+        PathRule, ProxyResponse, RequestHttpFrontend, RequestTcpFrontend, Route, RulePosition,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -265,41 +264,6 @@ impl Worker {
             UnixStream::from_raw_fd(self.scm_worker_to_main.fd);
         }
         result
-    }
-
-    pub fn default_tcp_listener(address: SocketAddr) -> TcpListenerConfig {
-        TcpListenerConfig {
-            address,
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-        }
-    }
-
-    pub fn default_http_listener(address: SocketAddr) -> HttpListenerConfig {
-        HttpListenerConfig {
-            address,
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-            ..HttpListenerConfig::default()
-        }
-    }
-
-    pub fn default_https_listener(address: SocketAddr) -> HttpsListenerConfig {
-        HttpsListenerConfig {
-            address,
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-            ..HttpsListenerConfig::default()
-        }
     }
 
     pub fn default_cluster<S: Into<String>>(cluster_id: S) -> Cluster {
