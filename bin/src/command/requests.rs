@@ -223,10 +223,8 @@ impl CommandServer {
                             let mut found = false;
                             let id = format!("LOAD-STATE-{}-{diff_counter}", request.id);
 
-                            for worker in self
-                                .workers
-                                .iter_mut()
-                                .filter(|worker| worker.is_not_stopped_or_stopping())
+                            for worker in
+                                self.workers.iter_mut().filter(|worker| worker.is_active())
                             {
                                 let worker_message_id = format!("{}-{}", id, worker.id);
                                 worker
@@ -549,13 +547,11 @@ impl CommandServer {
             client_id, worker_id
         );
 
-        if !self.workers.iter().any(|worker| {
-            worker.id == worker_id
-                && worker.run_state != RunState::Stopping
-                && worker.run_state != RunState::Stopped
-            // should we add this?
-            // && worker.run_state != RunState::NotAnswering
-        }) {
+        if !self
+            .workers
+            .iter()
+            .any(|worker| worker.id == worker_id && worker.is_active())
+        {
             bail!(format!(
                 "The worker {} does not exist, or is stopped / stopping.",
                 &worker_id
@@ -792,11 +788,7 @@ impl CommandServer {
                 let mut found = false;
                 let id = format!("LOAD-STATE-{}-{}", &request.id, diff_counter);
 
-                for worker in self
-                    .workers
-                    .iter_mut()
-                    .filter(|worker| worker.is_not_stopped_or_stopping())
-                {
+                for worker in self.workers.iter_mut().filter(|worker| worker.is_active()) {
                     let worker_message_id = format!("{}-{}", id, worker.id);
                     worker
                         .send(worker_message_id.clone(), request.content.clone())
@@ -1212,11 +1204,7 @@ impl CommandServer {
         let mut found = false;
         let mut stopping_workers = HashSet::new();
         let mut worker_count = 0usize;
-        for worker in self
-            .workers
-            .iter_mut()
-            .filter(|worker| worker.is_not_stopped_or_stopping())
-        {
+        for worker in self.workers.iter_mut().filter(|worker| worker.is_active()) {
             let should_stop_worker = request == Request::SoftStop || request == Request::HardStop;
             if should_stop_worker {
                 worker.run_state = RunState::Stopping;

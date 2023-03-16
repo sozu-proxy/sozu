@@ -514,11 +514,7 @@ impl CommandServer {
             }
 
             let mut count = 0usize;
-            for worker in self
-                .workers
-                .iter_mut()
-                .filter(|worker| worker.is_not_stopped_or_stopping())
-            {
+            for worker in self.workers.iter_mut().filter(|worker| worker.is_active()) {
                 worker.send(message.id.clone(), request.clone()).await;
                 count += 1;
             }

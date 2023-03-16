@@ -116,7 +116,7 @@ impl Worker {
         }
     }
 
-    pub fn is_not_stopped_or_stopping(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         self.run_state != RunState::Stopping && self.run_state != RunState::Stopped
     }
 
