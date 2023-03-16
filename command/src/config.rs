@@ -886,6 +886,7 @@ impl ClusterConfig {
     }
 }
 
+/// Built from the TOML config provided by the user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct FileConfig {
     pub command_socket: Option<String>,
@@ -1205,9 +1206,9 @@ impl ConfigBuilder {
             ctl_command_timeout: self.file.ctl_command_timeout.unwrap_or(1_000),
             pid_file_path: self.file.pid_file_path.clone(),
             activate_listeners: self.file.activate_listeners.unwrap_or(true),
-            front_timeout: self.file.front_timeout.unwrap_or(60),
-            back_timeout: self.file.front_timeout.unwrap_or(30),
-            connect_timeout: self.file.front_timeout.unwrap_or(3),
+            front_timeout: self.file.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
+            back_timeout: self.file.front_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
+            connect_timeout: self.file.front_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             //defaults to 30mn
             zombie_check_interval: self.file.zombie_check_interval.unwrap_or(30 * 60),
             accept_queue_timeout: self.file.accept_queue_timeout.unwrap_or(60),
@@ -1215,6 +1216,7 @@ impl ConfigBuilder {
     }
 }
 
+/// Sōzu config as parsed from the TOML config, used to create requests
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct Config {
     pub config_path: String,
@@ -1302,7 +1304,6 @@ impl Config {
         for listener in &self.http_listeners {
             v.push(WorkerRequest {
                 id: format!("CONFIG-{count}"),
-
                 content: Request::AddHttpListener(listener.clone()),
             });
             count += 1;
@@ -1311,7 +1312,6 @@ impl Config {
         for listener in &self.https_listeners {
             v.push(WorkerRequest {
                 id: format!("CONFIG-{count}"),
-
                 content: Request::AddHttpsListener(listener.clone()),
             });
             count += 1;
@@ -1320,7 +1320,6 @@ impl Config {
         for listener in &self.tcp_listeners {
             v.push(WorkerRequest {
                 id: format!("CONFIG-{count}"),
-
                 content: Request::AddTcpListener(listener.clone()),
             });
             count += 1;
