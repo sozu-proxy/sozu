@@ -63,6 +63,7 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
 
 pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"];
 
+// TODO: trickle default values from the config, see #873
 pub const DEFAULT_FRONT_TIMEOUT: u32 = 60;
 pub const DEFAULT_BACK_TIMEOUT: u32 = 30;
 pub const DEFAULT_CONNECT_TIMEOUT: u32 = 3;
@@ -129,7 +130,6 @@ impl ListenerBuilder {
         Self::new(address, ListenerProtocol::Https)
     }
 
-    // TODO: set the default values elsewhere, see #873
     /// starts building a Listener with default values
     fn new<S>(address: S, protocol: ListenerProtocol) -> ListenerBuilder
     where
@@ -265,7 +265,12 @@ impl ListenerBuilder {
     }
 
     pub fn to_http(&mut self) -> anyhow::Result<HttpListenerConfig> {
-        // TODO: reintroduce the protocol check and bail
+        if self.protocol != Some(ListenerProtocol::Http) {
+            bail!(format!(
+                "Can not build an HTTP listener from a {:?} config",
+                self.protocol
+            ));
+        }
 
         let (answer_404, answer_503) = self
             .get_404_503_answers()
@@ -288,7 +293,12 @@ impl ListenerBuilder {
     }
 
     pub fn to_tls(&self) -> anyhow::Result<HttpsListenerConfig> {
-        // TODO: reintroduce the protocol check and bail
+        if self.protocol != Some(ListenerProtocol::Https) {
+            bail!(format!(
+                "Can not build an HTTPS listener from a {:?} config",
+                self.protocol
+            ));
+        }
 
         let default_cipher_list = DEFAULT_RUSTLS_CIPHER_LIST
             .into_iter()
@@ -375,7 +385,12 @@ impl ListenerBuilder {
     }
 
     pub fn to_tcp(&self) -> anyhow::Result<TcpListenerConfig> {
-        // TODO: reintroduce the protocol check and bail
+        if self.protocol != Some(ListenerProtocol::Tcp) {
+            bail!(format!(
+                "Can not build a TCP listener from a {:?} config",
+                self.protocol
+            ));
+        }
 
         Ok(TcpListenerConfig {
             address: self.parse_address()?,
