@@ -264,6 +264,7 @@ impl ListenerBuilder {
         }
     }
 
+    /// build an HTTP listener using defaults if the values were not provided
     pub fn to_http(&mut self) -> anyhow::Result<HttpListenerConfig> {
         if self.protocol != Some(ListenerProtocol::Http) {
             bail!(format!(
@@ -292,6 +293,7 @@ impl ListenerBuilder {
         Ok(configuration)
     }
 
+    /// build an HTTPS listener using defaults if the values were not provided
     pub fn to_tls(&self) -> anyhow::Result<HttpsListenerConfig> {
         if self.protocol != Some(ListenerProtocol::Https) {
             bail!(format!(
@@ -384,6 +386,7 @@ impl ListenerBuilder {
         Ok(https_listener_config)
     }
 
+    /// build a TCP listener using defaults if the values were not provided
     pub fn to_tcp(&self) -> anyhow::Result<TcpListenerConfig> {
         if self.protocol != Some(ListenerProtocol::Tcp) {
             bail!(format!(
@@ -402,6 +405,8 @@ impl ListenerBuilder {
         })
     }
 
+    /// Get the 404 and 503 answers from the file system using the provided paths,
+    /// if none, defaults to HTML files in the sozu assets
     fn get_404_503_answers(&self) -> anyhow::Result<(String, String)> {
         let answer_404 = match &self.answer_404 {
             Some(a_404_path) => {
