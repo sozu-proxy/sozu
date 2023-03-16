@@ -217,8 +217,9 @@ use sozu_command::state::ClusterId;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
-    proxy::{Cluster, LoadBalancingParams, ProxyEvent, ProxyRequest, ProxyResponse, Route},
     ready::Ready,
+    request::{Cluster, LoadBalancingParams, WorkerRequest},
+    response::{Event, ProxyResponse, Route},
 };
 
 use self::{backends::BackendMap, retry::RetryPolicy};
@@ -437,7 +438,7 @@ pub enum AcceptError {
 
 use self::server::ListenToken;
 pub trait ProxyConfiguration {
-    fn notify(&mut self, message: ProxyRequest) -> ProxyResponse;
+    fn notify(&mut self, message: WorkerRequest) -> ProxyResponse;
     fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
     fn create_session(
         &mut self,
@@ -714,7 +715,7 @@ impl Backend {
 // can be safely stopped
 impl std::ops::Drop for Backend {
     fn drop(&mut self) {
-        server::push_event(ProxyEvent::RemovedBackendHasNoConnections(
+        server::push_event(Event::RemovedBackendHasNoConnections(
             self.backend_id.clone(),
             self.address,
         ));

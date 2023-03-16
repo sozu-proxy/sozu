@@ -1,20 +1,15 @@
 {
-  "id": "ID_TEST",
-  "version": 0,
-  "type": "PROXY",
-  "data": {
-    "type": "ADD_HTTP_FRONTEND",
-    "data": {
-      "route": {
-        "CLUSTER_ID": "xxx"
-      },
-      "address": "0.0.0.0:8080",
-      "hostname": "yyy",
-      "path": {
-        "PREFIX": "xxx"
-      },
-      "position": "TREE",
-      "tags": null
-    }
+  "type": "ADD_HTTP_FRONTEND",
+  "content": {
+    "route": {
+      "CLUSTER_ID": "xxx"
+    },
+    "address": "0.0.0.0:8080",
+    "hostname": "yyy",
+    "path": {
+      "PREFIX": "xxx"
+    },
+    "position": "TREE",
+    "tags": null
   }
 }

@@ -13,39 +13,34 @@ use mio::{
     Events, Interest, Poll, Token,
 };
 use slab::Slab;
-use sozu_command::proxy::{
-    ActivateListener, DeactivateListener, HttpListenerConfig, HttpsListenerConfig,
+use sozu_command::{
+    channel::Channel,
+    config::Config,
+    ready::Ready,
+    request::{
+        ActivateListener, Cluster, DeactivateListener, ListenerType, QueryCertificateType,
+        QueryClusterType, RemoveBackend, Request, WorkerRequest,
+    },
+    response::{
+        Backend as CommandLibBackend, Event, HttpListenerConfig, HttpsListenerConfig, MessageId,
+        ProxyResponse, ProxyResponseContent, QueryAnswer, QueryAnswerCertificate, ResponseStatus,
+        TcpListenerConfig as CommandTcpListener,
+    },
+    scm_socket::{Listeners, ScmSocket},
+    state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
 };
 use time::{Duration, Instant};
 
 use crate::{
-    backends::BackendMap,
-    features::FEATURES,
-    http, https,
-    metrics::METRICS,
-    pool::Pool,
-    sozu_command::{
-        channel::Channel,
-        config::Config,
-        proxy::{
-            Backend as CommandLibBackend, Cluster, ListenerType, MessageId, ProxyEvent,
-            ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
-            ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,
-            QueryClusterType, RemoveBackend, TcpListenerConfig as CommandTcpListener,
-        },
-        ready::Ready,
-        scm_socket::{Listeners, ScmSocket},
-        state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
-    },
-    tcp,
-    timer::Timer,
-    AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed,
+    backends::BackendMap, features::FEATURES, http, https, metrics::METRICS, pool::Pool, tcp,
+    timer::Timer, AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession,
+    SessionIsToBeClosed,
 };
 
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;
 
-pub type ProxyChannel = Channel<ProxyResponse, ProxyRequest>;
+pub type ProxyChannel = Channel<ProxyResponse, WorkerRequest>;
 
 thread_local! {
   pub static QUEUE: RefCell<VecDeque<ProxyResponse>> = RefCell::new(VecDeque::new());
@@ -61,11 +56,12 @@ pub fn push_queue(message: ProxyResponse) {
     });
 }
 
-pub fn push_event(event: ProxyEvent) {
+pub fn push_event(event: Event) {
     QUEUE.with(|queue| {
         (*queue.borrow_mut()).push_back(ProxyResponse {
             id: "EVENT".to_string(),
-            status: ProxyResponseStatus::Processing,
+            message: String::new(),
+            status: ResponseStatus::Processing,
             content: Some(ProxyResponseContent::Event(event)),
         });
     });
@@ -434,15 +430,15 @@ impl Server {
 
         // initialize the worker with the state we got from a file
         if let Some(state) = config_state {
-            for (counter, order) in state.generate_orders().iter().enumerate() {
+            for (counter, request) in state.generate_requests().iter().enumerate() {
                 let id = format!("INIT-{counter}");
-                let message = ProxyRequest {
+                let worker_request = WorkerRequest {
                     id,
-                    order: order.to_owned(),
+                    content: request.to_owned(),
                 };
 
-                trace!("generating initial config order: {:#?}", message);
-                server.notify_proxys(message);
+                trace!("generating initial config request: {:#?}", worker_request);
+                server.notify_proxys(worker_request);
             }
 
             // do not send back answers to the initialization messages
@@ -667,8 +663,8 @@ impl Server {
 
         loop {
             match self.channel.read_message() {
-                Ok(request) => match request.order {
-                    ProxyRequestOrder::HardStop => {
+                Ok(request) => match request.content {
+                    Request::HardStop => {
                         let req_id = request.id.clone();
                         self.notify(request);
                         if let Err(e) = self.channel.write_message(&ProxyResponse::ok(req_id)) {
@@ -679,12 +675,12 @@ impl Server {
                         }
                         return true;
                     }
-                    ProxyRequestOrder::SoftStop => {
+                    Request::SoftStop => {
                         self.shutting_down = Some(request.id.clone());
                         self.last_sessions_len = self.sessions.borrow().slab.len();
                         self.notify(request);
                     }
-                    ProxyRequestOrder::ReturnListenSockets => {
+                    Request::ReturnListenSockets => {
                         info!("received ReturnListenSockets order");
                         self.return_listen_sockets();
                     }
@@ -813,14 +809,11 @@ impl Server {
                 error!("Error while running the server channel: {}", e);
             }
             self.block_channel();
-            let proxy_response = ProxyResponse {
-                id: self
-                    .shutting_down
-                    .take()
-                    .expect("should have shut down correctly"), // panicking here makes sense actually
-                status: ProxyResponseStatus::Ok,
-                content: None,
-            };
+            let id = self
+                .shutting_down
+                .take()
+                .expect("should have shut down correctly"); // panicking here makes sense actually
+            let proxy_response = ProxyResponse::ok(id);
             if let Err(e) = self.channel.write_message(&proxy_response) {
                 error!("Could not write response to the main process: {}", e);
             }
@@ -874,8 +867,8 @@ impl Server {
         }
     }
 
-    fn notify(&mut self, message: ProxyRequest) {
-        if let ProxyRequestOrder::ConfigureMetrics(configuration) = &message.order {
+    fn notify(&mut self, message: WorkerRequest) {
+        if let Request::ConfigureMetrics(configuration) = &message.content {
             //let id = message.id.clone();
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).configure(configuration);
@@ -885,106 +878,102 @@ impl Server {
             return;
         }
 
-        if let ProxyRequestOrder::Query(ref query) = message.order {
-            match query {
-                Query::ClustersHashes => {
-                    push_queue(ProxyResponse {
-                        id: message.id.clone(),
-                        status: ProxyResponseStatus::Ok,
-                        content: Some(ProxyResponseContent::Query(QueryAnswer::ClustersHashes(
-                            self.config_state.hash_state(),
-                        ))),
-                    });
-                    return;
-                }
-                Query::Clusters(query_type) => {
-                    let query_answer = match query_type {
-                        QueryClusterType::ClusterId(cluster_id) => {
-                            QueryAnswer::Clusters(vec![self.config_state.cluster_state(cluster_id)])
-                        }
-                        QueryClusterType::Domain(domain) => {
-                            let cluster_ids = get_cluster_ids_by_domain(
-                                &self.config_state,
-                                domain.hostname.clone(),
-                                domain.path.clone(),
-                            );
-                            let answer = cluster_ids
-                                .iter()
-                                .map(|cluster_id| self.config_state.cluster_state(cluster_id))
-                                .collect();
+        match &message.content {
+            Request::QueryClustersHashes => {
+                push_queue(ProxyResponse::ok_with_content(
+                    message.id.clone(),
+                    ProxyResponseContent::Query(QueryAnswer::ClustersHashes(
+                        self.config_state.hash_state(),
+                    )),
+                ));
+                return;
+            }
+            Request::QueryClusters(query_type) => {
+                let query_answer = match query_type {
+                    QueryClusterType::ClusterId(cluster_id) => {
+                        QueryAnswer::Clusters(vec![self.config_state.cluster_state(cluster_id)])
+                    }
+                    QueryClusterType::Domain(domain) => {
+                        let cluster_ids = get_cluster_ids_by_domain(
+                            &self.config_state,
+                            domain.hostname.clone(),
+                            domain.path.clone(),
+                        );
+                        let answer = cluster_ids
+                            .iter()
+                            .map(|cluster_id| self.config_state.cluster_state(cluster_id))
+                            .collect();
 
-                            QueryAnswer::Clusters(answer)
-                        }
-                    };
-                    push_queue(ProxyResponse {
-                        id: message.id.clone(),
-                        status: ProxyResponseStatus::Ok,
-                        content: Some(ProxyResponseContent::Query(query_answer)),
-                    });
-                    return;
-                }
-                Query::Certificates(q) => {
-                    match q {
-                        // forward the query to the TLS implementation
-                        QueryCertificateType::Domain(_) => {}
-                        // forward the query to the TLS implementation
-                        QueryCertificateType::All => {}
-                        QueryCertificateType::Fingerprint(f) => {
-                            push_queue(ProxyResponse {
-                                id: message.id.clone(),
-                                status: ProxyResponseStatus::Ok,
-                                content: Some(ProxyResponseContent::Query(
-                                    QueryAnswer::Certificates(QueryAnswerCertificate::Fingerprint(
-                                        get_certificate(&self.config_state, f),
-                                    )),
+                        QueryAnswer::Clusters(answer)
+                    }
+                };
+                push_queue(ProxyResponse::ok_with_content(
+                    message.id.clone(),
+                    ProxyResponseContent::Query(query_answer),
+                ));
+                return;
+            }
+            Request::QueryCertificates(q) => {
+                match q {
+                    // forward the query to the TLS implementation
+                    QueryCertificateType::Domain(_) => {}
+                    // forward the query to the TLS implementation
+                    QueryCertificateType::All => {}
+                    QueryCertificateType::Fingerprint(f) => {
+                        push_queue(ProxyResponse::ok_with_content(
+                            message.id.clone(),
+                            ProxyResponseContent::Query(QueryAnswer::Certificates(
+                                QueryAnswerCertificate::Fingerprint(get_certificate(
+                                    &self.config_state,
+                                    f,
                                 )),
-                            });
-                            return;
-                        }
+                            )),
+                        ));
+                        return;
                     }
                 }
-                Query::Metrics(query_metrics_options) => {
-                    METRICS.with(|metrics| {
-                        let data = (*metrics.borrow_mut()).query(query_metrics_options);
-
-                        push_queue(ProxyResponse {
-                            id: message.id.clone(),
-                            status: ProxyResponseStatus::Ok,
-                            content: Some(ProxyResponseContent::Query(QueryAnswer::Metrics(data))),
-                        });
-                    });
-                    return;
-                }
             }
+            Request::QueryMetrics(query_metrics_options) => {
+                METRICS.with(|metrics| {
+                    let data = (*metrics.borrow_mut()).query(query_metrics_options);
+
+                    push_queue(ProxyResponse::ok_with_content(
+                        message.id.clone(),
+                        ProxyResponseContent::Query(QueryAnswer::Metrics(data)),
+                    ));
+                });
+                return;
+            }
+            _other_request => {}
         }
 
         self.notify_proxys(message);
     }
 
-    pub fn notify_proxys(&mut self, request: ProxyRequest) {
-        if let Err(e) = self.config_state.dispatch(&request.order) {
+    pub fn notify_proxys(&mut self, request: WorkerRequest) {
+        if let Err(e) = self.config_state.dispatch(&request.content) {
             error!("Could not execute order on config state: {:#}", e);
         }
 
         let req_id = request.id.clone();
 
-        match request.order {
-            ProxyRequestOrder::AddCluster(ref cluster) => {
+        match request.content {
+            Request::AddCluster(ref cluster) => {
                 self.add_cluster(cluster);
                 //not returning because the message must still be handled by each proxy
             }
-            ProxyRequestOrder::AddBackend(ref backend) => {
+            Request::AddBackend(ref backend) => {
                 push_queue(self.add_backend(&req_id, backend));
                 return;
             }
-            ProxyRequestOrder::RemoveBackend(ref remove_backend) => {
+            Request::RemoveBackend(ref remove_backend) => {
                 push_queue(self.remove_backend(&req_id, remove_backend));
                 return;
             }
             _ => {}
         };
 
-        let proxy_destinations = request.order.get_destinations();
+        let proxy_destinations = request.content.get_destinations();
         if proxy_destinations.to_http_proxy {
             push_queue(self.http.borrow_mut().notify(request.clone()));
         }
@@ -995,18 +984,18 @@ impl Server {
             push_queue(self.tcp.borrow_mut().notify(request.clone()));
         }
 
-        match request.order {
+        match request.content {
             // special case for adding listeners, because we need to register a listener
-            ProxyRequestOrder::AddHttpListener(ref listener) => {
+            Request::AddHttpListener(ref listener) => {
                 push_queue(self.notify_add_http_listener(&req_id, listener));
             }
-            ProxyRequestOrder::AddHttpsListener(ref listener) => {
+            Request::AddHttpsListener(ref listener) => {
                 push_queue(self.notify_add_https_listener(&req_id, listener));
             }
-            ProxyRequestOrder::AddTcpListener(listener) => {
+            Request::AddTcpListener(listener) => {
                 push_queue(self.notify_add_tcp_listener(&req_id, listener));
             }
-            ProxyRequestOrder::RemoveListener(ref remove) => {
+            Request::RemoveListener(ref remove) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
                 let response = match remove.proxy {
@@ -1016,13 +1005,13 @@ impl Server {
                 };
                 push_queue(response);
             }
-            ProxyRequestOrder::ActivateListener(ref activate) => {
+            Request::ActivateListener(ref activate) => {
                 push_queue(self.notify_activate_listener(&req_id, activate));
             }
-            ProxyRequestOrder::DeactivateListener(ref deactivate) => {
+            Request::DeactivateListener(ref deactivate) => {
                 push_queue(self.notify_deactivate_listener(&req_id, deactivate));
             }
-            _other_order => {}
+            _other_request => {}
         };
     }
 

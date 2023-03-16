@@ -6,12 +6,10 @@ use std::{
 use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 
-use sozu_command_lib::{
-    command::{CommandResponseContent, ListedFrontends, ListenersList, WorkerInfo},
-    proxy::{
-        AggregatedMetricsData, ClusterMetricsData, FilteredData, QueryAnswer,
-        QueryAnswerCertificate, QueryAnswerMetrics, Route, WorkerMetrics,
-    },
+use sozu_command_lib::response::{
+    AggregatedMetricsData, ClusterMetricsData, FilteredData, ListedFrontends, ListenersList,
+    QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics, ResponseContent, Route, WorkerInfo,
+    WorkerMetrics,
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -393,11 +391,11 @@ pub fn create_queried_cluster_table(
 pub fn print_query_response_data(
     cluster_id: Option<String>,
     domain: Option<String>,
-    data: Option<CommandResponseContent>,
+    data: Option<ResponseContent>,
     json: bool,
 ) -> anyhow::Result<()> {
     if let Some(needle) = cluster_id.or(domain) {
-        if let Some(CommandResponseContent::Query(data)) = &data {
+        if let Some(ResponseContent::Query(data)) = &data {
             if json {
                 return print_json_response(data);
             }
@@ -579,7 +577,7 @@ pub fn print_query_response_data(
 
             backend_table.printstd();
         }
-    } else if let Some(CommandResponseContent::Query(data)) = &data {
+    } else if let Some(ResponseContent::Query(data)) = &data {
         let mut table = Table::new();
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         let mut header = vec![cell!("key")];

@@ -16,13 +16,11 @@ use serde::{Deserialize, Serialize};
 use tempfile::tempfile;
 
 use sozu_command_lib::{
-    channel::Channel, command::RunState, config::Config, proxy::ProxyRequest, state::ConfigState,
+    channel::Channel, config::Config, request::WorkerRequest, response::RunState,
+    state::ConfigState,
 };
 
-use crate::{
-    command::{CommandServer, Worker},
-    util,
-};
+use crate::{command::CommandServer, util, worker::Worker};
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct SerializedWorker {
@@ -30,7 +28,7 @@ pub struct SerializedWorker {
     pub pid: i32,
     pub id: u32,
     pub run_state: RunState,
-    pub queue: Vec<ProxyRequest>,
+    pub queue: Vec<WorkerRequest>,
     pub scm: i32,
 }
 

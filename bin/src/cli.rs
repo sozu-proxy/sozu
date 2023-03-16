@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, net::SocketAddr};
 
 use clap::{Parser, Subcommand};
-use sozu_command_lib::proxy::{LoadBalancingAlgorithms, TlsVersion};
+
+use sozu_command_lib::{certificate::TlsVersion, request::LoadBalancingAlgorithms};
 
 #[derive(Parser, PartialEq, Eq, Clone, Debug)]
 #[clap(author, version, about)]
@@ -97,18 +98,13 @@ pub enum SubCmd {
     Shutdown {
         #[clap(long = "hard", help = "do not wait for connections to finish")]
         hard: bool,
-        #[clap(
-            short = 'w',
-            long = "worker",
-            help = "shuts down the worker with this id"
-        )]
-        worker: Option<u32>,
     },
     #[clap(name = "upgrade", about = "upgrade the proxy")]
     Upgrade {
-        #[clap(short = 'w', long = "worker", help = "Upgrade the worker with this id")]
+        #[clap(long = "worker", help = "upgrade a specific worker")]
         worker: Option<u32>,
     },
+
     #[clap(name = "status", about = "gets information on the running workers")]
     Status {
         #[clap(
@@ -438,11 +434,11 @@ pub enum Route {
 }
 
 #[allow(clippy::from_over_into)]
-impl std::convert::Into<sozu_command_lib::proxy::Route> for Route {
-    fn into(self) -> sozu_command_lib::proxy::Route {
+impl std::convert::Into<sozu_command_lib::response::Route> for Route {
+    fn into(self) -> sozu_command_lib::response::Route {
         match self {
-            Route::Deny => sozu_command_lib::proxy::Route::Deny,
-            Route::Id { id } => sozu_command_lib::proxy::Route::ClusterId(id),
+            Route::Deny => sozu_command_lib::response::Route::Deny,
+            Route::Id { id } => sozu_command_lib::response::Route::ClusterId(id),
         }
     }
 }

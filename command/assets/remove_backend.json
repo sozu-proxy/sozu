@@ -1,13 +1,8 @@
 {
-  "id": "ID_TEST",
-  "version": 0,
-  "type": "PROXY",
-  "data": {
-    "type": "REMOVE_BACKEND",
-    "data": {
-      "cluster_id": "xxx",
-      "backend_id": "xxx-0",
-      "address": "127.0.0.1:8080"
-    }
+  "type": "REMOVE_BACKEND",
+  "content": {
+    "cluster_id": "xxx",
+    "backend_id": "xxx-0",
+    "address": "127.0.0.1:8080"
   }
 }

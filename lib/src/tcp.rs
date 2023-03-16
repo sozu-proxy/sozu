@@ -36,11 +36,9 @@ use crate::{
     sozu_command::{
         config::ProxyProtocolConfig,
         logging,
-        proxy::{
-            ProxyEvent, ProxyRequest, ProxyRequestOrder, ProxyResponse, TcpFrontend,
-            TcpListenerConfig,
-        },
         ready::Ready,
+        request::{Request, WorkerRequest},
+        response::{Event, ProxyResponse, TcpFrontend, TcpListenerConfig},
         scm_socket::ScmSocket,
         state::ClusterId,
     },
@@ -333,7 +331,9 @@ impl TcpSession {
             TcpStateMachine::SendProxyProtocol(pp) => {
                 res = pp.back_writable(&mut self.metrics);
             }
-            TcpStateMachine::ExpectProxyProtocol(_) | TcpStateMachine::FailedUpgrade(_) => unreachable!(),
+            TcpStateMachine::ExpectProxyProtocol(_) | TcpStateMachine::FailedUpgrade(_) => {
+                unreachable!()
+            }
         };
 
         if let SessionResult::Upgrade = res.0 {
@@ -404,7 +404,10 @@ impl TcpSession {
         None
     }
 
-    fn upgrade_expect(&mut self, epp: ExpectProxyProtocol<MioTcpStream>) -> Option<TcpStateMachine> {
+    fn upgrade_expect(
+        &mut self,
+        epp: ExpectProxyProtocol<MioTcpStream>,
+    ) -> Option<TcpStateMachine> {
         if self.frontend_buffer.is_some() && self.backend_buffer.is_some() {
             let mut pipe = epp.into_pipe(
                 self.frontend_buffer.take().unwrap(),
@@ -500,7 +503,7 @@ impl TcpSession {
                         "backend server {} at {} is up",
                         backend.backend_id, backend.address
                     );
-                    push_event(ProxyEvent::BackendUp(
+                    push_event(Event::BackendUp(
                         backend.backend_id.clone(),
                         backend.address,
                     ));
@@ -552,7 +555,7 @@ impl TcpSession {
                     self.metrics.backend_id.as_deref()
                 );
 
-                push_event(ProxyEvent::BackendDown(
+                push_event(Event::BackendDown(
                     backend.backend_id.clone(),
                     backend.address,
                 ));
@@ -1316,23 +1319,23 @@ impl TcpProxy {
 }
 
 impl ProxyConfiguration for TcpProxy {
-    fn notify(&mut self, message: ProxyRequest) -> ProxyResponse {
-        match message.order {
-            ProxyRequestOrder::AddTcpFrontend(front) => {
+    fn notify(&mut self, message: WorkerRequest) -> ProxyResponse {
+        match message.content {
+            Request::AddTcpFrontend(front) => {
                 if let Err(err) = self.add_tcp_front(front) {
                     return ProxyResponse::error(message.id, err);
                 }
 
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestOrder::RemoveTcpFrontend(front) => {
+            Request::RemoveTcpFrontend(front) => {
                 if let Err(err) = self.remove_tcp_front(&front) {
                     return ProxyResponse::error(message.id, err);
                 }
 
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestOrder::SoftStop => {
+            Request::SoftStop => {
                 info!("{} processing soft shutdown", message.id);
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.iter() {
@@ -1343,7 +1346,7 @@ impl ProxyConfiguration for TcpProxy {
                 }
                 ProxyResponse::processing(message.id)
             }
-            ProxyRequestOrder::HardStop => {
+            Request::HardStop => {
                 info!("{} hard shutdown", message.id);
                 let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.drain() {
@@ -1354,11 +1357,11 @@ impl ProxyConfiguration for TcpProxy {
                 }
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestOrder::Status => {
+            Request::Status => {
                 info!("{} status", message.id);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestOrder::Logging(logging_filter) => {
+            Request::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     message.id, logging_filter
@@ -1369,7 +1372,7 @@ impl ProxyConfiguration for TcpProxy {
                 });
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestOrder::AddCluster(cluster) => {
+            Request::AddCluster(cluster) => {
                 let config = ClusterConfiguration {
                     proxy_protocol: cluster.proxy_protocol,
                     //load_balancing: cluster.load_balancing,
@@ -1377,11 +1380,11 @@ impl ProxyConfiguration for TcpProxy {
                 self.configs.insert(cluster.cluster_id, config);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestOrder::RemoveCluster { cluster_id } => {
+            Request::RemoveCluster { cluster_id } => {
                 self.configs.remove(&cluster_id);
                 ProxyResponse::ok(message.id)
             }
-            ProxyRequestOrder::RemoveListener(remove) => {
+            Request::RemoveListener(remove) => {
                 if !self.remove_listener(remove.address) {
                     ProxyResponse::error(
                         message.id,
@@ -1604,7 +1607,7 @@ pub fn start_tcp_worker(
 mod tests {
     use super::*;
     use crate::sozu_command::channel::Channel;
-    use crate::sozu_command::proxy::{self, LoadBalancingParams, TcpFrontend};
+    use crate::sozu_command::request::LoadBalancingParams;
     use crate::sozu_command::scm_socket::Listeners;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
@@ -1729,7 +1732,7 @@ mod tests {
     }
 
     /// used in tests only
-    pub fn start_proxy() -> anyhow::Result<Channel<ProxyRequest, ProxyResponse>> {
+    pub fn start_proxy() -> anyhow::Result<Channel<WorkerRequest, ProxyResponse>> {
         use crate::server;
 
         info!("listen for connections");
@@ -1845,7 +1848,7 @@ mod tests {
                     .with_context(|| "Could not parse address")?,
                 tags: None,
             };
-            let backend = proxy::Backend {
+            let backend = sozu_command_lib::response::Backend {
                 cluster_id: String::from("yolo"),
                 backend_id: String::from("yolo-0"),
                 address: "127.0.0.1:5678"
@@ -1857,15 +1860,15 @@ mod tests {
             };
 
             command
-                .write_message(&ProxyRequest {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO1"),
-                    order: ProxyRequestOrder::AddTcpFrontend(front),
+                    content: Request::AddTcpFrontend(front),
                 })
                 .unwrap();
             command
-                .write_message(&ProxyRequest {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO2"),
-                    order: ProxyRequestOrder::AddBackend(backend),
+                    content: Request::AddBackend(backend),
                 })
                 .unwrap();
         }
@@ -1877,7 +1880,7 @@ mod tests {
                     .with_context(|| "Could not parse address")?,
                 tags: None,
             };
-            let backend = proxy::Backend {
+            let backend = sozu_command::response::Backend {
                 cluster_id: String::from("yolo"),
                 backend_id: String::from("yolo-0"),
                 address: "127.0.0.1:5678"
@@ -1888,15 +1891,15 @@ mod tests {
                 backup: None,
             };
             command
-                .write_message(&ProxyRequest {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO3"),
-                    order: ProxyRequestOrder::AddTcpFrontend(front),
+                    content: Request::AddTcpFrontend(front),
                 })
                 .unwrap();
             command
-                .write_message(&ProxyRequest {
+                .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO4"),
-                    order: ProxyRequestOrder::AddBackend(backend),
+                    content: Request::AddBackend(backend),
                 })
                 .unwrap();
         }

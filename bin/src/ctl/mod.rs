@@ -6,11 +6,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use sozu_command_lib::{
-    channel::Channel,
-    command::{CommandRequest, CommandResponse},
-    config::Config,
-};
+use sozu_command_lib::{channel::Channel, config::Config, request::Request, response::Response};
 
 use crate::{
     cli::{self, *},
@@ -18,7 +14,7 @@ use crate::{
 };
 
 pub struct CommandManager {
-    channel: Channel<CommandRequest, CommandResponse>,
+    channel: Channel<Request, Response>,
     timeout: Duration,
     config: Config,
 }
@@ -55,15 +51,17 @@ pub fn ctl(args: cli::Args) -> Result<(), anyhow::Error> {
 impl CommandManager {
     fn handle_command(&mut self, command: SubCmd) -> anyhow::Result<()> {
         match command {
-            SubCmd::Shutdown { hard, worker } => {
+            SubCmd::Shutdown { hard } => {
                 if hard {
-                    self.hard_stop(worker)
+                    self.hard_stop()
                 } else {
-                    self.soft_stop(worker)
+                    self.soft_stop()
                 }
             }
-            SubCmd::Upgrade { worker: None } => self.upgrade_main(),
-            SubCmd::Upgrade { worker: Some(id) } => self.upgrade_worker(id),
+            SubCmd::Upgrade { worker } => match worker {
+                None => self.upgrade_main(),
+                Some(worker_id) => self.upgrade_worker(worker_id),
+            },
             SubCmd::Status { json } => self.status(json),
             SubCmd::Metrics { cmd, json } => match cmd {
                 MetricsCmd::Get {
@@ -151,7 +149,7 @@ impl CommandManager {
 }
 
 /// creates a blocking channel
-pub fn create_channel(config: &Config) -> anyhow::Result<Channel<CommandRequest, CommandResponse>> {
+pub fn create_channel(config: &Config) -> anyhow::Result<Channel<Request, Response>> {
     let mut channel = Channel::from_path(
         &config.command_socket_path()?,
         config.command_buffer_size,

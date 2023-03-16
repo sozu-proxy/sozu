@@ -26,10 +26,7 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::{
-    config::DEFAULT_CIPHER_SUITES,
-    proxy::{RemoveListener, ReplaceCertificate},
-};
+use sozu_command::config::DEFAULT_CIPHER_SUITES;
 use time::{Duration, Instant};
 
 use crate::{
@@ -50,14 +47,17 @@ use crate::{
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     sozu_command::{
+        certificate::{CertificateFingerprint, TlsVersion},
         logging,
-        proxy::{
-            AddCertificate, CertificateFingerprint, Cluster, HttpFrontend, HttpsListenerConfig,
-            ProxyRequest, ProxyRequestOrder, ProxyResponse, ProxyResponseContent,
-            ProxyResponseStatus, Query, QueryAnswer, QueryAnswerCertificate, QueryCertificateType,
-            RemoveCertificate, Route, TlsVersion,
-        },
         ready::Ready,
+        request::{
+            AddCertificate, Cluster, QueryCertificateType, RemoveCertificate, RemoveListener,
+            ReplaceCertificate, Request, WorkerRequest,
+        },
+        response::{
+            HttpFrontend, HttpsListenerConfig, ProxyResponse, ProxyResponseContent, QueryAnswer,
+            QueryAnswerCertificate, Route,
+        },
         scm_socket::ScmSocket,
         state::ClusterId,
     },
@@ -662,7 +662,7 @@ impl CertificateResolver for HttpsListener {
 
     fn add_certificate(
         &mut self,
-        opts: &sozu_command_lib::proxy::AddCertificate,
+        opts: &AddCertificate,
     ) -> Result<CertificateFingerprint, Self::Error> {
         let mut resolver = self
             .resolver
@@ -675,10 +675,7 @@ impl CertificateResolver for HttpsListener {
             .map_err(ListenerError::ResolverError)
     }
 
-    fn remove_certificate(
-        &mut self,
-        opts: &sozu_command_lib::proxy::RemoveCertificate,
-    ) -> Result<(), Self::Error> {
+    fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error> {
         let mut resolver = self
             .resolver
             .0
@@ -1262,36 +1259,36 @@ impl ProxyConfiguration for HttpsProxy {
         Ok(())
     }
 
-    fn notify(&mut self, request: ProxyRequest) -> ProxyResponse {
+    fn notify(&mut self, request: WorkerRequest) -> ProxyResponse {
         let request_id = request.id.clone();
 
-        let content_result = match request.order {
-            ProxyRequestOrder::AddCluster(cluster) => {
+        let content_result = match request.content {
+            Request::AddCluster(cluster) => {
                 info!("{} add cluster {:?}", request_id, cluster);
                 self.add_cluster(cluster.clone())
                     .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
-            ProxyRequestOrder::RemoveCluster { cluster_id } => {
+            Request::RemoveCluster { cluster_id } => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
                     .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
-            ProxyRequestOrder::AddHttpsFrontend(front) => {
+            Request::AddHttpsFrontend(front) => {
                 info!("{} add https front {:?}", request_id, front);
                 self.add_https_frontend(front)
                     .with_context(|| "Could not add https frontend")
             }
-            ProxyRequestOrder::RemoveHttpsFrontend(front) => {
+            Request::RemoveHttpsFrontend(front) => {
                 info!("{} remove https front {:?}", request_id, front);
                 self.remove_https_frontend(front)
                     .with_context(|| "Could not remove https frontend")
             }
-            ProxyRequestOrder::AddCertificate(add_certificate) => {
+            Request::AddCertificate(add_certificate) => {
                 info!("{} add certificate: {:?}", request_id, add_certificate);
                 self.add_certificate(add_certificate)
                     .with_context(|| "Could not add certificate")
             }
-            ProxyRequestOrder::RemoveCertificate(remove_certificate) => {
+            Request::RemoveCertificate(remove_certificate) => {
                 info!(
                     "{} remove certificate: {:?}",
                     request_id, remove_certificate
@@ -1299,7 +1296,7 @@ impl ProxyConfiguration for HttpsProxy {
                 self.remove_certificate(remove_certificate)
                     .with_context(|| "Could not remove certificate")
             }
-            ProxyRequestOrder::ReplaceCertificate(replace_certificate) => {
+            Request::ReplaceCertificate(replace_certificate) => {
                 info!(
                     "{} replace certificate: {:?}",
                     request_id, replace_certificate
@@ -1307,13 +1304,13 @@ impl ProxyConfiguration for HttpsProxy {
                 self.replace_certificate(replace_certificate)
                     .with_context(|| "Could not replace certificate")
             }
-            ProxyRequestOrder::RemoveListener(remove) => {
+            Request::RemoveListener(remove) => {
                 info!("removing HTTPS listener at address {:?}", remove.address);
                 self.remove_listener(remove.clone()).with_context(|| {
                     format!("Could not remove listener at address {:?}", remove.address)
                 })
             }
-            ProxyRequestOrder::SoftStop => {
+            Request::SoftStop => {
                 info!("{} processing soft shutdown", request_id);
                 match self
                     .soft_stop()
@@ -1326,7 +1323,7 @@ impl ProxyConfiguration for HttpsProxy {
                     Err(e) => Err(e),
                 }
             }
-            ProxyRequestOrder::HardStop => {
+            Request::HardStop => {
                 info!("{} processing hard shutdown", request_id);
                 match self
                     .hard_stop()
@@ -1339,11 +1336,11 @@ impl ProxyConfiguration for HttpsProxy {
                     Err(e) => Err(e),
                 }
             }
-            ProxyRequestOrder::Status => {
+            Request::Status => {
                 info!("{} status", request_id);
                 Ok(None)
             }
-            ProxyRequestOrder::Logging(logging_filter) => {
+            Request::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     request_id, logging_filter
@@ -1351,20 +1348,20 @@ impl ProxyConfiguration for HttpsProxy {
                 self.logging(logging_filter.clone())
                     .with_context(|| format!("Could not set logging level to {logging_filter}"))
             }
-            ProxyRequestOrder::Query(Query::Certificates(QueryCertificateType::All)) => {
+            Request::QueryCertificates(QueryCertificateType::All) => {
                 info!("{} query all certificates", request_id);
                 self.query_all_certificates()
                     .with_context(|| "Could not query all certificates")
             }
-            ProxyRequestOrder::Query(Query::Certificates(QueryCertificateType::Domain(domain))) => {
+            Request::QueryCertificates(QueryCertificateType::Domain(domain)) => {
                 info!("{} query certificate for domain {}", request_id, domain);
                 self.query_certificate_for_domain(domain.clone())
                     .with_context(|| format!("Could not query certificate for domain {domain}"))
             }
-            other_order => {
+            other_request => {
                 error!(
-                    "{} unsupported order for HTTPS proxy, ignoring {:?}",
-                    request.id, other_order
+                    "{} unsupported request for HTTPS proxy, ignoring {:?}",
+                    request.id, other_request
                 );
                 Err(anyhow::Error::msg("unsupported message"))
             }
@@ -1373,10 +1370,9 @@ impl ProxyConfiguration for HttpsProxy {
         match content_result {
             Ok(content) => {
                 info!("{} successful", request_id);
-                ProxyResponse {
-                    id: request_id,
-                    status: ProxyResponseStatus::Ok,
-                    content,
+                match content {
+                    Some(content) => ProxyResponse::ok_with_content(request_id, content),
+                    None => ProxyResponse::ok(request_id),
                 }
             }
             Err(error_message) => {
@@ -1561,7 +1557,7 @@ mod tests {
     use std::{str::FromStr, sync::Arc};
 
     use crate::router::{trie::TrieNode, MethodRule, PathRule, Router};
-    use crate::sozu_command::proxy::Route;
+    use crate::sozu_command::response::Route;
 
     use super::*;
 

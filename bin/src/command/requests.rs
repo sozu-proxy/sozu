@@ -14,17 +14,13 @@ use nom::{Err, HexDisplay, Offset};
 
 use sozu_command_lib::{
     buffer::fixed::Buffer,
-    command::{
-        CommandRequest, CommandRequestOrder, CommandResponse, CommandResponseContent,
-        CommandStatus, FrontendFilters, ListedFrontends, ListenersList, RunState, WorkerInfo,
-        PROTOCOL_VERSION,
-    },
     config::Config,
     logging,
     parser::parse_several_commands,
-    proxy::{
-        AggregatedMetricsData, MetricsConfiguration, ProxyRequest, ProxyRequestOrder,
-        ProxyResponseContent, ProxyResponseStatus, Query, QueryAnswer, QueryClusterType,
+    request::{FrontendFilters, MetricsConfiguration, QueryClusterType, Request, WorkerRequest},
+    response::{
+        AggregatedMetricsData, ListedFrontends, ListenersList, ProxyResponseContent, QueryAnswer,
+        Response, ResponseContent, ResponseStatus, RunState, WorkerInfo,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -33,82 +29,66 @@ use sozu_command_lib::{
 use sozu::metrics::METRICS;
 
 use crate::{
-    command::{CommandMessage, CommandServer, RequestIdentifier, Response, Success, Worker},
+    command::{Advancement, CommandMessage, CommandServer, Success},
     upgrade::fork_main_into_new_main,
-    worker::start_worker,
+    worker::{start_worker, Worker},
 };
 
 impl CommandServer {
     pub async fn handle_client_request(
         &mut self,
         client_id: String,
-        request: CommandRequest,
+        request: Request,
     ) -> anyhow::Result<Success> {
-        trace!("Received order {:?}", request);
-        let request_identifier = RequestIdentifier {
-            client: client_id.to_owned(),
-            request: request.id.to_owned(),
-        };
-        let cloned_identifier = request_identifier.clone();
+        trace!("Received request {:?}", request);
 
-        let result: anyhow::Result<Option<Success>> = match request.order {
-            CommandRequestOrder::SaveState { path } => self.save_state(&path).await,
-            CommandRequestOrder::DumpState => self.dump_state().await,
-            CommandRequestOrder::ListWorkers => self.list_workers().await,
-            CommandRequestOrder::ListFrontends(filters) => self.list_frontends(filters).await,
-            CommandRequestOrder::ListListeners => self.list_listeners(),
-            CommandRequestOrder::LoadState { path } => {
-                self.load_state(
-                    Some(request_identifier.client),
-                    request_identifier.request,
-                    &path,
-                )
-                .await
-            }
-            CommandRequestOrder::LaunchWorker(tag) => {
-                self.launch_worker(request_identifier, &tag).await
-            }
-            CommandRequestOrder::UpgradeMain => self.upgrade_main(request_identifier).await,
-            CommandRequestOrder::UpgradeWorker(worker_id) => {
-                self.upgrade_worker(request_identifier, worker_id).await
-            }
-            CommandRequestOrder::Proxy(proxy_request_order) => match *proxy_request_order {
-                ProxyRequestOrder::ConfigureMetrics(config) => {
-                    self.configure_metrics(request_identifier, config).await
-                }
-                ProxyRequestOrder::Query(query) => self.query(request_identifier, query).await,
-                ProxyRequestOrder::Logging(logging_filter) => {
-                    self.set_logging_level(logging_filter)
-                }
-                // we should have something like
-                // ProxyRequestOrder::SoftStop => self.do_something(),
-                // ProxyRequestOrder::HardStop => self.do_nothing_and_return_early(),
-                // but it goes in there instead:
-                order => {
-                    self.worker_order(request_identifier, order, request.worker_id)
-                        .await
-                }
-            },
-            CommandRequestOrder::SubscribeEvents => {
+        let cloned_client_id = client_id.clone();
+
+        let result: anyhow::Result<Option<Success>> = match request {
+            Request::SaveState { path } => self.save_state(&path).await,
+            Request::DumpState => self.dump_state().await,
+            Request::ListWorkers => self.list_workers().await,
+            Request::ListFrontends(filters) => self.list_frontends(filters).await,
+            Request::ListListeners => self.list_listeners(),
+            Request::LoadState { path } => self.load_state(Some(client_id), &path).await,
+            Request::LaunchWorker(tag) => self.launch_worker(client_id, &tag).await,
+            Request::UpgradeMain => self.upgrade_main(client_id).await,
+            Request::UpgradeWorker(worker_id) => self.upgrade_worker(client_id, worker_id).await,
+            Request::ConfigureMetrics(config) => self.configure_metrics(client_id, config).await,
+            // request::Query(query) => self.query(client_id, query).await,
+            Request::Logging(logging_filter) => self.set_logging_level(logging_filter),
+            Request::SubscribeEvents => {
                 self.event_subscribers.insert(client_id.clone());
                 Ok(Some(Success::SubscribeEvent(client_id.clone())))
             }
-            CommandRequestOrder::ReloadConfiguration { path } => {
-                self.reload_configuration(request_identifier, path).await
+            Request::ReloadConfiguration { path } => {
+                self.reload_configuration(client_id, path).await
             }
-            CommandRequestOrder::Status => self.status(request_identifier).await,
+            Request::Status => self.status(client_id).await,
+
+            Request::QueryCertificates(_)
+            | Request::QueryClusters(_)
+            | Request::QueryClustersHashes
+            | Request::QueryMetrics(_) => self.query(client_id, request).await,
+
+            // any other case is an request for the workers, except for SoftStop and HardStop.
+            // TODO: we should have something like:
+            // RequestContent::SoftStop => self.do_something(),
+            // RequestContent::HardStop => self.do_nothing_and_return_early(),
+            // but it goes in there instead:
+            request_for_workers => self.worker_requests(client_id, request_for_workers).await,
         };
 
         // Notify the command server by sending using his command_tx
         match result {
             Ok(Some(success)) => {
                 info!("{}", success);
-                return_success(self.command_tx.clone(), cloned_identifier, success).await;
+                return_success(self.command_tx.clone(), cloned_client_id, success).await;
             }
             Err(anyhow_error) => {
                 let formatted = format!("{anyhow_error:#}");
                 error!("{:#}", formatted);
-                return_error(self.command_tx.clone(), cloned_identifier, formatted).await;
+                return_error(self.command_tx.clone(), cloned_client_id, formatted).await;
             }
             Ok(None) => {
                 // do nothing here. Ok(None) means the function has already returned its result
@@ -134,15 +114,11 @@ impl CommandServer {
 
     pub fn save_state_to_file(&mut self, file: &mut File) -> anyhow::Result<usize> {
         let mut counter = 0usize;
-        let orders = self.state.generate_orders();
+        let requests = self.state.generate_requests();
 
         let result: anyhow::Result<usize> = (move || {
-            for command in orders {
-                let message = CommandRequest::new(
-                    format!("SAVE-{counter}"),
-                    CommandRequestOrder::Proxy(Box::new(command)),
-                    None,
-                );
+            for request in requests {
+                let message = WorkerRequest::new(format!("SAVE-{counter}"), request);
 
                 file.write_all(
                     &serde_json::to_string(&message)
@@ -177,15 +153,14 @@ impl CommandServer {
     pub async fn dump_state(&mut self) -> anyhow::Result<Option<Success>> {
         let state = self.state.clone();
 
-        Ok(Some(Success::DumpState(CommandResponseContent::State(
-            Box::new(state),
-        ))))
+        Ok(Some(Success::DumpState(ResponseContent::State(Box::new(
+            state,
+        )))))
     }
 
     pub async fn load_state(
         &mut self,
         client_id: Option<String>,
-        request_id: String,
         path: &str,
     ) -> anyhow::Result<Option<Success>> {
         let mut file =
@@ -215,7 +190,7 @@ impl CommandServer {
             }
 
             let mut offset = 0usize;
-            match parse_several_commands::<CommandRequest>(buffer.data()) {
+            match parse_several_commands::<WorkerRequest>(buffer.data()) {
                 Ok((i, requests)) => {
                     if !i.is_empty() {
                         debug!("could not parse {} bytes", i.len());
@@ -225,6 +200,8 @@ impl CommandServer {
                     }
                     offset = buffer.data().offset(i);
 
+                    /*
+                    TODO: maybe we should put on WorkerRequest the version field we had on CommandRequest: a u32 to track versionning
                     if requests.iter().any(|o| {
                         if o.version > PROTOCOL_VERSION {
                             error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, o.version);
@@ -235,32 +212,32 @@ impl CommandServer {
                     }) {
                         break;
                     }
+                    */
 
                     for request in requests {
-                        if let CommandRequestOrder::Proxy(order) = request.order {
-                            message_counter += 1;
+                        message_counter += 1;
 
-                            if self.state.dispatch(&order).is_ok() {
-                                diff_counter += 1;
+                        if self.state.dispatch(&request.content).is_ok() {
+                            diff_counter += 1;
 
-                                let mut found = false;
-                                let id = format!("LOAD-STATE-{request_id}-{diff_counter}");
+                            let mut found = false;
+                            let id = format!("LOAD-STATE-{}-{diff_counter}", request.id);
 
-                                for ref mut worker in self.workers.iter_mut().filter(|worker| {
-                                    worker.run_state != RunState::Stopping
-                                        && worker.run_state != RunState::Stopped
-                                }) {
-                                    let worker_message_id = format!("{}-{}", id, worker.id);
-                                    worker.send(worker_message_id.clone(), *order.clone()).await;
-                                    self.in_flight
-                                        .insert(worker_message_id, (load_state_tx.clone(), 1));
+                            for worker in
+                                self.workers.iter_mut().filter(|worker| worker.is_active())
+                            {
+                                let worker_message_id = format!("{}-{}", id, worker.id);
+                                worker
+                                    .send(worker_message_id.clone(), request.content.clone())
+                                    .await;
+                                self.in_flight
+                                    .insert(worker_message_id, (load_state_tx.clone(), 1));
 
-                                    found = true;
-                                }
+                                found = true;
+                            }
 
-                                if !found {
-                                    bail!("no worker found");
-                                }
+                            if !found {
+                                bail!("no worker found");
                             }
                         }
                     }
@@ -300,20 +277,20 @@ impl CommandServer {
                 let mut error = 0usize;
                 while let Some((proxy_response, _)) = load_state_rx.next().await {
                     match proxy_response.status {
-                        ProxyResponseStatus::Ok => {
+                        ResponseStatus::Ok => {
                             ok += 1;
                         }
-                        ProxyResponseStatus::Processing => {}
-                        ProxyResponseStatus::Error(message) => {
-                            error!("{}", message);
+                        ResponseStatus::Processing => {}
+                        ResponseStatus::Failure => {
+                            error!("{}", proxy_response.message);
                             error += 1;
                         }
                     };
                     debug!("ok:{}, error: {}", ok, error);
                 }
 
-                let request_identifier = match client_id {
-                    Some(client_id) => RequestIdentifier::new(client_id, request_id),
+                let client_id = match client_id {
+                    Some(client_id) => client_id,
                     None => {
                         match error {
                             0 => info!("loading state: {} ok messages, 0 errors", ok),
@@ -328,7 +305,7 @@ impl CommandServer {
                     0 => {
                         return_success(
                             command_tx,
-                            request_identifier,
+                            client_id,
                             Success::LoadState(path.to_string(), ok, error),
                         )
                         .await;
@@ -336,7 +313,7 @@ impl CommandServer {
                     _ => {
                         return_error(
                             command_tx,
-                            request_identifier,
+                            client_id,
                             format!("Loading state failed, ok: {ok}, error: {error}, path: {path}"),
                         )
                         .await;
@@ -349,7 +326,7 @@ impl CommandServer {
             if let Some(client_id) = client_id {
                 return_success(
                     self.command_tx.clone(),
-                    RequestIdentifier::new(client_id, request_id),
+                    client_id,
                     Success::LoadState(path.to_string(), 0, 0),
                 )
                 .await;
@@ -412,14 +389,14 @@ impl CommandServer {
             }
         }
 
-        Ok(Some(Success::ListFrontends(
-            CommandResponseContent::FrontendList(listed_frontends),
-        )))
+        Ok(Some(Success::ListFrontends(ResponseContent::FrontendList(
+            listed_frontends,
+        ))))
     }
 
     fn list_listeners(&self) -> anyhow::Result<Option<Success>> {
         Ok(Some(Success::ListListeners(
-            CommandResponseContent::ListenersList(ListenersList {
+            ResponseContent::ListenersList(ListenersList {
                 http_listeners: self.state.http_listeners.clone(),
                 https_listeners: self.state.https_listeners.clone(),
                 tcp_listeners: self.state.tcp_listeners.clone(),
@@ -440,14 +417,14 @@ impl CommandServer {
 
         debug!("workers: {:#?}", workers);
 
-        Ok(Some(Success::ListWorkers(CommandResponseContent::Workers(
+        Ok(Some(Success::ListWorkers(ResponseContent::Workers(
             workers,
         ))))
     }
 
     pub async fn launch_worker(
         &mut self,
-        request_identifier: RequestIdentifier,
+        client_id: String,
         _tag: &str,
     ) -> anyhow::Result<Option<Success>> {
         let mut worker = start_worker(
@@ -461,8 +438,8 @@ impl CommandServer {
 
         return_processing(
             self.command_tx.clone(),
-            request_identifier.clone(),
-            "Sending configuration orders to the new worker...",
+            client_id.clone(),
+            "Sending configuration requests to the new worker...",
         )
         .await;
 
@@ -500,31 +477,28 @@ impl CommandServer {
             })
         );
 
-        let activate_orders = self.state.generate_activate_orders();
-        for (count, order) in activate_orders.into_iter().enumerate() {
-            worker.send(format!("{id}-ACTIVATE-{count}"), order).await;
+        let activate_requests = self.state.generate_activate_requests();
+        for (count, request) in activate_requests.into_iter().enumerate() {
+            worker.send(format!("{id}-ACTIVATE-{count}"), request).await;
         }
 
         self.workers.push(worker);
 
         return_success(
             self.command_tx.clone(),
-            request_identifier,
+            client_id,
             Success::WorkerLaunched(id),
         )
         .await;
         Ok(None)
     }
 
-    pub async fn upgrade_main(
-        &mut self,
-        request_identifier: RequestIdentifier,
-    ) -> anyhow::Result<Option<Success>> {
+    pub async fn upgrade_main(&mut self, client_id: String) -> anyhow::Result<Option<Success>> {
         self.disable_cloexec_before_upgrade()?;
 
         return_processing(
             self.command_tx.clone(),
-            request_identifier,
+            client_id,
             "The proxy is processing the upgrade command.",
         )
         .await;
@@ -565,24 +539,22 @@ impl CommandServer {
 
     pub async fn upgrade_worker(
         &mut self,
-        request_identifier: RequestIdentifier,
-        id: u32,
+        client_id: String,
+        worker_id: u32,
     ) -> anyhow::Result<Option<Success>> {
         info!(
-            "client[{}] msg {} wants to upgrade worker {}",
-            request_identifier.client, request_identifier.request, id
+            "client[{}] msg wants to upgrade worker {}",
+            client_id, worker_id
         );
 
-        if !self.workers.iter().any(|worker| {
-            worker.id == id
-                && worker.run_state != RunState::Stopping
-                && worker.run_state != RunState::Stopped
-            // should we add this?
-            // && worker.run_state != RunState::NotAnswering
-        }) {
+        if !self
+            .workers
+            .iter()
+            .any(|worker| worker.id == worker_id && worker.is_active())
+        {
             bail!(format!(
                 "The worker {} does not exist, or is stopped / stopping.",
-                &id
+                &worker_id
             ));
         }
 
@@ -599,8 +571,8 @@ impl CommandServer {
 
         return_processing(
             self.command_tx.clone(),
-            request_identifier.clone(),
-            "Sending configuration orders to the worker",
+            client_id.clone(),
+            "Sending configuration requests to the worker",
         )
         .await;
 
@@ -620,9 +592,9 @@ impl CommandServer {
             .sender
             .as_mut()
             .with_context(|| "No sender on new worker".to_string())?
-            .send(ProxyRequest {
-                id: format!("UPGRADE-{id}-STATUS"),
-                order: ProxyRequestOrder::Status,
+            .send(WorkerRequest {
+                id: format!("UPGRADE-{worker_id}-STATUS"),
+                content: Request::Status,
             })
             .await
             .with_context(|| {
@@ -637,38 +609,39 @@ impl CommandServer {
             let old_worker: &mut Worker = self
                 .workers
                 .iter_mut()
-                .find(|worker| worker.id == id)
+                .find(|worker| worker.id == worker_id)
                 .unwrap();
 
             /*
             old_worker.channel.set_blocking(true);
-            old_worker.channel.write_message(&ProxyRequest { id: String::from(message_id), order: ProxyRequestOrder::ReturnListenSockets });
+            old_worker.channel.write_message(&ProxyRequest { id: String::from(message_id), request: RequestContent::ReturnListenSockets });
             info!("sent returnlistensockets message to worker");
             old_worker.channel.set_blocking(false);
             */
             let (sockets_return_tx, mut sockets_return_rx) = futures::channel::mpsc::channel(3);
-            let id = format!("{}-return-sockets", request_identifier.client);
+            let id = format!("{}-return-sockets", client_id);
             self.in_flight.insert(id.clone(), (sockets_return_tx, 1));
             old_worker
-                .send(id.clone(), ProxyRequestOrder::ReturnListenSockets)
+                .send(id.clone(), Request::ReturnListenSockets)
                 .await;
 
             info!("sent ReturnListenSockets to old worker");
 
             let cloned_command_tx = self.command_tx.clone();
-            let cloned_req_id = request_identifier.clone();
+            let cloned_req_id = client_id.clone();
             smol::spawn(async move {
                 while let Some((proxy_response, _)) = sockets_return_rx.next().await {
                     match proxy_response.status {
-                        ProxyResponseStatus::Ok => {
+                        ResponseStatus::Ok => {
                             info!("returnsockets OK");
                             break;
                         }
-                        ProxyResponseStatus::Processing => {
+                        ResponseStatus::Processing => {
                             info!("returnsockets processing");
                         }
-                        ProxyResponseStatus::Error(message) => {
-                            return_error(cloned_command_tx, cloned_req_id, message).await;
+                        ResponseStatus::Failure => {
+                            return_error(cloned_command_tx, cloned_req_id, proxy_response.message)
+                                .await;
                             break;
                         }
                     };
@@ -705,20 +678,20 @@ impl CommandServer {
             old_worker.run_state = RunState::Stopping;
 
             let (softstop_tx, mut softstop_rx) = futures::channel::mpsc::channel(10);
-            let softstop_id = format!("{}-softstop", request_identifier.client);
+            let softstop_id = format!("{}-softstop", client_id);
             self.in_flight.insert(softstop_id.clone(), (softstop_tx, 1));
             old_worker
-                .send(softstop_id.clone(), ProxyRequestOrder::SoftStop)
+                .send(softstop_id.clone(), Request::SoftStop)
                 .await;
 
             let mut command_tx = self.command_tx.clone();
-            let cloned_request_identifier = request_identifier.clone();
+            let cloned_client_id = client_id.clone();
             let worker_id = old_worker.id;
             smol::spawn(async move {
                 while let Some((proxy_response, _)) = softstop_rx.next().await {
                     match proxy_response.status {
                         // should we send all this to the command server?
-                        ProxyResponseStatus::Ok => {
+                        ResponseStatus::Ok => {
                             info!("softstop OK"); // this doesn't display :-(
                             if let Err(e) = command_tx
                                 .send(CommandMessage::WorkerClose { worker_id })
@@ -731,18 +704,18 @@ impl CommandServer {
                             }
                             break;
                         }
-                        ProxyResponseStatus::Processing => {
+                        ResponseStatus::Processing => {
                             info!("softstop processing");
                         }
-                        ProxyResponseStatus::Error(message) => {
-                            info!("softstop error: {:?}", message);
+                        ResponseStatus::Failure => {
+                            info!("softstop error: {:?}", proxy_response.message);
                             break;
                         }
                     };
                 }
                 return_processing(
                     command_tx.clone(),
-                    cloned_request_identifier,
+                    cloned_client_id,
                     "Processing softstop responses from the workers...",
                 )
                 .await;
@@ -773,13 +746,10 @@ impl CommandServer {
         })
         .detach();
 
-        let activate_orders = self.state.generate_activate_orders();
-        for (count, order) in activate_orders.into_iter().enumerate() {
+        let activate_requests = self.state.generate_activate_requests();
+        for (count, request) in activate_requests.into_iter().enumerate() {
             new_worker
-                .send(
-                    format!("{}-ACTIVATE-{}", request_identifier.client, count),
-                    order,
-                )
+                .send(format!("{}-ACTIVATE-{}", client_id, count), request)
                 .await;
         }
 
@@ -792,7 +762,7 @@ impl CommandServer {
 
     pub async fn reload_configuration(
         &mut self,
-        request_identifier: RequestIdentifier,
+        client_id: String,
         config_path: Option<String>,
     ) -> anyhow::Result<Option<Success>> {
         // check that this works
@@ -806,45 +776,38 @@ impl CommandServer {
 
         return_processing(
             self.command_tx.clone(),
-            request_identifier.clone(),
+            client_id.clone(),
             "Reloading configuration, sending config messages to workers...",
         )
         .await;
 
-        for message in new_config.generate_config_messages() {
-            if let CommandRequestOrder::Proxy(order) = message.order {
-                if self.state.dispatch(&order).is_ok() {
-                    diff_counter += 1;
+        for request in new_config.generate_config_messages() {
+            if self.state.dispatch(&request.content).is_ok() {
+                diff_counter += 1;
 
-                    let mut found = false;
-                    let id = format!(
-                        "LOAD-STATE-{}-{}",
-                        &request_identifier.request, diff_counter
-                    );
+                let mut found = false;
+                let id = format!("LOAD-STATE-{}-{}", &request.id, diff_counter);
 
-                    for ref mut worker in self.workers.iter_mut().filter(|worker| {
-                        worker.run_state != RunState::Stopping
-                            && worker.run_state != RunState::Stopped
-                    }) {
-                        let worker_message_id = format!("{}-{}", id, worker.id);
-                        worker.send(worker_message_id.clone(), *order.clone()).await;
-                        self.in_flight
-                            .insert(worker_message_id, (load_state_tx.clone(), 1));
+                for worker in self.workers.iter_mut().filter(|worker| worker.is_active()) {
+                    let worker_message_id = format!("{}-{}", id, worker.id);
+                    worker
+                        .send(worker_message_id.clone(), request.content.clone())
+                        .await;
+                    self.in_flight
+                        .insert(worker_message_id, (load_state_tx.clone(), 1));
 
-                        found = true;
-                    }
+                    found = true;
+                }
 
-                    if !found {
-                        // FIXME: should send back error here
-                        error!("no worker found");
-                    }
+                if !found {
+                    bail!("no worker found");
                 }
             }
         }
 
         // clone everything we will need in the detached thread
         let command_tx = self.command_tx.clone();
-        let cloned_identifier = request_identifier.clone();
+        let cloned_identifier = client_id.clone();
 
         if diff_counter > 0 {
             info!(
@@ -856,12 +819,12 @@ impl CommandServer {
                 let mut error = 0usize;
                 while let Some((proxy_response, _)) = load_state_rx.next().await {
                     match proxy_response.status {
-                        ProxyResponseStatus::Ok => {
+                        ResponseStatus::Ok => {
                             ok += 1;
                         }
-                        ProxyResponseStatus::Processing => {}
-                        ProxyResponseStatus::Error(message) => {
-                            error!("{}", message);
+                        ResponseStatus::Processing => {}
+                        ResponseStatus::Failure => {
+                            error!("{}", proxy_response.message);
                             error += 1;
                         }
                     };
@@ -902,10 +865,7 @@ impl CommandServer {
         Ok(None)
     }
 
-    pub async fn status(
-        &mut self,
-        request_identifier: RequestIdentifier,
-    ) -> anyhow::Result<Option<Success>> {
+    pub async fn status(&mut self, client_id: String) -> anyhow::Result<Option<Success>> {
         info!("Requesting the status of all workers.");
 
         let (status_tx, mut status_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
@@ -913,17 +873,17 @@ impl CommandServer {
         // create a status list with the available info of the main process
         let mut worker_info_map: BTreeMap<String, WorkerInfo> = BTreeMap::new();
 
-        let prefix = format!("{}-status-", request_identifier.client);
+        let prefix = format!("{}-status-", client_id);
 
         return_processing(
             self.command_tx.clone(),
-            request_identifier.clone(),
+            client_id.clone(),
             "Sending status requests to workers...",
         )
         .await;
 
         let mut count = 0usize;
-        for ref mut worker in self.workers.iter_mut() {
+        for worker in self.workers.iter_mut() {
             info!("Worker {} is {}", worker.id, worker.run_state);
 
             // create request ids even if we don't send any request, as keys in the tree map
@@ -932,7 +892,7 @@ impl CommandServer {
             if worker.run_state == RunState::Running {
                 info!("Summoning status of worker {}", worker.id);
                 worker
-                    .send(worker_request_id.clone(), ProxyRequestOrder::Status)
+                    .send(worker_request_id.clone(), Request::Status)
                     .await;
                 count += 1;
                 self.in_flight
@@ -942,7 +902,7 @@ impl CommandServer {
         }
 
         let command_tx = self.command_tx.clone();
-        let thread_request_identifier = request_identifier.clone();
+        let thread_client_id = client_id.clone();
 
         let now = Instant::now();
 
@@ -955,9 +915,9 @@ impl CommandServer {
                     proxy_response.id, proxy_response
                 );
                 let new_run_state = match proxy_response.status {
-                    ProxyResponseStatus::Ok => RunState::Running,
-                    ProxyResponseStatus::Processing => continue,
-                    ProxyResponseStatus::Error(_) => RunState::NotAnswering,
+                    ResponseStatus::Ok => RunState::Running,
+                    ResponseStatus::Processing => continue,
+                    ResponseStatus::Failure => RunState::NotAnswering,
                 };
                 worker_info_map
                     .entry(proxy_response.id)
@@ -976,8 +936,8 @@ impl CommandServer {
 
             return_success(
                 command_tx,
-                thread_request_identifier,
-                Success::Status(CommandResponseContent::Status(worker_info_vec)),
+                thread_client_id,
+                Success::Status(ResponseContent::Status(worker_info_vec)),
             )
             .await;
         })
@@ -989,45 +949,42 @@ impl CommandServer {
     // To get the proxy's metrics, the cli command is "metrics get", handled by the query() function
     pub async fn configure_metrics(
         &mut self,
-        request_identifier: RequestIdentifier,
+        client_id: String,
         config: MetricsConfiguration,
     ) -> anyhow::Result<Option<Success>> {
         let (metrics_tx, mut metrics_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
-        for ref mut worker in self
+        for worker in self
             .workers
             .iter_mut()
             .filter(|worker| worker.run_state != RunState::Stopped)
         {
-            let req_id = format!("{}-metrics-{}", request_identifier.client, worker.id);
+            let req_id = format!("{}-metrics-{}", client_id, worker.id);
             worker
-                .send(
-                    req_id.clone(),
-                    ProxyRequestOrder::ConfigureMetrics(config.clone()),
-                )
+                .send(req_id.clone(), Request::ConfigureMetrics(config.clone()))
                 .await;
             count += 1;
             self.in_flight.insert(req_id, (metrics_tx.clone(), 1));
         }
 
-        let prefix = format!("{}-metrics-", request_identifier.client);
+        let prefix = format!("{}-metrics-", client_id);
 
         let command_tx = self.command_tx.clone();
-        let thread_request_identifier = request_identifier.clone();
+        let thread_client_id = client_id.clone();
         smol::spawn(async move {
             let mut responses = Vec::new();
             let mut i = 0;
             while let Some((proxy_response, _)) = metrics_rx.next().await {
                 match proxy_response.status {
-                    ProxyResponseStatus::Ok => {
+                    ResponseStatus::Ok => {
                         let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
                         responses.push((tag, proxy_response));
                     }
-                    ProxyResponseStatus::Processing => {
+                    ResponseStatus::Processing => {
                         //info!("metrics processing");
                         continue;
                     }
-                    ProxyResponseStatus::Error(_) => {
+                    ResponseStatus::Failure => {
                         let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
                         responses.push((tag, proxy_response));
                     }
@@ -1043,8 +1000,8 @@ impl CommandServer {
             let mut has_error = false;
             for response in responses.iter() {
                 match response.1.status {
-                    ProxyResponseStatus::Error(ref e) => {
-                        messages.push(format!("{}: {}", response.0, e));
+                    ResponseStatus::Failure => {
+                        messages.push(format!("{}: {}", response.0, response.1.message));
                         has_error = true;
                     }
                     _ => messages.push(format!("{}: OK", response.0)),
@@ -1052,14 +1009,9 @@ impl CommandServer {
             }
 
             if has_error {
-                return_error(command_tx, thread_request_identifier, messages.join(", ")).await;
+                return_error(command_tx, thread_client_id, messages.join(", ")).await;
             } else {
-                return_success(
-                    command_tx,
-                    thread_request_identifier,
-                    Success::Metrics(config),
-                )
-                .await;
+                return_success(command_tx, thread_client_id, Success::Metrics(config)).await;
             }
         })
         .detach();
@@ -1068,38 +1020,36 @@ impl CommandServer {
 
     pub async fn query(
         &mut self,
-        request_identifier: RequestIdentifier,
-        query: Query,
+        client_id: String,
+        request: Request,
     ) -> anyhow::Result<Option<Success>> {
-        debug!("Received this query: {:?}", query);
+        debug!("Received this query: {:?}", request);
         let (query_tx, mut query_rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
-        for ref mut worker in self
+        for worker in self
             .workers
             .iter_mut()
             .filter(|worker| worker.run_state != RunState::Stopped)
         {
-            let req_id = format!("{}-query-{}", request_identifier.client, worker.id);
-            worker
-                .send(req_id.clone(), ProxyRequestOrder::Query(query.clone()))
-                .await;
+            let req_id = format!("{}-query-{}", client_id, worker.id);
+            worker.send(req_id.clone(), request.clone()).await;
             count += 1;
             self.in_flight.insert(req_id, (query_tx.clone(), 1));
         }
 
         return_processing(
             self.command_tx.clone(),
-            request_identifier.clone(),
+            client_id.clone(),
             "Query was sent to the workers...",
         )
         .await;
 
         let mut main_query_answer = None;
-        match &query {
-            Query::ClustersHashes => {
+        match &request {
+            Request::QueryClustersHashes => {
                 main_query_answer = Some(QueryAnswer::ClustersHashes(self.state.hash_state()));
             }
-            Query::Clusters(query_type) => {
+            Request::QueryClusters(query_type) => {
                 main_query_answer = Some(QueryAnswer::Clusters(match query_type {
                     QueryClusterType::ClusterId(cluster_id) => {
                         vec![self.state.cluster_state(cluster_id)]
@@ -1117,13 +1067,14 @@ impl CommandServer {
                     }
                 }));
             }
-            Query::Certificates(_) => {}
-            Query::Metrics(_) => {}
+            Request::QueryCertificates(_) => {}
+            Request::QueryMetrics(_) => {}
+            _ => {}
         };
 
         // all these are passed to the thread
         let command_tx = self.command_tx.clone();
-        let cloned_identifier = request_identifier.clone();
+        let cloned_identifier = client_id.clone();
 
         // this may waste resources and time in case of queries others than Metrics
         let main_metrics =
@@ -1134,14 +1085,14 @@ impl CommandServer {
             let mut i = 0;
             while let Some((proxy_response, worker_id)) = query_rx.next().await {
                 match proxy_response.status {
-                    ProxyResponseStatus::Ok => {
+                    ResponseStatus::Ok => {
                         responses.push((worker_id, proxy_response));
                     }
-                    ProxyResponseStatus::Processing => {
+                    ResponseStatus::Processing => {
                         info!("metrics processing");
                         continue;
                     }
-                    ProxyResponseStatus::Error(_) => {
+                    ResponseStatus::Failure => {
                         responses.push((worker_id, proxy_response));
                     }
                 };
@@ -1152,7 +1103,7 @@ impl CommandServer {
                 }
             }
 
-            let mut proxy_responses_map: BTreeMap<String, QueryAnswer> = responses
+            let mut query_answers: BTreeMap<String, QueryAnswer> = responses
                 .into_iter()
                 .filter_map(|(worker_id, proxy_response)| {
                     if let Some(ProxyResponseContent::Query(d)) = proxy_response.content {
@@ -1163,31 +1114,29 @@ impl CommandServer {
                 })
                 .collect();
 
-            let success = match &query {
-                &Query::ClustersHashes | &Query::Clusters(_) => {
+            let success = match &request {
+                &Request::QueryClustersHashes | &Request::QueryClusters(_) => {
                     let main = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
-                    proxy_responses_map.insert(String::from("main"), main);
-                    Success::Query(CommandResponseContent::Query(proxy_responses_map))
+                    query_answers.insert(String::from("main"), main);
+                    Success::Query(ResponseContent::Query(query_answers))
                 }
-                &Query::Certificates(_) => {
-                    info!(
-                        "certificates query answer received: {:?}",
-                        proxy_responses_map
-                    );
-                    Success::Query(CommandResponseContent::Query(proxy_responses_map))
+                &Request::QueryCertificates(_) => {
+                    info!("certificates query answer received: {:?}", query_answers);
+                    Success::Query(ResponseContent::Query(query_answers))
                 }
-                Query::Metrics(options) => {
-                    debug!("metrics query answer received: {:?}", proxy_responses_map);
+                Request::QueryMetrics(options) => {
+                    debug!("metrics query answer received: {:?}", query_answers);
 
                     if options.list {
-                        Success::Query(CommandResponseContent::Query(proxy_responses_map))
+                        Success::Query(ResponseContent::Query(query_answers))
                     } else {
-                        Success::Query(CommandResponseContent::Metrics(AggregatedMetricsData {
+                        Success::Query(ResponseContent::Metrics(AggregatedMetricsData {
                             main: main_metrics,
-                            workers: proxy_responses_map,
+                            workers: query_answers,
                         }))
                     }
                 }
+                _ => return, // very very unlikely
             };
 
             return_success(command_tx, cloned_identifier, success).await;
@@ -1210,29 +1159,28 @@ impl CommandServer {
         Ok(Some(Success::Logging(logging_filter)))
     }
 
-    pub async fn worker_order(
+    pub async fn worker_requests(
         &mut self,
-        request_identifier: RequestIdentifier,
-        order: ProxyRequestOrder,
-        worker_id: Option<u32>,
+        client_id: String,
+        request: Request,
     ) -> anyhow::Result<Option<Success>> {
-        if let &ProxyRequestOrder::AddCertificate(_) = &order {
-            debug!("workerconfig client order AddCertificate()");
+        if let &Request::AddCertificate(_) = &request {
+            debug!("workerconfig client request AddCertificate()");
         } else {
-            debug!("workerconfig client order {:?}", order);
+            debug!("workerconfig client request {:?}", request);
         }
 
         self.state
-            .dispatch(&order)
-            .with_context(|| "Could not execute order on the state")?;
+            .dispatch(&request)
+            .with_context(|| "Could not execute request on the state")?;
 
         if self.config.automatic_state_save
-            & (order != ProxyRequestOrder::SoftStop || order != ProxyRequestOrder::HardStop)
+            & (request != Request::SoftStop || request != Request::HardStop)
         {
             if let Some(path) = self.config.saved_state.clone() {
                 return_processing(
                     self.command_tx.clone(),
-                    request_identifier.clone(),
+                    client_id.clone(),
                     "Saving state to file",
                 )
                 .await;
@@ -1246,58 +1194,43 @@ impl CommandServer {
 
         return_processing(
             self.command_tx.clone(),
-            request_identifier.clone(),
-            match worker_id {
-                Some(id) => format!("Sending the order to worker {id}"),
-                None => "Sending the order to all workers".to_owned(),
-            },
+            client_id.clone(),
+            "Sending the request to all workers".to_owned(),
         )
         .await;
 
-        let (worker_order_tx, mut worker_order_rx) =
+        let (worker_request_tx, mut worker_request_rx) =
             futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut found = false;
         let mut stopping_workers = HashSet::new();
         let mut worker_count = 0usize;
-        for ref mut worker in self.workers.iter_mut().filter(|worker| {
-            worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
-        }) {
-            // sort out the specifically targeted worker, if provided
-            if let Some(id) = worker_id {
-                if id != worker.id {
-                    continue;
-                }
-            }
-
-            let should_stop_worker =
-                order == ProxyRequestOrder::SoftStop || order == ProxyRequestOrder::HardStop;
+        for worker in self.workers.iter_mut().filter(|worker| worker.is_active()) {
+            let should_stop_worker = request == Request::SoftStop || request == Request::HardStop;
             if should_stop_worker {
                 worker.run_state = RunState::Stopping;
                 stopping_workers.insert(worker.id);
             }
 
-            // let request_id = request_identifier.to_worker_request_id();
-            let req_id = format!("{}-worker-{}", request_identifier.client, worker.id);
-            worker.send(req_id.clone(), order.clone()).await;
-            self.in_flight.insert(req_id, (worker_order_tx.clone(), 1));
+            let req_id = format!("{}-worker-{}", client_id, worker.id);
+            worker.send(req_id.clone(), request.clone()).await;
+            self.in_flight
+                .insert(req_id, (worker_request_tx.clone(), 1));
 
             found = true;
             worker_count += 1;
         }
 
-        let should_stop_main = (order == ProxyRequestOrder::SoftStop
-            || order == ProxyRequestOrder::HardStop)
-            && worker_id.is_none();
+        let should_stop_main = request.is_a_stop();
 
         let mut command_tx = self.command_tx.clone();
-        let thread_request_identifier = request_identifier.clone();
+        let thread_client_id = client_id.clone();
 
         smol::spawn(async move {
             let mut responses = Vec::new();
             let mut response_count = 0usize;
-            while let Some((proxy_response, worker_id)) = worker_order_rx.next().await {
+            while let Some((proxy_response, worker_id)) = worker_request_rx.next().await {
                 match proxy_response.status {
-                    ProxyResponseStatus::Ok => {
+                    ResponseStatus::Ok => {
                         responses.push((worker_id, proxy_response));
 
                         if stopping_workers.contains(&worker_id) {
@@ -1312,11 +1245,11 @@ impl CommandServer {
                             }
                         }
                     }
-                    ProxyResponseStatus::Processing => {
-                        info!("Order is processing");
+                    ResponseStatus::Processing => {
+                        info!("request is processing");
                         continue;
                     }
-                    ProxyResponseStatus::Error(_) => {
+                    ResponseStatus::Failure => {
                         responses.push((worker_id, proxy_response));
                     }
                 };
@@ -1327,7 +1260,7 @@ impl CommandServer {
                 }
             }
 
-            // send the order to kill the main process only after all workers responded
+            // send the request to kill the main process only after all workers responded
             if should_stop_main {
                 if let Err(e) = command_tx.send(CommandMessage::MasterStop).await {
                     error!("could not send main stop message: {:?}", e);
@@ -1338,8 +1271,8 @@ impl CommandServer {
             let mut has_error = false;
             for response in responses.iter() {
                 match response.1.status {
-                    ProxyResponseStatus::Error(ref e) => {
-                        messages.push(format!("{}: {}", response.0, e));
+                    ResponseStatus::Failure => {
+                        messages.push(format!("{}: {}", response.0, response.1.message));
                         has_error = true;
                     }
                     _ => messages.push(format!("{}: OK", response.0)),
@@ -1347,36 +1280,27 @@ impl CommandServer {
             }
 
             if has_error {
-                return_error(command_tx, thread_request_identifier, messages.join(", ")).await;
+                return_error(command_tx, thread_client_id, messages.join(", ")).await;
             } else {
-                return_success(
-                    command_tx,
-                    thread_request_identifier,
-                    Success::WorkerOrder(worker_id),
-                )
-                .await;
+                return_success(command_tx, thread_client_id, Success::WorkerRequest).await;
             }
         })
         .detach();
 
         if !found {
-            // FIXME: should send back error here
-            // is this fix OK?
             bail!("no worker found");
         }
 
-        match order {
-            ProxyRequestOrder::AddBackend(_) | ProxyRequestOrder::RemoveBackend(_) => {
+        match request {
+            Request::AddBackend(_) | Request::RemoveBackend(_) => {
                 self.backends_count = self.state.count_backends()
             }
-            ProxyRequestOrder::AddHttpFrontend(_)
-            | ProxyRequestOrder::AddHttpsFrontend(_)
-            | ProxyRequestOrder::AddTcpFrontend(_)
-            | ProxyRequestOrder::RemoveHttpFrontend(_)
-            | ProxyRequestOrder::RemoveHttpsFrontend(_)
-            | ProxyRequestOrder::RemoveTcpFrontend(_) => {
-                self.frontends_count = self.state.count_frontends()
-            }
+            Request::AddHttpFrontend(_)
+            | Request::AddHttpsFrontend(_)
+            | Request::AddTcpFrontend(_)
+            | Request::RemoveHttpFrontend(_)
+            | Request::RemoveHttpsFrontend(_)
+            | Request::RemoveTcpFrontend(_) => self.frontends_count = self.state.count_frontends(),
             _ => {}
         };
 
@@ -1389,16 +1313,11 @@ impl CommandServer {
 
     pub async fn notify_advancement_to_client(
         &mut self,
-        request_identifier: RequestIdentifier,
-        response: Response,
+        client_id: String,
+        response: Advancement,
     ) -> anyhow::Result<Success> {
-        let RequestIdentifier {
-            client: client_id,
-            request: request_id,
-        } = request_identifier.to_owned();
-
         let command_response = match response {
-            Response::Ok(success) => {
+            Advancement::Ok(success) => {
                 let success_message = success.to_string();
 
                 let command_response_data = match success {
@@ -1412,30 +1331,18 @@ impl CommandServer {
                     _ => None,
                 };
 
-                CommandResponse::new(
-                    request_id.clone(),
-                    CommandStatus::Ok,
-                    success_message,
-                    command_response_data,
-                )
+                Response::new(ResponseStatus::Ok, success_message, command_response_data)
             }
-            Response::Processing(processing_message) => CommandResponse::new(
-                request_id.clone(),
-                CommandStatus::Processing,
-                processing_message,
-                None,
-            ),
-            Response::Error(error_message) => CommandResponse::new(
-                request_id.clone(),
-                CommandStatus::Error,
-                error_message,
-                None,
-            ),
+            Advancement::Processing(processing_message) => {
+                Response::new(ResponseStatus::Processing, processing_message, None)
+            }
+            Advancement::Error(error_message) => {
+                Response::new(ResponseStatus::Failure, error_message, None)
+            }
         };
 
         trace!(
-            "Sending response to request {} of client {}: {:?}",
-            request_id,
+            "Sending response to request sent by client {}: {:?}",
             client_id,
             command_response
         );
@@ -1444,10 +1351,7 @@ impl CommandServer {
             Some(client_tx) => {
                 trace!("sending from main process to client loop");
                 client_tx.send(command_response).await.with_context(|| {
-                    format!(
-                        "Could not notify client {} about request {}",
-                        client_id, request_identifier.request,
-                    )
+                    format!("Could not notify client {} about request", client_id)
                 })?;
             }
             None => bail!(format!("Could not find client {client_id}")),
@@ -1458,39 +1362,39 @@ impl CommandServer {
 }
 
 // Those return functions are meant to be called in detached threads
-// to notify the command server of an order's advancement.
+// to notify the command server of an request's advancement.
 async fn return_error<T>(
     mut command_tx: Sender<CommandMessage>,
-    request_identifier: RequestIdentifier,
+    client_id: String,
     error_message: T,
 ) where
     T: ToString,
 {
-    let error_command_message = CommandMessage::Advancement {
-        request_identifier,
-        response: Response::Error(error_message.to_string()),
+    let advancement = CommandMessage::Advancement {
+        client_id,
+        advancement: Advancement::Error(error_message.to_string()),
     };
 
     trace!("return_error: sending event to the command server");
-    if let Err(e) = command_tx.send(error_command_message).await {
+    if let Err(e) = command_tx.send(advancement).await {
         error!("Error while return error to the command server: {}", e)
     }
 }
 
 async fn return_processing<T>(
     mut command_tx: Sender<CommandMessage>,
-    request_identifier: RequestIdentifier,
+    client_id: String,
     processing_message: T,
 ) where
     T: ToString,
 {
-    let processing_command_message = CommandMessage::Advancement {
-        request_identifier,
-        response: Response::Processing(processing_message.to_string()),
+    let advancement = CommandMessage::Advancement {
+        client_id,
+        advancement: Advancement::Processing(processing_message.to_string()),
     };
 
     trace!("return_processing: sending event to the command server");
-    if let Err(e) = command_tx.send(processing_command_message).await {
+    if let Err(e) = command_tx.send(advancement).await {
         error!(
             "Error while returning processing to the command server: {}",
             e
@@ -1500,15 +1404,15 @@ async fn return_processing<T>(
 
 async fn return_success(
     mut command_tx: Sender<CommandMessage>,
-    request_identifier: RequestIdentifier,
+    client_id: String,
     success: Success,
 ) {
-    let success_command_message = CommandMessage::Advancement {
-        request_identifier,
-        response: Response::Ok(success),
+    let advancement = CommandMessage::Advancement {
+        client_id,
+        advancement: Advancement::Ok(success),
     };
     trace!("return_success: sending event to the command server");
-    if let Err(e) = command_tx.send(success_command_message).await {
+    if let Err(e) = command_tx.send(advancement).await {
         error!("Error while returning success to the command server: {}", e)
     }
 }

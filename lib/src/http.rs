@@ -12,23 +12,18 @@ use anyhow::{bail, Context};
 use mio::{net::*, unix::SourceFd, *};
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::proxy::RemoveListener;
 use time::{Duration, Instant};
 
+use sozu_command::{
+    logging,
+    ready::Ready,
+    request::{Cluster, RemoveListener, Request, WorkerRequest},
+    response::{HttpFrontend, HttpListenerConfig, ProxyResponse, Route},
+    scm_socket::{Listeners, ScmSocket},
+};
+
 use crate::{
-    protocol::SessionState,
-    router::Router,
-    sozu_command::{
-        logging,
-        proxy::{
-            Cluster, HttpFrontend, HttpListenerConfig, ProxyRequest, ProxyRequestOrder,
-            ProxyResponse, Route,
-        },
-        ready::Ready,
-        scm_socket::{Listeners, ScmSocket},
-    },
-    timer::TimeoutContainer,
-    util::UnwrapLog,
+    protocol::SessionState, router::Router, timer::TimeoutContainer, util::UnwrapLog,
     L7ListenerHandler, L7Proxy, ListenerHandler, SessionIsToBeClosed, SessionResult,
     StateMachineBuilder,
 };
@@ -783,37 +778,37 @@ impl HttpListener {
 }
 
 impl ProxyConfiguration for HttpProxy {
-    fn notify(&mut self, request: ProxyRequest) -> ProxyResponse {
+    fn notify(&mut self, request: WorkerRequest) -> ProxyResponse {
         let request_id = request.id.clone();
 
-        let result = match request.order {
-            ProxyRequestOrder::AddCluster(cluster) => {
+        let result = match request.content {
+            Request::AddCluster(cluster) => {
                 info!("{} add cluster {:?}", request.id, cluster);
                 self.add_cluster(cluster.clone())
                     .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
-            ProxyRequestOrder::RemoveCluster { cluster_id } => {
+            Request::RemoveCluster { cluster_id } => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
                     .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
-            ProxyRequestOrder::AddHttpFrontend(front) => {
+            Request::AddHttpFrontend(front) => {
                 info!("{} add front {:?}", request_id, front);
                 self.add_http_frontend(front)
                     .with_context(|| "Could not add http frontend")
             }
-            ProxyRequestOrder::RemoveHttpFrontend(front) => {
+            Request::RemoveHttpFrontend(front) => {
                 info!("{} remove front {:?}", request_id, front);
                 self.remove_http_frontend(front)
                     .with_context(|| "Could not remove http frontend")
             }
-            ProxyRequestOrder::RemoveListener(remove) => {
+            Request::RemoveListener(remove) => {
                 info!("removing HTTP listener at address {:?}", remove.address);
                 self.remove_listener(remove.clone()).with_context(|| {
                     format!("Could not remove listener at address {:?}", remove.address)
                 })
             }
-            ProxyRequestOrder::SoftStop => {
+            Request::SoftStop => {
                 info!("{} processing soft shutdown", request_id);
                 match self
                     .soft_stop()
@@ -826,7 +821,7 @@ impl ProxyConfiguration for HttpProxy {
                     Err(e) => Err(e),
                 }
             }
-            ProxyRequestOrder::HardStop => {
+            Request::HardStop => {
                 info!("{} processing hard shutdown", request_id);
                 match self
                     .hard_stop()
@@ -839,11 +834,11 @@ impl ProxyConfiguration for HttpProxy {
                     Err(e) => Err(e),
                 }
             }
-            ProxyRequestOrder::Status => {
+            Request::Status => {
                 info!("{} status", request_id);
                 Ok(())
             }
-            ProxyRequestOrder::Logging(logging_filter) => {
+            Request::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     request_id, logging_filter
@@ -1083,11 +1078,12 @@ pub fn start_http_worker(
 mod tests {
     extern crate tiny_http;
     use super::*;
-    use crate::sozu_command::channel::Channel;
-    use crate::sozu_command::proxy::{
-        Backend, HttpFrontend, HttpListenerConfig, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, ProxyRequest, ProxyRequestOrder, Route, RulePosition,
+    use crate::sozu_command::{
+        channel::Channel,
+        request::{LoadBalancingAlgorithms, LoadBalancingParams, Request, WorkerRequest},
+        response::{Backend, HttpFrontend, HttpListenerConfig, PathRule, Route, RulePosition},
     };
+
     use std::io::{Read, Write};
     use std::net::SocketAddr;
     use std::net::TcpStream;
@@ -1140,9 +1136,9 @@ mod tests {
             tags: None,
         };
         command
-            .write_message(&ProxyRequest {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                order: ProxyRequestOrder::AddHttpFrontend(front),
+                content: Request::AddHttpFrontend(front),
             })
             .unwrap();
         let backend = Backend {
@@ -1154,9 +1150,9 @@ mod tests {
             backup: None,
         };
         command
-            .write_message(&ProxyRequest {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                order: ProxyRequestOrder::AddBackend(backend),
+                content: Request::AddBackend(backend),
             })
             .unwrap();
 
@@ -1228,9 +1224,9 @@ mod tests {
             tags: None,
         };
         command
-            .write_message(&ProxyRequest {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                order: ProxyRequestOrder::AddHttpFrontend(front),
+                content: Request::AddHttpFrontend(front),
             })
             .unwrap();
         let backend = Backend {
@@ -1242,9 +1238,9 @@ mod tests {
             sticky_id: None,
         };
         command
-            .write_message(&ProxyRequest {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                order: ProxyRequestOrder::AddBackend(backend),
+                content: Request::AddBackend(backend),
             })
             .unwrap();
 
@@ -1341,9 +1337,9 @@ mod tests {
             sticky_session: false,
         };
         command
-            .write_message(&ProxyRequest {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                order: ProxyRequestOrder::AddCluster(cluster),
+                content: Request::AddCluster(cluster),
             })
             .unwrap();
         let front = HttpFrontend {
@@ -1356,9 +1352,9 @@ mod tests {
             tags: None,
         };
         command
-            .write_message(&ProxyRequest {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                order: ProxyRequestOrder::AddHttpFrontend(front),
+                content: Request::AddHttpFrontend(front),
             })
             .unwrap();
         let backend = Backend {
@@ -1370,9 +1366,9 @@ mod tests {
             sticky_id: None,
         };
         command
-            .write_message(&ProxyRequest {
+            .write_message(&WorkerRequest {
                 id: String::from("ID_IJKL"),
-                order: ProxyRequestOrder::AddBackend(backend),
+                content: Request::AddBackend(backend),
             })
             .unwrap();
 

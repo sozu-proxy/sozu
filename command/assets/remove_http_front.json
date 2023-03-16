@@ -1,23 +1,18 @@
 {
-  "id": "ID_TEST",
-  "version": 0,
-  "type": "PROXY",
-  "data": {
-    "type": "REMOVE_HTTP_FRONTEND",
-    "data": {
-      "route": {
-        "CLUSTER_ID": "xxx"
-      },
-      "address": "0.0.0.0:8080",
-      "hostname": "yyy",
-      "path": {
-        "PREFIX": "xxx"
-      },
-      "position": "TREE",
-      "tags": {
-        "owner": "John",
-        "uuid": "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83"
-      }
+  "type": "REMOVE_HTTP_FRONTEND",
+  "content": {
+    "route": {
+      "CLUSTER_ID": "xxx"
+    },
+    "address": "0.0.0.0:8080",
+    "hostname": "yyy",
+    "path": {
+      "PREFIX": "xxx"
+    },
+    "position": "TREE",
+    "tags": {
+      "owner": "John",
+      "uuid": "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83"
     }
   }
 }

@@ -772,19 +772,27 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
                 break;
             }
 
-            if frontend_interest.is_readable() && self.readable(metrics) == StateResult::CloseSession {
+            if frontend_interest.is_readable()
+                && self.readable(metrics) == StateResult::CloseSession
+            {
                 return SessionResult::Close;
             }
 
-            if backend_interest.is_writable() && self.backend_writable(metrics) == StateResult::CloseSession {
+            if backend_interest.is_writable()
+                && self.backend_writable(metrics) == StateResult::CloseSession
+            {
                 return SessionResult::Close;
             }
 
-            if backend_interest.is_readable() && self.backend_readable(metrics) == StateResult::CloseSession {
+            if backend_interest.is_readable()
+                && self.backend_readable(metrics) == StateResult::CloseSession
+            {
                 return SessionResult::Close;
             }
 
-            if frontend_interest.is_writable() && self.writable(metrics) == StateResult::CloseSession {
+            if frontend_interest.is_writable()
+                && self.writable(metrics) == StateResult::CloseSession
+            {
                 return SessionResult::Close;
             }
 
@@ -846,15 +854,17 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
         //info!("got timeout for token: {:?}", token);
         if self.frontend_token == token {
             self.log_request_error(metrics, "front socket timeout");
-            if let Some(timeout) = self.container_frontend_timeout
-                .as_mut() { timeout.triggered() }
+            if let Some(timeout) = self.container_frontend_timeout.as_mut() {
+                timeout.triggered()
+            }
             return StateResult::CloseSession;
         }
 
         if self.backend_token == Some(token) {
             //info!("backend timeout triggered for token {:?}", token);
-            if let Some(timeout) = self.container_backend_timeout
-                .as_mut() { timeout.triggered() }
+            if let Some(timeout) = self.container_backend_timeout.as_mut() {
+                timeout.triggered()
+            }
 
             self.log_request_error(metrics, "back socket timeout");
             return StateResult::CloseSession;

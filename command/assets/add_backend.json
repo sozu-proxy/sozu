@@ -1,18 +1,13 @@
 {
-  "id": "ID_TEST",
-  "version": 0,
-  "type": "PROXY",
-  "data": {
-    "type": "ADD_BACKEND",
-    "data": {
-      "cluster_id": "xxx",
-      "backend_id": "xxx-0",
-      "address": "127.0.0.1:8080",
-      "sticky_id": "xxx-0",
-      "load_balancing_parameters": {
-        "weight": 0
-      },
-      "backup": false
-    }
+  "type": "ADD_BACKEND",
+  "content": {
+    "cluster_id": "xxx",
+    "backend_id": "xxx-0",
+    "address": "127.0.0.1:8080",
+    "sticky_id": "xxx-0",
+    "load_balancing_parameters": {
+      "weight": 0
+    },
+    "backup": false
   }
 }

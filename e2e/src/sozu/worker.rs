@@ -16,10 +16,11 @@ use sozu_command::{
     channel::Channel,
     config::{Config, FileConfig},
     logging::{Logger, LoggerBackend},
-    proxy::{
-        Backend, Cluster, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        LoadBalancingAlgorithms, LoadBalancingParams, PathRule, ProxyRequest, ProxyRequestOrder,
-        ProxyResponse, Route, RulePosition, TcpFrontend, TcpListenerConfig,
+    request::Request,
+    request::{Cluster, LoadBalancingAlgorithms, LoadBalancingParams, WorkerRequest},
+    response::{
+        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, ProxyResponse,
+        Route, RulePosition, TcpFrontend, TcpListenerConfig,
     },
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -34,7 +35,7 @@ pub struct Worker {
     pub state: ConfigState,
     pub scm_main_to_worker: ScmSocket,
     pub scm_worker_to_main: ScmSocket,
-    pub command_channel: Channel<ProxyRequest, ProxyResponse>,
+    pub command_channel: Channel<WorkerRequest, ProxyResponse>,
     pub command_id: CommandID,
     pub server_job: JoinHandle<()>,
 }
@@ -107,7 +108,7 @@ impl Worker {
         config: Config,
         listeners: Listeners,
         state: ConfigState,
-    ) -> (ScmSocket, Channel<ProxyRequest, ProxyResponse>, Server) {
+    ) -> (ScmSocket, Channel<WorkerRequest, ProxyResponse>, Server) {
         let (scm_main_to_worker, scm_worker_to_main) =
             UnixStream::pair().expect("could not create unix stream pair");
         let (cmd_main_to_worker, cmd_worker_to_main) =
@@ -172,11 +173,11 @@ impl Worker {
         let server_job = thread::spawn(move || {
             let log_level = env::var("RUST_LOG").unwrap_or("error".to_string());
             Logger::init(
-                    thread_name.to_owned(),
-                    &log_level,
-                    LoggerBackend::Stdout(stdout()),
-                    None,
-                );
+                thread_name.to_owned(),
+                &log_level,
+                LoggerBackend::Stdout(stdout()),
+                None,
+            );
             let mut server = Server::try_new_from_config(
                 cmd_worker_to_main,
                 thread_scm_worker_to_main,
@@ -202,7 +203,7 @@ impl Worker {
     }
 
     pub fn upgrade<S: Into<String>>(&mut self, name: S) -> Self {
-        self.send_proxy_request(ProxyRequestOrder::ReturnListenSockets);
+        self.send_proxy_request(Request::ReturnListenSockets);
         self.read_to_last();
 
         self.scm_main_to_worker
@@ -214,7 +215,7 @@ impl Worker {
             .expect("receive listeners");
         println!("Listeners from old worker: {listeners:?}");
         println!("State from old worker: {:?}", self.state);
-        self.send_proxy_request(ProxyRequestOrder::SoftStop);
+        self.send_proxy_request(Request::SoftStop);
 
         let mut worker = Worker::start_new_worker(
             name,
@@ -228,8 +229,8 @@ impl Worker {
             .expect("send listeners");
         listeners.close();
         worker.command_id.prefix = "ACTIVATE_".to_string();
-        for order in self.state.generate_activate_orders() {
-            worker.send_proxy_request(order);
+        for request in self.state.generate_activate_requests() {
+            worker.send_proxy_request(request);
         }
         worker.command_id.prefix = "ID_".to_string();
         worker.read_to_last();
@@ -238,12 +239,12 @@ impl Worker {
         worker
     }
 
-    pub fn send_proxy_request(&mut self, order: ProxyRequestOrder) {
+    pub fn send_proxy_request(&mut self, request: Request) {
         //self.state.handle_order(&order);
         self.command_channel
-            .write_message(&ProxyRequest {
+            .write_message(&WorkerRequest {
                 id: self.command_id.next(),
-                order,
+                content: request,
             })
             .expect("Could not write message on command channel");
     }

@@ -1,19 +1,21 @@
+use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};
+
 use acme_lib::{create_p384_key, persist::FilePersist, Directory, DirectoryUrl};
 use anyhow::{bail, Context};
 use mio::net::UnixStream;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use tiny_http::{Response as HttpResponse, Server};
+
 use sozu_command_lib::{
-    certificate::{calculate_fingerprint, split_certificate_chain},
-    channel::Channel,
-    command::{CommandRequest, CommandRequestOrder, CommandResponse, CommandStatus},
-    config::Config,
-    proxy::{
-        AddCertificate, Backend, CertificateAndKey, CertificateFingerprint, HttpFrontend, PathRule,
-        ProxyRequestOrder, RemoveBackend, ReplaceCertificate, Route, RulePosition, TlsVersion,
+    certificate::{
+        calculate_fingerprint, split_certificate_chain, CertificateAndKey, CertificateFingerprint,
+        TlsVersion,
     },
+    channel::Channel,
+    config::Config,
+    request::{AddCertificate, RemoveBackend, ReplaceCertificate, Request},
+    response::{Backend, HttpFrontend, PathRule, Response, ResponseStatus, Route, RulePosition},
 };
-use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};
-use tiny_http::{Response, Server};
 
 use crate::util;
 
@@ -87,7 +89,7 @@ pub fn main(
 
     let tls_versions = vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3];
 
-    let mut channel: Channel<CommandRequest, CommandResponse> = Channel::new(stream, 10000, 20000);
+    let mut channel: Channel<Request, Response> = Channel::new(stream, 10000, 20000);
     channel
         .blocking()
         .with_context(|| "Could not block channel")?;
@@ -168,15 +170,15 @@ pub fn main(
                 info!("got request to URL: {}", request.url());
                 if request.url() == path {
                     if let Err(e) = request.respond(
-                        Response::from_data(key_authorization.as_bytes()).with_status_code(200),
+                        HttpResponse::from_data(key_authorization.as_bytes()).with_status_code(200),
                     ) {
                         error!("Error responding with 200 to request: {}", e);
                     }
                     info!("challenge request answered");
                     // the challenge can be called multiple times
                     //return true;
-                } else if let Err(e) =
-                    request.respond(Response::from_data(&b"not found"[..]).with_status_code(404))
+                } else if let Err(e) = request
+                    .respond(HttpResponse::from_data(&b"not found"[..]).with_status_code(404))
                 {
                     error!("Error responding with 404 to request: {}", e);
                 }
@@ -258,6 +260,7 @@ pub fn main(
     Ok(())
 }
 
+/*
 fn generate_id() -> String {
     let s: String = iter::repeat(())
         .map(|()| thread_rng().sample(Alphanumeric))
@@ -266,6 +269,7 @@ fn generate_id() -> String {
         .collect();
     format!("ID-{s}")
 }
+*/
 
 fn generate_app_id(app_id: &str) -> String {
     let s: String = iter::repeat(())
@@ -277,14 +281,14 @@ fn generate_app_id(app_id: &str) -> String {
 }
 
 fn set_up_proxying(
-    channel: &mut Channel<CommandRequest, CommandResponse>,
+    channel: &mut Channel<Request, Response>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let add_http_front = ProxyRequestOrder::AddHttpFrontend(HttpFrontend {
+    let add_http_front = Request::AddHttpFrontend(HttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         hostname: String::from(hostname),
         address: *frontend,
@@ -294,9 +298,9 @@ fn set_up_proxying(
         tags: None,
     });
 
-    order_command(channel, add_http_front).with_context(|| "Order AddHttpFront failed")?;
+    order_request(channel, add_http_front).with_context(|| "Request AddHttpFront failed")?;
 
-    let add_backend = ProxyRequestOrder::AddBackend(Backend {
+    let add_backend = Request::AddBackend(Backend {
         cluster_id: String::from(cluster_id),
         backend_id: format!("{cluster_id}-0"),
         address: server_address,
@@ -305,19 +309,19 @@ fn set_up_proxying(
         backup: None,
     });
 
-    order_command(channel, add_backend).with_context(|| "AddBackend order failed")?;
+    order_request(channel, add_backend).with_context(|| "AddBackend request failed")?;
     Ok(())
 }
 
 fn remove_proxying(
-    channel: &mut Channel<CommandRequest, CommandResponse>,
+    channel: &mut Channel<Request, Response>,
     frontend: &SocketAddr,
     cluster_id: &str,
     hostname: &str,
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let remove_http_front_order = ProxyRequestOrder::RemoveHttpFrontend(HttpFrontend {
+    let remove_http_front = Request::RemoveHttpFrontend(HttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         address: *frontend,
         hostname: String::from(hostname),
@@ -326,21 +330,20 @@ fn remove_proxying(
         position: RulePosition::Tree,
         tags: None,
     });
-    order_command(channel, remove_http_front_order)
-        .with_context(|| "RemoveHttpFront order failed")?;
+    order_request(channel, remove_http_front).with_context(|| "RemoveHttpFront request failed")?;
 
-    let remove_backend_order = ProxyRequestOrder::RemoveBackend(RemoveBackend {
+    let remove_backend = Request::RemoveBackend(RemoveBackend {
         cluster_id: String::from(cluster_id),
         backend_id: format!("{cluster_id}-0"),
         address: server_address,
     });
 
-    order_command(channel, remove_backend_order).with_context(|| "RemoveBackend order failed")?;
+    order_request(channel, remove_backend).with_context(|| "RemoveBackend request failed")?;
     Ok(())
 }
 
 fn add_certificate(
-    channel: &mut Channel<CommandRequest, CommandResponse>,
+    channel: &mut Channel<Request, Response>,
     frontend: &SocketAddr,
     hostname: &str,
     certificate_path: &str,
@@ -358,8 +361,8 @@ fn add_certificate(
         .map(split_certificate_chain)
         .with_context(|| "could not load certificate chain".to_string())?;
 
-    let certificate_order = match old_fingerprint {
-        None => ProxyRequestOrder::AddCertificate(AddCertificate {
+    let request = match old_fingerprint {
+        None => Request::AddCertificate(AddCertificate {
             address: *frontend,
             certificate: CertificateAndKey {
                 certificate,
@@ -371,7 +374,7 @@ fn add_certificate(
             expired_at: None,
         }),
 
-        Some(f) => ProxyRequestOrder::ReplaceCertificate(ReplaceCertificate {
+        Some(f) => Request::ReplaceCertificate(ReplaceCertificate {
             address: *frontend,
             new_certificate: CertificateAndKey {
                 certificate,
@@ -385,58 +388,48 @@ fn add_certificate(
         }),
     };
 
-    info!("Sending the certificate order {:?}", certificate_order);
-    order_command(channel, certificate_order)
-        .with_context(|| "Could not send the certificate order")
+    info!("Sending the certificate request {:?}", request);
+    order_request(channel, request).with_context(|| "Could not send the certificate request")
 }
 
-fn order_command(
-    channel: &mut Channel<CommandRequest, CommandResponse>,
-    order: ProxyRequestOrder,
-) -> anyhow::Result<()> {
-    let id = generate_id();
+fn order_request(channel: &mut Channel<Request, Response>, request: Request) -> anyhow::Result<()> {
     channel
-        .write_message(&CommandRequest::new(
-            id.clone(),
-            CommandRequestOrder::Proxy(Box::new(order.clone())),
-            None,
-        ))
+        .write_message(&request.clone())
         .with_context(|| "Could not write message on the channel")?;
 
     loop {
         let response = channel
             .read_message()
             .with_context(|| "Could not read response on channel")?;
-        if id != response.id {
-            panic!("received message with invalid id: {response:?}");
-        }
+
         match response.status {
-            CommandStatus::Processing => {
+            ResponseStatus::Processing => {
                 // do nothing here
                 // for other messages, we would loop over read_message
                 // until an error or ok message was sent
             }
-            CommandStatus::Error => {
-                bail!("could not execute order: {}", response.message);
+            ResponseStatus::Failure => {
+                bail!("could not execute request: {}", response.message);
             }
-            CommandStatus::Ok => {
-                match order {
-                    ProxyRequestOrder::AddBackend(_) => {
+            ResponseStatus::Ok => {
+                // TODO: remove the pattern matching and only display the response message
+                match request {
+                    Request::AddBackend(_) => {
                         info!("backend added : {}", response.message)
                     }
-                    ProxyRequestOrder::RemoveBackend(_) => {
+                    Request::RemoveBackend(_) => {
                         info!("backend removed : {} ", response.message)
                     }
-                    ProxyRequestOrder::AddCertificate(_) => {
+                    Request::AddCertificate(_) => {
                         info!("certificate added: {}", response.message)
                     }
-                    ProxyRequestOrder::RemoveCertificate(_) => {
+                    Request::RemoveCertificate(_) => {
                         info!("certificate removed: {}", response.message)
                     }
-                    ProxyRequestOrder::AddHttpFrontend(_) => {
+                    Request::AddHttpFrontend(_) => {
                         info!("front added: {}", response.message)
                     }
-                    ProxyRequestOrder::RemoveHttpFrontend(_) => {
+                    Request::RemoveHttpFrontend(_) => {
                         info!("front removed: {}", response.message)
                     }
                     _ => {

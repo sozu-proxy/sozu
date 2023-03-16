@@ -1,8 +1,6 @@
 {
-  "id": "ID_TEST",
-  "version": 0,
   "type": "SAVE_STATE",
-  "data": {
+  "content": {
     "path": "./config_dump.json"
   }
 }

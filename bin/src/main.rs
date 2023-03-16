@@ -45,10 +45,7 @@ use libc::{cpu_set_t, pid_t};
 use sozu::metrics::METRICS;
 use sozu_command_lib::config::Config;
 
-use crate::{
-    command::Worker,
-    worker::{get_executable_path, start_workers},
-};
+use crate::worker::{get_executable_path, start_workers, Worker};
 
 #[paw::main]
 fn main(args: Args) -> anyhow::Result<()> {

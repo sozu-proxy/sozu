@@ -74,17 +74,13 @@ where
 mod test {
     use super::*;
 
-    use crate::command::{CommandRequest, CommandRequestOrder};
+    use crate::request::{Request, WorkerRequest};
 
     #[test]
-    fn parse_one_command_request_works() {
-        let command_request = CommandRequest::new(
-            "Some request".to_string(),
-            CommandRequestOrder::DumpState,
-            Some(5),
-        );
+    fn parse_one_worker_request() {
+        let worker_request = WorkerRequest::new("Some request".to_string(), Request::DumpState);
 
-        let mut string = serde_json::ser::to_string(&command_request).unwrap();
+        let mut string = serde_json::ser::to_string(&worker_request).unwrap();
 
         string.push('\0');
 
@@ -96,47 +92,38 @@ mod test {
 
         assert_eq!(
             parse_one_command(bytes).unwrap(),
-            (&empty_vec[..], command_request)
+            (&empty_vec[..], worker_request)
         )
     }
 
     #[test]
-    fn parse_several_command_requests_works() {
-        let commands = vec![
-            CommandRequest::new(
+    fn parse_several_worker_requests() {
+        let requests = vec![
+            WorkerRequest::new(
                 "Some request".to_string(),
-                CommandRequestOrder::SaveState {
+                Request::SaveState {
                     path: "/some/path".to_string(),
                 },
-                Some(5),
             ),
-            CommandRequest::new(
-                "Some other request".to_string(),
-                CommandRequestOrder::SubscribeEvents,
-                Some(4),
-            ),
-            CommandRequest::new(
-                "Yet another request".to_string(),
-                CommandRequestOrder::DumpState,
-                None,
-            ),
+            WorkerRequest::new("Some other request".to_string(), Request::SubscribeEvents),
+            WorkerRequest::new("Yet another request".to_string(), Request::DumpState),
         ];
 
-        let mut serialized_commands = String::new();
+        let mut serialized_requests = String::new();
 
-        for command in commands.iter() {
-            serialized_commands += &serde_json::ser::to_string(&command).unwrap();
-            serialized_commands.push('\0');
+        for request in requests.iter() {
+            serialized_requests += &serde_json::ser::to_string(&request).unwrap();
+            serialized_requests.push('\0');
         }
 
-        let bytes_to_parse = &serialized_commands.as_bytes();
+        let bytes_to_parse = &serialized_requests.as_bytes();
 
-        let parsed_commands = parse_several_commands(bytes_to_parse).unwrap();
+        let parsed_requests = parse_several_commands(bytes_to_parse).unwrap();
 
-        println!("parsed commands: {parsed_commands:?}");
+        println!("parsed commands: {parsed_requests:?}");
 
         let empty_vec: Vec<u8> = vec![];
 
-        assert_eq!(parsed_commands, (&empty_vec[..], commands))
+        assert_eq!(parsed_requests, (&empty_vec[..], requests))
     }
 }

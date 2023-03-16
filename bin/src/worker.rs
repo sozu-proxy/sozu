@@ -11,6 +11,8 @@ use std::mem::size_of;
 #[cfg(target_os = "macos")]
 use std::ptr::null_mut;
 use std::{
+    collections::VecDeque,
+    fmt,
     fs::File,
     io::Seek,
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
@@ -19,6 +21,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
+use futures::SinkExt;
 use libc::{self, pid_t};
 #[cfg(target_os = "macos")]
 use libc::{c_char, PATH_MAX};
@@ -26,6 +29,7 @@ use libc::{c_char, PATH_MAX};
 use libc::{sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
 use mio::net::UnixStream;
 use nix::{self, unistd::*};
+use nix::{sys::signal::kill, unistd::Pid};
 
 use tempfile::tempfile;
 
@@ -34,13 +38,108 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     logging::target_to_backend,
-    proxy::{ProxyRequest, ProxyRequestOrder, ProxyResponse},
     ready::Ready,
+    request::{Request, WorkerRequest},
+    response::ProxyResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
 
-use crate::{command::Worker, logging, util};
+use crate::{logging, util};
+
+use sozu_command_lib::response::{RunState, WorkerInfo};
+
+/// An instance of Sōzu, as seen from the main process
+pub struct Worker {
+    pub id: u32,
+    /// for the worker to receive requests and respond to the main process
+    pub worker_channel: Option<Channel<WorkerRequest, ProxyResponse>>,
+    /// file descriptor of the command channel
+    pub worker_channel_fd: i32,
+    pub pid: pid_t,
+    pub run_state: RunState,
+    pub queue: VecDeque<WorkerRequest>,
+    /// Used to send and receive listeners (socket addresses and file descriptors)
+    pub scm_socket: ScmSocket,
+    /// Used to send proxyrequests to the worker loop
+    pub sender: Option<futures::channel::mpsc::Sender<WorkerRequest>>,
+}
+
+impl Worker {
+    pub fn new(
+        id: u32,
+        pid: pid_t,
+        command_channel: Channel<WorkerRequest, ProxyResponse>,
+        scm_socket: ScmSocket,
+        _: &Config,
+    ) -> Worker {
+        Worker {
+            id,
+            worker_channel_fd: command_channel.sock.as_raw_fd(),
+            worker_channel: Some(command_channel),
+            sender: None,
+            pid,
+            run_state: RunState::Running,
+            queue: VecDeque::new(),
+            scm_socket,
+        }
+    }
+
+    /// send proxy request to the worker, via the mpsc sender
+    pub async fn send(&mut self, order_id: String, content: Request) {
+        if let Some(worker_tx) = self.sender.as_mut() {
+            if let Err(e) = worker_tx
+                .send(WorkerRequest {
+                    id: order_id.clone(),
+                    content,
+                })
+                .await
+            {
+                error!(
+                    "error sending message {} to worker {:?}: {:?}",
+                    order_id, self.id, e
+                );
+            }
+        }
+    }
+
+    /// send a kill -0 to check on the pid, if it's dead it should be an error
+    pub fn the_pid_is_alive(&self) -> bool {
+        kill(Pid::from_raw(self.pid), None).is_ok()
+    }
+
+    pub fn info(&self) -> WorkerInfo {
+        WorkerInfo {
+            id: self.id,
+            pid: self.pid,
+            run_state: self.run_state,
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.run_state != RunState::Stopping && self.run_state != RunState::Stopped
+    }
+
+    /*
+    pub fn push_message(&mut self, message: ProxyRequest) {
+      self.queue.push_back(message);
+      self.channel.interest.insert(Ready::writable());
+    }
+
+    pub fn can_handle_events(&self) -> bool {
+      self.channel.readiness().is_readable() || (!self.queue.is_empty() && self.channel.readiness().is_writable())
+    }*/
+}
+
+impl fmt::Debug for Worker {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "Worker {{ id: {}, run_state: {:?} }}",
+            self.id, self.run_state
+        )
+    }
+}
 
 /// Called once at the beginning of the main process, this forks main into as many workers
 pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result<Vec<Worker>> {
@@ -69,9 +168,9 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
             }
 
             worker_channel
-                .write_message(&ProxyRequest {
+                .write_message(&WorkerRequest {
                     id: format!("start-status-{index}"),
-                    order: ProxyRequestOrder::Status,
+                    content: Request::Status,
                 })
                 .with_context(|| "Could not send status request to the worker")?;
 
@@ -165,7 +264,7 @@ pub fn begin_worker_process(
         error!("Could not unblock the worker-to-main channel: {}", e);
     }
 
-    let mut worker_to_main_channel: Channel<ProxyResponse, ProxyRequest> =
+    let mut worker_to_main_channel: Channel<ProxyResponse, WorkerRequest> =
         worker_to_main_channel.into();
     worker_to_main_channel.readiness.insert(Ready::readable());
 
@@ -208,7 +307,7 @@ pub fn fork_main_into_worker(
     executable_path: String,
     state: &ConfigState,
     listeners: Option<Listeners>,
-) -> anyhow::Result<(pid_t, Channel<ProxyRequest, ProxyResponse>, ScmSocket)> {
+) -> anyhow::Result<(pid_t, Channel<WorkerRequest, ProxyResponse>, ScmSocket)> {
     trace!("parent({})", unsafe { libc::getpid() });
 
     let mut state_file =
@@ -349,5 +448,9 @@ pub unsafe fn get_executable_path() -> anyhow::Result<String> {
         panic!("Could not retrieve the path of the executable");
     }
 
-    Ok(String::from_raw_parts(path.as_mut_ptr(), capacity - 1, path.len()))
+    Ok(String::from_raw_parts(
+        path.as_mut_ptr(),
+        capacity - 1,
+        path.len(),
+    ))
 }
