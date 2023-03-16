@@ -60,24 +60,11 @@ pub struct ConfigState {
     /// certificate and names
     pub certificates:
         HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
-    // TODO: delete those lines, they are useless
-    //ip, port
-    pub http_addresses: Vec<SocketAddr>,
-    pub https_addresses: Vec<SocketAddr>,
-    //tcp:
 }
 
 impl ConfigState {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn add_http_address(&mut self, address: SocketAddr) {
-        self.http_addresses.push(address)
-    }
-
-    pub fn add_https_address(&mut self, address: SocketAddr) {
-        self.https_addresses.push(address)
     }
 
     pub fn dispatch(&mut self, request: &Request) -> anyhow::Result<()> {
