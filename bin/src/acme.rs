@@ -13,8 +13,10 @@ use sozu_command_lib::{
     },
     channel::Channel,
     config::Config,
-    request::{AddBackend, AddCertificate, RemoveBackend, ReplaceCertificate, Request},
-    response::{PathRule, RequestHttpFrontend, Response, ResponseStatus, Route, RulePosition},
+    request::{
+        AddBackend, AddCertificate, RemoveBackend, ReplaceCertificate, Request, RequestHttpFrontend,
+    },
+    response::{PathRule, Response, ResponseStatus, Route, RulePosition},
 };
 
 use crate::util;

@@ -11,8 +11,9 @@ use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
     info,
     logging::{Logger, LoggerBackend},
-    request::{ActivateListener, AddCertificate, ListenerType, RemoveBackend, Request},
-    response::RequestHttpFrontend,
+    request::{
+        ActivateListener, AddCertificate, ListenerType, RemoveBackend, Request, RequestHttpFrontend,
+    },
     state::ConfigState,
 };
 

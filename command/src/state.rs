@@ -18,11 +18,11 @@ use crate::{
     request::{
         ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, ListenerType,
         RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
+        RequestHttpFrontend, RequestTcpFrontend,
     },
     response::{
         Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule,
-        QueryAnswerCluster, RequestHttpFrontend, RequestTcpFrontend, Route, TcpFrontend,
-        TcpListenerConfig,
+        QueryAnswerCluster, Route, TcpFrontend, TcpListenerConfig,
     },
 };
 
@@ -60,6 +60,7 @@ pub struct ConfigState {
     /// certificate and names
     pub certificates:
         HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
+    // TODO: delete those lines, they are useless
     //ip, port
     pub http_addresses: Vec<SocketAddr>,
     pub https_addresses: Vec<SocketAddr>,
@@ -539,7 +540,7 @@ impl ConfigState {
         }
 
         for front in self.http_fronts.values() {
-            v.push(Request::AddHttpFrontend(front.clone().to_request()));
+            v.push(Request::AddHttpFrontend(front.clone().into()));
         }
 
         for (front, certs) in self.certificates.iter() {
@@ -554,12 +555,12 @@ impl ConfigState {
         }
 
         for front in self.https_fronts.values() {
-            v.push(Request::AddHttpsFrontend(front.clone().to_request()));
+            v.push(Request::AddHttpsFrontend(front.clone().into()));
         }
 
         for front_list in self.tcp_fronts.values() {
             for front in front_list {
-                v.push(Request::AddTcpFrontend(front.clone().to_request()));
+                v.push(Request::AddTcpFrontend(front.clone().into()));
             }
         }
 
@@ -890,11 +891,11 @@ impl ConfigState {
         let added_http_fronts = their_http_fronts.difference(&my_http_fronts);
 
         for &(_, front) in removed_http_fronts {
-            v.push(Request::RemoveHttpFrontend(front.clone().to_request()));
+            v.push(Request::RemoveHttpFrontend(front.clone().into()));
         }
 
         for &(_, front) in added_http_fronts {
-            v.push(Request::AddHttpFrontend(front.clone().to_request()));
+            v.push(Request::AddHttpFrontend(front.clone().into()));
         }
 
         let mut my_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
@@ -909,11 +910,11 @@ impl ConfigState {
         let added_https_fronts = their_https_fronts.difference(&my_https_fronts);
 
         for &(_, front) in removed_https_fronts {
-            v.push(Request::RemoveHttpsFrontend(front.clone().to_request()));
+            v.push(Request::RemoveHttpsFrontend(front.clone().into()));
         }
 
         for &(_, front) in added_https_fronts {
-            v.push(Request::AddHttpsFrontend(front.clone().to_request()));
+            v.push(Request::AddHttpsFrontend(front.clone().into()));
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
@@ -933,11 +934,11 @@ impl ConfigState {
         let added_tcp_fronts = their_tcp_fronts.difference(&my_tcp_fronts);
 
         for &(_, front) in removed_tcp_fronts {
-            v.push(Request::RemoveTcpFrontend(front.clone().to_request()));
+            v.push(Request::RemoveTcpFrontend(front.clone().into()));
         }
 
         for &(_, front) in added_tcp_fronts {
-            v.push(Request::AddTcpFrontend(front.clone().to_request()));
+            v.push(Request::AddTcpFrontend(front.clone().into()));
         }
 
         //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -1218,8 +1219,8 @@ impl<
 mod tests {
     use super::*;
     use crate::{
-        request::{LoadBalancingAlgorithms, LoadBalancingParams, Request},
-        response::{RequestHttpFrontend, RulePosition},
+        request::{LoadBalancingAlgorithms, LoadBalancingParams, Request, RequestHttpFrontend},
+        response::RulePosition,
     };
 
     #[test]

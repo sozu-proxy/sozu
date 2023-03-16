@@ -7,8 +7,6 @@ use std::{
     net::SocketAddr,
 };
 
-use anyhow::Context;
-
 use crate::{
     certificate::TlsVersion,
     config::{
@@ -16,9 +14,10 @@ use crate::{
         DEFAULT_SIGNATURE_ALGORITHMS,
     },
     request::{
-        default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams, PROTOCOL_VERSION,
+        default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams,
+        RequestHttpFrontend, RequestTcpFrontend, PROTOCOL_VERSION,
     },
-    state::{ClusterId, ConfigState, RouteKey},
+    state::{ClusterId, ConfigState},
 };
 
 /// Responses of the main process to the CLI (or other client)
@@ -135,13 +134,8 @@ pub struct HttpFrontend {
     pub tags: Option<BTreeMap<String, String>>,
 }
 
-impl HttpFrontend {
-    /// `is_cluster_id` check if the frontend is dedicated to the given cluster_id
-    pub fn is_cluster_id(&self, cluster_id: &str) -> bool {
-        matches!(&self.route, Route::ClusterId(id) if id == cluster_id)
-    }
-
-    pub fn to_request(self) -> RequestHttpFrontend {
+impl Into<RequestHttpFrontend> for HttpFrontend {
+    fn into(self) -> RequestHttpFrontend {
         RequestHttpFrontend {
             route: self.route,
             address: self.address.to_string(),
@@ -151,47 +145,6 @@ impl HttpFrontend {
             position: self.position,
             tags: self.tags,
         }
-    }
-}
-
-/// A frontend as requested from the client, with a string SocketAddress
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RequestHttpFrontend {
-    pub route: Route,
-    pub address: String,
-    pub hostname: String,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_default_path_rule")]
-    pub path: PathRule,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub method: Option<String>,
-    #[serde(default)]
-    pub position: RulePosition,
-    pub tags: Option<BTreeMap<String, String>>,
-}
-
-impl RequestHttpFrontend {
-    /// `route_key` returns a representation of the frontend as a route key
-    pub fn route_key(&self) -> RouteKey {
-        self.into()
-    }
-
-    /// convert a requested frontend to a usable one
-    pub fn to_frontend(self) -> anyhow::Result<HttpFrontend> {
-        let address = self
-            .address
-            .parse::<SocketAddr>()
-            .with_context(|| "wrong socket address")?;
-
-        Ok(HttpFrontend {
-            address,
-            route: self.route,
-            hostname: self.hostname,
-            path: self.path,
-            method: self.method,
-            position: self.position,
-            tags: self.tags,
-        })
     }
 }
 
@@ -261,7 +214,7 @@ impl Default for PathRule {
     }
 }
 
-fn is_default_path_rule(p: &PathRule) -> bool {
+pub fn is_default_path_rule(p: &PathRule) -> bool {
     match p {
         PathRule::Regex(_) => false,
         PathRule::Equals(_) => false,
@@ -286,16 +239,8 @@ pub struct TcpFrontend {
     pub tags: Option<BTreeMap<String, String>>,
 }
 
-/// Meant for outside users, contains a String instead of a SocketAddr
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RequestTcpFrontend {
-    pub cluster_id: String,
-    pub address: String,
-    pub tags: Option<BTreeMap<String, String>>,
-}
-
-impl TcpFrontend {
-    pub fn to_request(self) -> RequestTcpFrontend {
+impl Into<RequestTcpFrontend> for TcpFrontend {
+    fn into(self) -> RequestTcpFrontend {
         RequestTcpFrontend {
             cluster_id: self.cluster_id,
             address: self.address.to_string(),

@@ -16,7 +16,6 @@ use mio::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::response::RequestTcpFrontend;
 use time::{Duration, Instant};
 
 use crate::{
@@ -38,7 +37,7 @@ use crate::{
         config::ProxyProtocolConfig,
         logging,
         ready::Ready,
-        request::{Request, WorkerRequest},
+        request::{Request, RequestTcpFrontend, WorkerRequest},
         response::{Event, ProxyResponse, TcpListenerConfig},
         scm_socket::ScmSocket,
         state::ClusterId,

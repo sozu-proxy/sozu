@@ -10,8 +10,8 @@ use anyhow::Context;
 use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    request::{AddBackend, LoadBalancingParams, Request, WorkerRequest},
-    response::{RequestTcpFrontend, TcpListenerConfig},
+    request::{AddBackend, LoadBalancingParams, Request, RequestTcpFrontend, WorkerRequest},
+    response::TcpListenerConfig,
 };
 
 fn main() -> anyhow::Result<()> {

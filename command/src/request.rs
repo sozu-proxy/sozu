@@ -1,13 +1,15 @@
-use std::{error, fmt, net::SocketAddr, str::FromStr};
+use std::{collections::BTreeMap, error, fmt, net::SocketAddr, str::FromStr};
+
+use anyhow::Context;
 
 use crate::{
     certificate::{CertificateAndKey, CertificateFingerprint},
     config::ProxyProtocolConfig,
     response::{
-        HttpListenerConfig, HttpsListenerConfig, MessageId, RequestHttpFrontend,
-        RequestTcpFrontend, TcpListenerConfig,
+        is_default_path_rule, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId,
+        PathRule, Route, RulePosition, TcpListenerConfig,
     },
-    state::ClusterId,
+    state::{ClusterId, RouteKey},
 };
 
 pub const PROTOCOL_VERSION: u8 = 0;
@@ -293,6 +295,53 @@ pub struct ReplaceCertificate {
     pub new_names: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_expired_at: Option<i64>,
+}
+
+/// Meant for outside users, contains a String instead of a SocketAddr
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestTcpFrontend {
+    pub cluster_id: String,
+    pub address: String,
+    pub tags: Option<BTreeMap<String, String>>,
+}
+
+/// A frontend as requested from the client, with a string SocketAddress
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestHttpFrontend {
+    pub route: Route,
+    pub address: String,
+    pub hostname: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_default_path_rule")]
+    pub path: PathRule,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub position: RulePosition,
+    pub tags: Option<BTreeMap<String, String>>,
+}
+
+impl RequestHttpFrontend {
+    /// `route_key` returns a representation of the frontend as a route key
+    pub fn route_key(&self) -> RouteKey {
+        self.into()
+    }
+
+    /// convert a requested frontend to a usable one by parsing its address
+    pub fn to_frontend(self) -> anyhow::Result<HttpFrontend> {
+        Ok(HttpFrontend {
+            address: self
+                .address
+                .parse::<SocketAddr>()
+                .with_context(|| "wrong socket address")?,
+            route: self.route,
+            hostname: self.hostname,
+            path: self.path,
+            method: self.method,
+            position: self.position,
+            tags: self.tags,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

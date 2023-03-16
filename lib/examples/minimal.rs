@@ -12,8 +12,8 @@ use crate::sozu_command::{
     channel::Channel,
     config::ListenerBuilder,
     logging::{Logger, LoggerBackend},
-    request::{AddBackend, LoadBalancingParams, Request, WorkerRequest},
-    response::{PathRule, RequestHttpFrontend, Route, RulePosition},
+    request::{AddBackend, LoadBalancingParams, Request, RequestHttpFrontend, WorkerRequest},
+    response::{PathRule, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {

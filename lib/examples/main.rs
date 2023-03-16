@@ -14,8 +14,11 @@ use sozu_command::{
     certificate::CertificateAndKey,
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    request::{AddBackend, AddCertificate, LoadBalancingParams, Request, WorkerRequest},
-    response::{PathRule, RequestHttpFrontend, Route, RulePosition},
+    request::{
+        AddBackend, AddCertificate, LoadBalancingParams, Request, RequestHttpFrontend,
+        WorkerRequest,
+    },
+    response::{PathRule, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {

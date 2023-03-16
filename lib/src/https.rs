@@ -26,7 +26,7 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::{config::DEFAULT_CIPHER_SUITES, response::RequestHttpFrontend};
+use sozu_command::{config::DEFAULT_CIPHER_SUITES, request::RequestHttpFrontend};
 use time::{Duration, Instant};
 
 use crate::{

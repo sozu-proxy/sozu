@@ -9,9 +9,9 @@ use sozu_command_lib::{
     request::{
         ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, FrontendFilters,
         ListenerType, LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, Request,
+        RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend, RequestTcpFrontend,
     },
-    response::{PathRule, RequestHttpFrontend, RequestTcpFrontend, RulePosition},
+    response::{PathRule, RulePosition},
 };
 
 use crate::{

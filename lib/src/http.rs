@@ -17,8 +17,8 @@ use time::{Duration, Instant};
 use sozu_command::{
     logging,
     ready::Ready,
-    request::{Cluster, RemoveListener, Request, WorkerRequest},
-    response::{HttpFrontend, HttpListenerConfig, ProxyResponse, RequestHttpFrontend, Route},
+    request::{Cluster, RemoveListener, Request, RequestHttpFrontend, WorkerRequest},
+    response::{HttpFrontend, HttpListenerConfig, ProxyResponse, Route},
     scm_socket::{Listeners, ScmSocket},
 };
 

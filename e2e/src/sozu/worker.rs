@@ -17,11 +17,10 @@ use sozu_command::{
     config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
     request::{
-        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, Request, WorkerRequest,
+        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, Request,
+        RequestHttpFrontend, RequestTcpFrontend, WorkerRequest,
     },
-    response::{
-        PathRule, ProxyResponse, RequestHttpFrontend, RequestTcpFrontend, Route, RulePosition,
-    },
+    response::{PathRule, ProxyResponse, Route, RulePosition},
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
