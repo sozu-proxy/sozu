@@ -1,7 +1,6 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
-    convert::From,
     default::Default,
     fmt,
     net::SocketAddr,
@@ -9,10 +8,6 @@ use std::{
 
 use crate::{
     certificate::TlsVersion,
-    config::{
-        DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST, DEFAULT_RUSTLS_CIPHER_LIST,
-        DEFAULT_SIGNATURE_ALGORITHMS,
-    },
     request::{
         default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams,
         RequestHttpFrontend, RequestTcpFrontend, PROTOCOL_VERSION,
@@ -338,24 +333,6 @@ pub struct HttpListenerConfig {
     pub request_timeout: u32,
 }
 
-// TODO: set the default values elsewhere, see #873
-impl Default for HttpListenerConfig {
-    fn default() -> HttpListenerConfig {
-        HttpListenerConfig {
-            address:           "127.0.0.1:8080".parse().expect("could not parse address"),
-              public_address:  None,
-              answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-              answer_503:      String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-              expect_proxy:    false,
-              sticky_name:     String::from("SOZUBALANCEID"),
-              front_timeout:   60,
-              back_timeout:    30,
-              connect_timeout: 3,
-              request_timeout: 10,
-        }
-    }
-}
-
 /// details of an HTTPS listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpsListenerConfig {
@@ -386,39 +363,6 @@ pub struct HttpsListenerConfig {
     pub connect_timeout: u32,
     /// max time to send a complete request
     pub request_timeout: u32,
-}
-
-impl Default for HttpsListenerConfig {
-    fn default() -> HttpsListenerConfig {
-        HttpsListenerConfig {
-      address:         "127.0.0.1:8443".parse().expect("could not parse address"),
-      public_address:  None,
-      answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-      answer_503:      String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-      cipher_list:     DEFAULT_RUSTLS_CIPHER_LIST.into_iter()
-          .map(String::from)
-          .collect(),
-      cipher_suites:  DEFAULT_CIPHER_SUITES.into_iter()
-          .map(String::from)
-          .collect(),
-      signature_algorithms: DEFAULT_SIGNATURE_ALGORITHMS.into_iter()
-          .map(String::from)
-          .collect(),
-      groups_list: DEFAULT_GROUPS_LIST.into_iter()
-          .map(String::from)
-          .collect(),
-      versions:            vec!(TlsVersion::TLSv1_2),
-      expect_proxy:        false,
-      sticky_name:         String::from("SOZUBALANCEID"),
-      certificate:         None,
-      certificate_chain:   vec![],
-      key:                 None,
-      front_timeout:   60,
-      back_timeout:    30,
-      connect_timeout: 3,
-      request_timeout: 10,
-    }
-    }
 }
 
 /// details of an TCP listener, sent by the main process to the worker
