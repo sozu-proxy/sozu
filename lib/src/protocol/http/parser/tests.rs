@@ -8,6 +8,7 @@ use nom::HexDisplay;
 use crate::buffer_queue::{buf_with_capacity, OutputElement};
 #[cfg(test)]
 use crate::protocol::http::AddedRequestHeader;
+use sozu_command::config::DEFAULT_STICKY_NAME;
 
 use super::*;
 
@@ -113,7 +114,7 @@ fn parse_state_host_in_url_test() {
     println!("buffer input: {:?}", buf.input_queue);
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
@@ -161,7 +162,7 @@ fn parse_state_host_in_url_conflict_test() {
     println!("buffer input: {:?}", buf.input_queue);
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
@@ -204,7 +205,7 @@ fn parse_state_content_length_test() {
     println!("buffer input: {:?}", buf.input_queue);
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
@@ -269,7 +270,7 @@ fn parse_state_content_length_partial() {
     );
     println!("buffer output: {:?}", buf.output_queue);
 
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!(
         "unparsed data after parsing:\n{}",
         buf.unparsed_data().to_hex(16)
@@ -320,7 +321,7 @@ fn parse_state_chunked_test() {
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     assert_eq!(buf.start_parsing_position, 116);
     assert_eq!(
@@ -355,7 +356,7 @@ fn parse_state_duplicate_content_length_test() {
     let (_pool, mut buf) = buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     assert_eq!(buf.start_parsing_position, 128);
     assert_eq!(
@@ -392,7 +393,7 @@ fn parse_state_content_length_and_chunked_test() {
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     assert_eq!(buf.start_parsing_position, 136);
     assert_eq!(
@@ -425,7 +426,7 @@ fn parse_request_without_length() {
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer output: {:?}", buf.output_queue);
@@ -467,7 +468,7 @@ fn parse_request_http_1_0_connection_close() {
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     assert_eq!(buf.start_parsing_position, 40);
     assert_eq!(
@@ -500,7 +501,7 @@ fn parse_request_http_1_0_connection_keep_alive() {
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer output: {:?}", buf.output_queue);
@@ -543,7 +544,7 @@ fn parse_request_http_1_1_connection_keep_alive() {
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("end buf:\n{}", buf.buffer.data().to_hex(16));
     println!("result: {result:?}");
     assert_eq!(
@@ -585,7 +586,7 @@ fn parse_request_http_1_1_connection_close() {
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("end buf:\n{}", buf.buffer.data().to_hex(16));
     println!("result: {result:?}");
     assert_eq!(
@@ -640,7 +641,8 @@ fn parse_request_add_header_test() {
         closing: false,
     });
 
-    let result = parse_request_until_stop(initial, None, &mut buf, added.as_ref(), "SOZUBALANCEID");
+    let result =
+        parse_request_until_stop(initial, None, &mut buf, added.as_ref(), DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer output: {:?}", buf.output_queue);
@@ -707,7 +709,8 @@ fn parse_request_delete_forwarded_headers() {
         closing: false,
     });
 
-    let result = parse_request_until_stop(initial, None, &mut buf, added.as_ref(), "SOZUBALANCEID");
+    let result =
+        parse_request_until_stop(initial, None, &mut buf, added.as_ref(), DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer output: {:?}", buf.output_queue);
@@ -829,7 +832,7 @@ fn parse_requests_and_chunks_test() {
     buf.write(&input[..]).unwrap();
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     assert_eq!(buf.start_parsing_position, 160);
     assert_eq!(
@@ -871,7 +874,7 @@ fn parse_requests_and_chunks_partial_test() {
     buf.write(&input[..125]).unwrap();
     println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result({}): {:?}", line!(), result);
     assert_eq!(buf.start_parsing_position, 124);
     assert_eq!(
@@ -895,7 +898,7 @@ fn parse_requests_and_chunks_partial_test() {
     buf.write(&input[125..140]).unwrap();
     println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-    let result = parse_request_until_stop(result.0, result.1, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(result.0, result.1, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result({}): {:?}", line!(), result);
     assert_eq!(buf.start_parsing_position, 153);
     assert_eq!(
@@ -917,7 +920,7 @@ fn parse_requests_and_chunks_partial_test() {
 
     buf.write(&input[153..]).unwrap();
     println!("parsing\n{}", buf.buffer.data().to_hex(16));
-    let result = parse_request_until_stop(result.0, result.1, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(result.0, result.1, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result({}): {:?}", line!(), result);
     assert_eq!(buf.start_parsing_position, 160);
     assert_eq!(
@@ -964,7 +967,7 @@ fn parse_response_and_chunks_partial_test() {
         &mut buf,
         false,
         "",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -996,7 +999,7 @@ fn parse_response_and_chunks_partial_test() {
         &mut buf,
         false,
         "",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -1028,7 +1031,7 @@ fn parse_response_and_chunks_partial_test() {
         &mut buf,
         false,
         "",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -1059,7 +1062,7 @@ fn parse_response_and_chunks_partial_test() {
         &mut buf,
         false,
         "",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -1118,7 +1121,7 @@ fn parse_incomplete_chunk_header_test() {
         &mut buf,
         false,
         "",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -1156,7 +1159,7 @@ fn parse_incomplete_chunk_header_test() {
         &mut buf,
         false,
         "",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -1189,7 +1192,7 @@ fn parse_incomplete_chunk_header_test() {
         &mut buf,
         false,
         "",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -1218,7 +1221,7 @@ fn parse_incomplete_chunk_header_test() {
         &mut buf,
         false,
         "",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -1260,7 +1263,7 @@ fn parse_response_302() {
         &mut buf,
         false,
         "Sozu-Id: 123456789\r\n",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -1318,7 +1321,7 @@ fn parse_response_303() {
         &mut buf,
         false,
         "Sozu-Id: 123456789\r\n",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -1375,7 +1378,7 @@ fn parse_response_304() {
         &mut buf,
         is_head,
         "",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -1475,7 +1478,7 @@ fn parse_state_head_with_content_length_test() {
         &mut buf,
         is_head,
         "",
-        "SOZUBALANCEID",
+        DEFAULT_STICKY_NAME,
         None,
         None,
     );
@@ -1524,7 +1527,7 @@ fn parse_connection_upgrade_test() {
     println!("buffer input: {:?}", buf.input_queue);
 
     //let result = parse_request(initial, input);
-    let result = parse_request_until_stop(initial, None, &mut buf, None, "SOZUBALANCEID");
+    let result = parse_request_until_stop(initial, None, &mut buf, None, DEFAULT_STICKY_NAME);
     println!("result: {result:?}");
     println!("input length: {}", input.len());
     println!("buffer input: {:?}", buf.input_queue);
@@ -1598,12 +1601,21 @@ fn header_cookies_no_sticky() {
         _ => panic!(),
     };
 
-    let moves1 =
-        header1.remove_sticky_cookie_in_request(header_line1, header_line1.len(), "SOZUBALANCEID");
-    let moves2 =
-        header2.remove_sticky_cookie_in_request(header_line2, header_line2.len(), "SOZUBALANCEID");
-    let moves3 =
-        header3.remove_sticky_cookie_in_request(header_line3, header_line3.len(), "SOZUBALANCEID");
+    let moves1 = header1.remove_sticky_cookie_in_request(
+        header_line1,
+        header_line1.len(),
+        DEFAULT_STICKY_NAME,
+    );
+    let moves2 = header2.remove_sticky_cookie_in_request(
+        header_line2,
+        header_line2.len(),
+        DEFAULT_STICKY_NAME,
+    );
+    let moves3 = header3.remove_sticky_cookie_in_request(
+        header_line3,
+        header_line3.len(),
+        DEFAULT_STICKY_NAME,
+    );
     let expected1 = vec![BufferMove::Advance(header_line1.len())];
     let expected2 = vec![BufferMove::Advance(header_line2.len())];
     let expected3 = vec![BufferMove::Advance(header_line3.len())];
@@ -1628,10 +1640,16 @@ fn header_cookies_sticky_only_cookie() {
         _ => panic!(),
     };
 
-    let moves1 =
-        header1.remove_sticky_cookie_in_request(header_line1, header_line1.len(), "SOZUBALANCEID");
-    let moves2 =
-        header2.remove_sticky_cookie_in_request(header_line2, header_line2.len(), "SOZUBALANCEID");
+    let moves1 = header1.remove_sticky_cookie_in_request(
+        header_line1,
+        header_line1.len(),
+        DEFAULT_STICKY_NAME,
+    );
+    let moves2 = header2.remove_sticky_cookie_in_request(
+        header_line2,
+        header_line2.len(),
+        DEFAULT_STICKY_NAME,
+    );
     let expected1 = vec![BufferMove::Delete(header_line1.len())];
     let expected2 = vec![BufferMove::Delete(header_line2.len())];
 
@@ -1660,12 +1678,21 @@ fn header_cookies_sticky_start() {
         _ => panic!(),
     };
 
-    let moves1 =
-        header1.remove_sticky_cookie_in_request(header_line1, header_line1.len(), "SOZUBALANCEID");
-    let moves2 =
-        header2.remove_sticky_cookie_in_request(header_line2, header_line2.len(), "SOZUBALANCEID");
-    let moves3 =
-        header3.remove_sticky_cookie_in_request(header_line3, header_line3.len(), "SOZUBALANCEID");
+    let moves1 = header1.remove_sticky_cookie_in_request(
+        header_line1,
+        header_line1.len(),
+        DEFAULT_STICKY_NAME,
+    );
+    let moves2 = header2.remove_sticky_cookie_in_request(
+        header_line2,
+        header_line2.len(),
+        DEFAULT_STICKY_NAME,
+    );
+    let moves3 = header3.remove_sticky_cookie_in_request(
+        header_line3,
+        header_line3.len(),
+        DEFAULT_STICKY_NAME,
+    );
     let expected1 = vec![
         BufferMove::Advance(7),
         BufferMove::Delete(16),
@@ -1711,12 +1738,21 @@ fn header_cookies_sticky_middle() {
         _ => panic!(),
     };
 
-    let moves1 =
-        header1.remove_sticky_cookie_in_request(header_line1, header_line1.len(), "SOZUBALANCEID");
-    let moves2 =
-        header2.remove_sticky_cookie_in_request(header_line2, header_line2.len(), "SOZUBALANCEID");
-    let moves3 =
-        header3.remove_sticky_cookie_in_request(header_line3, header_line3.len(), "SOZUBALANCEID");
+    let moves1 = header1.remove_sticky_cookie_in_request(
+        header_line1,
+        header_line1.len(),
+        DEFAULT_STICKY_NAME,
+    );
+    let moves2 = header2.remove_sticky_cookie_in_request(
+        header_line2,
+        header_line2.len(),
+        DEFAULT_STICKY_NAME,
+    );
+    let moves3 = header3.remove_sticky_cookie_in_request(
+        header_line3,
+        header_line3.len(),
+        DEFAULT_STICKY_NAME,
+    );
     let expected1 = vec![
         BufferMove::Advance(8),
         BufferMove::Advance(9),
@@ -1771,14 +1807,26 @@ fn header_cookies_sticky_end() {
         _ => panic!(),
     };
 
-    let moves1 =
-        header1.remove_sticky_cookie_in_request(header_line1, header_line1.len(), "SOZUBALANCEID");
-    let moves2 =
-        header2.remove_sticky_cookie_in_request(header_line2, header_line2.len(), "SOZUBALANCEID");
-    let moves3 =
-        header3.remove_sticky_cookie_in_request(header_line3, header_line3.len(), "SOZUBALANCEID");
-    let moves4 =
-        header4.remove_sticky_cookie_in_request(header_line4, header_line4.len(), "SOZUBALANCEID");
+    let moves1 = header1.remove_sticky_cookie_in_request(
+        header_line1,
+        header_line1.len(),
+        DEFAULT_STICKY_NAME,
+    );
+    let moves2 = header2.remove_sticky_cookie_in_request(
+        header_line2,
+        header_line2.len(),
+        DEFAULT_STICKY_NAME,
+    );
+    let moves3 = header3.remove_sticky_cookie_in_request(
+        header_line3,
+        header_line3.len(),
+        DEFAULT_STICKY_NAME,
+    );
+    let moves4 = header4.remove_sticky_cookie_in_request(
+        header_line4,
+        header_line4.len(),
+        DEFAULT_STICKY_NAME,
+    );
     let expected1 = vec![
         BufferMove::Advance(8),
         BufferMove::Advance(7),

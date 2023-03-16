@@ -68,9 +68,9 @@ pub const DEFAULT_BACK_TIMEOUT: u32 = 30;
 pub const DEFAULT_CONNECT_TIMEOUT: u32 = 3;
 pub const DEFAULT_REQUEST_TIMEOUT: u32 = 10;
 
-// todo: refactor this with a builder pattern for cleanliness
-/// an HTTP, HTTPS or TCP listener as ordered by a client.
-/// This is used to parse the TOML config.
+pub const DEFAULT_STICKY_NAME: &str = "SOZUBALANCEID";
+
+/// An HTTP, HTTPS or TCP listener as parsed from the config
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerBuilder {
@@ -100,8 +100,8 @@ pub struct ListenerBuilder {
     pub request_timeout: Option<u32>,
 }
 
-fn default_sticky_name() -> String {
-    String::from("SOZUBALANCEID")
+pub fn default_sticky_name() -> String {
+    DEFAULT_STICKY_NAME.to_string()
 }
 
 impl ListenerBuilder {
@@ -138,7 +138,7 @@ impl ListenerBuilder {
         ListenerBuilder {
             address: address.to_string(),
             protocol: Some(protocol),
-            sticky_name: String::from("SOZUBALANCEID"),
+            sticky_name: DEFAULT_STICKY_NAME.to_string(),
             front_timeout: Some(DEFAULT_FRONT_TIMEOUT),
             back_timeout: Some(DEFAULT_BACK_TIMEOUT),
             connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
