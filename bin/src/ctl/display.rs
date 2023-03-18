@@ -395,7 +395,7 @@ pub fn print_query_response_data(
     json: bool,
 ) -> anyhow::Result<()> {
     if let Some(needle) = cluster_id.or(domain) {
-        if let Some(ResponseContent::Query(data)) = &data {
+        if let Some(ResponseContent::WorkerResponses(data)) = &data {
             if json {
                 return print_json_response(data);
             }
@@ -577,7 +577,7 @@ pub fn print_query_response_data(
 
             backend_table.printstd();
         }
-    } else if let Some(ResponseContent::Query(data)) = &data {
+    } else if let Some(ResponseContent::WorkerResponses(data)) = &data {
         let mut table = Table::new();
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         let mut header = vec![cell!("key")];

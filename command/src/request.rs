@@ -363,7 +363,8 @@ pub struct AddBackend {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MetricsConfiguration {
-    Enabled(bool),
+    Enabled,
+    Disabled,
     Clear,
 }
 

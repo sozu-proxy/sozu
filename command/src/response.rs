@@ -59,7 +59,8 @@ pub enum ResponseContent {
     /// aggregated metrics of main process and workers
     Metrics(AggregatedMetricsData),
     /// worker responses to a same query: worker_id -> query_answer
-    Query(BTreeMap<String, QueryAnswer>),
+    // TODO: repace with WorkerResponses(BtreeMap<String, ResponseContent>)
+    WorkerResponses(BTreeMap<String, QueryAnswer>),
     /// the state of Sōzu: frontends, backends, listeners, etc.
     State(Box<ConfigState>),
     /// a proxy event
@@ -70,6 +71,9 @@ pub enum ResponseContent {
     Status(Vec<WorkerInfo>),
     /// all listeners
     ListenersList(ListenersList),
+
+
+
 }
 
 /// details of an query answer, sent by a worker
@@ -423,14 +427,14 @@ struct StatePath {
 pub type MessageId = String;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProxyResponse {
+pub struct WorkerResponse {
     pub id: MessageId,
     pub status: ResponseStatus,
     pub message: String,
     pub content: Option<ProxyResponseContent>,
 }
 
-impl ProxyResponse {
+impl WorkerResponse {
     pub fn ok<T>(id: T) -> Self
     where
         T: ToString,
@@ -493,7 +497,7 @@ impl ProxyResponse {
     }
 }
 
-impl fmt::Display for ProxyResponse {
+impl fmt::Display for WorkerResponse {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}-{:?}", self.id, self.status)
     }

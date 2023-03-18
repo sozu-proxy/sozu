@@ -93,7 +93,7 @@ impl CommandManager {
                         Some(response_content) => match response_content {
                             ResponseContent::Workers(_)
                             | ResponseContent::Metrics(_)
-                            | ResponseContent::Query(_)
+                            | ResponseContent::WorkerResponses(_)
                             | ResponseContent::Event(_) => {}
                             ResponseContent::State(state) => match json {
                                 true => print_json_response(&state)?,
@@ -292,7 +292,7 @@ impl CommandManager {
                             Some(ResponseContent::Metrics(aggregated_metrics_data)) => {
                                 print_metrics(aggregated_metrics_data, json)?
                             }
-                            Some(ResponseContent::Query(lists_of_metrics)) => {
+                            Some(ResponseContent::WorkerResponses(lists_of_metrics)) => {
                                 print_available_metrics(&lists_of_metrics)?;
                             }
                             _ => println!("Wrong kind of response here"),
@@ -416,7 +416,7 @@ impl CommandManager {
                 }
                 ResponseStatus::Ok => {
                     match response.content {
-                        Some(ResponseContent::Query(data)) => print_certificates(data, json)?,
+                        Some(ResponseContent::WorkerResponses(data)) => print_certificates(data, json)?,
                         _ => bail!("unexpected response: {:?}", response.content),
                     }
                     break;

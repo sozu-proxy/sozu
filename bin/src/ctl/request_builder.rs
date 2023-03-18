@@ -74,8 +74,8 @@ impl CommandManager {
         println!("Configuring metrics: {cmd:?}");
 
         let configuration = match cmd {
-            MetricsCmd::Enable => MetricsConfiguration::Enabled(true),
-            MetricsCmd::Disable => MetricsConfiguration::Enabled(false),
+            MetricsCmd::Enable => MetricsConfiguration::Enabled,
+            MetricsCmd::Disable => MetricsConfiguration::Disabled,
             MetricsCmd::Clear => MetricsConfiguration::Clear,
             _ => bail!("The command passed to the configure_metrics function is wrong."),
         };

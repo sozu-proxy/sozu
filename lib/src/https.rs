@@ -55,8 +55,8 @@ use crate::{
             ReplaceCertificate, Request, WorkerRequest,
         },
         response::{
-            HttpFrontend, HttpsListenerConfig, ProxyResponse, ProxyResponseContent, QueryAnswer,
-            QueryAnswerCertificate, Route,
+            HttpFrontend, HttpsListenerConfig, ProxyResponseContent, QueryAnswer,
+            QueryAnswerCertificate, Route, WorkerResponse,
         },
         scm_socket::ScmSocket,
         state::ClusterId,
@@ -1266,7 +1266,7 @@ impl ProxyConfiguration for HttpsProxy {
         Ok(())
     }
 
-    fn notify(&mut self, request: WorkerRequest) -> ProxyResponse {
+    fn notify(&mut self, request: WorkerRequest) -> WorkerResponse {
         let request_id = request.id.clone();
 
         let content_result = match request.content {
@@ -1325,7 +1325,7 @@ impl ProxyConfiguration for HttpsProxy {
                 {
                     Ok(_) => {
                         info!("{} soft stop successful", request_id);
-                        return ProxyResponse::processing(request.id);
+                        return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -1338,7 +1338,7 @@ impl ProxyConfiguration for HttpsProxy {
                 {
                     Ok(_) => {
                         info!("{} hard stop successful", request_id);
-                        return ProxyResponse::processing(request.id);
+                        return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -1378,13 +1378,13 @@ impl ProxyConfiguration for HttpsProxy {
             Ok(content) => {
                 info!("{} successful", request_id);
                 match content {
-                    Some(content) => ProxyResponse::ok_with_content(request_id, content),
-                    None => ProxyResponse::ok(request_id),
+                    Some(content) => WorkerResponse::ok_with_content(request_id, content),
+                    None => WorkerResponse::ok(request_id),
                 }
             }
             Err(error_message) => {
                 error!("{} unsuccessful: {:#}", request_id, error_message);
-                ProxyResponse::error(request_id, format!("{error_message:#}"))
+                WorkerResponse::error(request_id, format!("{error_message:#}"))
             }
         }
     }

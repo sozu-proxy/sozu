@@ -1118,17 +1118,17 @@ impl CommandServer {
                 &Request::QueryClustersHashes | &Request::QueryClusters(_) => {
                     let main = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
                     query_answers.insert(String::from("main"), main);
-                    Success::Query(ResponseContent::Query(query_answers))
+                    Success::Query(ResponseContent::WorkerResponses(query_answers))
                 }
                 &Request::QueryCertificates(_) => {
                     info!("certificates query answer received: {:?}", query_answers);
-                    Success::Query(ResponseContent::Query(query_answers))
+                    Success::Query(ResponseContent::WorkerResponses(query_answers))
                 }
                 Request::QueryMetrics(options) => {
                     debug!("metrics query answer received: {:?}", query_answers);
 
                     if options.list {
-                        Success::Query(ResponseContent::Query(query_answers))
+                        Success::Query(ResponseContent::WorkerResponses(query_answers))
                     } else {
                         Success::Query(ResponseContent::Metrics(AggregatedMetricsData {
                             main: main_metrics,
