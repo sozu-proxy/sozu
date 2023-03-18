@@ -8,8 +8,7 @@ use prettytable::{Row, Table};
 
 use sozu_command_lib::response::{
     AggregatedMetricsData, ClusterMetricsData, FilteredData, ListedFrontends, ListenersList,
-    QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics, ResponseContent, Route, WorkerInfo,
-    WorkerMetrics,
+    QueryAnswerCertificate, QueryAnswerMetrics, ResponseContent, Route, WorkerInfo, WorkerMetrics,
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -208,20 +207,23 @@ pub fn print_metrics(
     print_proxy_metrics(&Some(aggregated_metrics.main));
 
     // workers
-    for (worker_id, query_answer_metrics) in aggregated_metrics.workers.iter() {
+    for (worker_id, worker_metrics) in aggregated_metrics.workers.iter() {
         println!("\nWorker {worker_id}\n=========");
-        print_worker_metrics(query_answer_metrics)?;
+        print_worker_metrics(worker_metrics)?;
     }
     Ok(())
 }
 
-fn print_worker_metrics(query_answer: &QueryAnswer) -> anyhow::Result<()> {
-    match query_answer {
-        QueryAnswer::Metrics(QueryAnswerMetrics::All(WorkerMetrics { proxy, clusters })) => {
+fn print_worker_metrics(worker_metrics: &ResponseContent) -> anyhow::Result<()> {
+    match worker_metrics {
+        ResponseContent::QueriedMetrics(QueryAnswerMetrics::All(WorkerMetrics {
+            proxy,
+            clusters,
+        })) => {
             print_proxy_metrics(proxy);
             print_cluster_metrics(clusters);
         }
-        QueryAnswer::Metrics(QueryAnswerMetrics::Error(error)) => {
+        ResponseContent::QueriedMetrics(QueryAnswerMetrics::Error(error)) => {
             println!("Error: {error}\nMaybe check your command.")
         }
         _ => bail!("The query answer is wrong."),
@@ -376,7 +378,7 @@ pub fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), anyho
 
 pub fn create_queried_cluster_table(
     headers: Vec<&str>,
-    data: &BTreeMap<String, QueryAnswer>,
+    data: &BTreeMap<String, ResponseContent>,
 ) -> Table {
     let mut table = Table::new();
     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
@@ -425,7 +427,7 @@ pub fn print_query_response_data(
 
             for (key, metrics) in data.iter() {
                 //let m: u8 = metrics;
-                if let QueryAnswer::Clusters(clusters) = metrics {
+                if let ResponseContent::Clusters(clusters) = metrics {
                     for cluster in clusters.iter() {
                         let entry = cluster_data.entry(cluster).or_insert(Vec::new());
                         entry.push(key.to_owned());
@@ -591,7 +593,7 @@ pub fn print_query_response_data(
 
         for metrics in data.values() {
             //let m: u8 = metrics;
-            if let QueryAnswer::ClustersHashes(clusters) = metrics {
+            if let ResponseContent::ClustersHashes(clusters) = metrics {
                 for (key, value) in clusters.iter() {
                     query_data.entry(key).or_insert(Vec::new()).push(value);
                 }
@@ -619,15 +621,18 @@ pub fn print_query_response_data(
     Ok(())
 }
 
-pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> anyhow::Result<()> {
+pub fn print_certificates(
+    response_contents: BTreeMap<String, ResponseContent>,
+    json: bool,
+) -> anyhow::Result<()> {
     if json {
-        print_json_response(&data)?;
+        print_json_response(&response_contents)?;
         return Ok(());
     }
 
     //println!("received: {:?}", data);
-    let it = data.iter().map(|(k, v)| match v {
-        QueryAnswer::Certificates(c) => (k, c),
+    let it = response_contents.iter().map(|(k, v)| match v {
+        ResponseContent::Certificates(c) => (k, c),
         v => {
             eprintln!("unexpected certificates query answer: {v:?}");
             exit(1);
@@ -684,12 +689,12 @@ fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
     .unwrap_or_default()
 }
 
-pub fn print_available_metrics(answers: &BTreeMap<String, QueryAnswer>) -> anyhow::Result<()> {
+pub fn print_available_metrics(answers: &BTreeMap<String, ResponseContent>) -> anyhow::Result<()> {
     let mut available_metrics: (HashSet<String>, HashSet<String>) =
         (HashSet::new(), HashSet::new());
-    for query_answer in answers.values() {
-        match query_answer {
-            QueryAnswer::Metrics(QueryAnswerMetrics::List((
+    for content in answers.values() {
+        match content {
+            ResponseContent::QueriedMetrics(QueryAnswerMetrics::List((
                 proxy_metric_keys,
                 cluster_metric_keys,
             ))) => {

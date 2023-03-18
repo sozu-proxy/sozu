@@ -22,9 +22,8 @@ use sozu_command::{
         QueryCertificateType, QueryClusterType, RemoveBackend, Request, WorkerRequest,
     },
     response::{
-        Event, HttpListenerConfig, HttpsListenerConfig, MessageId, QueryAnswer,
-        QueryAnswerCertificate, ResponseContent, ResponseStatus,
-        TcpListenerConfig as CommandTcpListener, WorkerResponse,
+        Event, HttpListenerConfig, HttpsListenerConfig, MessageId, QueryAnswerCertificate,
+        ResponseContent, ResponseStatus, TcpListenerConfig as CommandTcpListener, WorkerResponse,
     },
     scm_socket::{Listeners, ScmSocket},
     state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
@@ -882,16 +881,14 @@ impl Server {
             Request::QueryClustersHashes => {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ResponseContent::Query(QueryAnswer::ClustersHashes(
-                        self.config_state.hash_state(),
-                    )),
+                    ResponseContent::ClustersHashes(self.config_state.hash_state()),
                 ));
                 return;
             }
             Request::QueryClusters(query_type) => {
-                let query_answer = match query_type {
+                let content = match query_type {
                     QueryClusterType::ClusterId(cluster_id) => {
-                        QueryAnswer::Clusters(vec![self.config_state.cluster_state(cluster_id)])
+                        ResponseContent::Clusters(vec![self.config_state.cluster_state(cluster_id)])
                     }
                     QueryClusterType::Domain(domain) => {
                         let cluster_ids = get_cluster_ids_by_domain(
@@ -904,13 +901,10 @@ impl Server {
                             .map(|cluster_id| self.config_state.cluster_state(cluster_id))
                             .collect();
 
-                        QueryAnswer::Clusters(answer)
+                        ResponseContent::Clusters(answer)
                     }
                 };
-                push_queue(WorkerResponse::ok_with_content(
-                    message.id.clone(),
-                    ResponseContent::Query(query_answer),
-                ));
+                push_queue(WorkerResponse::ok_with_content(message.id.clone(), content));
                 return;
             }
             Request::QueryCertificates(q) => {
@@ -922,11 +916,8 @@ impl Server {
                     QueryCertificateType::Fingerprint(f) => {
                         push_queue(WorkerResponse::ok_with_content(
                             message.id.clone(),
-                            ResponseContent::Query(QueryAnswer::Certificates(
-                                QueryAnswerCertificate::Fingerprint(get_certificate(
-                                    &self.config_state,
-                                    f,
-                                )),
+                            ResponseContent::Certificates(QueryAnswerCertificate::Fingerprint(
+                                get_certificate(&self.config_state, f),
                             )),
                         ));
                         return;
@@ -939,7 +930,7 @@ impl Server {
 
                     push_queue(WorkerResponse::ok_with_content(
                         message.id.clone(),
-                        ResponseContent::Query(QueryAnswer::Metrics(data)),
+                        ResponseContent::QueriedMetrics(data),
                     ));
                 });
                 return;

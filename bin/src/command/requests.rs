@@ -19,8 +19,8 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     request::{FrontendFilters, MetricsConfiguration, QueryClusterType, Request, WorkerRequest},
     response::{
-        AggregatedMetricsData, ListedFrontends, ListenersList, QueryAnswer, Response,
-        ResponseContent, ResponseStatus, RunState, WorkerInfo,
+        AggregatedMetricsData, ListedFrontends, ListenersList, Response, ResponseContent,
+        ResponseStatus, RunState, WorkerInfo,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -1044,13 +1044,13 @@ impl CommandServer {
         )
         .await;
 
-        let mut main_query_answer = None;
+        let mut main_response_content = None;
         match &request {
             Request::QueryClustersHashes => {
-                main_query_answer = Some(QueryAnswer::ClustersHashes(self.state.hash_state()));
+                main_response_content = Some(ResponseContent::ClustersHashes(self.state.hash_state()));
             }
             Request::QueryClusters(query_type) => {
-                main_query_answer = Some(QueryAnswer::Clusters(match query_type {
+                main_response_content = Some(ResponseContent::Clusters(match query_type {
                     QueryClusterType::ClusterId(cluster_id) => {
                         vec![self.state.cluster_state(cluster_id)]
                     }
@@ -1103,11 +1103,11 @@ impl CommandServer {
                 }
             }
 
-            let mut query_answers: BTreeMap<String, QueryAnswer> = responses
+            let mut worker_responses: BTreeMap<String, ResponseContent> = responses
                 .into_iter()
                 .filter_map(|(worker_id, proxy_response)| {
-                    if let Some(ResponseContent::Query(d)) = proxy_response.content {
-                        Some((worker_id.to_string(), d))
+                    if let Some(response_content) = proxy_response.content {
+                        Some((worker_id.to_string(), response_content))
                     } else {
                         None
                     }
@@ -1116,23 +1116,23 @@ impl CommandServer {
 
             let success = match &request {
                 &Request::QueryClustersHashes | &Request::QueryClusters(_) => {
-                    let main = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
-                    query_answers.insert(String::from("main"), main);
-                    Success::Query(ResponseContent::WorkerResponses(query_answers))
+                    let main = main_response_content.unwrap(); // we should refactor to avoid this unwrap()
+                    worker_responses.insert(String::from("main"), main);
+                    Success::Query(ResponseContent::WorkerResponses(worker_responses))
                 }
                 &Request::QueryCertificates(_) => {
-                    info!("certificates query answer received: {:?}", query_answers);
-                    Success::Query(ResponseContent::WorkerResponses(query_answers))
+                    info!("certificates query answer received: {:?}", worker_responses);
+                    Success::Query(ResponseContent::WorkerResponses(worker_responses))
                 }
                 Request::QueryMetrics(options) => {
-                    debug!("metrics query answer received: {:?}", query_answers);
+                    debug!("metrics query answer received: {:?}", worker_responses);
 
                     if options.list {
-                        Success::Query(ResponseContent::WorkerResponses(query_answers))
+                        Success::Query(ResponseContent::WorkerResponses(worker_responses))
                     } else {
                         Success::Query(ResponseContent::Metrics(AggregatedMetricsData {
                             main: main_metrics,
-                            workers: query_answers,
+                            workers: worker_responses,
                         }))
                     }
                 }

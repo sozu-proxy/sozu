@@ -58,9 +58,8 @@ pub enum ResponseContent {
     Workers(Vec<WorkerInfo>),
     /// aggregated metrics of main process and workers
     Metrics(AggregatedMetricsData),
-    /// worker responses to a same query: worker_id -> query_answer
-    // TODO: repace with WorkerResponses(BtreeMap<String, ResponseContent>)
-    WorkerResponses(BTreeMap<String, QueryAnswer>),
+    /// worker responses to a same query: worker_id -> response_content
+    WorkerResponses(BTreeMap<String, ResponseContent>),
     /// the state of Sōzu: frontends, backends, listeners, etc.
     State(Box<ConfigState>),
     /// a proxy event
@@ -74,18 +73,11 @@ pub enum ResponseContent {
 
     /// contains proxy & cluster metrics
     WorkerMetrics(WorkerMetrics),
-    Query(QueryAnswer),
-}
-
-/// details of an query answer, sent by a worker
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum QueryAnswer {
     Clusters(Vec<QueryAnswerCluster>),
     /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
     Certificates(QueryAnswerCertificate),
-    Metrics(QueryAnswerMetrics),
+    QueriedMetrics(QueryAnswerMetrics),
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -519,7 +511,7 @@ pub enum ResponseContent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedMetricsData {
     pub main: BTreeMap<String, FilteredData>,
-    pub workers: BTreeMap<String, QueryAnswer>,
+    pub workers: BTreeMap<String, ResponseContent>,
 }
 
 /// All metrics of a worker: proxy and clusters
@@ -668,7 +660,7 @@ mod tests {
                 .collect(),
                 workers: [(
                     String::from("0"),
-                    QueryAnswer::Metrics(QueryAnswerMetrics::All(WorkerMetrics {
+                    ResponseContent::QueriedMetrics(QueryAnswerMetrics::All(WorkerMetrics {
                         proxy: Some(
                             [
                                 (String::from("sozu.gauge"), FilteredData::Gauge(1)),
