@@ -19,8 +19,8 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     request::{FrontendFilters, MetricsConfiguration, QueryClusterType, Request, WorkerRequest},
     response::{
-        AggregatedMetricsData, ListedFrontends, ListenersList, ProxyResponseContent, QueryAnswer,
-        Response, ResponseContent, ResponseStatus, RunState, WorkerInfo,
+        AggregatedMetricsData, ListedFrontends, ListenersList, QueryAnswer, Response,
+        ResponseContent, ResponseStatus, RunState, WorkerInfo,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -1106,7 +1106,7 @@ impl CommandServer {
             let mut query_answers: BTreeMap<String, QueryAnswer> = responses
                 .into_iter()
                 .filter_map(|(worker_id, proxy_response)| {
-                    if let Some(ProxyResponseContent::Query(d)) = proxy_response.content {
+                    if let Some(ResponseContent::Query(d)) = proxy_response.content {
                         Some((worker_id.to_string(), d))
                     } else {
                         None

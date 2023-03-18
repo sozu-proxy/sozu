@@ -94,6 +94,8 @@ impl CommandManager {
                             ResponseContent::Workers(_)
                             | ResponseContent::Metrics(_)
                             | ResponseContent::WorkerResponses(_)
+                            | ResponseContent::WorkerMetrics(_)
+                            | ResponseContent::Query(_)
                             | ResponseContent::Event(_) => {}
                             ResponseContent::State(state) => match json {
                                 true => print_json_response(&state)?,
@@ -416,7 +418,9 @@ impl CommandManager {
                 }
                 ResponseStatus::Ok => {
                     match response.content {
-                        Some(ResponseContent::WorkerResponses(data)) => print_certificates(data, json)?,
+                        Some(ResponseContent::WorkerResponses(data)) => {
+                            print_certificates(data, json)?
+                        }
                         _ => bail!("unexpected response: {:?}", response.content),
                     }
                     break;

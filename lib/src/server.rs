@@ -22,8 +22,8 @@ use sozu_command::{
         QueryCertificateType, QueryClusterType, RemoveBackend, Request, WorkerRequest,
     },
     response::{
-        Event, HttpListenerConfig, HttpsListenerConfig, MessageId, ProxyResponseContent,
-        QueryAnswer, QueryAnswerCertificate, ResponseStatus,
+        Event, HttpListenerConfig, HttpsListenerConfig, MessageId, QueryAnswer,
+        QueryAnswerCertificate, ResponseContent, ResponseStatus,
         TcpListenerConfig as CommandTcpListener, WorkerResponse,
     },
     scm_socket::{Listeners, ScmSocket},
@@ -62,7 +62,7 @@ pub fn push_event(event: Event) {
             id: "EVENT".to_string(),
             message: String::new(),
             status: ResponseStatus::Processing,
-            content: Some(ProxyResponseContent::Event(event)),
+            content: Some(ResponseContent::Event(event)),
         });
     });
 }
@@ -882,7 +882,7 @@ impl Server {
             Request::QueryClustersHashes => {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ProxyResponseContent::Query(QueryAnswer::ClustersHashes(
+                    ResponseContent::Query(QueryAnswer::ClustersHashes(
                         self.config_state.hash_state(),
                     )),
                 ));
@@ -909,7 +909,7 @@ impl Server {
                 };
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ProxyResponseContent::Query(query_answer),
+                    ResponseContent::Query(query_answer),
                 ));
                 return;
             }
@@ -922,7 +922,7 @@ impl Server {
                     QueryCertificateType::Fingerprint(f) => {
                         push_queue(WorkerResponse::ok_with_content(
                             message.id.clone(),
-                            ProxyResponseContent::Query(QueryAnswer::Certificates(
+                            ResponseContent::Query(QueryAnswer::Certificates(
                                 QueryAnswerCertificate::Fingerprint(get_certificate(
                                     &self.config_state,
                                     f,
@@ -939,7 +939,7 @@ impl Server {
 
                     push_queue(WorkerResponse::ok_with_content(
                         message.id.clone(),
-                        ProxyResponseContent::Query(QueryAnswer::Metrics(data)),
+                        ResponseContent::Query(QueryAnswer::Metrics(data)),
                     ));
                 });
                 return;

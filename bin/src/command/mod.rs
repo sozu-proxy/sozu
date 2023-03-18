@@ -26,9 +26,7 @@ use serde::{Deserialize, Serialize};
 use sozu_command_lib::{
     config::Config,
     request::{MetricsConfiguration, Request, WorkerRequest},
-    response::{
-        ProxyResponseContent, Response, ResponseContent, ResponseStatus, RunState, WorkerResponse,
-    },
+    response::{Response, ResponseContent, ResponseStatus, RunState, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
@@ -709,7 +707,7 @@ impl CommandServer {
         response: WorkerResponse,
     ) -> anyhow::Result<Success> {
         // Notify the client with Processing in case of a proxy event
-        if let Some(ProxyResponseContent::Event(event)) = response.content {
+        if let Some(ResponseContent::Event(event)) = response.content {
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = Response::new(

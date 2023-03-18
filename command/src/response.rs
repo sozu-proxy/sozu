@@ -72,8 +72,9 @@ pub enum ResponseContent {
     /// all listeners
     ListenersList(ListenersList),
 
-
-
+    /// contains proxy & cluster metrics
+    WorkerMetrics(WorkerMetrics),
+    Query(QueryAnswer),
 }
 
 /// details of an query answer, sent by a worker
@@ -431,7 +432,7 @@ pub struct WorkerResponse {
     pub id: MessageId,
     pub status: ResponseStatus,
     pub message: String,
-    pub content: Option<ProxyResponseContent>,
+    pub content: Option<ResponseContent>,
 }
 
 impl WorkerResponse {
@@ -447,7 +448,7 @@ impl WorkerResponse {
         }
     }
 
-    pub fn ok_with_content<T>(id: T, content: ProxyResponseContent) -> Self
+    pub fn ok_with_content<T>(id: T, content: ResponseContent) -> Self
     where
         T: ToString,
     {
@@ -503,14 +504,16 @@ impl fmt::Display for WorkerResponse {
     }
 }
 
+/*
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ProxyResponseContent {
+pub enum ResponseContent {
     /// contains proxy & cluster metrics
     Metrics(WorkerMetrics),
     Query(QueryAnswer),
     Event(Event),
 }
+*/
 
 /// Aggregated metrics of main process & workers, for the CLI
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
