@@ -566,7 +566,15 @@ pub struct ClusterMetrics {
     /// metric name -> metric value
     pub cluster: Option<BTreeMap<String, FilteredMetrics>>,
     /// backend_id -> (metric name-> metric value)
-    pub backends: Option<BTreeMap<String, BTreeMap<String, FilteredMetrics>>>,
+    pub backends: Option<Vec<BackendMetrics>>,
+}
+
+/// the metrics of a given backend
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendMetrics {
+    pub backend_id: String,
+    /// metric name -> metric value
+    pub metrics: BTreeMap<String, FilteredMetrics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -609,13 +617,6 @@ pub struct Percentiles {
     pub p_99_99: u64,
     pub p_99_999: u64,
     pub p_100: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackendMetricsData {
-    pub bytes_in: usize,
-    pub bytes_out: usize,
-    pub percentiles: Percentiles,
 }
 
 fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
@@ -729,40 +730,32 @@ mod tests {
                                         .cloned()
                                         .collect()
                                     ),
-                                    backends: Some(
-                                        [(
-                                            String::from("cluster_1-0"),
-                                            [
-                                                (
-                                                    String::from("bytes_in"),
-                                                    FilteredMetrics::Count(256)
-                                                ),
-                                                (
-                                                    String::from("bytes_out"),
-                                                    FilteredMetrics::Count(128)
-                                                ),
-                                                (
-                                                    String::from("percentiles"),
-                                                    FilteredMetrics::Percentiles(Percentiles {
-                                                        samples: 42,
-                                                        p_50: 1,
-                                                        p_90: 2,
-                                                        p_99: 10,
-                                                        p_99_9: 12,
-                                                        p_99_99: 20,
-                                                        p_99_999: 22,
-                                                        p_100: 30,
-                                                    })
-                                                )
-                                            ]
-                                            .iter()
-                                            .cloned()
-                                            .collect()
-                                        )]
+                                    backends: Some(vec![BackendMetrics {
+                                        backend_id: String::from("cluster_1-0"),
+                                        metrics: [
+                                            (String::from("bytes_in"), FilteredMetrics::Count(256)),
+                                            (
+                                                String::from("bytes_out"),
+                                                FilteredMetrics::Count(128)
+                                            ),
+                                            (
+                                                String::from("percentiles"),
+                                                FilteredMetrics::Percentiles(Percentiles {
+                                                    samples: 42,
+                                                    p_50: 1,
+                                                    p_90: 2,
+                                                    p_99: 10,
+                                                    p_99_9: 12,
+                                                    p_99_99: 20,
+                                                    p_99_999: 22,
+                                                    p_100: 30,
+                                                })
+                                            )
+                                        ]
                                         .iter()
                                         .cloned()
                                         .collect()
-                                    ),
+                                    }]),
                                 }
                             )]
                             .iter()

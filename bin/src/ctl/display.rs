@@ -252,9 +252,9 @@ fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetric
             }
 
             if let Some(backends) = &cluster_metrics_data.backends {
-                for (backend_id, backend_metrics) in backends.iter() {
-                    println!("\n{cluster_id}/{backend_id}\n--------");
-                    let filtered = filter_metrics(backend_metrics);
+                for backend_metrics in backends.iter() {
+                    println!("\n{cluster_id}/{}\n--------", backend_metrics.backend_id);
+                    let filtered = filter_metrics(&backend_metrics.metrics);
                     print_gauges_and_counts(&filtered);
                     print_percentiles(&filtered);
                 }
