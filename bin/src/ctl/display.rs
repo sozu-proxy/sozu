@@ -7,7 +7,7 @@ use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::response::{
-    AggregatedMetricsData, ClusterMetricsData, FilteredData, ListedFrontends, ListenersList,
+    AggregatedMetrics, ClusterMetricsData, FilteredData, ListedFrontends, ListenersList,
     QueryAnswerCertificate, QueryAnswerMetrics, ResponseContent, Route, WorkerInfo, WorkerMetrics,
 };
 
@@ -193,7 +193,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
 
 pub fn print_metrics(
     // main & worker metrics
-    aggregated_metrics: AggregatedMetricsData,
+    aggregated_metrics: AggregatedMetrics,
     json: bool,
 ) -> anyhow::Result<()> {
     if json {

@@ -57,7 +57,7 @@ pub enum ResponseContent {
     /// a list of workers, with ids, pids, statuses
     Workers(Vec<WorkerInfo>),
     /// aggregated metrics of main process and workers
-    Metrics(AggregatedMetricsData),
+    Metrics(AggregatedMetrics),
     /// worker responses to a same query: worker_id -> response_content
     WorkerResponses(BTreeMap<String, ResponseContent>),
     /// the state of Sōzu: frontends, backends, listeners, etc.
@@ -545,7 +545,7 @@ impl fmt::Display for WorkerResponse {
 
 /// Aggregated metrics of main process & workers, for the CLI
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AggregatedMetricsData {
+pub struct AggregatedMetrics {
     pub main: BTreeMap<String, FilteredData>,
     pub workers: BTreeMap<String, ResponseContent>,
 }
@@ -685,7 +685,7 @@ mod tests {
             version: 0,
             status: ResponseStatus::Ok,
             message: String::from(""),
-            content: Some(ResponseContent::Metrics(AggregatedMetricsData {
+            content: Some(ResponseContent::Metrics(AggregatedMetrics {
                 main: [
                     (String::from("sozu.gauge"), FilteredData::Gauge(1)),
                     (String::from("sozu.count"), FilteredData::Count(-2)),

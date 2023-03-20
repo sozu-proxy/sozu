@@ -19,7 +19,7 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     request::{FrontendFilters, MetricsConfiguration, QueryClusterType, Request, WorkerRequest},
     response::{
-        AggregatedMetricsData, ListedFrontends, ListenersList, Response, ResponseContent,
+        AggregatedMetrics, ListedFrontends, ListenersList, Response, ResponseContent,
         ResponseStatus, RunState, WorkerInfo,
     },
     scm_socket::Listeners,
@@ -1047,7 +1047,8 @@ impl CommandServer {
         let mut main_response_content = None;
         match &request {
             Request::QueryClustersHashes => {
-                main_response_content = Some(ResponseContent::ClustersHashes(self.state.hash_state()));
+                main_response_content =
+                    Some(ResponseContent::ClustersHashes(self.state.hash_state()));
             }
             Request::QueryClusters(query_type) => {
                 main_response_content = Some(ResponseContent::Clusters(match query_type {
@@ -1130,7 +1131,7 @@ impl CommandServer {
                     if options.list {
                         Success::Query(ResponseContent::WorkerResponses(worker_responses))
                     } else {
-                        Success::Query(ResponseContent::Metrics(AggregatedMetricsData {
+                        Success::Query(ResponseContent::Metrics(AggregatedMetrics {
                             main: main_metrics,
                             workers: worker_responses,
                         }))
