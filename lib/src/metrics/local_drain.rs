@@ -6,7 +6,7 @@ use hdrhistogram::Histogram;
 
 use crate::sozu_command::{
     request::{MetricsConfiguration, QueryMetricsOptions},
-    response::{ClusterMetricsData, FilteredData, Percentiles, QueryAnswerMetrics, WorkerMetrics},
+    response::{ClusterMetrics, FilteredData, Percentiles, QueryAnswerMetrics, WorkerMetrics},
 };
 
 use super::{MetricData, Subscriber};
@@ -246,7 +246,7 @@ impl LocalDrain {
     pub fn dump_cluster_metrics(
         &mut self,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<BTreeMap<String, ClusterMetricsData>> {
+    ) -> anyhow::Result<BTreeMap<String, ClusterMetrics>> {
         let mut cluster_data = BTreeMap::new();
 
         for cluster_id in self.get_cluster_ids() {
@@ -265,7 +265,7 @@ impl LocalDrain {
         &self,
         cluster_id: &str,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<ClusterMetricsData> {
+    ) -> anyhow::Result<ClusterMetrics> {
         let raw_metrics = self
             .cluster_metrics
             .get(cluster_id)
@@ -292,7 +292,7 @@ impl LocalDrain {
                 ))?;
             backends.insert(backend_id.to_owned(), backend_metrics);
         }
-        Ok(ClusterMetricsData {
+        Ok(ClusterMetrics {
             cluster: Some(cluster),
             backends: Some(backends),
         })
@@ -329,7 +329,7 @@ impl LocalDrain {
         metric_names: &Vec<String>,
     ) -> anyhow::Result<WorkerMetrics> {
         debug!("Querying cluster with ids: {:?}", cluster_ids);
-        let mut clusters: BTreeMap<String, ClusterMetricsData> = BTreeMap::new();
+        let mut clusters: BTreeMap<String, ClusterMetrics> = BTreeMap::new();
 
         for cluster_id in cluster_ids {
             clusters.insert(
@@ -350,7 +350,7 @@ impl LocalDrain {
         backend_ids: &Vec<String>,
         metric_names: &Vec<String>,
     ) -> anyhow::Result<WorkerMetrics> {
-        let mut clusters: BTreeMap<String, ClusterMetricsData> = BTreeMap::new();
+        let mut clusters: BTreeMap<String, ClusterMetrics> = BTreeMap::new();
 
         for backend_id in backend_ids {
             let cluster_id = self
@@ -367,7 +367,7 @@ impl LocalDrain {
 
             clusters.insert(
                 cluster_id,
-                ClusterMetricsData {
+                ClusterMetrics {
                     cluster: None,
                     backends: Some(backend_map),
                 },

@@ -7,7 +7,7 @@ use anyhow::{self, bail, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::response::{
-    AggregatedMetrics, ClusterMetricsData, FilteredData, ListedFrontends, ListenersList,
+    AggregatedMetrics, ClusterMetrics, FilteredData, ListedFrontends, ListenersList,
     QueryAnswerCertificate, QueryAnswerMetrics, ResponseContent, Route, WorkerInfo, WorkerMetrics,
 };
 
@@ -240,7 +240,7 @@ fn print_proxy_metrics(proxy_metrics: &Option<BTreeMap<String, FilteredData>>) {
     }
 }
 
-fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetricsData>>) {
+fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetrics>>) {
     if let Some(cluster_metrics) = cluster_metrics {
         for (cluster_id, cluster_metrics_data) in cluster_metrics.iter() {
             println!("\nCluster {cluster_id}\n--------");
