@@ -21,7 +21,7 @@ use crate::{
         RequestHttpFrontend, RequestTcpFrontend,
     },
     response::{
-        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule,
+        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, PathRuleKind,
         QueryAnswerCluster, Route, TcpFrontend, TcpListenerConfig,
     },
 };
@@ -1068,28 +1068,28 @@ impl ConfigState {
     }
 }
 
+fn domain_check(
+    front_hostname: &str,
+    front_path_rule: &PathRule,
+    hostname: &str,
+    path_prefix: &Option<String>,
+) -> bool {
+    if hostname != front_hostname {
+        return false;
+    }
+
+    if let Some(ref path) = &path_prefix {
+        return path == &front_path_rule.value;
+    }
+
+    true
+}
+
 pub fn get_cluster_ids_by_domain(
     state: &ConfigState,
     hostname: String,
     path: Option<String>,
 ) -> HashSet<ClusterId> {
-    let domain_check = |front_hostname: &str,
-                        front_path: &PathRule,
-                        hostname: &str,
-                        path_prefix: &Option<String>|
-     -> bool {
-        if hostname != front_hostname {
-            return false;
-        }
-
-        match (&path_prefix, front_path) {
-            (None, _) => true,
-            (Some(ref path), PathRule::Prefix(s)) => path == s,
-            (Some(ref path), PathRule::Regex(s)) => path == s,
-            (Some(ref path), PathRule::Equals(s)) => path == s,
-        }
-    };
-
     let mut cluster_ids: HashSet<ClusterId> = HashSet::new();
 
     state.http_fronts.values().for_each(|front| {
@@ -1217,7 +1217,7 @@ mod tests {
             .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
-                path: PathRule::Prefix(String::from("/")),
+                path: PathRule::prefix(String::from("/")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree,
@@ -1228,7 +1228,7 @@ mod tests {
             .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
-                path: PathRule::Prefix(String::from("/abc")),
+                path: PathRule::prefix(String::from("/abc")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Pre,
@@ -1301,7 +1301,7 @@ mod tests {
             .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
-                path: PathRule::Prefix(String::from("/")),
+                path: PathRule::prefix(String::from("/")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Post,
@@ -1312,7 +1312,7 @@ mod tests {
             .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
-                path: PathRule::Prefix(String::from("/abc")),
+                path: PathRule::prefix(String::from("/abc")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree,
@@ -1366,7 +1366,7 @@ mod tests {
             .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
-                path: PathRule::Prefix(String::from("/")),
+                path: PathRule::prefix(String::from("/")),
                 address: "0.0.0.0:8080".to_string(),
                 method: None,
                 position: RulePosition::Post,
@@ -1419,7 +1419,7 @@ mod tests {
             Request::RemoveHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("cluster_2")),
                 hostname: String::from("test.local"),
-                path: PathRule::Prefix(String::from("/abc")),
+                path: PathRule::prefix(String::from("/abc")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree,
@@ -1485,7 +1485,7 @@ mod tests {
         let http_front_cluster1 = RequestHttpFrontend {
             route: Route::ClusterId(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
-            path: PathRule::Prefix(String::from("")),
+            path: PathRule::prefix(String::from("")),
             method: None,
             address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
@@ -1495,7 +1495,7 @@ mod tests {
         let https_front_cluster1 = RequestHttpFrontend {
             route: Route::ClusterId(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
-            path: PathRule::Prefix(String::from("")),
+            path: PathRule::prefix(String::from("")),
             method: None,
             address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
@@ -1505,7 +1505,7 @@ mod tests {
         let http_front_cluster2 = RequestHttpFrontend {
             route: Route::ClusterId(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
-            path: PathRule::Prefix(String::from("/api")),
+            path: PathRule::prefix(String::from("/api")),
             method: None,
             address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
@@ -1515,7 +1515,7 @@ mod tests {
         let https_front_cluster2 = RequestHttpFrontend {
             route: Route::ClusterId(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
-            path: PathRule::Prefix(String::from("/api")),
+            path: PathRule::prefix(String::from("/api")),
             method: None,
             address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
@@ -1820,10 +1820,19 @@ impl serde::Serialize for RouteKey {
     where
         S: serde::Serializer,
     {
-        let mut s = match &self.path_rule {
-            PathRule::Prefix(prefix) => format!("{};{};P{}", self.address, self.hostname, prefix),
-            PathRule::Regex(regex) => format!("{};{};R{}", self.address, self.hostname, regex),
-            PathRule::Equals(path) => format!("{};{};={}", self.address, self.hostname, path),
+        let mut s = match &self.path_rule.kind {
+            PathRuleKind::Prefix => format!(
+                "{};{};P{}",
+                self.address, self.hostname, self.path_rule.value
+            ),
+            PathRuleKind::Regex => format!(
+                "{};{};R{}",
+                self.address, self.hostname, self.path_rule.value
+            ),
+            PathRuleKind::Equals => format!(
+                "{};{};={}",
+                self.address, self.hostname, self.path_rule.value
+            ),
         };
 
         if let Some(method) = &self.method {
@@ -1884,9 +1893,9 @@ impl<'de> Visitor<'de> for RouteKeyVisitor {
             .ok_or_else(|| E::custom("invalid format".to_string()))?;
 
         let path_rule = match path_rule_str.chars().next() {
-            Some('R') => PathRule::Regex(String::from(&path_rule_str[1..])),
-            Some('P') => PathRule::Prefix(String::from(&path_rule_str[1..])),
-            Some('=') => PathRule::Equals(String::from(&path_rule_str[1..])),
+            Some('R') => PathRule::regex(String::from(&path_rule_str[1..])),
+            Some('P') => PathRule::prefix(String::from(&path_rule_str[1..])),
+            Some('=') => PathRule::equals(String::from(&path_rule_str[1..])),
             _ => return Err(E::custom("invalid path rule".to_string())),
         };
 

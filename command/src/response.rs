@@ -175,26 +175,74 @@ impl Default for RulePosition {
 
 /// A filter for the path of incoming requests
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+// #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct PathRule {
+    /// Either Prefix, Regex or Equals
+    pub kind: PathRuleKind,
+    pub value: String,
+}
+
+/// The kind of filter used for path rules
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PathRule {
+pub enum PathRuleKind {
     /// filters paths that start with a pattern, typically "/api"
-    Prefix(String),
+    Prefix,
     /// filters paths that match a regex pattern
-    Regex(String),
+    Regex,
     /// filters paths that exactly match a pattern, no more, no less
-    Equals(String),
+    Equals,
 }
 
 impl PathRule {
+    pub fn prefix<S>(value: S) -> Self
+    where
+        S: ToString,
+    {
+        Self {
+            kind: PathRuleKind::Prefix,
+            value: value.to_string(),
+        }
+    }
+
+    pub fn regex<S>(value: S) -> Self
+    where
+        S: ToString,
+    {
+        Self {
+            kind: PathRuleKind::Regex,
+            value: value.to_string(),
+        }
+    }
+
+    pub fn equals<S>(value: S) -> Self
+    where
+        S: ToString,
+    {
+        Self {
+            kind: PathRuleKind::Equals,
+            value: value.to_string(),
+        }
+    }
+
     pub fn from_cli_options(
         path_prefix: Option<String>,
         path_regex: Option<String>,
         path_equals: Option<String>,
     ) -> Self {
         match (path_prefix, path_regex, path_equals) {
-            (Some(prefix), _, _) => PathRule::Prefix(prefix),
-            (None, Some(regex), _) => PathRule::Regex(regex),
-            (None, None, Some(equals)) => PathRule::Equals(equals),
+            (Some(prefix), _, _) => PathRule {
+                kind: PathRuleKind::Prefix,
+                value: prefix,
+            },
+            (None, Some(regex), _) => PathRule {
+                kind: PathRuleKind::Regex,
+                value: regex,
+            },
+            (None, None, Some(equals)) => PathRule {
+                kind: PathRuleKind::Equals,
+                value: equals,
+            },
             _ => PathRule::default(),
         }
     }
@@ -202,24 +250,23 @@ impl PathRule {
 
 impl Default for PathRule {
     fn default() -> Self {
-        PathRule::Prefix(String::new())
+        PathRule {
+            kind: PathRuleKind::Prefix,
+            value: String::new(),
+        }
     }
 }
 
 pub fn is_default_path_rule(p: &PathRule) -> bool {
-    match p {
-        PathRule::Regex(_) => false,
-        PathRule::Equals(_) => false,
-        PathRule::Prefix(s) => s.is_empty(),
-    }
+    p.kind == PathRuleKind::Prefix && p.value.is_empty()
 }
 
 impl std::fmt::Display for PathRule {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            PathRule::Prefix(s) => write!(f, "prefix '{s}'"),
-            PathRule::Regex(r) => write!(f, "regexp '{}'", r.as_str()),
-            PathRule::Equals(s) => write!(f, "equals '{s}'"),
+        match self.kind {
+            PathRuleKind::Prefix => write!(f, "prefix '{}'", self.value),
+            PathRuleKind::Regex => write!(f, "regexp '{}'", self.value),
+            PathRuleKind::Equals => write!(f, "equals '{}'", self.value),
         }
     }
 }
@@ -495,17 +542,6 @@ impl fmt::Display for WorkerResponse {
         write!(f, "{}-{:?}", self.id, self.status)
     }
 }
-
-/*
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ResponseContent {
-    /// contains proxy & cluster metrics
-    Metrics(WorkerMetrics),
-    Query(QueryAnswer),
-    Event(Event),
-}
-*/
 
 /// Aggregated metrics of main process & workers, for the CLI
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

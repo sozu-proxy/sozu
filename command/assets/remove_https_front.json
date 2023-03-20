@@ -7,7 +7,8 @@
     "address": "0.0.0.0:8443",
     "hostname": "yyy",
     "path": {
-      "PREFIX": "xxx"
+      "kind": "PREFIX",
+      "value": "xxx"
     },
     "position": "TREE",
     "tags": {

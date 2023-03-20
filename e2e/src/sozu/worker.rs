@@ -296,7 +296,7 @@ impl Worker {
             route: Route::ClusterId(cluster_id.into()),
             address: address.to_string(),
             hostname: String::from("localhost"),
-            path: PathRule::Prefix(String::from("/")),
+            path: PathRule::prefix(String::from("/")),
             method: None,
             position: RulePosition::Tree,
             tags: None,

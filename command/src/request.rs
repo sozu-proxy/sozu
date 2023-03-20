@@ -472,7 +472,7 @@ mod tests {
 
     #[test]
     fn config_message_test() {
-        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "ADD_HTTP_FRONTEND", "content":{"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}}"#;
+        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "ADD_HTTP_FRONTEND", "content":{"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"kind": "PREFIX", "value": "xxx"}, "address": "0.0.0.0:8080"}}"#;
         let message: Request = serde_json::from_str(raw_json).unwrap();
         println!("{message:?}");
         assert_eq!(
@@ -480,7 +480,7 @@ mod tests {
             Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("xxx")),
                 hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
+                path: PathRule::prefix(String::from("xxx")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree,
@@ -534,7 +534,7 @@ mod tests {
         Request::AddHttpFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
-            path: PathRule::Prefix(String::from("xxx")),
+            path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
@@ -548,7 +548,7 @@ mod tests {
         Request::RemoveHttpFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
-            path: PathRule::Prefix(String::from("xxx")),
+            path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
@@ -568,7 +568,7 @@ mod tests {
         Request::AddHttpsFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
-            path: PathRule::Prefix(String::from("xxx")),
+            path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
@@ -582,7 +582,7 @@ mod tests {
         Request::RemoveHttpsFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
-            path: PathRule::Prefix(String::from("xxx")),
+            path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn add_front_test() {
-        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": { "CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": { "CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"kind": "PREFIX", "value": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
         let command: Request = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
@@ -705,7 +705,7 @@ mod tests {
                 == Request::AddHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
+                    path: PathRule::prefix(String::from("xxx")),
                     method: None,
                     address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
@@ -716,7 +716,7 @@ mod tests {
 
     #[test]
     fn remove_front_test() {
-        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"kind": "PREFIX", "value": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: Request = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
@@ -724,7 +724,7 @@ mod tests {
                 == Request::RemoveHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
+                    path: PathRule::prefix(String::from("xxx")),
                     method: None,
                     address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
@@ -771,7 +771,7 @@ mod tests {
 
     #[test]
     fn http_front_crash_test() {
-        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"kind": "PREFIX", "value": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: Request = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
@@ -779,7 +779,7 @@ mod tests {
                 == Request::AddHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
-                    path: PathRule::Prefix(String::from("")),
+                    path: PathRule::prefix(String::from("")),
                     method: None,
                     address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn http_front_crash_test2() {
-        let raw_json = r#"{"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242" }"#;
+        let raw_json = r#"{"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"kind": "PREFIX", "value": ""}, "address": "127.0.0.1:4242" }"#;
         let front: HttpFrontend = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{front:?}");
         assert!(
@@ -801,7 +801,7 @@ mod tests {
                 == HttpFrontend {
                     route: Route::ClusterId(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
-                    path: PathRule::Prefix(String::from("")),
+                    path: PathRule::prefix(String::from("")),
                     method: None,
                     address: "127.0.0.1:4242".parse().unwrap(),
                     position: RulePosition::Tree,
