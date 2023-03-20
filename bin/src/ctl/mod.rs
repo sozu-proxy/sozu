@@ -1,4 +1,5 @@
 mod command;
+/// TODO: just create a display() method on sozu_command_lib::Response and put everything in there
 mod display;
 mod request_builder;
 
@@ -106,14 +107,22 @@ impl CommandManager {
                     key,
                     address,
                     tls_versions,
-                } => self.add_certificate(address, &certificate, &chain, &key, tls_versions),
+                } => self.add_certificate(
+                    address.to_string(),
+                    &certificate,
+                    &chain,
+                    &key,
+                    tls_versions,
+                ),
                 CertificateCmd::Remove {
                     certificate,
                     address,
                     fingerprint,
-                } => {
-                    self.remove_certificate(address, certificate.as_deref(), fingerprint.as_deref())
-                }
+                } => self.remove_certificate(
+                    address.to_string(),
+                    certificate.as_deref(),
+                    fingerprint.as_deref(),
+                ),
                 CertificateCmd::Replace {
                     certificate,
                     chain,
@@ -123,7 +132,7 @@ impl CommandManager {
                     old_fingerprint,
                     tls_versions,
                 } => self.replace_certificate(
-                    address,
+                    address.to_string(),
                     &certificate,
                     &chain,
                     &key,

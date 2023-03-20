@@ -120,7 +120,7 @@ impl CommandManager {
                 backup,
             } => self.order_request(Request::AddBackend(AddBackend {
                 cluster_id: id,
-                address,
+                address: address.to_string(),
                 backend_id,
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id,
@@ -132,7 +132,7 @@ impl CommandManager {
                 address,
             } => self.order_request(Request::RemoveBackend(RemoveBackend {
                 cluster_id: id,
-                address,
+                address: address.to_string(),
                 backend_id,
             })),
         }
@@ -175,14 +175,14 @@ impl CommandManager {
             TcpFrontendCmd::Add { id, address, tags } => {
                 self.order_request(Request::AddTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
-                    address,
+                    address: address.to_string(),
                     tags,
                 }))
             }
             TcpFrontendCmd::Remove { id, address } => {
                 self.order_request(Request::RemoveTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
-                    address,
+                    address: address.to_string(),
                     tags: None,
                 }))
             }
@@ -202,7 +202,7 @@ impl CommandManager {
                 tags,
             } => self.order_request(Request::AddHttpFrontend(RequestHttpFrontend {
                 route: route.into(),
-                address,
+                address: address.to_string(),
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
@@ -220,7 +220,7 @@ impl CommandManager {
                 route,
             } => self.order_request(Request::RemoveHttpFrontend(RequestHttpFrontend {
                 route: route.into(),
-                address,
+                address: address.to_string(),
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
@@ -243,7 +243,7 @@ impl CommandManager {
                 tags,
             } => self.order_request(Request::AddHttpsFrontend(RequestHttpFrontend {
                 route: route.into(),
-                address,
+                address: address.to_string(),
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
@@ -260,7 +260,7 @@ impl CommandManager {
                 route,
             } => self.order_request(Request::RemoveHttpsFrontend(RequestHttpFrontend {
                 route: route.into(),
-                address,
+                address: address.to_string(),
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
@@ -304,13 +304,13 @@ impl CommandManager {
                 self.order_request(Request::AddHttpsListener(https_listener))
             }
             HttpsListenerCmd::Remove { address } => {
-                self.remove_listener(address, ListenerType::HTTPS)
+                self.remove_listener(address.to_string(), ListenerType::HTTPS)
             }
             HttpsListenerCmd::Activate { address } => {
-                self.activate_listener(address, ListenerType::HTTPS)
+                self.activate_listener(address.to_string(), ListenerType::HTTPS)
             }
             HttpsListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address, ListenerType::HTTPS)
+                self.deactivate_listener(address.to_string(), ListenerType::HTTPS)
             }
         }
     }
@@ -344,13 +344,13 @@ impl CommandManager {
                 self.order_request(Request::AddHttpListener(http_listener))
             }
             HttpListenerCmd::Remove { address } => {
-                self.remove_listener(address, ListenerType::HTTP)
+                self.remove_listener(address.to_string(), ListenerType::HTTP)
             }
             HttpListenerCmd::Activate { address } => {
-                self.activate_listener(address, ListenerType::HTTP)
+                self.activate_listener(address.to_string(), ListenerType::HTTP)
             }
             HttpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address, ListenerType::HTTP)
+                self.deactivate_listener(address.to_string(), ListenerType::HTTP)
             }
         }
     }
@@ -370,12 +370,14 @@ impl CommandManager {
 
                 self.order_request(Request::AddTcpListener(listener))
             }
-            TcpListenerCmd::Remove { address } => self.remove_listener(address, ListenerType::TCP),
+            TcpListenerCmd::Remove { address } => {
+                self.remove_listener(address.to_string(), ListenerType::TCP)
+            }
             TcpListenerCmd::Activate { address } => {
-                self.activate_listener(address, ListenerType::TCP)
+                self.activate_listener(address.to_string(), ListenerType::TCP)
             }
             TcpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address, ListenerType::TCP)
+                self.deactivate_listener(address.to_string(), ListenerType::TCP)
             }
         }
     }

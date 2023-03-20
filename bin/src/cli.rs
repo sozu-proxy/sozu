@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::SocketAddr};
 
 use clap::{Parser, Subcommand};
 
@@ -363,7 +363,7 @@ pub enum BackendCmd {
             long = "address",
             help = "server address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
     },
     #[clap(name = "add", about = "Add a backend")]
     Add {
@@ -376,7 +376,7 @@ pub enum BackendCmd {
             long = "address",
             help = "server address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
         #[clap(
             short = 's',
             long = "sticky-id",
@@ -452,7 +452,7 @@ pub enum HttpFrontendCmd {
             long = "address",
             help = "frontend address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
         #[clap(subcommand, name = "route")]
         route: Route,
         #[clap(long = "hostname", aliases = &["host"])]
@@ -481,7 +481,7 @@ pub enum HttpFrontendCmd {
             long = "address",
             help = "frontend address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
         #[clap(subcommand, name = "route")]
         route: Route,
         #[clap(long = "hostname", aliases = &["host"])]
@@ -518,7 +518,7 @@ pub enum TcpFrontendCmd {
             long = "address",
             help = "frontend address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
         #[clap(
             long = "tags",
             help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')",
@@ -539,7 +539,7 @@ pub enum TcpFrontendCmd {
             long = "address",
             help = "frontend address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
     },
 }
 
@@ -569,12 +569,12 @@ pub enum HttpListenerCmd {
     #[clap(name = "add")]
     Add {
         #[clap(short = 'a')]
-        address: String,
+        address: SocketAddr,
         #[clap(
             long = "public-address",
             help = "a different IP than the one the socket sees, for logs and forwarded headers"
         )]
-        public_address: Option<String>,
+        public_address: Option<SocketAddr>,
         #[clap(
             long = "answer-404",
             help = "path to file of the 404 answer sent to the client when a frontend is not found"
@@ -620,7 +620,7 @@ pub enum HttpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
     },
     #[clap(name = "activate")]
     Activate {
@@ -629,7 +629,7 @@ pub enum HttpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
     },
     #[clap(name = "deactivate")]
     Deactivate {
@@ -638,7 +638,7 @@ pub enum HttpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
     },
 }
 
@@ -647,12 +647,12 @@ pub enum HttpsListenerCmd {
     #[clap(name = "add")]
     Add {
         #[clap(short = 'a')]
-        address: String,
+        address: SocketAddr,
         #[clap(
             long = "public-address",
             help = "a different IP than the one the socket sees, for logs and forwarded headers"
         )]
-        public_address: Option<String>,
+        public_address: Option<SocketAddr>,
         #[clap(
             long = "answer-404",
             help = "path to file of the 404 answer sent to the client when a frontend is not found"
@@ -705,7 +705,7 @@ pub enum HttpsListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
     },
     #[clap(name = "activate")]
     Activate {
@@ -714,7 +714,7 @@ pub enum HttpsListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
     },
     #[clap(name = "deactivate")]
     Deactivate {
@@ -723,7 +723,7 @@ pub enum HttpsListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
     },
 }
 
@@ -736,12 +736,12 @@ pub enum TcpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
         #[clap(
             long = "public-address",
             help = "a different IP than the one the socket sees, for logs and forwarded headers"
         )]
-        public_address: Option<String>,
+        public_address: Option<SocketAddr>,
         #[clap(
             long = "expect-proxy",
             help = "Configures the client socket to receive a PROXY protocol header"
@@ -755,7 +755,7 @@ pub enum TcpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
     },
     #[clap(name = "activate")]
     Activate {
@@ -764,7 +764,7 @@ pub enum TcpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
     },
     #[clap(name = "deactivate")]
     Deactivate {
@@ -773,7 +773,7 @@ pub enum TcpListenerCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
     },
 }
 
@@ -786,7 +786,7 @@ pub enum CertificateCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
         #[clap(long = "certificate", help = "path to the certificate")]
         certificate: String,
         #[clap(long = "certificate-chain", help = "path to the certificate chain")]
@@ -804,7 +804,7 @@ pub enum CertificateCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
         #[clap(aliases = &["cert"], long = "certificate", help = "path to the certificate")]
         certificate: Option<String>,
         #[clap(short = 'f', long = "fingerprint", help = "certificate fingerprint")]
@@ -817,7 +817,7 @@ pub enum CertificateCmd {
             long = "address",
             help = "listener address, format: IP:port"
         )]
-        address: String,
+        address: SocketAddr,
         #[clap(long = "new-certificate", help = "path to the new certificate")]
         certificate: String,
         #[clap(
