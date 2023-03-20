@@ -3,11 +3,11 @@ use std::{collections::BTreeMap, str, time::Instant};
 
 use anyhow::Context;
 use hdrhistogram::Histogram;
-use sozu_command::response::BackendMetrics;
+use sozu_command::response::{AvailableMetrics, BackendMetrics, ResponseContent};
 
 use crate::sozu_command::{
     request::{MetricsConfiguration, QueryMetricsOptions},
-    response::{ClusterMetrics, FilteredMetrics, Percentiles, QueryAnswerMetrics, WorkerMetrics},
+    response::{ClusterMetrics, FilteredMetrics, Percentiles, WorkerMetrics},
 };
 
 use super::{MetricData, Subscriber};
@@ -169,7 +169,7 @@ impl LocalDrain {
             .collect()
     }
 
-    pub fn query(&mut self, options: &QueryMetricsOptions) -> QueryAnswerMetrics {
+    pub fn query(&mut self, options: &QueryMetricsOptions) -> anyhow::Result<ResponseContent> {
         trace!(
             "The local drain received a metrics query with this options: {:?}",
             options
@@ -187,28 +187,28 @@ impl LocalDrain {
         }
 
         let worker_metrics = match (cluster_ids.is_empty(), backend_ids.is_empty()) {
-            (false, _) => self.query_clusters(cluster_ids, metric_names),
-            (true, false) => self.query_backends(backend_ids, metric_names),
-            (true, true) => self.dump_all_metrics(metric_names),
+            (false, _) => self.query_clusters(cluster_ids, metric_names)?,
+            (true, false) => self.query_backends(backend_ids, metric_names)?,
+            (true, true) => self.dump_all_metrics(metric_names)?,
         };
 
-        match worker_metrics {
-            Ok(worker_metrics) => QueryAnswerMetrics::All(worker_metrics),
-            Err(e) => QueryAnswerMetrics::Error(e.to_string()),
-        }
+        Ok(ResponseContent::WorkerMetrics(worker_metrics))
     }
 
-    fn list_all_metric_names(&self) -> QueryAnswerMetrics {
-        let proxy_metrics_names = self.proxy_metrics.keys().cloned().collect();
+    fn list_all_metric_names(&self) -> anyhow::Result<ResponseContent> {
+        let proxy_metrics = self.proxy_metrics.keys().cloned().collect();
 
-        let mut cluster_metrics_names = Vec::new();
+        let mut cluster_metrics = Vec::new();
 
         for cluster_metrics_entry in self.cluster_metrics.iter() {
             for (metric_name, _) in cluster_metrics_entry.1.iter() {
-                cluster_metrics_names.push(metric_name.to_owned());
+                cluster_metrics.push(metric_name.to_owned());
             }
         }
-        QueryAnswerMetrics::List((proxy_metrics_names, cluster_metrics_names))
+        Ok(ResponseContent::AvailableMetrics(AvailableMetrics {
+            proxy_metrics,
+            cluster_metrics,
+        }))
     }
 
     pub fn dump_all_metrics(

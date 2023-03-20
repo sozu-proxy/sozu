@@ -98,7 +98,7 @@ impl CommandManager {
                             | ResponseContent::ClustersHashes(_)
                             | ResponseContent::Clusters(_)
                             | ResponseContent::Certificates(_)
-                            | ResponseContent::QueriedMetrics(_)
+                            | ResponseContent::AvailableMetrics(_)
                             | ResponseContent::Event(_) => {}
                             ResponseContent::State(state) => match json {
                                 true => print_json_response(&state)?,
@@ -297,8 +297,8 @@ impl CommandManager {
                             Some(ResponseContent::Metrics(aggregated_metrics_data)) => {
                                 print_metrics(aggregated_metrics_data, json)?
                             }
-                            Some(ResponseContent::WorkerResponses(worker_responses)) => {
-                                print_available_metrics(&worker_responses)?;
+                            Some(ResponseContent::AvailableMetrics(available)) => {
+                                print_available_metrics(&available)?;
                             }
                             _ => println!("Wrong kind of response here"),
                         }

@@ -19,8 +19,8 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     request::{FrontendFilters, MetricsConfiguration, QueryClusterType, Request, WorkerRequest},
     response::{
-        AggregatedMetrics, ListedFrontends, ListenersList, Response, ResponseContent,
-        ResponseStatus, RunState, WorkerInfo,
+        AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, Response,
+        ResponseContent, ResponseStatus, RunState, WorkerInfo,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -1126,19 +1126,38 @@ impl CommandServer {
                     ResponseContent::WorkerResponses(worker_responses)
                 }
                 Request::QueryMetrics(options) => {
-                    let workers_metrics = worker_responses
-                        .into_iter()
-                        .filter_map(|(worker_id, worker_response)| match worker_response {
-                            ResponseContent::WorkerMetrics(worker_metrics) => {
-                                Some((worker_id, worker_metrics))
+                    if options.list {
+                        let mut summed_proxy_metrics = Vec::new();
+                        let mut summed_cluster_metrics = Vec::new();
+                        for (_, response) in worker_responses {
+                            if let ResponseContent::AvailableMetrics(AvailableMetrics {
+                                proxy_metrics,
+                                cluster_metrics,
+                            }) = response
+                            {
+                                summed_proxy_metrics.append(&mut proxy_metrics.clone());
+                                summed_cluster_metrics.append(&mut cluster_metrics.clone());
                             }
-                            _ => None,
+                        }
+                        ResponseContent::AvailableMetrics(AvailableMetrics {
+                            proxy_metrics: summed_proxy_metrics,
+                            cluster_metrics: summed_cluster_metrics,
                         })
-                        .collect();
-                    ResponseContent::Metrics(AggregatedMetrics {
-                        main: main_metrics,
-                        workers: workers_metrics,
-                    })
+                    } else {
+                        let workers_metrics = worker_responses
+                            .into_iter()
+                            .filter_map(|(worker_id, worker_response)| match worker_response {
+                                ResponseContent::WorkerMetrics(worker_metrics) => {
+                                    Some((worker_id, worker_metrics))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        ResponseContent::Metrics(AggregatedMetrics {
+                            main: main_metrics,
+                            workers: workers_metrics,
+                        })
+                    }
                 }
                 _ => return, // very very unlikely
             };

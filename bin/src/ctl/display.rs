@@ -3,12 +3,12 @@ use std::{
     process::exit,
 };
 
-use anyhow::{self, bail, Context};
+use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::response::{
-    AggregatedMetrics, ClusterMetrics, FilteredMetrics, ListedFrontends, ListenersList,
-    QueryAnswerCertificate, QueryAnswerMetrics, ResponseContent, Route, WorkerInfo, WorkerMetrics,
+    AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics, ListedFrontends,
+    ListenersList, QueryAnswerCertificate, ResponseContent, Route, WorkerInfo, WorkerMetrics,
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -680,46 +680,13 @@ fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
     .unwrap_or_default()
 }
 
-pub fn print_available_metrics(answers: &BTreeMap<String, ResponseContent>) -> anyhow::Result<()> {
-    let mut available_metrics: (HashSet<String>, HashSet<String>) =
-        (HashSet::new(), HashSet::new());
-    for content in answers.values() {
-        match content {
-            ResponseContent::QueriedMetrics(QueryAnswerMetrics::List((
-                proxy_metric_keys,
-                cluster_metric_keys,
-            ))) => {
-                for key in proxy_metric_keys {
-                    available_metrics
-                        .0
-                        .insert(key.replace('\t', ".").to_owned());
-                }
-                for key in cluster_metric_keys {
-                    available_metrics
-                        .1
-                        .insert(key.replace('\t', ".").to_owned());
-                }
-            }
-            _ => bail!("The proxy responded nonsense instead of metric names"),
-        }
-    }
-    let proxy_metrics_names = available_metrics
-        .0
-        .iter()
-        .map(|s| s.to_owned())
-        .collect::<Vec<String>>();
-    let cluster_metrics_names = available_metrics
-        .1
-        .iter()
-        .map(|s| s.to_owned())
-        .collect::<Vec<String>>();
-
+pub fn print_available_metrics(available_metrics: &AvailableMetrics) -> anyhow::Result<()> {
     println!("Available metrics on the proxy level:");
-    for metric_name in proxy_metrics_names {
+    for metric_name in &available_metrics.proxy_metrics {
         println!("\t{metric_name}");
     }
     println!("Available metrics on the cluster level:");
-    for metric_name in cluster_metrics_names {
+    for metric_name in &available_metrics.cluster_metrics {
         println!("\t{metric_name}");
     }
     Ok(())

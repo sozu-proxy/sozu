@@ -926,12 +926,10 @@ impl Server {
             }
             Request::QueryMetrics(query_metrics_options) => {
                 METRICS.with(|metrics| {
-                    let data = (*metrics.borrow_mut()).query(query_metrics_options);
-
-                    push_queue(WorkerResponse::ok_with_content(
-                        message.id.clone(),
-                        ResponseContent::QueriedMetrics(data),
-                    ));
+                    match (*metrics.borrow_mut()).query(query_metrics_options) {
+                        Ok(c) => push_queue(WorkerResponse::ok_with_content(message.id.clone(), c)),
+                        Err(e) => error!("Error querying metrics: {:#}", e),
+                    }
                 });
                 return;
             }

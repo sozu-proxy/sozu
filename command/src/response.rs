@@ -73,11 +73,14 @@ pub enum ResponseContent {
 
     /// contains proxy & cluster metrics
     WorkerMetrics(WorkerMetrics),
+
+    /// Lists of metrics that are available
+    AvailableMetrics(AvailableMetrics),
+
     Clusters(Vec<QueryAnswerCluster>),
     /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
     Certificates(QueryAnswerCertificate),
-    QueriedMetrics(QueryAnswerMetrics),
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -99,15 +102,11 @@ pub enum QueryAnswerCertificate {
     Fingerprint(Option<(String, Vec<String>)>),
 }
 
-/// Returned by the local drain
+/// lists of available metrics in a worker, or in the main process (in which case there are no cluster metrics)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QueryAnswerMetrics {
-    /// (list of proxy metrics, list of cluster metrics)
-    List((Vec<String>, Vec<String>)),
-    /// all worker metrics, proxy & clusters, with Options all around for partial answers
-    All(WorkerMetrics),
-    /// Use to trickle up errors to the CLI
-    Error(String),
+pub struct AvailableMetrics {
+    pub proxy_metrics: Vec<String>,
+    pub cluster_metrics: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
