@@ -547,7 +547,7 @@ impl fmt::Display for WorkerResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedMetrics {
     pub main: BTreeMap<String, FilteredMetrics>,
-    pub workers: BTreeMap<String, ResponseContent>,
+    pub workers: BTreeMap<String, WorkerMetrics>,
 }
 
 /// All metrics of a worker: proxy and clusters
@@ -697,7 +697,7 @@ mod tests {
                 .collect(),
                 workers: [(
                     String::from("0"),
-                    ResponseContent::QueriedMetrics(QueryAnswerMetrics::All(WorkerMetrics {
+                    WorkerMetrics {
                         proxy: Some(
                             [
                                 (String::from("sozu.gauge"), FilteredMetrics::Gauge(1)),
@@ -762,7 +762,7 @@ mod tests {
                             .cloned()
                             .collect()
                         )
-                    }))
+                    }
                 )]
                 .iter()
                 .cloned()

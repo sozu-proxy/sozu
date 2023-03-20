@@ -214,20 +214,9 @@ pub fn print_metrics(
     Ok(())
 }
 
-fn print_worker_metrics(worker_metrics: &ResponseContent) -> anyhow::Result<()> {
-    match worker_metrics {
-        ResponseContent::QueriedMetrics(QueryAnswerMetrics::All(WorkerMetrics {
-            proxy,
-            clusters,
-        })) => {
-            print_proxy_metrics(proxy);
-            print_cluster_metrics(clusters);
-        }
-        ResponseContent::QueriedMetrics(QueryAnswerMetrics::Error(error)) => {
-            println!("Error: {error}\nMaybe check your command.")
-        }
-        _ => bail!("The query answer is wrong."),
-    }
+fn print_worker_metrics(worker_metrics: &WorkerMetrics) -> anyhow::Result<()> {
+    print_proxy_metrics(&worker_metrics.proxy);
+    print_cluster_metrics(&worker_metrics.clusters);
 
     Ok(())
 }

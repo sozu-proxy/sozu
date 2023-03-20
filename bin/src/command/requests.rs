@@ -1115,32 +1115,40 @@ impl CommandServer {
                 })
                 .collect();
 
-            let success = match &request {
+            let response_content = match &request {
                 &Request::QueryClustersHashes | &Request::QueryClusters(_) => {
                     let main = main_response_content.unwrap(); // we should refactor to avoid this unwrap()
                     worker_responses.insert(String::from("main"), main);
-                    Success::Query(ResponseContent::WorkerResponses(worker_responses))
+                    ResponseContent::WorkerResponses(worker_responses)
                 }
                 &Request::QueryCertificates(_) => {
                     info!("certificates query answer received: {:?}", worker_responses);
-                    Success::Query(ResponseContent::WorkerResponses(worker_responses))
+                    ResponseContent::WorkerResponses(worker_responses)
                 }
                 Request::QueryMetrics(options) => {
-                    debug!("metrics query answer received: {:?}", worker_responses);
-
-                    if options.list {
-                        Success::Query(ResponseContent::WorkerResponses(worker_responses))
-                    } else {
-                        Success::Query(ResponseContent::Metrics(AggregatedMetrics {
-                            main: main_metrics,
-                            workers: worker_responses,
-                        }))
-                    }
+                    let workers_metrics = worker_responses
+                        .into_iter()
+                        .filter_map(|(worker_id, worker_response)| match worker_response {
+                            ResponseContent::WorkerMetrics(worker_metrics) => {
+                                Some((worker_id, worker_metrics))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    ResponseContent::Metrics(AggregatedMetrics {
+                        main: main_metrics,
+                        workers: workers_metrics,
+                    })
                 }
                 _ => return, // very very unlikely
             };
 
-            return_success(command_tx, cloned_identifier, success).await;
+            return_success(
+                command_tx,
+                cloned_identifier,
+                Success::Query(response_content),
+            )
+            .await;
         })
         .detach();
 
