@@ -16,7 +16,7 @@ use mio::net::UdpSocket;
 
 use crate::sozu_command::{
     request::{MetricsConfiguration, QueryMetricsOptions},
-    response::{FilteredData, QueryAnswerMetrics},
+    response::{FilteredMetrics, QueryAnswerMetrics},
 };
 
 use self::{local_drain::LocalDrain, network_drain::NetworkDrain};
@@ -215,7 +215,7 @@ impl Aggregator {
         }
     }
 
-    pub fn dump_local_proxy_metrics(&mut self) -> BTreeMap<String, FilteredData> {
+    pub fn dump_local_proxy_metrics(&mut self) -> BTreeMap<String, FilteredMetrics> {
         self.local.dump_proxy_metrics(&Vec::new())
     }
 
