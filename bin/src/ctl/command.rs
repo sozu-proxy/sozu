@@ -99,6 +99,7 @@ impl CommandManager {
                             | ResponseContent::Clusters(_)
                             | ResponseContent::Certificates(_)
                             | ResponseContent::CertificatesByDomain(_)
+                            | ResponseContent::CertificateByFingerprint(_)
                             | ResponseContent::AllCertificates(_)
                             | ResponseContent::AvailableMetrics(_)
                             | ResponseContent::Event(_) => {}

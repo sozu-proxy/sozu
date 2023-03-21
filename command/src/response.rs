@@ -87,6 +87,10 @@ pub enum ResponseContent {
 
     /// returns certificates matching a certificate request by domain
     CertificatesByDomain(HashMap<SocketAddr, Option<(String, Vec<u8>)>>),
+
+    /// returns the certificate matching a request by fingerprint,
+    /// and the list of domain names associated
+    CertificateByFingerprint(Option<(String, Vec<String>)>),
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -103,9 +107,9 @@ pub enum QueryAnswerCertificate {
     /*
     /// returns a fingerprint
     Domain(HashMap<SocketAddr, Option<(String, Vec<u8>)>>),
-    */
     /// returns the certificate
     Fingerprint(Option<(String, Vec<String>)>),
+    */
 }
 
 /// lists of available metrics in a worker, or in the main process (in which case there are no cluster metrics)

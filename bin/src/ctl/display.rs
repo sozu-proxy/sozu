@@ -643,7 +643,7 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            ResponseContent::Certificates(QueryAnswerCertificate::Fingerprint(opt)) => {
+            ResponseContent::CertificateByFingerprint(opt) => {
                 if let Some((s, v)) = opt {
                     println!("\tfrontends: {v:?}\ncertificate:\n{s}");
                 } else {

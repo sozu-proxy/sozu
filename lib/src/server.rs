@@ -916,8 +916,9 @@ impl Server {
                     QueryCertificateType::Fingerprint(f) => {
                         push_queue(WorkerResponse::ok_with_content(
                             message.id.clone(),
-                            ResponseContent::Certificates(QueryAnswerCertificate::Fingerprint(
-                                get_certificate(&self.config_state, f),
+                            ResponseContent::CertificateByFingerprint(get_certificate(
+                                &self.config_state,
+                                f,
                             )),
                         ));
                         return;
