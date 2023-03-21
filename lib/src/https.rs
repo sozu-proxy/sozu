@@ -26,7 +26,9 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::{config::DEFAULT_CIPHER_SUITES, request::RequestHttpFrontend};
+use sozu_command::{
+    certificate::CertificateSummary, config::DEFAULT_CIPHER_SUITES, request::RequestHttpFrontend,
+};
 use time::{Duration, Instant};
 
 use crate::{
@@ -935,14 +937,17 @@ impl HttpsProxy {
             .map(|listener| {
                 let owned = listener.borrow();
                 let resolver = unwrap_msg!(owned.resolver.0.lock());
-                let res = resolver
+                let certificate_summaries = resolver
                     .domains
                     .to_hashmap()
                     .drain()
-                    .map(|(k, v)| (String::from_utf8(k).unwrap(), v.0))
+                    .map(|(k, fingerprint)| CertificateSummary {
+                        domain: String::from_utf8(k).unwrap(),
+                        fingerprint,
+                    })
                     .collect();
 
-                (owned.address, res)
+                (owned.address, certificate_summaries)
             })
             .collect::<HashMap<_, _>>();
 
@@ -968,7 +973,10 @@ impl HttpsProxy {
                     owned.address,
                     resolver
                         .domain_lookup(domain.as_bytes(), true)
-                        .map(|(k, v)| (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())),
+                        .map(|(k, fingerprint)| CertificateSummary {
+                            domain: String::from_utf8(k.to_vec()).unwrap(),
+                            fingerprint: fingerprint.clone(),
+                        }),
                 )
             })
             .collect::<HashMap<_, _>>();

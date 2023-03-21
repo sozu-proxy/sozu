@@ -624,8 +624,12 @@ pub fn print_certificates(
                 for (addr, h2) in h.iter() {
                     println!("\t{addr}:");
 
-                    for (domain, fingerprint) in h2.iter() {
-                        println!("\t\t{}:\t{}", domain, hex::encode(fingerprint));
+                    for summary in h2.iter() {
+                        println!(
+                            "\t\t{}:\t{}",
+                            summary.domain,
+                            hex::encode(summary.fingerprint.0.to_owned())
+                        );
                     }
 
                     println!();
@@ -634,8 +638,12 @@ pub fn print_certificates(
             ResponseContent::CertificatesByDomain(h) => {
                 for (addr, opt) in h.iter() {
                     println!("\t{addr}:");
-                    if let Some((key, fingerprint)) = opt {
-                        println!("\t\t{}:\t{}", key, hex::encode(fingerprint));
+                    if let Some(summary) = opt {
+                        println!(
+                            "\t\t{}:\t{}",
+                            summary.domain,
+                            hex::encode(summary.fingerprint.0.to_owned())
+                        );
                     } else {
                         println!("\t\tnot found");
                     }

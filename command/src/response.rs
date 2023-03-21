@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    certificate::TlsVersion,
+    certificate::{CertificateSummary, TlsVersion},
     request::{
         default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams,
         RequestHttpFrontend, RequestTcpFrontend, PROTOCOL_VERSION,
@@ -81,11 +81,11 @@ pub enum ResponseContent {
     /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
 
-    /// returns a list of certificates: domain -> fingerprint
-    AllCertificates(HashMap<SocketAddr, BTreeMap<String, Vec<u8>>>),
+    /// returns a list of certificates for each address
+    AllCertificates(HashMap<SocketAddr, Vec<CertificateSummary>>),
 
     /// returns certificates matching a certificate request by domain
-    CertificatesByDomain(HashMap<SocketAddr, Option<(String, Vec<u8>)>>),
+    CertificatesByDomain(HashMap<SocketAddr, Option<CertificateSummary>>),
 
     /// returns the certificate matching a request by fingerprint,
     /// and the list of domain names associated
