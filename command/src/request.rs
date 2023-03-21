@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, error, fmt, net::SocketAddr, str::FromStr};
 use anyhow::Context;
 
 use crate::{
-    certificate::{CertificateAndKey, CertificateFingerprint},
+    certificate::{CertificateAndKey, Fingerprint},
     config::ProxyProtocolConfig,
     response::{
         is_default_path_rule, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId,
@@ -283,14 +283,14 @@ pub struct AddCertificate {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RemoveCertificate {
     pub address: String,
-    pub fingerprint: CertificateFingerprint,
+    pub fingerprint: Fingerprint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReplaceCertificate {
     pub address: String,
     pub new_certificate: CertificateAndKey,
-    pub old_fingerprint: CertificateFingerprint,
+    pub old_fingerprint: Fingerprint,
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
     pub new_names: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -621,7 +621,7 @@ mod tests {
         "../assets/remove_certificate.json",
         Request::RemoveCertificate(RemoveCertificate {
             address: "0.0.0.0:443".parse().unwrap(),
-            fingerprint: CertificateFingerprint(
+            fingerprint: Fingerprint(
                 FromHex::from_hex(
                     "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
                 )

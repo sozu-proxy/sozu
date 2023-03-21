@@ -67,21 +67,21 @@ impl FromStr for TlsVersion {
 
 //FIXME: make fixed size depending on hash algorithm
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CertificateFingerprint(pub Vec<u8>);
+pub struct Fingerprint(pub Vec<u8>);
 
-impl fmt::Debug for CertificateFingerprint {
+impl fmt::Debug for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "CertificateFingerprint({})", hex::encode(&self.0))
     }
 }
 
-impl fmt::Display for CertificateFingerprint {
+impl fmt::Display for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "{}", hex::encode(&self.0))
     }
 }
 
-impl serde::Serialize for CertificateFingerprint {
+impl serde::Serialize for Fingerprint {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -90,31 +90,31 @@ impl serde::Serialize for CertificateFingerprint {
     }
 }
 
-struct CertificateFingerprintVisitor;
+struct FingerprintVisitor;
 
-impl<'de> Visitor<'de> for CertificateFingerprintVisitor {
-    type Value = CertificateFingerprint;
+impl<'de> Visitor<'de> for FingerprintVisitor {
+    type Value = Fingerprint;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         formatter.write_str("the certificate fingerprint must be in hexadecimal format")
     }
 
-    fn visit_str<E>(self, value: &str) -> Result<CertificateFingerprint, E>
+    fn visit_str<E>(self, value: &str) -> Result<Fingerprint, E>
     where
         E: de::Error,
     {
         FromHex::from_hex(value)
             .map_err(|e| E::custom(format!("could not deserialize hex: {e:?}")))
-            .map(CertificateFingerprint)
+            .map(Fingerprint)
     }
 }
 
-impl<'de> serde::Deserialize<'de> for CertificateFingerprint {
-    fn deserialize<D>(deserializer: D) -> Result<CertificateFingerprint, D::Error>
+impl<'de> serde::Deserialize<'de> for Fingerprint {
+    fn deserialize<D>(deserializer: D) -> Result<Fingerprint, D::Error>
     where
         D: serde::de::Deserializer<'de>,
     {
-        deserializer.deserialize_str(CertificateFingerprintVisitor {})
+        deserializer.deserialize_str(FingerprintVisitor {})
     }
 }
 

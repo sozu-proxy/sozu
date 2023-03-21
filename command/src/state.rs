@@ -14,15 +14,15 @@ use anyhow::{bail, Context};
 use serde::de::{self, Visitor};
 
 use crate::{
-    certificate::{calculate_fingerprint, CertificateAndKey, CertificateFingerprint},
+    certificate::{calculate_fingerprint, CertificateAndKey, Fingerprint},
     request::{
         ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, ListenerType,
         RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
         RequestHttpFrontend, RequestTcpFrontend,
     },
     response::{
-        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, PathRuleKind,
-        ClusterInformation, Route, TcpFrontend, TcpListenerConfig,
+        Backend, ClusterInformation, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
+        PathRule, PathRuleKind, Route, TcpFrontend, TcpListenerConfig,
     },
 };
 
@@ -39,7 +39,7 @@ pub struct HttpProxy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpsProxy {
     address: SocketAddr,
-    certificates: HashMap<CertificateFingerprint, CertificateAndKey>,
+    certificates: HashMap<Fingerprint, CertificateAndKey>,
     fronts: HashMap<ClusterId, Vec<HttpFrontend>>,
     backends: HashMap<ClusterId, Vec<Backend>>,
 }
@@ -58,8 +58,7 @@ pub struct ConfigState {
     pub https_fronts: BTreeMap<RouteKey, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
     /// certificate and names
-    pub certificates:
-        HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
+    pub certificates: HashMap<SocketAddr, HashMap<Fingerprint, (CertificateAndKey, Vec<String>)>>,
 }
 
 impl ConfigState {
@@ -314,7 +313,7 @@ impl ConfigState {
     }
 
     fn add_certificate(&mut self, add: &AddCertificate) -> anyhow::Result<()> {
-        let fingerprint = CertificateFingerprint(
+        let fingerprint = Fingerprint(
             calculate_fingerprint(add.certificate.certificate.as_bytes())
                 .with_context(|| "cannot calculate the certificate's fingerprint")?,
         );
@@ -365,7 +364,7 @@ impl ConfigState {
             .with_context(|| format!("No certificate to replace for address {}", replace.address))?
             .remove(&replace.old_fingerprint);
 
-        let new_fingerprint = CertificateFingerprint(
+        let new_fingerprint = Fingerprint(
             calculate_fingerprint(replace.new_certificate.certificate.as_bytes())
                 .with_context(|| "cannot obtain the certificate's fingerprint")?,
         );
@@ -929,12 +928,12 @@ impl ConfigState {
         }
 
         //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
-        let my_certificates: HashSet<(SocketAddr, &CertificateFingerprint)> = HashSet::from_iter(
+        let my_certificates: HashSet<(SocketAddr, &Fingerprint)> = HashSet::from_iter(
             self.certificates
                 .iter()
                 .flat_map(|(addr, certs)| repeat(*addr).zip(certs.keys())),
         );
-        let their_certificates: HashSet<(SocketAddr, &CertificateFingerprint)> = HashSet::from_iter(
+        let their_certificates: HashSet<(SocketAddr, &Fingerprint)> = HashSet::from_iter(
             other
                 .certificates
                 .iter()
@@ -1115,7 +1114,7 @@ pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(Strin
     state
         .certificates
         .values()
-        .filter_map(|h| h.get(&CertificateFingerprint(fingerprint.to_vec())))
+        .filter_map(|h| h.get(&Fingerprint(fingerprint.to_vec())))
         .map(|(c, names)| (c.certificate.clone(), names.clone()))
         .next()
 }

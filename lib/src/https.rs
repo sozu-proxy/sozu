@@ -47,7 +47,7 @@ use crate::{
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     sozu_command::{
-        certificate::{CertificateFingerprint, TlsVersion},
+        certificate::{Fingerprint, TlsVersion},
         logging,
         ready::Ready,
         request::{
@@ -643,10 +643,7 @@ impl L7ListenerHandler for HttpsListener {
 impl CertificateResolver for HttpsListener {
     type Error = ListenerError;
 
-    fn get_certificate(
-        &self,
-        fingerprint: &CertificateFingerprint,
-    ) -> Option<ParsedCertificateAndKey> {
+    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<ParsedCertificateAndKey> {
         let resolver = self
             .resolver
             .0
@@ -657,10 +654,7 @@ impl CertificateResolver for HttpsListener {
         resolver.get_certificate(fingerprint)
     }
 
-    fn add_certificate(
-        &mut self,
-        opts: &AddCertificate,
-    ) -> Result<CertificateFingerprint, Self::Error> {
+    fn add_certificate(&mut self, opts: &AddCertificate) -> Result<Fingerprint, Self::Error> {
         let mut resolver = self
             .resolver
             .0

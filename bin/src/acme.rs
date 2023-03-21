@@ -8,8 +8,7 @@ use tiny_http::{Response as HttpResponse, Server};
 
 use sozu_command_lib::{
     certificate::{
-        calculate_fingerprint, split_certificate_chain, CertificateAndKey, CertificateFingerprint,
-        TlsVersion,
+        calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint, TlsVersion,
     },
     channel::Channel,
     config::Config,
@@ -382,7 +381,7 @@ fn add_certificate(
                 key,
                 versions: tls_versions.clone(),
             },
-            old_fingerprint: CertificateFingerprint(f),
+            old_fingerprint: Fingerprint(f),
             new_names: vec![hostname.to_string()],
             new_expired_at: None,
         }),

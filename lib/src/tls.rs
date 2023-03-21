@@ -23,7 +23,7 @@ use x509_parser::{
 
 use crate::router::trie::*;
 use sozu_command::{
-    certificate::{CertificateAndKey, CertificateFingerprint, TlsVersion},
+    certificate::{CertificateAndKey, Fingerprint, TlsVersion},
     request::{AddCertificate, RemoveCertificate, ReplaceCertificate},
 };
 
@@ -34,17 +34,11 @@ pub trait CertificateResolver {
     type Error;
 
     // `get_certificate` returns the certificate, its chain and private key
-    fn get_certificate(
-        &self,
-        fingerprint: &CertificateFingerprint,
-    ) -> Option<ParsedCertificateAndKey>;
+    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<ParsedCertificateAndKey>;
 
     // `add_certificate` to the certificate resolver, ensures that it is valid and check if it can
     // replace another certificate
-    fn add_certificate(
-        &mut self,
-        opts: &AddCertificate,
-    ) -> Result<CertificateFingerprint, Self::Error>;
+    fn add_certificate(&mut self, opts: &AddCertificate) -> Result<Fingerprint, Self::Error>;
 
     // `remove_certificate` from the certificate resolver, may fail if there is no alternative for
     // a domain name
@@ -56,7 +50,7 @@ pub trait CertificateResolver {
     fn replace_certificate(
         &mut self,
         opts: &ReplaceCertificate,
-    ) -> Result<CertificateFingerprint, Self::Error> {
+    ) -> Result<Fingerprint, Self::Error> {
         let fingerprint = self.add_certificate(&AddCertificate {
             address: opts.address.to_owned(),
             certificate: opts.new_certificate.to_owned(),
@@ -84,14 +78,14 @@ pub trait CertificateResolverHelper {
     fn find_certificates_by_names(
         &self,
         names: &HashSet<String>,
-    ) -> Result<HashSet<CertificateFingerprint>, Self::Error>;
+    ) -> Result<HashSet<Fingerprint>, Self::Error>;
 
     // `certificate_names` returns the hashset of subjects that the certificate is able to handle by
     // parsing the pem file and scrapping the information
     fn certificate_names(&self, pem: &Pem) -> Result<HashSet<String>, Self::Error>;
 
     // `fingerprint` returns the computed fingerprint for the given certificate
-    fn fingerprint(certificate: &Pem) -> CertificateFingerprint;
+    fn fingerprint(certificate: &Pem) -> Fingerprint;
 
     // `parse` ensures that a certificate, its chain and its private key are valid by parsing them
     // and check that the signature algorithm is supported and return them
@@ -179,26 +173,20 @@ pub enum GenericCertificateResolverError {
 
 #[derive(Debug)]
 pub struct GenericCertificateResolver {
-    pub domains: TrieNode<CertificateFingerprint>,
-    certificates: HashMap<CertificateFingerprint, ParsedCertificateAndKey>,
-    name_fingerprint_idx: HashMap<String, HashSet<CertificateFingerprint>>,
-    overrides: HashMap<CertificateFingerprint, CertificateOverride>,
+    pub domains: TrieNode<Fingerprint>,
+    certificates: HashMap<Fingerprint, ParsedCertificateAndKey>,
+    name_fingerprint_idx: HashMap<String, HashSet<Fingerprint>>,
+    overrides: HashMap<Fingerprint, CertificateOverride>,
 }
 
 impl CertificateResolver for GenericCertificateResolver {
     type Error = GenericCertificateResolverError;
 
-    fn get_certificate(
-        &self,
-        fingerprint: &CertificateFingerprint,
-    ) -> Option<ParsedCertificateAndKey> {
+    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<ParsedCertificateAndKey> {
         self.certificates.get(fingerprint).map(ToOwned::to_owned)
     }
 
-    fn add_certificate(
-        &mut self,
-        opts: &AddCertificate,
-    ) -> Result<CertificateFingerprint, Self::Error> {
+    fn add_certificate(&mut self, opts: &AddCertificate) -> Result<Fingerprint, Self::Error> {
         // Check if we could parse the certificate, chain and private key, if not just throw an
         // error.
         let parsed_certificate_and_key = Self::parse(&opts.certificate)?;
@@ -286,7 +274,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
     fn find_certificates_by_names(
         &self,
         names: &HashSet<String>,
-    ) -> Result<HashSet<CertificateFingerprint>, Self::Error> {
+    ) -> Result<HashSet<Fingerprint>, Self::Error> {
         let mut fingerprints = HashSet::new();
         for name in names {
             if let Some(fprints) = self.name_fingerprint_idx.get(name) {
@@ -337,8 +325,8 @@ impl CertificateResolverHelper for GenericCertificateResolver {
         Ok(names)
     }
 
-    fn fingerprint(pem: &Pem) -> CertificateFingerprint {
-        CertificateFingerprint(Sha256::digest(&pem.contents).iter().cloned().collect())
+    fn fingerprint(pem: &Pem) -> Fingerprint {
+        Fingerprint(Sha256::digest(&pem.contents).iter().cloned().collect())
     }
 
     fn parse(
@@ -420,11 +408,7 @@ impl GenericCertificateResolver {
         Self::default()
     }
 
-    fn is_required_for_domain(
-        &self,
-        names: &HashSet<String>,
-        fingerprint: &CertificateFingerprint,
-    ) -> bool {
+    fn is_required_for_domain(&self, names: &HashSet<String>, fingerprint: &Fingerprint) -> bool {
         for name in names {
             if let Some(fingerprints) = self.name_fingerprint_idx.get(name) {
                 if 1 == fingerprints.len() && fingerprints.get(fingerprint).is_some() {
@@ -438,12 +422,10 @@ impl GenericCertificateResolver {
 
     fn should_insert(
         &self,
-        fingerprint: &CertificateFingerprint,
+        fingerprint: &Fingerprint,
         parsed_certificate_and_key: &ParsedCertificateAndKey,
-    ) -> Result<
-        (bool, HashMap<CertificateFingerprint, HashSet<String>>),
-        GenericCertificateResolverError,
-    > {
+    ) -> Result<(bool, HashMap<Fingerprint, HashSet<String>>), GenericCertificateResolverError>
+    {
         let x509 = parsed_certificate_and_key
             .certificate
             .parse_x509()
@@ -517,11 +499,11 @@ impl GenericCertificateResolver {
         Ok((true, certificates_to_remove))
     }
 
-    fn get_expiration_override(&self, fingerprint: &CertificateFingerprint) -> Option<i64> {
+    fn get_expiration_override(&self, fingerprint: &Fingerprint) -> Option<i64> {
         self.overrides.get(fingerprint).and_then(|co| co.expiration)
     }
 
-    fn get_names_override(&self, fingerprint: &CertificateFingerprint) -> Option<HashSet<String>> {
+    fn get_names_override(&self, fingerprint: &Fingerprint) -> Option<HashSet<String>> {
         self.overrides
             .get(fingerprint)
             .and_then(|co| co.names.to_owned())
@@ -531,7 +513,7 @@ impl GenericCertificateResolver {
         &self,
         domain: &[u8],
         accept_wildcard: bool,
-    ) -> Option<&KeyValue<Key, CertificateFingerprint>> {
+    ) -> Option<&KeyValue<Key, Fingerprint>> {
         self.domains.domain_lookup(domain, accept_wildcard)
     }
 }
