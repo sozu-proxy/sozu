@@ -77,7 +77,7 @@ pub enum ResponseContent {
     /// Lists of metrics that are available
     AvailableMetrics(AvailableMetrics),
 
-    Clusters(Vec<QueryAnswerCluster>),
+    Clusters(Vec<ClusterInformation>),
     /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
 
@@ -93,7 +93,7 @@ pub enum ResponseContent {
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct QueryAnswerCluster {
+pub struct ClusterInformation {
     pub configuration: Option<Cluster>,
     pub http_frontends: Vec<HttpFrontend>,
     pub https_frontends: Vec<HttpFrontend>,

@@ -22,7 +22,7 @@ use crate::{
     },
     response::{
         Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, PathRuleKind,
-        QueryAnswerCluster, Route, TcpFrontend, TcpListenerConfig,
+        ClusterInformation, Route, TcpFrontend, TcpListenerConfig,
     },
 };
 
@@ -1019,8 +1019,8 @@ impl ConfigState {
             .collect()
     }
 
-    pub fn cluster_state(&self, cluster_id: &str) -> QueryAnswerCluster {
-        QueryAnswerCluster {
+    pub fn cluster_state(&self, cluster_id: &str) -> ClusterInformation {
+        ClusterInformation {
             configuration: self.clusters.get(cluster_id).cloned(),
             http_frontends: self
                 .http_fronts
