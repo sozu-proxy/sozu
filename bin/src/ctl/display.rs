@@ -5,7 +5,7 @@ use prettytable::{Row, Table};
 
 use sozu_command_lib::response::{
     AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics, ListedFrontends,
-    ListenersList, QueryAnswerCertificate, ResponseContent, Route, WorkerInfo, WorkerMetrics,
+    ListenersList, ResponseContent, Route, WorkerInfo, WorkerMetrics,
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {

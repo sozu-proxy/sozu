@@ -22,8 +22,8 @@ use sozu_command::{
         QueryCertificateType, QueryClusterType, RemoveBackend, Request, WorkerRequest,
     },
     response::{
-        Event, HttpListenerConfig, HttpsListenerConfig, MessageId, QueryAnswerCertificate,
-        ResponseContent, ResponseStatus, TcpListenerConfig as CommandTcpListener, WorkerResponse,
+        Event, HttpListenerConfig, HttpsListenerConfig, MessageId, ResponseContent, ResponseStatus,
+        TcpListenerConfig as CommandTcpListener, WorkerResponse,
     },
     scm_socket::{Listeners, ScmSocket},
     state::{get_certificate, get_cluster_ids_by_domain, ConfigState},

@@ -97,7 +97,6 @@ impl CommandManager {
                             | ResponseContent::WorkerMetrics(_)
                             | ResponseContent::ClustersHashes(_)
                             | ResponseContent::Clusters(_)
-                            | ResponseContent::Certificates(_)
                             | ResponseContent::CertificatesByDomain(_)
                             | ResponseContent::CertificateByFingerprint(_)
                             | ResponseContent::AllCertificates(_)

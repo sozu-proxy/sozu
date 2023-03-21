@@ -80,7 +80,6 @@ pub enum ResponseContent {
     Clusters(Vec<QueryAnswerCluster>),
     /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
-    Certificates(QueryAnswerCertificate),
 
     /// returns a list of certificates: domain -> fingerprint
     AllCertificates(HashMap<SocketAddr, BTreeMap<String, Vec<u8>>>),
@@ -100,16 +99,6 @@ pub struct QueryAnswerCluster {
     pub https_frontends: Vec<HttpFrontend>,
     pub tcp_frontends: Vec<TcpFrontend>,
     pub backends: Vec<Backend>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QueryAnswerCertificate {
-    /*
-    /// returns a fingerprint
-    Domain(HashMap<SocketAddr, Option<(String, Vec<u8>)>>),
-    /// returns the certificate
-    Fingerprint(Option<(String, Vec<String>)>),
-    */
 }
 
 /// lists of available metrics in a worker, or in the main process (in which case there are no cluster metrics)
