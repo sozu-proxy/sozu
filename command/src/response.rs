@@ -84,6 +84,9 @@ pub enum ResponseContent {
 
     /// returns a list of certificates: domain -> fingerprint
     AllCertificates(HashMap<SocketAddr, BTreeMap<String, Vec<u8>>>),
+
+    /// returns certificates matching a certificate request by domain
+    CertificatesByDomain(HashMap<SocketAddr, Option<(String, Vec<u8>)>>),
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -97,8 +100,10 @@ pub struct QueryAnswerCluster {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryAnswerCertificate {
+    /*
     /// returns a fingerprint
     Domain(HashMap<SocketAddr, Option<(String, Vec<u8>)>>),
+    */
     /// returns the certificate
     Fingerprint(Option<(String, Vec<String>)>),
 }

@@ -98,6 +98,7 @@ impl CommandManager {
                             | ResponseContent::ClustersHashes(_)
                             | ResponseContent::Clusters(_)
                             | ResponseContent::Certificates(_)
+                            | ResponseContent::CertificatesByDomain(_)
                             | ResponseContent::AllCertificates(_)
                             | ResponseContent::AvailableMetrics(_)
                             | ResponseContent::Event(_) => {}

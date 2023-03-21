@@ -631,7 +631,7 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            ResponseContent::Certificates(QueryAnswerCertificate::Domain(h)) => {
+            ResponseContent::CertificatesByDomain(h) => {
                 for (addr, opt) in h.iter() {
                     println!("\t{addr}:");
                     if let Some((key, fingerprint)) = opt {

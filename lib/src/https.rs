@@ -54,10 +54,7 @@ use crate::{
             AddCertificate, Cluster, QueryCertificateType, RemoveCertificate, RemoveListener,
             ReplaceCertificate, Request, WorkerRequest,
         },
-        response::{
-            HttpFrontend, HttpsListenerConfig, QueryAnswerCertificate, ResponseContent, Route,
-            WorkerResponse,
-        },
+        response::{HttpFrontend, HttpsListenerConfig, ResponseContent, Route, WorkerResponse},
         scm_socket::ScmSocket,
         state::ClusterId,
     },
@@ -987,9 +984,7 @@ impl HttpsProxy {
             domain, certificates
         );
 
-        Ok(Some(ResponseContent::Certificates(
-            QueryAnswerCertificate::Domain(certificates),
-        )))
+        Ok(Some(ResponseContent::CertificatesByDomain(certificates)))
     }
 
     pub fn activate_listener(
