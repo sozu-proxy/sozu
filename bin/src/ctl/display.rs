@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    process::exit,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{self, Context};
 use prettytable::{Row, Table};
@@ -621,20 +618,9 @@ pub fn print_certificates(
         return Ok(());
     }
 
-    //println!("received: {:?}", data);
-    let it = response_contents.iter().map(|(k, v)| match v {
-        ResponseContent::Certificates(c) => (k, c),
-        v => {
-            eprintln!("unexpected certificates query answer: {v:?}");
-            exit(1);
-        }
-    });
-
-    for (k, v) in it {
-        println!("process '{k}':");
-
-        match v {
-            QueryAnswerCertificate::All(h) => {
+    for (_worker_id, response_content) in response_contents.iter() {
+        match response_content {
+            ResponseContent::AllCertificates(h) => {
                 for (addr, h2) in h.iter() {
                     println!("\t{addr}:");
 
@@ -645,7 +631,7 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            QueryAnswerCertificate::Domain(h) => {
+            ResponseContent::Certificates(QueryAnswerCertificate::Domain(h)) => {
                 for (addr, opt) in h.iter() {
                     println!("\t{addr}:");
                     if let Some((key, fingerprint)) = opt {
@@ -657,13 +643,14 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            QueryAnswerCertificate::Fingerprint(opt) => {
+            ResponseContent::Certificates(QueryAnswerCertificate::Fingerprint(opt)) => {
                 if let Some((s, v)) = opt {
                     println!("\tfrontends: {v:?}\ncertificate:\n{s}");
                 } else {
                     println!("\tnot found");
                 }
             }
+            _ => {}
         }
         println!();
     }

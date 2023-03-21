@@ -960,9 +960,7 @@ impl HttpsProxy {
             certificates
         );
 
-        Ok(Some(ResponseContent::Certificates(
-            QueryAnswerCertificate::All(certificates),
-        )))
+        Ok(Some(ResponseContent::AllCertificates(certificates)))
     }
 
     pub fn query_certificate_for_domain(
