@@ -80,7 +80,7 @@ pub enum Request {
     DeactivateListener(DeactivateListener),
 
     QueryAllCertificates,
-    QueryCertificateByFingerprint(Vec<u8>),
+    QueryCertificateByFingerprint(Fingerprint),
     QueryCertificatesByDomain(String),
 
     QueryClusters(QueryClusterType),

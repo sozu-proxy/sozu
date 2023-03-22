@@ -913,7 +913,7 @@ impl Server {
                     message.id.clone(),
                     ResponseContent::CertificateByFingerprint(get_certificate(
                         &self.config_state,
-                        f,
+                        &f.0,
                     )),
                 ));
                 return;
