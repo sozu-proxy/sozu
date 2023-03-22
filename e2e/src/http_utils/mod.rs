@@ -23,3 +23,15 @@ pub fn http_request<S1: Into<String>, S2: Into<String>, S3: Into<String>, S4: In
         content,
     )
 }
+
+// the default value for the 404 error, as provided in the command lib,
+// used as default for listeners
+pub fn default_404_answer() -> String {
+    String::from(include_str!("../../../command/assets/404.html"))
+}
+
+// the default value for the 503 error, as provided in the command lib,
+// used as default for listeners
+pub fn default_503_answer() -> String {
+    String::from(include_str!("../../../command/assets/503.html"))
+}

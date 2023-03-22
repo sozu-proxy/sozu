@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn lifecycle() -> Result<(), Box<dyn Error + Send + Sync>> {
-        let address = "127.0.0.1:8080".parse()?;
+        let address = "127.0.0.1:8080".to_string();
         let mut resolver = GenericCertificateResolver::new();
         let certificate_and_key = CertificateAndKey {
             certificate: String::from(include_str!("../assets/certificate.pem")),
@@ -674,7 +674,7 @@ mod tests {
             .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
 
         let fingerprint = resolver.add_certificate(&AddCertificate {
-            address,
+            address: address.clone(),
             certificate: certificate_and_key,
             names: vec![],
             expired_at: None,
@@ -711,7 +711,7 @@ mod tests {
 
     #[test]
     fn name_override() -> Result<(), Box<dyn Error + Send + Sync>> {
-        let address = "127.0.0.1:8080".parse()?;
+        let address = "127.0.0.1:8080".to_string();
         let mut resolver = GenericCertificateResolver::new();
         let certificate_and_key = CertificateAndKey {
             certificate: String::from(include_str!("../assets/certificate.pem")),
@@ -724,7 +724,7 @@ mod tests {
             .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
 
         let fingerprint = resolver.add_certificate(&AddCertificate {
-            address,
+            address: address.clone(),
             certificate: certificate_and_key,
             names: vec!["localhost".into(), "lolcatho.st".into()],
             expired_at: None,
@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn replacement() -> Result<(), Box<dyn Error + Send + Sync>> {
-        let address = "127.0.0.1:8080".parse()?;
+        let address = "127.0.0.1:8080".to_string();
         let mut resolver = GenericCertificateResolver::new();
 
         // ---------------------------------------------------------------------
@@ -789,7 +789,7 @@ mod tests {
 
         let names_1y = resolver.certificate_names(&pem)?;
         let fingerprint_1y = resolver.add_certificate(&AddCertificate {
-            address,
+            address: address.clone(),
             certificate: certificate_and_key_1y,
             names: vec![],
             expired_at: None,
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn expiration_override() -> Result<(), Box<dyn Error + Send + Sync>> {
-        let address = "127.0.0.1:8080".parse()?;
+        let address = "127.0.0.1:8080".to_string();
         let mut resolver = GenericCertificateResolver::new();
 
         // ---------------------------------------------------------------------
@@ -860,7 +860,7 @@ mod tests {
 
         let names_1y = resolver.certificate_names(&pem)?;
         let fingerprint_1y = resolver.add_certificate(&AddCertificate {
-            address,
+            address: address.clone(),
             certificate: certificate_and_key_1y,
             names: vec![],
             expired_at: Some(
@@ -972,12 +972,12 @@ mod tests {
 
         // ---------------------------------------------------------------------
         // load certificates in resolver
-        let address = "127.0.0.1:8080".parse()?;
+        let address = "127.0.0.1:8080".to_string();
         let mut resolver = GenericCertificateResolver::default();
 
         for certificate in &certificates {
             resolver.add_certificate(&AddCertificate {
-                address,
+                address: address.clone(),
                 certificate: certificate.to_owned(),
                 names: vec![],
                 expired_at: None,

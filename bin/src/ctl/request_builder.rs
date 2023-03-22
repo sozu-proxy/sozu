@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use anyhow::{bail, Context};
 
 use sozu_command_lib::{
@@ -7,14 +5,13 @@ use sozu_command_lib::{
         calculate_fingerprint, split_certificate_chain, CertificateAndKey, CertificateFingerprint,
         TlsVersion,
     },
-    config::{Config, FileListenerProtocolConfig, Listener, ProxyProtocolConfig},
+    config::{Config, ListenerBuilder, ProxyProtocolConfig},
     request::{
-        ActivateListener, AddCertificate, Cluster, DeactivateListener, ListenerType,
-        LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate,
+        ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, FrontendFilters,
+        ListenerType, LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend, RequestTcpFrontend,
     },
-    request::{FrontendFilters, Request},
-    response::{Backend, HttpFrontend, PathRule, RulePosition, TcpFrontend, TcpListenerConfig},
+    response::{PathRule, RulePosition},
 };
 
 use crate::{
@@ -121,9 +118,9 @@ impl CommandManager {
                 address,
                 sticky_id,
                 backup,
-            } => self.order_request(Request::AddBackend(Backend {
+            } => self.order_request(Request::AddBackend(AddBackend {
                 cluster_id: id,
-                address,
+                address: address.to_string(),
                 backend_id,
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id,
@@ -135,7 +132,7 @@ impl CommandManager {
                 address,
             } => self.order_request(Request::RemoveBackend(RemoveBackend {
                 cluster_id: id,
-                address,
+                address: address.to_string(),
                 backend_id,
             })),
         }
@@ -176,16 +173,16 @@ impl CommandManager {
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> anyhow::Result<()> {
         match cmd {
             TcpFrontendCmd::Add { id, address, tags } => {
-                self.order_request(Request::AddTcpFrontend(TcpFrontend {
+                self.order_request(Request::AddTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
-                    address,
+                    address: address.to_string(),
                     tags,
                 }))
             }
             TcpFrontendCmd::Remove { id, address } => {
-                self.order_request(Request::RemoveTcpFrontend(TcpFrontend {
+                self.order_request(Request::RemoveTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
-                    address,
+                    address: address.to_string(),
                     tags: None,
                 }))
             }
@@ -203,9 +200,9 @@ impl CommandManager {
                 method,
                 route,
                 tags,
-            } => self.order_request(Request::AddHttpFrontend(HttpFrontend {
+            } => self.order_request(Request::AddHttpFrontend(RequestHttpFrontend {
                 route: route.into(),
-                address,
+                address: address.to_string(),
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
@@ -221,9 +218,9 @@ impl CommandManager {
                 address,
                 method,
                 route,
-            } => self.order_request(Request::RemoveHttpFrontend(HttpFrontend {
+            } => self.order_request(Request::RemoveHttpFrontend(RequestHttpFrontend {
                 route: route.into(),
-                address,
+                address: address.to_string(),
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
@@ -244,9 +241,9 @@ impl CommandManager {
                 method,
                 route,
                 tags,
-            } => self.order_request(Request::AddHttpsFrontend(HttpFrontend {
+            } => self.order_request(Request::AddHttpsFrontend(RequestHttpFrontend {
                 route: route.into(),
-                address,
+                address: address.to_string(),
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
@@ -261,9 +258,9 @@ impl CommandManager {
                 address,
                 method,
                 route,
-            } => self.order_request(Request::RemoveHttpsFrontend(HttpFrontend {
+            } => self.order_request(Request::RemoveHttpsFrontend(RequestHttpFrontend {
                 route: route.into(),
-                address,
+                address: address.to_string(),
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
@@ -289,38 +286,31 @@ impl CommandManager {
                 request_timeout,
                 connect_timeout,
             } => {
-                let mut listener = Listener::new(address, FileListenerProtocolConfig::Https);
-                listener.public_address = public_address;
-                listener.answer_404 = answer_404;
-                listener.answer_503 = answer_503;
-                listener.expect_proxy = Some(expect_proxy);
-                if let Some(sticky_name) = sticky_name {
-                    listener.sticky_name = sticky_name;
-                }
-                listener.cipher_list = cipher_list;
-                listener.tls_versions = if tls_versions.is_empty() {
-                    None
-                } else {
-                    Some(tls_versions)
-                };
-                let https_listener = listener
-                    .to_tls(
-                        front_timeout,
-                        back_timeout,
-                        connect_timeout,
-                        request_timeout,
-                    )
+                let https_listener = ListenerBuilder::new_https(address)
+                    .with_public_address(public_address)
+                    .with_answer_404_path(answer_404)
+                    .with_answer_503_path(answer_503)
+                    .with_tls_versions(tls_versions)
+                    .with_cipher_list(cipher_list)
+                    .with_expect_proxy(expect_proxy)
+                    .with_sticky_name(sticky_name)
+                    .with_front_timeout(front_timeout)
+                    .with_back_timeout(back_timeout)
+                    .with_request_timeout(request_timeout)
+                    .with_connect_timeout(connect_timeout)
+                    .to_tls()
                     .with_context(|| "Error creating HTTPS listener")?;
+
                 self.order_request(Request::AddHttpsListener(https_listener))
             }
             HttpsListenerCmd::Remove { address } => {
-                self.remove_listener(address, ListenerType::HTTPS)
+                self.remove_listener(address.to_string(), ListenerType::HTTPS)
             }
             HttpsListenerCmd::Activate { address } => {
-                self.activate_listener(address, ListenerType::HTTPS)
+                self.activate_listener(address.to_string(), ListenerType::HTTPS)
             }
             HttpsListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address, ListenerType::HTTPS)
+                self.deactivate_listener(address.to_string(), ListenerType::HTTPS)
             }
         }
     }
@@ -339,33 +329,28 @@ impl CommandManager {
                 request_timeout,
                 connect_timeout,
             } => {
-                let mut listener = Listener::new(address, FileListenerProtocolConfig::Http);
-                listener.public_address = public_address;
-                listener.answer_404 = answer_404;
-                listener.answer_503 = answer_503;
-                listener.expect_proxy = Some(expect_proxy);
-                if let Some(sticky_name) = sticky_name {
-                    listener.sticky_name = sticky_name;
-                }
-
-                let http_listener = listener
-                    .to_http(
-                        front_timeout,
-                        back_timeout,
-                        connect_timeout,
-                        request_timeout,
-                    )
+                let http_listener = ListenerBuilder::new_http(address)
+                    .with_public_address(public_address)
+                    .with_answer_404_path(answer_404)
+                    .with_answer_503_path(answer_503)
+                    .with_expect_proxy(expect_proxy)
+                    .with_sticky_name(sticky_name)
+                    .with_front_timeout(front_timeout)
+                    .with_request_timeout(request_timeout)
+                    .with_back_timeout(back_timeout)
+                    .with_connect_timeout(connect_timeout)
+                    .to_http()
                     .with_context(|| "Error creating HTTP listener")?;
                 self.order_request(Request::AddHttpListener(http_listener))
             }
             HttpListenerCmd::Remove { address } => {
-                self.remove_listener(address, ListenerType::HTTP)
+                self.remove_listener(address.to_string(), ListenerType::HTTP)
             }
             HttpListenerCmd::Activate { address } => {
-                self.activate_listener(address, ListenerType::HTTP)
+                self.activate_listener(address.to_string(), ListenerType::HTTP)
             }
             HttpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address, ListenerType::HTTP)
+                self.deactivate_listener(address.to_string(), ListenerType::HTTP)
             }
         }
     }
@@ -376,20 +361,23 @@ impl CommandManager {
                 address,
                 public_address,
                 expect_proxy,
-            } => self.order_request(Request::AddTcpListener(TcpListenerConfig {
-                address,
-                public_address,
-                expect_proxy,
-                front_timeout: 60,
-                back_timeout: 30,
-                connect_timeout: 3,
-            })),
-            TcpListenerCmd::Remove { address } => self.remove_listener(address, ListenerType::TCP),
+            } => {
+                let listener = ListenerBuilder::new_tcp(address)
+                    .with_public_address(public_address)
+                    .with_expect_proxy(expect_proxy)
+                    .to_tcp()
+                    .with_context(|| "Could not create TCP listener")?;
+
+                self.order_request(Request::AddTcpListener(listener))
+            }
+            TcpListenerCmd::Remove { address } => {
+                self.remove_listener(address.to_string(), ListenerType::TCP)
+            }
             TcpListenerCmd::Activate { address } => {
-                self.activate_listener(address, ListenerType::TCP)
+                self.activate_listener(address.to_string(), ListenerType::TCP)
             }
             TcpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address, ListenerType::TCP)
+                self.deactivate_listener(address.to_string(), ListenerType::TCP)
             }
         }
     }
@@ -398,21 +386,20 @@ impl CommandManager {
         self.order_request(Request::ListListeners)
     }
 
-    pub fn remove_listener(
-        &mut self,
-        address: SocketAddr,
-        proxy: ListenerType,
-    ) -> anyhow::Result<()> {
-        self.order_request(Request::RemoveListener(RemoveListener { address, proxy }))
+    pub fn remove_listener(&mut self, address: String, proxy: ListenerType) -> anyhow::Result<()> {
+        self.order_request(Request::RemoveListener(RemoveListener {
+            address: address.parse().with_context(|| "wrong socket address")?,
+            proxy,
+        }))
     }
 
     pub fn activate_listener(
         &mut self,
-        address: SocketAddr,
+        address: String,
         proxy: ListenerType,
     ) -> anyhow::Result<()> {
         self.order_request(Request::ActivateListener(ActivateListener {
-            address,
+            address: address.parse().with_context(|| "wrong socket address")?,
             proxy,
             from_scm: false,
         }))
@@ -420,11 +407,12 @@ impl CommandManager {
 
     pub fn deactivate_listener(
         &mut self,
-        address: SocketAddr,
+        address: String,
         proxy: ListenerType,
     ) -> anyhow::Result<()> {
         self.order_request(Request::DeactivateListener(DeactivateListener {
-            address,
+            // address,
+            address: address.parse().with_context(|| "wrong socket address")?,
             proxy,
             to_scm: false,
         }))
@@ -436,7 +424,7 @@ impl CommandManager {
 
     pub fn add_certificate(
         &mut self,
-        address: SocketAddr,
+        address: String,
         certificate_path: &str,
         certificate_chain_path: &str,
         key_path: &str,
@@ -456,7 +444,7 @@ impl CommandManager {
 
     pub fn replace_certificate(
         &mut self,
-        address: SocketAddr,
+        address: String,
         new_certificate_path: &str,
         new_certificate_chain_path: &str,
         new_key_path: &str,
@@ -498,7 +486,7 @@ impl CommandManager {
 
     pub fn remove_certificate(
         &mut self,
-        address: SocketAddr,
+        address: String,
         certificate_path: Option<&str>,
         fingerprint: Option<&str>,
     ) -> anyhow::Result<()> {

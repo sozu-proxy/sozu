@@ -7,11 +7,13 @@ extern crate time;
 use std::{collections::BTreeMap, env, io::stdout, thread};
 
 use anyhow::Context;
-use sozu_command::{
+
+use crate::sozu_command::{
     channel::Channel,
+    config::ListenerBuilder,
     logging::{Logger, LoggerBackend},
-    request::{LoadBalancingParams, Request, WorkerRequest},
-    response::{Backend, HttpFrontend, HttpListenerConfig, PathRule, Route, RulePosition},
+    request::{AddBackend, LoadBalancingParams, Request, RequestHttpFrontend, WorkerRequest},
+    response::{PathRule, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -33,12 +35,7 @@ fn main() -> anyhow::Result<()> {
 
     info!("starting up");
 
-    let config = HttpListenerConfig {
-        address: "127.0.0.1:8080"
-            .parse()
-            .with_context(|| "could not parse address")?,
-        ..Default::default()
-    };
+    let http_listener = ListenerBuilder::new_http("127.0.0.1:8080").to_http()?;
 
     let (mut command, channel) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
@@ -46,14 +43,12 @@ fn main() -> anyhow::Result<()> {
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
+        sozu::http::start_http_worker(http_listener, channel, max_buffers, buffer_size);
     });
 
-    let http_front = HttpFrontend {
+    let http_front = RequestHttpFrontend {
         route: Route::ClusterId(String::from("test")),
-        address: "127.0.0.1:8080"
-            .parse()
-            .with_context(|| "could not parse address")?,
+        address: "127.0.0.1:8080".to_string(),
         hostname: String::from("example.com"),
         path: PathRule::Prefix(String::from("/")),
         method: None,
@@ -63,12 +58,10 @@ fn main() -> anyhow::Result<()> {
             ("id".to_owned(), "my-own-http-front".to_owned()),
         ])),
     };
-    let http_backend = Backend {
+    let http_backend = AddBackend {
         cluster_id: String::from("test"),
         backend_id: String::from("test-0"),
-        address: "127.0.0.1:8000"
-            .parse()
-            .with_context(|| "could not parse address")?,
+        address: "127.0.0.1:8000".to_string(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id: None,
         backup: None,

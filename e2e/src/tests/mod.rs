@@ -3,7 +3,7 @@ mod tests;
 use std::{io::stdin, net::SocketAddr};
 
 use sozu_command_lib::{
-    config::Config,
+    config::{Config, ListenerBuilder},
     request::Request,
     request::{ActivateListener, ListenerType},
     scm_socket::Listeners,
@@ -43,9 +43,9 @@ pub fn setup_test<S: Into<String>>(
 ) -> (Worker, Vec<SocketAddr>) {
     let mut worker = Worker::start_new_worker(name, config, &listeners, state);
 
-    worker.send_proxy_request(Request::AddHttpListener(Worker::default_http_listener(
-        front_address,
-    )));
+    worker.send_proxy_request(Request::AddHttpListener(
+        ListenerBuilder::new_http(front_address).to_http().unwrap(),
+    ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::HTTP,
@@ -59,13 +59,13 @@ pub fn setup_test<S: Into<String>>(
 
     let mut backends = Vec::new();
     for i in 0..nb_backends {
-        let back_address = format!("127.0.0.1:{}", 2002 + i)
+        let back_address: SocketAddr = format!("127.0.0.1:{}", 2002 + i)
             .parse()
             .expect("could not parse back address");
         worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
             "cluster_0",
             format!("cluster_0-{i}"),
-            back_address,
+            back_address.to_string(),
         )));
         backends.push(back_address);
     }

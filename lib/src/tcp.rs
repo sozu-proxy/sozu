@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{hash_map::Entry, BTreeMap, HashMap},
-    io::{self, ErrorKind},
+    io::ErrorKind,
     net::{Shutdown, SocketAddr},
     os::unix::io::AsRawFd,
     rc::Rc,
@@ -37,8 +37,8 @@ use crate::{
         config::ProxyProtocolConfig,
         logging,
         ready::Ready,
-        request::{Request, WorkerRequest},
-        response::{Event, ProxyResponse, TcpFrontend, TcpListenerConfig},
+        request::{Request, RequestTcpFrontend, WorkerRequest},
+        response::{Event, ProxyResponse, TcpListenerConfig},
         scm_socket::ScmSocket,
         state::ClusterId,
     },
@@ -1271,49 +1271,47 @@ impl TcpProxy {
             })
     }
 
-    pub fn add_tcp_front(&mut self, front: TcpFrontend) -> Result<(), io::Error> {
+    pub fn add_tcp_front(&mut self, front: RequestTcpFrontend) -> anyhow::Result<()> {
+        let address = front
+            .address
+            .parse()
+            .with_context(|| "wrong socket address")?;
+
         let mut listener = match self
             .listeners
             .values()
-            .find(|l| l.borrow().address == front.address)
+            .find(|l| l.borrow().address == address)
         {
             Some(l) => l.borrow_mut(),
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no such listener for '{}'", front.address),
-                ));
-            }
+            None => bail!(format!("no such listener for '{}'", front.address)),
         };
 
         self.fronts
             .insert(front.cluster_id.to_string(), listener.token);
-
         listener.set_tags(front.address.to_string(), front.tags);
         listener.cluster_id = Some(front.cluster_id.to_string());
         Ok(())
     }
 
-    pub fn remove_tcp_front(&mut self, front: &TcpFrontend) -> Result<(), io::Error> {
+    pub fn remove_tcp_front(&mut self, front: RequestTcpFrontend) -> anyhow::Result<()> {
+        let address = front
+            .address
+            .parse()
+            .with_context(|| "wrong socket address")?;
+
         let mut listener = match self
             .listeners
             .values()
-            .find(|l| l.borrow().address == front.address)
+            .find(|l| l.borrow().address == address)
         {
             Some(l) => l.borrow_mut(),
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no such listener for '{}'", front.address),
-                ));
-            }
+            None => bail!(format!("no such listener for '{}'", front.address)),
         };
 
         listener.set_tags(front.address.to_string(), None);
         if let Some(cluster_id) = listener.cluster_id.take() {
             self.fronts.remove(&cluster_id);
         }
-
         Ok(())
     }
 }
@@ -1329,7 +1327,7 @@ impl ProxyConfiguration for TcpProxy {
                 ProxyResponse::ok(message.id)
             }
             Request::RemoveTcpFrontend(front) => {
-                if let Err(err) = self.remove_tcp_front(&front) {
+                if let Err(err) = self.remove_tcp_front(front) {
                     return ProxyResponse::error(message.id, err);
                 }
 
@@ -1841,11 +1839,9 @@ mod tests {
 
         command.blocking().unwrap();
         {
-            let front = TcpFrontend {
+            let front = RequestTcpFrontend {
                 cluster_id: String::from("yolo"),
-                address: "127.0.0.1:1234"
-                    .parse()
-                    .with_context(|| "Could not parse address")?,
+                address: "127.0.0.1:1234".to_string(),
                 tags: None,
             };
             let backend = sozu_command_lib::response::Backend {
@@ -1868,16 +1864,14 @@ mod tests {
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO2"),
-                    content: Request::AddBackend(backend),
+                    content: Request::AddBackend(backend.to_add_backend()),
                 })
                 .unwrap();
         }
         {
-            let front = TcpFrontend {
+            let front = RequestTcpFrontend {
                 cluster_id: String::from("yolo"),
-                address: "127.0.0.1:1235"
-                    .parse()
-                    .with_context(|| "Could not parse address")?,
+                address: "127.0.0.1:1235".to_string(),
                 tags: None,
             };
             let backend = sozu_command::response::Backend {
@@ -1899,7 +1893,7 @@ mod tests {
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO4"),
-                    content: Request::AddBackend(backend),
+                    content: Request::AddBackend(backend.to_add_backend()),
                 })
                 .unwrap();
         }

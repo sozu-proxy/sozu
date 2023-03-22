@@ -17,7 +17,7 @@ use time::{Duration, Instant};
 use sozu_command::{
     logging,
     ready::Ready,
-    request::{Cluster, RemoveListener, Request, WorkerRequest},
+    request::{Cluster, RemoveListener, Request, RequestHttpFrontend, WorkerRequest},
     response::{HttpFrontend, HttpListenerConfig, ProxyResponse, Route},
     scm_socket::{Listeners, ScmSocket},
 };
@@ -615,7 +615,9 @@ impl HttpProxy {
         Ok(())
     }
 
-    pub fn add_http_frontend(&mut self, front: HttpFrontend) -> anyhow::Result<()> {
+    pub fn add_http_frontend(&mut self, front: RequestHttpFrontend) -> anyhow::Result<()> {
+        let front = front.to_frontend()?;
+
         match self
             .listeners
             .values()
@@ -639,7 +641,9 @@ impl HttpProxy {
         }
     }
 
-    pub fn remove_http_frontend(&mut self, front: HttpFrontend) -> anyhow::Result<()> {
+    pub fn remove_http_frontend(&mut self, front: RequestHttpFrontend) -> anyhow::Result<()> {
+        let front = front.to_frontend()?;
+
         if let Some(listener) = self
             .listeners
             .values()
@@ -1077,11 +1081,13 @@ pub fn start_http_worker(
 #[cfg(test)]
 mod tests {
     extern crate tiny_http;
+    use sozu_command::config::ListenerBuilder;
+
     use super::*;
     use crate::sozu_command::{
         channel::Channel,
         request::{LoadBalancingAlgorithms, LoadBalancingParams, Request, WorkerRequest},
-        response::{Backend, HttpFrontend, HttpListenerConfig, PathRule, Route, RulePosition},
+        response::{Backend, HttpFrontend, PathRule, Route, RulePosition},
     };
 
     use std::io::{Read, Write};
@@ -1112,12 +1118,9 @@ mod tests {
         start_server(1025, barrier.clone());
         barrier.wait();
 
-        let address: SocketAddr =
-            FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
-        let config = HttpListenerConfig {
-            address,
-            ..Default::default()
-        };
+        let config = ListenerBuilder::new_http("127.0.0.1:1024")
+            .to_http()
+            .expect("could not create listener config");
 
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
@@ -1126,9 +1129,9 @@ mod tests {
             start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
         });
 
-        let front = HttpFrontend {
+        let front = RequestHttpFrontend {
             route: Route::ClusterId(String::from("cluster_1")),
-            address: "127.0.0.1:1024".parse().unwrap(),
+            address: "127.0.0.1:1024".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::Prefix(String::from("/")),
             method: None,
@@ -1152,7 +1155,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Request::AddBackend(backend),
+                content: Request::AddBackend(backend.to_add_backend()),
             })
             .unwrap();
 
@@ -1199,12 +1202,9 @@ mod tests {
         start_server(1028, barrier.clone());
         barrier.wait();
 
-        let address: SocketAddr =
-            FromStr::from_str("127.0.0.1:1031").expect("could not parse address");
-        let config = HttpListenerConfig {
-            address,
-            ..Default::default()
-        };
+        let config = ListenerBuilder::new_http("127.0.0.1:1031")
+            .to_http()
+            .expect("could not create listener config");
 
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
@@ -1214,8 +1214,8 @@ mod tests {
             start_http_worker(config, channel, 10, 16384).expect("could not start the http server");
         });
 
-        let front = HttpFrontend {
-            address: "127.0.0.1:1031".parse().unwrap(),
+        let front = RequestHttpFrontend {
+            address: "127.0.0.1:1031".to_string(),
             hostname: String::from("localhost"),
             method: None,
             path: PathRule::Prefix(String::from("/")),
@@ -1240,7 +1240,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Request::AddBackend(backend),
+                content: Request::AddBackend(backend.to_add_backend()),
             })
             .unwrap();
 
@@ -1313,12 +1313,10 @@ mod tests {
     #[test]
     fn https_redirect() {
         setup_test_logger!();
-        let address: SocketAddr =
-            FromStr::from_str("127.0.0.1:1041").expect("could not parse address");
-        let config = HttpListenerConfig {
-            address,
-            ..Default::default()
-        };
+
+        let config = ListenerBuilder::new_http("127.0.0.1:1041")
+            .to_http()
+            .expect("could not create listener config");
 
         let (mut command, channel) =
             Channel::generate(1000, 10000).expect("should create a channel");
@@ -1342,8 +1340,8 @@ mod tests {
                 content: Request::AddCluster(cluster),
             })
             .unwrap();
-        let front = HttpFrontend {
-            address: "127.0.0.1:1041".parse().unwrap(),
+        let front = RequestHttpFrontend {
+            address: "127.0.0.1:1041".to_string(),
             hostname: String::from("localhost"),
             method: None,
             path: PathRule::Prefix(String::from("/")),
@@ -1368,7 +1366,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_IJKL"),
-                content: Request::AddBackend(backend),
+                content: Request::AddBackend(backend.to_add_backend()),
             })
             .unwrap();
 
@@ -1495,6 +1493,11 @@ mod tests {
 
         let address: SocketAddr =
             FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
+
+        let default_config = ListenerBuilder::new_http(address)
+            .to_http()
+            .expect("Could not create default HTTP listener config");
+
         let listener = HttpListener {
             listener: None,
             address,
@@ -1503,7 +1506,7 @@ mod tests {
                 "HTTP/1.1 404 Not Found\r\n\r\n",
                 "HTTP/1.1 503 Service Unavailable\r\n\r\n",
             ))),
-            config: Default::default(),
+            config: default_config,
             token: Token(0),
             active: true,
             tags: BTreeMap::new(),

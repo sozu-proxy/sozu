@@ -13,8 +13,10 @@ use sozu_command_lib::{
     },
     channel::Channel,
     config::Config,
-    request::{AddCertificate, RemoveBackend, ReplaceCertificate, Request},
-    response::{Backend, HttpFrontend, PathRule, Response, ResponseStatus, Route, RulePosition},
+    request::{
+        AddBackend, AddCertificate, RemoveBackend, ReplaceCertificate, Request, RequestHttpFrontend,
+    },
+    response::{PathRule, Response, ResponseStatus, Route, RulePosition},
 };
 
 use crate::util;
@@ -58,9 +60,7 @@ pub fn main(
     let http = http_frontend_address
         .parse::<SocketAddr>()
         .with_context(|| "invalid HTTP frontend address format")?;
-    let https = https_frontend_address
-        .parse::<SocketAddr>()
-        .with_context(|| "invalid HTTPS frontend address format")?;
+    let https = https_frontend_address;
 
     let old_certificate_file = match old_certificate_path {
         Some(path) => {
@@ -152,7 +152,7 @@ pub fn main(
         let acme_app_id = generate_app_id(&cluster_id);
 
         debug!("setting up proxying");
-        set_up_proxying(&mut channel, &http, &acme_app_id, &domain, &path, address)
+        set_up_proxying(&mut channel, &http, &acme_app_id, &domain, &path, &address)
             .with_context(|| "could not set up proxying to HTTP challenge server")?;
 
         let path2 = path.clone();
@@ -286,12 +286,12 @@ fn set_up_proxying(
     cluster_id: &str,
     hostname: &str,
     path_begin: &str,
-    server_address: SocketAddr,
+    server_address: &SocketAddr,
 ) -> anyhow::Result<()> {
-    let add_http_front = Request::AddHttpFrontend(HttpFrontend {
+    let add_http_front = Request::AddHttpFrontend(RequestHttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
         hostname: String::from(hostname),
-        address: *frontend,
+        address: frontend.to_string(),
         path: PathRule::Prefix(path_begin.to_owned()),
         method: None,
         position: RulePosition::Tree,
@@ -300,10 +300,10 @@ fn set_up_proxying(
 
     order_request(channel, add_http_front).with_context(|| "Request AddHttpFront failed")?;
 
-    let add_backend = Request::AddBackend(Backend {
-        cluster_id: String::from(cluster_id),
+    let add_backend = Request::AddBackend(AddBackend {
+        cluster_id: cluster_id.to_string(),
         backend_id: format!("{cluster_id}-0"),
-        address: server_address,
+        address: server_address.to_string(),
         load_balancing_parameters: None,
         sticky_id: None,
         backup: None,
@@ -321,9 +321,9 @@ fn remove_proxying(
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let remove_http_front = Request::RemoveHttpFrontend(HttpFrontend {
+    let remove_http_front = Request::RemoveHttpFrontend(RequestHttpFrontend {
         route: Route::ClusterId(cluster_id.to_owned()),
-        address: *frontend,
+        address: frontend.to_string(),
         hostname: String::from(hostname),
         path: PathRule::Prefix(path_begin.to_owned()),
         method: None,
@@ -333,9 +333,9 @@ fn remove_proxying(
     order_request(channel, remove_http_front).with_context(|| "RemoveHttpFront request failed")?;
 
     let remove_backend = Request::RemoveBackend(RemoveBackend {
+        address: server_address.to_string(),
         cluster_id: String::from(cluster_id),
         backend_id: format!("{cluster_id}-0"),
-        address: server_address,
     });
 
     order_request(channel, remove_backend).with_context(|| "RemoveBackend request failed")?;
@@ -344,7 +344,7 @@ fn remove_proxying(
 
 fn add_certificate(
     channel: &mut Channel<Request, Response>,
-    frontend: &SocketAddr,
+    frontend: &str,
     hostname: &str,
     certificate_path: &str,
     chain_path: &str,
@@ -363,7 +363,7 @@ fn add_certificate(
 
     let request = match old_fingerprint {
         None => Request::AddCertificate(AddCertificate {
-            address: *frontend,
+            address: frontend.to_owned(),
             certificate: CertificateAndKey {
                 certificate,
                 certificate_chain,
@@ -375,7 +375,7 @@ fn add_certificate(
         }),
 
         Some(f) => Request::ReplaceCertificate(ReplaceCertificate {
-            address: *frontend,
+            address: frontend.to_owned(),
             new_certificate: CertificateAndKey {
                 certificate,
                 certificate_chain,

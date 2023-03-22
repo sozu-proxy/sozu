@@ -26,7 +26,7 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::config::DEFAULT_CIPHER_SUITES;
+use sozu_command::{config::DEFAULT_CIPHER_SUITES, request::RequestHttpFrontend};
 use time::{Duration, Instant};
 
 use crate::{
@@ -1081,8 +1081,10 @@ impl HttpsProxy {
 
     pub fn add_https_frontend(
         &mut self,
-        front: HttpFrontend,
+        front: RequestHttpFrontend,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
+        let front = front.to_frontend()?;
+
         match self
             .listeners
             .values()
@@ -1102,8 +1104,10 @@ impl HttpsProxy {
 
     pub fn remove_https_frontend(
         &mut self,
-        front: HttpFrontend,
+        front: RequestHttpFrontend,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
+        let front = front.to_frontend()?;
+
         if let Some(listener) = self
             .listeners
             .values()
@@ -1122,10 +1126,11 @@ impl HttpsProxy {
         &mut self,
         add_certificate: AddCertificate,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
+        let address = add_certificate.address.parse()?;
         match self
             .listeners
             .values()
-            .find(|l| l.borrow().address == add_certificate.address)
+            .find(|l| l.borrow().address == address)
         {
             Some(listener) => listener
                 .borrow_mut()
@@ -1145,10 +1150,11 @@ impl HttpsProxy {
         &mut self,
         remove_certificate: RemoveCertificate,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
+        let address = remove_certificate.address.parse()?;
         match self
             .listeners
             .values()
-            .find(|l| l.borrow().address == remove_certificate.address)
+            .find(|l| l.borrow().address == address)
         {
             Some(listener) => listener
                 .borrow_mut()
@@ -1168,10 +1174,11 @@ impl HttpsProxy {
         &mut self,
         replace_certificate: ReplaceCertificate,
     ) -> anyhow::Result<Option<ProxyResponseContent>> {
+        let address = replace_certificate.address.parse()?;
         match self
             .listeners
             .values()
-            .find(|l| l.borrow().address == replace_certificate.address)
+            .find(|l| l.borrow().address == address)
         {
             Some(listener) => listener
                 .borrow_mut()
@@ -1556,6 +1563,8 @@ pub fn start_https_worker(
 mod tests {
     use std::{str::FromStr, sync::Arc};
 
+    use sozu_command::config::ListenerBuilder;
+
     use crate::router::{trie::TrieNode, MethodRule, PathRule, Router};
     use crate::sozu_command::response::Route;
 
@@ -1628,6 +1637,10 @@ mod tests {
 
         let rustls_details = Arc::new(server_config);
 
+        let default_config = ListenerBuilder::new_https(address)
+            .to_tls()
+            .expect("Could not create default HTTPS listener config");
+
         let listener = HttpsListener {
             listener: None,
             address,
@@ -1638,7 +1651,7 @@ mod tests {
                 "HTTP/1.1 404 Not Found\r\n\r\n",
                 "HTTP/1.1 503 Service Unavailable\r\n\r\n",
             ))),
-            config: Default::default(),
+            config: default_config,
             token: Token(0),
             active: true,
             tags: BTreeMap::new(),

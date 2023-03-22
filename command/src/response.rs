@@ -1,7 +1,6 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
-    convert::From,
     default::Default,
     fmt,
     net::SocketAddr,
@@ -9,12 +8,11 @@ use std::{
 
 use crate::{
     certificate::TlsVersion,
-    config::{
-        DEFAULT_CIPHER_SUITES, DEFAULT_GROUPS_LIST, DEFAULT_RUSTLS_CIPHER_LIST,
-        DEFAULT_SIGNATURE_ALGORITHMS,
+    request::{
+        default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams,
+        RequestHttpFrontend, RequestTcpFrontend, PROTOCOL_VERSION,
     },
-    request::{default_sticky_name, is_false, Cluster, LoadBalancingParams, PROTOCOL_VERSION},
-    state::{ClusterId, ConfigState, RouteKey},
+    state::{ClusterId, ConfigState},
 };
 
 /// Responses of the main process to the CLI (or other client)
@@ -131,15 +129,17 @@ pub struct HttpFrontend {
     pub tags: Option<BTreeMap<String, String>>,
 }
 
-impl HttpFrontend {
-    /// `is_cluster_id` check if the frontend is dedicated to the given cluster_id
-    pub fn is_cluster_id(&self, cluster_id: &str) -> bool {
-        matches!(&self.route, Route::ClusterId(id) if id == cluster_id)
-    }
-
-    /// `route_key` returns a representation of the frontend as a route key
-    pub fn route_key(&self) -> RouteKey {
-        self.into()
+impl Into<RequestHttpFrontend> for HttpFrontend {
+    fn into(self) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            route: self.route,
+            address: self.address.to_string(),
+            hostname: self.hostname,
+            path: self.path,
+            method: self.method,
+            position: self.position,
+            tags: self.tags,
+        }
     }
 }
 
@@ -209,7 +209,7 @@ impl Default for PathRule {
     }
 }
 
-fn is_default_path_rule(p: &PathRule) -> bool {
+pub fn is_default_path_rule(p: &PathRule) -> bool {
     match p {
         PathRule::Regex(_) => false,
         PathRule::Equals(_) => false,
@@ -232,6 +232,16 @@ pub struct TcpFrontend {
     pub cluster_id: String,
     pub address: SocketAddr,
     pub tags: Option<BTreeMap<String, String>>,
+}
+
+impl Into<RequestTcpFrontend> for TcpFrontend {
+    fn into(self) -> RequestTcpFrontend {
+        RequestTcpFrontend {
+            cluster_id: self.cluster_id,
+            address: self.address.to_string(),
+            tags: self.tags,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -278,6 +288,19 @@ impl PartialOrd for Backend {
     }
 }
 
+impl Backend {
+    pub fn to_add_backend(self) -> AddBackend {
+        AddBackend {
+            cluster_id: self.cluster_id,
+            address: self.address.to_string(),
+            sticky_id: self.sticky_id,
+            backend_id: self.backend_id,
+            load_balancing_parameters: self.load_balancing_parameters,
+            backup: self.backup,
+        }
+    }
+}
+
 /// All listeners, listed for the CLI.
 /// the bool indicates if it is active or not
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -310,24 +333,6 @@ pub struct HttpListenerConfig {
     pub request_timeout: u32,
 }
 
-// TODO: set the default values elsewhere, see #873
-impl Default for HttpListenerConfig {
-    fn default() -> HttpListenerConfig {
-        HttpListenerConfig {
-            address:           "127.0.0.1:8080".parse().expect("could not parse address"),
-              public_address:  None,
-              answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-              answer_503:      String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-              expect_proxy:    false,
-              sticky_name:     String::from("SOZUBALANCEID"),
-              front_timeout:   60,
-              back_timeout:    30,
-              connect_timeout: 3,
-              request_timeout: 10,
-        }
-    }
-}
-
 /// details of an HTTPS listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpsListenerConfig {
@@ -358,39 +363,6 @@ pub struct HttpsListenerConfig {
     pub connect_timeout: u32,
     /// max time to send a complete request
     pub request_timeout: u32,
-}
-
-impl Default for HttpsListenerConfig {
-    fn default() -> HttpsListenerConfig {
-        HttpsListenerConfig {
-      address:         "127.0.0.1:8443".parse().expect("could not parse address"),
-      public_address:  None,
-      answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-      answer_503:      String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
-      cipher_list:     DEFAULT_RUSTLS_CIPHER_LIST.into_iter()
-          .map(String::from)
-          .collect(),
-      cipher_suites:  DEFAULT_CIPHER_SUITES.into_iter()
-          .map(String::from)
-          .collect(),
-      signature_algorithms: DEFAULT_SIGNATURE_ALGORITHMS.into_iter()
-          .map(String::from)
-          .collect(),
-      groups_list: DEFAULT_GROUPS_LIST.into_iter()
-          .map(String::from)
-          .collect(),
-      versions:            vec!(TlsVersion::TLSv1_2),
-      expect_proxy:        false,
-      sticky_name:         String::from("SOZUBALANCEID"),
-      certificate:         None,
-      certificate_chain:   vec![],
-      key:                 None,
-      front_timeout:   60,
-      back_timeout:    30,
-      connect_timeout: 3,
-      request_timeout: 10,
-    }
-    }
 }
 
 /// details of an TCP listener, sent by the main process to the worker

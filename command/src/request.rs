@@ -1,13 +1,15 @@
-use std::{error, fmt, net::SocketAddr, str::FromStr};
+use std::{collections::BTreeMap, error, fmt, net::SocketAddr, str::FromStr};
+
+use anyhow::Context;
 
 use crate::{
     certificate::{CertificateAndKey, CertificateFingerprint},
     config::ProxyProtocolConfig,
     response::{
-        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpFrontend,
-        TcpListenerConfig,
+        is_default_path_rule, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId,
+        PathRule, Route, RulePosition, TcpListenerConfig,
     },
-    state::ClusterId,
+    state::{ClusterId, RouteKey},
 };
 
 pub const PROTOCOL_VERSION: u8 = 0;
@@ -52,20 +54,20 @@ pub enum Request {
         cluster_id: String,
     },
 
-    AddHttpFrontend(HttpFrontend),
-    RemoveHttpFrontend(HttpFrontend),
+    AddHttpFrontend(RequestHttpFrontend),
+    RemoveHttpFrontend(RequestHttpFrontend),
 
-    AddHttpsFrontend(HttpFrontend),
-    RemoveHttpsFrontend(HttpFrontend),
+    AddHttpsFrontend(RequestHttpFrontend),
+    RemoveHttpsFrontend(RequestHttpFrontend),
 
     AddCertificate(AddCertificate),
     ReplaceCertificate(ReplaceCertificate),
     RemoveCertificate(RemoveCertificate),
 
-    AddTcpFrontend(TcpFrontend),
-    RemoveTcpFrontend(TcpFrontend),
+    AddTcpFrontend(RequestTcpFrontend),
+    RemoveTcpFrontend(RequestTcpFrontend),
 
-    AddBackend(Backend),
+    AddBackend(AddBackend),
     RemoveBackend(RemoveBackend),
 
     AddHttpListener(HttpListenerConfig),
@@ -268,7 +270,7 @@ pub struct FrontendFilters {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AddCertificate {
-    pub address: SocketAddr,
+    pub address: String,
     pub certificate: CertificateAndKey,
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
     pub names: Vec<String>,
@@ -280,13 +282,13 @@ pub struct AddCertificate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RemoveCertificate {
-    pub address: SocketAddr,
+    pub address: String,
     pub fingerprint: CertificateFingerprint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReplaceCertificate {
-    pub address: SocketAddr,
+    pub address: String,
     pub new_certificate: CertificateAndKey,
     pub old_fingerprint: CertificateFingerprint,
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
@@ -295,11 +297,68 @@ pub struct ReplaceCertificate {
     pub new_expired_at: Option<i64>,
 }
 
+/// Meant for outside users, contains a String instead of a SocketAddr
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestTcpFrontend {
+    pub cluster_id: String,
+    pub address: String,
+    pub tags: Option<BTreeMap<String, String>>,
+}
+
+/// A frontend as requested from the client, with a string SocketAddress
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestHttpFrontend {
+    pub route: Route,
+    pub address: String,
+    pub hostname: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "is_default_path_rule")]
+    pub path: PathRule,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub position: RulePosition,
+    pub tags: Option<BTreeMap<String, String>>,
+}
+
+impl RequestHttpFrontend {
+    /// `route_key` returns a representation of the frontend as a route key
+    pub fn route_key(&self) -> RouteKey {
+        self.into()
+    }
+
+    /// convert a requested frontend to a usable one by parsing its address
+    pub fn to_frontend(self) -> anyhow::Result<HttpFrontend> {
+        Ok(HttpFrontend {
+            address: self
+                .address
+                .parse::<SocketAddr>()
+                .with_context(|| "wrong socket address")?,
+            route: self.route,
+            hostname: self.hostname,
+            path: self.path,
+            method: self.method,
+            position: self.position,
+            tags: self.tags,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RemoveBackend {
     pub cluster_id: String,
     pub backend_id: String,
-    pub address: SocketAddr,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AddBackend {
+    pub cluster_id: String,
+    pub backend_id: String,
+    pub address: String,
+    pub sticky_id: Option<String>,
+    pub load_balancing_parameters: Option<LoadBalancingParams>,
+    pub backup: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -406,7 +465,7 @@ mod tests {
     use super::*;
     use crate::certificate::{split_certificate_chain, TlsVersion};
     use crate::config::ProxyProtocolConfig;
-    use crate::response::{Backend, HttpFrontend, PathRule, Route, RulePosition};
+    use crate::response::{HttpFrontend, PathRule, Route, RulePosition};
     use hex::FromHex;
     use serde_json;
 
@@ -417,12 +476,12 @@ mod tests {
         println!("{message:?}");
         assert_eq!(
             message,
-            Request::AddHttpFrontend(HttpFrontend {
+            Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::Prefix(String::from("xxx")),
                 method: None,
-                address: "0.0.0.0:8080".parse().unwrap(),
+                address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree,
                 tags: None,
             })
@@ -471,12 +530,12 @@ mod tests {
     test_message!(
         add_http_front,
         "../assets/add_http_front.json",
-        Request::AddHttpFrontend(HttpFrontend {
+        Request::AddHttpFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::Prefix(String::from("xxx")),
             method: None,
-            address: "0.0.0.0:8080".parse().unwrap(),
+            address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
             tags: None,
         })
@@ -485,12 +544,12 @@ mod tests {
     test_message!(
         remove_http_front,
         "../assets/remove_http_front.json",
-        Request::RemoveHttpFrontend(HttpFrontend {
+        Request::RemoveHttpFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::Prefix(String::from("xxx")),
             method: None,
-            address: "0.0.0.0:8080".parse().unwrap(),
+            address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
             tags: Some(BTreeMap::from([
                 ("owner".to_owned(), "John".to_owned()),
@@ -505,12 +564,12 @@ mod tests {
     test_message!(
         add_https_front,
         "../assets/add_https_front.json",
-        Request::AddHttpsFrontend(HttpFrontend {
+        Request::AddHttpsFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::Prefix(String::from("xxx")),
             method: None,
-            address: "0.0.0.0:8443".parse().unwrap(),
+            address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
             tags: None,
         })
@@ -519,12 +578,12 @@ mod tests {
     test_message!(
         remove_https_front,
         "../assets/remove_https_front.json",
-        Request::RemoveHttpsFrontend(HttpFrontend {
+        Request::RemoveHttpsFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::Prefix(String::from("xxx")),
             method: None,
-            address: "0.0.0.0:8443".parse().unwrap(),
+            address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
             tags: Some(BTreeMap::from([
                 ("owner".to_owned(), "John".to_owned()),
@@ -573,10 +632,10 @@ mod tests {
     test_message!(
         add_backend,
         "../assets/add_backend.json",
-        Request::AddBackend(Backend {
+        Request::AddBackend(AddBackend {
             cluster_id: String::from("xxx"),
             backend_id: String::from("xxx-0"),
-            address: "127.0.0.1:8080".parse().unwrap(),
+            address: "127.0.0.1:8080".to_string(),
             load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
             sticky_id: Some(String::from("xxx-0")),
             backup: Some(false),
@@ -642,12 +701,12 @@ mod tests {
         println!("{command:?}");
         assert!(
             command
-                == Request::AddHttpFrontend(HttpFrontend {
+                == Request::AddHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
                     path: PathRule::Prefix(String::from("xxx")),
                     method: None,
-                    address: "127.0.0.1:4242".parse().unwrap(),
+                    address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
                     tags: None,
                 })
@@ -661,12 +720,12 @@ mod tests {
         println!("{command:?}");
         assert!(
             command
-                == Request::RemoveHttpFrontend(HttpFrontend {
+                == Request::RemoveHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
                     path: PathRule::Prefix(String::from("xxx")),
                     method: None,
-                    address: "127.0.0.1:4242".parse().unwrap(),
+                    address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
                     tags: Some(BTreeMap::from([
                         ("owner".to_owned(), "John".to_owned()),
@@ -683,10 +742,10 @@ mod tests {
         println!("{command:?}");
         assert!(
             command
-                == Request::AddBackend(Backend {
+                == Request::AddBackend(AddBackend {
                     cluster_id: String::from("xxx"),
                     backend_id: String::from("xxx-0"),
-                    address: "0.0.0.0:8080".parse().unwrap(),
+                    address: "0.0.0.0:8080".to_string(),
                     sticky_id: None,
                     load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
                     backup: None,
@@ -716,12 +775,12 @@ mod tests {
         println!("{command:?}");
         assert!(
             command
-                == Request::AddHttpFrontend(HttpFrontend {
+                == Request::AddHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
                     path: PathRule::Prefix(String::from("")),
                     method: None,
-                    address: "127.0.0.1:4242".parse().unwrap(),
+                    address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
                     tags: Some(BTreeMap::from([
                         ("owner".to_owned(), "John".to_owned()),

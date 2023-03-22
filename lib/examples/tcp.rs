@@ -10,8 +10,8 @@ use anyhow::Context;
 use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    request::{LoadBalancingParams, Request, WorkerRequest},
-    response::{Backend, TcpFrontend, TcpListenerConfig},
+    request::{AddBackend, LoadBalancingParams, Request, RequestTcpFrontend, WorkerRequest},
+    response::TcpListenerConfig,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -55,19 +55,15 @@ fn main() -> anyhow::Result<()> {
         sozu::tcp::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 
-    let tcp_front = TcpFrontend {
+    let tcp_front = RequestTcpFrontend {
         cluster_id: String::from("test"),
-        address: "127.0.0.1:8080"
-            .parse()
-            .with_context(|| "could not parse address")?,
+        address: "127.0.0.1:8080".to_string(),
         tags: None,
     };
-    let tcp_backend = Backend {
+    let tcp_backend = AddBackend {
         cluster_id: String::from("test"),
         backend_id: String::from("test-0"),
-        address: "127.0.0.1:1026"
-            .parse()
-            .with_context(|| "could not parse address")?,
+        address: "127.0.0.1:1026".to_string(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id: None,
         backup: None,

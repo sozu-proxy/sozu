@@ -8,17 +8,17 @@ extern crate time;
 use std::{env, io::stdout, thread};
 
 use anyhow::Context;
+use sozu_command::config::ListenerBuilder;
 
 use sozu_command::{
     certificate::CertificateAndKey,
     channel::Channel,
-    config::DEFAULT_RUSTLS_CIPHER_LIST,
     logging::{Logger, LoggerBackend},
-    request::{AddCertificate, LoadBalancingParams, Request, WorkerRequest},
-    response::{
-        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, Route,
-        RulePosition,
+    request::{
+        AddBackend, AddCertificate, LoadBalancingParams, Request, RequestHttpFrontend,
+        WorkerRequest,
     },
+    response::{PathRule, Route, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -50,26 +50,19 @@ fn main() -> anyhow::Result<()> {
     );
     gauge!("sozu.TEST", 42);
 
-    let config = HttpListenerConfig {
-        address: "127.0.0.1:8080"
-            .parse()
-            .with_context(|| "could not parse address")?,
-        ..Default::default()
-    };
+    let http_listener = ListenerBuilder::new_http("127.0.0.1:8080").to_http()?;
 
     let (mut command, channel) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::http::start_http_worker(config, channel, max_buffers, buffer_size);
+        sozu::http::start_http_worker(http_listener, channel, max_buffers, buffer_size);
     });
 
-    let http_front = HttpFrontend {
+    let http_front = RequestHttpFrontend {
         route: Route::ClusterId(String::from("cluster_1")),
-        address: "127.0.0.1:8080"
-            .parse()
-            .with_context(|| "Could not parse frontend address")?,
+        address: "127.0.0.1:8080".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::Prefix(String::from("/")),
         method: None,
@@ -77,13 +70,11 @@ fn main() -> anyhow::Result<()> {
         tags: None,
     };
 
-    let http_backend = Backend {
+    let http_backend = AddBackend {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026"
-            .parse()
-            .with_context(|| "Could not parse backend address")?,
+        address: "127.0.0.1:1026".to_string(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };
@@ -101,23 +92,14 @@ fn main() -> anyhow::Result<()> {
     info!("MAIN\tHTTP -> {:?}", command.read_message());
     info!("MAIN\tHTTP -> {:?}", command.read_message());
 
-    let config = HttpsListenerConfig {
-        address: "127.0.0.1:8443"
-            .parse()
-            .with_context(|| "could not parse address")?,
-        cipher_list: DEFAULT_RUSTLS_CIPHER_LIST
-            .into_iter()
-            .map(String::from)
-            .collect(),
-        ..Default::default()
-    };
+    let https_listener = ListenerBuilder::new_tcp("127.0.0.1:8443").to_tls()?;
 
     let (mut command2, channel2) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
     let jg2 = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::https::start_https_worker(config, channel2, max_buffers, buffer_size)
+        sozu::https::start_https_worker(https_listener, channel2, max_buffers, buffer_size)
     });
 
     let cert1 = include_str!("../assets/certificate.pem");
@@ -141,11 +123,9 @@ fn main() -> anyhow::Result<()> {
         }),
     });
 
-    let tls_front = HttpFrontend {
+    let tls_front = RequestHttpFrontend {
         route: Route::ClusterId(String::from("cluster_1")),
-        address: "127.0.0.1:8443"
-            .parse()
-            .with_context(|| "Could not parse frontend address")?,
+        address: "127.0.0.1:8443".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::Prefix(String::from("/")),
         method: None,
@@ -157,13 +137,11 @@ fn main() -> anyhow::Result<()> {
         id: String::from("ID_IJKL2"),
         content: Request::AddHttpsFrontend(tls_front),
     });
-    let tls_backend = Backend {
+    let tls_backend = AddBackend {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026"
-            .parse()
-            .with_context(|| "Could not parse backend address")?,
+        address: "127.0.0.1:1026".to_string(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };
@@ -195,11 +173,9 @@ fn main() -> anyhow::Result<()> {
         }),
     });
 
-    let tls_front2 = HttpFrontend {
+    let tls_front2 = RequestHttpFrontend {
         route: Route::ClusterId(String::from("cluster_2")),
-        address: "127.0.0.1:8443"
-            .parse()
-            .with_context(|| "Could not parse frontend address")?,
+        address: "127.0.0.1:8443".to_string(),
         hostname: String::from("test.local"),
         path: PathRule::Prefix(String::from("/")),
         method: None,
@@ -212,13 +188,11 @@ fn main() -> anyhow::Result<()> {
         content: Request::AddHttpsFrontend(tls_front2),
     });
 
-    let tls_backend2 = Backend {
+    let tls_backend2 = AddBackend {
         cluster_id: String::from("cluster_2"),
         backend_id: String::from("cluster_2-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026"
-            .parse()
-            .with_context(|| "Could not parse backend address")?,
+        address: "127.0.0.1:1026".to_string(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };

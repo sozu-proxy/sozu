@@ -8,16 +8,17 @@ use serial_test::serial;
 
 use sozu_command_lib::{
     certificate::CertificateAndKey,
-    config::FileConfig,
+    config::{FileConfig, ListenerBuilder},
     info,
     logging::{Logger, LoggerBackend},
-    request::{ActivateListener, AddCertificate, ListenerType, RemoveBackend, Request},
-    response::HttpFrontend,
+    request::{
+        ActivateListener, AddCertificate, ListenerType, RemoveBackend, Request, RequestHttpFrontend,
+    },
     state::ConfigState,
 };
 
 use crate::{
-    http_utils::{http_ok_response, http_request},
+    http_utils::{default_404_answer, default_503_answer, http_ok_response, http_request},
     mock::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
@@ -276,16 +277,15 @@ pub fn try_issue_810_panic(part2: bool) -> State {
         .parse()
         .expect("could not parse front address");
     let back_address = "127.0.0.1:2002"
-        .to_string()
-        .parse()
+        .parse::<std::net::SocketAddr>()
         .expect("could not parse back address");
 
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("810-PANIC", config, &listeners, state);
 
-    worker.send_proxy_request(Request::AddTcpListener(Worker::default_tcp_listener(
-        front_address,
-    )));
+    worker.send_proxy_request(Request::AddTcpListener(
+        ListenerBuilder::new_tcp(front_address).to_tcp().unwrap(),
+    ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::TCP,
@@ -294,13 +294,13 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     worker.send_proxy_request(Request::AddCluster(Worker::default_cluster("cluster_0")));
     worker.send_proxy_request(Request::AddTcpFrontend(Worker::default_tcp_frontend(
         "cluster_0",
-        front_address,
+        front_address.to_string(),
     )));
 
     worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0",
-        back_address,
+        back_address.to_string(),
     )));
     worker.read_to_last();
 
@@ -342,16 +342,16 @@ pub fn try_tls_endpoint() -> State {
         .parse()
         .expect("could not parse front address");
     let back_address = "127.0.0.1:2002"
-        .to_string()
-        .parse()
+        .parse::<std::net::SocketAddr>()
         .expect("could not parse back address");
 
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
 
-    worker.send_proxy_request(Request::AddHttpsListener(Worker::default_https_listener(
-        front_address,
-    )));
+    worker.send_proxy_request(Request::AddHttpsListener(
+        ListenerBuilder::new_https(front_address).to_tls().unwrap(),
+    ));
+
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::HTTPS,
@@ -361,7 +361,7 @@ pub fn try_tls_endpoint() -> State {
     worker.send_proxy_request(Request::AddCluster(Worker::default_cluster("cluster_0")));
 
     let hostname = "localhost".to_string();
-    worker.send_proxy_request(Request::AddHttpsFrontend(HttpFrontend {
+    worker.send_proxy_request(Request::AddHttpsFrontend(RequestHttpFrontend {
         hostname: hostname.to_owned(),
         ..Worker::default_http_frontend("cluster_0", front_address)
     }));
@@ -373,7 +373,7 @@ pub fn try_tls_endpoint() -> State {
         versions: vec![],
     };
     let add_certificate = AddCertificate {
-        address: front_address,
+        address: front_address.to_string(),
         certificate: certificate_and_key,
         names: vec![],
         expired_at: None,
@@ -383,7 +383,7 @@ pub fn try_tls_endpoint() -> State {
     worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0",
-        back_address,
+        back_address.to_string(),
     )));
     worker.read_to_last();
 
@@ -628,9 +628,9 @@ fn try_http_behaviors() -> State {
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("BEHAVE-WORKER", config, &listeners, state);
 
-    worker.send_proxy_request(Request::AddHttpListener(Worker::default_http_listener(
-        front_address,
-    )));
+    worker.send_proxy_request(Request::AddHttpListener(
+        ListenerBuilder::new_http(front_address).to_http().unwrap(),
+    ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address,
         proxy: ListenerType::HTTP,
@@ -647,15 +647,13 @@ fn try_http_behaviors() -> State {
     info!("expecting 404");
     client.connect();
     client.send();
-    let expected_response = String::from(
-        "HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-    );
+
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(expected_response));
+    assert_eq!(response, Some(default_404_answer()));
     assert_eq!(client.receive(), None);
 
-    worker.send_proxy_request(Request::AddHttpFrontend(HttpFrontend {
+    worker.send_proxy_request(Request::AddHttpFrontend(RequestHttpFrontend {
         hostname: String::from("example.com"),
         ..Worker::default_http_frontend("cluster_0", front_address)
     }));
@@ -664,21 +662,19 @@ fn try_http_behaviors() -> State {
     info!("expecting 503");
     client.connect();
     client.send();
-    let expected_response = String::from(
-        "HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-    );
+
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(expected_response));
+    assert_eq!(response, Some(default_503_answer()));
     assert_eq!(client.receive(), None);
 
     let back_address = "127.0.0.1:2002"
-        .parse()
+        .parse::<std::net::SocketAddr>()
         .expect("could not parse back address");
     worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
-        back_address,
+        back_address.to_string(),
     )));
     worker.read_to_last();
 
@@ -718,12 +714,12 @@ fn try_http_behaviors() -> State {
     worker.send_proxy_request(Request::RemoveBackend(RemoveBackend {
         cluster_id: String::from("cluster_0"),
         backend_id: String::from("cluster_0-0"),
-        address: back_address,
+        address: back_address.to_string(),
     }));
     worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
-        back_address,
+        back_address.to_string(),
     )));
     backend.disconnect();
     worker.read_to_last();
@@ -768,23 +764,20 @@ fn try_http_behaviors() -> State {
     backend.receive(0);
     backend.close(0);
 
-    let expected_response = String::from(
-        "HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-    );
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(expected_response));
+    assert_eq!(response, Some(default_503_answer()));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request(Request::RemoveBackend(RemoveBackend {
         cluster_id: String::from("cluster_0"),
         backend_id: String::from("cluster_0-0"),
-        address: back_address,
+        address: back_address.to_string(),
     }));
     worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
-        back_address,
+        back_address.to_string(),
     )));
     backend.disconnect();
     worker.read_to_last();

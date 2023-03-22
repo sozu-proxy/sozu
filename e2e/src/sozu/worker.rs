@@ -14,14 +14,13 @@ use sozu_lib as sozu;
 use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
-    config::{Config, FileConfig},
+    config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
-    request::Request,
-    request::{Cluster, LoadBalancingAlgorithms, LoadBalancingParams, WorkerRequest},
-    response::{
-        Backend, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, PathRule, ProxyResponse,
-        Route, RulePosition, TcpFrontend, TcpListenerConfig,
+    request::{
+        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, Request,
+        RequestHttpFrontend, RequestTcpFrontend, WorkerRequest,
     },
+    response::{PathRule, ProxyResponse, Route, RulePosition},
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
@@ -53,35 +52,7 @@ pub fn set_no_close_exec(fd: i32) {
 
 impl Worker {
     pub fn empty_file_config() -> FileConfig {
-        FileConfig {
-            command_socket: None,
-            saved_state: None,
-            automatic_state_save: None,
-            worker_count: None,
-            worker_automatic_restart: Some(false),
-            handle_process_affinity: None,
-            command_buffer_size: None,
-            max_command_buffer_size: None,
-            max_connections: None,
-            min_buffers: None,
-            max_buffers: None,
-            buffer_size: None,
-            log_level: None,
-            log_target: None,
-            log_access_target: None,
-            metrics: None,
-            listeners: None,
-            clusters: None,
-            ctl_command_timeout: None,
-            pid_file_path: None,
-            activate_listeners: None,
-            request_timeout: None,
-            front_timeout: None,
-            back_timeout: None,
-            connect_timeout: None,
-            zombie_check_interval: None,
-            accept_queue_timeout: None,
-        }
+        FileConfig::default()
     }
 
     pub fn empty_listeners() -> Listeners {
@@ -92,8 +63,11 @@ impl Worker {
         }
     }
 
-    pub fn into_config(config: FileConfig) -> Config {
-        config.into("").expect("could not create Config")
+    pub fn into_config(file_config: FileConfig) -> Config {
+        let mut config_builder = ConfigBuilder::new(file_config);
+        config_builder
+            .into_config("")
+            .expect("could not create Config")
     }
 
     pub fn empty_config() -> (Config, Listeners, ConfigState) {
@@ -291,41 +265,6 @@ impl Worker {
         result
     }
 
-    pub fn default_tcp_listener(address: SocketAddr) -> TcpListenerConfig {
-        TcpListenerConfig {
-            address,
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-        }
-    }
-
-    pub fn default_http_listener(address: SocketAddr) -> HttpListenerConfig {
-        HttpListenerConfig {
-            address,
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-            ..HttpListenerConfig::default()
-        }
-    }
-
-    pub fn default_https_listener(address: SocketAddr) -> HttpsListenerConfig {
-        HttpsListenerConfig {
-            address,
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-            ..HttpsListenerConfig::default()
-        }
-    }
-
     pub fn default_cluster<S: Into<String>>(cluster_id: S) -> Cluster {
         Cluster {
             cluster_id: cluster_id.into(),
@@ -340,9 +279,9 @@ impl Worker {
 
     pub fn default_tcp_frontend<S: Into<String>>(
         cluster_id: S,
-        address: SocketAddr,
-    ) -> TcpFrontend {
-        TcpFrontend {
+        address: String,
+    ) -> RequestTcpFrontend {
+        RequestTcpFrontend {
             cluster_id: cluster_id.into(),
             address,
             tags: None,
@@ -352,10 +291,10 @@ impl Worker {
     pub fn default_http_frontend<S: Into<String>>(
         cluster_id: S,
         address: SocketAddr,
-    ) -> HttpFrontend {
-        HttpFrontend {
+    ) -> RequestHttpFrontend {
+        RequestHttpFrontend {
             route: Route::ClusterId(cluster_id.into()),
-            address,
+            address: address.to_string(),
             hostname: String::from("localhost"),
             path: PathRule::Prefix(String::from("/")),
             method: None,
@@ -367,9 +306,9 @@ impl Worker {
     pub fn default_backend<S1: Into<String>, S2: Into<String>>(
         cluster_id: S1,
         backend_id: S2,
-        address: SocketAddr,
-    ) -> Backend {
-        Backend {
+        address: String,
+    ) -> AddBackend {
+        AddBackend {
             cluster_id: cluster_id.into(),
             backend_id: backend_id.into(),
             address,

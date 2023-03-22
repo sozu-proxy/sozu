@@ -18,12 +18,12 @@ use sozu_command::{
     config::Config,
     ready::Ready,
     request::{
-        ActivateListener, Cluster, DeactivateListener, ListenerType, QueryCertificateType,
-        QueryClusterType, RemoveBackend, Request, WorkerRequest,
+        ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType,
+        QueryCertificateType, QueryClusterType, RemoveBackend, Request, WorkerRequest,
     },
     response::{
-        Backend as CommandLibBackend, Event, HttpListenerConfig, HttpsListenerConfig, MessageId,
-        ProxyResponse, ProxyResponseContent, QueryAnswer, QueryAnswerCertificate, ResponseStatus,
+        Event, HttpListenerConfig, HttpsListenerConfig, MessageId, ProxyResponse,
+        ProxyResponseContent, QueryAnswer, QueryAnswerCertificate, ResponseStatus,
         TcpListenerConfig as CommandTcpListener,
     },
     scm_socket::{Listeners, ScmSocket},
@@ -1025,25 +1025,26 @@ impl Server {
             );
     }
 
-    fn add_backend(&mut self, req_id: &str, backend: &CommandLibBackend) -> ProxyResponse {
+    fn add_backend(&mut self, req_id: &str, add_backend: &AddBackend) -> ProxyResponse {
         let new_backend = Backend::new(
-            &backend.backend_id,
-            backend.address,
-            backend.sticky_id.clone(),
-            backend.load_balancing_parameters.clone(),
-            backend.backup,
+            &add_backend.backend_id,
+            add_backend.address.parse().unwrap(),
+            add_backend.sticky_id.clone(),
+            add_backend.load_balancing_parameters.clone(),
+            add_backend.backup,
         );
         self.backends
             .borrow_mut()
-            .add_backend(&backend.cluster_id, new_backend);
+            .add_backend(&add_backend.cluster_id, new_backend);
 
         ProxyResponse::ok(req_id)
     }
 
     fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> ProxyResponse {
+        let address = backend.address.parse().unwrap();
         self.backends
             .borrow_mut()
-            .remove_backend(&backend.cluster_id, &backend.address);
+            .remove_backend(&backend.cluster_id, &address);
 
         ProxyResponse::ok(req_id)
     }
