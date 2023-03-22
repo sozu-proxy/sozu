@@ -620,7 +620,7 @@ pub fn print_certificates(
 
     for (_worker_id, response_content) in response_contents.iter() {
         match response_content {
-            ResponseContent::AllCertificates(h) => {
+            ResponseContent::Certificates(h) => {
                 for (addr, h2) in h.iter() {
                     println!("\t{addr}:");
 
@@ -630,22 +630,6 @@ pub fn print_certificates(
                             summary.domain,
                             hex::encode(summary.fingerprint.0.to_owned())
                         );
-                    }
-
-                    println!();
-                }
-            }
-            ResponseContent::CertificatesByDomain(h) => {
-                for (addr, opt) in h.iter() {
-                    println!("\t{addr}:");
-                    if let Some(summary) = opt {
-                        println!(
-                            "\t\t{}:\t{}",
-                            summary.domain,
-                            hex::encode(summary.fingerprint.0.to_owned())
-                        );
-                    } else {
-                        println!("\t\tnot found");
                     }
 
                     println!();

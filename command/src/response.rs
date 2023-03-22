@@ -81,11 +81,8 @@ pub enum ResponseContent {
     /// cluster id -> hash of cluster information
     ClustersHashes(BTreeMap<String, u64>),
 
-    /// returns a list of certificates for each address
-    AllCertificates(HashMap<SocketAddr, Vec<CertificateSummary>>),
-
-    /// returns certificates matching a certificate request by domain
-    CertificatesByDomain(HashMap<SocketAddr, Option<CertificateSummary>>),
+    /// a list of certificates for each socket address
+    Certificates(HashMap<SocketAddr, Vec<CertificateSummary>>),
 
     /// returns the certificate matching a request by fingerprint,
     /// and the list of domain names associated

@@ -97,9 +97,8 @@ impl CommandManager {
                             | ResponseContent::WorkerMetrics(_)
                             | ResponseContent::ClustersHashes(_)
                             | ResponseContent::Clusters(_)
-                            | ResponseContent::CertificatesByDomain(_)
                             | ResponseContent::CertificateByFingerprint(_)
-                            | ResponseContent::AllCertificates(_)
+                            | ResponseContent::Certificates(_)
                             | ResponseContent::AvailableMetrics(_)
                             | ResponseContent::Event(_) => {}
                             ResponseContent::State(state) => match json {

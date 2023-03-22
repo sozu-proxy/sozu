@@ -956,7 +956,7 @@ impl HttpsProxy {
             certificates
         );
 
-        Ok(Some(ResponseContent::AllCertificates(certificates)))
+        Ok(Some(ResponseContent::Certificates(certificates)))
     }
 
     pub fn query_certificate_for_domain(
@@ -969,15 +969,17 @@ impl HttpsProxy {
             .map(|listener| {
                 let owned = listener.borrow();
                 let resolver = unwrap_msg!(owned.resolver.0.lock());
-                (
-                    owned.address,
-                    resolver
-                        .domain_lookup(domain.as_bytes(), true)
-                        .map(|(k, fingerprint)| CertificateSummary {
+                let mut certificate_summary = vec![];
+
+                resolver
+                    .domain_lookup(domain.as_bytes(), true)
+                    .map(|(k, fingerprint)| {
+                        certificate_summary.push(CertificateSummary {
                             domain: String::from_utf8(k.to_vec()).unwrap(),
                             fingerprint: fingerprint.clone(),
-                        }),
-                )
+                        });
+                    });
+                (owned.address, certificate_summary)
             })
             .collect::<HashMap<_, _>>();
 
@@ -986,7 +988,7 @@ impl HttpsProxy {
             domain, certificates
         );
 
-        Ok(Some(ResponseContent::CertificatesByDomain(certificates)))
+        Ok(Some(ResponseContent::Certificates(certificates)))
     }
 
     pub fn activate_listener(
