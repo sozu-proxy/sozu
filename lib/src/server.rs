@@ -18,8 +18,8 @@ use sozu_command::{
     config::Config,
     ready::Ready,
     request::{
-        ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType,
-        QueryCertificateType, QueryClusterType, RemoveBackend, Request, WorkerRequest,
+        ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType, QueryClusterType,
+        RemoveBackend, Request, WorkerRequest,
     },
     response::{
         Event, HttpListenerConfig, HttpsListenerConfig, MessageId, ResponseContent, ResponseStatus,
@@ -907,20 +907,16 @@ impl Server {
                 push_queue(WorkerResponse::ok_with_content(message.id.clone(), content));
                 return;
             }
-            Request::QueryCertificates(q) => {
-                match q {
-                    // forward the query to the TLS implementation
-                    QueryCertificateType::Fingerprint(f) => {
-                        push_queue(WorkerResponse::ok_with_content(
-                            message.id.clone(),
-                            ResponseContent::CertificateByFingerprint(get_certificate(
-                                &self.config_state,
-                                f,
-                            )),
-                        ));
-                        return;
-                    }
-                }
+            Request::QueryCertificateByFingerprint(f) => {
+                // forward the query to the TLS implementation
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id.clone(),
+                    ResponseContent::CertificateByFingerprint(get_certificate(
+                        &self.config_state,
+                        f,
+                    )),
+                ));
+                return;
             }
             Request::QueryMetrics(query_metrics_options) => {
                 METRICS.with(|metrics| {

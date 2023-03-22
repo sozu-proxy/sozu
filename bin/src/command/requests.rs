@@ -66,7 +66,9 @@ impl CommandServer {
             }
             Request::Status => self.status(client_id).await,
 
-            Request::QueryCertificates(_)
+            Request::QueryCertificateByFingerprint(_)
+            | Request::QueryCertificatesByDomain(_)
+            | Request::QueryAllCertificates
             | Request::QueryClusters(_)
             | Request::QueryClustersHashes
             | Request::QueryMetrics(_) => self.query(client_id, request).await,
@@ -1068,8 +1070,6 @@ impl CommandServer {
                     }
                 }));
             }
-            Request::QueryCertificates(_) => {}
-            Request::QueryMetrics(_) => {}
             _ => {}
         };
 
@@ -1121,7 +1121,9 @@ impl CommandServer {
                     worker_responses.insert(String::from("main"), main);
                     ResponseContent::WorkerResponses(worker_responses)
                 }
-                &Request::QueryCertificates(_) => {
+                &Request::QueryCertificatesByDomain(_)
+                | &Request::QueryCertificateByFingerprint(_)
+                | &Request::QueryAllCertificates => {
                     info!("certificates query answer received: {:?}", worker_responses);
                     ResponseContent::WorkerResponses(worker_responses)
                 }

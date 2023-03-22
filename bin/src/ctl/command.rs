@@ -4,9 +4,7 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
 
 use sozu_command_lib::{
-    request::{
-        QueryCertificateType, QueryClusterDomain, QueryClusterType, QueryMetricsOptions, Request,
-    },
+    request::{QueryClusterDomain, QueryClusterType, QueryMetricsOptions, Request},
     response::{Response, ResponseContent, ResponseStatus, RunState, WorkerInfo},
 };
 
@@ -393,7 +391,7 @@ impl CommandManager {
                 Err(e) => {
                     bail!("invalid fingerprint: {:?}", e);
                 }
-                Ok(f) => Request::QueryCertificates(QueryCertificateType::Fingerprint(f)),
+                Ok(f) => Request::QueryCertificateByFingerprint(f),
             },
             (None, Some(d)) => Request::QueryCertificatesByDomain(d),
             (Some(_), Some(_)) => {

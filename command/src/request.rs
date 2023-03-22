@@ -80,8 +80,9 @@ pub enum Request {
     DeactivateListener(DeactivateListener),
 
     QueryAllCertificates,
+    QueryCertificateByFingerprint(Vec<u8>),
     QueryCertificatesByDomain(String),
-    QueryCertificates(QueryCertificateType),
+
     QueryClusters(QueryClusterType),
     QueryClustersHashes,
     QueryMetrics(QueryMetricsOptions),
@@ -114,9 +115,9 @@ impl Request {
             | Request::AddCertificate(_)
             | Request::QueryAllCertificates
             | Request::QueryCertificatesByDomain(_)
+            | Request::QueryCertificateByFingerprint(_)
             | Request::ReplaceCertificate(_)
-            | Request::RemoveCertificate(_)
-            | Request::QueryCertificates(_) => proxy_destination.to_https_proxy = true,
+            | Request::RemoveCertificate(_) => proxy_destination.to_https_proxy = true,
 
             Request::AddTcpFrontend(_) | Request::RemoveTcpFrontend(_) => {
                 proxy_destination.to_tcp_proxy = true
@@ -383,13 +384,6 @@ pub enum QueryClusterType {
 pub struct QueryClusterDomain {
     pub hostname: String,
     pub path: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum QueryCertificateType {
-    // Domain(String),
-    Fingerprint(Vec<u8>),
 }
 
 /// Options originating from the command line
