@@ -387,21 +387,19 @@ impl CommandManager {
         fingerprint: Option<String>,
         domain: Option<String>,
     ) -> Result<(), anyhow::Error> {
-        let query = match (fingerprint, domain) {
-            (None, None) => QueryCertificateType::All,
+        let request = match (fingerprint, domain) {
+            (None, None) => Request::QueryAllCertificates,
             (Some(f), None) => match hex::decode(f) {
                 Err(e) => {
                     bail!("invalid fingerprint: {:?}", e);
                 }
-                Ok(f) => QueryCertificateType::Fingerprint(f),
+                Ok(f) => Request::QueryCertificates(QueryCertificateType::Fingerprint(f)),
             },
-            (None, Some(d)) => QueryCertificateType::Domain(d),
+            (None, Some(d)) => Request::QueryCertificates(QueryCertificateType::Domain(d)),
             (Some(_), Some(_)) => {
                 bail!("Error: Either request a fingerprint or a domain name");
             }
         };
-
-        let request = Request::QueryCertificates(query);
 
         self.send_request(request)?;
 

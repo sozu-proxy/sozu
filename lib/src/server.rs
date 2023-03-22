@@ -912,7 +912,6 @@ impl Server {
                     // forward the query to the TLS implementation
                     QueryCertificateType::Domain(_) => {}
                     // forward the query to the TLS implementation
-                    QueryCertificateType::All => {}
                     QueryCertificateType::Fingerprint(f) => {
                         push_queue(WorkerResponse::ok_with_content(
                             message.id.clone(),

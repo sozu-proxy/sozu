@@ -1343,7 +1343,7 @@ impl ProxyConfiguration for HttpsProxy {
                 self.logging(logging_filter.clone())
                     .with_context(|| format!("Could not set logging level to {logging_filter}"))
             }
-            Request::QueryCertificates(QueryCertificateType::All) => {
+            Request::QueryAllCertificates => {
                 info!("{} query all certificates", request_id);
                 self.query_all_certificates()
                     .with_context(|| "Could not query all certificates")

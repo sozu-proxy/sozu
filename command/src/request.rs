@@ -79,6 +79,7 @@ pub enum Request {
     ActivateListener(ActivateListener),
     DeactivateListener(DeactivateListener),
 
+    QueryAllCertificates,
     QueryCertificates(QueryCertificateType),
     QueryClusters(QueryClusterType),
     QueryClustersHashes,
@@ -110,6 +111,7 @@ impl Request {
             Request::AddHttpsFrontend(_)
             | Request::RemoveHttpsFrontend(_)
             | Request::AddCertificate(_)
+            | Request::QueryAllCertificates
             | Request::ReplaceCertificate(_)
             | Request::RemoveCertificate(_)
             | Request::QueryCertificates(_) => proxy_destination.to_https_proxy = true,
@@ -384,7 +386,6 @@ pub struct QueryClusterDomain {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryCertificateType {
-    All,
     Domain(String),
     Fingerprint(Vec<u8>),
 }
