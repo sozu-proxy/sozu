@@ -1,15 +1,11 @@
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    process::exit,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use anyhow::{self, bail, Context};
+use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::response::{
-    AggregatedMetricsData, ClusterMetricsData, FilteredData, ListedFrontends, ListenersList,
-    QueryAnswer, QueryAnswerCertificate, QueryAnswerMetrics, ResponseContent, Route, WorkerInfo,
-    WorkerMetrics,
+    AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics, ListedFrontends,
+    ListenersList, ResponseContent, Route, WorkerInfo, WorkerMetrics,
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -194,7 +190,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
 
 pub fn print_metrics(
     // main & worker metrics
-    aggregated_metrics: AggregatedMetricsData,
+    aggregated_metrics: AggregatedMetrics,
     json: bool,
 ) -> anyhow::Result<()> {
     if json {
@@ -208,29 +204,21 @@ pub fn print_metrics(
     print_proxy_metrics(&Some(aggregated_metrics.main));
 
     // workers
-    for (worker_id, query_answer_metrics) in aggregated_metrics.workers.iter() {
+    for (worker_id, worker_metrics) in aggregated_metrics.workers.iter() {
         println!("\nWorker {worker_id}\n=========");
-        print_worker_metrics(query_answer_metrics)?;
+        print_worker_metrics(worker_metrics)?;
     }
     Ok(())
 }
 
-fn print_worker_metrics(query_answer: &QueryAnswer) -> anyhow::Result<()> {
-    match query_answer {
-        QueryAnswer::Metrics(QueryAnswerMetrics::All(WorkerMetrics { proxy, clusters })) => {
-            print_proxy_metrics(proxy);
-            print_cluster_metrics(clusters);
-        }
-        QueryAnswer::Metrics(QueryAnswerMetrics::Error(error)) => {
-            println!("Error: {error}\nMaybe check your command.")
-        }
-        _ => bail!("The query answer is wrong."),
-    }
+fn print_worker_metrics(worker_metrics: &WorkerMetrics) -> anyhow::Result<()> {
+    print_proxy_metrics(&worker_metrics.proxy);
+    print_cluster_metrics(&worker_metrics.clusters);
 
     Ok(())
 }
 
-fn print_proxy_metrics(proxy_metrics: &Option<BTreeMap<String, FilteredData>>) {
+fn print_proxy_metrics(proxy_metrics: &Option<BTreeMap<String, FilteredMetrics>>) {
     if let Some(metrics) = proxy_metrics {
         let filtered = filter_metrics(metrics);
         print_gauges_and_counts(&filtered);
@@ -238,7 +226,7 @@ fn print_proxy_metrics(proxy_metrics: &Option<BTreeMap<String, FilteredData>>) {
     }
 }
 
-fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetricsData>>) {
+fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetrics>>) {
     if let Some(cluster_metrics) = cluster_metrics {
         for (cluster_id, cluster_metrics_data) in cluster_metrics.iter() {
             println!("\nCluster {cluster_id}\n--------");
@@ -250,9 +238,9 @@ fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetric
             }
 
             if let Some(backends) = &cluster_metrics_data.backends {
-                for (backend_id, backend_metrics) in backends.iter() {
-                    println!("\n{cluster_id}/{backend_id}\n--------");
-                    let filtered = filter_metrics(backend_metrics);
+                for backend_metrics in backends.iter() {
+                    println!("\n{cluster_id}/{}\n--------", backend_metrics.backend_id);
+                    let filtered = filter_metrics(&backend_metrics.metrics);
                     print_gauges_and_counts(&filtered);
                     print_percentiles(&filtered);
                 }
@@ -261,7 +249,9 @@ fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetric
     }
 }
 
-fn filter_metrics(metrics: &BTreeMap<String, FilteredData>) -> BTreeMap<String, FilteredData> {
+fn filter_metrics(
+    metrics: &BTreeMap<String, FilteredMetrics>,
+) -> BTreeMap<String, FilteredMetrics> {
     let mut filtered_metrics = BTreeMap::new();
 
     for (metric_key, filtered_value) in metrics.iter() {
@@ -273,11 +263,11 @@ fn filter_metrics(metrics: &BTreeMap<String, FilteredData>) -> BTreeMap<String, 
     filtered_metrics
 }
 
-fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredData>) {
+fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     let mut titles: Vec<String> = filtered_metrics
         .iter()
         .filter_map(|(title, filtered_data)| match filtered_data {
-            FilteredData::Count(_) | FilteredData::Gauge(_) => Some(title.to_owned()),
+            FilteredMetrics::Count(_) | FilteredMetrics::Gauge(_) => Some(title.to_owned()),
             _ => None,
         })
         .collect();
@@ -297,11 +287,11 @@ fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredData>) {
     for title in titles {
         let mut row = vec![cell!(title)];
         match filtered_metrics.get(&title) {
-            Some(FilteredData::Count(c)) => {
+            Some(FilteredMetrics::Count(c)) => {
                 row.push(cell!(""));
                 row.push(cell!(c))
             }
-            Some(FilteredData::Gauge(c)) => {
+            Some(FilteredMetrics::Gauge(c)) => {
                 row.push(cell!(c));
                 row.push(cell!(""))
             }
@@ -313,11 +303,11 @@ fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredData>) {
     table.printstd();
 }
 
-fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredData>) {
+fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     let mut percentile_titles: Vec<String> = filtered_metrics
         .iter()
         .filter_map(|(title, filtered_data)| match filtered_data {
-            FilteredData::Percentiles(_) => Some(title.to_owned()),
+            FilteredMetrics::Percentiles(_) => Some(title.to_owned()),
             _ => None,
         })
         .collect();
@@ -346,7 +336,7 @@ fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredData>) {
 
     for title in percentile_titles {
         match filtered_metrics.get(&title) {
-            Some(FilteredData::Percentiles(p)) => {
+            Some(FilteredMetrics::Percentiles(p)) => {
                 percentile_table.add_row(Row::new(vec![
                     cell!(title),
                     cell!(p.samples),
@@ -376,7 +366,7 @@ pub fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), anyho
 
 pub fn create_queried_cluster_table(
     headers: Vec<&str>,
-    data: &BTreeMap<String, QueryAnswer>,
+    data: &BTreeMap<String, ResponseContent>,
 ) -> Table {
     let mut table = Table::new();
     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
@@ -395,7 +385,7 @@ pub fn print_query_response_data(
     json: bool,
 ) -> anyhow::Result<()> {
     if let Some(needle) = cluster_id.or(domain) {
-        if let Some(ResponseContent::Query(data)) = &data {
+        if let Some(ResponseContent::WorkerResponses(data)) = &data {
             if json {
                 return print_json_response(data);
             }
@@ -425,7 +415,7 @@ pub fn print_query_response_data(
 
             for (key, metrics) in data.iter() {
                 //let m: u8 = metrics;
-                if let QueryAnswer::Clusters(clusters) = metrics {
+                if let ResponseContent::Clusters(clusters) = metrics {
                     for cluster in clusters.iter() {
                         let entry = cluster_data.entry(cluster).or_insert(Vec::new());
                         entry.push(key.to_owned());
@@ -577,7 +567,7 @@ pub fn print_query_response_data(
 
             backend_table.printstd();
         }
-    } else if let Some(ResponseContent::Query(data)) = &data {
+    } else if let Some(ResponseContent::WorkerResponses(data)) = &data {
         let mut table = Table::new();
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         let mut header = vec![cell!("key")];
@@ -591,7 +581,7 @@ pub fn print_query_response_data(
 
         for metrics in data.values() {
             //let m: u8 = metrics;
-            if let QueryAnswer::ClustersHashes(clusters) = metrics {
+            if let ResponseContent::ClustersHashes(clusters) = metrics {
                 for (key, value) in clusters.iter() {
                     query_data.entry(key).or_insert(Vec::new()).push(value);
                 }
@@ -619,55 +609,40 @@ pub fn print_query_response_data(
     Ok(())
 }
 
-pub fn print_certificates(data: BTreeMap<String, QueryAnswer>, json: bool) -> anyhow::Result<()> {
+pub fn print_certificates(
+    response_contents: BTreeMap<String, ResponseContent>,
+    json: bool,
+) -> anyhow::Result<()> {
     if json {
-        print_json_response(&data)?;
+        print_json_response(&response_contents)?;
         return Ok(());
     }
 
-    //println!("received: {:?}", data);
-    let it = data.iter().map(|(k, v)| match v {
-        QueryAnswer::Certificates(c) => (k, c),
-        v => {
-            eprintln!("unexpected certificates query answer: {v:?}");
-            exit(1);
-        }
-    });
-
-    for (k, v) in it {
-        println!("process '{k}':");
-
-        match v {
-            QueryAnswerCertificate::All(h) => {
+    for (_worker_id, response_content) in response_contents.iter() {
+        match response_content {
+            ResponseContent::Certificates(h) => {
                 for (addr, h2) in h.iter() {
                     println!("\t{addr}:");
 
-                    for (domain, fingerprint) in h2.iter() {
-                        println!("\t\t{}:\t{}", domain, hex::encode(fingerprint));
+                    for summary in h2.iter() {
+                        println!(
+                            "\t\t{}:\t{}",
+                            summary.domain,
+                            hex::encode(summary.fingerprint.0.to_owned())
+                        );
                     }
 
                     println!();
                 }
             }
-            QueryAnswerCertificate::Domain(h) => {
-                for (addr, opt) in h.iter() {
-                    println!("\t{addr}:");
-                    if let Some((key, fingerprint)) = opt {
-                        println!("\t\t{}:\t{}", key, hex::encode(fingerprint));
-                    } else {
-                        println!("\t\tnot found");
-                    }
-
-                    println!();
-                }
-            }
-            QueryAnswerCertificate::Fingerprint(opt) => {
+            ResponseContent::CertificateByFingerprint(opt) => {
                 if let Some((s, v)) = opt {
                     println!("\tfrontends: {v:?}\ncertificate:\n{s}");
                 } else {
                     println!("\tnot found");
                 }
             }
+            _ => {}
         }
         println!();
     }
@@ -684,46 +659,13 @@ fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
     .unwrap_or_default()
 }
 
-pub fn print_available_metrics(answers: &BTreeMap<String, QueryAnswer>) -> anyhow::Result<()> {
-    let mut available_metrics: (HashSet<String>, HashSet<String>) =
-        (HashSet::new(), HashSet::new());
-    for query_answer in answers.values() {
-        match query_answer {
-            QueryAnswer::Metrics(QueryAnswerMetrics::List((
-                proxy_metric_keys,
-                cluster_metric_keys,
-            ))) => {
-                for key in proxy_metric_keys {
-                    available_metrics
-                        .0
-                        .insert(key.replace('\t', ".").to_owned());
-                }
-                for key in cluster_metric_keys {
-                    available_metrics
-                        .1
-                        .insert(key.replace('\t', ".").to_owned());
-                }
-            }
-            _ => bail!("The proxy responded nonsense instead of metric names"),
-        }
-    }
-    let proxy_metrics_names = available_metrics
-        .0
-        .iter()
-        .map(|s| s.to_owned())
-        .collect::<Vec<String>>();
-    let cluster_metrics_names = available_metrics
-        .1
-        .iter()
-        .map(|s| s.to_owned())
-        .collect::<Vec<String>>();
-
+pub fn print_available_metrics(available_metrics: &AvailableMetrics) -> anyhow::Result<()> {
     println!("Available metrics on the proxy level:");
-    for metric_name in proxy_metrics_names {
+    for metric_name in &available_metrics.proxy_metrics {
         println!("\t{metric_name}");
     }
     println!("Available metrics on the cluster level:");
-    for metric_name in cluster_metrics_names {
+    for metric_name in &available_metrics.cluster_metrics {
         println!("\t{metric_name}");
     }
     Ok(())

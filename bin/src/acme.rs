@@ -8,8 +8,7 @@ use tiny_http::{Response as HttpResponse, Server};
 
 use sozu_command_lib::{
     certificate::{
-        calculate_fingerprint, split_certificate_chain, CertificateAndKey, CertificateFingerprint,
-        TlsVersion,
+        calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint, TlsVersion,
     },
     channel::Channel,
     config::Config,
@@ -292,7 +291,7 @@ fn set_up_proxying(
         route: Route::ClusterId(cluster_id.to_owned()),
         hostname: String::from(hostname),
         address: frontend.to_string(),
-        path: PathRule::Prefix(path_begin.to_owned()),
+        path: PathRule::prefix(path_begin.to_owned()),
         method: None,
         position: RulePosition::Tree,
         tags: None,
@@ -325,7 +324,7 @@ fn remove_proxying(
         route: Route::ClusterId(cluster_id.to_owned()),
         address: frontend.to_string(),
         hostname: String::from(hostname),
-        path: PathRule::Prefix(path_begin.to_owned()),
+        path: PathRule::prefix(path_begin.to_owned()),
         method: None,
         position: RulePosition::Tree,
         tags: None,
@@ -382,7 +381,7 @@ fn add_certificate(
                 key,
                 versions: tls_versions.clone(),
             },
-            old_fingerprint: CertificateFingerprint(f),
+            old_fingerprint: Fingerprint(f),
             new_names: vec![hostname.to_string()],
             new_expired_at: None,
         }),

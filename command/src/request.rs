@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, error, fmt, net::SocketAddr, str::FromStr};
 use anyhow::Context;
 
 use crate::{
-    certificate::{CertificateAndKey, CertificateFingerprint},
+    certificate::{CertificateAndKey, Fingerprint},
     config::ProxyProtocolConfig,
     response::{
         is_default_path_rule, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId,
@@ -79,7 +79,10 @@ pub enum Request {
     ActivateListener(ActivateListener),
     DeactivateListener(DeactivateListener),
 
-    QueryCertificates(QueryCertificateType),
+    QueryAllCertificates,
+    QueryCertificateByFingerprint(Fingerprint),
+    QueryCertificatesByDomain(String),
+
     QueryClusters(QueryClusterType),
     QueryClustersHashes,
     QueryMetrics(QueryMetricsOptions),
@@ -110,9 +113,11 @@ impl Request {
             Request::AddHttpsFrontend(_)
             | Request::RemoveHttpsFrontend(_)
             | Request::AddCertificate(_)
+            | Request::QueryAllCertificates
+            | Request::QueryCertificatesByDomain(_)
+            | Request::QueryCertificateByFingerprint(_)
             | Request::ReplaceCertificate(_)
-            | Request::RemoveCertificate(_)
-            | Request::QueryCertificates(_) => proxy_destination.to_https_proxy = true,
+            | Request::RemoveCertificate(_) => proxy_destination.to_https_proxy = true,
 
             Request::AddTcpFrontend(_) | Request::RemoveTcpFrontend(_) => {
                 proxy_destination.to_tcp_proxy = true
@@ -283,14 +288,14 @@ pub struct AddCertificate {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RemoveCertificate {
     pub address: String,
-    pub fingerprint: CertificateFingerprint,
+    pub fingerprint: Fingerprint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReplaceCertificate {
     pub address: String,
     pub new_certificate: CertificateAndKey,
-    pub old_fingerprint: CertificateFingerprint,
+    pub old_fingerprint: Fingerprint,
     #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
     pub new_names: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -363,7 +368,8 @@ pub struct AddBackend {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MetricsConfiguration {
-    Enabled(bool),
+    Enabled,
+    Disabled,
     Clear,
 }
 
@@ -378,14 +384,6 @@ pub enum QueryClusterType {
 pub struct QueryClusterDomain {
     pub hostname: String,
     pub path: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum QueryCertificateType {
-    All,
-    Domain(String),
-    Fingerprint(Vec<u8>),
 }
 
 /// Options originating from the command line
@@ -471,7 +469,7 @@ mod tests {
 
     #[test]
     fn config_message_test() {
-        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "ADD_HTTP_FRONTEND", "content":{"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}}"#;
+        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "ADD_HTTP_FRONTEND", "content":{"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"kind": "PREFIX", "value": "xxx"}, "address": "0.0.0.0:8080"}}"#;
         let message: Request = serde_json::from_str(raw_json).unwrap();
         println!("{message:?}");
         assert_eq!(
@@ -479,7 +477,7 @@ mod tests {
             Request::AddHttpFrontend(RequestHttpFrontend {
                 route: Route::ClusterId(String::from("xxx")),
                 hostname: String::from("yyy"),
-                path: PathRule::Prefix(String::from("xxx")),
+                path: PathRule::prefix(String::from("xxx")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree,
@@ -533,7 +531,7 @@ mod tests {
         Request::AddHttpFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
-            path: PathRule::Prefix(String::from("xxx")),
+            path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
@@ -547,7 +545,7 @@ mod tests {
         Request::RemoveHttpFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
-            path: PathRule::Prefix(String::from("xxx")),
+            path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8080".to_string(),
             position: RulePosition::Tree,
@@ -567,7 +565,7 @@ mod tests {
         Request::AddHttpsFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
-            path: PathRule::Prefix(String::from("xxx")),
+            path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
@@ -581,7 +579,7 @@ mod tests {
         Request::RemoveHttpsFrontend(RequestHttpFrontend {
             route: Route::ClusterId(String::from("xxx")),
             hostname: String::from("yyy"),
-            path: PathRule::Prefix(String::from("xxx")),
+            path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8443".to_string(),
             position: RulePosition::Tree,
@@ -620,7 +618,7 @@ mod tests {
         "../assets/remove_certificate.json",
         Request::RemoveCertificate(RemoveCertificate {
             address: "0.0.0.0:443".parse().unwrap(),
-            fingerprint: CertificateFingerprint(
+            fingerprint: Fingerprint(
                 FromHex::from_hex(
                     "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
                 )
@@ -696,7 +694,7 @@ mod tests {
 
     #[test]
     fn add_front_test() {
-        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": { "CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": { "CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"kind": "PREFIX", "value": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
         let command: Request = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
@@ -704,7 +702,7 @@ mod tests {
                 == Request::AddHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
+                    path: PathRule::prefix(String::from("xxx")),
                     method: None,
                     address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
@@ -715,7 +713,7 @@ mod tests {
 
     #[test]
     fn remove_front_test() {
-        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"kind": "PREFIX", "value": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: Request = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
@@ -723,7 +721,7 @@ mod tests {
                 == Request::RemoveHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("xxx")),
                     hostname: String::from("yyy"),
-                    path: PathRule::Prefix(String::from("xxx")),
+                    path: PathRule::prefix(String::from("xxx")),
                     method: None,
                     address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
@@ -770,7 +768,7 @@ mod tests {
 
     #[test]
     fn http_front_crash_test() {
-        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"kind": "PREFIX", "value": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: Request = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
@@ -778,7 +776,7 @@ mod tests {
                 == Request::AddHttpFrontend(RequestHttpFrontend {
                     route: Route::ClusterId(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
-                    path: PathRule::Prefix(String::from("")),
+                    path: PathRule::prefix(String::from("")),
                     method: None,
                     address: "127.0.0.1:4242".to_string(),
                     position: RulePosition::Tree,
@@ -792,7 +790,7 @@ mod tests {
 
     #[test]
     fn http_front_crash_test2() {
-        let raw_json = r#"{"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242" }"#;
+        let raw_json = r#"{"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"kind": "PREFIX", "value": ""}, "address": "127.0.0.1:4242" }"#;
         let front: HttpFrontend = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{front:?}");
         assert!(
@@ -800,7 +798,7 @@ mod tests {
                 == HttpFrontend {
                     route: Route::ClusterId(String::from("aa")),
                     hostname: String::from("cltdl.fr"),
-                    path: PathRule::Prefix(String::from("")),
+                    path: PathRule::prefix(String::from("")),
                     method: None,
                     address: "127.0.0.1:4242".parse().unwrap(),
                     position: RulePosition::Tree,

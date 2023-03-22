@@ -20,7 +20,7 @@ use sozu_command::{
         AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, Request,
         RequestHttpFrontend, RequestTcpFrontend, WorkerRequest,
     },
-    response::{PathRule, ProxyResponse, Route, RulePosition},
+    response::{PathRule, Route, RulePosition, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
@@ -34,7 +34,7 @@ pub struct Worker {
     pub state: ConfigState,
     pub scm_main_to_worker: ScmSocket,
     pub scm_worker_to_main: ScmSocket,
-    pub command_channel: Channel<WorkerRequest, ProxyResponse>,
+    pub command_channel: Channel<WorkerRequest, WorkerResponse>,
     pub command_id: CommandID,
     pub server_job: JoinHandle<()>,
 }
@@ -82,7 +82,7 @@ impl Worker {
         config: Config,
         listeners: Listeners,
         state: ConfigState,
-    ) -> (ScmSocket, Channel<WorkerRequest, ProxyResponse>, Server) {
+    ) -> (ScmSocket, Channel<WorkerRequest, WorkerResponse>, Server) {
         let (scm_main_to_worker, scm_worker_to_main) =
             UnixStream::pair().expect("could not create unix stream pair");
         let (cmd_main_to_worker, cmd_worker_to_main) =
@@ -223,7 +223,7 @@ impl Worker {
             .expect("Could not write message on command channel");
     }
 
-    pub fn read_proxy_response(&mut self) -> Option<ProxyResponse> {
+    pub fn read_proxy_response(&mut self) -> Option<WorkerResponse> {
         let response = self
             .command_channel
             .read_message()
@@ -296,7 +296,7 @@ impl Worker {
             route: Route::ClusterId(cluster_id.into()),
             address: address.to_string(),
             hostname: String::from("localhost"),
-            path: PathRule::Prefix(String::from("/")),
+            path: PathRule::prefix(String::from("/")),
             method: None,
             position: RulePosition::Tree,
             tags: None,

@@ -22,27 +22,50 @@
       },
       "workers": {
         "0": {
-          "type": "METRICS",
-          "data": {
-            "All": {
-              "proxy": {
-                "sozu.count": {
-                  "type": "COUNT",
-                  "data": -2
-                },
-                "sozu.gauge": {
-                  "type": "GAUGE",
-                  "data": 1
-                },
-                "sozu.time": {
-                  "type": "TIME",
-                  "data": 1234
+          "proxy": {
+            "sozu.count": {
+              "type": "COUNT",
+              "data": -2
+            },
+            "sozu.gauge": {
+              "type": "GAUGE",
+              "data": 1
+            },
+            "sozu.time": {
+              "type": "TIME",
+              "data": 1234
+            }
+          },
+          "clusters": {
+            "cluster_1": {
+              "cluster": {
+                "request_time": {
+                  "type": "PERCENTILES",
+                  "data": {
+                    "samples": 42,
+                    "p_50": 1,
+                    "p_90": 2,
+                    "p_99": 10,
+                    "p_99_9": 12,
+                    "p_99_99": 20,
+                    "p_99_999": 22,
+                    "p_100": 30
+                  }
                 }
               },
-              "clusters": {
-                "cluster_1": {
-                  "cluster": {
-                    "request_time": {
+              "backends": [
+                {
+                  "backend_id": "cluster_1-0",
+                  "metrics": {
+                    "bytes_in": {
+                      "type": "COUNT",
+                      "data": 256
+                    },
+                    "bytes_out": {
+                      "type": "COUNT",
+                      "data": 128
+                    },
+                    "percentiles": {
                       "type": "PERCENTILES",
                       "data": {
                         "samples": 42,
@@ -55,34 +78,9 @@
                         "p_100": 30
                       }
                     }
-                  },
-                  "backends": {
-                    "cluster_1-0": {
-                      "bytes_in": {
-                        "type": "COUNT",
-                        "data": 256
-                      },
-                      "bytes_out": {
-                        "type": "COUNT",
-                        "data": 128
-                      },
-                      "percentiles": {
-                        "type": "PERCENTILES",
-                        "data": {
-                          "samples": 42,
-                          "p_50": 1,
-                          "p_90": 2,
-                          "p_99": 10,
-                          "p_99_9": 12,
-                          "p_99_99": 20,
-                          "p_99_999": 22,
-                          "p_100": 30
-                        }
-                      }
-                    }
                   }
                 }
-              }
+              ]
             }
           }
         }

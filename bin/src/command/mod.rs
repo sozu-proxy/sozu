@@ -26,9 +26,7 @@ use serde::{Deserialize, Serialize};
 use sozu_command_lib::{
     config::Config,
     request::{MetricsConfiguration, Request, WorkerRequest},
-    response::{
-        ProxyResponse, ProxyResponseContent, Response, ResponseContent, ResponseStatus, RunState,
-    },
+    response::{Response, ResponseContent, ResponseStatus, RunState, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
@@ -58,7 +56,7 @@ enum CommandMessage {
     },
     WorkerResponse {
         worker_id: u32,
-        response: ProxyResponse,
+        response: WorkerResponse,
     },
     WorkerClose {
         worker_id: u32,
@@ -198,7 +196,7 @@ pub struct CommandServer {
     in_flight: HashMap<
         String, // the request id
         (
-            futures::channel::mpsc::Sender<(ProxyResponse, u32)>, // (response, worker id) to notify whoever sent the Request
+            futures::channel::mpsc::Sender<(WorkerResponse, u32)>, // (response, worker id) to notify whoever sent the Request
             usize, // the number of expected responses
         ),
     >,
@@ -706,10 +704,10 @@ impl CommandServer {
     async fn handle_worker_response(
         &mut self,
         worker_id: u32,
-        response: ProxyResponse,
+        response: WorkerResponse,
     ) -> anyhow::Result<Success> {
         // Notify the client with Processing in case of a proxy event
-        if let Some(ProxyResponseContent::Event(event)) = response.content {
+        if let Some(ResponseContent::Event(event)) = response.content {
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = Response::new(
@@ -1023,7 +1021,7 @@ async fn worker_loop(
             Ok(msg) => msg,
         };
 
-        match serde_json::from_slice::<ProxyResponse>(&message) {
+        match serde_json::from_slice::<WorkerResponse>(&message) {
             Err(e) => {
                 error!("could not decode worker message: {:?}", e);
                 break;

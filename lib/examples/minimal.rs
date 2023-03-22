@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
         route: Route::ClusterId(String::from("test")),
         address: "127.0.0.1:8080".to_string(),
         hostname: String::from("example.com"),
-        path: PathRule::Prefix(String::from("/")),
+        path: PathRule::prefix(String::from("/")),
         method: None,
         position: RulePosition::Pre,
         tags: Some(BTreeMap::from([

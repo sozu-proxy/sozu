@@ -19,8 +19,8 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     request::{FrontendFilters, MetricsConfiguration, QueryClusterType, Request, WorkerRequest},
     response::{
-        AggregatedMetricsData, ListedFrontends, ListenersList, ProxyResponseContent, QueryAnswer,
-        Response, ResponseContent, ResponseStatus, RunState, WorkerInfo,
+        AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, Response,
+        ResponseContent, ResponseStatus, RunState, WorkerInfo,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -66,7 +66,9 @@ impl CommandServer {
             }
             Request::Status => self.status(client_id).await,
 
-            Request::QueryCertificates(_)
+            Request::QueryCertificateByFingerprint(_)
+            | Request::QueryCertificatesByDomain(_)
+            | Request::QueryAllCertificates
             | Request::QueryClusters(_)
             | Request::QueryClustersHashes
             | Request::QueryMetrics(_) => self.query(client_id, request).await,
@@ -1044,13 +1046,14 @@ impl CommandServer {
         )
         .await;
 
-        let mut main_query_answer = None;
+        let mut main_response_content = None;
         match &request {
             Request::QueryClustersHashes => {
-                main_query_answer = Some(QueryAnswer::ClustersHashes(self.state.hash_state()));
+                main_response_content =
+                    Some(ResponseContent::ClustersHashes(self.state.hash_state()));
             }
             Request::QueryClusters(query_type) => {
-                main_query_answer = Some(QueryAnswer::Clusters(match query_type {
+                main_response_content = Some(ResponseContent::Clusters(match query_type {
                     QueryClusterType::ClusterId(cluster_id) => {
                         vec![self.state.cluster_state(cluster_id)]
                     }
@@ -1067,8 +1070,6 @@ impl CommandServer {
                     }
                 }));
             }
-            Request::QueryCertificates(_) => {}
-            Request::QueryMetrics(_) => {}
             _ => {}
         };
 
@@ -1103,43 +1104,72 @@ impl CommandServer {
                 }
             }
 
-            let mut query_answers: BTreeMap<String, QueryAnswer> = responses
+            let mut worker_responses: BTreeMap<String, ResponseContent> = responses
                 .into_iter()
                 .filter_map(|(worker_id, proxy_response)| {
-                    if let Some(ProxyResponseContent::Query(d)) = proxy_response.content {
-                        Some((worker_id.to_string(), d))
+                    if let Some(response_content) = proxy_response.content {
+                        Some((worker_id.to_string(), response_content))
                     } else {
                         None
                     }
                 })
                 .collect();
 
-            let success = match &request {
+            let response_content = match &request {
                 &Request::QueryClustersHashes | &Request::QueryClusters(_) => {
-                    let main = main_query_answer.unwrap(); // we should refactor to avoid this unwrap()
-                    query_answers.insert(String::from("main"), main);
-                    Success::Query(ResponseContent::Query(query_answers))
+                    let main = main_response_content.unwrap(); // we should refactor to avoid this unwrap()
+                    worker_responses.insert(String::from("main"), main);
+                    ResponseContent::WorkerResponses(worker_responses)
                 }
-                &Request::QueryCertificates(_) => {
-                    info!("certificates query answer received: {:?}", query_answers);
-                    Success::Query(ResponseContent::Query(query_answers))
+                &Request::QueryCertificatesByDomain(_)
+                | &Request::QueryCertificateByFingerprint(_)
+                | &Request::QueryAllCertificates => {
+                    info!("certificates query answer received: {:?}", worker_responses);
+                    ResponseContent::WorkerResponses(worker_responses)
                 }
                 Request::QueryMetrics(options) => {
-                    debug!("metrics query answer received: {:?}", query_answers);
-
                     if options.list {
-                        Success::Query(ResponseContent::Query(query_answers))
+                        let mut summed_proxy_metrics = Vec::new();
+                        let mut summed_cluster_metrics = Vec::new();
+                        for (_, response) in worker_responses {
+                            if let ResponseContent::AvailableMetrics(AvailableMetrics {
+                                proxy_metrics,
+                                cluster_metrics,
+                            }) = response
+                            {
+                                summed_proxy_metrics.append(&mut proxy_metrics.clone());
+                                summed_cluster_metrics.append(&mut cluster_metrics.clone());
+                            }
+                        }
+                        ResponseContent::AvailableMetrics(AvailableMetrics {
+                            proxy_metrics: summed_proxy_metrics,
+                            cluster_metrics: summed_cluster_metrics,
+                        })
                     } else {
-                        Success::Query(ResponseContent::Metrics(AggregatedMetricsData {
+                        let workers_metrics = worker_responses
+                            .into_iter()
+                            .filter_map(|(worker_id, worker_response)| match worker_response {
+                                ResponseContent::WorkerMetrics(worker_metrics) => {
+                                    Some((worker_id, worker_metrics))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        ResponseContent::Metrics(AggregatedMetrics {
                             main: main_metrics,
-                            workers: query_answers,
-                        }))
+                            workers: workers_metrics,
+                        })
                     }
                 }
                 _ => return, // very very unlikely
             };
 
-            return_success(command_tx, cloned_identifier, success).await;
+            return_success(
+                command_tx,
+                cloned_identifier,
+                Success::Query(response_content),
+            )
+            .await;
         })
         .detach();
 

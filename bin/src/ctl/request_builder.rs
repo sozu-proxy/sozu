@@ -2,8 +2,7 @@ use anyhow::{bail, Context};
 
 use sozu_command_lib::{
     certificate::{
-        calculate_fingerprint, split_certificate_chain, CertificateAndKey, CertificateFingerprint,
-        TlsVersion,
+        calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint, TlsVersion,
     },
     config::{Config, ListenerBuilder, ProxyProtocolConfig},
     request::{
@@ -74,8 +73,8 @@ impl CommandManager {
         println!("Configuring metrics: {cmd:?}");
 
         let configuration = match cmd {
-            MetricsCmd::Enable => MetricsConfiguration::Enabled(true),
-            MetricsCmd::Disable => MetricsConfiguration::Enabled(false),
+            MetricsCmd::Enable => MetricsConfiguration::Enabled,
+            MetricsCmd::Disable => MetricsConfiguration::Disabled,
             MetricsCmd::Clear => MetricsConfiguration::Clear,
             _ => bail!("The command passed to the configure_metrics function is wrong."),
         };
@@ -510,9 +509,7 @@ impl CommandManager {
     }
 }
 
-fn get_fingerprint_from_certificate_path(
-    certificate_path: &str,
-) -> anyhow::Result<CertificateFingerprint> {
+fn get_fingerprint_from_certificate_path(certificate_path: &str) -> anyhow::Result<Fingerprint> {
     let bytes = Config::load_file_bytes(certificate_path)
         .with_context(|| format!("could not load certificate file on path {certificate_path}"))?;
 
@@ -520,13 +517,13 @@ fn get_fingerprint_from_certificate_path(
         format!("could not calculate fingerprint for the certificate at {certificate_path}")
     })?;
 
-    Ok(CertificateFingerprint(parsed_bytes))
+    Ok(Fingerprint(parsed_bytes))
 }
 
-fn decode_fingerprint(fingerprint: &str) -> anyhow::Result<CertificateFingerprint> {
+fn decode_fingerprint(fingerprint: &str) -> anyhow::Result<Fingerprint> {
     let bytes = hex::decode(fingerprint)
         .with_context(|| "Failed at decoding the string (expected hexadecimal data)")?;
-    Ok(CertificateFingerprint(bytes))
+    Ok(Fingerprint(bytes))
 }
 
 fn load_full_certificate(

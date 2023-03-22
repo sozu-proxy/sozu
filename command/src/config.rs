@@ -555,11 +555,11 @@ impl FileClusterFrontendConfig {
         };
 
         let path = match (self.path.as_ref(), self.path_type.as_ref()) {
-            (None, _) => PathRule::Prefix("".to_string()),
-            (Some(s), Some(PathRuleType::Prefix)) => PathRule::Prefix(s.to_string()),
-            (Some(s), Some(PathRuleType::Regex)) => PathRule::Regex(s.to_string()),
-            (Some(s), Some(PathRuleType::Equals)) => PathRule::Equals(s.to_string()),
-            (Some(s), None) => PathRule::Prefix(s.clone()),
+            (None, _) => PathRule::prefix("".to_string()),
+            (Some(s), Some(PathRuleType::Prefix)) => PathRule::prefix(s.to_string()),
+            (Some(s), Some(PathRuleType::Regex)) => PathRule::regex(s.to_string()),
+            (Some(s), Some(PathRuleType::Equals)) => PathRule::equals(s.to_string()),
+            (Some(s), None) => PathRule::prefix(s.clone()),
         };
 
         Ok(HttpFrontendConfig {

@@ -18,7 +18,7 @@ use sozu_command::{
     logging,
     ready::Ready,
     request::{Cluster, RemoveListener, Request, RequestHttpFrontend, WorkerRequest},
-    response::{HttpFrontend, HttpListenerConfig, ProxyResponse, Route},
+    response::{HttpFrontend, HttpListenerConfig, Route, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
 };
 
@@ -782,7 +782,7 @@ impl HttpListener {
 }
 
 impl ProxyConfiguration for HttpProxy {
-    fn notify(&mut self, request: WorkerRequest) -> ProxyResponse {
+    fn notify(&mut self, request: WorkerRequest) -> WorkerResponse {
         let request_id = request.id.clone();
 
         let result = match request.content {
@@ -820,7 +820,7 @@ impl ProxyConfiguration for HttpProxy {
                 {
                     Ok(()) => {
                         info!("{} soft stop successful", request_id);
-                        return ProxyResponse::processing(request.id);
+                        return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -833,7 +833,7 @@ impl ProxyConfiguration for HttpProxy {
                 {
                     Ok(()) => {
                         info!("{} hard stop successful", request_id);
-                        return ProxyResponse::processing(request.id);
+                        return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -862,11 +862,11 @@ impl ProxyConfiguration for HttpProxy {
         match result {
             Ok(()) => {
                 info!("{} successful", request_id);
-                ProxyResponse::ok(request_id)
+                WorkerResponse::ok(request_id)
             }
             Err(error_message) => {
                 error!("{} unsuccessful: {:#}", request_id, error_message);
-                ProxyResponse::error(request_id, format!("{error_message:#}"))
+                WorkerResponse::error(request_id, format!("{error_message:#}"))
             }
         }
     }
@@ -1133,7 +1133,7 @@ mod tests {
             route: Route::ClusterId(String::from("cluster_1")),
             address: "127.0.0.1:1024".to_string(),
             hostname: String::from("localhost"),
-            path: PathRule::Prefix(String::from("/")),
+            path: PathRule::prefix(String::from("/")),
             method: None,
             position: RulePosition::Tree,
             tags: None,
@@ -1218,7 +1218,7 @@ mod tests {
             address: "127.0.0.1:1031".to_string(),
             hostname: String::from("localhost"),
             method: None,
-            path: PathRule::Prefix(String::from("/")),
+            path: PathRule::prefix(String::from("/")),
             position: RulePosition::Tree,
             route: Route::ClusterId(String::from("cluster_1")),
             tags: None,
@@ -1344,7 +1344,7 @@ mod tests {
             address: "127.0.0.1:1041".to_string(),
             hostname: String::from("localhost"),
             method: None,
-            path: PathRule::Prefix(String::from("/")),
+            path: PathRule::prefix(String::from("/")),
             position: RulePosition::Tree,
             route: Route::ClusterId(String::from("cluster_1")),
             tags: None,
@@ -1451,7 +1451,7 @@ mod tests {
                 address: "0.0.0.0:80".parse().unwrap(),
                 hostname: "lolcatho.st".to_owned(),
                 method: None,
-                path: PathRule::Prefix(uri1),
+                path: PathRule::prefix(uri1),
                 position: RulePosition::Tree,
                 route: Route::ClusterId(cluster_id1),
                 tags: None,
@@ -1462,7 +1462,7 @@ mod tests {
                 address: "0.0.0.0:80".parse().unwrap(),
                 hostname: "lolcatho.st".to_owned(),
                 method: None,
-                path: PathRule::Prefix(uri2),
+                path: PathRule::prefix(uri2),
                 position: RulePosition::Tree,
                 route: Route::ClusterId(cluster_id2),
                 tags: None,
@@ -1473,7 +1473,7 @@ mod tests {
                 address: "0.0.0.0:80".parse().unwrap(),
                 hostname: "lolcatho.st".to_owned(),
                 method: None,
-                path: PathRule::Prefix(uri3),
+                path: PathRule::prefix(uri3),
                 position: RulePosition::Tree,
                 route: Route::ClusterId(cluster_id3),
                 tags: None,
@@ -1484,7 +1484,7 @@ mod tests {
                 address: "0.0.0.0:80".parse().unwrap(),
                 hostname: "other.domain".to_owned(),
                 method: None,
-                path: PathRule::Prefix("/test".to_owned()),
+                path: PathRule::prefix("/test".to_owned()),
                 position: RulePosition::Tree,
                 route: Route::ClusterId("cluster_1".to_owned()),
                 tags: None,

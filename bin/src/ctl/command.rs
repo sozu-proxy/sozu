@@ -4,9 +4,8 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
 
 use sozu_command_lib::{
-    request::{
-        QueryCertificateType, QueryClusterDomain, QueryClusterType, QueryMetricsOptions, Request,
-    },
+    certificate::Fingerprint,
+    request::{QueryClusterDomain, QueryClusterType, QueryMetricsOptions, Request},
     response::{Response, ResponseContent, ResponseStatus, RunState, WorkerInfo},
 };
 
@@ -93,7 +92,13 @@ impl CommandManager {
                         Some(response_content) => match response_content {
                             ResponseContent::Workers(_)
                             | ResponseContent::Metrics(_)
-                            | ResponseContent::Query(_)
+                            | ResponseContent::WorkerResponses(_)
+                            | ResponseContent::WorkerMetrics(_)
+                            | ResponseContent::ClustersHashes(_)
+                            | ResponseContent::Clusters(_)
+                            | ResponseContent::CertificateByFingerprint(_)
+                            | ResponseContent::Certificates(_)
+                            | ResponseContent::AvailableMetrics(_)
                             | ResponseContent::Event(_) => {}
                             ResponseContent::State(state) => match json {
                                 true => print_json_response(&state)?,
@@ -292,8 +297,8 @@ impl CommandManager {
                             Some(ResponseContent::Metrics(aggregated_metrics_data)) => {
                                 print_metrics(aggregated_metrics_data, json)?
                             }
-                            Some(ResponseContent::Query(lists_of_metrics)) => {
-                                print_available_metrics(&lists_of_metrics)?;
+                            Some(ResponseContent::AvailableMetrics(available)) => {
+                                print_available_metrics(&available)?;
                             }
                             _ => println!("Wrong kind of response here"),
                         }
@@ -381,21 +386,19 @@ impl CommandManager {
         fingerprint: Option<String>,
         domain: Option<String>,
     ) -> Result<(), anyhow::Error> {
-        let query = match (fingerprint, domain) {
-            (None, None) => QueryCertificateType::All,
+        let request = match (fingerprint, domain) {
+            (None, None) => Request::QueryAllCertificates,
             (Some(f), None) => match hex::decode(f) {
                 Err(e) => {
                     bail!("invalid fingerprint: {:?}", e);
                 }
-                Ok(f) => QueryCertificateType::Fingerprint(f),
+                Ok(f) => Request::QueryCertificateByFingerprint(Fingerprint(f)),
             },
-            (None, Some(d)) => QueryCertificateType::Domain(d),
+            (None, Some(d)) => Request::QueryCertificatesByDomain(d),
             (Some(_), Some(_)) => {
                 bail!("Error: Either request a fingerprint or a domain name");
             }
         };
-
-        let request = Request::QueryCertificates(query);
 
         self.send_request(request)?;
 
@@ -416,7 +419,9 @@ impl CommandManager {
                 }
                 ResponseStatus::Ok => {
                     match response.content {
-                        Some(ResponseContent::Query(data)) => print_certificates(data, json)?,
+                        Some(ResponseContent::WorkerResponses(data)) => {
+                            print_certificates(data, json)?
+                        }
                         _ => bail!("unexpected response: {:?}", response.content),
                     }
                     break;

@@ -26,7 +26,9 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::{config::DEFAULT_CIPHER_SUITES, request::RequestHttpFrontend};
+use sozu_command::{
+    certificate::CertificateSummary, config::DEFAULT_CIPHER_SUITES, request::RequestHttpFrontend,
+};
 use time::{Duration, Instant};
 
 use crate::{
@@ -47,17 +49,14 @@ use crate::{
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     sozu_command::{
-        certificate::{CertificateFingerprint, TlsVersion},
+        certificate::{Fingerprint, TlsVersion},
         logging,
         ready::Ready,
         request::{
-            AddCertificate, Cluster, QueryCertificateType, RemoveCertificate, RemoveListener,
-            ReplaceCertificate, Request, WorkerRequest,
+            AddCertificate, Cluster, RemoveCertificate, RemoveListener, ReplaceCertificate,
+            Request, WorkerRequest,
         },
-        response::{
-            HttpFrontend, HttpsListenerConfig, ProxyResponse, ProxyResponseContent, QueryAnswer,
-            QueryAnswerCertificate, Route,
-        },
+        response::{HttpFrontend, HttpsListenerConfig, ResponseContent, Route, WorkerResponse},
         scm_socket::ScmSocket,
         state::ClusterId,
     },
@@ -646,10 +645,7 @@ impl L7ListenerHandler for HttpsListener {
 impl CertificateResolver for HttpsListener {
     type Error = ListenerError;
 
-    fn get_certificate(
-        &self,
-        fingerprint: &CertificateFingerprint,
-    ) -> Option<ParsedCertificateAndKey> {
+    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<ParsedCertificateAndKey> {
         let resolver = self
             .resolver
             .0
@@ -660,10 +656,7 @@ impl CertificateResolver for HttpsListener {
         resolver.get_certificate(fingerprint)
     }
 
-    fn add_certificate(
-        &mut self,
-        opts: &AddCertificate,
-    ) -> Result<CertificateFingerprint, Self::Error> {
+    fn add_certificate(&mut self, opts: &AddCertificate) -> Result<Fingerprint, Self::Error> {
         let mut resolver = self
             .resolver
             .0
@@ -874,7 +867,7 @@ impl HttpsProxy {
     pub fn remove_listener(
         &mut self,
         remove: RemoveListener,
-    ) -> anyhow::Result<Option<ProxyResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         let len = self.listeners.len();
 
         self.listeners
@@ -929,10 +922,7 @@ impl HttpsProxy {
         Ok(())
     }
 
-    pub fn logging(
-        &mut self,
-        logging_filter: String,
-    ) -> anyhow::Result<Option<ProxyResponseContent>> {
+    pub fn logging(&mut self, logging_filter: String) -> anyhow::Result<Option<ResponseContent>> {
         logging::LOGGER.with(|l| {
             let directives = logging::parse_logging_spec(&logging_filter);
             l.borrow_mut().set_directives(directives);
@@ -940,21 +930,24 @@ impl HttpsProxy {
         Ok(None)
     }
 
-    pub fn query_all_certificates(&mut self) -> anyhow::Result<Option<ProxyResponseContent>> {
+    pub fn query_all_certificates(&mut self) -> anyhow::Result<Option<ResponseContent>> {
         let certificates = self
             .listeners
             .values()
             .map(|listener| {
                 let owned = listener.borrow();
                 let resolver = unwrap_msg!(owned.resolver.0.lock());
-                let res = resolver
+                let certificate_summaries = resolver
                     .domains
                     .to_hashmap()
                     .drain()
-                    .map(|(k, v)| (String::from_utf8(k).unwrap(), v.0))
+                    .map(|(k, fingerprint)| CertificateSummary {
+                        domain: String::from_utf8(k).unwrap(),
+                        fingerprint,
+                    })
                     .collect();
 
-                (owned.address, res)
+                (owned.address, certificate_summaries)
             })
             .collect::<HashMap<_, _>>();
 
@@ -963,27 +956,30 @@ impl HttpsProxy {
             certificates
         );
 
-        Ok(Some(ProxyResponseContent::Query(
-            QueryAnswer::Certificates(QueryAnswerCertificate::All(certificates)),
-        )))
+        Ok(Some(ResponseContent::Certificates(certificates)))
     }
 
     pub fn query_certificate_for_domain(
         &mut self,
         domain: String,
-    ) -> anyhow::Result<Option<ProxyResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         let certificates = self
             .listeners
             .values()
             .map(|listener| {
                 let owned = listener.borrow();
                 let resolver = unwrap_msg!(owned.resolver.0.lock());
-                (
-                    owned.address,
-                    resolver
-                        .domain_lookup(domain.as_bytes(), true)
-                        .map(|(k, v)| (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())),
-                )
+                let mut certificate_summary = vec![];
+
+                resolver
+                    .domain_lookup(domain.as_bytes(), true)
+                    .map(|(k, fingerprint)| {
+                        certificate_summary.push(CertificateSummary {
+                            domain: String::from_utf8(k.to_vec()).unwrap(),
+                            fingerprint: fingerprint.clone(),
+                        });
+                    });
+                (owned.address, certificate_summary)
             })
             .collect::<HashMap<_, _>>();
 
@@ -992,9 +988,7 @@ impl HttpsProxy {
             domain, certificates
         );
 
-        Ok(Some(ProxyResponseContent::Query(
-            QueryAnswer::Certificates(QueryAnswerCertificate::Domain(certificates)),
-        )))
+        Ok(Some(ResponseContent::Certificates(certificates)))
     }
 
     pub fn activate_listener(
@@ -1046,10 +1040,7 @@ impl HttpsProxy {
             })
     }
 
-    pub fn add_cluster(
-        &mut self,
-        mut cluster: Cluster,
-    ) -> anyhow::Result<Option<ProxyResponseContent>> {
+    pub fn add_cluster(&mut self, mut cluster: Cluster) -> anyhow::Result<Option<ResponseContent>> {
         if let Some(answer_503) = cluster.answer_503.take() {
             for listener in self.listeners.values() {
                 listener
@@ -1063,10 +1054,7 @@ impl HttpsProxy {
         Ok(None)
     }
 
-    pub fn remove_cluster(
-        &mut self,
-        cluster_id: &str,
-    ) -> anyhow::Result<Option<ProxyResponseContent>> {
+    pub fn remove_cluster(&mut self, cluster_id: &str) -> anyhow::Result<Option<ResponseContent>> {
         self.clusters.remove(cluster_id);
         for listener in self.listeners.values() {
             listener
@@ -1082,7 +1070,7 @@ impl HttpsProxy {
     pub fn add_https_frontend(
         &mut self,
         front: RequestHttpFrontend,
-    ) -> anyhow::Result<Option<ProxyResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         let front = front.to_frontend()?;
 
         match self
@@ -1105,7 +1093,7 @@ impl HttpsProxy {
     pub fn remove_https_frontend(
         &mut self,
         front: RequestHttpFrontend,
-    ) -> anyhow::Result<Option<ProxyResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         let front = front.to_frontend()?;
 
         if let Some(listener) = self
@@ -1125,7 +1113,7 @@ impl HttpsProxy {
     pub fn add_certificate(
         &mut self,
         add_certificate: AddCertificate,
-    ) -> anyhow::Result<Option<ProxyResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         let address = add_certificate.address.parse()?;
         match self
             .listeners
@@ -1149,7 +1137,7 @@ impl HttpsProxy {
     pub fn remove_certificate(
         &mut self,
         remove_certificate: RemoveCertificate,
-    ) -> anyhow::Result<Option<ProxyResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         let address = remove_certificate.address.parse()?;
         match self
             .listeners
@@ -1173,7 +1161,7 @@ impl HttpsProxy {
     pub fn replace_certificate(
         &mut self,
         replace_certificate: ReplaceCertificate,
-    ) -> anyhow::Result<Option<ProxyResponseContent>> {
+    ) -> anyhow::Result<Option<ResponseContent>> {
         let address = replace_certificate.address.parse()?;
         match self
             .listeners
@@ -1266,7 +1254,7 @@ impl ProxyConfiguration for HttpsProxy {
         Ok(())
     }
 
-    fn notify(&mut self, request: WorkerRequest) -> ProxyResponse {
+    fn notify(&mut self, request: WorkerRequest) -> WorkerResponse {
         let request_id = request.id.clone();
 
         let content_result = match request.content {
@@ -1325,7 +1313,7 @@ impl ProxyConfiguration for HttpsProxy {
                 {
                     Ok(_) => {
                         info!("{} soft stop successful", request_id);
-                        return ProxyResponse::processing(request.id);
+                        return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -1338,7 +1326,7 @@ impl ProxyConfiguration for HttpsProxy {
                 {
                     Ok(_) => {
                         info!("{} hard stop successful", request_id);
-                        return ProxyResponse::processing(request.id);
+                        return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
@@ -1355,12 +1343,12 @@ impl ProxyConfiguration for HttpsProxy {
                 self.logging(logging_filter.clone())
                     .with_context(|| format!("Could not set logging level to {logging_filter}"))
             }
-            Request::QueryCertificates(QueryCertificateType::All) => {
+            Request::QueryAllCertificates => {
                 info!("{} query all certificates", request_id);
                 self.query_all_certificates()
                     .with_context(|| "Could not query all certificates")
             }
-            Request::QueryCertificates(QueryCertificateType::Domain(domain)) => {
+            Request::QueryCertificatesByDomain(domain) => {
                 info!("{} query certificate for domain {}", request_id, domain);
                 self.query_certificate_for_domain(domain.clone())
                     .with_context(|| format!("Could not query certificate for domain {domain}"))
@@ -1378,13 +1366,13 @@ impl ProxyConfiguration for HttpsProxy {
             Ok(content) => {
                 info!("{} successful", request_id);
                 match content {
-                    Some(content) => ProxyResponse::ok_with_content(request_id, content),
-                    None => ProxyResponse::ok(request_id),
+                    Some(content) => WorkerResponse::ok_with_content(request_id, content),
+                    None => WorkerResponse::ok(request_id),
                 }
             }
             Err(error_message) => {
                 error!("{} unsuccessful: {:#}", request_id, error_message);
-                ProxyResponse::error(request_id, format!("{error_message:#}"))
+                WorkerResponse::error(request_id, format!("{error_message:#}"))
             }
         }
     }

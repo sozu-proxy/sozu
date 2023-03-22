@@ -3,6 +3,7 @@ pub mod trie;
 
 use anyhow::{bail, Context};
 use regex::bytes::Regex;
+use sozu_command::response::PathRuleKind;
 use std::str::from_utf8;
 
 use crate::{
@@ -485,10 +486,10 @@ impl PathRule {
     }
 
     pub fn from_config(rule: CommandPathRule) -> Option<Self> {
-        match rule {
-            CommandPathRule::Prefix(s) => Some(PathRule::Prefix(s)),
-            CommandPathRule::Regex(s) => Regex::new(&s).ok().map(PathRule::Regex),
-            CommandPathRule::Equals(s) => Some(PathRule::Equals(s)),
+        match rule.kind {
+            PathRuleKind::Prefix => Some(PathRule::Prefix(rule.value)),
+            PathRuleKind::Regex => Regex::new(&rule.value).ok().map(PathRule::Regex),
+            PathRuleKind::Equals => Some(PathRule::Equals(rule.value)),
         }
     }
 }
@@ -502,23 +503,6 @@ impl std::cmp::PartialEq for PathRule {
         }
     }
 }
-
-/*
-impl std::str::FromStr for PathRule {
-  type Err = ();
-
-  fn from_str(s: &str) -> Result<Self, Self::Err> {
-    Ok(if s.chars().next() == Some('~') {
-      match regex::bytes::Regex::new(&s[1..]) {
-        Ok(r) => PathRule::Regex(r),
-        Err(_) => return Err(()),
-      }
-    } else {
-      PathRule::Prefix(s.to_string())
-    })
-  }
-}
-*/
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MethodRule {
