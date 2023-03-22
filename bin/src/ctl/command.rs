@@ -395,7 +395,7 @@ impl CommandManager {
                 }
                 Ok(f) => Request::QueryCertificates(QueryCertificateType::Fingerprint(f)),
             },
-            (None, Some(d)) => Request::QueryCertificates(QueryCertificateType::Domain(d)),
+            (None, Some(d)) => Request::QueryCertificatesByDomain(d),
             (Some(_), Some(_)) => {
                 bail!("Error: Either request a fingerprint or a domain name");
             }

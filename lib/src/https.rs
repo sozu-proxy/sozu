@@ -53,8 +53,8 @@ use crate::{
         logging,
         ready::Ready,
         request::{
-            AddCertificate, Cluster, QueryCertificateType, RemoveCertificate, RemoveListener,
-            ReplaceCertificate, Request, WorkerRequest,
+            AddCertificate, Cluster, RemoveCertificate, RemoveListener, ReplaceCertificate,
+            Request, WorkerRequest,
         },
         response::{HttpFrontend, HttpsListenerConfig, ResponseContent, Route, WorkerResponse},
         scm_socket::ScmSocket,
@@ -1348,7 +1348,7 @@ impl ProxyConfiguration for HttpsProxy {
                 self.query_all_certificates()
                     .with_context(|| "Could not query all certificates")
             }
-            Request::QueryCertificates(QueryCertificateType::Domain(domain)) => {
+            Request::QueryCertificatesByDomain(domain) => {
                 info!("{} query certificate for domain {}", request_id, domain);
                 self.query_certificate_for_domain(domain.clone())
                     .with_context(|| format!("Could not query certificate for domain {domain}"))
