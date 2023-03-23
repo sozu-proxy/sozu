@@ -83,6 +83,7 @@ pub enum Request {
     QueryCertificateByFingerprint(Fingerprint),
     QueryCertificatesByDomain(String),
 
+    QueryClusterById(ClusterId),
     QueryClusters(QueryClusterType),
     QueryClustersHashes,
     QueryMetrics(QueryMetricsOptions),
@@ -130,6 +131,7 @@ impl Request {
             | Request::SoftStop
             | Request::HardStop
             | Request::Status
+            | Request::QueryClusterById(_)
             | Request::QueryClusters(_)
             | Request::QueryClustersHashes
             | Request::QueryMetrics(_)
@@ -376,7 +378,7 @@ pub enum MetricsConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryClusterType {
-    ClusterId(String),
+    // ClusterId(String),
     Domain(QueryClusterDomain),
 }
 

@@ -885,11 +885,14 @@ impl Server {
                 ));
                 return;
             }
+            Request::QueryClusterById(cluster_id) => {
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id.clone(),
+                    ResponseContent::Clusters(vec![self.config_state.cluster_state(cluster_id)]),
+                ));
+            }
             Request::QueryClusters(query_type) => {
                 let content = match query_type {
-                    QueryClusterType::ClusterId(cluster_id) => {
-                        ResponseContent::Clusters(vec![self.config_state.cluster_state(cluster_id)])
-                    }
                     QueryClusterType::Domain(domain) => {
                         let cluster_ids = get_cluster_ids_by_domain(
                             &self.config_state,

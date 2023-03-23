@@ -1052,11 +1052,13 @@ impl CommandServer {
                 main_response_content =
                     Some(ResponseContent::ClustersHashes(self.state.hash_state()));
             }
+            Request::QueryClusterById(cluster_id) => {
+                main_response_content = Some(ResponseContent::Clusters(vec![self
+                    .state
+                    .cluster_state(cluster_id)]))
+            }
             Request::QueryClusters(query_type) => {
                 main_response_content = Some(ResponseContent::Clusters(match query_type {
-                    QueryClusterType::ClusterId(cluster_id) => {
-                        vec![self.state.cluster_state(cluster_id)]
-                    }
                     QueryClusterType::Domain(domain) => {
                         let cluster_ids = get_cluster_ids_by_domain(
                             &self.state,

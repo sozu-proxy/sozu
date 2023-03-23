@@ -332,8 +332,8 @@ impl CommandManager {
             bail!("Error: Either request an cluster ID or a domain name");
         }
 
-        let command = if let Some(ref cluster_id) = cluster_id {
-            Request::QueryClusters(QueryClusterType::ClusterId(cluster_id.to_string()))
+        let request = if let Some(ref cluster_id) = cluster_id {
+            Request::QueryClusterById(cluster_id.to_string())
         } else if let Some(ref domain) = domain {
             let splitted: Vec<String> =
                 domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
@@ -355,7 +355,7 @@ impl CommandManager {
             Request::QueryClustersHashes
         };
 
-        self.send_request(command)?;
+        self.send_request(request)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
