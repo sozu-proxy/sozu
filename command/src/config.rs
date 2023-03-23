@@ -14,14 +14,13 @@ use toml;
 
 use crate::{
     certificate::{split_certificate_chain, CertificateAndKey, TlsVersion},
+    proto::command::{PathRule, RequestHttpFrontend, RulePosition},
     request::{
         ActivateListener, AddBackend, AddCertificate, Cluster, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, Request, RequestHttpFrontend,
-        RequestTcpFrontend, WorkerRequest,
+        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, Request, RequestTcpFrontend,
+        WorkerRequest,
     },
-    response::{
-        HttpListenerConfig, HttpsListenerConfig, PathRule, RulePosition, TcpListenerConfig,
-    },
+    response::{HttpListenerConfig, HttpsListenerConfig, TcpListenerConfig},
 };
 
 /// [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS
@@ -750,6 +749,11 @@ impl HttpFrontendConfig {
     pub fn generate_requests(&self, cluster_id: &str) -> Vec<Request> {
         let mut v = Vec::new();
 
+        let tags = match self.tags.clone() {
+            Some(tags) => tags,
+            None => BTreeMap::new(),
+        };
+
         if self.key.is_some() && self.certificate.is_some() {
             v.push(Request::AddCertificate(AddCertificate {
                 address: self.address.to_string(),
@@ -769,8 +773,8 @@ impl HttpFrontendConfig {
                 hostname: self.hostname.clone(),
                 path: self.path.clone(),
                 method: self.method.clone(),
-                position: self.position,
-                tags: self.tags.clone(),
+                position: self.position.into(),
+                tags,
             }));
         } else {
             //create the front both for HTTP and HTTPS if possible
@@ -780,8 +784,8 @@ impl HttpFrontendConfig {
                 hostname: self.hostname.clone(),
                 path: self.path.clone(),
                 method: self.method.clone(),
-                position: self.position,
-                tags: self.tags.clone(),
+                position: self.position.into(),
+                tags,
             }));
         }
 

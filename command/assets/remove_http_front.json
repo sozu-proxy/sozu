@@ -5,10 +5,11 @@
     "address": "0.0.0.0:8080",
     "hostname": "yyy",
     "path": {
-      "kind": "PREFIX",
+      "kind": 0,
       "value": "xxx"
     },
-    "position": "TREE",
+    "method": null,
+    "position": 2,
     "tags": {
       "owner": "John",
       "uuid": "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83"

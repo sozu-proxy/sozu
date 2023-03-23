@@ -16,8 +16,9 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     logging,
+    proto::command::RequestHttpFrontend,
     ready::Ready,
-    request::{Cluster, RemoveListener, Request, RequestHttpFrontend, WorkerRequest},
+    request::{Cluster, RemoveListener, Request, WorkerRequest},
     response::{HttpFrontend, HttpListenerConfig, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
 };
@@ -1105,22 +1106,25 @@ pub fn start_http_worker(
 #[cfg(test)]
 mod tests {
     extern crate tiny_http;
-    use sozu_command::config::ListenerBuilder;
 
     use super::*;
     use crate::sozu_command::{
         channel::Channel,
+        config::ListenerBuilder,
+        proto::command::{PathRule, RulePosition},
         request::{LoadBalancingAlgorithms, LoadBalancingParams, Request, WorkerRequest},
-        response::{Backend, HttpFrontend, PathRule, RulePosition},
+        response::{Backend, HttpFrontend},
     };
 
-    use std::io::{Read, Write};
-    use std::net::SocketAddr;
-    use std::net::TcpStream;
-    use std::str::FromStr;
-    use std::sync::{Arc, Barrier};
-    use std::time::Duration;
-    use std::{str, thread};
+    use std::{
+        io::{Read, Write},
+        net::{SocketAddr, TcpStream},
+        str,
+        str::FromStr,
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
 
     /*
     #[test]
@@ -1159,8 +1163,8 @@ mod tests {
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
             method: None,
-            position: RulePosition::Tree,
-            tags: None,
+            position: RulePosition::Tree.into(),
+            tags: BTreeMap::new(),
         };
         command
             .write_message(&WorkerRequest {
@@ -1243,9 +1247,9 @@ mod tests {
             hostname: String::from("localhost"),
             method: None,
             path: PathRule::prefix(String::from("/")),
-            position: RulePosition::Tree,
+            position: RulePosition::Tree.into(),
             cluster_id: Some(String::from("cluster_1")),
-            tags: None,
+            tags: BTreeMap::new(),
         };
         command
             .write_message(&WorkerRequest {
@@ -1369,9 +1373,9 @@ mod tests {
             hostname: String::from("localhost"),
             method: None,
             path: PathRule::prefix(String::from("/")),
-            position: RulePosition::Tree,
+            position: RulePosition::Tree.into(),
             cluster_id: Some(String::from("cluster_1")),
-            tags: None,
+            tags: BTreeMap::new(),
         };
         command
             .write_message(&WorkerRequest {

@@ -8,9 +8,10 @@ use std::{
 
 use crate::{
     certificate::{CertificateSummary, TlsVersion},
+    proto::command::{PathRule, PathRuleKind, RequestHttpFrontend, RulePosition},
     request::{
         default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams,
-        RequestHttpFrontend, RequestTcpFrontend, PROTOCOL_VERSION,
+        RequestTcpFrontend, PROTOCOL_VERSION,
     },
     state::{ClusterId, ConfigState},
 };
@@ -124,51 +125,20 @@ pub struct HttpFrontend {
 
 impl Into<RequestHttpFrontend> for HttpFrontend {
     fn into(self) -> RequestHttpFrontend {
+        let tags = match self.tags {
+            Some(tags) => tags,
+            None => BTreeMap::new(),
+        };
         RequestHttpFrontend {
             cluster_id: self.cluster_id,
             address: self.address.to_string(),
             hostname: self.hostname,
             path: self.path,
             method: self.method,
-            position: self.position,
-            tags: self.tags,
+            position: self.position.into(),
+            tags,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RulePosition {
-    Pre,
-    Post,
-    Tree,
-}
-
-impl Default for RulePosition {
-    fn default() -> Self {
-        RulePosition::Tree
-    }
-}
-
-/// A filter for the path of incoming requests
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-// #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub struct PathRule {
-    /// Either Prefix, Regex or Equals
-    pub kind: PathRuleKind,
-    pub value: String,
-}
-
-/// The kind of filter used for path rules
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PathRuleKind {
-    /// filters paths that start with a pattern, typically "/api"
-    Prefix,
-    /// filters paths that match a regex pattern
-    Regex,
-    /// filters paths that exactly match a pattern, no more, no less
-    Equals,
 }
 
 impl PathRule {
@@ -177,7 +147,7 @@ impl PathRule {
         S: ToString,
     {
         Self {
-            kind: PathRuleKind::Prefix,
+            kind: PathRuleKind::Prefix.into(),
             value: value.to_string(),
         }
     }
@@ -187,7 +157,7 @@ impl PathRule {
         S: ToString,
     {
         Self {
-            kind: PathRuleKind::Regex,
+            kind: PathRuleKind::Regex.into(),
             value: value.to_string(),
         }
     }
@@ -197,7 +167,7 @@ impl PathRule {
         S: ToString,
     {
         Self {
-            kind: PathRuleKind::Equals,
+            kind: PathRuleKind::Equals.into(),
             value: value.to_string(),
         }
     }
@@ -209,15 +179,15 @@ impl PathRule {
     ) -> Self {
         match (path_prefix, path_regex, path_equals) {
             (Some(prefix), _, _) => PathRule {
-                kind: PathRuleKind::Prefix,
+                kind: PathRuleKind::Prefix as i32,
                 value: prefix,
             },
             (None, Some(regex), _) => PathRule {
-                kind: PathRuleKind::Regex,
+                kind: PathRuleKind::Regex as i32,
                 value: regex,
             },
             (None, None, Some(equals)) => PathRule {
-                kind: PathRuleKind::Equals,
+                kind: PathRuleKind::Equals as i32,
                 value: equals,
             },
             _ => PathRule::default(),
@@ -225,25 +195,17 @@ impl PathRule {
     }
 }
 
-impl Default for PathRule {
-    fn default() -> Self {
-        PathRule {
-            kind: PathRuleKind::Prefix,
-            value: String::new(),
-        }
-    }
-}
-
 pub fn is_default_path_rule(p: &PathRule) -> bool {
-    p.kind == PathRuleKind::Prefix && p.value.is_empty()
+    PathRuleKind::from_i32(p.kind) == Some(PathRuleKind::Prefix) && p.value.is_empty()
 }
 
 impl std::fmt::Display for PathRule {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.kind {
-            PathRuleKind::Prefix => write!(f, "prefix '{}'", self.value),
-            PathRuleKind::Regex => write!(f, "regexp '{}'", self.value),
-            PathRuleKind::Equals => write!(f, "equals '{}'", self.value),
+        match PathRuleKind::from_i32(self.kind) {
+            Some(PathRuleKind::Prefix) => write!(f, "prefix '{}'", self.value),
+            Some(PathRuleKind::Regex) => write!(f, "regexp '{}'", self.value),
+            Some(PathRuleKind::Equals) => write!(f, "equals '{}'", self.value),
+            None => write!(f, ""),
         }
     }
 }

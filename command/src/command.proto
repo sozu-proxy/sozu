@@ -1,4 +1,47 @@
 syntax = "proto2";
 package command;
 
-message helloworld {};
+message RequestHttpFrontend {
+    optional string cluster_id = 1;
+    required string address = 2;
+    required string hostname = 3;
+    required PathRule path = 4;
+    optional string method = 5;
+    required RulePosition position = 6 [default = TREE];
+    map<string, string> tags = 7;
+}
+
+// list the frontends, filtered by protocol and/or domain
+message FrontendFilters {
+    required bool http = 1;
+    required bool https = 2;
+    required bool tcp = 3;
+    optional string domain = 4;
+}
+
+// A filter for the path of incoming requests
+message PathRule {
+    // The kind of filter used for path rules
+    required PathRuleKind kind = 1;
+    // the value of the given prefix, regex or equal pathrule
+    required string value = 2;
+}
+
+// The kind of filter used for path rules
+enum PathRuleKind {
+    // filters paths that start with a pattern, typically "/api"
+    PREFIX = 0;
+    // filters paths that match a regex pattern
+    REGEX = 1;
+    // filters paths that exactly match a pattern, no more, no less
+    EQUALS = 2;
+}
+
+// TODO: find a proper definition for this
+enum RulePosition {
+    PRE = 0;
+    POST = 1;
+    TREE = 2;
+}
+
+

@@ -13,14 +13,15 @@ use anyhow::{bail, Context};
 
 use crate::{
     certificate::{calculate_fingerprint, CertificateAndKey, Fingerprint},
+    proto::command::{PathRule, PathRuleKind, RequestHttpFrontend},
     request::{
         ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, ListenerType,
         RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
-        RequestHttpFrontend, RequestTcpFrontend,
+        RequestTcpFrontend,
     },
     response::{
         Backend, ClusterInformation, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        PathRule, TcpFrontend, TcpListenerConfig,
+        TcpFrontend, TcpListenerConfig,
     },
 };
 
@@ -1231,8 +1232,8 @@ impl<
 mod tests {
     use super::*;
     use crate::{
-        request::{LoadBalancingAlgorithms, LoadBalancingParams, Request, RequestHttpFrontend},
-        response::RulePosition,
+        proto::command::{RequestHttpFrontend, RulePosition},
+        request::{LoadBalancingAlgorithms, LoadBalancingParams, Request},
     };
 
     #[test]
@@ -1245,8 +1246,8 @@ mod tests {
                 path: PathRule::prefix(String::from("/")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Tree,
-                tags: None,
+                position: RulePosition::Tree.into(),
+                tags: BTreeMap::new(),
             }))
             .expect("Could not execute request");
         state
@@ -1256,8 +1257,8 @@ mod tests {
                 path: PathRule::prefix(String::from("/abc")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Pre,
-                tags: None,
+                position: RulePosition::Pre.into(),
+                tags: BTreeMap::new(),
             }))
             .expect("Could not execute request");
         state
@@ -1329,8 +1330,8 @@ mod tests {
                 path: PathRule::prefix(String::from("/")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Post,
-                tags: None,
+                position: RulePosition::Post.into(),
+                tags: BTreeMap::new(),
             }))
             .expect("Could not execute request");
         state
@@ -1340,8 +1341,8 @@ mod tests {
                 path: PathRule::prefix(String::from("/abc")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Tree,
-                tags: None,
+                position: RulePosition::Tree.into(),
+                tags: BTreeMap::new(),
             }))
             .expect("Could not execute request");
         state
@@ -1394,8 +1395,8 @@ mod tests {
                 path: PathRule::prefix(String::from("/")),
                 address: "0.0.0.0:8080".to_string(),
                 method: None,
-                position: RulePosition::Post,
-                tags: None,
+                position: RulePosition::Post.into(),
+                tags: BTreeMap::new(),
             }))
             .expect("Could not execute request");
         state2
@@ -1447,8 +1448,8 @@ mod tests {
                 path: PathRule::prefix(String::from("/abc")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Tree,
-                tags: None,
+                position: RulePosition::Tree.into(),
+                tags: BTreeMap::new(),
             }),
             Request::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("cluster_2"),
@@ -1513,8 +1514,8 @@ mod tests {
             path: PathRule::prefix(String::from("")),
             method: None,
             address: "0.0.0.0:8080".to_string(),
-            position: RulePosition::Tree,
-            tags: None,
+            position: RulePosition::Tree.into(),
+            tags: BTreeMap::new(),
         };
 
         let https_front_cluster1 = RequestHttpFrontend {
@@ -1523,8 +1524,8 @@ mod tests {
             path: PathRule::prefix(String::from("")),
             method: None,
             address: "0.0.0.0:8443".to_string(),
-            position: RulePosition::Tree,
-            tags: None,
+            position: RulePosition::Tree.into(),
+            tags: BTreeMap::new(),
         };
 
         let http_front_cluster2 = RequestHttpFrontend {
@@ -1533,8 +1534,8 @@ mod tests {
             path: PathRule::prefix(String::from("/api")),
             method: None,
             address: "0.0.0.0:8080".to_string(),
-            position: RulePosition::Tree,
-            tags: None,
+            position: RulePosition::Tree.into(),
+            tags: BTreeMap::new(),
         };
 
         let https_front_cluster2 = RequestHttpFrontend {
@@ -1543,8 +1544,8 @@ mod tests {
             path: PathRule::prefix(String::from("/api")),
             method: None,
             address: "0.0.0.0:8443".to_string(),
-            position: RulePosition::Tree,
-            tags: None,
+            position: RulePosition::Tree.into(),
+            tags: BTreeMap::new(),
         };
 
         let add_http_front_cluster1 = Request::AddHttpFrontend(http_front_cluster1);

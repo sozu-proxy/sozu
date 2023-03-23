@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Context};
 
 use sozu_command_lib::{
@@ -5,12 +7,12 @@ use sozu_command_lib::{
         calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint, TlsVersion,
     },
     config::{Config, ListenerBuilder, ProxyProtocolConfig},
+    proto::command::{FrontendFilters, PathRule, RequestHttpFrontend, RulePosition},
     request::{
-        ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, FrontendFilters,
-        ListenerType, LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend, RequestTcpFrontend,
+        ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, ListenerType,
+        LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, Request, RequestTcpFrontend,
     },
-    response::{PathRule, RulePosition},
 };
 
 use crate::{
@@ -205,8 +207,11 @@ impl CommandManager {
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
-                position: RulePosition::Tree,
-                tags,
+                position: RulePosition::Tree.into(),
+                tags: match tags {
+                    Some(tags) => tags,
+                    None => BTreeMap::new(),
+                },
             })),
 
             HttpFrontendCmd::Remove {
@@ -223,8 +228,8 @@ impl CommandManager {
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
-                position: RulePosition::Tree,
-                tags: None,
+                position: RulePosition::Tree.into(),
+                tags: BTreeMap::new(),
             })),
         }
     }
@@ -246,8 +251,11 @@ impl CommandManager {
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
-                position: RulePosition::Tree,
-                tags,
+                position: RulePosition::Tree.into(),
+                tags: match tags {
+                    Some(tags) => tags,
+                    None => BTreeMap::new(),
+                },
             })),
             HttpFrontendCmd::Remove {
                 hostname,
@@ -263,8 +271,8 @@ impl CommandManager {
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
-                position: RulePosition::Tree,
-                tags: None,
+                position: RulePosition::Tree.into(),
+                tags: BTreeMap::new(),
             })),
         }
     }

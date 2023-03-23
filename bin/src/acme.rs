@@ -1,4 +1,4 @@
-use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};
+use std::{collections::BTreeMap, fs::File, io::Write, iter, net::SocketAddr, thread, time};
 
 use acme_lib::{create_p384_key, persist::FilePersist, Directory, DirectoryUrl};
 use anyhow::{bail, Context};
@@ -12,10 +12,9 @@ use sozu_command_lib::{
     },
     channel::Channel,
     config::Config,
-    request::{
-        AddBackend, AddCertificate, RemoveBackend, ReplaceCertificate, Request, RequestHttpFrontend,
-    },
-    response::{PathRule, Response, ResponseStatus, RulePosition},
+    proto::command::{PathRule, RequestHttpFrontend, RulePosition},
+    request::{AddBackend, AddCertificate, RemoveBackend, ReplaceCertificate, Request},
+    response::{Response, ResponseStatus},
 };
 
 use crate::util;
@@ -293,8 +292,8 @@ fn set_up_proxying(
         address: frontend.to_string(),
         path: PathRule::prefix(path_begin.to_owned()),
         method: None,
-        position: RulePosition::Tree,
-        tags: None,
+        position: RulePosition::Tree.into(),
+        tags: BTreeMap::new(),
     });
 
     order_request(channel, add_http_front).with_context(|| "Request AddHttpFront failed")?;
@@ -326,8 +325,8 @@ fn remove_proxying(
         hostname: String::from(hostname),
         path: PathRule::prefix(path_begin.to_owned()),
         method: None,
-        position: RulePosition::Tree,
-        tags: None,
+        position: RulePosition::Tree.into(),
+        tags: BTreeMap::new(),
     });
     order_request(channel, remove_http_front).with_context(|| "RemoveHttpFront request failed")?;
 

@@ -27,7 +27,8 @@ use rustls::{
 use rusty_ulid::Ulid;
 use slab::Slab;
 use sozu_command::{
-    certificate::CertificateSummary, config::DEFAULT_CIPHER_SUITES, request::RequestHttpFrontend,
+    certificate::CertificateSummary, config::DEFAULT_CIPHER_SUITES,
+    proto::command::RequestHttpFrontend,
 };
 use time::{Duration, Instant};
 

@@ -12,9 +12,8 @@ use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
     info,
     logging::{Logger, LoggerBackend},
-    request::{
-        ActivateListener, AddCertificate, ListenerType, RemoveBackend, Request, RequestHttpFrontend,
-    },
+    proto::command::RequestHttpFrontend,
+    request::{ActivateListener, AddCertificate, ListenerType, RemoveBackend, Request},
     state::ConfigState,
 };
 

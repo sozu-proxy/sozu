@@ -3,12 +3,13 @@ pub mod trie;
 
 use anyhow::{bail, Context};
 use regex::bytes::Regex;
-use sozu_command::{response::PathRuleKind, state::ClusterId};
 use std::str::from_utf8;
 
-use crate::{
-    protocol::http::parser::Method,
-    sozu_command::response::{HttpFrontend, PathRule as CommandPathRule, RulePosition},
+use crate::protocol::http::parser::Method;
+use sozu_command::{
+    proto::command::{PathRule as CommandPathRule, PathRuleKind, RulePosition},
+    response::HttpFrontend,
+    state::ClusterId,
 };
 
 use self::pattern_trie::TrieNode;
@@ -488,10 +489,11 @@ impl PathRule {
     }
 
     pub fn from_config(rule: CommandPathRule) -> Option<Self> {
-        match rule.kind {
-            PathRuleKind::Prefix => Some(PathRule::Prefix(rule.value)),
-            PathRuleKind::Regex => Regex::new(&rule.value).ok().map(PathRule::Regex),
-            PathRuleKind::Equals => Some(PathRule::Equals(rule.value)),
+        match PathRuleKind::from_i32(rule.kind) {
+            Some(PathRuleKind::Prefix) => Some(PathRule::Prefix(rule.value)),
+            Some(PathRuleKind::Regex) => Regex::new(&rule.value).ok().map(PathRule::Regex),
+            Some(PathRuleKind::Equals) => Some(PathRule::Equals(rule.value)),
+            _ => None,
         }
     }
 }

@@ -17,7 +17,8 @@ use sozu_command_lib::{
     config::Config,
     logging,
     parser::parse_several_commands,
-    request::{FrontendFilters, MetricsConfiguration, Request, WorkerRequest},
+    proto::command::FrontendFilters,
+    request::{MetricsConfiguration, Request, WorkerRequest},
     response::{
         AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, Response,
         ResponseContent, ResponseStatus, RunState, WorkerInfo,

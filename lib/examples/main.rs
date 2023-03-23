@@ -5,6 +5,7 @@ extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 extern crate time;
 
+use std::collections::BTreeMap;
 use std::{env, io::stdout, thread};
 
 use anyhow::Context;
@@ -14,11 +15,9 @@ use sozu_command::{
     certificate::CertificateAndKey,
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    request::{
-        AddBackend, AddCertificate, LoadBalancingParams, Request, RequestHttpFrontend,
-        WorkerRequest,
-    },
-    response::{PathRule, RulePosition},
+    proto::command::RequestHttpFrontend,
+    proto::command::{PathRule, RulePosition},
+    request::{AddBackend, AddCertificate, LoadBalancingParams, Request, WorkerRequest},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -66,8 +65,8 @@ fn main() -> anyhow::Result<()> {
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
         method: None,
-        position: RulePosition::Tree,
-        tags: None,
+        position: RulePosition::Tree.into(),
+        tags: BTreeMap::new(),
     };
 
     let http_backend = AddBackend {
@@ -129,8 +128,8 @@ fn main() -> anyhow::Result<()> {
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
         method: None,
-        position: RulePosition::Tree,
-        tags: None,
+        position: RulePosition::Tree.into(),
+        tags: BTreeMap::new(),
     };
 
     command2.write_message(&WorkerRequest {
@@ -179,8 +178,8 @@ fn main() -> anyhow::Result<()> {
         hostname: String::from("test.local"),
         path: PathRule::prefix(String::from("/")),
         method: None,
-        position: RulePosition::Tree,
-        tags: None,
+        position: RulePosition::Tree.into(),
+        tags: BTreeMap::new(),
     };
 
     command2.write_message(&WorkerRequest {

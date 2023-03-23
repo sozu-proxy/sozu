@@ -11,9 +11,9 @@ use anyhow::Context;
 use crate::{
     certificate::{CertificateAndKey, Fingerprint},
     config::ProxyProtocolConfig,
+    proto::command::{FrontendFilters, RequestHttpFrontend, RulePosition, PathRuleKind},
     response::{
-        is_default_path_rule, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId,
-        PathRule, PathRuleKind, RulePosition, TcpListenerConfig,
+        HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
     },
     state::ClusterId,
 };
@@ -274,14 +274,6 @@ pub struct DeactivateListener {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct FrontendFilters {
-    pub http: bool,
-    pub https: bool,
-    pub tcp: bool,
-    pub domain: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AddCertificate {
     pub address: String,
     pub certificate: CertificateAndKey,
@@ -318,23 +310,6 @@ pub struct RequestTcpFrontend {
     pub tags: Option<BTreeMap<String, String>>,
 }
 
-/// A frontend as requested from the client, with a string SocketAddress
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RequestHttpFrontend {
-    /// Send a 401, DENY, if cluster_id is None
-    pub cluster_id: Option<ClusterId>,
-    pub address: String,
-    pub hostname: String,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_default_path_rule")]
-    pub path: PathRule,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub method: Option<String>,
-    #[serde(default)]
-    pub position: RulePosition,
-    pub tags: Option<BTreeMap<String, String>>,
-}
-
 impl RequestHttpFrontend {
     /// convert a requested frontend to a usable one by parsing its address
     pub fn to_frontend(self) -> anyhow::Result<HttpFrontend> {
@@ -347,8 +322,9 @@ impl RequestHttpFrontend {
             hostname: self.hostname,
             path: self.path,
             method: self.method,
-            position: self.position,
-            tags: self.tags,
+            position: RulePosition::from_i32(self.position)
+                .with_context(|| "wrong i32 value for RulePosition")?,
+            tags: Some(self.tags),
         })
     }
 }
@@ -356,16 +332,17 @@ impl RequestHttpFrontend {
 impl Display for RequestHttpFrontend {
     /// Used to create a unique summary of the frontend, used as a key in maps
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match &self.path.kind {
-            PathRuleKind::Prefix => {
+        let s = match &PathRuleKind::from_i32(self.path.kind) {
+            Some(PathRuleKind::Prefix) => {
                 format!("{};{};P{}", self.address, self.hostname, self.path.value)
             }
-            PathRuleKind::Regex => {
+            Some(PathRuleKind::Regex) => {
                 format!("{};{};R{}", self.address, self.hostname, self.path.value)
             }
-            PathRuleKind::Equals => {
+            Some(PathRuleKind::Equals) => {
                 format!("{};{};={}", self.address, self.hostname, self.path.value)
             }
+            None => String::from("Wrong variant of PathRuleKind"),
         };
 
         match &self.method {
@@ -482,13 +459,14 @@ mod tests {
     use super::*;
     use crate::certificate::{split_certificate_chain, TlsVersion};
     use crate::config::ProxyProtocolConfig;
-    use crate::response::{HttpFrontend, PathRule, RulePosition};
+    use crate::proto::command::{PathRule, RulePosition};
+    use crate::response::HttpFrontend;
     use hex::FromHex;
     use serde_json;
 
     #[test]
     fn config_message_test() {
-        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "ADD_HTTP_FRONTEND", "content":{"cluster_id": "xxx", "hostname": "yyy", "path": {"kind": "PREFIX", "value": "xxx"}, "address": "0.0.0.0:8080"}}"#;
+        let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "ADD_HTTP_FRONTEND", "content":{"cluster_id": "xxx", "hostname": "yyy", "path": {"kind": 0, "value": "xxx"}, "method": null, "position": 2, "address": "0.0.0.0:8080", "tags": {}}}"#;
         let message: Request = serde_json::from_str(raw_json).unwrap();
         println!("{message:?}");
         assert_eq!(
@@ -499,8 +477,8 @@ mod tests {
                 path: PathRule::prefix(String::from("xxx")),
                 method: None,
                 address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Tree,
-                tags: None,
+                position: RulePosition::Tree.into(),
+                tags: BTreeMap::new(),
             })
         );
     }
@@ -553,8 +531,8 @@ mod tests {
             path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8080".to_string(),
-            position: RulePosition::Tree,
-            tags: None,
+            position: RulePosition::Tree.into(),
+            tags: BTreeMap::new(),
         })
     );
 
@@ -567,14 +545,14 @@ mod tests {
             path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8080".to_string(),
-            position: RulePosition::Tree,
-            tags: Some(BTreeMap::from([
+            position: RulePosition::Tree.into(),
+            tags: BTreeMap::from([
                 ("owner".to_owned(), "John".to_owned()),
                 (
                     "uuid".to_owned(),
                     "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
                 )
-            ]))
+            ])
         })
     );
 
@@ -587,8 +565,8 @@ mod tests {
             path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8443".to_string(),
-            position: RulePosition::Tree,
-            tags: None,
+            position: RulePosition::Tree.into(),
+            tags: BTreeMap::new(),
         })
     );
 
@@ -601,14 +579,14 @@ mod tests {
             path: PathRule::prefix(String::from("xxx")),
             method: None,
             address: "0.0.0.0:8443".to_string(),
-            position: RulePosition::Tree,
-            tags: Some(BTreeMap::from([
+            position: RulePosition::Tree.into(),
+            tags: BTreeMap::from([
                 ("owner".to_owned(), "John".to_owned()),
                 (
                     "uuid".to_owned(),
                     "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
                 )
-            ]))
+            ])
         })
     );
 
@@ -713,26 +691,26 @@ mod tests {
 
     #[test]
     fn add_front_test() {
-        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"cluster_id": "xxx", "hostname": "yyy", "path": {"kind": "PREFIX", "value": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
-        let command: Request = serde_json::from_str(raw_json).expect("could not parse json");
-        println!("{command:?}");
-        assert!(
-            command
-                == Request::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: Some(String::from("xxx")),
-                    hostname: String::from("yyy"),
-                    path: PathRule::prefix(String::from("xxx")),
-                    method: None,
-                    address: "127.0.0.1:4242".to_string(),
-                    position: RulePosition::Tree,
-                    tags: None,
-                })
-        );
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"cluster_id": "xxx", "hostname": "yyy", "path": {"kind": 0, "value": "xxx"}, "method": null, "position": 2, "address": "127.0.0.1:4242", "sticky_session": false, "tags": {}}}"#;
+        let parsed_request: Request = serde_json::from_str(raw_json).expect("could not parse json");
+        println!("parsed: {:?}", parsed_request);
+
+        let add_http_frontend = Request::AddHttpFrontend(RequestHttpFrontend {
+            cluster_id: Some(String::from("xxx")),
+            hostname: String::from("yyy"),
+            path: PathRule::prefix(String::from("xxx")),
+            method: None,
+            address: "127.0.0.1:4242".to_string(),
+            position: RulePosition::Tree.into(),
+            tags: BTreeMap::new(),
+        });
+        println!("expected: {:?}", add_http_frontend);
+        assert!(parsed_request == add_http_frontend);
     }
 
     #[test]
     fn remove_front_test() {
-        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "content": {"cluster_id": "xxx", "hostname": "yyy", "path": {"kind": "PREFIX", "value": "xxx"}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "content": {"cluster_id": "xxx", "hostname": "yyy", "path": {"kind": 0, "value": "xxx"}, "position": 2, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: Request = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
         assert!(
@@ -743,11 +721,11 @@ mod tests {
                     path: PathRule::prefix(String::from("xxx")),
                     method: None,
                     address: "127.0.0.1:4242".to_string(),
-                    position: RulePosition::Tree,
-                    tags: Some(BTreeMap::from([
+                    position: RulePosition::Tree.into(),
+                    tags: BTreeMap::from([
                         ("owner".to_owned(), "John".to_owned()),
                         ("id".to_owned(), "some-long-id".to_owned())
-                    ])),
+                    ]),
                 })
         );
     }
@@ -787,42 +765,41 @@ mod tests {
 
     #[test]
     fn http_front_crash_test() {
-        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"cluster_id": "aa", "hostname": "cltdl.fr", "path": {"kind": "PREFIX", "value": ""}, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
+        let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "content": {"cluster_id": "aa", "hostname": "cltdl.fr", "path": {"kind": 0, "value": ""}, "position": 2, "address": "127.0.0.1:4242", "tags": { "owner": "John", "id": "some-long-id" }}}"#;
         let command: Request = serde_json::from_str(raw_json).expect("could not parse json");
         println!("{command:?}");
-        assert!(
-            command
-                == Request::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: Some(String::from("aa")),
-                    hostname: String::from("cltdl.fr"),
-                    path: PathRule::prefix(String::from("")),
-                    method: None,
-                    address: "127.0.0.1:4242".to_string(),
-                    position: RulePosition::Tree,
-                    tags: Some(BTreeMap::from([
-                        ("owner".to_owned(), "John".to_owned()),
-                        ("id".to_owned(), "some-long-id".to_owned())
-                    ])),
-                })
+        assert_eq!(
+            command,
+            Request::AddHttpFrontend(RequestHttpFrontend {
+                cluster_id: Some(String::from("aa")),
+                hostname: String::from("cltdl.fr"),
+                path: PathRule::prefix(String::from("")),
+                method: None,
+                address: "127.0.0.1:4242".to_string(),
+                position: RulePosition::Tree.into(),
+                tags: BTreeMap::from([
+                    ("owner".to_owned(), "John".to_owned()),
+                    ("id".to_owned(), "some-long-id".to_owned())
+                ]),
+            })
         );
     }
 
     #[test]
     fn http_front_crash_test2() {
-        let raw_json = r#"{"cluster_id": "aa", "hostname": "cltdl.fr", "path": {"kind": "PREFIX", "value": ""}, "address": "127.0.0.1:4242" }"#;
-        let front: HttpFrontend = serde_json::from_str(raw_json).expect("could not parse json");
-        println!("{front:?}");
-        assert!(
-            front
-                == HttpFrontend {
-                    cluster_id: Some(String::from("aa")),
-                    hostname: String::from("cltdl.fr"),
-                    path: PathRule::prefix(String::from("")),
-                    method: None,
-                    address: "127.0.0.1:4242".parse().unwrap(),
-                    position: RulePosition::Tree,
-                    tags: None,
-                }
-        );
+        let raw_json = r#"{"cluster_id": "aa", "hostname": "cltdl.fr", "path": {"kind": 0, "value": "something"}, "position": "TREE", "address": "127.0.0.1:4242"}"#;
+        let parsed_front: HttpFrontend =
+            serde_json::from_str(raw_json).expect("could not parse json");
+        println!("{parsed_front:?}");
+        let expected_front = HttpFrontend {
+            cluster_id: Some(String::from("aa")),
+            hostname: String::from("cltdl.fr"),
+            path: PathRule::prefix(String::from("something")),
+            method: None,
+            address: "127.0.0.1:4242".parse().unwrap(),
+            position: RulePosition::Tree,
+            tags: None,
+        };
+        assert_eq!(parsed_front, expected_front);
     }
 }
