@@ -84,7 +84,7 @@ pub enum Request {
     QueryCertificatesByDomain(String),
 
     QueryClusterById(ClusterId),
-    QueryClusters(QueryClusterType),
+    QueryClustersByDomain(QueryClusterByDomain),
     QueryClustersHashes,
     QueryMetrics(QueryMetricsOptions),
 
@@ -132,7 +132,7 @@ impl Request {
             | Request::HardStop
             | Request::Status
             | Request::QueryClusterById(_)
-            | Request::QueryClusters(_)
+            | Request::QueryClustersByDomain(_)
             | Request::QueryClustersHashes
             | Request::QueryMetrics(_)
             | Request::Logging(_) => {
@@ -376,14 +376,7 @@ pub enum MetricsConfiguration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum QueryClusterType {
-    // ClusterId(String),
-    Domain(QueryClusterDomain),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct QueryClusterDomain {
+pub struct QueryClusterByDomain {
     pub hostname: String,
     pub path: Option<String>,
 }

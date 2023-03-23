@@ -17,7 +17,7 @@ use sozu_command_lib::{
     config::Config,
     logging,
     parser::parse_several_commands,
-    request::{FrontendFilters, MetricsConfiguration, QueryClusterType, Request, WorkerRequest},
+    request::{FrontendFilters, MetricsConfiguration, Request, WorkerRequest},
     response::{
         AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, Response,
         ResponseContent, ResponseStatus, RunState, WorkerInfo,
@@ -69,7 +69,8 @@ impl CommandServer {
             Request::QueryCertificateByFingerprint(_)
             | Request::QueryCertificatesByDomain(_)
             | Request::QueryAllCertificates
-            | Request::QueryClusters(_)
+            | Request::QueryClusterById(_)
+            | Request::QueryClustersByDomain(_)
             | Request::QueryClustersHashes
             | Request::QueryMetrics(_) => self.query(client_id, request).await,
 
@@ -1057,20 +1058,17 @@ impl CommandServer {
                     .state
                     .cluster_state(cluster_id)]))
             }
-            Request::QueryClusters(query_type) => {
-                main_response_content = Some(ResponseContent::Clusters(match query_type {
-                    QueryClusterType::Domain(domain) => {
-                        let cluster_ids = get_cluster_ids_by_domain(
-                            &self.state,
-                            domain.hostname.clone(),
-                            domain.path.clone(),
-                        );
-                        cluster_ids
-                            .iter()
-                            .map(|cluster_id| self.state.cluster_state(cluster_id))
-                            .collect()
-                    }
-                }));
+            Request::QueryClustersByDomain(domain) => {
+                let cluster_ids = get_cluster_ids_by_domain(
+                    &self.state,
+                    domain.hostname.clone(),
+                    domain.path.clone(),
+                );
+                let clusters = cluster_ids
+                    .iter()
+                    .map(|cluster_id| self.state.cluster_state(cluster_id))
+                    .collect();
+                main_response_content = Some(ResponseContent::Clusters(clusters));
             }
             _ => {}
         };
@@ -1118,7 +1116,9 @@ impl CommandServer {
                 .collect();
 
             let response_content = match &request {
-                &Request::QueryClustersHashes | &Request::QueryClusters(_) => {
+                &Request::QueryClustersHashes
+                | &Request::QueryClusterById(_)
+                | &Request::QueryClustersByDomain(_) => {
                     let main = main_response_content.unwrap(); // we should refactor to avoid this unwrap()
                     worker_responses.insert(String::from("main"), main);
                     ResponseContent::WorkerResponses(worker_responses)

@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use sozu_command_lib::{
     certificate::Fingerprint,
-    request::{QueryClusterDomain, QueryClusterType, QueryMetricsOptions, Request},
+    request::{QueryClusterByDomain, QueryMetricsOptions, Request},
     response::{Response, ResponseContent, ResponseStatus, RunState, WorkerInfo},
 };
 
@@ -342,7 +342,7 @@ impl CommandManager {
                 bail!("Domain can't be empty");
             }
 
-            let query_domain = QueryClusterDomain {
+            let query_domain = QueryClusterByDomain {
                 hostname: splitted
                     .get(0)
                     .with_context(|| "Domain can't be empty")?
@@ -350,7 +350,7 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
             };
 
-            Request::QueryClusters(QueryClusterType::Domain(query_domain))
+            Request::QueryClustersByDomain(query_domain)
         } else {
             Request::QueryClustersHashes
         };

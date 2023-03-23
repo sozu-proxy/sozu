@@ -18,8 +18,8 @@ use sozu_command::{
     config::Config,
     ready::Ready,
     request::{
-        ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType, QueryClusterType,
-        RemoveBackend, Request, WorkerRequest,
+        ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType, RemoveBackend,
+        Request, WorkerRequest,
     },
     response::{
         Event, HttpListenerConfig, HttpsListenerConfig, MessageId, ResponseContent, ResponseStatus,
@@ -891,23 +891,21 @@ impl Server {
                     ResponseContent::Clusters(vec![self.config_state.cluster_state(cluster_id)]),
                 ));
             }
-            Request::QueryClusters(query_type) => {
-                let content = match query_type {
-                    QueryClusterType::Domain(domain) => {
-                        let cluster_ids = get_cluster_ids_by_domain(
-                            &self.config_state,
-                            domain.hostname.clone(),
-                            domain.path.clone(),
-                        );
-                        let answer = cluster_ids
-                            .iter()
-                            .map(|cluster_id| self.config_state.cluster_state(cluster_id))
-                            .collect();
+            Request::QueryClustersByDomain(domain) => {
+                let cluster_ids = get_cluster_ids_by_domain(
+                    &self.config_state,
+                    domain.hostname.clone(),
+                    domain.path.clone(),
+                );
+                let answer = cluster_ids
+                    .iter()
+                    .map(|cluster_id| self.config_state.cluster_state(cluster_id))
+                    .collect();
 
-                        ResponseContent::Clusters(answer)
-                    }
-                };
-                push_queue(WorkerResponse::ok_with_content(message.id.clone(), content));
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id.clone(),
+                    ResponseContent::Clusters(answer),
+                ));
                 return;
             }
             Request::QueryCertificateByFingerprint(f) => {

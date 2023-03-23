@@ -129,7 +129,8 @@ impl ConfigState {
             &Request::Logging(_)
             | &Request::Status
             | &Request::SoftStop
-            | &Request::QueryClusters(_)
+            | &Request::QueryClusterById(_)
+            | &Request::QueryClustersByDomain(_)
             | &Request::QueryMetrics(_)
             | &Request::QueryClustersHashes
             | &Request::ConfigureMetrics(_)
