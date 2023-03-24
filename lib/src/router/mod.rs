@@ -3,12 +3,12 @@ pub mod trie;
 
 use anyhow::{bail, Context};
 use regex::bytes::Regex;
-use sozu_command::response::PathRuleKind;
+use sozu_command::{response::PathRuleKind, state::ClusterId};
 use std::str::from_utf8;
 
 use crate::{
     protocol::http::parser::Method,
-    sozu_command::response::{HttpFrontend, PathRule as CommandPathRule, Route, RulePosition},
+    sozu_command::response::{HttpFrontend, PathRule as CommandPathRule, RulePosition},
 };
 
 use self::pattern_trie::TrieNode;
@@ -107,21 +107,23 @@ impl Router {
 
         let method_rule = MethodRule::new(front.method.clone());
 
+        let route = match &front.route {
+            Some(cluster_id) => Route::ClusterId(cluster_id.clone()),
+            None => Route::Deny,
+        };
+
         let success = match front.position {
             RulePosition::Pre => match front.hostname.parse::<DomainRule>() {
-                Ok(domain) => self.add_pre_rule(&domain, &path_rule, &method_rule, &front.route),
+                Ok(domain) => self.add_pre_rule(&domain, &path_rule, &method_rule, &route),
                 Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
             },
             RulePosition::Post => match front.hostname.parse::<DomainRule>() {
-                Ok(domain) => self.add_post_rule(&domain, &path_rule, &method_rule, &front.route),
+                Ok(domain) => self.add_post_rule(&domain, &path_rule, &method_rule, &route),
                 Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
             },
-            RulePosition::Tree => self.add_tree_rule(
-                front.hostname.as_bytes(),
-                &path_rule,
-                &method_rule,
-                &front.route,
-            ),
+            RulePosition::Tree => {
+                self.add_tree_rule(front.hostname.as_bytes(), &path_rule, &method_rule, &route)
+            }
         };
         match success {
             true => Ok(()),
@@ -537,10 +539,18 @@ impl MethodRule {
     }
 }
 
+/// The cluster to which the traffic will be redirected
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Route {
+    /// send a 401 default answer
+    Deny,
+    /// the cluster to which the frontend belongs
+    ClusterId(ClusterId),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sozu_command::response::Route;
 
     #[test]
     fn convert_regex() {

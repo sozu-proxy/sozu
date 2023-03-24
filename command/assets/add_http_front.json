@@ -1,9 +1,7 @@
 {
   "type": "ADD_HTTP_FRONTEND",
   "content": {
-    "route": {
-      "CLUSTER_ID": "xxx"
-    },
+    "route": "xxx",
     "address": "0.0.0.0:8080",
     "hostname": "yyy",
     "path": {

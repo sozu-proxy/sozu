@@ -14,7 +14,7 @@ use std::{
 use anyhow::{bail, Context};
 use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
-use sozu_command::response::{Event, Route};
+use sozu_command::response::Event;
 use time::{Duration, Instant};
 
 use crate::{
@@ -29,7 +29,7 @@ use crate::{
     util::UnwrapLog,
     Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler, L7Proxy,
     ListenerHandler, LogDuration, ProxySession, SessionIsToBeClosed,
-    {Protocol, Readiness, SessionMetrics, StateResult},
+    {Protocol, Readiness, SessionMetrics, StateResult}, router::Route,
 };
 
 use self::parser::{

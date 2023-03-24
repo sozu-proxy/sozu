@@ -18,7 +18,7 @@ use sozu_command::{
         AddBackend, AddCertificate, LoadBalancingParams, Request, RequestHttpFrontend,
         WorkerRequest,
     },
-    response::{PathRule, Route, RulePosition},
+    response::{PathRule, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let http_front = RequestHttpFrontend {
-        route: Route::ClusterId(String::from("cluster_1")),
+        route: Some(String::from("cluster_1")),
         address: "127.0.0.1:8080".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
@@ -124,7 +124,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let tls_front = RequestHttpFrontend {
-        route: Route::ClusterId(String::from("cluster_1")),
+        route: Some(String::from("cluster_1")),
         address: "127.0.0.1:8443".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
@@ -174,7 +174,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let tls_front2 = RequestHttpFrontend {
-        route: Route::ClusterId(String::from("cluster_2")),
+        route: Some(String::from("cluster_2")),
         address: "127.0.0.1:8443".to_string(),
         hostname: String::from("test.local"),
         path: PathRule::prefix(String::from("/")),
