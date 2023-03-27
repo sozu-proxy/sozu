@@ -19,7 +19,7 @@ answer_404 = "./assets/404.html"
 address = "0.0.0.0:443"
 protocol = "https"
 answer_404 = "./assets/404.html"
-tls_versions = ["TLSv1.2"]
+tls_versions = ["TLS_V12"]
 
 [[listeners]]
 address = "0.0.0.0:1234"

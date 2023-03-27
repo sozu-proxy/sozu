@@ -183,9 +183,9 @@ answer_503 = "/etc/sozu/html/503.html"
 # this option is incompatible with public_address
 # expect_proxy = false
 
-# Supported TLS versions. Possible values are "SSLv2", "SSLv3", "TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3".
-# Defaults to `["TLSv1.2", "TLSv1.3"]`. Besides, `rustls` tls provider only support "TLSv1.2" and "TLSv1.3" values.
-tls_versions = ["TLSv1.2", "TLSv1.3"]
+# Supported TLS versions. Possible values are "SSL_V2", "SSL_V3", "TLSv1", "TLS_V11", "TLS_V12", "TLS_V13".
+# Defaults to `["TLS_V12", "TLS_V13"]`. Besides, `rustls` tls provider only support "TLS_V12" and "TLS_V13" values.
+tls_versions = ["TLS_V12", "TLS_V13"]
 
 # TLS ciphers considered as secure can be retrieved on the ANSSI document located here:
 # https://www.ssi.gouv.fr/uploads/2020/03/anssi-guide-recommandations_de_securite_relatives_a_tls-v1.2.pdf

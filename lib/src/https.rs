@@ -26,11 +26,22 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::{
-    config::DEFAULT_CIPHER_SUITES,
-    proto::command::{CertificateSummary, RequestHttpFrontend},
-};
 use time::{Duration, Instant};
+
+use sozu_command::{
+    certificate::Fingerprint,
+    config::DEFAULT_CIPHER_SUITES,
+    logging,
+    proto::command::{CertificateSummary, RequestHttpFrontend, TlsVersion},
+    ready::Ready,
+    request::{
+        AddCertificate, Cluster, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
+        WorkerRequest,
+    },
+    response::{HttpFrontend, HttpsListenerConfig, ResponseContent, WorkerResponse},
+    scm_socket::ScmSocket,
+    state::ClusterId,
+};
 
 use crate::{
     backends::BackendMap,
@@ -49,18 +60,6 @@ use crate::{
     router::{Route, Router},
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
-    sozu_command::{
-        certificate::{Fingerprint, TlsVersion},
-        logging,
-        ready::Ready,
-        request::{
-            AddCertificate, Cluster, RemoveCertificate, RemoveListener, ReplaceCertificate,
-            Request, WorkerRequest,
-        },
-        response::{HttpFrontend, HttpsListenerConfig, ResponseContent, WorkerResponse},
-        scm_socket::ScmSocket,
-        state::ClusterId,
-    },
     timer::TimeoutContainer,
     tls::{
         CertificateResolver, GenericCertificateResolverError, MutexWrappedCertificateResolver,
@@ -777,8 +776,8 @@ impl HttpsListener {
             .versions
             .iter()
             .filter_map(|version| match version {
-                TlsVersion::TLSv1_2 => Some(&rustls::version::TLS12),
-                TlsVersion::TLSv1_3 => Some(&rustls::version::TLS13),
+                TlsVersion::TlsV12 => Some(&rustls::version::TLS12),
+                TlsVersion::TlsV13 => Some(&rustls::version::TLS13),
                 other_version => {
                     error!("unsupported TLS version: {:?}", other_version);
                     None

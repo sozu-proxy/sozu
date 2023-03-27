@@ -7,12 +7,10 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use tiny_http::{Response as HttpResponse, Server};
 
 use sozu_command_lib::{
-    certificate::{
-        calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint, TlsVersion,
-    },
+    certificate::{calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint},
     channel::Channel,
     config::Config,
-    proto::command::{PathRule, RequestHttpFrontend, RulePosition},
+    proto::command::{PathRule, RequestHttpFrontend, RulePosition, TlsVersion},
     request::{AddBackend, AddCertificate, RemoveBackend, ReplaceCertificate, Request},
     response::{Response, ResponseStatus},
 };
@@ -85,7 +83,7 @@ pub fn main(
         )
     })?;
 
-    let tls_versions = vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3];
+    let tls_versions = vec![TlsVersion::TlsV12, TlsVersion::TlsV13];
 
     let mut channel: Channel<Request, Response> = Channel::new(stream, 10000, 20000);
     channel

@@ -95,9 +95,9 @@ sticky_name = "SOZUBALANCEID"
 #### Options specific to HTTPS listeners
 
 ```toml
-# supported TLS versions. Possible values are "SSLv2", "SSLv3",
-# "TLSv1.2", "TLSv1.3". Defaults to "TLSv1.2" and "TLSv1.3"
-tls_versions = ["TLSv1.2", "TLSv1.3"]
+# supported TLS versions. Possible values are "SSL_V2", "SSL_V3",
+# "TLS_V12", "TLS_V13". Defaults to "TLS_V12" and "TLS_V13"
+tls_versions = ["TLS_V12", "TLS_V13"]
 ```
 
 #### Options specific to Rustls based HTTPS listeners

@@ -3,11 +3,9 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Context};
 
 use sozu_command_lib::{
-    certificate::{
-        calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint, TlsVersion,
-    },
+    certificate::{calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint},
     config::{Config, ListenerBuilder, ProxyProtocolConfig},
-    proto::command::{FrontendFilters, PathRule, RequestHttpFrontend, RulePosition},
+    proto::command::{FrontendFilters, PathRule, RequestHttpFrontend, RulePosition, TlsVersion},
     request::{
         ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, ListenerType,
         LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,

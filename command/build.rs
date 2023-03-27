@@ -18,6 +18,11 @@ pub fn main() {
     config.enum_attribute("inner", "#[derive(Hash, Eq, Ord, PartialOrd)]");
     // config.enum_attribute("worker_order.Inner", "#[derive(Hash, Eq)]");
 
+    // config.enum_attribute(
+    //     "TlsVersion",
+    //     "#[serde(deserialize_with = \"certificate::TlsVersion::from_str\")]",
+    // );
+
     tonic_build::configure()
         .build_client(true)
         .build_server(true)

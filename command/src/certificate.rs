@@ -6,6 +6,8 @@ use pem::parse;
 use serde::de::{self, Visitor};
 use sha2::{Digest, Sha256};
 
+use crate::proto::command::TlsVersion;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CertificateAndKey {
     pub certificate: String,
@@ -16,19 +18,21 @@ pub struct CertificateAndKey {
     pub versions: Vec<TlsVersion>,
 }
 
+/*
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TlsVersion {
     SSLv2,
     SSLv3,
     #[serde(rename = "TLSv1")]
     TLSv1_0,
-    #[serde(rename = "TLSv1.1")]
+    #[serde(rename = "TLS_V11")]
     TLSv1_1,
-    #[serde(rename = "TLSv1.2")]
+    #[serde(rename = "TLS_V12")]
     TLSv1_2,
-    #[serde(rename = "TLSv1.3")]
+    #[serde(rename = "TLS_V13")]
     TLSv1_3,
 }
+*/
 
 #[derive(Debug)]
 pub struct ParseErrorTlsVersion;
@@ -54,12 +58,12 @@ impl FromStr for TlsVersion {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "SSLv2" => Ok(TlsVersion::SSLv2),
-            "SSLv3" => Ok(TlsVersion::SSLv3),
-            "TLSv1" => Ok(TlsVersion::TLSv1_0),
-            "TLSv1.1" => Ok(TlsVersion::TLSv1_1),
-            "TLSv1.2" => Ok(TlsVersion::TLSv1_2),
-            "TLSv1.3" => Ok(TlsVersion::TLSv1_3),
+            "SSL_V2" => Ok(TlsVersion::SslV2),
+            "SSL_V3" => Ok(TlsVersion::SslV3),
+            "TLSv1" => Ok(TlsVersion::TlsV10),
+            "TLS_V11" => Ok(TlsVersion::TlsV11),
+            "TLS_V12" => Ok(TlsVersion::TlsV12),
+            "TLS_V13" => Ok(TlsVersion::TlsV13),
             _ => Err(ParseErrorTlsVersion {}),
         }
     }

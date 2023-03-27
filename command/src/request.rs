@@ -457,9 +457,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::certificate::{split_certificate_chain, TlsVersion};
+    use crate::certificate::split_certificate_chain;
     use crate::config::ProxyProtocolConfig;
-    use crate::proto::command::{PathRule, RulePosition};
+    use crate::proto::command::{PathRule, RulePosition, TlsVersion};
     use crate::response::HttpFrontend;
     use hex::FromHex;
     use serde_json;
@@ -603,7 +603,7 @@ mod tests {
                 certificate: String::from(CERTIFICATE),
                 certificate_chain: split_certificate_chain(String::from(CHAIN)),
                 key: String::from(KEY),
-                versions: vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
+                versions: vec![TlsVersion::TlsV12, TlsVersion::TlsV13],
             },
             names: vec![],
             expired_at: None,

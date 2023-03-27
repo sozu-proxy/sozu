@@ -49,3 +49,12 @@ message CertificateSummary {
     required string domain = 1;
     required string fingerprint = 2;
 }
+
+enum TlsVersion {
+    SSL_V2 = 0;
+    SSL_V3 = 1;
+    TLS_V1_0 = 2;
+    TLS_V1_1 = 3;
+    TLS_V1_2 = 4;
+    TLS_V1_3 = 5;
+}

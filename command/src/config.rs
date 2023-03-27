@@ -13,8 +13,8 @@ use anyhow::{bail, Context};
 use toml;
 
 use crate::{
-    certificate::{split_certificate_chain, CertificateAndKey, TlsVersion},
-    proto::command::{PathRule, RequestHttpFrontend, RulePosition},
+    certificate::{split_certificate_chain, CertificateAndKey},
+    proto::command::{PathRule, RequestHttpFrontend, RulePosition, TlsVersion},
     request::{
         ActivateListener, AddBackend, AddCertificate, Cluster, ListenerType,
         LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, Request, RequestTcpFrontend,
@@ -332,7 +332,7 @@ impl ListenerBuilder {
         let groups_list: Vec<String> = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
 
         let versions = match self.tls_versions {
-            None => vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
+            None => vec![TlsVersion::TlsV12, TlsVersion::TlsV13],
             Some(ref v) => v.clone(),
         };
 
