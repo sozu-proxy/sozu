@@ -44,4 +44,8 @@ enum RulePosition {
     TREE = 2;
 }
 
-
+// domain name and fingerprint of a certificate
+message CertificateSummary {
+    required string domain = 1;
+    required string fingerprint = 2;
+}

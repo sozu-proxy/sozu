@@ -646,7 +646,7 @@ pub fn print_certificates(
                         println!(
                             "\t\t{}:\t{}",
                             summary.domain,
-                            hex::encode(summary.fingerprint.0.to_owned())
+                            hex::encode(summary.fingerprint.to_owned())
                         );
                     }
 

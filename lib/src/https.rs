@@ -27,8 +27,8 @@ use rustls::{
 use rusty_ulid::Ulid;
 use slab::Slab;
 use sozu_command::{
-    certificate::CertificateSummary, config::DEFAULT_CIPHER_SUITES,
-    proto::command::RequestHttpFrontend,
+    config::DEFAULT_CIPHER_SUITES,
+    proto::command::{CertificateSummary, RequestHttpFrontend},
 };
 use time::{Duration, Instant};
 
@@ -951,7 +951,7 @@ impl HttpsProxy {
                     .drain()
                     .map(|(k, fingerprint)| CertificateSummary {
                         domain: String::from_utf8(k).unwrap(),
-                        fingerprint,
+                        fingerprint: fingerprint.to_string(),
                     })
                     .collect();
 
@@ -984,7 +984,7 @@ impl HttpsProxy {
                     .map(|(k, fingerprint)| {
                         certificate_summary.push(CertificateSummary {
                             domain: String::from_utf8(k.to_vec()).unwrap(),
-                            fingerprint: fingerprint.clone(),
+                            fingerprint: fingerprint.to_string(),
                         });
                     });
                 (owned.address, certificate_summary)

@@ -6,13 +6,6 @@ use pem::parse;
 use serde::de::{self, Visitor};
 use sha2::{Digest, Sha256};
 
-/// domain name and fingerprint of a certificate
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CertificateSummary {
-    pub domain: String,
-    pub fingerprint: Fingerprint,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CertificateAndKey {
     pub certificate: String,
@@ -73,6 +66,7 @@ impl FromStr for TlsVersion {
 }
 
 //FIXME: make fixed size depending on hash algorithm
+/// A TLS certificates, encoded in bytes
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Fingerprint(pub Vec<u8>);
 

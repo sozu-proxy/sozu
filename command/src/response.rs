@@ -7,8 +7,10 @@ use std::{
 };
 
 use crate::{
-    certificate::{CertificateSummary, TlsVersion},
-    proto::command::{PathRule, PathRuleKind, RequestHttpFrontend, RulePosition},
+    certificate::TlsVersion,
+    proto::command::{
+        CertificateSummary, PathRule, PathRuleKind, RequestHttpFrontend, RulePosition,
+    },
     request::{
         default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams,
         RequestTcpFrontend, PROTOCOL_VERSION,
