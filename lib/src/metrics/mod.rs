@@ -361,7 +361,7 @@ macro_rules! record_backend_metrics (
     use $crate::metrics::{MetricData,Subscriber};
     $crate::metrics::METRICS.with(|metrics| {
       let m = &mut *metrics.borrow_mut();
-      let cluster_id: &str = $cluster_id.as_str();
+      let cluster_id: &str = $cluster_id;
       let backend_id: &str = $backend_id;
 
       m.receive_metric("bytes_in", Some(cluster_id), Some(backend_id), MetricData::Count($bin as i64));

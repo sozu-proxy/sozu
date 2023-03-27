@@ -815,6 +815,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4a1e36c821dbe04574f602848a19f742f4fb3c98d40449f11bcad18d6b17421"
 
 [[package]]
+name = "htx"
+version = "0.3.1"
+source = "git+https://github.com/CleverCloud/htx#c082a8ad7e5e29259dd042766d8f2b431906cbb6"
+dependencies = [
+ "nom",
+]
+
+[[package]]
 name = "hyper"
 version = "0.14.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1821,6 +1829,7 @@ dependencies = [
  "hdrhistogram",
  "hex",
  "hpack",
+ "htx",
  "idna",
  "lazycell",
  "libc",

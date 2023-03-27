@@ -6,7 +6,7 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::http::OptionalString,
+    protocol::http::AsStr,
     socket::{SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
@@ -76,8 +76,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         let log_ctx = format!(
             "{} {} {}\t",
             &request_id,
-            cluster_id.as_deref().unwrap_or("-"),
-            backend_id.as_deref().unwrap_or("-")
+            cluster_id.as_str(),
+            backend_id.as_str()
         );
         let frontend_status = ConnectionStatus::Normal;
         let backend_status = if backend_socket.is_none() {
@@ -180,8 +180,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.log_ctx = format!(
             "{} {} {}\t",
             self.request_id,
-            self.cluster_id.as_deref().unwrap_or("-"),
-            self.backend_id.as_deref().unwrap_or("-")
+            self.cluster_id.as_str(),
+            self.backend_id.as_str()
         );
     }
 
@@ -241,10 +241,10 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         let response_time = metrics.response_time();
         let service_time = metrics.service_time();
 
-        let cluster_id = self.cluster_id.clone().unwrap_or_else(|| String::from("-"));
+        let cluster_id = self.cluster_id.as_str();
         time!(
             "request_time",
-            &cluster_id,
+            cluster_id,
             response_time.whole_milliseconds()
         );
 
@@ -281,9 +281,9 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             LogDuration(service_time),
             metrics.bin,
             metrics.bout,
-            OptionalString::from(tags.as_ref()),
+            tags.as_str(),
             proto,
-            self.websocket_context.as_deref().unwrap_or("-")
+            self.websocket_context.as_str()
         );
     }
 
@@ -303,10 +303,10 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         let response_time = metrics.response_time();
         let service_time = metrics.service_time();
 
-        let cluster_id = self.cluster_id.clone().unwrap_or_else(|| String::from("-"));
+        let cluster_id = self.cluster_id.as_str();
         time!(
             "request_time",
-            &cluster_id,
+            cluster_id,
             response_time.whole_milliseconds()
         );
 
@@ -335,7 +335,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             metrics.bin,
             metrics.bout,
             proto,
-            self.websocket_context.as_deref().unwrap_or("-"),
+            self.websocket_context.as_str(),
             message
         );
     }

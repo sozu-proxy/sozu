@@ -202,39 +202,8 @@ impl HttpSession {
         let back_token = unwrap_msg!(http.backend_token);
         let ws_context = http.websocket_context();
 
-        let front_buf = match http.frontend_buffer {
-            Some(buf) => buf.buffer,
-            None => {
-                let pool = match self.pool.upgrade() {
-                    Some(p) => p,
-                    None => return None,
-                };
-
-                let buffer = match pool.borrow_mut().checkout() {
-                    Some(buf) => buf,
-                    None => return None,
-                };
-
-                buffer
-            }
-        };
-
-        let back_buf = match http.backend_buffer {
-            Some(buf) => buf.buffer,
-            None => {
-                let pool = match self.pool.upgrade() {
-                    Some(p) => p,
-                    None => return None,
-                };
-
-                let buffer = match pool.borrow_mut().checkout() {
-                    Some(buf) => buf,
-                    None => return None,
-                };
-
-                buffer
-            }
-        };
+        let front_buf = http.htx_request.storage.buffer;
+        let back_buf = http.htx_response.storage.buffer;
 
         gauge_add!("protocol.http", -1);
         gauge_add!("protocol.ws", 1);
@@ -282,7 +251,6 @@ impl HttpSession {
             .map(|add| (add.destination(), add.source()))
         {
             Some((Some(public_address), Some(client_address))) => {
-                let readiness = expect.frontend_readiness;
                 let mut http = Http::new(
                     self.answers.clone(),
                     self.configured_backend_timeout,
@@ -299,7 +267,7 @@ impl HttpSession {
                     Some(client_address),
                     self.sticky_name.clone(),
                 );
-                http.frontend_readiness.event = readiness.event;
+                http.frontend_readiness.event = expect.frontend_readiness.event;
 
                 gauge_add!("protocol.proxy.expect", -1);
                 gauge_add!("protocol.http", 1);

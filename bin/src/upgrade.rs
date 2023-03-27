@@ -104,7 +104,7 @@ pub fn fork_main_into_new_main(
 
             if let Err(e) = fork_confirmation_channel.nonblocking() {
                 error!(
-                    "Could not unblock the fork confirmation channel: {}. This is not normal, you may need to restart sozu", 
+                    "Could not unblock the fork confirmation channel: {}. This is not normal, you may need to restart sozu",
                     e
                 );
             }

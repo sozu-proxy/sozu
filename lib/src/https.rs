@@ -47,7 +47,6 @@ use sozu_command::{
 
 use crate::{
     backends::BackendMap,
-    buffer_queue::BufferQueue,
     pool::Pool,
     protocol::{
         h2::Http2,
@@ -262,9 +261,6 @@ impl HttpsSession {
         // - find corresponding listener
         // - determine next protocol (tcps, https ,http2)
 
-        let front_buf = self.pool.upgrade().and_then(|p| p.borrow_mut().checkout());
-        front_buf.as_ref()?;
-
         let sni = handshake.session.server_name();
         let alpn = handshake.session.alpn_protocol();
         let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
@@ -284,7 +280,6 @@ impl HttpsSession {
             None => AlpnProtocols::Http11,
         };
 
-        let mut front_buf = front_buf.unwrap();
         if let Some(version) = handshake.session.protocol_version() {
             incr!(rustls_version_str(version));
         };
@@ -323,11 +318,11 @@ impl HttpsSession {
                     .frontend_socket
                     .session
                     .reader()
-                    .read(front_buf.space())
+                    .read(http.htx_request.storage.space())
                 {
                     Ok(sz) => {
                         //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-                        front_buf.fill(sz);
+                        http.htx_request.storage.fill(sz);
                         count!("bytes_in", sz as i64);
                         self.metrics.bin += sz;
                     }
@@ -336,11 +331,6 @@ impl HttpsSession {
                     }
                 }
 
-                let size = front_buf.available_data();
-                let mut buf = BufferQueue::with_buffer(front_buf);
-                buf.sliced_input(size);
-
-                http.frontend_buffer = Some(buf);
                 http.frontend_readiness = readiness;
                 http.frontend_readiness.interest =
                     Ready::readable() | Ready::hup() | Ready::error();
@@ -374,36 +364,8 @@ impl HttpsSession {
         let back_token = unwrap_msg!(http.backend_token);
         let ws_context = http.websocket_context();
 
-        let front_buf = match http.frontend_buffer {
-            Some(buf) => buf.buffer,
-            None => {
-                let pool = match self.pool.upgrade() {
-                    Some(p) => p,
-                    None => return None,
-                };
-
-                let buffer = match pool.borrow_mut().checkout() {
-                    Some(buf) => buf,
-                    None => return None,
-                };
-                buffer
-            }
-        };
-        let back_buf = match http.backend_buffer {
-            Some(buf) => buf.buffer,
-            None => {
-                let pool = match self.pool.upgrade() {
-                    Some(p) => p,
-                    None => return None,
-                };
-
-                let buffer = match pool.borrow_mut().checkout() {
-                    Some(buf) => buf,
-                    None => return None,
-                };
-                buffer
-            }
-        };
+        let front_buf = http.htx_request.storage.buffer;
+        let back_buf = http.htx_response.storage.buffer;
 
         // TODO: is this necessary? Do we need to reset the timeouts?
         // http.container_frontend_timeout.reset();
