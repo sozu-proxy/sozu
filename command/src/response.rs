@@ -107,8 +107,8 @@ pub struct AvailableMetrics {
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpFrontend {
-    /// The route is DENY if None
-    pub route: Option<ClusterId>,
+    /// Send a 401, DENY, if cluster_id is None
+    pub cluster_id: Option<ClusterId>,
     pub address: SocketAddr,
     pub hostname: String,
     #[serde(default)]
@@ -125,7 +125,7 @@ pub struct HttpFrontend {
 impl Into<RequestHttpFrontend> for HttpFrontend {
     fn into(self) -> RequestHttpFrontend {
         RequestHttpFrontend {
-            route: self.route,
+            cluster_id: self.cluster_id,
             address: self.address.to_string(),
             hostname: self.hostname,
             path: self.path,

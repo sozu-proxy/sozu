@@ -133,11 +133,20 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         table.add_row(row!["HTTP frontends "]);
         table.add_row(row![
-            "route", "address", "hostname", "path", "method", "position", "tags"
+            "cluster_id",
+            "address",
+            "hostname",
+            "path",
+            "method",
+            "position",
+            "tags"
         ]);
         for http_frontend in frontends.http_frontends.iter() {
             table.add_row(row!(
-                http_frontend.route.clone().unwrap_or("Deny".to_owned()),
+                http_frontend
+                    .cluster_id
+                    .clone()
+                    .unwrap_or("Deny".to_owned()),
                 http_frontend.address.to_string(),
                 http_frontend.hostname.to_string(),
                 format!("{:?}", http_frontend.path),
@@ -155,11 +164,20 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         table.add_row(row!["HTTPS frontends"]);
         table.add_row(row![
-            "route", "address", "hostname", "path", "method", "position", "tags"
+            "cluster_id",
+            "address",
+            "hostname",
+            "path",
+            "method",
+            "position",
+            "tags"
         ]);
         for https_frontend in frontends.https_frontends.iter() {
             table.add_row(row!(
-                https_frontend.route.clone().unwrap_or("Deny".to_owned()),
+                https_frontend
+                    .cluster_id
+                    .clone()
+                    .unwrap_or("Deny".to_owned()),
                 https_frontend.address.to_string(),
                 https_frontend.hostname.to_string(),
                 format!("{:?}", https_frontend.path),
@@ -480,7 +498,7 @@ pub fn print_query_response_data(
 
             for (key, values) in frontend_data.iter() {
                 let mut row = Vec::new();
-                match &key.route {
+                match &key.cluster_id {
                     Some(cluster_id) => row.push(cell!(cluster_id)),
                     None => row.push(cell!("-")),
                 }
@@ -504,7 +522,7 @@ pub fn print_query_response_data(
 
             for (key, values) in https_frontend_data.iter() {
                 let mut row = Vec::new();
-                match &key.route {
+                match &key.cluster_id {
                     Some(cluster_id) => row.push(cell!(cluster_id)),
                     None => row.push(cell!("-")),
                 }

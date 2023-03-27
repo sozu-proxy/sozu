@@ -107,7 +107,7 @@ impl Router {
 
         let method_rule = MethodRule::new(front.method.clone());
 
-        let route = match &front.route {
+        let route = match &front.cluster_id {
             Some(cluster_id) => Route::ClusterId(cluster_id.clone()),
             None => Route::Deny,
         };

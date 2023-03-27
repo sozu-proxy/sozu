@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, net::SocketAddr};
 use clap::{Parser, Subcommand};
 
 use sozu_command_lib::{
-    certificate::TlsVersion, request::LoadBalancingAlgorithms, state::ClusterId,
+    certificate::TlsVersion, request::LoadBalancingAlgorithms, state::ClusterId as StateClusterId,
 };
 
 #[derive(Parser, PartialEq, Eq, Clone, Debug)]
@@ -425,7 +425,7 @@ pub enum FrontendCmd {
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
-pub enum Route {
+pub enum ClusterId {
     /// traffic will go to the backend servers with this cluster id
     Id {
         /// traffic will go to the backend servers with this cluster id
@@ -436,11 +436,11 @@ pub enum Route {
 }
 
 #[allow(clippy::from_over_into)]
-impl std::convert::Into<Option<ClusterId>> for Route {
-    fn into(self) -> Option<ClusterId> {
+impl std::convert::Into<Option<StateClusterId>> for ClusterId {
+    fn into(self) -> Option<StateClusterId> {
         match self {
-            Route::Deny => None,
-            Route::Id { id } => Some(id),
+            ClusterId::Deny => None,
+            ClusterId::Id { id } => Some(id),
         }
     }
 }
@@ -455,8 +455,8 @@ pub enum HttpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
-        #[clap(subcommand, name = "route")]
-        route: Route,
+        #[clap(subcommand, name = "cluster_id")]
+        cluster_id: ClusterId,
         #[clap(long = "hostname", aliases = &["host"])]
         hostname: String,
         #[clap(short = 'p', long = "path-prefix", help = "URL prefix of the frontend")]
@@ -484,8 +484,8 @@ pub enum HttpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
-        #[clap(subcommand, name = "route")]
-        route: Route,
+        #[clap(subcommand, name = "cluster_id")]
+        cluster_id: ClusterId,
         #[clap(long = "hostname", aliases = &["host"])]
         hostname: String,
         #[clap(short = 'p', long = "path-prefix", help = "URL prefix of the frontend")]

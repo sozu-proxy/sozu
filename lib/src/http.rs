@@ -1131,7 +1131,7 @@ mod tests {
         });
 
         let front = RequestHttpFrontend {
-            route: Some(String::from("cluster_1")),
+            cluster_id: Some(String::from("cluster_1")),
             address: "127.0.0.1:1024".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
@@ -1221,7 +1221,7 @@ mod tests {
             method: None,
             path: PathRule::prefix(String::from("/")),
             position: RulePosition::Tree,
-            route: Some(String::from("cluster_1")),
+            cluster_id: Some(String::from("cluster_1")),
             tags: None,
         };
         command
@@ -1347,7 +1347,7 @@ mod tests {
             method: None,
             path: PathRule::prefix(String::from("/")),
             position: RulePosition::Tree,
-            route: Some(String::from("cluster_1")),
+            cluster_id: Some(String::from("cluster_1")),
             tags: None,
         };
         command
@@ -1454,7 +1454,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri1),
                 position: RulePosition::Tree,
-                route: Some(cluster_id1),
+                cluster_id: Some(cluster_id1),
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1465,7 +1465,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri2),
                 position: RulePosition::Tree,
-                route: Some(cluster_id2),
+                cluster_id: Some(cluster_id2),
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1476,7 +1476,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri3),
                 position: RulePosition::Tree,
-                route: Some(cluster_id3),
+                cluster_id: Some(cluster_id3),
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1487,7 +1487,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix("/test".to_owned()),
                 position: RulePosition::Tree,
-                route: Some("cluster_1".to_owned()),
+                cluster_id: Some("cluster_1".to_owned()),
                 tags: None,
             })
             .expect("Could not add http frontend");
