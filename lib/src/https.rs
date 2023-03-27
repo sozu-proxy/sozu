@@ -45,7 +45,7 @@ use crate::{
         rustls::TlsHandshake,
         Http, Pipe, SessionState,
     },
-    router::Router,
+    router::{Route, Router},
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     sozu_command::{
@@ -56,7 +56,7 @@ use crate::{
             AddCertificate, Cluster, RemoveCertificate, RemoveListener, ReplaceCertificate,
             Request, WorkerRequest,
         },
-        response::{HttpFrontend, HttpsListenerConfig, ResponseContent, Route, WorkerResponse},
+        response::{HttpFrontend, HttpsListenerConfig, ResponseContent, WorkerResponse},
         scm_socket::ScmSocket,
         state::ClusterId,
     },
@@ -1553,8 +1553,7 @@ mod tests {
 
     use sozu_command::config::ListenerBuilder;
 
-    use crate::router::{trie::TrieNode, MethodRule, PathRule, Router};
-    use crate::sozu_command::response::Route;
+    use crate::router::{trie::TrieNode, MethodRule, PathRule, Router, Route};
 
     use super::*;
 

@@ -13,7 +13,7 @@ use crate::sozu_command::{
     config::ListenerBuilder,
     logging::{Logger, LoggerBackend},
     request::{AddBackend, LoadBalancingParams, Request, RequestHttpFrontend, WorkerRequest},
-    response::{PathRule, Route, RulePosition},
+    response::{PathRule, RulePosition},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let http_front = RequestHttpFrontend {
-        route: Route::ClusterId(String::from("test")),
+        cluster_id: Some(String::from("test")),
         address: "127.0.0.1:8080".to_string(),
         hostname: String::from("example.com"),
         path: PathRule::prefix(String::from("/")),

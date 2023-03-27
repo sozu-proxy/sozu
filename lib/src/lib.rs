@@ -219,10 +219,10 @@ use time::{Duration, Instant};
 use crate::sozu_command::{
     ready::Ready,
     request::{Cluster, LoadBalancingParams, WorkerRequest},
-    response::{Event, Route, WorkerResponse},
+    response::{Event, WorkerResponse},
 };
 
-use self::{backends::BackendMap, retry::RetryPolicy};
+use self::{backends::BackendMap, retry::RetryPolicy, router::Route};
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

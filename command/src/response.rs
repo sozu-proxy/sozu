@@ -12,7 +12,7 @@ use crate::{
         default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams,
         RequestHttpFrontend, RequestTcpFrontend, PROTOCOL_VERSION,
     },
-    state::{ClusterId, ConfigState},
+    state::{ConfigState, ClusterId},
 };
 
 /// Responses of the main process to the CLI (or other client)
@@ -107,7 +107,8 @@ pub struct AvailableMetrics {
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpFrontend {
-    pub route: Route,
+    /// Send a 401, DENY, if cluster_id is None
+    pub cluster_id: Option<ClusterId>,
     pub address: SocketAddr,
     pub hostname: String,
     #[serde(default)]
@@ -124,32 +125,13 @@ pub struct HttpFrontend {
 impl Into<RequestHttpFrontend> for HttpFrontend {
     fn into(self) -> RequestHttpFrontend {
         RequestHttpFrontend {
-            route: self.route,
+            cluster_id: self.cluster_id,
             address: self.address.to_string(),
             hostname: self.hostname,
             path: self.path,
             method: self.method,
             position: self.position,
             tags: self.tags,
-        }
-    }
-}
-
-/// The cluster to which the traffic will be redirected
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Route {
-    /// send a 401 default answer
-    Deny,
-    /// the cluster to which the frontend belongs
-    ClusterId(ClusterId),
-}
-
-impl std::fmt::Display for Route {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Route::Deny => write!(f, "deny"),
-            Route::ClusterId(string) => write!(f, "{string}"),
         }
     }
 }

@@ -1,9 +1,7 @@
 {
   "type": "REMOVE_HTTPS_FRONTEND",
   "content": {
-    "route": {
-      "CLUSTER_ID": "xxx"
-    },
+    "cluster_id": "xxx",
     "address": "0.0.0.0:8443",
     "hostname": "yyy",
     "path": {

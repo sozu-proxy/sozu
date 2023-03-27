@@ -5,7 +5,7 @@ use prettytable::{Row, Table};
 
 use sozu_command_lib::response::{
     AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics, ListedFrontends,
-    ListenersList, ResponseContent, Route, WorkerInfo, WorkerMetrics,
+    ListenersList, ResponseContent, WorkerInfo, WorkerMetrics,
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -133,11 +133,20 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         table.add_row(row!["HTTP frontends "]);
         table.add_row(row![
-            "route", "address", "hostname", "path", "method", "position", "tags"
+            "cluster_id",
+            "address",
+            "hostname",
+            "path",
+            "method",
+            "position",
+            "tags"
         ]);
         for http_frontend in frontends.http_frontends.iter() {
             table.add_row(row!(
-                http_frontend.route,
+                http_frontend
+                    .cluster_id
+                    .clone()
+                    .unwrap_or("Deny".to_owned()),
                 http_frontend.address.to_string(),
                 http_frontend.hostname.to_string(),
                 format!("{:?}", http_frontend.path),
@@ -155,11 +164,20 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         table.add_row(row!["HTTPS frontends"]);
         table.add_row(row![
-            "route", "address", "hostname", "path", "method", "position", "tags"
+            "cluster_id",
+            "address",
+            "hostname",
+            "path",
+            "method",
+            "position",
+            "tags"
         ]);
         for https_frontend in frontends.https_frontends.iter() {
             table.add_row(row!(
-                https_frontend.route,
+                https_frontend
+                    .cluster_id
+                    .clone()
+                    .unwrap_or("Deny".to_owned()),
                 https_frontend.address.to_string(),
                 https_frontend.hostname.to_string(),
                 format!("{:?}", https_frontend.path),
@@ -480,9 +498,9 @@ pub fn print_query_response_data(
 
             for (key, values) in frontend_data.iter() {
                 let mut row = Vec::new();
-                match &key.route {
-                    Route::ClusterId(cluster_id) => row.push(cell!(cluster_id)),
-                    Route::Deny => row.push(cell!("-")),
+                match &key.cluster_id {
+                    Some(cluster_id) => row.push(cell!(cluster_id)),
+                    None => row.push(cell!("-")),
                 }
                 row.push(cell!(key.hostname));
                 row.push(cell!(key.path));
@@ -504,9 +522,9 @@ pub fn print_query_response_data(
 
             for (key, values) in https_frontend_data.iter() {
                 let mut row = Vec::new();
-                match &key.route {
-                    Route::ClusterId(cluster_id) => row.push(cell!(cluster_id)),
-                    Route::Deny => row.push(cell!("-")),
+                match &key.cluster_id {
+                    Some(cluster_id) => row.push(cell!(cluster_id)),
+                    None => row.push(cell!("-")),
                 }
                 row.push(cell!(key.hostname));
                 row.push(cell!(key.path));

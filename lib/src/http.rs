@@ -18,7 +18,7 @@ use sozu_command::{
     logging,
     ready::Ready,
     request::{Cluster, RemoveListener, Request, RequestHttpFrontend, WorkerRequest},
-    response::{HttpFrontend, HttpListenerConfig, Route, WorkerResponse},
+    response::{HttpFrontend, HttpListenerConfig, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
 };
 
@@ -39,6 +39,7 @@ use super::{
         proxy_protocol::expect::ExpectProxyProtocol,
         {Http, Pipe},
     },
+    router::Route,
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager},
     socket::server_bind,
     sozu_command::state::ClusterId,
@@ -1087,7 +1088,7 @@ mod tests {
     use crate::sozu_command::{
         channel::Channel,
         request::{LoadBalancingAlgorithms, LoadBalancingParams, Request, WorkerRequest},
-        response::{Backend, HttpFrontend, PathRule, Route, RulePosition},
+        response::{Backend, HttpFrontend, PathRule, RulePosition},
     };
 
     use std::io::{Read, Write};
@@ -1130,7 +1131,7 @@ mod tests {
         });
 
         let front = RequestHttpFrontend {
-            route: Route::ClusterId(String::from("cluster_1")),
+            cluster_id: Some(String::from("cluster_1")),
             address: "127.0.0.1:1024".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
@@ -1220,7 +1221,7 @@ mod tests {
             method: None,
             path: PathRule::prefix(String::from("/")),
             position: RulePosition::Tree,
-            route: Route::ClusterId(String::from("cluster_1")),
+            cluster_id: Some(String::from("cluster_1")),
             tags: None,
         };
         command
@@ -1346,7 +1347,7 @@ mod tests {
             method: None,
             path: PathRule::prefix(String::from("/")),
             position: RulePosition::Tree,
-            route: Route::ClusterId(String::from("cluster_1")),
+            cluster_id: Some(String::from("cluster_1")),
             tags: None,
         };
         command
@@ -1453,7 +1454,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri1),
                 position: RulePosition::Tree,
-                route: Route::ClusterId(cluster_id1),
+                cluster_id: Some(cluster_id1),
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1464,7 +1465,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri2),
                 position: RulePosition::Tree,
-                route: Route::ClusterId(cluster_id2),
+                cluster_id: Some(cluster_id2),
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1475,7 +1476,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri3),
                 position: RulePosition::Tree,
-                route: Route::ClusterId(cluster_id3),
+                cluster_id: Some(cluster_id3),
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1486,7 +1487,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix("/test".to_owned()),
                 position: RulePosition::Tree,
-                route: Route::ClusterId("cluster_1".to_owned()),
+                cluster_id: Some("cluster_1".to_owned()),
                 tags: None,
             })
             .expect("Could not add http frontend");

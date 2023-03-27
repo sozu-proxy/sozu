@@ -22,7 +22,7 @@ use crate::{
     },
     response::{
         Backend, ClusterInformation, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        PathRule, PathRuleKind, Route, TcpFrontend, TcpListenerConfig,
+        PathRule, PathRuleKind, TcpFrontend, TcpListenerConfig,
     },
 };
 
@@ -129,7 +129,8 @@ impl ConfigState {
             &Request::Logging(_)
             | &Request::Status
             | &Request::SoftStop
-            | &Request::QueryClusters(_)
+            | &Request::QueryClusterById(_)
+            | &Request::QueryClustersByDomain(_)
             | &Request::QueryMetrics(_)
             | &Request::QueryClustersHashes
             | &Request::ConfigureMetrics(_)
@@ -299,12 +300,12 @@ impl ConfigState {
 
     fn remove_http_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
         if self.http_fronts.remove(&front.route_key()).is_none() {
-            let error_msg = match &front.route {
-                Route::ClusterId(cluster_id) => format!(
+            let error_msg = match &front.cluster_id {
+                Some(cluster_id) => format!(
                     "No such frontend at {} for the cluster {}",
                     front.address, cluster_id
                 ),
-                Route::Deny => format!("No such frontend at {}", front.address),
+                None => format!("No such frontend at {}", front.address),
             };
             bail!(error_msg);
         }
@@ -997,7 +998,7 @@ impl ConfigState {
             .collect();
 
         for front in self.http_fronts.values() {
-            if let Route::ClusterId(cluster_id) = &front.route {
+            if let Some(cluster_id) = &front.cluster_id {
                 if let Some(s) = h.get_mut(cluster_id) {
                     front.hash(s);
                 }
@@ -1005,7 +1006,7 @@ impl ConfigState {
         }
 
         for front in self.https_fronts.values() {
-            if let Route::ClusterId(cluster_id) = &front.route {
+            if let Some(cluster_id) = &front.cluster_id {
                 if let Some(s) = h.get_mut(cluster_id) {
                     front.hash(s);
                 }
@@ -1023,9 +1024,9 @@ impl ConfigState {
             http_frontends: self
                 .http_fronts
                 .iter()
-                .filter_map(|(_k, v)| match &v.route {
-                    Route::Deny => None,
-                    Route::ClusterId(id) => {
+                .filter_map(|(_k, v)| match &v.cluster_id {
+                    None => None,
+                    Some(id) => {
                         if id == cluster_id {
                             Some(v)
                         } else {
@@ -1038,9 +1039,9 @@ impl ConfigState {
             https_frontends: self
                 .https_fronts
                 .iter()
-                .filter_map(|(_k, v)| match &v.route {
-                    Route::Deny => None,
-                    Route::ClusterId(id) => {
+                .filter_map(|(_k, v)| match &v.cluster_id {
+                    None => None,
+                    Some(id) => {
                         if id == cluster_id {
                             Some(v)
                         } else {
@@ -1092,7 +1093,7 @@ pub fn get_cluster_ids_by_domain(
 
     state.http_fronts.values().for_each(|front| {
         if domain_check(&front.hostname, &front.path, &hostname, &path) {
-            if let Route::ClusterId(id) = &front.route {
+            if let Some(id) = &front.cluster_id {
                 cluster_ids.insert(id.to_string());
             }
         }
@@ -1100,7 +1101,7 @@ pub fn get_cluster_ids_by_domain(
 
     state.https_fronts.values().for_each(|front| {
         if domain_check(&front.hostname, &front.path, &hostname, &path) {
-            if let Route::ClusterId(id) = &front.route {
+            if let Some(id) = &front.cluster_id {
                 cluster_ids.insert(id.to_string());
             }
         }
@@ -1213,7 +1214,7 @@ mod tests {
         let mut state: ConfigState = Default::default();
         state
             .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
-                route: Route::ClusterId(String::from("cluster_1")),
+                cluster_id: Some(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::prefix(String::from("/")),
                 method: None,
@@ -1224,7 +1225,7 @@ mod tests {
             .expect("Could not execute request");
         state
             .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
-                route: Route::ClusterId(String::from("cluster_2")),
+                cluster_id: Some(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
                 method: None,
@@ -1297,7 +1298,7 @@ mod tests {
         let mut state: ConfigState = Default::default();
         state
             .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
-                route: Route::ClusterId(String::from("cluster_1")),
+                cluster_id: Some(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::prefix(String::from("/")),
                 method: None,
@@ -1308,7 +1309,7 @@ mod tests {
             .expect("Could not execute request");
         state
             .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
-                route: Route::ClusterId(String::from("cluster_2")),
+                cluster_id: Some(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
                 method: None,
@@ -1362,7 +1363,7 @@ mod tests {
         let mut state2: ConfigState = Default::default();
         state2
             .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
-                route: Route::ClusterId(String::from("cluster_1")),
+                cluster_id: Some(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::prefix(String::from("/")),
                 address: "0.0.0.0:8080".to_string(),
@@ -1415,7 +1416,7 @@ mod tests {
 
         let e = vec![
             Request::RemoveHttpFrontend(RequestHttpFrontend {
-                route: Route::ClusterId(String::from("cluster_2")),
+                cluster_id: Some(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
                 method: None,
@@ -1481,7 +1482,7 @@ mod tests {
     fn cluster_ids_by_domain() {
         let mut config = ConfigState::new();
         let http_front_cluster1 = RequestHttpFrontend {
-            route: Route::ClusterId(String::from("MyCluster_1")),
+            cluster_id: Some(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("")),
             method: None,
@@ -1491,7 +1492,7 @@ mod tests {
         };
 
         let https_front_cluster1 = RequestHttpFrontend {
-            route: Route::ClusterId(String::from("MyCluster_1")),
+            cluster_id: Some(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("")),
             method: None,
@@ -1501,7 +1502,7 @@ mod tests {
         };
 
         let http_front_cluster2 = RequestHttpFrontend {
-            route: Route::ClusterId(String::from("MyCluster_2")),
+            cluster_id: Some(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("/api")),
             method: None,
@@ -1511,7 +1512,7 @@ mod tests {
         };
 
         let https_front_cluster2 = RequestHttpFrontend {
-            route: Route::ClusterId(String::from("MyCluster_2")),
+            cluster_id: Some(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("/api")),
             method: None,

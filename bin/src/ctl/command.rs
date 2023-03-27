@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use sozu_command_lib::{
     certificate::Fingerprint,
-    request::{QueryClusterDomain, QueryClusterType, QueryMetricsOptions, Request},
+    request::{QueryClusterByDomain, QueryMetricsOptions, Request},
     response::{Response, ResponseContent, ResponseStatus, RunState, WorkerInfo},
 };
 
@@ -332,8 +332,8 @@ impl CommandManager {
             bail!("Error: Either request an cluster ID or a domain name");
         }
 
-        let command = if let Some(ref cluster_id) = cluster_id {
-            Request::QueryClusters(QueryClusterType::ClusterId(cluster_id.to_string()))
+        let request = if let Some(ref cluster_id) = cluster_id {
+            Request::QueryClusterById(cluster_id.to_string())
         } else if let Some(ref domain) = domain {
             let splitted: Vec<String> =
                 domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
@@ -342,7 +342,7 @@ impl CommandManager {
                 bail!("Domain can't be empty");
             }
 
-            let query_domain = QueryClusterDomain {
+            let query_domain = QueryClusterByDomain {
                 hostname: splitted
                     .get(0)
                     .with_context(|| "Domain can't be empty")?
@@ -350,12 +350,12 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
             };
 
-            Request::QueryClusters(QueryClusterType::Domain(query_domain))
+            Request::QueryClustersByDomain(query_domain)
         } else {
             Request::QueryClustersHashes
         };
 
-        self.send_request(command)?;
+        self.send_request(request)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
