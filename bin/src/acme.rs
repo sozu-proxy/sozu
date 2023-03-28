@@ -11,9 +11,10 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     proto::command::{
-        AddCertificate, CertificateAndKey, PathRule, RequestHttpFrontend, RulePosition, TlsVersion,
+        AddCertificate, CertificateAndKey, PathRule, ReplaceCertificate, RequestHttpFrontend,
+        RulePosition, TlsVersion,
     },
-    request::{AddBackend, RemoveBackend, ReplaceCertificate, Request},
+    request::{AddBackend, RemoveBackend, Request},
     response::{Response, ResponseStatus},
 };
 
@@ -382,7 +383,7 @@ fn add_certificate(
                 key,
                 versions,
             },
-            old_fingerprint: Fingerprint(f),
+            old_fingerprint: Fingerprint(f).to_string(),
             new_names: vec![hostname.to_string()],
             new_expired_at: None,
         }),

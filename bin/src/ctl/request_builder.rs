@@ -7,12 +7,12 @@ use sozu_command_lib::{
     config::{Config, ListenerBuilder, ProxyProtocolConfig},
     proto::command::{
         AddCertificate, CertificateAndKey, FrontendFilters, PathRule, RemoveCertificate,
-        RequestHttpFrontend, RulePosition, TlsVersion,
+        ReplaceCertificate, RequestHttpFrontend, RulePosition, TlsVersion,
     },
     request::{
         ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType,
-        LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveListener,
-        ReplaceCertificate, Request, RequestTcpFrontend,
+        LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveListener, Request,
+        RequestTcpFrontend,
     },
 };
 
@@ -484,7 +484,7 @@ impl CommandManager {
         self.order_request(Request::ReplaceCertificate(ReplaceCertificate {
             address,
             new_certificate,
-            old_fingerprint,
+            old_fingerprint: old_fingerprint.to_string(),
             new_names: vec![],
             new_expired_at: None,
         }))?;

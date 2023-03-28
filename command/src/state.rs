@@ -14,11 +14,12 @@ use anyhow::{bail, Context};
 use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
-        AddCertificate, CertificateAndKey, PathRule, RemoveCertificate, RequestHttpFrontend,
+        AddCertificate, CertificateAndKey, PathRule, RemoveCertificate, ReplaceCertificate,
+        RequestHttpFrontend,
     },
     request::{
         ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType, RemoveBackend,
-        RemoveListener, ReplaceCertificate, Request, RequestTcpFrontend,
+        RemoveListener, Request, RequestTcpFrontend,
     },
     response::{
         Backend, ClusterInformation, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
@@ -387,10 +388,15 @@ impl ConfigState {
             .parse()
             .with_context(|| "Could not parse socket address")?;
 
+        let old_fingerprint = Fingerprint(
+            hex::decode(&replace.old_fingerprint)
+                .with_context(|| "Failed at decoding the string (expected hexadecimal data)")?,
+        );
+
         self.certificates
             .get_mut(&address)
             .with_context(|| format!("No certificate to replace for address {}", replace.address))?
-            .remove(&replace.old_fingerprint);
+            .remove(&old_fingerprint);
 
         let new_fingerprint = Fingerprint(
             calculate_fingerprint(replace.new_certificate.certificate.as_bytes())

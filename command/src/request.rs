@@ -12,7 +12,7 @@ use crate::{
     certificate::Fingerprint,
     config::ProxyProtocolConfig,
     proto::command::{
-        AddCertificate, CertificateAndKey, FrontendFilters, PathRuleKind, RemoveCertificate,
+        AddCertificate, FrontendFilters, PathRuleKind, RemoveCertificate, ReplaceCertificate,
         RequestHttpFrontend, RulePosition,
     },
     response::{
@@ -276,25 +276,6 @@ pub struct DeactivateListener {
     pub to_scm: bool,
 }
 
-/*
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RemoveCertificate {
-    pub address: String,
-    pub fingerprint: Fingerprint,
-}
-*/
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ReplaceCertificate {
-    pub address: String,
-    pub new_certificate: CertificateAndKey,
-    pub old_fingerprint: Fingerprint,
-    #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
-    pub new_names: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub new_expired_at: Option<i64>,
-}
-
 /// Meant for outside users, contains a String instead of a SocketAddr
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestTcpFrontend {
@@ -452,7 +433,7 @@ mod tests {
     use super::*;
     use crate::certificate::split_certificate_chain;
     use crate::config::ProxyProtocolConfig;
-    use crate::proto::command::{PathRule, RulePosition, TlsVersion};
+    use crate::proto::command::{CertificateAndKey, PathRule, RulePosition, TlsVersion};
     use crate::response::HttpFrontend;
     use serde_json;
 

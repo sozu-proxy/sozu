@@ -24,8 +24,7 @@ use x509_parser::{
 use crate::router::trie::*;
 use sozu_command::{
     certificate::Fingerprint,
-    proto::command::{AddCertificate, CertificateAndKey, TlsVersion},
-    request::ReplaceCertificate,
+    proto::command::{AddCertificate, CertificateAndKey, ReplaceCertificate, TlsVersion},
 };
 
 // -----------------------------------------------------------------------------

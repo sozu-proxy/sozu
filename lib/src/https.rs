@@ -33,10 +33,11 @@ use sozu_command::{
     config::DEFAULT_CIPHER_SUITES,
     logging,
     proto::command::{
-        AddCertificate, CertificateSummary, RemoveCertificate, RequestHttpFrontend, TlsVersion,
+        AddCertificate, CertificateSummary, RemoveCertificate, ReplaceCertificate,
+        RequestHttpFrontend, TlsVersion,
     },
     ready::Ready,
-    request::{Cluster, RemoveListener, ReplaceCertificate, Request, WorkerRequest},
+    request::{Cluster, RemoveListener, Request, WorkerRequest},
     response::{HttpFrontend, HttpsListenerConfig, ResponseContent, WorkerResponse},
     scm_socket::ScmSocket,
     state::ClusterId,

@@ -44,6 +44,7 @@ enum RulePosition {
     TREE = 2;
 }
 
+// Add a new TLS certificate to an HTTPs listener
 message AddCertificate {
     required string address = 1;
     required CertificateAndKey certificate = 2;
@@ -54,8 +55,18 @@ message AddCertificate {
 
 message RemoveCertificate {
     required string address = 1;
-    // a hex-encoded TLS fingerprint
+    // a hex-encoded TLS fingerprint to identify the certificate to remove
     required string fingerprint = 2;
+}
+
+message ReplaceCertificate {
+    required string address = 1;
+    required CertificateAndKey new_certificate = 2;
+    // a hex-encoded TLS fingerprint to identify the old certificate
+    required string old_fingerprint = 3;
+    repeated string new_names = 4;
+    // A unix timestamp. Overrides certificate expiration.
+    optional int64 new_expired_at = 5;
 }
 
 message CertificateAndKey {
