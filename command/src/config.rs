@@ -15,8 +15,8 @@ use toml;
 use crate::{
     certificate::split_certificate_chain,
     proto::command::{
-        AddCertificate, CertificateAndKey, LoadBalancingAlgorithms, PathRule, RequestHttpFrontend,
-        RulePosition, TlsVersion,
+        AddCertificate, CertificateAndKey, LoadBalancingAlgorithms, PathRule, ProxyProtocolConfig,
+        RequestHttpFrontend, RulePosition, TlsVersion,
     },
     request::{
         ActivateListener, AddBackend, Cluster, ListenerType, LoadBalancingParams, LoadMetric,
@@ -485,15 +485,6 @@ pub struct MetricsConfig {
     pub tagged_metrics: bool,
     #[serde(default)]
     pub prefix: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[serde(deny_unknown_fields)]
-pub enum ProxyProtocolConfig {
-    ExpectHeader,
-    SendHeader,
-    RelayHeader,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

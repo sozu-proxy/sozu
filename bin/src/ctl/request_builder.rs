@@ -4,10 +4,10 @@ use anyhow::{bail, Context};
 
 use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
-    config::{Config, ListenerBuilder, ProxyProtocolConfig},
+    config::{Config, ListenerBuilder},
     proto::command::{
-        AddCertificate, CertificateAndKey, FrontendFilters, PathRule, RemoveCertificate,
-        ReplaceCertificate, RequestHttpFrontend, RulePosition, TlsVersion,
+        AddCertificate, CertificateAndKey, FrontendFilters, PathRule, ProxyProtocolConfig,
+        RemoveCertificate, ReplaceCertificate, RequestHttpFrontend, RulePosition, TlsVersion,
     },
     request::{
         ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType,

@@ -34,8 +34,8 @@ use crate::{
     },
     socket::server_bind,
     sozu_command::{
-        config::ProxyProtocolConfig,
         logging,
+        proto::command::ProxyProtocolConfig,
         ready::Ready,
         request::{Request, RequestTcpFrontend, WorkerRequest},
         response::{Event, TcpListenerConfig, WorkerResponse},

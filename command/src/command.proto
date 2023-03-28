@@ -99,3 +99,9 @@ enum LoadBalancingAlgorithms {
     LEAST_LOADED = 2;
     POWER_OF_TWO = 3;
 }
+
+enum ProxyProtocolConfig {
+    EXPECT_HEADER = 0;
+    SEND_HEADER = 1;
+    RELAY_HEADER = 2;
+}

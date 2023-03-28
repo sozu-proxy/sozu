@@ -10,10 +10,10 @@ use anyhow::Context;
 
 use crate::{
     certificate::Fingerprint,
-    config::ProxyProtocolConfig,
     proto::command::{
-        AddCertificate, FrontendFilters, LoadBalancingAlgorithms, PathRuleKind, RemoveCertificate,
-        ReplaceCertificate, RequestHttpFrontend, RulePosition,
+        AddCertificate, FrontendFilters, LoadBalancingAlgorithms, PathRuleKind,
+        ProxyProtocolConfig, RemoveCertificate, ReplaceCertificate, RequestHttpFrontend,
+        RulePosition,
     },
     response::{
         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
@@ -425,8 +425,9 @@ mod tests {
 
     use super::*;
     use crate::certificate::split_certificate_chain;
-    use crate::config::ProxyProtocolConfig;
-    use crate::proto::command::{CertificateAndKey, PathRule, RulePosition, TlsVersion};
+    use crate::proto::command::{
+        CertificateAndKey, PathRule, ProxyProtocolConfig, RulePosition, TlsVersion,
+    };
     use crate::response::HttpFrontend;
     use serde_json;
 
