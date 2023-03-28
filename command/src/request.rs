@@ -11,7 +11,7 @@ use anyhow::Context;
 use crate::{
     certificate::Fingerprint,
     proto::command::{
-        AddCertificate, FrontendFilters, LoadBalancingAlgorithms, PathRuleKind,
+        AddCertificate, FrontendFilters, LoadBalancingAlgorithms, LoadMetric, PathRuleKind,
         ProxyProtocolConfig, RemoveCertificate, ReplaceCertificate, RequestHttpFrontend,
         RulePosition,
     },
@@ -232,18 +232,6 @@ pub struct Cluster {
     pub load_metric: Option<LoadMetric>,
 }
 
-/// how sozu measures which backend is less loaded
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoadMetric {
-    /// number of TCP connections
-    Connections,
-    /// number of active HTTP requests
-    Requests,
-    /// time to connect to the backend, weighted by the number of active connections (peak EWMA)
-    ConnectionTime,
-}
-
 pub fn default_sticky_name() -> String {
     String::from("SOZUBALANCEID")
 }
@@ -365,14 +353,6 @@ pub struct QueryMetricsOptions {
     pub backend_ids: Vec<String>,
     pub metric_names: Vec<String>,
 }
-
-/*
-impl Default for LoadBalancingAlgorithms {
-    fn default() -> Self {
-        LoadBalancingAlgorithms::RoundRobin
-    }
-}
-*/
 
 #[derive(Debug)]
 pub struct ParseErrorLoadBalancing;

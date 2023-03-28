@@ -105,3 +105,13 @@ enum ProxyProtocolConfig {
     SEND_HEADER = 1;
     RELAY_HEADER = 2;
 }
+
+// how sozu measures which backend is less loaded
+enum LoadMetric {
+    // number of TCP connections
+    CONNECTIONS = 0;
+    // number of active HTTP requests
+    REQUESTS = 1;
+    // time to connect to the backend, weighted by the number of active connections (peak EWMA)
+    CONNECTION_TIME = 2;
+}

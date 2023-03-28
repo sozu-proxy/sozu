@@ -7,7 +7,7 @@ use rand::{
     thread_rng, Rng,
 };
 
-use crate::{sozu_command::request::LoadMetric, Backend};
+use crate::{sozu_command::proto::command::LoadMetric, Backend};
 
 pub trait LoadBalancingAlgorithm: Debug {
     fn next_available_backend(
@@ -177,7 +177,7 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
 mod test {
     use super::*;
     use crate::retry::{ExponentialBackoffPolicy, RetryPolicyWrapper};
-    use crate::sozu_command::request::LoadMetric;
+    use crate::sozu_command::proto::command::LoadMetric;
     use crate::{BackendStatus, PeakEWMA};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
