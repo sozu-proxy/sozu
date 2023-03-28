@@ -13,10 +13,12 @@ use anyhow::{bail, Context};
 
 use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
-    proto::command::{AddCertificate, CertificateAndKey, PathRule, RequestHttpFrontend},
+    proto::command::{
+        AddCertificate, CertificateAndKey, PathRule, RemoveCertificate, RequestHttpFrontend,
+    },
     request::{
         ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType, RemoveBackend,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, Request, RequestTcpFrontend,
+        RemoveListener, ReplaceCertificate, Request, RequestTcpFrontend,
     },
     response::{
         Backend, ClusterInformation, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
@@ -358,12 +360,18 @@ impl ConfigState {
     }
 
     fn remove_certificate(&mut self, remove: &RemoveCertificate) -> anyhow::Result<()> {
+        let fingerprint = Fingerprint(
+            hex::decode(&remove.fingerprint)
+                .with_context(|| "Failed at decoding the string (expected hexadecimal data)")?,
+        );
+
         let address = remove
             .address
             .parse()
             .with_context(|| "Could not parse socket address")?;
+
         if let Some(index) = self.certificates.get_mut(&address) {
-            index.remove(&remove.fingerprint);
+            index.remove(&fingerprint);
         }
 
         Ok(())
@@ -972,7 +980,7 @@ impl ConfigState {
         for &(address, fingerprint) in removed_certificates {
             v.push(Request::RemoveCertificate(RemoveCertificate {
                 address: address.to_string(),
-                fingerprint: fingerprint.clone(),
+                fingerprint: fingerprint.to_string(),
             }));
         }
 

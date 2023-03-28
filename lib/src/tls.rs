@@ -25,7 +25,7 @@ use crate::router::trie::*;
 use sozu_command::{
     certificate::Fingerprint,
     proto::command::{AddCertificate, CertificateAndKey, TlsVersion},
-    request::{RemoveCertificate, ReplaceCertificate},
+    request::ReplaceCertificate,
 };
 
 // -----------------------------------------------------------------------------
@@ -43,7 +43,7 @@ pub trait CertificateResolver {
 
     // `remove_certificate` from the certificate resolver, may fail if there is no alternative for
     // a domain name
-    fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error>;
+    fn remove_certificate(&mut self, opts: &Fingerprint) -> Result<(), Self::Error>;
 
     // `replace_certificate` by a new one, this method is a short-hand for `add_certificate` and
     // then `remove_certificate`. It is possible that the certificate will not be replaced, if the
@@ -59,10 +59,7 @@ pub trait CertificateResolver {
             expired_at: opts.new_expired_at.to_owned(),
         })?;
 
-        self.remove_certificate(&RemoveCertificate {
-            address: opts.address.to_owned(),
-            fingerprint: opts.old_fingerprint.to_owned(),
-        })?;
+        self.remove_certificate(&fingerprint)?;
 
         Ok(fingerprint)
     }
@@ -241,20 +238,20 @@ impl CertificateResolver for GenericCertificateResolver {
         Ok(fingerprint.to_owned())
     }
 
-    fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error> {
-        if let Some(certificate_and_key) = self.get_certificate(&opts.fingerprint) {
-            let names = match self.get_names_override(&opts.fingerprint) {
+    fn remove_certificate(&mut self, fingerprint: &Fingerprint) -> Result<(), Self::Error> {
+        if let Some(certificate_and_key) = self.get_certificate(fingerprint) {
+            let names = match self.get_names_override(fingerprint) {
                 Some(names) => names,
                 None => self.certificate_names(&certificate_and_key.certificate)?,
             };
 
-            if self.is_required_for_domain(&names, &opts.fingerprint) {
+            if self.is_required_for_domain(&names, fingerprint) {
                 return Err(GenericCertificateResolverError::IsStillInUseError);
             }
 
             for name in &names {
                 if let Some(fingerprints) = self.name_fingerprint_idx.get_mut(name) {
-                    fingerprints.remove(&opts.fingerprint);
+                    fingerprints.remove(fingerprint);
 
                     if fingerprints.is_empty() {
                         self.domains.domain_remove(&name.to_owned().into_bytes());
@@ -262,7 +259,7 @@ impl CertificateResolver for GenericCertificateResolver {
                 }
             }
 
-            self.certificates.remove(&opts.fingerprint);
+            self.certificates.remove(fingerprint);
         }
 
         Ok(())
@@ -652,8 +649,6 @@ mod tests {
         GenericCertificateResolverError,
     };
 
-    use crate::sozu_command::request::RemoveCertificate;
-
     use rand::{seq::SliceRandom, thread_rng};
     use sozu_command::proto::command::{AddCertificate, CertificateAndKey};
     use x509_parser::pem::parse_x509_pem;
@@ -683,10 +678,7 @@ mod tests {
             return Err("failed to retrieve certificate".into());
         }
 
-        if let Err(err) = resolver.remove_certificate(&RemoveCertificate {
-            address,
-            fingerprint: fingerprint.to_owned(),
-        }) {
+        if let Err(err) = resolver.remove_certificate(&fingerprint) {
             match err {
                 GenericCertificateResolverError::IsStillInUseError => {}
                 _ => {
@@ -733,10 +725,7 @@ mod tests {
             return Err("failed to retrieve certificate".into());
         }
 
-        if let Err(err) = resolver.remove_certificate(&RemoveCertificate {
-            address,
-            fingerprint: fingerprint.to_owned(),
-        }) {
+        if let Err(err) = resolver.remove_certificate(&fingerprint) {
             match err {
                 GenericCertificateResolverError::IsStillInUseError => {}
                 _ => {

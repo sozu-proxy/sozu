@@ -2202,6 +2202,7 @@ dependencies = [
  "cookie-factory",
  "foreign-types-shared",
  "hdrhistogram",
+ "hex",
  "hpack",
  "idna 0.3.0",
  "lazycell",

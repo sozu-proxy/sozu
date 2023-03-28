@@ -12,8 +12,8 @@ use crate::{
     certificate::Fingerprint,
     config::ProxyProtocolConfig,
     proto::command::{
-        AddCertificate, CertificateAndKey, FrontendFilters, PathRuleKind, RequestHttpFrontend,
-        RulePosition,
+        AddCertificate, CertificateAndKey, FrontendFilters, PathRuleKind, RemoveCertificate,
+        RequestHttpFrontend, RulePosition,
     },
     response::{
         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
@@ -276,11 +276,13 @@ pub struct DeactivateListener {
     pub to_scm: bool,
 }
 
+/*
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RemoveCertificate {
     pub address: String,
     pub fingerprint: Fingerprint,
 }
+*/
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReplaceCertificate {
@@ -452,7 +454,6 @@ mod tests {
     use crate::config::ProxyProtocolConfig;
     use crate::proto::command::{PathRule, RulePosition, TlsVersion};
     use crate::response::HttpFrontend;
-    use hex::FromHex;
     use serde_json;
 
     #[test]
@@ -606,12 +607,8 @@ mod tests {
         "../assets/remove_certificate.json",
         Request::RemoveCertificate(RemoveCertificate {
             address: "0.0.0.0:443".parse().unwrap(),
-            fingerprint: Fingerprint(
-                FromHex::from_hex(
-                    "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
-                )
-                .unwrap()
-            ),
+            fingerprint: "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
+                .to_owned(),
         })
     );
 

@@ -52,6 +52,12 @@ message AddCertificate {
     optional int64 expired_at = 4;
 }
 
+message RemoveCertificate {
+    required string address = 1;
+    // a hex-encoded TLS fingerprint
+    required string fingerprint = 2;
+}
+
 message CertificateAndKey {
     required string certificate = 1;
     repeated string certificate_chain = 2;
@@ -62,6 +68,7 @@ message CertificateAndKey {
 // domain name and fingerprint of a certificate
 message CertificateSummary {
     required string domain = 1;
+    // a hex-encoded TLS fingerprint
     required string fingerprint = 2;
 }
 

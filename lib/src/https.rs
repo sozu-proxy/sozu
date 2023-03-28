@@ -32,11 +32,11 @@ use sozu_command::{
     certificate::Fingerprint,
     config::DEFAULT_CIPHER_SUITES,
     logging,
-    proto::command::{AddCertificate, CertificateSummary, RequestHttpFrontend, TlsVersion},
-    ready::Ready,
-    request::{
-        Cluster, RemoveCertificate, RemoveListener, ReplaceCertificate, Request, WorkerRequest,
+    proto::command::{
+        AddCertificate, CertificateSummary, RemoveCertificate, RequestHttpFrontend, TlsVersion,
     },
+    ready::Ready,
+    request::{Cluster, RemoveListener, ReplaceCertificate, Request, WorkerRequest},
     response::{HttpFrontend, HttpsListenerConfig, ResponseContent, WorkerResponse},
     scm_socket::ScmSocket,
     state::ClusterId,
@@ -669,7 +669,7 @@ impl CertificateResolver for HttpsListener {
             .map_err(ListenerError::ResolverError)
     }
 
-    fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error> {
+    fn remove_certificate(&mut self, fingerprint: &Fingerprint) -> Result<(), Self::Error> {
         let mut resolver = self
             .resolver
             .0
@@ -677,7 +677,7 @@ impl CertificateResolver for HttpsListener {
             .map_err(|err| ListenerError::LockError(err.to_string()))?;
 
         resolver
-            .remove_certificate(opts)
+            .remove_certificate(fingerprint)
             .map_err(ListenerError::ResolverError)
     }
 }
@@ -1145,6 +1145,10 @@ impl HttpsProxy {
         remove_certificate: RemoveCertificate,
     ) -> anyhow::Result<Option<ResponseContent>> {
         let address = remove_certificate.address.parse()?;
+        let fingerprint = Fingerprint(
+            hex::decode(&remove_certificate.fingerprint)
+                .with_context(|| "Failed at decoding the string (expected hexadecimal data)")?,
+        );
         match self
             .listeners
             .values()
@@ -1152,7 +1156,7 @@ impl HttpsProxy {
         {
             Some(listener) => listener
                 .borrow_mut()
-                .remove_certificate(&remove_certificate)
+                .remove_certificate(&fingerprint)
                 .with_context(|| "Could not remove certificate from listener")?,
             None => bail!(
                 "removing certificate from unknown listener {}",

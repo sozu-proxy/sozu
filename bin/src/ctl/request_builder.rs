@@ -6,13 +6,13 @@ use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
     config::{Config, ListenerBuilder, ProxyProtocolConfig},
     proto::command::{
-        AddCertificate, CertificateAndKey, FrontendFilters, PathRule, RequestHttpFrontend,
-        RulePosition, TlsVersion,
+        AddCertificate, CertificateAndKey, FrontendFilters, PathRule, RemoveCertificate,
+        RequestHttpFrontend, RulePosition, TlsVersion,
     },
     request::{
         ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType,
-        LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, Request, RequestTcpFrontend,
+        LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveListener,
+        ReplaceCertificate, Request, RequestTcpFrontend,
     },
 };
 
@@ -513,7 +513,7 @@ impl CommandManager {
 
         self.order_request(Request::RemoveCertificate(RemoveCertificate {
             address,
-            fingerprint,
+            fingerprint: fingerprint.to_string(),
         }))
     }
 }

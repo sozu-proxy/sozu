@@ -30,6 +30,7 @@ include = [
 anyhow = "^1.0.69"
 cookie-factory = "^0.3.2"
 foreign-types-shared = "^0.1.1"
+hex = "^0.4.3"
 hdrhistogram = "^7.5.2"
 hpack = "^0.3.0"
 idna = "^0.3.0"
