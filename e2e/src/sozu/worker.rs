@@ -17,10 +17,9 @@ use sozu_command::{
     channel::Channel,
     config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
-    proto::command::{PathRule, RequestHttpFrontend, RulePosition},
+    proto::command::{LoadBalancingAlgorithms, PathRule, RequestHttpFrontend, RulePosition},
     request::{
-        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, Request,
-        RequestTcpFrontend, WorkerRequest,
+        AddBackend, Cluster, LoadBalancingParams, Request, RequestTcpFrontend, WorkerRequest,
     },
     response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},

@@ -1245,8 +1245,8 @@ impl<
 mod tests {
     use super::*;
     use crate::{
-        proto::command::{RequestHttpFrontend, RulePosition},
-        request::{LoadBalancingAlgorithms, LoadBalancingParams, Request},
+        proto::command::{LoadBalancingAlgorithms, RequestHttpFrontend, RulePosition},
+        request::{LoadBalancingParams, Request},
     };
 
     #[test]

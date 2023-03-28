@@ -91,3 +91,11 @@ enum TlsVersion {
     TLS_V1_2 = 4;
     TLS_V1_3 = 5;
 }
+
+// TODO: check that default is ROUND_ROBIN
+enum LoadBalancingAlgorithms {
+    ROUND_ROBIN = 0;
+    RANDOM = 1;
+    LEAST_LOADED = 2;
+    POWER_OF_TWO = 3;
+}

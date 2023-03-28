@@ -244,8 +244,8 @@ cipher_list = [
 protocol = "http"
 
 # per cluster load balancing algorithm. The possible values are
-# "round_robin", "random", "least_loaded" and "power_of_two". Defaults to "round_robin"
-load_balancing = "round_robin"
+# "ROUND_ROBIN", "RANDOM", "LEAST_LOADED" and "POWER_OF_TWO". Defaults to "ROUND_ROBIN"
+load_balancing = "ROUND_ROBIN"
 # metric evaluating the load on the backend. available options: connections, requests, connection_time
 # load_metric = "connections"
 

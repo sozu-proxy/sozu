@@ -12,8 +12,8 @@ use crate::{
     certificate::Fingerprint,
     config::ProxyProtocolConfig,
     proto::command::{
-        AddCertificate, FrontendFilters, PathRuleKind, RemoveCertificate, ReplaceCertificate,
-        RequestHttpFrontend, RulePosition,
+        AddCertificate, FrontendFilters, LoadBalancingAlgorithms, PathRuleKind, RemoveCertificate,
+        ReplaceCertificate, RequestHttpFrontend, RulePosition,
     },
     response::{
         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
@@ -366,20 +366,13 @@ pub struct QueryMetricsOptions {
     pub metric_names: Vec<String>,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoadBalancingAlgorithms {
-    RoundRobin,
-    Random,
-    LeastLoaded,
-    PowerOfTwo,
-}
-
+/*
 impl Default for LoadBalancingAlgorithms {
     fn default() -> Self {
         LoadBalancingAlgorithms::RoundRobin
     }
 }
+*/
 
 #[derive(Debug)]
 pub struct ParseErrorLoadBalancing;
