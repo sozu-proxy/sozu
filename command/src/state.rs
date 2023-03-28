@@ -12,8 +12,8 @@ use std::{
 use anyhow::{bail, Context};
 
 use crate::{
-    certificate::{calculate_fingerprint, CertificateAndKey, Fingerprint},
-    proto::command::{PathRule, PathRuleKind, RequestHttpFrontend},
+    certificate::{calculate_fingerprint, Fingerprint},
+    proto::command::{CertificateAndKey, PathRule, PathRuleKind, RequestHttpFrontend},
     request::{
         ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, ListenerType,
         RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,

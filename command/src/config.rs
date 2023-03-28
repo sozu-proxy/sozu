@@ -13,8 +13,8 @@ use anyhow::{bail, Context};
 use toml;
 
 use crate::{
-    certificate::{split_certificate_chain, CertificateAndKey},
-    proto::command::{PathRule, RequestHttpFrontend, RulePosition, TlsVersion},
+    certificate::split_certificate_chain,
+    proto::command::{CertificateAndKey, PathRule, RequestHttpFrontend, RulePosition, TlsVersion},
     request::{
         ActivateListener, AddBackend, AddCertificate, Cluster, ListenerType,
         LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, Request, RequestTcpFrontend,
@@ -761,7 +761,7 @@ impl HttpFrontendConfig {
                     key: self.key.clone().unwrap(),
                     certificate: self.certificate.clone().unwrap(),
                     certificate_chain: self.certificate_chain.clone().unwrap_or_default(),
-                    versions: self.tls_versions.clone(),
+                    versions: self.tls_versions.iter().map(|v| *v as i32).collect(),
                 },
                 names: vec![self.hostname.clone()],
                 expired_at: None,

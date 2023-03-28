@@ -23,8 +23,8 @@ use x509_parser::{
 
 use crate::router::trie::*;
 use sozu_command::{
-    certificate::{CertificateAndKey, Fingerprint},
-    proto::command::TlsVersion,
+    certificate::Fingerprint,
+    proto::command::{CertificateAndKey, TlsVersion},
     request::{AddCertificate, RemoveCertificate, ReplaceCertificate},
 };
 
@@ -351,11 +351,16 @@ impl CertificateResolverHelper for GenericCertificateResolver {
             if !keys.is_empty() {
                 let key = PrivateKey(keys.swap_remove(0));
                 if RsaSigningKey::new(&key).is_ok() {
+                    let versions = certificate_and_key
+                        .versions
+                        .iter()
+                        .filter_map(|v| TlsVersion::from_i32(*v))
+                        .collect();
                     return Ok(ParsedCertificateAndKey {
                         certificate,
                         chain: chains,
                         key: certificate_and_key.key.to_owned(),
-                        versions: certificate_and_key.versions.to_owned(),
+                        versions,
                     });
                 }
             }
@@ -367,23 +372,34 @@ impl CertificateResolverHelper for GenericCertificateResolver {
         if let Ok(mut keys) = parsed_keys {
             if !keys.is_empty() {
                 let key = PrivateKey(keys.swap_remove(0));
+
                 // try to read as rsa private key
                 if RsaSigningKey::new(&key).is_ok() {
+                    let versions = certificate_and_key
+                        .versions
+                        .iter()
+                        .filter_map(|v| TlsVersion::from_i32(*v))
+                        .collect();
                     return Ok(ParsedCertificateAndKey {
                         certificate,
                         chain: chains,
                         key: certificate_and_key.key.to_owned(),
-                        versions: certificate_and_key.versions.to_owned(),
+                        versions,
                     });
                 }
 
                 // try to read as ecdsa private key
                 if rustls::sign::any_ecdsa_type(&key).is_ok() {
+                    let versions = certificate_and_key
+                        .versions
+                        .iter()
+                        .filter_map(|v| TlsVersion::from_i32(*v))
+                        .collect();
                     return Ok(ParsedCertificateAndKey {
                         certificate,
                         chain: chains,
                         key: certificate_and_key.key.to_owned(),
-                        versions: certificate_and_key.versions.to_owned(),
+                        versions,
                     });
                 }
             }
@@ -639,7 +655,7 @@ mod tests {
     use crate::sozu_command::request::{AddCertificate, RemoveCertificate};
 
     use rand::{seq::SliceRandom, thread_rng};
-    use sozu_command::certificate::CertificateAndKey;
+    use sozu_command::proto::command::CertificateAndKey;
     use x509_parser::pem::parse_x509_pem;
 
     #[test]

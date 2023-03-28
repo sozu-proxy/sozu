@@ -12,11 +12,9 @@ use anyhow::Context;
 use sozu_command::config::ListenerBuilder;
 
 use sozu_command::{
-    certificate::CertificateAndKey,
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    proto::command::RequestHttpFrontend,
-    proto::command::{PathRule, RulePosition},
+    proto::command::{CertificateAndKey, PathRule, RequestHttpFrontend, RulePosition},
     request::{AddBackend, AddCertificate, LoadBalancingParams, Request, WorkerRequest},
 };
 

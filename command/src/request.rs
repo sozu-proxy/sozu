@@ -9,9 +9,11 @@ use std::{
 use anyhow::Context;
 
 use crate::{
-    certificate::{CertificateAndKey, Fingerprint},
+    certificate::Fingerprint,
     config::ProxyProtocolConfig,
-    proto::command::{FrontendFilters, RequestHttpFrontend, RulePosition, PathRuleKind},
+    proto::command::{
+        CertificateAndKey, FrontendFilters, PathRuleKind, RequestHttpFrontend, RulePosition,
+    },
     response::{
         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
     },
@@ -603,7 +605,7 @@ mod tests {
                 certificate: String::from(CERTIFICATE),
                 certificate_chain: split_certificate_chain(String::from(CHAIN)),
                 key: String::from(KEY),
-                versions: vec![TlsVersion::TlsV12, TlsVersion::TlsV13],
+                versions: vec![TlsVersion::TlsV12.into(), TlsVersion::TlsV13.into()],
             },
             names: vec![],
             expired_at: None,

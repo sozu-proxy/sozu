@@ -44,6 +44,13 @@ enum RulePosition {
     TREE = 2;
 }
 
+message CertificateAndKey {
+    required string certificate = 1;
+    repeated string certificate_chain = 2;
+    required string key = 3;
+    repeated TlsVersion versions = 4;
+}
+
 // domain name and fingerprint of a certificate
 message CertificateSummary {
     required string domain = 1;

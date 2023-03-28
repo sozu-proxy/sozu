@@ -8,11 +8,10 @@ use std::{
 use serial_test::serial;
 
 use sozu_command_lib::{
-    certificate::CertificateAndKey,
     config::{FileConfig, ListenerBuilder},
     info,
     logging::{Logger, LoggerBackend},
-    proto::command::RequestHttpFrontend,
+    proto::command::{CertificateAndKey, RequestHttpFrontend},
     request::{ActivateListener, AddCertificate, ListenerType, RemoveBackend, Request},
     state::ConfigState,
 };

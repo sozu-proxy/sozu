@@ -7,10 +7,10 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use tiny_http::{Response as HttpResponse, Server};
 
 use sozu_command_lib::{
-    certificate::{calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint},
+    certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
     channel::Channel,
     config::Config,
-    proto::command::{PathRule, RequestHttpFrontend, RulePosition, TlsVersion},
+    proto::command::{CertificateAndKey, PathRule, RequestHttpFrontend, RulePosition, TlsVersion},
     request::{AddBackend, AddCertificate, RemoveBackend, ReplaceCertificate, Request},
     response::{Response, ResponseStatus},
 };
@@ -357,6 +357,8 @@ fn add_certificate(
         .map(split_certificate_chain)
         .with_context(|| "could not load certificate chain".to_string())?;
 
+    let versions = tls_versions.iter().map(|v| *v as i32).collect();
+
     let request = match old_fingerprint {
         None => Request::AddCertificate(AddCertificate {
             address: frontend.to_owned(),
@@ -364,7 +366,7 @@ fn add_certificate(
                 certificate,
                 certificate_chain,
                 key,
-                versions: tls_versions.clone(),
+                versions,
             },
             names: vec![hostname.to_string()],
             expired_at: None,
@@ -376,7 +378,7 @@ fn add_certificate(
                 certificate,
                 certificate_chain,
                 key,
-                versions: tls_versions.clone(),
+                versions,
             },
             old_fingerprint: Fingerprint(f),
             new_names: vec![hostname.to_string()],

@@ -8,32 +8,6 @@ use sha2::{Digest, Sha256};
 
 use crate::proto::command::TlsVersion;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CertificateAndKey {
-    pub certificate: String,
-    pub certificate_chain: Vec<String>,
-    pub key: String,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub versions: Vec<TlsVersion>,
-}
-
-/*
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TlsVersion {
-    SSLv2,
-    SSLv3,
-    #[serde(rename = "TLSv1")]
-    TLSv1_0,
-    #[serde(rename = "TLS_V11")]
-    TLSv1_1,
-    #[serde(rename = "TLS_V12")]
-    TLSv1_2,
-    #[serde(rename = "TLS_V13")]
-    TLSv1_3,
-}
-*/
-
 #[derive(Debug)]
 pub struct ParseErrorTlsVersion;
 

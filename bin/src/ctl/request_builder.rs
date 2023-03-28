@@ -3,9 +3,11 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Context};
 
 use sozu_command_lib::{
-    certificate::{calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint},
+    certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
     config::{Config, ListenerBuilder, ProxyProtocolConfig},
-    proto::command::{FrontendFilters, PathRule, RequestHttpFrontend, RulePosition, TlsVersion},
+    proto::command::{
+        CertificateAndKey, FrontendFilters, PathRule, RequestHttpFrontend, RulePosition, TlsVersion,
+    },
     request::{
         ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, ListenerType,
         LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
@@ -549,6 +551,8 @@ fn load_full_certificate(
 
     let key = Config::load_file(key_path)
         .with_context(|| format!("Could not load key file on path {key_path}"))?;
+
+    let versions = versions.iter().map(|v| *v as i32).collect();
 
     Ok(CertificateAndKey {
         certificate,
