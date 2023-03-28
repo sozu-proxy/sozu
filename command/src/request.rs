@@ -12,7 +12,8 @@ use crate::{
     certificate::Fingerprint,
     config::ProxyProtocolConfig,
     proto::command::{
-        CertificateAndKey, FrontendFilters, PathRuleKind, RequestHttpFrontend, RulePosition,
+        AddCertificate, CertificateAndKey, FrontendFilters, PathRuleKind, RequestHttpFrontend,
+        RulePosition,
     },
     response::{
         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
@@ -273,18 +274,6 @@ pub struct DeactivateListener {
     pub address: String,
     pub proxy: ListenerType,
     pub to_scm: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AddCertificate {
-    pub address: String,
-    pub certificate: CertificateAndKey,
-    #[serde(skip_serializing_if = "Vec::is_empty", default = "Vec::new")]
-    pub names: Vec<String>,
-    /// The `expired_at` override certificate expiration, the value of the field
-    /// is a unix timestamp
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expired_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

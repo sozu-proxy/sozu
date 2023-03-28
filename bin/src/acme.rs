@@ -10,8 +10,10 @@ use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
     channel::Channel,
     config::Config,
-    proto::command::{CertificateAndKey, PathRule, RequestHttpFrontend, RulePosition, TlsVersion},
-    request::{AddBackend, AddCertificate, RemoveBackend, ReplaceCertificate, Request},
+    proto::command::{
+        AddCertificate, CertificateAndKey, PathRule, RequestHttpFrontend, RulePosition, TlsVersion,
+    },
+    request::{AddBackend, RemoveBackend, ReplaceCertificate, Request},
     response::{Response, ResponseStatus},
 };
 

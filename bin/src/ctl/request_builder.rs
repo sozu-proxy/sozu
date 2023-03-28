@@ -6,10 +6,11 @@ use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
     config::{Config, ListenerBuilder, ProxyProtocolConfig},
     proto::command::{
-        CertificateAndKey, FrontendFilters, PathRule, RequestHttpFrontend, RulePosition, TlsVersion,
+        AddCertificate, CertificateAndKey, FrontendFilters, PathRule, RequestHttpFrontend,
+        RulePosition, TlsVersion,
     },
     request::{
-        ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, ListenerType,
+        ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType,
         LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
         RemoveListener, ReplaceCertificate, Request, RequestTcpFrontend,
     },

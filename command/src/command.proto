@@ -44,6 +44,14 @@ enum RulePosition {
     TREE = 2;
 }
 
+message AddCertificate {
+    required string address = 1;
+    required CertificateAndKey certificate = 2;
+    repeated string names = 3;
+    // A unix timestamp. Overrides certificate expiration.
+    optional int64 expired_at = 4;
+}
+
 message CertificateAndKey {
     required string certificate = 1;
     repeated string certificate_chain = 2;

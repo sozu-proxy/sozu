@@ -24,8 +24,8 @@ use x509_parser::{
 use crate::router::trie::*;
 use sozu_command::{
     certificate::Fingerprint,
-    proto::command::{CertificateAndKey, TlsVersion},
-    request::{AddCertificate, RemoveCertificate, ReplaceCertificate},
+    proto::command::{AddCertificate, CertificateAndKey, TlsVersion},
+    request::{RemoveCertificate, ReplaceCertificate},
 };
 
 // -----------------------------------------------------------------------------
@@ -652,10 +652,10 @@ mod tests {
         GenericCertificateResolverError,
     };
 
-    use crate::sozu_command::request::{AddCertificate, RemoveCertificate};
+    use crate::sozu_command::request::RemoveCertificate;
 
     use rand::{seq::SliceRandom, thread_rng};
-    use sozu_command::proto::command::CertificateAndKey;
+    use sozu_command::proto::command::{AddCertificate, CertificateAndKey};
     use x509_parser::pem::parse_x509_pem;
 
     #[test]

@@ -14,11 +14,12 @@ use toml;
 
 use crate::{
     certificate::split_certificate_chain,
-    proto::command::{CertificateAndKey, PathRule, RequestHttpFrontend, RulePosition, TlsVersion},
+    proto::command::{
+        AddCertificate, CertificateAndKey, PathRule, RequestHttpFrontend, RulePosition, TlsVersion,
+    },
     request::{
-        ActivateListener, AddBackend, AddCertificate, Cluster, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, Request, RequestTcpFrontend,
-        WorkerRequest,
+        ActivateListener, AddBackend, Cluster, ListenerType, LoadBalancingAlgorithms,
+        LoadBalancingParams, LoadMetric, Request, RequestTcpFrontend, WorkerRequest,
     },
     response::{HttpListenerConfig, HttpsListenerConfig, TcpListenerConfig},
 };

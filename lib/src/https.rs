@@ -32,11 +32,10 @@ use sozu_command::{
     certificate::Fingerprint,
     config::DEFAULT_CIPHER_SUITES,
     logging,
-    proto::command::{CertificateSummary, RequestHttpFrontend, TlsVersion},
+    proto::command::{AddCertificate, CertificateSummary, RequestHttpFrontend, TlsVersion},
     ready::Ready,
     request::{
-        AddCertificate, Cluster, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
-        WorkerRequest,
+        Cluster, RemoveCertificate, RemoveListener, ReplaceCertificate, Request, WorkerRequest,
     },
     response::{HttpFrontend, HttpsListenerConfig, ResponseContent, WorkerResponse},
     scm_socket::ScmSocket,

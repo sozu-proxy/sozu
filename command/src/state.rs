@@ -13,11 +13,10 @@ use anyhow::{bail, Context};
 
 use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
-    proto::command::{CertificateAndKey, PathRule, PathRuleKind, RequestHttpFrontend},
+    proto::command::{AddCertificate, CertificateAndKey, PathRule, RequestHttpFrontend},
     request::{
-        ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, ListenerType,
-        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
-        RequestTcpFrontend,
+        ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, Request, RequestTcpFrontend,
     },
     response::{
         Backend, ClusterInformation, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,

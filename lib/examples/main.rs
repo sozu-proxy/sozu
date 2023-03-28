@@ -14,8 +14,10 @@ use sozu_command::config::ListenerBuilder;
 use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    proto::command::{CertificateAndKey, PathRule, RequestHttpFrontend, RulePosition},
-    request::{AddBackend, AddCertificate, LoadBalancingParams, Request, WorkerRequest},
+    proto::command::{
+        AddCertificate, CertificateAndKey, PathRule, RequestHttpFrontend, RulePosition,
+    },
+    request::{AddBackend, LoadBalancingParams, Request, WorkerRequest},
 };
 
 fn main() -> anyhow::Result<()> {
