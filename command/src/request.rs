@@ -11,9 +11,9 @@ use anyhow::Context;
 use crate::{
     certificate::Fingerprint,
     proto::command::{
-        AddCertificate, FrontendFilters, LoadBalancingAlgorithms, LoadMetric, PathRuleKind,
-        ProxyProtocolConfig, RemoveCertificate, ReplaceCertificate, RequestHttpFrontend,
-        RulePosition,
+        AddCertificate, Cluster, FrontendFilters, LoadBalancingAlgorithms, LoadMetric,
+        PathRuleKind, ProxyProtocolConfig, RemoveCertificate, ReplaceCertificate,
+        RequestHttpFrontend, RulePosition,
     },
     response::{
         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
@@ -209,29 +209,6 @@ pub struct ProxyDestinations {
     pub to_tcp_proxy: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Cluster {
-    pub cluster_id: ClusterId,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_false")]
-    pub sticky_session: bool,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_false")]
-    pub https_redirect: bool,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_default")]
-    pub proxy_protocol: Option<ProxyProtocolConfig>,
-    #[serde(rename = "load_balancing")]
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_default")]
-    pub load_balancing: LoadBalancingAlgorithms,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_default")]
-    pub answer_503: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub load_metric: Option<LoadMetric>,
-}
-
 pub fn default_sticky_name() -> String {
     String::from("SOZUBALANCEID")
 }
@@ -395,10 +372,6 @@ pub fn is_false(b: &bool) -> bool {
     !*b
 }
 
-fn is_default<T: Default + PartialEq>(t: &T) -> bool {
-    t == &T::default()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -454,8 +427,8 @@ mod tests {
             cluster_id: String::from("xxx"),
             sticky_session: true,
             https_redirect: true,
-            proxy_protocol: Some(ProxyProtocolConfig::ExpectHeader),
-            load_balancing: LoadBalancingAlgorithms::RoundRobin,
+            proxy_protocol: Some(ProxyProtocolConfig::ExpectHeader as i32),
+            load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
             load_metric: None,
             answer_503: None,
         })

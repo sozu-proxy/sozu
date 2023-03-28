@@ -217,8 +217,9 @@ use sozu_command::state::ClusterId;
 use time::{Duration, Instant};
 
 use crate::sozu_command::{
+    proto::command::Cluster,
     ready::Ready,
-    request::{Cluster, LoadBalancingParams, WorkerRequest},
+    request::{LoadBalancingParams, WorkerRequest},
     response::{Event, WorkerResponse},
 };
 

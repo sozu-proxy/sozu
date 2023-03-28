@@ -15,11 +15,11 @@ use toml;
 use crate::{
     certificate::split_certificate_chain,
     proto::command::{
-        AddCertificate, CertificateAndKey, LoadBalancingAlgorithms, LoadMetric, PathRule,
+        AddCertificate, CertificateAndKey, Cluster, LoadBalancingAlgorithms, LoadMetric, PathRule,
         ProxyProtocolConfig, RequestHttpFrontend, RulePosition, TlsVersion,
     },
     request::{
-        ActivateListener, AddBackend, Cluster, ListenerType, LoadBalancingParams, Request,
+        ActivateListener, AddBackend, ListenerType, LoadBalancingParams, Request,
         RequestTcpFrontend, WorkerRequest,
     },
     response::{HttpListenerConfig, HttpsListenerConfig, TcpListenerConfig},
@@ -806,9 +806,9 @@ impl HttpClusterConfig {
             sticky_session: self.sticky_session,
             https_redirect: self.https_redirect,
             proxy_protocol: None,
-            load_balancing: self.load_balancing,
+            load_balancing: self.load_balancing as i32,
             answer_503: self.answer_503.clone(),
-            load_metric: self.load_metric,
+            load_metric: self.load_metric.and_then(|s| Some(s as i32)),
         })];
 
         for frontend in &self.frontends {
@@ -860,9 +860,9 @@ impl TcpClusterConfig {
             cluster_id: self.cluster_id.clone(),
             sticky_session: false,
             https_redirect: false,
-            proxy_protocol: self.proxy_protocol.clone(),
-            load_balancing: self.load_balancing,
-            load_metric: self.load_metric,
+            proxy_protocol: self.proxy_protocol.and_then(|s| Some(s as i32)),
+            load_balancing: self.load_balancing as i32,
+            load_metric: self.load_metric.and_then(|s| Some(s as i32)),
             answer_503: None,
         })];
 

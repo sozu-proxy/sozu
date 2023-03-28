@@ -6,13 +6,12 @@ use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
     config::{Config, ListenerBuilder},
     proto::command::{
-        AddCertificate, CertificateAndKey, FrontendFilters, PathRule, ProxyProtocolConfig,
+        AddCertificate, CertificateAndKey, Cluster, FrontendFilters, PathRule, ProxyProtocolConfig,
         RemoveCertificate, ReplaceCertificate, RequestHttpFrontend, RulePosition, TlsVersion,
     },
     request::{
-        ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType,
-        LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveListener, Request,
-        RequestTcpFrontend,
+        ActivateListener, AddBackend, DeactivateListener, ListenerType, LoadBalancingParams,
+        MetricsConfiguration, RemoveBackend, RemoveListener, Request, RequestTcpFrontend,
     },
 };
 
@@ -160,8 +159,8 @@ impl CommandManager {
                     cluster_id: id,
                     sticky_session,
                     https_redirect,
-                    proxy_protocol,
-                    load_balancing: load_balancing_policy,
+                    proxy_protocol: proxy_protocol.and_then(|pp| Some(pp as i32)),
+                    load_balancing: load_balancing_policy as i32,
                     load_metric: None,
                     answer_503: None,
                 }))

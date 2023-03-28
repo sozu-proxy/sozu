@@ -17,10 +17,10 @@ use sozu_command::{
     channel::Channel,
     config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
-    proto::command::{LoadBalancingAlgorithms, PathRule, RequestHttpFrontend, RulePosition},
-    request::{
-        AddBackend, Cluster, LoadBalancingParams, Request, RequestTcpFrontend, WorkerRequest,
+    proto::command::{
+        Cluster, LoadBalancingAlgorithms, PathRule, RequestHttpFrontend, RulePosition,
     },
+    request::{AddBackend, LoadBalancingParams, Request, RequestTcpFrontend, WorkerRequest},
     response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -272,7 +272,7 @@ impl Worker {
             sticky_session: false,
             https_redirect: false,
             proxy_protocol: None,
-            load_balancing: LoadBalancingAlgorithms::default(),
+            load_balancing: LoadBalancingAlgorithms::default() as i32,
             load_metric: None,
             answer_503: None,
         }

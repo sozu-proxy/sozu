@@ -14,11 +14,11 @@ use anyhow::{bail, Context};
 use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
-        AddCertificate, CertificateAndKey, PathRule, RemoveCertificate, ReplaceCertificate,
-        RequestHttpFrontend,
+        AddCertificate, CertificateAndKey, Cluster, PathRule, RemoveCertificate,
+        ReplaceCertificate, RequestHttpFrontend,
     },
     request::{
-        ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType, RemoveBackend,
+        ActivateListener, AddBackend, DeactivateListener, ListenerType, RemoveBackend,
         RemoveListener, Request, RequestTcpFrontend,
     },
     response::{
@@ -1394,7 +1394,7 @@ mod tests {
                 sticky_session: true,
                 https_redirect: true,
                 proxy_protocol: None,
-                load_balancing: LoadBalancingAlgorithms::RoundRobin,
+                load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
                 load_metric: None,
                 answer_503: None,
             }))
@@ -1448,7 +1448,7 @@ mod tests {
                 sticky_session: false,
                 https_redirect: false,
                 proxy_protocol: None,
-                load_balancing: LoadBalancingAlgorithms::RoundRobin,
+                load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
                 load_metric: None,
                 answer_503: None,
             }))
@@ -1485,7 +1485,7 @@ mod tests {
                 sticky_session: false,
                 https_redirect: false,
                 proxy_protocol: None,
-                load_balancing: LoadBalancingAlgorithms::RoundRobin,
+                load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
                 load_metric: None,
                 answer_503: None,
             }),

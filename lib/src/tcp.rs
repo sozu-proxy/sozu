@@ -1382,7 +1382,9 @@ impl ProxyConfiguration for TcpProxy {
             }
             Request::AddCluster(cluster) => {
                 let config = ClusterConfiguration {
-                    proxy_protocol: cluster.proxy_protocol,
+                    proxy_protocol: cluster
+                        .proxy_protocol
+                        .and_then(|pp| ProxyProtocolConfig::from_i32(pp)),
                     //load_balancing: cluster.load_balancing,
                 };
                 self.configs.insert(cluster.cluster_id, config);

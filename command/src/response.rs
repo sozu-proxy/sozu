@@ -8,11 +8,12 @@ use std::{
 
 use crate::{
     proto::command::{
-        CertificateSummary, PathRule, PathRuleKind, RequestHttpFrontend, RulePosition, TlsVersion,
+        CertificateSummary, Cluster, PathRule, PathRuleKind, RequestHttpFrontend, RulePosition,
+        TlsVersion,
     },
     request::{
-        default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams,
-        RequestTcpFrontend, PROTOCOL_VERSION,
+        default_sticky_name, is_false, AddBackend, LoadBalancingParams, RequestTcpFrontend,
+        PROTOCOL_VERSION,
     },
     state::{ClusterId, ConfigState},
 };

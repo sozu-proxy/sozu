@@ -16,10 +16,11 @@ use slab::Slab;
 use sozu_command::{
     channel::Channel,
     config::Config,
+    proto::command::{Cluster, LoadBalancingAlgorithms, LoadMetric},
     ready::Ready,
     request::{
-        ActivateListener, AddBackend, Cluster, DeactivateListener, ListenerType, RemoveBackend,
-        Request, WorkerRequest,
+        ActivateListener, AddBackend, DeactivateListener, ListenerType, RemoveBackend, Request,
+        WorkerRequest,
     },
     response::{
         Event, HttpListenerConfig, HttpsListenerConfig, MessageId, ResponseContent, ResponseStatus,
@@ -1004,8 +1005,8 @@ impl Server {
             .borrow_mut()
             .set_load_balancing_policy_for_cluster(
                 &cluster.cluster_id,
-                cluster.load_balancing,
-                cluster.load_metric,
+                LoadBalancingAlgorithms::from_i32(cluster.load_balancing).unwrap_or_default(),
+                cluster.load_metric.and_then(|lm| LoadMetric::from_i32(lm)),
             );
     }
 

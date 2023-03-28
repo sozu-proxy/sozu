@@ -16,9 +16,9 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     logging,
-    proto::command::RequestHttpFrontend,
+    proto::command::{Cluster, RequestHttpFrontend},
     ready::Ready,
-    request::{Cluster, RemoveListener, Request, WorkerRequest},
+    request::{RemoveListener, Request, WorkerRequest},
     response::{HttpFrontend, HttpListenerConfig, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
 };
@@ -1357,7 +1357,7 @@ mod tests {
             answer_503: None,
             cluster_id: String::from("cluster_1"),
             https_redirect: true,
-            load_balancing: LoadBalancingAlgorithms::default(),
+            load_balancing: LoadBalancingAlgorithms::default() as i32,
             load_metric: None,
             proxy_protocol: None,
             sticky_session: false,
