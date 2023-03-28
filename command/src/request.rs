@@ -10,8 +10,8 @@ use anyhow::Context;
 use crate::{
     certificate::Fingerprint,
     proto::command::{
-        AddCertificate, Cluster, FrontendFilters, LoadBalancingAlgorithms, PathRuleKind,
-        RemoveBackend, RemoveCertificate, ReplaceCertificate, RequestHttpFrontend,
+        AddBackend, AddCertificate, Cluster, FrontendFilters, LoadBalancingAlgorithms,
+        PathRuleKind, RemoveBackend, RemoveCertificate, ReplaceCertificate, RequestHttpFrontend,
         RequestTcpFrontend, RulePosition,
     },
     response::{
@@ -283,16 +283,6 @@ impl Display for RequestHttpFrontend {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AddBackend {
-    pub cluster_id: String,
-    pub backend_id: String,
-    pub address: String,
-    pub sticky_id: Option<String>,
-    pub load_balancing_parameters: Option<LoadBalancingParams>,
-    pub backup: Option<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MetricsConfiguration {
     Enabled,
     Disabled,
@@ -347,10 +337,6 @@ impl FromStr for LoadBalancingAlgorithms {
         }
     }
 }
-#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct LoadBalancingParams {
-    pub weight: u8,
-}
 
 pub fn is_false(b: &bool) -> bool {
     !*b
@@ -363,7 +349,8 @@ mod tests {
     use super::*;
     use crate::certificate::split_certificate_chain;
     use crate::proto::command::{
-        CertificateAndKey, PathRule, ProxyProtocolConfig, RulePosition, TlsVersion,
+        CertificateAndKey, LoadBalancingParams, PathRule, ProxyProtocolConfig, RulePosition,
+        TlsVersion,
     };
     use crate::response::HttpFrontend;
     use serde_json;

@@ -17,10 +17,10 @@ use sozu_command::{
     config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
     proto::command::{
-        Cluster, LoadBalancingAlgorithms, PathRule, RequestHttpFrontend, RequestTcpFrontend,
-        RulePosition,
+        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition,
     },
-    request::{AddBackend, LoadBalancingParams, Request, WorkerRequest},
+    request::{Request, WorkerRequest},
     response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,

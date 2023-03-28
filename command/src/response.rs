@@ -8,10 +8,10 @@ use std::{
 
 use crate::{
     proto::command::{
-        CertificateSummary, Cluster, PathRule, PathRuleKind, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, TlsVersion,
+        AddBackend, CertificateSummary, Cluster, LoadBalancingParams, PathRule, PathRuleKind,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, TlsVersion,
     },
-    request::{default_sticky_name, is_false, AddBackend, LoadBalancingParams, PROTOCOL_VERSION},
+    request::{default_sticky_name, is_false, PROTOCOL_VERSION},
     state::{ClusterId, ConfigState},
 };
 
@@ -294,6 +294,7 @@ pub struct ListenersList {
     pub tcp_listeners: HashMap<String, TcpListenerConfig>,
 }
 
+// TODO: implement Default
 /// details of an HTTP listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpListenerConfig {
@@ -319,6 +320,7 @@ pub struct HttpListenerConfig {
     pub active: bool,
 }
 
+// TODO: implement Default
 /// details of an HTTPS listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpsListenerConfig {
@@ -353,6 +355,7 @@ pub struct HttpsListenerConfig {
     pub active: bool,
 }
 
+// TODO: implement Default
 /// details of an TCP listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TcpListenerConfig {

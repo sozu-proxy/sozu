@@ -12,8 +12,10 @@ use crate::sozu_command::{
     channel::Channel,
     config::ListenerBuilder,
     logging::{Logger, LoggerBackend},
-    proto::command::{PathRule, RequestHttpFrontend, RulePosition},
-    request::{AddBackend, LoadBalancingParams, Request, WorkerRequest},
+    proto::command::{
+        AddBackend, LoadBalancingParams, PathRule, RequestHttpFrontend, RulePosition,
+    },
+    request::{Request, WorkerRequest},
 };
 
 fn main() -> anyhow::Result<()> {

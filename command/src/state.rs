@@ -14,12 +14,10 @@ use anyhow::{bail, Context};
 use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
-        AddCertificate, CertificateAndKey, Cluster, PathRule, RemoveBackend, RemoveCertificate,
-        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
+        AddBackend, AddCertificate, CertificateAndKey, Cluster, PathRule, RemoveBackend,
+        RemoveCertificate, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
     },
-    request::{
-        ActivateListener, AddBackend, DeactivateListener, ListenerType, RemoveListener, Request,
-    },
+    request::{ActivateListener, DeactivateListener, ListenerType, RemoveListener, Request},
     response::{
         Backend, ClusterInformation, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
         TcpFrontend, TcpListenerConfig,
@@ -1244,8 +1242,8 @@ impl<
 mod tests {
     use super::*;
     use crate::{
-        proto::command::{LoadBalancingAlgorithms, RequestHttpFrontend, RulePosition},
-        request::{LoadBalancingParams, Request},
+        proto::command::{LoadBalancingParams, RequestHttpFrontend, RulePosition},
+        request::Request,
     };
 
     #[test]
@@ -1256,10 +1254,9 @@ mod tests {
                 cluster_id: Some(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::prefix(String::from("/")),
-                method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree.into(),
-                tags: BTreeMap::new(),
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1267,10 +1264,9 @@ mod tests {
                 cluster_id: Some(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
-                method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Pre.into(),
-                tags: BTreeMap::new(),
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1278,9 +1274,7 @@ mod tests {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1288,9 +1282,7 @@ mod tests {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1298,9 +1290,7 @@ mod tests {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1308,9 +1298,7 @@ mod tests {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-3"),
                 address: "192.168.1.3:1027".parse().unwrap(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1340,10 +1328,9 @@ mod tests {
                 cluster_id: Some(String::from("cluster_1")),
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::prefix(String::from("/")),
-                method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Post.into(),
-                tags: BTreeMap::new(),
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1351,10 +1338,9 @@ mod tests {
                 cluster_id: Some(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
-                method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree.into(),
-                tags: BTreeMap::new(),
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1363,8 +1349,7 @@ mod tests {
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1373,8 +1358,7 @@ mod tests {
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1383,8 +1367,7 @@ mod tests {
                 backend_id: String::from("cluster_2-0"),
                 address: "192.167.1.2:1026".parse().unwrap(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1392,10 +1375,7 @@ mod tests {
                 cluster_id: String::from("cluster_2"),
                 sticky_session: true,
                 https_redirect: true,
-                proxy_protocol: None,
-                load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-                load_metric: None,
-                answer_503: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
 
@@ -1406,9 +1386,8 @@ mod tests {
                 hostname: String::from("lolcatho.st:8080"),
                 path: PathRule::prefix(String::from("/")),
                 address: "0.0.0.0:8080".to_string(),
-                method: None,
                 position: RulePosition::Post.into(),
-                tags: BTreeMap::new(),
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state2
@@ -1417,8 +1396,7 @@ mod tests {
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".parse().unwrap(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state2
@@ -1427,8 +1405,7 @@ mod tests {
                 backend_id: String::from("cluster_1-1"),
                 address: "127.0.0.2:1027".parse().unwrap(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state2
@@ -1437,8 +1414,7 @@ mod tests {
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".parse().unwrap(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state2
@@ -1446,10 +1422,7 @@ mod tests {
                 cluster_id: String::from("cluster_3"),
                 sticky_session: false,
                 https_redirect: false,
-                proxy_protocol: None,
-                load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-                load_metric: None,
-                answer_503: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
 
@@ -1458,10 +1431,9 @@ mod tests {
                 cluster_id: Some(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
-                method: None,
                 address: "0.0.0.0:8080".to_string(),
                 position: RulePosition::Tree.into(),
-                tags: BTreeMap::new(),
+                ..Default::default()
             }),
             Request::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("cluster_2"),
@@ -1473,8 +1445,7 @@ mod tests {
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".to_string(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }),
             Request::RemoveCluster {
                 cluster_id: String::from("cluster_2"),
@@ -1483,10 +1454,7 @@ mod tests {
                 cluster_id: String::from("cluster_3"),
                 sticky_session: false,
                 https_redirect: false,
-                proxy_protocol: None,
-                load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-                load_metric: None,
-                answer_503: None,
+                ..Default::default()
             }),
         ];
         let expected_diff: HashSet<&Request> = HashSet::from_iter(e.iter());
@@ -1505,8 +1473,7 @@ mod tests {
                 backend_id: String::from("cluster_1-2"),
                 address: "127.0.0.2:1028".to_string(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         let hash3 = state3.hash_state();
@@ -1524,40 +1491,32 @@ mod tests {
             cluster_id: Some(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("")),
-            method: None,
             address: "0.0.0.0:8080".to_string(),
-            position: RulePosition::Tree.into(),
-            tags: BTreeMap::new(),
+            ..Default::default()
         };
 
         let https_front_cluster1 = RequestHttpFrontend {
             cluster_id: Some(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("")),
-            method: None,
             address: "0.0.0.0:8443".to_string(),
-            position: RulePosition::Tree.into(),
-            tags: BTreeMap::new(),
+            ..Default::default()
         };
 
         let http_front_cluster2 = RequestHttpFrontend {
             cluster_id: Some(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("/api")),
-            method: None,
             address: "0.0.0.0:8080".to_string(),
-            position: RulePosition::Tree.into(),
-            tags: BTreeMap::new(),
+            ..Default::default()
         };
 
         let https_front_cluster2 = RequestHttpFrontend {
             cluster_id: Some(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("/api")),
-            method: None,
             address: "0.0.0.0:8443".to_string(),
-            position: RulePosition::Tree.into(),
-            tags: BTreeMap::new(),
+            ..Default::default()
         };
 
         let add_http_front_cluster1 = Request::AddHttpFrontend(http_front_cluster1);

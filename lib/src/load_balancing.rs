@@ -56,7 +56,7 @@ impl LoadBalancingAlgorithm for Random {
         backends: &mut Vec<Rc<RefCell<Backend>>>,
     ) -> Option<Rc<RefCell<Backend>>> {
         let mut rng = thread_rng();
-        let weights: Vec<u8> = backends
+        let weights: Vec<i32> = backends
             .iter()
             .map(|b| {
                 b.borrow()

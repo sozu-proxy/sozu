@@ -15,9 +15,10 @@ use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
     proto::command::{
-        AddCertificate, CertificateAndKey, PathRule, RequestHttpFrontend, RulePosition,
+        AddBackend, AddCertificate, CertificateAndKey, LoadBalancingParams, PathRule,
+        RequestHttpFrontend, RulePosition,
     },
-    request::{AddBackend, LoadBalancingParams, Request, WorkerRequest},
+    request::{Request, WorkerRequest},
 };
 
 fn main() -> anyhow::Result<()> {

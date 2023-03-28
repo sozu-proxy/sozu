@@ -1626,7 +1626,7 @@ pub fn start_tcp_worker(
 mod tests {
     use super::*;
     use crate::sozu_command::channel::Channel;
-    use crate::sozu_command::request::LoadBalancingParams;
+    use crate::sozu_command::proto::command::LoadBalancingParams;
     use crate::sozu_command::scm_socket::Listeners;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};

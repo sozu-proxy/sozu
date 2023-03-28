@@ -134,10 +134,25 @@ enum LoadMetric {
     CONNECTION_TIME = 2;
 }
 
+// add a backend
+message AddBackend {
+    required string cluster_id = 1;
+    required string backend_id = 2;
+    // the socket address of the backend
+    required string address = 3;
+    optional string sticky_id = 4;
+    optional LoadBalancingParams load_balancing_parameters = 5;
+    optional bool backup = 6;
+}
+
 // remove an existing backend
 message RemoveBackend {
     required string cluster_id = 1;
     required string backend_id = 2;
     // the socket address of the backend
     required string address = 3 ;
+}
+
+message LoadBalancingParams {
+    required int32 weight = 1;
 }

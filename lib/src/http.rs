@@ -1111,8 +1111,8 @@ mod tests {
     use crate::sozu_command::{
         channel::Channel,
         config::ListenerBuilder,
-        proto::command::{LoadBalancingAlgorithms, PathRule, RulePosition},
-        request::{LoadBalancingParams, Request, WorkerRequest},
+        proto::command::{LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RulePosition},
+        request::{Request, WorkerRequest},
         response::{Backend, HttpFrontend},
     };
 

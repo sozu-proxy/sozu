@@ -15,12 +15,11 @@ use toml;
 use crate::{
     certificate::split_certificate_chain,
     proto::command::{
-        AddCertificate, CertificateAndKey, Cluster, LoadBalancingAlgorithms, LoadMetric, PathRule,
-        ProxyProtocolConfig, RequestHttpFrontend, RequestTcpFrontend, RulePosition, TlsVersion,
+        AddBackend, AddCertificate, CertificateAndKey, Cluster, LoadBalancingAlgorithms,
+        LoadBalancingParams, LoadMetric, PathRule, ProxyProtocolConfig, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, TlsVersion,
     },
-    request::{
-        ActivateListener, AddBackend, ListenerType, LoadBalancingParams, Request, WorkerRequest,
-    },
+    request::{ActivateListener, ListenerType, Request, WorkerRequest},
     response::{HttpListenerConfig, HttpsListenerConfig, TcpListenerConfig},
 };
 
@@ -817,7 +816,7 @@ impl HttpClusterConfig {
 
         for (backend_count, backend) in self.backends.iter().enumerate() {
             let load_balancing_parameters = Some(LoadBalancingParams {
-                weight: backend.weight.unwrap_or(100),
+                weight: backend.weight.unwrap_or(100) as i32,
             });
 
             v.push(Request::AddBackend(AddBackend {
@@ -875,7 +874,7 @@ impl TcpClusterConfig {
 
         for (backend_count, backend) in self.backends.iter().enumerate() {
             let load_balancing_parameters = Some(LoadBalancingParams {
-                weight: backend.weight.unwrap_or(100),
+                weight: backend.weight.unwrap_or(100) as i32,
             });
 
             v.push(Request::AddBackend(AddBackend {

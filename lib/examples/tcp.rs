@@ -10,8 +10,8 @@ use anyhow::Context;
 use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    proto::command::RequestTcpFrontend,
-    request::{AddBackend, LoadBalancingParams, Request, WorkerRequest},
+    proto::command::{AddBackend, LoadBalancingParams, RequestTcpFrontend},
+    request::{Request, WorkerRequest},
     response::TcpListenerConfig,
 };
 
