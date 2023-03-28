@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     env,
     io::stdout,
     net::SocketAddr,
@@ -18,9 +17,10 @@ use sozu_command::{
     config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
     proto::command::{
-        Cluster, LoadBalancingAlgorithms, PathRule, RequestHttpFrontend, RulePosition,
+        Cluster, LoadBalancingAlgorithms, PathRule, RequestHttpFrontend, RequestTcpFrontend,
+        RulePosition,
     },
-    request::{AddBackend, LoadBalancingParams, Request, RequestTcpFrontend, WorkerRequest},
+    request::{AddBackend, LoadBalancingParams, Request, WorkerRequest},
     response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -285,7 +285,7 @@ impl Worker {
         RequestTcpFrontend {
             cluster_id: cluster_id.into(),
             address,
-            tags: None,
+            ..Default::default()
         }
     }
 
@@ -298,9 +298,8 @@ impl Worker {
             address: address.to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
-            method: None,
             position: RulePosition::Tree.into(),
-            tags: BTreeMap::new(),
+            ..Default::default()
         }
     }
 

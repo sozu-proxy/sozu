@@ -10,7 +10,8 @@ use anyhow::Context;
 use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    request::{AddBackend, LoadBalancingParams, Request, RequestTcpFrontend, WorkerRequest},
+    proto::command::RequestTcpFrontend,
+    request::{AddBackend, LoadBalancingParams, Request, WorkerRequest},
     response::TcpListenerConfig,
 };
 
@@ -59,7 +60,7 @@ fn main() -> anyhow::Result<()> {
     let tcp_front = RequestTcpFrontend {
         cluster_id: String::from("test"),
         address: "127.0.0.1:8080".to_string(),
-        tags: None,
+        ..Default::default()
     };
     let tcp_backend = AddBackend {
         cluster_id: String::from("test"),

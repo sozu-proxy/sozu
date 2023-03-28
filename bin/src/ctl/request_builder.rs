@@ -7,11 +7,12 @@ use sozu_command_lib::{
     config::{Config, ListenerBuilder},
     proto::command::{
         AddCertificate, CertificateAndKey, Cluster, FrontendFilters, PathRule, ProxyProtocolConfig,
-        RemoveCertificate, ReplaceCertificate, RequestHttpFrontend, RulePosition, TlsVersion,
+        RemoveCertificate, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
+        RulePosition, TlsVersion,
     },
     request::{
         ActivateListener, AddBackend, DeactivateListener, ListenerType, LoadBalancingParams,
-        MetricsConfiguration, RemoveBackend, RemoveListener, Request, RequestTcpFrontend,
+        MetricsConfiguration, RemoveBackend, RemoveListener, Request,
     },
 };
 
@@ -177,14 +178,14 @@ impl CommandManager {
                 self.order_request(Request::AddTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address: address.to_string(),
-                    tags,
+                    tags: tags.unwrap_or(BTreeMap::new()),
                 }))
             }
             TcpFrontendCmd::Remove { id, address } => {
                 self.order_request(Request::RemoveTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address: address.to_string(),
-                    tags: None,
+                    ..Default::default()
                 }))
             }
         }

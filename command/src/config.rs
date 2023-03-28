@@ -16,11 +16,10 @@ use crate::{
     certificate::split_certificate_chain,
     proto::command::{
         AddCertificate, CertificateAndKey, Cluster, LoadBalancingAlgorithms, LoadMetric, PathRule,
-        ProxyProtocolConfig, RequestHttpFrontend, RulePosition, TlsVersion,
+        ProxyProtocolConfig, RequestHttpFrontend, RequestTcpFrontend, RulePosition, TlsVersion,
     },
     request::{
-        ActivateListener, AddBackend, ListenerType, LoadBalancingParams, Request,
-        RequestTcpFrontend, WorkerRequest,
+        ActivateListener, AddBackend, ListenerType, LoadBalancingParams, Request, WorkerRequest,
     },
     response::{HttpListenerConfig, HttpsListenerConfig, TcpListenerConfig},
 };
@@ -870,7 +869,7 @@ impl TcpClusterConfig {
             v.push(Request::AddTcpFrontend(RequestTcpFrontend {
                 cluster_id: self.cluster_id.clone(),
                 address: frontend.address.to_string(),
-                tags: frontend.tags.clone(),
+                tags: frontend.tags.clone().unwrap_or(BTreeMap::new()),
             }));
         }
 

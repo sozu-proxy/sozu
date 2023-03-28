@@ -35,9 +35,9 @@ use crate::{
     socket::server_bind,
     sozu_command::{
         logging,
-        proto::command::ProxyProtocolConfig,
+        proto::command::{ProxyProtocolConfig, RequestTcpFrontend},
         ready::Ready,
-        request::{Request, RequestTcpFrontend, WorkerRequest},
+        request::{Request, WorkerRequest},
         response::{Event, TcpListenerConfig, WorkerResponse},
         scm_socket::ScmSocket,
         state::ClusterId,
@@ -1298,7 +1298,7 @@ impl TcpProxy {
 
         self.fronts
             .insert(front.cluster_id.to_string(), listener.token);
-        listener.set_tags(front.address.to_string(), front.tags);
+        listener.set_tags(front.address.to_string(), Some(front.tags));
         listener.cluster_id = Some(front.cluster_id.to_string());
         Ok(())
     }
@@ -1864,7 +1864,7 @@ mod tests {
             let front = RequestTcpFrontend {
                 cluster_id: String::from("yolo"),
                 address: "127.0.0.1:1234".to_string(),
-                tags: None,
+                ..Default::default()
             };
             let backend = sozu_command_lib::response::Backend {
                 cluster_id: String::from("yolo"),
@@ -1894,7 +1894,7 @@ mod tests {
             let front = RequestTcpFrontend {
                 cluster_id: String::from("yolo"),
                 address: "127.0.0.1:1235".to_string(),
-                tags: None,
+                ..Default::default()
             };
             let backend = sozu_command::response::Backend {
                 cluster_id: String::from("yolo"),

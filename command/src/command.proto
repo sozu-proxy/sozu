@@ -8,7 +8,16 @@ message RequestHttpFrontend {
     required PathRule path = 4;
     optional string method = 5;
     required RulePosition position = 6 [default = TREE];
+    // custom tags to identify the frontend in the access logs
     map<string, string> tags = 7;
+}
+
+message RequestTcpFrontend {
+    required string cluster_id = 1;
+    // the socket address on which to listen for incoming traffic
+    required string address = 2;
+    // custom tags to identify the frontend in the access logs
+    map<string, string> tags = 3;
 }
 
 // list the frontends, filtered by protocol and/or domain

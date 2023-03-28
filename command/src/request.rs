@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     error,
     fmt::{self, Display},
     net::SocketAddr,
@@ -11,9 +10,9 @@ use anyhow::Context;
 use crate::{
     certificate::Fingerprint,
     proto::command::{
-        AddCertificate, Cluster, FrontendFilters, LoadBalancingAlgorithms, LoadMetric,
-        PathRuleKind, ProxyProtocolConfig, RemoveCertificate, ReplaceCertificate,
-        RequestHttpFrontend, RulePosition,
+        AddCertificate, Cluster, FrontendFilters, LoadBalancingAlgorithms, PathRuleKind,
+        RemoveCertificate, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
+        RulePosition,
     },
     response::{
         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
@@ -239,14 +238,6 @@ pub struct DeactivateListener {
     pub address: String,
     pub proxy: ListenerType,
     pub to_scm: bool,
-}
-
-/// Meant for outside users, contains a String instead of a SocketAddr
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RequestTcpFrontend {
-    pub cluster_id: String,
-    pub address: String,
-    pub tags: Option<BTreeMap<String, String>>,
 }
 
 impl RequestHttpFrontend {

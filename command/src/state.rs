@@ -15,11 +15,11 @@ use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
         AddCertificate, CertificateAndKey, Cluster, PathRule, RemoveCertificate,
-        ReplaceCertificate, RequestHttpFrontend,
+        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
     },
     request::{
         ActivateListener, AddBackend, DeactivateListener, ListenerType, RemoveBackend,
-        RemoveListener, Request, RequestTcpFrontend,
+        RemoveListener, Request,
     },
     response::{
         Backend, ClusterInformation, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
@@ -438,7 +438,7 @@ impl ConfigState {
                 .address
                 .parse()
                 .with_context(|| "wrong socket address")?,
-            tags: front.tags.clone(),
+            tags: Some(front.tags.clone()),
         };
         if tcp_frontends.contains(&tcp_frontend) {
             bail!("This tcp frontend is already present: {:?}", tcp_frontend);

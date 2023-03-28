@@ -8,13 +8,10 @@ use std::{
 
 use crate::{
     proto::command::{
-        CertificateSummary, Cluster, PathRule, PathRuleKind, RequestHttpFrontend, RulePosition,
-        TlsVersion,
+        CertificateSummary, Cluster, PathRule, PathRuleKind, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, TlsVersion,
     },
-    request::{
-        default_sticky_name, is_false, AddBackend, LoadBalancingParams, RequestTcpFrontend,
-        PROTOCOL_VERSION,
-    },
+    request::{default_sticky_name, is_false, AddBackend, LoadBalancingParams, PROTOCOL_VERSION},
     state::{ClusterId, ConfigState},
 };
 
@@ -216,6 +213,7 @@ impl std::fmt::Display for PathRule {
 pub struct TcpFrontend {
     pub cluster_id: String,
     pub address: SocketAddr,
+    // TODO: remove the Option here, the map may as well be empty
     pub tags: Option<BTreeMap<String, String>>,
 }
 
@@ -224,7 +222,7 @@ impl Into<RequestTcpFrontend> for TcpFrontend {
         RequestTcpFrontend {
             cluster_id: self.cluster_id,
             address: self.address.to_string(),
-            tags: self.tags,
+            tags: self.tags.unwrap_or(BTreeMap::new()),
         }
     }
 }
