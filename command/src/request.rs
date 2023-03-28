@@ -11,8 +11,8 @@ use crate::{
     certificate::Fingerprint,
     proto::command::{
         AddCertificate, Cluster, FrontendFilters, LoadBalancingAlgorithms, PathRuleKind,
-        RemoveCertificate, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
-        RulePosition,
+        RemoveBackend, RemoveCertificate, ReplaceCertificate, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition,
     },
     response::{
         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
@@ -280,13 +280,6 @@ impl Display for RequestHttpFrontend {
             None => write!(f, "{s}"),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RemoveBackend {
-    pub cluster_id: String,
-    pub backend_id: String,
-    pub address: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -133,3 +133,11 @@ enum LoadMetric {
     // time to connect to the backend, weighted by the number of active connections (peak EWMA)
     CONNECTION_TIME = 2;
 }
+
+// remove an existing backend
+message RemoveBackend {
+    required string cluster_id = 1;
+    required string backend_id = 2;
+    // the socket address of the backend
+    required string address = 3 ;
+}

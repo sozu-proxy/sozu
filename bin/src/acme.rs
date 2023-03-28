@@ -11,10 +11,10 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     proto::command::{
-        AddCertificate, CertificateAndKey, PathRule, ReplaceCertificate, RequestHttpFrontend,
-        RulePosition, TlsVersion,
+        AddCertificate, CertificateAndKey, PathRule, RemoveBackend, ReplaceCertificate,
+        RequestHttpFrontend, RulePosition, TlsVersion,
     },
-    request::{AddBackend, RemoveBackend, Request},
+    request::{AddBackend, Request},
     response::{Response, ResponseStatus},
 };
 

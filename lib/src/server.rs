@@ -16,11 +16,10 @@ use slab::Slab;
 use sozu_command::{
     channel::Channel,
     config::Config,
-    proto::command::{Cluster, LoadBalancingAlgorithms, LoadMetric},
+    proto::command::{Cluster, LoadBalancingAlgorithms, LoadMetric, RemoveBackend},
     ready::Ready,
     request::{
-        ActivateListener, AddBackend, DeactivateListener, ListenerType, RemoveBackend, Request,
-        WorkerRequest,
+        ActivateListener, AddBackend, DeactivateListener, ListenerType, Request, WorkerRequest,
     },
     response::{
         Event, HttpListenerConfig, HttpsListenerConfig, MessageId, ResponseContent, ResponseStatus,

@@ -7,12 +7,12 @@ use sozu_command_lib::{
     config::{Config, ListenerBuilder},
     proto::command::{
         AddCertificate, CertificateAndKey, Cluster, FrontendFilters, PathRule, ProxyProtocolConfig,
-        RemoveCertificate, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
-        RulePosition, TlsVersion,
+        RemoveBackend, RemoveCertificate, ReplaceCertificate, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, TlsVersion,
     },
     request::{
         ActivateListener, AddBackend, DeactivateListener, ListenerType, LoadBalancingParams,
-        MetricsConfiguration, RemoveBackend, RemoveListener, Request,
+        MetricsConfiguration, RemoveListener, Request,
     },
 };
 
