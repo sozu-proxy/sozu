@@ -8,9 +8,9 @@ use std::{
 
 use crate::{
     proto::command::{
-        AddBackend, CertificateSummary, Cluster, FilteredTimeSerie, LoadBalancingParams, PathRule,
-        PathRuleKind, Percentiles, RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState,
-        TlsVersion, WorkerInfo,
+        AddBackend, CertificateSummary, Cluster, FilteredMetrics, FilteredTimeSerie,
+        LoadBalancingParams, PathRule, PathRuleKind, RequestHttpFrontend, RequestTcpFrontend,
+        RulePosition, RunState, TlsVersion, WorkerInfo,
     },
     request::{default_sticky_name, is_false, PROTOCOL_VERSION},
     state::{ClusterId, ConfigState},
@@ -510,6 +510,7 @@ pub struct BackendMetrics {
     pub metrics: BTreeMap<String, FilteredMetrics>,
 }
 
+/*
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FilteredMetrics {
@@ -519,6 +520,7 @@ pub enum FilteredMetrics {
     Percentiles(Percentiles),
     TimeSerie(FilteredTimeSerie),
 }
+*/
 
 impl fmt::Display for FilteredTimeSerie {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -537,7 +539,7 @@ fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use crate::proto::command::WorkerInfo;
+    use crate::proto::command::{filtered_metrics, FilteredMetrics, WorkerInfo, Percentiles};
 
     use super::*;
 
@@ -602,9 +604,24 @@ mod tests {
             message: String::from(""),
             content: Some(ResponseContent::Metrics(AggregatedMetrics {
                 main: [
-                    (String::from("sozu.gauge"), FilteredMetrics::Gauge(1)),
-                    (String::from("sozu.count"), FilteredMetrics::Count(-2)),
-                    (String::from("sozu.time"), FilteredMetrics::Time(1234)),
+                    (
+                        String::from("sozu.gauge"),
+                        FilteredMetrics {
+                            inner: Some(filtered_metrics::Inner::Gauge(1))
+                        }
+                    ),
+                    (
+                        String::from("sozu.count"),
+                        FilteredMetrics {
+                            inner: Some(filtered_metrics::Inner::Count(-2))
+                        }
+                    ),
+                    (
+                        String::from("sozu.time"),
+                        FilteredMetrics {
+                            inner: Some(filtered_metrics::Inner::Time(1234))
+                        }
+                    ),
                 ]
                 .iter()
                 .cloned()
@@ -614,9 +631,24 @@ mod tests {
                     WorkerMetrics {
                         proxy: Some(
                             [
-                                (String::from("sozu.gauge"), FilteredMetrics::Gauge(1)),
-                                (String::from("sozu.count"), FilteredMetrics::Count(-2)),
-                                (String::from("sozu.time"), FilteredMetrics::Time(1234)),
+                                (
+                                    String::from("sozu.gauge"),
+                                    FilteredMetrics {
+                                        inner: Some(filtered_metrics::Inner::Gauge(1))
+                                    }
+                                ),
+                                (
+                                    String::from("sozu.count"),
+                                    FilteredMetrics {
+                                        inner: Some(filtered_metrics::Inner::Count(-2))
+                                    }
+                                ),
+                                (
+                                    String::from("sozu.time"),
+                                    FilteredMetrics {
+                                        inner: Some(filtered_metrics::Inner::Time(1234))
+                                    }
+                                ),
                             ]
                             .iter()
                             .cloned()
@@ -629,16 +661,20 @@ mod tests {
                                     cluster: Some(
                                         [(
                                             String::from("request_time"),
-                                            FilteredMetrics::Percentiles(Percentiles {
-                                                samples: 42,
-                                                p_50: 1,
-                                                p_90: 2,
-                                                p_99: 10,
-                                                p_99_9: 12,
-                                                p_99_99: 20,
-                                                p_99_999: 22,
-                                                p_100: 30,
-                                            })
+                                            FilteredMetrics {
+                                                inner: Some(filtered_metrics::Inner::Percentiles(
+                                                    Percentiles {
+                                                        samples: 42,
+                                                        p_50: 1,
+                                                        p_90: 2,
+                                                        p_99: 10,
+                                                        p_99_9: 12,
+                                                        p_99_99: 20,
+                                                        p_99_999: 22,
+                                                        p_100: 30,
+                                                    }
+                                                ))
+                                            }
                                         )]
                                         .iter()
                                         .cloned()
@@ -647,23 +683,40 @@ mod tests {
                                     backends: Some(vec![BackendMetrics {
                                         backend_id: String::from("cluster_1-0"),
                                         metrics: [
-                                            (String::from("bytes_in"), FilteredMetrics::Count(256)),
+                                            (
+                                                String::from("bytes_in"),
+                                                FilteredMetrics {
+                                                    inner: Some(filtered_metrics::Inner::Count(
+                                                        256
+                                                    ))
+                                                }
+                                            ),
                                             (
                                                 String::from("bytes_out"),
-                                                FilteredMetrics::Count(128)
+                                                FilteredMetrics {
+                                                    inner: Some(filtered_metrics::Inner::Count(
+                                                        128
+                                                    ))
+                                                }
                                             ),
                                             (
                                                 String::from("percentiles"),
-                                                FilteredMetrics::Percentiles(Percentiles {
-                                                    samples: 42,
-                                                    p_50: 1,
-                                                    p_90: 2,
-                                                    p_99: 10,
-                                                    p_99_9: 12,
-                                                    p_99_99: 20,
-                                                    p_99_999: 22,
-                                                    p_100: 30,
-                                                })
+                                                FilteredMetrics {
+                                                    inner: Some(
+                                                        filtered_metrics::Inner::Percentiles(
+                                                            Percentiles {
+                                                                samples: 42,
+                                                                p_50: 1,
+                                                                p_90: 2,
+                                                                p_99: 10,
+                                                                p_99_9: 12,
+                                                                p_99_99: 20,
+                                                                p_99_999: 22,
+                                                                p_100: 30,
+                                                            }
+                                                        )
+                                                    )
+                                                }
                                             )
                                         ]
                                         .iter()

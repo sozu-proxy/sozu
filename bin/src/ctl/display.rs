@@ -4,10 +4,10 @@ use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::{
-    proto::command::WorkerInfo,
+    proto::command::{filtered_metrics, FilteredMetrics, WorkerInfo},
     response::{
-        AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics, ListedFrontends,
-        ListenersList, ResponseContent, WorkerMetrics,
+        AggregatedMetrics, AvailableMetrics, ClusterMetrics, ListedFrontends, ListenersList,
+        ResponseContent, WorkerMetrics,
     },
 };
 
@@ -287,8 +287,10 @@ fn filter_metrics(
 fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     let mut titles: Vec<String> = filtered_metrics
         .iter()
-        .filter_map(|(title, filtered_data)| match filtered_data {
-            FilteredMetrics::Count(_) | FilteredMetrics::Gauge(_) => Some(title.to_owned()),
+        .filter_map(|(title, filtered_data)| match filtered_data.inner {
+            Some(filtered_metrics::Inner::Count(_)) | Some(filtered_metrics::Inner::Gauge(_)) => {
+                Some(title.to_owned())
+            }
             _ => None,
         })
         .collect();
@@ -308,14 +310,17 @@ fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredMetrics>)
     for title in titles {
         let mut row = vec![cell!(title)];
         match filtered_metrics.get(&title) {
-            Some(FilteredMetrics::Count(c)) => {
-                row.push(cell!(""));
-                row.push(cell!(c))
-            }
-            Some(FilteredMetrics::Gauge(c)) => {
-                row.push(cell!(c));
-                row.push(cell!(""))
-            }
+            Some(filtered_metrics) => match filtered_metrics.inner {
+                Some(filtered_metrics::Inner::Count(c)) => {
+                    row.push(cell!(""));
+                    row.push(cell!(c))
+                }
+                Some(filtered_metrics::Inner::Gauge(c)) => {
+                    row.push(cell!(c));
+                    row.push(cell!(""))
+                }
+                _ => {}
+            },
             _ => row.push(cell!("")),
         }
         table.add_row(Row::new(row));
@@ -327,9 +332,12 @@ fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredMetrics>)
 fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     let mut percentile_titles: Vec<String> = filtered_metrics
         .iter()
-        .filter_map(|(title, filtered_data)| match filtered_data {
-            FilteredMetrics::Percentiles(_) => Some(title.to_owned()),
-            _ => None,
+        .filter_map(|(title, filtered_data)| match filtered_data.inner.clone() {
+            Some(filtered_metrics) => match filtered_metrics {
+                filtered_metrics::Inner::Percentiles(_) => Some(title.to_owned()),
+                _ => None,
+            },
+            None => None,
         })
         .collect();
 
@@ -357,20 +365,23 @@ fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
 
     for title in percentile_titles {
         match filtered_metrics.get(&title) {
-            Some(FilteredMetrics::Percentiles(p)) => {
-                percentile_table.add_row(Row::new(vec![
-                    cell!(title),
-                    cell!(p.samples),
-                    cell!(p.p_50),
-                    cell!(p.p_90),
-                    cell!(p.p_99),
-                    cell!(p.p_99_9),
-                    cell!(p.p_99_99),
-                    cell!(p.p_99_999),
-                    cell!(p.p_100),
-                ]));
-            }
-            _ => println!("Something went VERY wrong here"),
+            Some(filtered_metrics) => match filtered_metrics.inner.clone() {
+                Some(filtered_metrics::Inner::Percentiles(p)) => {
+                    percentile_table.add_row(Row::new(vec![
+                        cell!(title),
+                        cell!(p.samples),
+                        cell!(p.p_50),
+                        cell!(p.p_90),
+                        cell!(p.p_99),
+                        cell!(p.p_99_9),
+                        cell!(p.p_99_99),
+                        cell!(p.p_99_999),
+                        cell!(p.p_100),
+                    ]));
+                }
+                _ => {}
+            },
+            None => println!("Something went VERY wrong here"),
         }
     }
 

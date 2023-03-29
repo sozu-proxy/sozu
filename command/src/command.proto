@@ -198,6 +198,16 @@ enum RunState {
     NOT_ANSWERING = 3;
 }
 
+message FilteredMetrics {
+    oneof inner {
+        uint64 gauge = 1;
+        int64 count = 2;
+        uint64 time = 3;
+        Percentiles percentiles = 4;
+        FilteredTimeSerie time_serie = 5;
+    }
+}
+
 message FilteredTimeSerie {
     required uint32 last_second = 1;
     repeated uint32 last_minute = 2;

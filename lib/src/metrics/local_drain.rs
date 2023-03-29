@@ -3,11 +3,14 @@ use std::{collections::BTreeMap, str, time::Instant};
 
 use anyhow::Context;
 use hdrhistogram::Histogram;
-use sozu_command::response::{AvailableMetrics, BackendMetrics, ResponseContent};
+use sozu_command::{
+    proto::command::filtered_metrics,
+    response::{AvailableMetrics, BackendMetrics, ResponseContent},
+};
 
 use crate::sozu_command::{
-    proto::command::{MetricsConfiguration, Percentiles, QueryMetricsOptions},
-    response::{ClusterMetrics, FilteredMetrics, WorkerMetrics},
+    proto::command::{FilteredMetrics, MetricsConfiguration, Percentiles, QueryMetricsOptions},
+    response::{ClusterMetrics, WorkerMetrics},
 };
 
 use super::{MetricData, Subscriber};
@@ -64,11 +67,17 @@ impl AggregatedMetric {
 
     pub fn to_filtered(&self) -> FilteredMetrics {
         match *self {
-            AggregatedMetric::Gauge(i) => FilteredMetrics::Gauge(i),
-            AggregatedMetric::Count(i) => FilteredMetrics::Count(i),
-            AggregatedMetric::Time(ref hist) => {
-                FilteredMetrics::Percentiles(histogram_to_percentiles(hist))
-            }
+            AggregatedMetric::Gauge(i) => FilteredMetrics {
+                inner: Some(filtered_metrics::Inner::Gauge(i as u64)),
+            },
+            AggregatedMetric::Count(i) => FilteredMetrics {
+                inner: Some(filtered_metrics::Inner::Count(i)),
+            },
+            AggregatedMetric::Time(ref hist) => FilteredMetrics {
+                inner: Some(filtered_metrics::Inner::Percentiles(
+                    histogram_to_percentiles(hist),
+                )),
+            },
         }
     }
 }
