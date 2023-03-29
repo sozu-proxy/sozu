@@ -156,3 +156,8 @@ message RemoveBackend {
 message LoadBalancingParams {
     required int32 weight = 1;
 }
+
+message QueryClusterByDomain {
+    required string hostname = 1;
+    optional string path = 2;
+}

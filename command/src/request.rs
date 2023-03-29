@@ -11,8 +11,8 @@ use crate::{
     certificate::Fingerprint,
     proto::command::{
         AddBackend, AddCertificate, Cluster, FrontendFilters, LoadBalancingAlgorithms,
-        PathRuleKind, RemoveBackend, RemoveCertificate, ReplaceCertificate, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition,
+        PathRuleKind, QueryClusterByDomain, RemoveBackend, RemoveCertificate, ReplaceCertificate,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition,
     },
     response::{
         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
@@ -289,11 +289,13 @@ pub enum MetricsConfiguration {
     Clear,
 }
 
+/*
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueryClusterByDomain {
     pub hostname: String,
     pub path: Option<String>,
 }
+*/
 
 /// Options originating from the command line
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
