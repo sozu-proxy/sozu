@@ -198,6 +198,13 @@ enum RunState {
     NOT_ANSWERING = 3;
 }
 
+message FilteredTimeSerie {
+    required uint32 last_second = 1;
+    repeated uint32 last_minute = 2;
+    repeated uint32 last_hour = 3;
+}
+
+
 message Percentiles {
     required uint64 samples = 1;
     required uint64 p_50 = 2;

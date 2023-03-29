@@ -8,9 +8,9 @@ use std::{
 
 use crate::{
     proto::command::{
-        AddBackend, CertificateSummary, Cluster, LoadBalancingParams, PathRule, PathRuleKind,
-        Percentiles, RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, TlsVersion,
-        WorkerInfo,
+        AddBackend, CertificateSummary, Cluster, FilteredTimeSerie, LoadBalancingParams, PathRule,
+        PathRuleKind, Percentiles, RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState,
+        TlsVersion, WorkerInfo,
     },
     request::{default_sticky_name, is_false, PROTOCOL_VERSION},
     state::{ClusterId, ConfigState},
@@ -520,23 +520,14 @@ pub enum FilteredMetrics {
     TimeSerie(FilteredTimeSerie),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct FilteredTimeSerie {
-    pub last_second: u32,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub last_minute: Vec<u32>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub last_hour: Vec<u32>,
-}
-
-impl fmt::Debug for FilteredTimeSerie {
+impl fmt::Display for FilteredTimeSerie {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "FilteredTimeSerie {{\nlast_second: {},\nlast_minute:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\nlast_hour:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n}}",
-      self.last_second,
-    &self.last_minute[0..10], &self.last_minute[10..20], &self.last_minute[20..30], &self.last_minute[30..40], &self.last_minute[40..50], &self.last_minute[50..60],
-    &self.last_hour[0..10], &self.last_hour[10..20], &self.last_hour[20..30], &self.last_hour[30..40], &self.last_hour[40..50], &self.last_hour[50..60])
+        write!(
+            f,
+            "FilteredTimeSerie {{\nlast_second: {},\nlast_minute:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\nlast_hour:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n}}",
+            self.last_second,
+            &self.last_minute[0..10], &self.last_minute[10..20], &self.last_minute[20..30], &self.last_minute[30..40], &self.last_minute[40..50], &self.last_minute[50..60],
+            &self.last_hour[0..10], &self.last_hour[10..20], &self.last_hour[20..30], &self.last_hour[30..40], &self.last_hour[40..50], &self.last_hour[50..60])
     }
 }
 
