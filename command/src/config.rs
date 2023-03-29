@@ -426,6 +426,7 @@ impl ListenerBuilder {
             front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
             back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+            active: false,
         })
     }
 

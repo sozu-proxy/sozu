@@ -12,7 +12,7 @@ use crate::{
         default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams,
         RequestHttpFrontend, RequestTcpFrontend, PROTOCOL_VERSION,
     },
-    state::{ConfigState, ClusterId},
+    state::{ClusterId, ConfigState},
 };
 
 /// Responses of the main process to the CLI (or other client)
@@ -329,7 +329,7 @@ pub struct ListenersList {
     /// address -> (listener_config, activated)
     pub http_listeners: HashMap<String, (HttpListenerConfig, bool)>,
     pub https_listeners: HashMap<String, (HttpsListenerConfig, bool)>,
-    pub tcp_listeners: HashMap<String, (TcpListenerConfig, bool)>,
+    pub tcp_listeners: HashMap<String, TcpListenerConfig>,
 }
 
 /// details of an HTTP listener, sent by the main process to the worker
@@ -400,6 +400,8 @@ pub struct TcpListenerConfig {
     pub front_timeout: u32,
     pub back_timeout: u32,
     pub connect_timeout: u32,
+    /// should default to false
+    pub active: bool,
 }
 
 /// Runstate of a worker

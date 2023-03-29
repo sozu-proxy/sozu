@@ -22,6 +22,7 @@ use crate::{
     pool::Pool,
     protocol::SessionResult,
     retry::RetryPolicy,
+    router::Route,
     server::{push_event, CONN_RETRIES},
     socket::{SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
@@ -29,7 +30,7 @@ use crate::{
     util::UnwrapLog,
     Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler, L7Proxy,
     ListenerHandler, LogDuration, ProxySession, SessionIsToBeClosed,
-    {Protocol, Readiness, SessionMetrics, StateResult}, router::Route,
+    {Protocol, Readiness, SessionMetrics, StateResult},
 };
 
 use self::parser::{

@@ -51,7 +51,7 @@ pub struct ConfigState {
     /// the bool indicates if it is active or not
     pub http_listeners: HashMap<String, (HttpListenerConfig, bool)>,
     pub https_listeners: HashMap<String, (HttpsListenerConfig, bool)>,
-    pub tcp_listeners: HashMap<String, (TcpListenerConfig, bool)>,
+    pub tcp_listeners: HashMap<String, TcpListenerConfig>,
     /// indexed by (address, hostname, path)
     pub http_fronts: BTreeMap<RouteKey, HttpFrontend>,
     /// indexed by (address, hostname, path)
@@ -178,7 +178,7 @@ impl ConfigState {
 
     fn add_tcp_listener(&mut self, listener: &TcpListenerConfig) -> anyhow::Result<()> {
         match self.tcp_listeners.entry(listener.address.clone()) {
-            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
+            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             HashMapEntry::Occupied(_) => {
                 bail!("The entry is occupied for address {}", listener.address)
             }
@@ -241,7 +241,7 @@ impl ConfigState {
                 if self
                     .tcp_listeners
                     .get_mut(&activate.address)
-                    .map(|t| t.1 = true)
+                    .map(|listener| listener.active = true)
                     .is_none()
                 {
                     bail!("No tcp listener found with address {}", activate.address)
@@ -280,7 +280,7 @@ impl ConfigState {
                 if self
                     .tcp_listeners
                     .get_mut(&deactivate.address)
-                    .map(|t| t.1 = false)
+                    .map(|listener| listener.active = false)
                     .is_none()
                 {
                     bail!("No tcp listener found with address {}", deactivate.address)
@@ -510,9 +510,9 @@ impl ConfigState {
             }
         }
 
-        for &(ref listener, active) in self.tcp_listeners.values() {
+        for listener in self.tcp_listeners.values() {
             v.push(Request::AddTcpListener(listener.clone()));
-            if active {
+            if listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: listener.address.clone(),
                     proxy: ListenerType::TCP,
@@ -589,7 +589,7 @@ impl ConfigState {
         for front in self
             .tcp_listeners
             .iter()
-            .filter(|(_, t)| t.1)
+            .filter(|(_, listener)| listener.active)
             .map(|(k, _)| k)
         {
             v.push(Request::ActivateListener(ActivateListener {
@@ -622,7 +622,7 @@ impl ConfigState {
         let mut v = vec![];
 
         for address in removed_tcp_listeners {
-            if self.tcp_listeners[*address].1 {
+            if self.tcp_listeners[*address].active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: address.to_string(),
                     proxy: ListenerType::TCP,
@@ -638,10 +638,10 @@ impl ConfigState {
 
         for address in added_tcp_listeners.clone() {
             v.push(Request::AddTcpListener(
-                other.tcp_listeners[*address].0.clone(),
+                other.tcp_listeners[*address].clone(),
             ));
 
-            if other.tcp_listeners[*address].1 {
+            if other.tcp_listeners[*address].active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: address.to_string(),
                     proxy: ListenerType::TCP,
@@ -709,8 +709,8 @@ impl ConfigState {
         }
 
         for addr in my_tcp_listeners.intersection(&their_tcp_listeners) {
-            let (my_listener, my_active) = &self.tcp_listeners[*addr];
-            let (their_listener, their_active) = &other.tcp_listeners[*addr];
+            let my_listener = &self.tcp_listeners[*addr];
+            let their_listener = &other.tcp_listeners[*addr];
 
             if my_listener != their_listener {
                 v.push(Request::RemoveListener(RemoveListener {
@@ -721,7 +721,7 @@ impl ConfigState {
                 v.push(Request::AddTcpListener(their_listener.clone()));
             }
 
-            if *my_active && !*their_active {
+            if my_listener.active && !their_listener.active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: addr.to_string(),
                     proxy: ListenerType::TCP,
@@ -729,7 +729,7 @@ impl ConfigState {
                 }));
             }
 
-            if !*my_active && *their_active {
+            if !my_listener.active && their_listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: addr.to_string(),
                     proxy: ListenerType::TCP,
@@ -967,9 +967,9 @@ impl ConfigState {
 
         for address in added_tcp_listeners {
             let listener = &other.tcp_listeners[*address];
-            if listener.1 {
+            if listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
-                    address: listener.0.address.clone(),
+                    address: listener.address.clone(),
                     proxy: ListenerType::TCP,
                     from_scm: false,
                 }));
@@ -1613,6 +1613,7 @@ mod tests {
                 front_timeout: 60,
                 back_timeout: 30,
                 connect_timeout: 3,
+                active: false,
             }))
             .expect("Could not execute request");
         state
@@ -1675,6 +1676,7 @@ mod tests {
                 front_timeout: 60,
                 back_timeout: 30,
                 connect_timeout: 3,
+                active: false,
             }))
             .expect("Could not execute request");
         state2
@@ -1740,6 +1742,7 @@ mod tests {
                 front_timeout: 60,
                 back_timeout: 30,
                 connect_timeout: 3,
+                active: false,
             }),
             Request::DeactivateListener(DeactivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),

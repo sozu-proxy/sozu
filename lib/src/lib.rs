@@ -434,7 +434,7 @@ pub enum AcceptError {
     TooManySessions,
     WouldBlock,
     RegisterError,
-    WrongSocketAddress
+    WrongSocketAddress,
 }
 
 use self::server::ListenToken;

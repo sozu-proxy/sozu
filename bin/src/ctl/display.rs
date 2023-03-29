@@ -97,7 +97,7 @@ pub fn print_listeners(listeners_list: ListenersList) {
             "connect timeout",
             "activated"
         ]);
-        for (_, (tcp_listener, activated)) in listeners_list.tcp_listeners.iter() {
+        for (_, tcp_listener) in listeners_list.tcp_listeners.iter() {
             table.add_row(row![
                 format!("{:?}", tcp_listener.address),
                 format!("{:?}", tcp_listener.public_address),
@@ -105,7 +105,7 @@ pub fn print_listeners(listeners_list: ListenersList) {
                 tcp_listener.front_timeout,
                 tcp_listener.back_timeout,
                 tcp_listener.connect_timeout,
-                activated,
+                tcp_listener.active,
             ]);
         }
         table.printstd();

@@ -1805,6 +1805,7 @@ mod tests {
                 front_timeout: 60,
                 back_timeout: 30,
                 connect_timeout: 3,
+                active: false,
             };
 
             {
