@@ -296,6 +296,7 @@ impl ListenerBuilder {
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             answer_404,
             answer_503,
+            active: false,
         };
 
         Ok(configuration)

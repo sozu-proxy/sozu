@@ -49,7 +49,7 @@ pub struct ConfigState {
     pub clusters: BTreeMap<ClusterId, Cluster>,
     pub backends: BTreeMap<ClusterId, Vec<Backend>>,
     /// the bool indicates if it is active or not
-    pub http_listeners: HashMap<String, (HttpListenerConfig, bool)>,
+    pub http_listeners: HashMap<String, HttpListenerConfig>,
     pub https_listeners: HashMap<String, HttpsListenerConfig>,
     pub tcp_listeners: HashMap<String, TcpListenerConfig>,
     /// indexed by (address, hostname, path)
@@ -158,7 +158,7 @@ impl ConfigState {
 
     fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> anyhow::Result<()> {
         match self.http_listeners.entry(listener.address.to_string()) {
-            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
+            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             HashMapEntry::Occupied(_) => {
                 bail!("The entry is occupied for address {}", listener.address)
             }
@@ -221,7 +221,7 @@ impl ConfigState {
                 if self
                     .http_listeners
                     .get_mut(&activate.address)
-                    .map(|t| t.1 = true)
+                    .map(|listener| listener.active = true)
                     .is_none()
                 {
                     bail!("No http listener found with address {}", activate.address)
@@ -257,7 +257,7 @@ impl ConfigState {
                 if self
                     .http_listeners
                     .get_mut(&deactivate.address)
-                    .map(|t| t.1 = false)
+                    .map(|listener| listener.active = false)
                     .is_none()
                 {
                     bail!("No http listener found with address {}", deactivate.address)
@@ -488,9 +488,9 @@ impl ConfigState {
     pub fn generate_requests(&self) -> Vec<Request> {
         let mut v = Vec::new();
 
-        for &(ref listener, active) in self.http_listeners.values() {
+        for listener in self.http_listeners.values() {
             v.push(Request::AddHttpListener(listener.clone()));
-            if active {
+            if listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: listener.address.clone(),
                     proxy: ListenerType::HTTP,
@@ -564,7 +564,7 @@ impl ConfigState {
         for front in self
             .http_listeners
             .iter()
-            .filter(|(_, t)| t.1)
+            .filter(|(_, listener)| listener.active)
             .map(|(k, _)| k)
         {
             v.push(Request::ActivateListener(ActivateListener {
@@ -651,7 +651,7 @@ impl ConfigState {
         }
 
         for address in removed_http_listeners {
-            if self.http_listeners[*address].1 {
+            if self.http_listeners[*address].active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: address.to_string(),
                     proxy: ListenerType::HTTP,
@@ -667,10 +667,10 @@ impl ConfigState {
 
         for address in added_http_listeners.clone() {
             v.push(Request::AddHttpListener(
-                other.http_listeners[*address].0.clone(),
+                other.http_listeners[*address].clone(),
             ));
 
-            if other.http_listeners[*address].1 {
+            if other.http_listeners[*address].active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: address.to_string(),
                     proxy: ListenerType::HTTP,
@@ -741,19 +741,21 @@ impl ConfigState {
         }
 
         for addr in my_http_listeners.intersection(&their_http_listeners) {
-            let (my_listener, my_active) = &self.http_listeners[*addr];
-            let (their_listener, their_active) = &other.http_listeners[*addr];
+            let my_listener = &self.http_listeners[*addr];
+            let their_listener = &other.http_listeners[*addr];
 
             if my_listener != their_listener {
                 v.push(Request::RemoveListener(RemoveListener {
                     address: addr.to_string(),
                     proxy: ListenerType::HTTP,
                 }));
-
-                v.push(Request::AddHttpListener(their_listener.clone()));
+                // any added listener should be unactive
+                let mut listener_to_add = their_listener.clone();
+                listener_to_add.active = false;
+                v.push(Request::AddHttpListener(listener_to_add));
             }
 
-            if *my_active && !*their_active {
+            if my_listener.active && !their_listener.active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: addr.to_string(),
                     proxy: ListenerType::HTTP,
@@ -761,7 +763,7 @@ impl ConfigState {
                 }));
             }
 
-            if !*my_active && *their_active {
+            if !my_listener.active && their_listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: addr.to_string(),
                     proxy: ListenerType::HTTP,
@@ -1639,6 +1641,7 @@ mod tests {
                 request_timeout: 10,
                 back_timeout: 30,
                 connect_timeout: 3,
+                active: false,
             }))
             .expect("Could not execute request");
         state
@@ -1696,6 +1699,7 @@ mod tests {
                 request_timeout: 10,
                 back_timeout: 30,
                 connect_timeout: 3,
+                active: false,
             }))
             .expect("Could not execute request");
         state2
@@ -1770,6 +1774,7 @@ mod tests {
                 request_timeout: 10,
                 back_timeout: 30,
                 connect_timeout: 3,
+                active: false,
             }),
             Request::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
