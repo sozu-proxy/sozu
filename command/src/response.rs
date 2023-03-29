@@ -328,7 +328,7 @@ impl Backend {
 pub struct ListenersList {
     /// address -> (listener_config, activated)
     pub http_listeners: HashMap<String, (HttpListenerConfig, bool)>,
-    pub https_listeners: HashMap<String, (HttpsListenerConfig, bool)>,
+    pub https_listeners: HashMap<String, HttpsListenerConfig>,
     pub tcp_listeners: HashMap<String, TcpListenerConfig>,
 }
 
@@ -385,6 +385,8 @@ pub struct HttpsListenerConfig {
     pub connect_timeout: u32,
     /// max time to send a complete request
     pub request_timeout: u32,
+    /// should default to false
+    pub active: bool,
 }
 
 /// details of an TCP listener, sent by the main process to the worker

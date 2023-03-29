@@ -50,7 +50,7 @@ pub struct ConfigState {
     pub backends: BTreeMap<ClusterId, Vec<Backend>>,
     /// the bool indicates if it is active or not
     pub http_listeners: HashMap<String, (HttpListenerConfig, bool)>,
-    pub https_listeners: HashMap<String, (HttpsListenerConfig, bool)>,
+    pub https_listeners: HashMap<String, HttpsListenerConfig>,
     pub tcp_listeners: HashMap<String, TcpListenerConfig>,
     /// indexed by (address, hostname, path)
     pub http_fronts: BTreeMap<RouteKey, HttpFrontend>,
@@ -168,7 +168,7 @@ impl ConfigState {
 
     fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> anyhow::Result<()> {
         match self.https_listeners.entry(listener.address.clone()) {
-            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert((listener.clone(), false)),
+            HashMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             HashMapEntry::Occupied(_) => {
                 bail!("The entry is occupied for address {}", listener.address)
             }
@@ -231,7 +231,7 @@ impl ConfigState {
                 if self
                     .https_listeners
                     .get_mut(&activate.address)
-                    .map(|t| t.1 = true)
+                    .map(|listener| listener.active = true)
                     .is_none()
                 {
                     bail!("No https listener found with address {}", activate.address)
@@ -267,7 +267,7 @@ impl ConfigState {
                 if self
                     .https_listeners
                     .get_mut(&deactivate.address)
-                    .map(|t| t.1 = false)
+                    .map(|listener| listener.active = false)
                     .is_none()
                 {
                     bail!(
@@ -499,9 +499,9 @@ impl ConfigState {
             }
         }
 
-        for &(ref listener, active) in self.https_listeners.values() {
+        for listener in self.https_listeners.values() {
             v.push(Request::AddHttpsListener(listener.clone()));
-            if active {
+            if listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: listener.address.clone(),
                     proxy: ListenerType::HTTPS,
@@ -577,7 +577,7 @@ impl ConfigState {
         for front in self
             .https_listeners
             .iter()
-            .filter(|(_, t)| t.1)
+            .filter(|(_, listener)| listener.active)
             .map(|(k, _)| k)
         {
             v.push(Request::ActivateListener(ActivateListener {
@@ -680,7 +680,7 @@ impl ConfigState {
         }
 
         for address in removed_https_listeners {
-            if self.https_listeners[*address].1 {
+            if self.https_listeners[*address].active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: address.to_string(),
                     proxy: ListenerType::HTTPS,
@@ -696,10 +696,10 @@ impl ConfigState {
 
         for address in added_https_listeners.clone() {
             v.push(Request::AddHttpsListener(
-                other.https_listeners[*address].0.clone(),
+                other.https_listeners[*address].clone(),
             ));
 
-            if other.https_listeners[*address].1 {
+            if other.https_listeners[*address].active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: address.to_string(),
                     proxy: ListenerType::HTTPS,
@@ -717,8 +717,10 @@ impl ConfigState {
                     address: addr.to_string(),
                     proxy: ListenerType::TCP,
                 }));
-
-                v.push(Request::AddTcpListener(their_listener.clone()));
+                // any added listener should be unactive
+                let mut listener_to_add = their_listener.clone();
+                listener_to_add.active = false;
+                v.push(Request::AddTcpListener(listener_to_add));
             }
 
             if my_listener.active && !their_listener.active {
@@ -769,19 +771,21 @@ impl ConfigState {
         }
 
         for addr in my_https_listeners.intersection(&their_https_listeners) {
-            let (my_listener, my_active) = &self.https_listeners[*addr];
-            let (their_listener, their_active) = &other.https_listeners[*addr];
+            let my_listener = &self.https_listeners[*addr];
+            let their_listener = &other.https_listeners[*addr];
 
             if my_listener != their_listener {
                 v.push(Request::RemoveListener(RemoveListener {
                     address: addr.to_string(),
                     proxy: ListenerType::HTTPS,
                 }));
-
-                v.push(Request::AddHttpsListener(their_listener.clone()));
+                // any added listener should be unactive
+                let mut listener_to_add = their_listener.clone();
+                listener_to_add.active = false;
+                v.push(Request::AddHttpsListener(listener_to_add));
             }
 
-            if *my_active && !*their_active {
+            if my_listener.active && !their_listener.active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: addr.to_string(),
                     proxy: ListenerType::HTTPS,
@@ -789,7 +793,7 @@ impl ConfigState {
                 }));
             }
 
-            if !*my_active && *their_active {
+            if !my_listener.active && their_listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: addr.to_string(),
                     proxy: ListenerType::HTTPS,
@@ -1657,6 +1661,7 @@ mod tests {
                 request_timeout: 10,
                 back_timeout: 30,
                 connect_timeout: 3,
+                active: false,
             }))
             .expect("Could not execute request");
         state
@@ -1720,6 +1725,7 @@ mod tests {
                 request_timeout: 10,
                 back_timeout: 30,
                 connect_timeout: 3,
+                active: false,
             }))
             .expect("Could not execute request");
         state2
@@ -1793,6 +1799,7 @@ mod tests {
                 request_timeout: 10,
                 back_timeout: 30,
                 connect_timeout: 3,
+                active: false,
             }),
         ];
 

@@ -397,6 +397,7 @@ impl ListenerBuilder {
             cipher_suites,
             signature_algorithms,
             groups_list,
+            active: false,
         };
 
         Ok(https_listener_config)
