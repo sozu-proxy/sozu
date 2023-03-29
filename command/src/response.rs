@@ -8,9 +8,9 @@ use std::{
 
 use crate::{
     proto::command::{
-        AddBackend, CertificateSummary, Cluster, FilteredMetrics, FilteredTimeSerie,
-        LoadBalancingParams, PathRule, PathRuleKind, RequestHttpFrontend, RequestTcpFrontend,
-        RulePosition, RunState, TlsVersion, WorkerInfo,
+        AddBackend, CertificateSummary, Cluster, ClusterMetrics, FilteredMetrics,
+        FilteredTimeSerie, LoadBalancingParams, PathRule, PathRuleKind, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, RunState, TlsVersion, WorkerInfo,
     },
     request::{default_sticky_name, is_false, PROTOCOL_VERSION},
     state::{ClusterId, ConfigState},
@@ -493,35 +493,6 @@ pub struct WorkerMetrics {
     pub clusters: Option<BTreeMap<String, ClusterMetrics>>,
 }
 
-/// the metrics of a given cluster, with several backends
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusterMetrics {
-    /// metric name -> metric value
-    pub cluster: Option<BTreeMap<String, FilteredMetrics>>,
-    /// backend_id -> (metric name-> metric value)
-    pub backends: Option<Vec<BackendMetrics>>,
-}
-
-/// the metrics of a given backend
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackendMetrics {
-    pub backend_id: String,
-    /// metric name -> metric value
-    pub metrics: BTreeMap<String, FilteredMetrics>,
-}
-
-/*
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum FilteredMetrics {
-    Gauge(usize),
-    Count(i64),
-    Time(usize),
-    Percentiles(Percentiles),
-    TimeSerie(FilteredTimeSerie),
-}
-*/
-
 impl fmt::Display for FilteredTimeSerie {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
@@ -539,7 +510,9 @@ fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use crate::proto::command::{filtered_metrics, FilteredMetrics, WorkerInfo, Percentiles};
+    use crate::proto::command::{
+        filtered_metrics, BackendMetrics, ClusterMetrics, FilteredMetrics, Percentiles, WorkerInfo,
+    };
 
     use super::*;
 
@@ -658,29 +631,27 @@ mod tests {
                             [(
                                 String::from("cluster_1"),
                                 ClusterMetrics {
-                                    cluster: Some(
-                                        [(
-                                            String::from("request_time"),
-                                            FilteredMetrics {
-                                                inner: Some(filtered_metrics::Inner::Percentiles(
-                                                    Percentiles {
-                                                        samples: 42,
-                                                        p_50: 1,
-                                                        p_90: 2,
-                                                        p_99: 10,
-                                                        p_99_9: 12,
-                                                        p_99_99: 20,
-                                                        p_99_999: 22,
-                                                        p_100: 30,
-                                                    }
-                                                ))
-                                            }
-                                        )]
-                                        .iter()
-                                        .cloned()
-                                        .collect()
-                                    ),
-                                    backends: Some(vec![BackendMetrics {
+                                    cluster: [(
+                                        String::from("request_time"),
+                                        FilteredMetrics {
+                                            inner: Some(filtered_metrics::Inner::Percentiles(
+                                                Percentiles {
+                                                    samples: 42,
+                                                    p_50: 1,
+                                                    p_90: 2,
+                                                    p_99: 10,
+                                                    p_99_9: 12,
+                                                    p_99_99: 20,
+                                                    p_99_999: 22,
+                                                    p_100: 30,
+                                                }
+                                            ))
+                                        }
+                                    )]
+                                    .iter()
+                                    .cloned()
+                                    .collect(),
+                                    backends: vec![BackendMetrics {
                                         backend_id: String::from("cluster_1-0"),
                                         metrics: [
                                             (
@@ -722,7 +693,7 @@ mod tests {
                                         .iter()
                                         .cloned()
                                         .collect()
-                                    }]),
+                                    }],
                                 }
                             )]
                             .iter()

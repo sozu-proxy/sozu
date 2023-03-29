@@ -198,6 +198,19 @@ enum RunState {
     NOT_ANSWERING = 3;
 }
 
+// the metrics of a given cluster, with several backends
+message ClusterMetrics {
+    // metric name -> metric value
+    map<string, FilteredMetrics> cluster = 1;
+    // backend_id -> (metric name-> metric value)
+    repeated BackendMetrics backends = 2;
+}
+
+message BackendMetrics {
+    required string backend_id = 1;
+    map<string, FilteredMetrics> metrics = 2;
+}
+
 message FilteredMetrics {
     oneof inner {
         uint64 gauge = 1;

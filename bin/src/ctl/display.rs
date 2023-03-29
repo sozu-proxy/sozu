@@ -4,10 +4,10 @@ use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::{
-    proto::command::{filtered_metrics, FilteredMetrics, WorkerInfo},
+    proto::command::{filtered_metrics, ClusterMetrics, FilteredMetrics, WorkerInfo},
     response::{
-        AggregatedMetrics, AvailableMetrics, ClusterMetrics, ListedFrontends, ListenersList,
-        ResponseContent, WorkerMetrics,
+        AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, ResponseContent,
+        WorkerMetrics,
     },
 };
 
@@ -252,19 +252,15 @@ fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetric
         for (cluster_id, cluster_metrics_data) in cluster_metrics.iter() {
             println!("\nCluster {cluster_id}\n--------");
 
-            if let Some(cluster) = &cluster_metrics_data.cluster {
-                let filtered = filter_metrics(cluster);
+            let filtered = filter_metrics(&cluster_metrics_data.cluster);
+            print_gauges_and_counts(&filtered);
+            print_percentiles(&filtered);
+
+            for backend_metrics in cluster_metrics_data.backends.iter() {
+                println!("\n{cluster_id}/{}\n--------", backend_metrics.backend_id);
+                let filtered = filter_metrics(&backend_metrics.metrics);
                 print_gauges_and_counts(&filtered);
                 print_percentiles(&filtered);
-            }
-
-            if let Some(backends) = &cluster_metrics_data.backends {
-                for backend_metrics in backends.iter() {
-                    println!("\n{cluster_id}/{}\n--------", backend_metrics.backend_id);
-                    let filtered = filter_metrics(&backend_metrics.metrics);
-                    print_gauges_and_counts(&filtered);
-                    print_percentiles(&filtered);
-                }
             }
         }
     }

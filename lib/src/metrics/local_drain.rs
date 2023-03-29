@@ -4,13 +4,15 @@ use std::{collections::BTreeMap, str, time::Instant};
 use anyhow::Context;
 use hdrhistogram::Histogram;
 use sozu_command::{
-    proto::command::filtered_metrics,
-    response::{AvailableMetrics, BackendMetrics, ResponseContent},
+    proto::command::{filtered_metrics, BackendMetrics},
+    response::{AvailableMetrics, ResponseContent},
 };
 
 use crate::sozu_command::{
-    proto::command::{FilteredMetrics, MetricsConfiguration, Percentiles, QueryMetricsOptions},
-    response::{ClusterMetrics, WorkerMetrics},
+    proto::command::{
+        ClusterMetrics, FilteredMetrics, MetricsConfiguration, Percentiles, QueryMetricsOptions,
+    },
+    response::WorkerMetrics,
 };
 
 use super::{MetricData, Subscriber};
@@ -296,10 +298,7 @@ impl LocalDrain {
                 ))?;
             backends.push(backend_metrics);
         }
-        Ok(ClusterMetrics {
-            cluster: Some(cluster),
-            backends: Some(backends),
-        })
+        Ok(ClusterMetrics { cluster, backends })
     }
 
     fn metrics_of_one_backend(
@@ -366,14 +365,14 @@ impl LocalDrain {
                 .context(format!("No metrics found for backend with id {backend_id}"))?
                 .to_owned();
 
-            let mut backend_vec = Vec::new();
-            backend_vec.push(self.metrics_of_one_backend(backend_id, metric_names)?);
+            let mut backends = Vec::new();
+            backends.push(self.metrics_of_one_backend(backend_id, metric_names)?);
 
             clusters.insert(
                 cluster_id,
                 ClusterMetrics {
-                    cluster: None,
-                    backends: Some(backend_vec),
+                    cluster: BTreeMap::new(),
+                    backends,
                 },
             );
         }
