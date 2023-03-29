@@ -8,11 +8,9 @@ use sozu_command::{
     response::{AvailableMetrics, ResponseContent},
 };
 
-use crate::sozu_command::{
-    proto::command::{
-        ClusterMetrics, FilteredMetrics, MetricsConfiguration, Percentiles, QueryMetricsOptions,
-    },
-    response::WorkerMetrics,
+use crate::sozu_command::proto::command::{
+    ClusterMetrics, FilteredMetrics, MetricsConfiguration, Percentiles, QueryMetricsOptions,
+    WorkerMetrics,
 };
 
 use super::{MetricData, Subscriber};
@@ -227,8 +225,8 @@ impl LocalDrain {
         metric_names: &Vec<String>,
     ) -> anyhow::Result<WorkerMetrics> {
         Ok(WorkerMetrics {
-            proxy: Some(self.dump_proxy_metrics(metric_names)),
-            clusters: Some(self.dump_cluster_metrics(metric_names)?),
+            proxy: self.dump_proxy_metrics(metric_names),
+            clusters: self.dump_cluster_metrics(metric_names)?,
         })
     }
 
@@ -346,8 +344,8 @@ impl LocalDrain {
 
         trace!("query result: {:#?}", clusters);
         Ok(WorkerMetrics {
-            proxy: None,
-            clusters: Some(clusters),
+            proxy: BTreeMap::new(),
+            clusters,
         })
     }
 
@@ -379,8 +377,8 @@ impl LocalDrain {
 
         trace!("query result: {:#?}", clusters);
         Ok(WorkerMetrics {
-            proxy: None,
-            clusters: Some(clusters),
+            proxy: BTreeMap::new(),
+            clusters,
         })
     }
 

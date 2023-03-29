@@ -198,6 +198,15 @@ enum RunState {
     NOT_ANSWERING = 3;
 }
 
+// All metrics of a worker: proxy and clusters
+// Populated by Options so partial results can be sent
+message WorkerMetrics {
+   // Metrics of the worker process, key -> value
+    map<string, FilteredMetrics> proxy = 1;
+    // cluster_id -> cluster_metrics
+    map<string, ClusterMetrics> clusters = 2;
+}
+
 // the metrics of a given cluster, with several backends
 message ClusterMetrics {
     // metric name -> metric value

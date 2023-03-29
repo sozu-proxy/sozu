@@ -4,10 +4,11 @@ use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
 use sozu_command_lib::{
-    proto::command::{filtered_metrics, ClusterMetrics, FilteredMetrics, WorkerInfo},
+    proto::command::{
+        filtered_metrics, ClusterMetrics, FilteredMetrics, WorkerInfo, WorkerMetrics,
+    },
     response::{
         AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, ResponseContent,
-        WorkerMetrics,
     },
 };
 
@@ -222,7 +223,7 @@ pub fn print_metrics(
     // main process metrics
     println!("\nMAIN PROCESS\n============");
 
-    print_proxy_metrics(&Some(aggregated_metrics.main));
+    print_proxy_metrics(&aggregated_metrics.main);
 
     // workers
     for (worker_id, worker_metrics) in aggregated_metrics.workers.iter() {
@@ -239,29 +240,25 @@ fn print_worker_metrics(worker_metrics: &WorkerMetrics) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_proxy_metrics(proxy_metrics: &Option<BTreeMap<String, FilteredMetrics>>) {
-    if let Some(metrics) = proxy_metrics {
-        let filtered = filter_metrics(metrics);
-        print_gauges_and_counts(&filtered);
-        print_percentiles(&filtered);
-    }
+fn print_proxy_metrics(proxy_metrics: &BTreeMap<String, FilteredMetrics>) {
+    let filtered = filter_metrics(proxy_metrics);
+    print_gauges_and_counts(&filtered);
+    print_percentiles(&filtered);
 }
 
-fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetrics>>) {
-    if let Some(cluster_metrics) = cluster_metrics {
-        for (cluster_id, cluster_metrics_data) in cluster_metrics.iter() {
-            println!("\nCluster {cluster_id}\n--------");
+fn print_cluster_metrics(cluster_metrics: &BTreeMap<String, ClusterMetrics>) {
+    for (cluster_id, cluster_metrics_data) in cluster_metrics.iter() {
+        println!("\nCluster {cluster_id}\n--------");
 
-            let filtered = filter_metrics(&cluster_metrics_data.cluster);
+        let filtered = filter_metrics(&cluster_metrics_data.cluster);
+        print_gauges_and_counts(&filtered);
+        print_percentiles(&filtered);
+
+        for backend_metrics in cluster_metrics_data.backends.iter() {
+            println!("\n{cluster_id}/{}\n--------", backend_metrics.backend_id);
+            let filtered = filter_metrics(&backend_metrics.metrics);
             print_gauges_and_counts(&filtered);
             print_percentiles(&filtered);
-
-            for backend_metrics in cluster_metrics_data.backends.iter() {
-                println!("\n{cluster_id}/{}\n--------", backend_metrics.backend_id);
-                let filtered = filter_metrics(&backend_metrics.metrics);
-                print_gauges_and_counts(&filtered);
-                print_percentiles(&filtered);
-            }
         }
     }
 }
