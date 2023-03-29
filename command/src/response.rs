@@ -9,7 +9,7 @@ use std::{
 use crate::{
     proto::command::{
         AddBackend, CertificateSummary, Cluster, LoadBalancingParams, PathRule, PathRuleKind,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, TlsVersion,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, TlsVersion,
     },
     request::{default_sticky_name, is_false, PROTOCOL_VERSION},
     state::{ClusterId, ConfigState},
@@ -371,16 +371,6 @@ pub struct TcpListenerConfig {
     pub connect_timeout: u32,
     /// should default to false
     pub active: bool,
-}
-
-/// Runstate of a worker
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RunState {
-    Running,
-    Stopping,
-    Stopped,
-    NotAnswering,
 }
 
 impl fmt::Display for RunState {

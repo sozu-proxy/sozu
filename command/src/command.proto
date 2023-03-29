@@ -183,3 +183,11 @@ enum MetricsConfiguration {
     // wipe the metrics memory
     CLEAR = 2;
 }
+
+// Runstate of a worker
+enum RunState {
+    RUNNING = 0;
+    STOPPING = 1;
+    STOPPED = 2;
+    NOT_ANSWERING = 3;
+}

@@ -5,9 +5,9 @@ use serde::Serialize;
 
 use sozu_command_lib::{
     certificate::Fingerprint,
-    proto::command::{QueryClusterByDomain, QueryMetricsOptions},
+    proto::command::{QueryClusterByDomain, QueryMetricsOptions, RunState},
     request::Request,
-    response::{Response, ResponseContent, ResponseStatus, RunState, WorkerInfo},
+    response::{Response, ResponseContent, ResponseStatus, WorkerInfo},
 };
 
 use crate::ctl::{
