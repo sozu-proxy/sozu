@@ -326,16 +326,17 @@ impl Backend {
 /// the bool indicates if it is active or not
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ListenersList {
-    pub http_listeners: HashMap<SocketAddr, (HttpListenerConfig, bool)>,
-    pub https_listeners: HashMap<SocketAddr, (HttpsListenerConfig, bool)>,
-    pub tcp_listeners: HashMap<SocketAddr, (TcpListenerConfig, bool)>,
+    /// address -> (listener_config, activated)
+    pub http_listeners: HashMap<String, (HttpListenerConfig, bool)>,
+    pub https_listeners: HashMap<String, (HttpsListenerConfig, bool)>,
+    pub tcp_listeners: HashMap<String, (TcpListenerConfig, bool)>,
 }
 
 /// details of an HTTP listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpListenerConfig {
-    pub address: SocketAddr,
-    pub public_address: Option<SocketAddr>,
+    pub address: String,
+    pub public_address: Option<String>,
     pub answer_404: String,
     pub answer_503: String,
     #[serde(default)]
@@ -357,8 +358,8 @@ pub struct HttpListenerConfig {
 /// details of an HTTPS listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpsListenerConfig {
-    pub address: SocketAddr,
-    pub public_address: Option<SocketAddr>,
+    pub address: String,
+    pub public_address: Option<String>,
     pub answer_404: String,
     pub answer_503: String,
     pub versions: Vec<TlsVersion>,
@@ -389,10 +390,10 @@ pub struct HttpsListenerConfig {
 /// details of an TCP listener, sent by the main process to the worker
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TcpListenerConfig {
-    pub address: SocketAddr,
+    pub address: String,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub public_address: Option<SocketAddr>,
+    pub public_address: Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if = "is_false")]
     pub expect_proxy: bool,

@@ -249,20 +249,20 @@ pub enum ListenerType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RemoveListener {
-    pub address: SocketAddr,
+    pub address: String,
     pub proxy: ListenerType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActivateListener {
-    pub address: SocketAddr,
+    pub address: String,
     pub proxy: ListenerType,
     pub from_scm: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DeactivateListener {
-    pub address: SocketAddr,
+    pub address: String,
     pub proxy: ListenerType,
     pub to_scm: bool,
 }

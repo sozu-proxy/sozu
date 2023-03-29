@@ -277,9 +277,17 @@ impl ListenerBuilder {
             .get_404_503_answers()
             .with_context(|| "Could not get 404 and 503 answers from file system")?;
 
+        let _address = self
+            .parse_address()
+            .with_context(|| "wrong socket address")?;
+
+        let _public_address = self
+            .parse_public_address()
+            .with_context(|| "wrong public address")?;
+
         let configuration = HttpListenerConfig {
-            address: self.parse_address()?,
-            public_address: self.parse_public_address()?,
+            address: self.address.clone(),
+            public_address: self.public_address.clone(),
             expect_proxy: self.expect_proxy.unwrap_or(false),
             sticky_name: self.sticky_name.clone(),
             front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
@@ -362,10 +370,18 @@ impl ListenerBuilder {
             .get_404_503_answers()
             .with_context(|| "Could not get 404 and 503 answers from file system")?;
 
+        let _address = self
+            .parse_address()
+            .with_context(|| "wrong socket address")?;
+
+        let _public_address = self
+            .parse_public_address()
+            .with_context(|| "wrong public address")?;
+
         let https_listener_config = HttpsListenerConfig {
-            address: self.parse_address()?,
+            address: self.address.clone(),
             sticky_name: self.sticky_name.clone(),
-            public_address: self.parse_public_address()?,
+            public_address: self.public_address.clone(),
             cipher_list,
             versions,
             expect_proxy: self.expect_proxy.unwrap_or(false),
@@ -395,9 +411,17 @@ impl ListenerBuilder {
             ));
         }
 
+        let _address = self
+            .parse_address()
+            .with_context(|| "wrong socket address")?;
+
+        let _public_address = self
+            .parse_public_address()
+            .with_context(|| "wrong public address")?;
+
         Ok(TcpListenerConfig {
-            address: self.parse_address()?,
-            public_address: self.parse_public_address()?,
+            address: self.address.clone(),
+            public_address: self.public_address.clone(),
             expect_proxy: self.expect_proxy.unwrap_or(false),
             front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
             back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
@@ -1078,7 +1102,7 @@ impl ConfigBuilder {
                                 if frontend.certificate.is_none() {
                                     if let Some(https_listener) =
                                         self.built.https_listeners.iter().find(|listener| {
-                                            listener.address == frontend.address
+                                            listener.address == frontend.address.to_string()
                                                 && listener.certificate.is_some()
                                         })
                                     {
@@ -1341,7 +1365,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
-                        address: listener.address,
+                        address: listener.address.clone(),
                         proxy: ListenerType::HTTP,
                         from_scm: false,
                     }),
@@ -1353,7 +1377,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
-                        address: listener.address,
+                        address: listener.address.clone(),
                         proxy: ListenerType::HTTPS,
                         from_scm: false,
                     }),
@@ -1365,7 +1389,7 @@ impl Config {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
-                        address: listener.address,
+                        address: listener.address.clone(),
                         proxy: ListenerType::TCP,
                         from_scm: false,
                     }),

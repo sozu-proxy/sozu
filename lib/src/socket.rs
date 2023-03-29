@@ -1,8 +1,9 @@
 use std::{
-    io::{self, ErrorKind, Read, Write},
+    io::{ErrorKind, Read, Write},
     net::SocketAddr,
 };
 
+use anyhow::Context;
 use mio::net::{TcpListener, TcpStream};
 use rustls::{ProtocolVersion, ServerConnection};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -342,8 +343,13 @@ impl SocketHandler for FrontRustls {
 }
 
 // TODO: Do we want to add context here or is it overkill?
-pub fn server_bind(addr: SocketAddr) -> io::Result<TcpListener> {
-    let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+pub fn server_bind(addr: String) -> anyhow::Result<TcpListener> {
+    let address: SocketAddr = addr.parse().with_context(|| "Wrong socket address")?;
+    let sock = Socket::new(
+        Domain::for_address(address),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
 
     // set so_reuseaddr, but only on unix (mirrors what libstd does)
     if cfg!(unix) {
@@ -353,7 +359,7 @@ pub fn server_bind(addr: SocketAddr) -> io::Result<TcpListener> {
     sock.set_reuse_port(true)?;
 
     // bind the socket
-    let addr = addr.into();
+    let addr = address.into();
     sock.bind(&addr)?;
 
     sock.set_nonblocking(true)?;
