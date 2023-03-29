@@ -17,11 +17,11 @@ use sozu_command_lib::{
     config::Config,
     logging,
     parser::parse_several_commands,
-    proto::command::{FrontendFilters, MetricsConfiguration, RunState},
+    proto::command::{FrontendFilters, MetricsConfiguration, RunState, WorkerInfo},
     request::{Request, WorkerRequest},
     response::{
         AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, Response,
-        ResponseContent, ResponseStatus, WorkerInfo,
+        ResponseContent, ResponseStatus,
     },
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -415,7 +415,7 @@ impl CommandServer {
             .map(|worker| WorkerInfo {
                 id: worker.id,
                 pid: worker.pid,
-                run_state: worker.run_state,
+                run_state: worker.run_state as i32,
             })
             .collect();
 
@@ -925,7 +925,7 @@ impl CommandServer {
                 };
                 worker_info_map
                     .entry(proxy_response.id)
-                    .and_modify(|worker_info| worker_info.run_state = new_run_state);
+                    .and_modify(|worker_info| worker_info.run_state = new_run_state as i32);
 
                 i += 1;
                 if i == count || now.elapsed() > Duration::from_secs(10) {

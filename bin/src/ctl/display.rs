@@ -3,9 +3,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
-use sozu_command_lib::response::{
-    AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics, ListedFrontends,
-    ListenersList, ResponseContent, WorkerInfo, WorkerMetrics,
+use sozu_command_lib::{
+    proto::command::WorkerInfo,
+    response::{
+        AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics, ListedFrontends,
+        ListenersList, ResponseContent, WorkerMetrics,
+    },
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {

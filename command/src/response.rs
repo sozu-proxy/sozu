@@ -9,7 +9,7 @@ use std::{
 use crate::{
     proto::command::{
         AddBackend, CertificateSummary, Cluster, LoadBalancingParams, PathRule, PathRuleKind,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, TlsVersion,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, TlsVersion, WorkerInfo,
     },
     request::{default_sticky_name, is_false, PROTOCOL_VERSION},
     state::{ClusterId, ConfigState},
@@ -379,13 +379,6 @@ impl fmt::Display for RunState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WorkerInfo {
-    pub id: u32,
-    pub pid: i32,
-    pub run_state: RunState,
-}
-
 /// a backend event that happened on a proxy
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -564,6 +557,8 @@ fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
 
 #[cfg(test)]
 mod tests {
+    use crate::proto::command::WorkerInfo;
+
     use super::*;
 
     macro_rules! test_message_answer (
@@ -606,12 +601,12 @@ mod tests {
                 WorkerInfo {
                     id: 1,
                     pid: 5678,
-                    run_state: RunState::Running,
+                    run_state: RunState::Running as i32,
                 },
                 WorkerInfo {
                     id: 0,
                     pid: 1234,
-                    run_state: RunState::Stopping,
+                    run_state: RunState::Stopping as i32,
                 },
             ))),
         }

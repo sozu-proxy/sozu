@@ -9,12 +9,12 @@
       {
         "id": 1,
         "pid": 5678,
-        "run_state": "RUNNING"
+        "run_state": 0
       },
       {
         "id": 0,
         "pid": 1234,
-        "run_state": "STOPPING"
+        "run_state": 1
       }
     ]
   }

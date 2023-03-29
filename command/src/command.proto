@@ -184,6 +184,12 @@ enum MetricsConfiguration {
     CLEAR = 2;
 }
 
+message WorkerInfo {
+    required uint32 id = 1;
+    required int32 pid = 2;
+    required RunState run_state = 3;
+}
+
 // Runstate of a worker
 enum RunState {
     RUNNING = 0;

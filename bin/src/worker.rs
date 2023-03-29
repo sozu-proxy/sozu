@@ -47,7 +47,7 @@ use sozu_command_lib::{
 
 use crate::{logging, util};
 
-use sozu_command_lib::{proto::command::RunState, response::WorkerInfo};
+use sozu_command_lib::proto::command::{RunState, WorkerInfo};
 
 /// An instance of Sōzu, as seen from the main process
 pub struct Worker {
@@ -112,7 +112,7 @@ impl Worker {
         WorkerInfo {
             id: self.id,
             pid: self.pid,
-            run_state: self.run_state,
+            run_state: self.run_state as i32,
         }
     }
 
