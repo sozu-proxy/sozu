@@ -5,11 +5,10 @@ use prettytable::{Row, Table};
 
 use sozu_command_lib::{
     proto::command::{
-        filtered_metrics, ClusterMetrics, FilteredMetrics, WorkerInfo, WorkerMetrics,
+        filtered_metrics, AggregatedMetrics, ClusterMetrics, FilteredMetrics, WorkerInfo,
+        WorkerMetrics,
     },
-    response::{
-        AggregatedMetrics, AvailableMetrics, ListedFrontends, ListenersList, ResponseContent,
-    },
+    response::{AvailableMetrics, ListedFrontends, ListenersList, ResponseContent},
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {

@@ -198,6 +198,12 @@ enum RunState {
     NOT_ANSWERING = 3;
 }
 
+// Aggregated metrics of main process & workers
+message AggregatedMetrics {
+    map<string, FilteredMetrics> main = 1;
+    map<string, WorkerMetrics> workers = 2;
+}
+
 // All metrics of a worker: proxy and clusters
 // Populated by Options so partial results can be sent
 message WorkerMetrics {

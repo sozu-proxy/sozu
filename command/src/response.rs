@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     proto::command::{
-        AddBackend, CertificateSummary, Cluster, FilteredMetrics, FilteredTimeSerie,
+        AddBackend, AggregatedMetrics, CertificateSummary, Cluster, FilteredTimeSerie,
         LoadBalancingParams, PathRule, PathRuleKind, RequestHttpFrontend, RequestTcpFrontend,
         RulePosition, RunState, TlsVersion, WorkerInfo, WorkerMetrics,
     },
@@ -476,13 +476,6 @@ impl fmt::Display for WorkerResponse {
     }
 }
 
-/// Aggregated metrics of main process & workers, for the CLI
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AggregatedMetrics {
-    pub main: BTreeMap<String, FilteredMetrics>,
-    pub workers: BTreeMap<String, WorkerMetrics>,
-}
-
 impl fmt::Display for FilteredTimeSerie {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
@@ -501,8 +494,8 @@ fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
 #[cfg(test)]
 mod tests {
     use crate::proto::command::{
-        filtered_metrics, BackendMetrics, ClusterMetrics, FilteredMetrics, Percentiles, WorkerInfo,
-        WorkerMetrics,
+        filtered_metrics, AggregatedMetrics, BackendMetrics, ClusterMetrics, FilteredMetrics,
+        Percentiles, WorkerInfo, WorkerMetrics,
     };
 
     use super::*;
