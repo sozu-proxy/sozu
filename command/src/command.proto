@@ -161,3 +161,15 @@ message QueryClusterByDomain {
     required string hostname = 1;
     optional string path = 2;
 }
+
+// Options when querying metrics
+message QueryMetricsOptions {
+    // query a list of available metrics
+    required bool list = 1;
+    // query metrics for these clusters
+    repeated string cluster_ids = 2;
+    // query metrics for these backends
+    repeated string backend_ids = 3;
+    // query only these metrics
+    repeated string metric_names = 4;
+}

@@ -16,8 +16,7 @@ use mio::net::UdpSocket;
 use sozu_command::response::ResponseContent;
 
 use crate::sozu_command::{
-    request::{MetricsConfiguration, QueryMetricsOptions},
-    response::FilteredMetrics,
+    proto::command::QueryMetricsOptions, request::MetricsConfiguration, response::FilteredMetrics,
 };
 
 use self::{local_drain::LocalDrain, network_drain::NetworkDrain};
