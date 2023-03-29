@@ -9,7 +9,8 @@ use std::{
 use crate::{
     proto::command::{
         AddBackend, CertificateSummary, Cluster, LoadBalancingParams, PathRule, PathRuleKind,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, TlsVersion, WorkerInfo,
+        Percentiles, RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, TlsVersion,
+        WorkerInfo,
     },
     request::{default_sticky_name, is_false, PROTOCOL_VERSION},
     state::{ClusterId, ConfigState},
@@ -537,18 +538,6 @@ impl fmt::Debug for FilteredTimeSerie {
     &self.last_minute[0..10], &self.last_minute[10..20], &self.last_minute[20..30], &self.last_minute[30..40], &self.last_minute[40..50], &self.last_minute[50..60],
     &self.last_hour[0..10], &self.last_hour[10..20], &self.last_hour[20..30], &self.last_hour[30..40], &self.last_hour[40..50], &self.last_hour[50..60])
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-pub struct Percentiles {
-    pub samples: u64,
-    pub p_50: u64,
-    pub p_90: u64,
-    pub p_99: u64,
-    pub p_99_9: u64,
-    pub p_99_99: u64,
-    pub p_99_999: u64,
-    pub p_100: u64,
 }
 
 fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {

@@ -197,3 +197,14 @@ enum RunState {
     STOPPED = 2;
     NOT_ANSWERING = 3;
 }
+
+message Percentiles {
+    required uint64 samples = 1;
+    required uint64 p_50 = 2;
+    required uint64 p_90 = 3;
+    required uint64 p_99 = 4;
+    required uint64 p_99_9 = 5;
+    required uint64 p_99_99 = 6;
+    required uint64 p_99_999 = 7;
+    required uint64 p_100 = 8;
+}
