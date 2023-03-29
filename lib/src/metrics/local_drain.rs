@@ -6,8 +6,7 @@ use hdrhistogram::Histogram;
 use sozu_command::response::{AvailableMetrics, BackendMetrics, ResponseContent};
 
 use crate::sozu_command::{
-    proto::command::QueryMetricsOptions,
-    request::MetricsConfiguration,
+    proto::command::{MetricsConfiguration, QueryMetricsOptions},
     response::{ClusterMetrics, FilteredMetrics, Percentiles, WorkerMetrics},
 };
 

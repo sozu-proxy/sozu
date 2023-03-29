@@ -12,7 +12,7 @@ use crate::{
     proto::command::{
         AddBackend, AddCertificate, Cluster, FrontendFilters, LoadBalancingAlgorithms,
         PathRuleKind, QueryClusterByDomain, QueryMetricsOptions, RemoveBackend, RemoveCertificate,
-        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,MetricsConfiguration
     },
     response::{
         HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
@@ -280,13 +280,6 @@ impl Display for RequestHttpFrontend {
             None => write!(f, "{s}"),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum MetricsConfiguration {
-    Enabled,
-    Disabled,
-    Clear,
 }
 
 #[derive(Debug)]

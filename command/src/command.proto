@@ -173,3 +173,13 @@ message QueryMetricsOptions {
     // query only these metrics
     repeated string metric_names = 4;
 }
+
+// options to configure metrics collection
+enum MetricsConfiguration {
+    // enable metrics collection
+    ENABLED = 0;
+    // disable metrics collection
+    DISABLED = 1;
+    // wipe the metrics memory
+    CLEAR = 2;
+}
