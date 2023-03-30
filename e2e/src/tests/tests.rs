@@ -370,11 +370,11 @@ pub fn try_tls_endpoint() -> State {
         key: String::from(include_str!("../../../lib/assets/local-key.pem")),
         certificate_chain: vec![],
         versions: vec![],
+        names: vec![],
     };
     let add_certificate = AddCertificate {
         address: front_address.to_string(),
         certificate: certificate_and_key,
-        names: vec![],
         expired_at: None,
     };
     worker.send_proxy_request(Request::AddCertificate(add_certificate));

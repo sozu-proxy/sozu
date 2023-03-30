@@ -54,7 +54,6 @@ pub trait CertificateResolver {
         let fingerprint = self.add_certificate(&AddCertificate {
             address: opts.address.to_owned(),
             certificate: opts.new_certificate.to_owned(),
-            names: opts.new_names.to_owned(),
             expired_at: opts.new_expired_at.to_owned(),
         })?;
 
@@ -103,8 +102,8 @@ pub struct CertificateOverride {
 impl From<&AddCertificate> for CertificateOverride {
     fn from(opts: &AddCertificate) -> Self {
         let mut names = None;
-        if !opts.names.is_empty() {
-            names = Some(opts.names.iter().cloned().collect())
+        if !opts.certificate.names.is_empty() {
+            names = Some(opts.certificate.names.iter().cloned().collect())
         }
 
         Self {
@@ -188,7 +187,7 @@ impl CertificateResolver for GenericCertificateResolver {
         // error.
         let parsed_certificate_and_key = Self::parse(&opts.certificate)?;
         let fingerprint = Self::fingerprint(&parsed_certificate_and_key.certificate);
-        if !opts.names.is_empty() || opts.expired_at.is_some() {
+        if !opts.certificate.names.is_empty() || opts.expired_at.is_some() {
             self.overrides
                 .insert(fingerprint.to_owned(), CertificateOverride::from(opts));
         } else {
@@ -661,6 +660,7 @@ mod tests {
             key: String::from(include_str!("../assets/key.pem")),
             certificate_chain: vec![],
             versions: vec![],
+            names: vec![],
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
@@ -669,7 +669,6 @@ mod tests {
         let fingerprint = resolver.add_certificate(&AddCertificate {
             address: address.clone(),
             certificate: certificate_and_key,
-            names: vec![],
             expired_at: None,
         })?;
 
@@ -708,6 +707,7 @@ mod tests {
             key: String::from(include_str!("../assets/key.pem")),
             certificate_chain: vec![],
             versions: vec![],
+            names: vec!["localhost".into(), "lolcatho.st".into()],
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
@@ -716,7 +716,6 @@ mod tests {
         let fingerprint = resolver.add_certificate(&AddCertificate {
             address: address.clone(),
             certificate: certificate_and_key,
-            names: vec!["localhost".into(), "lolcatho.st".into()],
             expired_at: None,
         })?;
 
@@ -769,6 +768,7 @@ mod tests {
             key: String::from(include_str!("../assets/tests/key-1y.pem")),
             certificate_chain: vec![],
             versions: vec![],
+            names: vec![],
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key_1y.certificate.as_bytes())
@@ -778,7 +778,6 @@ mod tests {
         let fingerprint_1y = resolver.add_certificate(&AddCertificate {
             address: address.clone(),
             certificate: certificate_and_key_1y,
-            names: vec![],
             expired_at: None,
         })?;
 
@@ -793,12 +792,12 @@ mod tests {
             key: String::from(include_str!("../assets/tests/key-2y.pem")),
             certificate_chain: vec![],
             versions: vec![],
+            names: vec![],
         };
 
         let fingerprint_2y = resolver.add_certificate(&AddCertificate {
             address,
             certificate: certificate_and_key_2y,
-            names: vec![],
             expired_at: None,
         })?;
 
@@ -840,6 +839,7 @@ mod tests {
             key: String::from(include_str!("../assets/tests/key-1y.pem")),
             certificate_chain: vec![],
             versions: vec![],
+            names: vec![],
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key_1y.certificate.as_bytes())
@@ -849,7 +849,6 @@ mod tests {
         let fingerprint_1y = resolver.add_certificate(&AddCertificate {
             address: address.clone(),
             certificate: certificate_and_key_1y,
-            names: vec![],
             expired_at: Some(
                 (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
                     + Duration::from_secs(3 * 365 * 24 * 3600))
@@ -868,12 +867,12 @@ mod tests {
             key: String::from(include_str!("../assets/tests/key-2y.pem")),
             certificate_chain: vec![],
             versions: vec![],
+            names: vec![],
         };
 
         let fingerprint_2y = resolver.add_certificate(&AddCertificate {
             address,
             certificate: certificate_and_key_2y,
-            names: vec![],
             expired_at: None,
         })?;
 
@@ -913,36 +912,42 @@ mod tests {
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],
                 versions: vec![],
+                names: vec![],
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-2.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],
                 versions: vec![],
+                names: vec![],
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-3.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],
                 versions: vec![],
+                names: vec![],
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-4.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],
                 versions: vec![],
+                names: vec![],
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-5.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],
                 versions: vec![],
+                names: vec![],
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-6.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
                 certificate_chain: vec![],
                 versions: vec![],
+                names: vec![],
             },
         ];
 
@@ -966,7 +971,6 @@ mod tests {
             resolver.add_certificate(&AddCertificate {
                 address: address.clone(),
                 certificate: certificate.to_owned(),
-                names: vec![],
                 expired_at: None,
             })?;
         }

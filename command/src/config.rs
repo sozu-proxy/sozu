@@ -753,8 +753,8 @@ impl HttpFrontendConfig {
                     certificate: self.certificate.clone().unwrap(),
                     certificate_chain: self.certificate_chain.clone().unwrap_or_default(),
                     versions: self.tls_versions.iter().map(|v| *v as i32).collect(),
+                    names: vec![self.hostname.clone()],
                 },
-                names: vec![self.hostname.clone()],
                 expired_at: None,
             }));
 

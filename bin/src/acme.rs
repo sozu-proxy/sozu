@@ -370,8 +370,8 @@ fn add_certificate(
                 certificate_chain,
                 key,
                 versions,
+                names: vec![hostname.to_string()],
             },
-            names: vec![hostname.to_string()],
             expired_at: None,
         }),
 
@@ -382,9 +382,9 @@ fn add_certificate(
                 certificate_chain,
                 key,
                 versions,
+                names: vec![hostname.to_string()],
             },
             old_fingerprint: Fingerprint(f).to_string(),
-            new_names: vec![hostname.to_string()],
             new_expired_at: None,
         }),
     };

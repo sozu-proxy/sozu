@@ -436,14 +436,18 @@ impl CommandManager {
         key_path: &str,
         versions: Vec<TlsVersion>,
     ) -> anyhow::Result<()> {
-        let new_certificate =
-            load_full_certificate(certificate_path, certificate_chain_path, key_path, versions)
-                .with_context(|| "Could not load the full certificate")?;
+        let new_certificate = load_full_certificate(
+            certificate_path,
+            certificate_chain_path,
+            key_path,
+            versions,
+            vec![],
+        )
+        .with_context(|| "Could not load the full certificate")?;
 
         self.order_request(Request::AddCertificate(AddCertificate {
             address,
             certificate: new_certificate,
-            names: vec![],
             expired_at: None,
         }))
     }
@@ -476,6 +480,7 @@ impl CommandManager {
             new_certificate_chain_path,
             new_key_path,
             versions,
+            vec![],
         )
         .with_context(|| "Could not load the full certificate")?;
 
@@ -483,7 +488,6 @@ impl CommandManager {
             address,
             new_certificate,
             old_fingerprint: old_fingerprint.to_string(),
-            new_names: vec![],
             new_expired_at: None,
         }))?;
 
@@ -538,6 +542,7 @@ fn load_full_certificate(
     certificate_chain_path: &str,
     key_path: &str,
     versions: Vec<TlsVersion>,
+    names: Vec<String>,
 ) -> Result<CertificateAndKey, anyhow::Error> {
     let certificate = Config::load_file(certificate_path)
         .with_context(|| format!("Could not load certificate file on path {certificate_path}"))?;
@@ -558,5 +563,6 @@ fn load_full_certificate(
         certificate_chain,
         key,
         versions,
+        names,
     })
 }

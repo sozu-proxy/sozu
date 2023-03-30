@@ -57,9 +57,8 @@ enum RulePosition {
 message AddCertificate {
     required string address = 1;
     required CertificateAndKey certificate = 2;
-    repeated string names = 3;
     // A unix timestamp. Overrides certificate expiration.
-    optional int64 expired_at = 4;
+    optional int64 expired_at = 3;
 }
 
 message RemoveCertificate {
@@ -73,9 +72,8 @@ message ReplaceCertificate {
     required CertificateAndKey new_certificate = 2;
     // a hex-encoded TLS fingerprint to identify the old certificate
     required string old_fingerprint = 3;
-    repeated string new_names = 4;
     // A unix timestamp. Overrides certificate expiration.
-    optional int64 new_expired_at = 5;
+    optional int64 new_expired_at = 4;
 }
 
 message CertificateAndKey {
@@ -83,6 +81,8 @@ message CertificateAndKey {
     repeated string certificate_chain = 2;
     required string key = 3;
     repeated TlsVersion versions = 4;
+    // hostnames linked to the certificate
+    repeated string names = 5;
 }
 
 // domain name and fingerprint of a certificate
