@@ -106,10 +106,10 @@ impl ConfigState {
                 .replace_certificate(replace)
                 .with_context(|| "Could not replace certificate"),
             Request::AddHttpsFrontend(front) => self
-                .add_http_frontend(front)
+                .add_https_frontend(front)
                 .with_context(|| "Could not add HTTPS frontend"),
             Request::RemoveHttpsFrontend(front) => self
-                .remove_http_frontend(front)
+                .remove_https_frontend(front)
                 .with_context(|| "Could not remove HTTPS frontend"),
             Request::AddTcpFrontend(front) => self
                 .add_tcp_frontend(front)
@@ -296,8 +296,30 @@ impl ConfigState {
         Ok(())
     }
 
+    fn add_https_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
+        match self.https_fronts.entry(front.to_string()) {
+            BTreeMapEntry::Vacant(e) => e.insert(front.clone().to_frontend()?),
+            BTreeMapEntry::Occupied(_) => bail!("This frontend is already present: {:?}", front),
+        };
+        Ok(())
+    }
+
     fn remove_http_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
         if self.http_fronts.remove(&front.to_string()).is_none() {
+            let error_msg = match &front.cluster_id {
+                Some(cluster_id) => format!(
+                    "No such frontend at {} for the cluster {}",
+                    front.address, cluster_id
+                ),
+                None => format!("No such frontend at {}", front.address),
+            };
+            bail!(error_msg);
+        }
+        Ok(())
+    }
+
+    fn remove_https_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
+        if self.https_fronts.remove(&front.to_string()).is_none() {
             let error_msg = match &front.cluster_id {
                 Some(cluster_id) => format!(
                     "No such frontend at {} for the cluster {}",
