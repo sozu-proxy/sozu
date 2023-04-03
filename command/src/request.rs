@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, error, fmt, net::SocketAddr, str::FromStr};
+use std::{
+    collections::BTreeMap,
+    error,
+    fmt::{self, Display},
+    net::SocketAddr,
+    str::FromStr,
+};
 
 use anyhow::Context;
 
@@ -7,7 +13,7 @@ use crate::{
     config::ProxyProtocolConfig,
     response::{
         is_default_path_rule, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId,
-        PathRule, RulePosition, TcpListenerConfig, PathRuleKind,
+        PathRule, PathRuleKind, RulePosition, TcpListenerConfig,
     },
     state::ClusterId,
 };
@@ -345,10 +351,12 @@ impl RequestHttpFrontend {
             tags: self.tags,
         })
     }
+}
 
+impl Display for RequestHttpFrontend {
     /// Used to create a unique summary of the frontend, used as a key in maps
-    pub fn to_string(&self) -> String {
-        let mut s = match &self.path.kind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match &self.path.kind {
             PathRuleKind::Prefix => {
                 format!("{};{};P{}", self.address, self.hostname, self.path.value)
             }
@@ -360,11 +368,10 @@ impl RequestHttpFrontend {
             }
         };
 
-        if let Some(method) = &self.method {
-            s = format!("{s};{method}");
+        match &self.method {
+            Some(method) => write!(f, "{s};{method}"),
+            None => write!(f, "{s}"),
         }
-
-        s
     }
 }
 
