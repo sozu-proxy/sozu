@@ -14,15 +14,12 @@ use anyhow::{bail, Context};
 use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
-        AddBackend, AddCertificate, CertificateAndKey, Cluster, HttpListenerConfig, PathRule,
-        RemoveBackend, RemoveCertificate, ReplaceCertificate, RequestHttpFrontend,
-        RequestTcpFrontend,
+        AddBackend, AddCertificate, CertificateAndKey, Cluster, HttpListenerConfig,
+        HttpsListenerConfig, PathRule, RemoveBackend, RemoveCertificate, ReplaceCertificate,
+        RequestHttpFrontend, RequestTcpFrontend,
     },
     request::{ActivateListener, DeactivateListener, ListenerType, RemoveListener, Request},
-    response::{
-        Backend, ClusterInformation, HttpFrontend, HttpsListenerConfig, TcpFrontend,
-        TcpListenerConfig,
-    },
+    response::{Backend, ClusterInformation, HttpFrontend, TcpFrontend, TcpListenerConfig},
 };
 
 /// To use throughout Sōzu
@@ -1620,33 +1617,16 @@ mod tests {
         state
             .dispatch(&Request::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
-                answer_404: String::new(),
-                answer_503: String::new(),
-                sticky_name: String::new(),
                 ..Default::default()
             }))
             .expect("Could not execute request");
         state
             .dispatch(&Request::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
-                answer_404: String::new(),
+                // answer_404: String::new(),
                 answer_503: String::new(),
                 sticky_name: String::new(),
-                versions: vec![],
-                cipher_list: vec![],
-                cipher_suites: vec![],
-                signature_algorithms: vec![],
-                groups_list: vec![],
-                certificate: None,
-                certificate_chain: vec![],
-                key: None,
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
-                active: false,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1688,24 +1668,8 @@ mod tests {
         state2
             .dispatch(&Request::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
                 answer_404: String::from("test"),
-                answer_503: String::new(),
-                sticky_name: String::new(),
-                versions: vec![],
-                cipher_list: vec![],
-                cipher_suites: vec![],
-                signature_algorithms: vec![],
-                groups_list: vec![],
-                certificate: None,
-                certificate_chain: vec![],
-                key: None,
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
-                active: false,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state2
@@ -1757,24 +1721,8 @@ mod tests {
             }),
             Request::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
                 answer_404: String::from("test"),
-                answer_503: String::new(),
-                sticky_name: String::new(),
-                versions: vec![],
-                cipher_list: vec![],
-                cipher_suites: vec![],
-                signature_algorithms: vec![],
-                groups_list: vec![],
-                certificate: None,
-                certificate_chain: vec![],
-                key: None,
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
-                active: false,
+                ..Default::default()
             }),
         ];
 

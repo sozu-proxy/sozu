@@ -33,12 +33,12 @@ use sozu_command::{
     config::DEFAULT_CIPHER_SUITES,
     logging,
     proto::command::{
-        AddCertificate, CertificateSummary, Cluster, RemoveCertificate, ReplaceCertificate,
-        RequestHttpFrontend, TlsVersion,
+        AddCertificate, CertificateSummary, Cluster, HttpsListenerConfig, RemoveCertificate,
+        ReplaceCertificate, RequestHttpFrontend, TlsVersion,
     },
     ready::Ready,
     request::{RemoveListener, Request, WorkerRequest},
-    response::{HttpFrontend, HttpsListenerConfig, ResponseContent, WorkerResponse},
+    response::{HttpFrontend, ResponseContent, WorkerResponse},
     scm_socket::ScmSocket,
     state::ClusterId,
 };
@@ -775,11 +775,11 @@ impl HttpsListener {
         let versions = config
             .versions
             .iter()
-            .filter_map(|version| match version {
-                TlsVersion::TlsV12 => Some(&rustls::version::TLS12),
-                TlsVersion::TlsV13 => Some(&rustls::version::TLS13),
-                other_version => {
-                    error!("unsupported TLS version: {:?}", other_version);
+            .filter_map(|version| match TlsVersion::from_i32(*version) {
+                Some(TlsVersion::TlsV12) => Some(&rustls::version::TLS12),
+                Some(TlsVersion::TlsV13) => Some(&rustls::version::TLS13),
+                _other_version => {
+                    error!("unsupported TLS version: {:?}", _other_version);
                     None
                 }
             })

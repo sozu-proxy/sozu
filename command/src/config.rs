@@ -16,11 +16,11 @@ use crate::{
     certificate::split_certificate_chain,
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, Cluster, HttpListenerConfig,
-        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, PathRule, ProxyProtocolConfig,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, TlsVersion,
+        HttpsListenerConfig, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, PathRule,
+        ProxyProtocolConfig, RequestHttpFrontend, RequestTcpFrontend, RulePosition, TlsVersion,
     },
     request::{ActivateListener, ListenerType, Request, WorkerRequest},
-    response::{HttpsListenerConfig, TcpListenerConfig},
+    response::TcpListenerConfig,
 };
 
 /// [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS
@@ -328,8 +328,8 @@ impl ListenerBuilder {
         let groups_list: Vec<String> = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
 
         let versions = match self.tls_versions {
-            None => vec![TlsVersion::TlsV12, TlsVersion::TlsV13],
-            Some(ref v) => v.clone(),
+            None => vec![TlsVersion::TlsV12 as i32, TlsVersion::TlsV13 as i32],
+            Some(ref v) => v.iter().map(|v| *v as i32).collect(),
         };
 
         let key = self.key.as_ref().and_then(|path| {

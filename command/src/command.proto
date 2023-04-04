@@ -21,6 +21,38 @@ message HttpListenerConfig {
     required bool active = 11 [default = false];
 }
 
+// details of an HTTPS listener
+message HttpsListenerConfig {
+    required string address = 1;
+    optional string public_address = 2;
+    required string answer_404 = 3;
+    required string answer_503 = 4;
+    required bool expect_proxy = 5 [default = false];
+    required string sticky_name = 6;
+    // client inactive time, in seconds
+    required uint32 front_timeout = 7 [default = 60];
+    // backend server inactive time, in seconds
+    required uint32 back_timeout = 8 [default = 30];
+    // time to connect to the backend, in seconds
+    required uint32 connect_timeout = 9 [default = 3];
+    // max time to send a complete request, in seconds
+    required uint32 request_timeout = 10 [default = 10];
+    // wether the listener is actively listening on its socket
+    required bool active = 11 [default = false];
+    // TLS versions
+    repeated TlsVersion versions = 12;
+    repeated string cipher_list = 13;
+    repeated string cipher_suites = 14;
+    repeated string signature_algorithms = 15;
+    repeated string groups_list = 16;
+    optional string certificate = 17;
+    repeated string certificate_chain = 18;
+    optional string key = 19;
+}
+
+
+
+
 message RequestHttpFrontend {
     optional string cluster_id = 1;
     required string address = 2;

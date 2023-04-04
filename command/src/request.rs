@@ -11,11 +11,11 @@ use crate::{
     certificate::Fingerprint,
     proto::command::{
         AddBackend, AddCertificate, Cluster, FrontendFilters, HttpListenerConfig,
-        LoadBalancingAlgorithms, MetricsConfiguration, PathRuleKind, QueryClusterByDomain,
-        QueryMetricsOptions, RemoveBackend, RemoveCertificate, ReplaceCertificate,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        HttpsListenerConfig, LoadBalancingAlgorithms, MetricsConfiguration, PathRuleKind,
+        QueryClusterByDomain, QueryMetricsOptions, RemoveBackend, RemoveCertificate,
+        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
     },
-    response::{HttpFrontend, HttpsListenerConfig, MessageId, TcpListenerConfig},
+    response::{HttpFrontend, MessageId, TcpListenerConfig},
     state::ClusterId,
 };
 

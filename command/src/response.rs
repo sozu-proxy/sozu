@@ -9,8 +9,9 @@ use std::{
 use crate::{
     proto::command::{
         AddBackend, AggregatedMetrics, CertificateSummary, Cluster, FilteredTimeSerie,
-        LoadBalancingParams, PathRule, PathRuleKind, RequestHttpFrontend, RequestTcpFrontend,
-        RulePosition, RunState, TlsVersion, WorkerInfo, WorkerMetrics, HttpListenerConfig,
+        HttpListenerConfig, HttpsListenerConfig, LoadBalancingParams, PathRule, PathRuleKind,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, TlsVersion, WorkerInfo,
+        WorkerMetrics,
     },
     request::{default_sticky_name, is_false, PROTOCOL_VERSION},
     state::{ClusterId, ConfigState},
@@ -293,41 +294,6 @@ pub struct ListenersList {
     pub http_listeners: HashMap<String, HttpListenerConfig>,
     pub https_listeners: HashMap<String, HttpsListenerConfig>,
     pub tcp_listeners: HashMap<String, TcpListenerConfig>,
-}
-
-// TODO: implement Default
-/// details of an HTTPS listener, sent by the main process to the worker
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HttpsListenerConfig {
-    pub address: String,
-    pub public_address: Option<String>,
-    pub answer_404: String,
-    pub answer_503: String,
-    pub versions: Vec<TlsVersion>,
-    pub cipher_list: Vec<String>,
-    #[serde(default)]
-    pub cipher_suites: Vec<String>,
-    #[serde(default)]
-    pub signature_algorithms: Vec<String>,
-    #[serde(default)]
-    pub groups_list: Vec<String>,
-    #[serde(default)]
-    pub expect_proxy: bool,
-    #[serde(default = "default_sticky_name")]
-    pub sticky_name: String,
-    #[serde(default)]
-    pub certificate: Option<String>,
-    #[serde(default)]
-    pub certificate_chain: Vec<String>,
-    #[serde(default)]
-    pub key: Option<String>,
-    pub front_timeout: u32,
-    pub back_timeout: u32,
-    pub connect_timeout: u32,
-    /// max time to send a complete request
-    pub request_timeout: u32,
-    /// should default to false
-    pub active: bool,
 }
 
 // TODO: implement Default
