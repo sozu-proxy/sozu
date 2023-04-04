@@ -4,14 +4,12 @@ use std::{
         hash_map::{DefaultHasher, Entry as HashMapEntry},
         BTreeMap, BTreeSet, HashMap, HashSet,
     },
-    fmt,
     hash::{Hash, Hasher},
     iter::{repeat, FromIterator},
     net::SocketAddr,
 };
 
 use anyhow::{bail, Context};
-use serde::de::{self, Visitor};
 
 use crate::{
     certificate::{calculate_fingerprint, CertificateAndKey, Fingerprint},
@@ -22,7 +20,7 @@ use crate::{
     },
     response::{
         Backend, ClusterInformation, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        PathRule, PathRuleKind, TcpFrontend, TcpListenerConfig,
+        PathRule, TcpFrontend, TcpListenerConfig,
     },
 };
 
@@ -48,14 +46,14 @@ pub struct HttpsProxy {
 pub struct ConfigState {
     pub clusters: BTreeMap<ClusterId, Cluster>,
     pub backends: BTreeMap<ClusterId, Vec<Backend>>,
-    /// the bool indicates if it is active or not
     pub http_listeners: HashMap<String, HttpListenerConfig>,
     pub https_listeners: HashMap<String, HttpsListenerConfig>,
     pub tcp_listeners: HashMap<String, TcpListenerConfig>,
+    /// HTTP frontends, indexed by a summary of each front's address;hostname;path, for uniqueness.
+    /// For example: `"0.0.0.0:8080;lolcatho.st;P/api"`
+    pub http_fronts: BTreeMap<String, HttpFrontend>,
     /// indexed by (address, hostname, path)
-    pub http_fronts: BTreeMap<RouteKey, HttpFrontend>,
-    /// indexed by (address, hostname, path)
-    pub https_fronts: BTreeMap<RouteKey, HttpFrontend>,
+    pub https_fronts: BTreeMap<String, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
     /// certificate and names
     pub certificates: HashMap<SocketAddr, HashMap<Fingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -108,10 +106,10 @@ impl ConfigState {
                 .replace_certificate(replace)
                 .with_context(|| "Could not replace certificate"),
             Request::AddHttpsFrontend(front) => self
-                .add_http_frontend(front)
+                .add_https_frontend(front)
                 .with_context(|| "Could not add HTTPS frontend"),
             Request::RemoveHttpsFrontend(front) => self
-                .remove_http_frontend(front)
+                .remove_https_frontend(front)
                 .with_context(|| "Could not remove HTTPS frontend"),
             Request::AddTcpFrontend(front) => self
                 .add_tcp_frontend(front)
@@ -291,7 +289,15 @@ impl ConfigState {
     }
 
     fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
-        match self.http_fronts.entry(front.route_key()) {
+        match self.http_fronts.entry(front.to_string()) {
+            BTreeMapEntry::Vacant(e) => e.insert(front.clone().to_frontend()?),
+            BTreeMapEntry::Occupied(_) => bail!("This frontend is already present: {:?}", front),
+        };
+        Ok(())
+    }
+
+    fn add_https_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
+        match self.https_fronts.entry(front.to_string()) {
             BTreeMapEntry::Vacant(e) => e.insert(front.clone().to_frontend()?),
             BTreeMapEntry::Occupied(_) => bail!("This frontend is already present: {:?}", front),
         };
@@ -299,7 +305,21 @@ impl ConfigState {
     }
 
     fn remove_http_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
-        if self.http_fronts.remove(&front.route_key()).is_none() {
+        if self.http_fronts.remove(&front.to_string()).is_none() {
+            let error_msg = match &front.cluster_id {
+                Some(cluster_id) => format!(
+                    "No such frontend at {} for the cluster {}",
+                    front.address, cluster_id
+                ),
+                None => format!("No such frontend at {}", front.address),
+            };
+            bail!(error_msg);
+        }
+        Ok(())
+    }
+
+    fn remove_https_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
+        if self.https_fronts.remove(&front.to_string()).is_none() {
             let error_msg = match &front.cluster_id {
                 Some(cluster_id) => format!(
                     "No such frontend at {} for the cluster {}",
@@ -870,11 +890,11 @@ impl ConfigState {
             }
         }
 
-        let mut my_http_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
+        let mut my_http_fronts: HashSet<(&str, &HttpFrontend)> = HashSet::new();
         for (route, front) in self.http_fronts.iter() {
             my_http_fronts.insert((route, front));
         }
-        let mut their_http_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
+        let mut their_http_fronts: HashSet<(&str, &HttpFrontend)> = HashSet::new();
         for (route, front) in other.http_fronts.iter() {
             their_http_fronts.insert((route, front));
         }
@@ -890,11 +910,11 @@ impl ConfigState {
             v.push(Request::AddHttpFrontend(front.clone().into()));
         }
 
-        let mut my_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
+        let mut my_https_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
         for (route, front) in self.https_fronts.iter() {
             my_https_fronts.insert((route, front));
         }
-        let mut their_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
+        let mut their_https_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
         for (route, front) in other.https_fronts.iter() {
             their_https_fronts.insert((route, front));
         }
@@ -1817,118 +1837,5 @@ mod tests {
         let _hash2 = state2.hash_state();
 
         assert_eq!(diff, e);
-    }
-}
-
-/// `RouteKey` is the routing key built from the following tuple.
-#[derive(PartialOrd, Ord, Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RouteKey {
-    pub address: String,
-    hostname: String,
-    pub path_rule: PathRule,
-    pub method: Option<String>,
-}
-
-impl serde::Serialize for RouteKey {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut s = match &self.path_rule.kind {
-            PathRuleKind::Prefix => format!(
-                "{};{};P{}",
-                self.address, self.hostname, self.path_rule.value
-            ),
-            PathRuleKind::Regex => format!(
-                "{};{};R{}",
-                self.address, self.hostname, self.path_rule.value
-            ),
-            PathRuleKind::Equals => format!(
-                "{};{};={}",
-                self.address, self.hostname, self.path_rule.value
-            ),
-        };
-
-        if let Some(method) = &self.method {
-            s = format!("{s};{method}");
-        }
-
-        serializer.serialize_str(&s)
-    }
-}
-
-impl From<RequestHttpFrontend> for RouteKey {
-    fn from(frontend: RequestHttpFrontend) -> Self {
-        Self {
-            address: frontend.address,
-            hostname: frontend.hostname,
-            path_rule: frontend.path,
-            method: frontend.method,
-        }
-    }
-}
-
-impl From<&RequestHttpFrontend> for RouteKey {
-    fn from(frontend: &RequestHttpFrontend) -> Self {
-        Self {
-            address: frontend.address.clone(),
-            hostname: frontend.hostname.clone(),
-            path_rule: frontend.path.clone(),
-            method: frontend.method.clone(),
-        }
-    }
-}
-
-struct RouteKeyVisitor {}
-
-impl<'de> Visitor<'de> for RouteKeyVisitor {
-    type Value = RouteKey;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("parsing a route key")
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<RouteKey, E>
-    where
-        E: de::Error,
-    {
-        let mut it = value.split(';');
-        let address = it
-            .next()
-            .ok_or_else(|| E::custom("invalid format".to_string()))
-            .map(|s| s.to_string())?;
-
-        let hostname = it
-            .next()
-            .ok_or_else(|| E::custom("invalid format".to_string()))?;
-
-        let path_rule_str = it
-            .next()
-            .ok_or_else(|| E::custom("invalid format".to_string()))?;
-
-        let path_rule = match path_rule_str.chars().next() {
-            Some('R') => PathRule::regex(String::from(&path_rule_str[1..])),
-            Some('P') => PathRule::prefix(String::from(&path_rule_str[1..])),
-            Some('=') => PathRule::equals(String::from(&path_rule_str[1..])),
-            _ => return Err(E::custom("invalid path rule".to_string())),
-        };
-
-        let method = it.next().map(String::from);
-
-        Ok(RouteKey {
-            address,
-            hostname: hostname.to_string(),
-            path_rule,
-            method,
-        })
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for RouteKey {
-    fn deserialize<D>(deserializer: D) -> Result<RouteKey, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        deserializer.deserialize_str(RouteKeyVisitor {})
     }
 }
