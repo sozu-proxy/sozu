@@ -35,10 +35,10 @@ use crate::{
     socket::server_bind,
     sozu_command::{
         logging,
-        proto::command::{ProxyProtocolConfig, RequestTcpFrontend},
+        proto::command::{ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig},
         ready::Ready,
         request::{Request, WorkerRequest},
-        response::{Event, TcpListenerConfig, WorkerResponse},
+        response::{Event, WorkerResponse},
         scm_socket::ScmSocket,
         state::ClusterId,
     },
@@ -1802,12 +1802,7 @@ mod tests {
             let mut configuration = TcpProxy::new(registry, sessions.clone(), backends.clone());
             let listener_config = TcpListenerConfig {
                 address: "127.0.0.1:1234".to_string(),
-                public_address: None,
-                expect_proxy: false,
-                front_timeout: 60,
-                back_timeout: 30,
-                connect_timeout: 3,
-                active: false,
+                ..Default::default()
             };
 
             {

@@ -17,10 +17,10 @@ use crate::{
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, Cluster, HttpListenerConfig,
         HttpsListenerConfig, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, PathRule,
-        ProxyProtocolConfig, RequestHttpFrontend, RequestTcpFrontend, RulePosition, TlsVersion,
+        ProxyProtocolConfig, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        TcpListenerConfig, TlsVersion,
     },
     request::{ActivateListener, ListenerType, Request, WorkerRequest},
-    response::TcpListenerConfig,
 };
 
 /// [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS

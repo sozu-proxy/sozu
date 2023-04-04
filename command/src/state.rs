@@ -16,10 +16,10 @@ use crate::{
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, Cluster, HttpListenerConfig,
         HttpsListenerConfig, PathRule, RemoveBackend, RemoveCertificate, ReplaceCertificate,
-        RequestHttpFrontend, RequestTcpFrontend,
+        RequestHttpFrontend, RequestTcpFrontend, TcpListenerConfig,
     },
     request::{ActivateListener, DeactivateListener, ListenerType, RemoveListener, Request},
-    response::{Backend, ClusterInformation, HttpFrontend, TcpFrontend, TcpListenerConfig},
+    response::{Backend, ClusterInformation, HttpFrontend, TcpFrontend},
 };
 
 /// To use throughout Sōzu
@@ -1599,12 +1599,7 @@ mod tests {
         state
             .dispatch(&Request::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
-                front_timeout: 60,
-                back_timeout: 30,
-                connect_timeout: 3,
-                active: false,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1641,12 +1636,8 @@ mod tests {
         state2
             .dispatch(&Request::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
-                public_address: None,
                 expect_proxy: true,
-                front_timeout: 60,
-                back_timeout: 30,
-                connect_timeout: 3,
-                active: false,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state2
@@ -1687,12 +1678,8 @@ mod tests {
             }),
             Request::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
-                public_address: None,
                 expect_proxy: true,
-                front_timeout: 60,
-                back_timeout: 30,
-                connect_timeout: 3,
-                active: false,
+                ..Default::default()
             }),
             Request::DeactivateListener(DeactivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),

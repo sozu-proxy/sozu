@@ -18,14 +18,11 @@ use sozu_command::{
     config::Config,
     proto::command::{
         AddBackend, Cluster, HttpListenerConfig, HttpsListenerConfig, LoadBalancingAlgorithms,
-        LoadMetric, RemoveBackend,
+        LoadMetric, RemoveBackend, TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
     request::{ActivateListener, DeactivateListener, ListenerType, Request, WorkerRequest},
-    response::{
-        Event, MessageId, ResponseContent, ResponseStatus, TcpListenerConfig as CommandTcpListener,
-        WorkerResponse,
-    },
+    response::{Event, MessageId, ResponseContent, ResponseStatus, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
 };
