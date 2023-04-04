@@ -1052,16 +1052,17 @@ impl Server {
         let token = Token(entry.key());
 
         match self.http.borrow_mut().add_listener(listener.clone(), token) {
-            Some(_token) => {
+            Ok(_token) => {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::HTTPListen,
                 })));
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
-            None => {
-                error!("Couldn't add HTTP listener");
-                WorkerResponse::error(req_id, "cannot add HTTP listener")
+            Err(e) => {
+                let error = format!("Couldn't add HTTP listener: {:#}", e);
+                error!("{}", error);
+                WorkerResponse::error(req_id, error)
             }
         }
     }
@@ -1120,16 +1121,17 @@ impl Server {
             .borrow_mut()
             .add_listener(listener, self.pool.clone(), token)
         {
-            Some(_token) => {
+            Ok(_token) => {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::TCPListen,
                 })));
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
-            None => {
-                error!("Couldn't add TCP listener");
-                WorkerResponse::error(req_id, "cannot add TCP listener")
+            Err(e) => {
+                let error = format!("Couldn't add TCP listener: {:#}", e);
+                error!("{}", error);
+                WorkerResponse::error(req_id, error)
             }
         }
     }
@@ -1144,18 +1146,20 @@ impl Server {
             req_id, activate.proxy, activate
         );
 
+        let address: std::net::SocketAddr = match activate.address.parse() {
+            Ok(a) => a,
+            Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {}", e)),
+        };
+
         match activate.proxy {
             ListenerType::HTTP => {
                 let listener = self
                     .scm_listeners
                     .as_mut()
-                    .and_then(|s| s.get_http(&activate.address))
+                    .and_then(|s| s.get_http(&address))
                     .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
 
-                let activated_token = self
-                    .http
-                    .borrow_mut()
-                    .activate_listener(&activate.address, listener);
+                let activated_token = self.http.borrow_mut().activate_listener(&address, listener);
                 match activated_token {
                     Ok(token) => {
                         self.accept(ListenToken(token.0), Protocol::HTTPListen);
@@ -1171,13 +1175,13 @@ impl Server {
                 let listener = self
                     .scm_listeners
                     .as_mut()
-                    .and_then(|s| s.get_https(&activate.address))
+                    .and_then(|s| s.get_https(&address))
                     .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
 
                 let activated_token = self
                     .https
                     .borrow_mut()
-                    .activate_listener(&activate.address, listener);
+                    .activate_listener(&address, listener);
                 match activated_token {
                     Ok(token) => {
                         self.accept(ListenToken(token.0), Protocol::HTTPSListen);
@@ -1193,13 +1197,10 @@ impl Server {
                 let listener = self
                     .scm_listeners
                     .as_mut()
-                    .and_then(|s| s.get_tcp(&activate.address))
+                    .and_then(|s| s.get_tcp(&address))
                     .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
 
-                let listener_token = self
-                    .tcp
-                    .borrow_mut()
-                    .activate_listener(&activate.address, listener);
+                let listener_token = self.tcp.borrow_mut().activate_listener(&address, listener);
                 match listener_token {
                     Some(token) => {
                         self.accept(ListenToken(token.0), Protocol::TCPListen);
@@ -1224,25 +1225,21 @@ impl Server {
             req_id, deactivate.proxy, deactivate
         );
 
+        let address: std::net::SocketAddr = match deactivate.address.parse() {
+            Ok(a) => a,
+            Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {}", e)),
+        };
+
         match deactivate.proxy {
             ListenerType::HTTP => {
-                let (token, mut listener) = match self
-                    .http
-                    .borrow_mut()
-                    .give_back_listener(deactivate.address)
+                let (token, mut listener) = match self.http.borrow_mut().give_back_listener(address)
                 {
                     Some((token, listener)) => (token, listener),
                     None => {
-                        error!(
-                            "Couldn't deactivate HTTP listener at address {:?}",
-                            deactivate.address
-                        );
+                        error!("Couldn't deactivate HTTP listener at address {:?}", address);
                         return WorkerResponse::error(
                             req_id,
-                            format!(
-                                "cannot deactivate HTTP listener at address {:?}",
-                                deactivate.address
-                            ),
+                            format!("cannot deactivate HTTP listener at address {:?}", address),
                         );
                     }
                 };
@@ -1265,7 +1262,7 @@ impl Server {
                 if deactivate.to_scm {
                     self.unblock_scm_socket();
                     let listeners = Listeners {
-                        http: vec![(deactivate.address, listener.as_raw_fd())],
+                        http: vec![(address, listener.as_raw_fd())],
                         tls: vec![],
                         tcp: vec![],
                     };
@@ -1282,21 +1279,18 @@ impl Server {
                 let (token, mut listener) = match self
                     .https
                     .borrow_mut()
-                    .give_back_listener(deactivate.address)
+                    .give_back_listener(address)
                 {
                     Some((token, listener)) => (token, listener),
 
                     None => {
                         error!(
                             "Couldn't deactivate HTTPS listener at address {:?}",
-                            deactivate.address
+                            address
                         );
                         return WorkerResponse::error(
                             req_id,
-                            format!(
-                                "cannot deactivate HTTPS listener at address {:?}",
-                                deactivate.address
-                            ),
+                            format!("cannot deactivate HTTPS listener at address {:?}", address),
                         );
                     }
                 };
@@ -1315,7 +1309,7 @@ impl Server {
                     self.unblock_scm_socket();
                     let listeners = Listeners {
                         http: vec![],
-                        tls: vec![(deactivate.address, listener.as_raw_fd())],
+                        tls: vec![(address, listener.as_raw_fd())],
                         tcp: vec![],
                     };
                     info!("sending HTTPS listener: {:?}", listeners);
@@ -1328,23 +1322,17 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             ListenerType::TCP => {
-                let (token, mut listener) =
-                    match self.tcp.borrow_mut().give_back_listener(deactivate.address) {
-                        Some((token, listener)) => (token, listener),
-                        None => {
-                            error!(
-                                "Couldn't deactivate TCP listener at address {:?}",
-                                deactivate.address
-                            );
-                            return WorkerResponse::error(
-                                req_id,
-                                format!(
-                                    "cannot deactivate TCP listener at address {:?}",
-                                    deactivate.address
-                                ),
-                            );
-                        }
-                    };
+                let (token, mut listener) = match self.tcp.borrow_mut().give_back_listener(address)
+                {
+                    Some((token, listener)) => (token, listener),
+                    None => {
+                        error!("Couldn't deactivate TCP listener at address {:?}", address);
+                        return WorkerResponse::error(
+                            req_id,
+                            format!("cannot deactivate TCP listener at address {:?}", address),
+                        );
+                    }
+                };
 
                 if let Err(e) = self.poll.registry().deregister(&mut listener) {
                     error!(
@@ -1362,7 +1350,7 @@ impl Server {
                     let listeners = Listeners {
                         http: vec![],
                         tls: vec![],
-                        tcp: vec![(deactivate.address, listener.as_raw_fd())],
+                        tcp: vec![(address, listener.as_raw_fd())],
                     };
                     info!("sending TCP listener: {:?}", listeners);
                     let res = self.scm.send_listeners(&listeners);

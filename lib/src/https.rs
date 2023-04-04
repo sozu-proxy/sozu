@@ -572,6 +572,8 @@ pub enum ListenerError {
     PemParseError(String),
     #[error("failed to build rustls context, {0}")]
     BuildRustlsError(String),
+    #[error("Wrong socket address")]
+    WrongSocketAddress,
 }
 
 pub struct HttpsListener {
@@ -690,9 +692,14 @@ impl HttpsListener {
 
         let server_config = Arc::new(Self::create_rustls_context(&config, resolver.to_owned())?);
 
+        let address: StdSocketAddr = config
+            .address
+            .parse()
+            .map_err(|_| ListenerError::WrongSocketAddress)?;
+
         Ok(HttpsListener {
             listener: None,
-            address: config.address,
+            address,
             resolver,
             rustls_details: server_config,
             active: false,
@@ -718,7 +725,7 @@ impl HttpsListener {
 
         let mut listener = match tcp_listener {
             Some(tcp_listener) => tcp_listener,
-            None => server_bind(self.config.address)
+            None => server_bind(self.config.address.clone())
                 .with_context(|| format!("could not create listener {:?}", self.config.address))?,
         };
 
@@ -871,7 +878,7 @@ impl HttpsProxy {
         let len = self.listeners.len();
 
         self.listeners
-            .retain(|_, listener| listener.borrow().address != remove.address);
+            .retain(|_, listener| listener.borrow().address.to_string() != remove.address);
 
         if !self.listeners.len() < len {
             info!(
@@ -1232,6 +1239,14 @@ impl ProxyConfiguration for HttpsProxy {
                 AcceptError::RegisterError
             })?;
 
+        let public_address: StdSocketAddr = owned
+            .config
+            .public_address
+            .clone()
+            .unwrap_or(owned.config.address.clone())
+            .parse()
+            .map_err(|_| AcceptError::WrongSocketAddress)?;
+
         let session = Rc::new(RefCell::new(HttpsSession::new(
             owned.answers.clone(),
             Duration::seconds(owned.config.back_timeout as i64),
@@ -1242,7 +1257,7 @@ impl ProxyConfiguration for HttpsProxy {
             listener.clone(),
             Rc::downgrade(&self.pool),
             proxy,
-            owned.config.public_address.unwrap_or(owned.config.address),
+            public_address,
             rustls_details,
             frontend_sock,
             owned.config.sticky_name.clone(),
@@ -1514,9 +1529,16 @@ pub fn start_https_worker(
         .try_clone()
         .with_context(|| "Failed at creating a registry")?;
     let mut proxy = HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
-    let address = config.address;
+    let address = config.address.clone();
     if proxy.add_listener(config, token).is_some()
-        && proxy.activate_listener(&address, None).is_ok()
+        && proxy
+            .activate_listener(
+                &address
+                    .parse()
+                    .with_context(|| "Could not parse socket address")?,
+                None,
+            )
+            .is_ok()
     {
         let (scm_server, _scm_client) =
             UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
@@ -1553,7 +1575,7 @@ mod tests {
 
     use sozu_command::config::ListenerBuilder;
 
-    use crate::router::{trie::TrieNode, MethodRule, PathRule, Router, Route};
+    use crate::router::{trie::TrieNode, MethodRule, PathRule, Route, Router};
 
     use super::*;
 

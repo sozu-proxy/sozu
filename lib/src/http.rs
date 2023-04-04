@@ -519,13 +519,19 @@ impl HttpProxy {
         }
     }
 
-    pub fn add_listener(&mut self, config: HttpListenerConfig, token: Token) -> Option<Token> {
+    pub fn add_listener(
+        &mut self,
+        config: HttpListenerConfig,
+        token: Token,
+    ) -> anyhow::Result<Token> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                entry.insert(Rc::new(RefCell::new(HttpListener::new(config, token))));
-                Some(token)
+                let http_listener = HttpListener::new(config, token)
+                    .with_context(|| "Could not create http listener")?;
+                entry.insert(Rc::new(RefCell::new(http_listener)));
+                Ok(token)
             }
-            _ => None,
+            _ => bail!("There is already a listener for this token"),
         }
     }
 
@@ -536,7 +542,7 @@ impl HttpProxy {
     pub fn remove_listener(&mut self, remove: RemoveListener) -> anyhow::Result<()> {
         let len = self.listeners.len();
         self.listeners
-            .retain(|_, l| l.borrow().address != remove.address);
+            .retain(|_, l| l.borrow().address.to_string() != remove.address);
 
         if !self.listeners.len() < len {
             info!("no HTTP listener to remove at address {:?}", remove.address);
@@ -711,10 +717,14 @@ impl HttpProxy {
 }
 
 impl HttpListener {
-    pub fn new(config: HttpListenerConfig, token: Token) -> HttpListener {
-        HttpListener {
+    pub fn new(config: HttpListenerConfig, token: Token) -> anyhow::Result<HttpListener> {
+        let address = config
+            .address
+            .parse()
+            .with_context(|| "wrong socket address")?;
+        Ok(HttpListener {
             active: false,
-            address: config.address,
+            address,
             answers: Rc::new(RefCell::new(HttpAnswers::new(
                 &config.answer_404,
                 &config.answer_503,
@@ -724,7 +734,7 @@ impl HttpListener {
             listener: None,
             tags: BTreeMap::new(),
             token,
-        }
+        })
     }
 
     pub fn activate(
@@ -738,7 +748,7 @@ impl HttpListener {
 
         let mut listener = match tcp_listener {
             Some(tcp_listener) => tcp_listener,
-            None => server_bind(self.config.address)
+            None => server_bind(self.config.address.clone())
                 .with_context(|| format!("could not create listener {:?}", self.config.address))?,
         };
 
@@ -916,6 +926,14 @@ impl ProxyConfiguration for HttpProxy {
             return Err(AcceptError::RegisterError);
         }
 
+        let public_address: SocketAddr = owned
+            .config
+            .public_address
+            .clone()
+            .unwrap_or(owned.config.address.clone())
+            .parse()
+            .map_err(|_| AcceptError::WrongSocketAddress)?;
+
         let session = HttpSession::new(
             owned.answers.clone(),
             Duration::seconds(owned.config.back_timeout as i64),
@@ -926,7 +944,7 @@ impl ProxyConfiguration for HttpProxy {
             listener.clone(),
             Rc::downgrade(&self.pool),
             proxy,
-            owned.config.public_address.unwrap_or(owned.config.address),
+            public_address,
             frontend_sock,
             owned.config.sticky_name.clone(),
             session_token,
@@ -1028,7 +1046,7 @@ pub fn start_http_worker(
         Token(key)
     };
 
-    let address = config.address;
+    let address = config.address.clone();
     let sessions = SessionManager::new(sessions, max_buffers);
     let registry = event_loop
         .registry()
@@ -1036,7 +1054,12 @@ pub fn start_http_worker(
         .with_context(|| "Failed at creating a registry")?;
     let mut proxy = HttpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
     let _ = proxy.add_listener(config, token);
-    let _ = proxy.activate_listener(&address, None);
+    let _ = proxy.activate_listener(
+        &address
+            .parse()
+            .with_context(|| "Could not parse socket address")?,
+        None,
+    );
     let (scm_server, scm_client) =
         UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
     let client_scm_socket =

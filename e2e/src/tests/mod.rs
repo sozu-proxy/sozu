@@ -47,7 +47,7 @@ pub fn setup_test<S: Into<String>>(
         ListenerBuilder::new_http(front_address).to_http().unwrap(),
     ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
-        address: front_address,
+        address: front_address.to_string(),
         proxy: ListenerType::HTTP,
         from_scm: false,
     }));

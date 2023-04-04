@@ -1127,17 +1127,25 @@ impl ListenerHandler for TcpListener {
 }
 
 impl TcpListener {
-    fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool>>, token: Token) -> TcpListener {
-        TcpListener {
+    fn new(
+        config: TcpListenerConfig,
+        pool: Rc<RefCell<Pool>>,
+        token: Token,
+    ) -> anyhow::Result<TcpListener> {
+        let address = config
+            .address
+            .parse()
+            .with_context(|| "wrong socket address")?;
+        Ok(TcpListener {
             cluster_id: None,
             listener: None,
             token,
-            address: config.address,
+            address,
             pool,
             config,
             active: false,
             tags: BTreeMap::new(),
-        }
+        })
     }
 
     // TODO: return Result with context
@@ -1151,10 +1159,10 @@ impl TcpListener {
         }
 
         let mut listener = tcp_listener.or_else(|| {
-            server_bind(self.config.address)
+            server_bind(self.config.address.clone())
                 .map_err(|e| {
                     error!(
-                        "could not create listener {:?}: {:?}",
+                        "could not create listener {:?}: {:#}",
                         self.config.address, e
                     );
                 })
@@ -1213,13 +1221,15 @@ impl TcpProxy {
         config: TcpListenerConfig,
         pool: Rc<RefCell<Pool>>,
         token: Token,
-    ) -> Option<Token> {
+    ) -> anyhow::Result<Token> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                entry.insert(Rc::new(RefCell::new(TcpListener::new(config, pool, token))));
-                Some(token)
+                let tcp_listener = TcpListener::new(config, pool, token)
+                    .with_context(|| "Could not create TCP listener")?;
+                entry.insert(Rc::new(RefCell::new(tcp_listener)));
+                Ok(token)
             }
-            _ => None,
+            _ => bail!("It seems a listener already exists for this token"),
         }
     }
 
@@ -1383,7 +1393,16 @@ impl ProxyConfiguration for TcpProxy {
                 WorkerResponse::ok(message.id)
             }
             Request::RemoveListener(remove) => {
-                if !self.remove_listener(remove.address) {
+                let address = match remove.address.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return WorkerResponse::error(
+                            message.id,
+                            format!("Wrong socket address: {}", e),
+                        )
+                    }
+                };
+                if !self.remove_listener(address) {
                     WorkerResponse::error(
                         message.id,
                         format!("no TCP listener to remove at address {:?}", remove.address),
@@ -1562,14 +1581,14 @@ pub fn start_tcp_worker(
     };
 
     let sessions = SessionManager::new(sessions, max_buffers);
-    let address = config.address;
+    let address = config.address.clone();
     let registry = poll
         .registry()
         .try_clone()
         .with_context(|| "Failed at creating a registry")?;
     let mut configuration = TcpProxy::new(registry, sessions.clone(), backends.clone());
     let _ = configuration.add_listener(config, pool.clone(), token);
-    let _ = configuration.activate_listener(&address, None);
+    let _ = configuration.activate_listener(&address.parse().unwrap(), None);
     let (scm_server, _scm_client) =
         UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
     let scm_socket =
@@ -1780,21 +1799,22 @@ mod tests {
             let registry = poll.registry().try_clone().unwrap();
             let mut configuration = TcpProxy::new(registry, sessions.clone(), backends.clone());
             let listener_config = TcpListenerConfig {
-                address: "127.0.0.1:1234".parse().unwrap(),
+                address: "127.0.0.1:1234".to_string(),
                 public_address: None,
                 expect_proxy: false,
                 front_timeout: 60,
                 back_timeout: 30,
                 connect_timeout: 3,
+                active: false,
             };
 
             {
-                let address = listener_config.address;
+                let address = listener_config.address.clone();
                 let mut s = sessions.borrow_mut();
                 let entry = s.slab.vacant_entry();
                 let _ =
                     configuration.add_listener(listener_config, pool.clone(), Token(entry.key()));
-                let _ = configuration.activate_listener(&address, None);
+                let _ = configuration.activate_listener(&address.parse().unwrap(), None);
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::TCPListen,
                 })));
