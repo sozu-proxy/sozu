@@ -11,7 +11,7 @@ use sozu_command_lib::response::{
 pub fn print_listeners(listeners_list: ListenersList) {
     println!("\nHTTP LISTENERS\n================");
 
-    for (_, (http_listener, activated)) in listeners_list.http_listeners.iter() {
+    for (_, http_listener) in listeners_list.http_listeners.iter() {
         let mut table = Table::new();
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         table.add_row(row![
@@ -30,13 +30,13 @@ pub fn print_listeners(listeners_list: ListenersList) {
         table.add_row(row!["back timeout", http_listener.back_timeout]);
         table.add_row(row!["connect timeout", http_listener.connect_timeout]);
         table.add_row(row!["request timeout", http_listener.request_timeout]);
-        table.add_row(row!["activated", activated]);
+        table.add_row(row!["activated", http_listener.active]);
         table.printstd();
     }
 
     println!("\nHTTPS LISTENERS\n================");
 
-    for (_, (https_listener, activated)) in listeners_list.https_listeners.iter() {
+    for (_, https_listener) in listeners_list.https_listeners.iter() {
         let mut table = Table::new();
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         let mut tls_versions = String::new();
@@ -78,7 +78,7 @@ pub fn print_listeners(listeners_list: ListenersList) {
         table.add_row(row!["back timeout", https_listener.back_timeout,]);
         table.add_row(row!["connect timeout", https_listener.connect_timeout,]);
         table.add_row(row!["request timeout", https_listener.request_timeout,]);
-        table.add_row(row!["activated", activated]);
+        table.add_row(row!["activated", https_listener.active]);
         table.printstd();
     }
 
@@ -97,7 +97,7 @@ pub fn print_listeners(listeners_list: ListenersList) {
             "connect timeout",
             "activated"
         ]);
-        for (_, (tcp_listener, activated)) in listeners_list.tcp_listeners.iter() {
+        for (_, tcp_listener) in listeners_list.tcp_listeners.iter() {
             table.add_row(row![
                 format!("{:?}", tcp_listener.address),
                 format!("{:?}", tcp_listener.public_address),
@@ -105,7 +105,7 @@ pub fn print_listeners(listeners_list: ListenersList) {
                 tcp_listener.front_timeout,
                 tcp_listener.back_timeout,
                 tcp_listener.connect_timeout,
-                activated,
+                tcp_listener.active,
             ]);
         }
         table.printstd();

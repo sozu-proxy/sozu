@@ -7,9 +7,9 @@ use crate::{
     config::ProxyProtocolConfig,
     response::{
         is_default_path_rule, HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId,
-        PathRule, RulePosition, TcpListenerConfig,
+        PathRule, RulePosition, TcpListenerConfig, PathRuleKind,
     },
-    state::{ClusterId, RouteKey},
+    state::ClusterId,
 };
 
 pub const PROTOCOL_VERSION: u8 = 0;
@@ -249,20 +249,20 @@ pub enum ListenerType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RemoveListener {
-    pub address: SocketAddr,
+    pub address: String,
     pub proxy: ListenerType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ActivateListener {
-    pub address: SocketAddr,
+    pub address: String,
     pub proxy: ListenerType,
     pub from_scm: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DeactivateListener {
-    pub address: SocketAddr,
+    pub address: String,
     pub proxy: ListenerType,
     pub to_scm: bool,
 }
@@ -330,11 +330,6 @@ pub struct RequestHttpFrontend {
 }
 
 impl RequestHttpFrontend {
-    /// `route_key` returns a representation of the frontend as a route key
-    pub fn route_key(&self) -> RouteKey {
-        self.into()
-    }
-
     /// convert a requested frontend to a usable one by parsing its address
     pub fn to_frontend(self) -> anyhow::Result<HttpFrontend> {
         Ok(HttpFrontend {
@@ -349,6 +344,27 @@ impl RequestHttpFrontend {
             position: self.position,
             tags: self.tags,
         })
+    }
+
+    /// Used to create a unique summary of the frontend, used as a key in maps
+    pub fn to_string(&self) -> String {
+        let mut s = match &self.path.kind {
+            PathRuleKind::Prefix => {
+                format!("{};{};P{}", self.address, self.hostname, self.path.value)
+            }
+            PathRuleKind::Regex => {
+                format!("{};{};R{}", self.address, self.hostname, self.path.value)
+            }
+            PathRuleKind::Equals => {
+                format!("{};{};={}", self.address, self.hostname, self.path.value)
+            }
+        };
+
+        if let Some(method) = &self.method {
+            s = format!("{s};{method}");
+        }
+
+        s
     }
 }
 

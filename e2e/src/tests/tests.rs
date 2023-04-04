@@ -1,5 +1,6 @@
 use std::{
     io::stdout,
+    net::SocketAddr,
     thread,
     time::{Duration, Instant},
 };
@@ -273,7 +274,7 @@ pub fn try_issue_810_timeout() -> State {
 }
 
 pub fn try_issue_810_panic(part2: bool) -> State {
-    let front_address = "127.0.0.1:2001"
+    let front_address: SocketAddr = "127.0.0.1:2001"
         .parse()
         .expect("could not parse front address");
     let back_address = "127.0.0.1:2002"
@@ -287,7 +288,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
         ListenerBuilder::new_tcp(front_address).to_tcp().unwrap(),
     ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
-        address: front_address,
+        address: front_address.to_string(),
         proxy: ListenerType::TCP,
         from_scm: false,
     }));
@@ -338,7 +339,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
 }
 
 pub fn try_tls_endpoint() -> State {
-    let front_address = "127.0.0.1:2001"
+    let front_address: SocketAddr = "127.0.0.1:2001"
         .parse()
         .expect("could not parse front address");
     let back_address = "127.0.0.1:2002"
@@ -353,7 +354,7 @@ pub fn try_tls_endpoint() -> State {
     ));
 
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
-        address: front_address,
+        address: front_address.to_string(),
         proxy: ListenerType::HTTPS,
         from_scm: false,
     }));
@@ -621,7 +622,7 @@ fn try_http_behaviors() -> State {
 
     info!("starting up");
 
-    let front_address = "127.0.0.1:2001"
+    let front_address: SocketAddr = "127.0.0.1:2001"
         .parse()
         .expect("could not parse front address");
 
@@ -632,7 +633,7 @@ fn try_http_behaviors() -> State {
         ListenerBuilder::new_http(front_address).to_http().unwrap(),
     ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
-        address: front_address,
+        address: front_address.to_string(),
         proxy: ListenerType::HTTP,
         from_scm: false,
     }));
