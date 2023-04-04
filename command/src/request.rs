@@ -10,13 +10,12 @@ use anyhow::Context;
 use crate::{
     certificate::Fingerprint,
     proto::command::{
-        AddBackend, AddCertificate, Cluster, FrontendFilters, LoadBalancingAlgorithms,
-        PathRuleKind, QueryClusterByDomain, QueryMetricsOptions, RemoveBackend, RemoveCertificate,
-        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,MetricsConfiguration
+        AddBackend, AddCertificate, Cluster, FrontendFilters, HttpListenerConfig,
+        LoadBalancingAlgorithms, MetricsConfiguration, PathRuleKind, QueryClusterByDomain,
+        QueryMetricsOptions, RemoveBackend, RemoveCertificate, ReplaceCertificate,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition,
     },
-    response::{
-        HttpFrontend, HttpListenerConfig, HttpsListenerConfig, MessageId, TcpListenerConfig,
-    },
+    response::{HttpFrontend, HttpsListenerConfig, MessageId, TcpListenerConfig},
     state::ClusterId,
 };
 

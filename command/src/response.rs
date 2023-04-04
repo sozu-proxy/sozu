@@ -10,7 +10,7 @@ use crate::{
     proto::command::{
         AddBackend, AggregatedMetrics, CertificateSummary, Cluster, FilteredTimeSerie,
         LoadBalancingParams, PathRule, PathRuleKind, RequestHttpFrontend, RequestTcpFrontend,
-        RulePosition, RunState, TlsVersion, WorkerInfo, WorkerMetrics,
+        RulePosition, RunState, TlsVersion, WorkerInfo, WorkerMetrics, HttpListenerConfig,
     },
     request::{default_sticky_name, is_false, PROTOCOL_VERSION},
     state::{ClusterId, ConfigState},
@@ -293,32 +293,6 @@ pub struct ListenersList {
     pub http_listeners: HashMap<String, HttpListenerConfig>,
     pub https_listeners: HashMap<String, HttpsListenerConfig>,
     pub tcp_listeners: HashMap<String, TcpListenerConfig>,
-}
-
-// TODO: implement Default
-/// details of an HTTP listener, sent by the main process to the worker
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HttpListenerConfig {
-    pub address: String,
-    pub public_address: Option<String>,
-    pub answer_404: String,
-    pub answer_503: String,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_false")]
-    pub expect_proxy: bool,
-    /// identifies sticky sessions
-    #[serde(default = "default_sticky_name")]
-    pub sticky_name: String,
-    /// client inactive time
-    pub front_timeout: u32,
-    /// backend server inactive time
-    pub back_timeout: u32,
-    /// time to connect to the backend
-    pub connect_timeout: u32,
-    /// max time to send a complete request
-    pub request_timeout: u32,
-    /// should default to false
-    pub active: bool,
 }
 
 // TODO: implement Default

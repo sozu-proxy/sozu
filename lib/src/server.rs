@@ -16,11 +16,13 @@ use slab::Slab;
 use sozu_command::{
     channel::Channel,
     config::Config,
-    proto::command::{AddBackend, Cluster, LoadBalancingAlgorithms, LoadMetric, RemoveBackend},
+    proto::command::{
+        AddBackend, Cluster, HttpListenerConfig, LoadBalancingAlgorithms, LoadMetric, RemoveBackend,
+    },
     ready::Ready,
     request::{ActivateListener, DeactivateListener, ListenerType, Request, WorkerRequest},
     response::{
-        Event, HttpListenerConfig, HttpsListenerConfig, MessageId, ResponseContent, ResponseStatus,
+        Event, HttpsListenerConfig, MessageId, ResponseContent, ResponseStatus,
         TcpListenerConfig as CommandTcpListener, WorkerResponse,
     },
     scm_socket::{Listeners, ScmSocket},

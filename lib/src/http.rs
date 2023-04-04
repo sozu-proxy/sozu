@@ -16,10 +16,10 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     logging,
-    proto::command::{Cluster, RequestHttpFrontend},
+    proto::command::{Cluster, HttpListenerConfig, RequestHttpFrontend},
     ready::Ready,
     request::{RemoveListener, Request, WorkerRequest},
-    response::{HttpFrontend, HttpListenerConfig, WorkerResponse},
+    response::{HttpFrontend, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
 };
 

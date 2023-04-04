@@ -15,12 +15,12 @@ use toml;
 use crate::{
     certificate::split_certificate_chain,
     proto::command::{
-        AddBackend, AddCertificate, CertificateAndKey, Cluster, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, PathRule, ProxyProtocolConfig, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, TlsVersion,
+        AddBackend, AddCertificate, CertificateAndKey, Cluster, HttpListenerConfig,
+        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, PathRule, ProxyProtocolConfig,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, TlsVersion,
     },
     request::{ActivateListener, ListenerType, Request, WorkerRequest},
-    response::{HttpListenerConfig, HttpsListenerConfig, TcpListenerConfig},
+    response::{HttpsListenerConfig, TcpListenerConfig},
 };
 
 /// [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS
@@ -289,13 +289,9 @@ impl ListenerBuilder {
             public_address: self.public_address.clone(),
             expect_proxy: self.expect_proxy.unwrap_or(false),
             sticky_name: self.sticky_name.clone(),
-            front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
-            back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
-            connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
-            request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             answer_404,
             answer_503,
-            active: false,
+            ..Default::default()
         };
 
         Ok(configuration)

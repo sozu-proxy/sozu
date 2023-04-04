@@ -1,6 +1,26 @@
 syntax = "proto2";
 package command;
 
+// details of an HTTP listener
+message HttpListenerConfig {
+    required string address = 1;
+    optional string public_address = 2;
+    required string answer_404 = 3;
+    required string answer_503 = 4;
+    required bool expect_proxy = 5 [default = false];
+    required string sticky_name = 6;
+    // client inactive time, in seconds
+    required uint32 front_timeout = 7 [default = 60];
+    // backend server inactive time, in seconds
+    required uint32 back_timeout = 8 [default = 30];
+    // time to connect to the backend, in seconds
+    required uint32 connect_timeout = 9 [default = 3];
+    // max time to send a complete request, in seconds
+    required uint32 request_timeout = 10 [default = 10];
+    // wether the listener is actively listening on its socket
+    required bool active = 11 [default = false];
+}
+
 message RequestHttpFrontend {
     optional string cluster_id = 1;
     required string address = 2;

@@ -14,13 +14,14 @@ use anyhow::{bail, Context};
 use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
-        AddBackend, AddCertificate, CertificateAndKey, Cluster, PathRule, RemoveBackend,
-        RemoveCertificate, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
+        AddBackend, AddCertificate, CertificateAndKey, Cluster, HttpListenerConfig, PathRule,
+        RemoveBackend, RemoveCertificate, ReplaceCertificate, RequestHttpFrontend,
+        RequestTcpFrontend,
     },
     request::{ActivateListener, DeactivateListener, ListenerType, RemoveListener, Request},
     response::{
-        Backend, ClusterInformation, HttpFrontend, HttpListenerConfig, HttpsListenerConfig,
-        TcpFrontend, TcpListenerConfig,
+        Backend, ClusterInformation, HttpFrontend, HttpsListenerConfig, TcpFrontend,
+        TcpListenerConfig,
     },
 };
 
@@ -1619,16 +1620,10 @@ mod tests {
         state
             .dispatch(&Request::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
                 answer_404: String::new(),
                 answer_503: String::new(),
                 sticky_name: String::new(),
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
-                active: false,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state
@@ -1677,16 +1672,10 @@ mod tests {
         state2
             .dispatch(&Request::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
                 answer_404: "test".to_string(),
                 answer_503: String::new(),
                 sticky_name: String::new(),
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
-                active: false,
+                ..Default::default()
             }))
             .expect("Could not execute request");
         state2
@@ -1752,16 +1741,10 @@ mod tests {
             }),
             Request::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
-                public_address: None,
-                expect_proxy: false,
                 answer_404: String::from("test"),
                 answer_503: String::new(),
                 sticky_name: String::new(),
-                front_timeout: 60,
-                request_timeout: 10,
-                back_timeout: 30,
-                connect_timeout: 3,
-                active: false,
+                ..Default::default()
             }),
             Request::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
