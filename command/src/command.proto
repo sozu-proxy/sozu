@@ -65,6 +65,16 @@ message TcpListenerConfig {
     required bool active = 7 [default = false];
 }
 
+// All listeners, listed
+message ListenersList {
+    // address -> http listener config
+    map<string, HttpListenerConfig> http_listeners = 1;
+    // address -> https listener config
+    map<string, HttpsListenerConfig> https_listeners = 2;
+    // address -> tcp listener config
+    map<string, TcpListenerConfig> tcp_listeners = 3;
+}
+
 message RequestHttpFrontend {
     optional string cluster_id = 1;
     required string address = 2;

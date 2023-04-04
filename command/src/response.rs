@@ -9,9 +9,8 @@ use std::{
 use crate::{
     proto::command::{
         AddBackend, AggregatedMetrics, CertificateSummary, Cluster, FilteredTimeSerie,
-        HttpListenerConfig, HttpsListenerConfig, LoadBalancingParams, PathRule, PathRuleKind,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, TcpListenerConfig,
-        WorkerInfo, WorkerMetrics,
+        ListenersList, LoadBalancingParams, PathRule, PathRuleKind, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, RunState, WorkerInfo, WorkerMetrics,
     },
     request::PROTOCOL_VERSION,
     state::{ClusterId, ConfigState},
@@ -284,16 +283,6 @@ impl Backend {
             backup: self.backup,
         }
     }
-}
-
-/// All listeners, listed for the CLI.
-/// the bool indicates if it is active or not
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ListenersList {
-    /// address -> (listener_config, activated)
-    pub http_listeners: HashMap<String, HttpListenerConfig>,
-    pub https_listeners: HashMap<String, HttpsListenerConfig>,
-    pub tcp_listeners: HashMap<String, TcpListenerConfig>,
 }
 
 impl fmt::Display for RunState {
