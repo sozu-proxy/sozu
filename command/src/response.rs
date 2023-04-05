@@ -90,6 +90,8 @@ pub enum ResponseContent {
     CertificateByFingerprint(Option<(String, Vec<String>)>),
 }
 
+// TODO: the types HttpFrontend, TcpFrontend and Backend are not present,
+// and not meant to be present in proto::command. Find a fix, like using the type HttpRequestFrontend
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterInformation {
     pub configuration: Option<Cluster>,
@@ -228,6 +230,7 @@ impl Into<RequestTcpFrontend> for TcpFrontend {
     }
 }
 
+// TODO: should contain HttpFrontendConfig and TcpFrontendConfig, or types written in protobuf
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ListedFrontends {
     pub http_frontends: Vec<HttpFrontend>,
@@ -291,6 +294,7 @@ impl fmt::Display for RunState {
     }
 }
 
+// TODO: remove the SocketAddr type
 /// a backend event that happened on a proxy
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]

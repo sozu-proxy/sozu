@@ -208,10 +208,6 @@ pub struct ProxyDestinations {
     pub to_tcp_proxy: bool,
 }
 
-pub fn default_sticky_name() -> String {
-    String::from("SOZUBALANCEID")
-}
-
 impl RequestHttpFrontend {
     /// convert a requested frontend to a usable one by parsing its address
     pub fn to_frontend(self) -> anyhow::Result<HttpFrontend> {
@@ -286,6 +282,7 @@ impl FromStr for LoadBalancingAlgorithms {
         }
     }
 }
+
 
 pub fn is_false(b: &bool) -> bool {
     !*b
