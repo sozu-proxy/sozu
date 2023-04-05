@@ -6,12 +6,12 @@ use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
     config::{Config, ListenerBuilder},
     proto::command::{
-        AddBackend, AddCertificate, CertificateAndKey, Cluster, FrontendFilters,
+        AddBackend, AddCertificate, CertificateAndKey, Cluster, FrontendFilters, ListenerType,
         LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig, RemoveBackend,
         RemoveCertificate, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
         RulePosition, TlsVersion,
     },
-    request::{ActivateListener, DeactivateListener, ListenerType, RemoveListener, Request},
+    request::{ActivateListener, DeactivateListener, RemoveListener, Request},
 };
 
 use crate::{
@@ -310,13 +310,13 @@ impl CommandManager {
                 self.order_request(Request::AddHttpsListener(https_listener))
             }
             HttpsListenerCmd::Remove { address } => {
-                self.remove_listener(address.to_string(), ListenerType::HTTPS)
+                self.remove_listener(address.to_string(), ListenerType::Https)
             }
             HttpsListenerCmd::Activate { address } => {
-                self.activate_listener(address.to_string(), ListenerType::HTTPS)
+                self.activate_listener(address.to_string(), ListenerType::Https)
             }
             HttpsListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.to_string(), ListenerType::HTTPS)
+                self.deactivate_listener(address.to_string(), ListenerType::Https)
             }
         }
     }
@@ -350,13 +350,13 @@ impl CommandManager {
                 self.order_request(Request::AddHttpListener(http_listener))
             }
             HttpListenerCmd::Remove { address } => {
-                self.remove_listener(address.to_string(), ListenerType::HTTP)
+                self.remove_listener(address.to_string(), ListenerType::Http)
             }
             HttpListenerCmd::Activate { address } => {
-                self.activate_listener(address.to_string(), ListenerType::HTTP)
+                self.activate_listener(address.to_string(), ListenerType::Http)
             }
             HttpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.to_string(), ListenerType::HTTP)
+                self.deactivate_listener(address.to_string(), ListenerType::Http)
             }
         }
     }
@@ -377,13 +377,13 @@ impl CommandManager {
                 self.order_request(Request::AddTcpListener(listener))
             }
             TcpListenerCmd::Remove { address } => {
-                self.remove_listener(address.to_string(), ListenerType::TCP)
+                self.remove_listener(address.to_string(), ListenerType::Tcp)
             }
             TcpListenerCmd::Activate { address } => {
-                self.activate_listener(address.to_string(), ListenerType::TCP)
+                self.activate_listener(address.to_string(), ListenerType::Tcp)
             }
             TcpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.to_string(), ListenerType::TCP)
+                self.deactivate_listener(address.to_string(), ListenerType::Tcp)
             }
         }
     }

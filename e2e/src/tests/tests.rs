@@ -11,8 +11,10 @@ use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
     info,
     logging::{Logger, LoggerBackend},
-    proto::command::{AddCertificate, CertificateAndKey, RemoveBackend, RequestHttpFrontend},
-    request::{ActivateListener, ListenerType, Request},
+    proto::command::{
+        AddCertificate, CertificateAndKey, ListenerType, RemoveBackend, RequestHttpFrontend,
+    },
+    request::{ActivateListener, Request},
     state::ConfigState,
 };
 
@@ -287,7 +289,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address.to_string(),
-        proxy: ListenerType::TCP,
+        proxy: ListenerType::Tcp,
         from_scm: false,
     }));
     worker.send_proxy_request(Request::AddCluster(Worker::default_cluster("cluster_0")));
@@ -353,7 +355,7 @@ pub fn try_tls_endpoint() -> State {
 
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address.to_string(),
-        proxy: ListenerType::HTTPS,
+        proxy: ListenerType::Https,
         from_scm: false,
     }));
 
@@ -632,7 +634,7 @@ fn try_http_behaviors() -> State {
     ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address.to_string(),
-        proxy: ListenerType::HTTP,
+        proxy: ListenerType::Http,
         from_scm: false,
     }));
     worker.read_to_last();

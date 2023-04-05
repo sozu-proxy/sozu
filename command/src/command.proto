@@ -65,6 +65,12 @@ message TcpListenerConfig {
     required bool active = 7 [default = false];
 }
 
+enum ListenerType {
+    HTTP = 0;
+    HTTPS = 1;
+    TCP = 2;
+}
+
 // All listeners, listed
 message ListenersList {
     // address -> http listener config

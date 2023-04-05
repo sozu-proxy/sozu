@@ -11,8 +11,8 @@ use crate::{
     certificate::Fingerprint,
     proto::command::{
         AddBackend, AddCertificate, Cluster, FrontendFilters, HttpListenerConfig,
-        HttpsListenerConfig, LoadBalancingAlgorithms, MetricsConfiguration, PathRuleKind,
-        QueryClusterByDomain, QueryMetricsOptions, RemoveBackend, RemoveCertificate,
+        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, MetricsConfiguration,
+        PathRuleKind, QueryClusterByDomain, QueryMetricsOptions, RemoveBackend, RemoveCertificate,
         ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
         TcpListenerConfig,
     },
@@ -210,14 +210,6 @@ pub struct ProxyDestinations {
 
 pub fn default_sticky_name() -> String {
     String::from("SOZUBALANCEID")
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ListenerType {
-    HTTP,
-    HTTPS,
-    TCP,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

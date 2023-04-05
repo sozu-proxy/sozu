@@ -16,11 +16,11 @@ use crate::{
     certificate::split_certificate_chain,
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, Cluster, HttpListenerConfig,
-        HttpsListenerConfig, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, PathRule,
-        ProxyProtocolConfig, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
-        TcpListenerConfig, TlsVersion,
+        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadBalancingParams,
+        LoadMetric, PathRule, ProxyProtocolConfig, RequestHttpFrontend, RequestTcpFrontend,
+        RulePosition, TcpListenerConfig, TlsVersion,
     },
-    request::{ActivateListener, ListenerType, Request, WorkerRequest},
+    request::{ActivateListener, Request, WorkerRequest},
 };
 
 /// [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS
@@ -1360,7 +1360,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
                         address: listener.address.clone(),
-                        proxy: ListenerType::HTTP,
+                        proxy: ListenerType::Http,
                         from_scm: false,
                     }),
                 });
@@ -1372,7 +1372,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
                         address: listener.address.clone(),
-                        proxy: ListenerType::HTTPS,
+                        proxy: ListenerType::Https,
                         from_scm: false,
                     }),
                 });
@@ -1384,7 +1384,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
                         address: listener.address.clone(),
-                        proxy: ListenerType::TCP,
+                        proxy: ListenerType::Tcp,
                         from_scm: false,
                     }),
                 });

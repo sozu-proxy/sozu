@@ -17,11 +17,12 @@ use sozu_command::{
     channel::Channel,
     config::Config,
     proto::command::{
-        AddBackend, Cluster, HttpListenerConfig, HttpsListenerConfig, LoadBalancingAlgorithms,
-        LoadMetric, RemoveBackend, TcpListenerConfig as CommandTcpListener,
+        AddBackend, Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType,
+        LoadBalancingAlgorithms, LoadMetric, RemoveBackend,
+        TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
-    request::{ActivateListener, DeactivateListener, ListenerType, Request, WorkerRequest},
+    request::{ActivateListener, DeactivateListener, Request, WorkerRequest},
     response::{Event, MessageId, ResponseContent, ResponseStatus, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
@@ -981,9 +982,9 @@ impl Server {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
                 let response = match remove.proxy {
-                    ListenerType::HTTP => self.http.borrow_mut().notify(request.clone()),
-                    ListenerType::HTTPS => self.https.borrow_mut().notify(request.clone()),
-                    ListenerType::TCP => self.tcp.borrow_mut().notify(request.clone()),
+                    ListenerType::Http => self.http.borrow_mut().notify(request.clone()),
+                    ListenerType::Https => self.https.borrow_mut().notify(request.clone()),
+                    ListenerType::Tcp => self.tcp.borrow_mut().notify(request.clone()),
                 };
                 push_queue(response);
             }
@@ -1150,7 +1151,7 @@ impl Server {
         };
 
         match activate.proxy {
-            ListenerType::HTTP => {
+            ListenerType::Http => {
                 let listener = self
                     .scm_listeners
                     .as_mut()
@@ -1169,7 +1170,7 @@ impl Server {
                     }
                 }
             }
-            ListenerType::HTTPS => {
+            ListenerType::Https => {
                 let listener = self
                     .scm_listeners
                     .as_mut()
@@ -1191,7 +1192,7 @@ impl Server {
                     }
                 }
             }
-            ListenerType::TCP => {
+            ListenerType::Tcp => {
                 let listener = self
                     .scm_listeners
                     .as_mut()
@@ -1229,7 +1230,7 @@ impl Server {
         };
 
         match deactivate.proxy {
-            ListenerType::HTTP => {
+            ListenerType::Http => {
                 let (token, mut listener) = match self.http.borrow_mut().give_back_listener(address)
                 {
                     Some((token, listener)) => (token, listener),
@@ -1273,7 +1274,7 @@ impl Server {
                 }
                 WorkerResponse::ok(req_id)
             }
-            ListenerType::HTTPS => {
+            ListenerType::Https => {
                 let (token, mut listener) = match self
                     .https
                     .borrow_mut()
@@ -1319,7 +1320,7 @@ impl Server {
                 }
                 WorkerResponse::ok(req_id)
             }
-            ListenerType::TCP => {
+            ListenerType::Tcp => {
                 let (token, mut listener) = match self.tcp.borrow_mut().give_back_listener(address)
                 {
                     Some((token, listener)) => (token, listener),
