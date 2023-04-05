@@ -15,12 +15,12 @@ use toml;
 use crate::{
     certificate::split_certificate_chain,
     proto::command::{
-        AddBackend, AddCertificate, CertificateAndKey, Cluster, HttpListenerConfig,
-        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadBalancingParams,
-        LoadMetric, PathRule, ProxyProtocolConfig, RequestHttpFrontend, RequestTcpFrontend,
-        RulePosition, TcpListenerConfig, TlsVersion,
+        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
+        HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
+        LoadBalancingParams, LoadMetric, PathRule, ProxyProtocolConfig, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, TcpListenerConfig, TlsVersion,
     },
-    request::{ActivateListener, Request, WorkerRequest},
+    request::{Request, WorkerRequest},
 };
 
 /// [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS
@@ -1360,7 +1360,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
                         address: listener.address.clone(),
-                        proxy: ListenerType::Http,
+                        proxy: ListenerType::Http.into(),
                         from_scm: false,
                     }),
                 });
@@ -1372,7 +1372,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
                         address: listener.address.clone(),
-                        proxy: ListenerType::Https,
+                        proxy: ListenerType::Https.into(),
                         from_scm: false,
                     }),
                 });
@@ -1384,7 +1384,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
                         address: listener.address.clone(),
-                        proxy: ListenerType::Tcp,
+                        proxy: ListenerType::Tcp.into(),
                         from_scm: false,
                     }),
                 });

@@ -10,7 +10,7 @@ use anyhow::Context;
 use crate::{
     certificate::Fingerprint,
     proto::command::{
-        AddBackend, AddCertificate, Cluster, FrontendFilters, HttpListenerConfig,
+        ActivateListener, AddBackend, AddCertificate, Cluster, FrontendFilters, HttpListenerConfig,
         HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, MetricsConfiguration,
         PathRuleKind, QueryClusterByDomain, QueryMetricsOptions, RemoveBackend, RemoveCertificate,
         RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
@@ -210,13 +210,6 @@ pub struct ProxyDestinations {
 
 pub fn default_sticky_name() -> String {
     String::from("SOZUBALANCEID")
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ActivateListener {
-    pub address: String,
-    pub proxy: ListenerType,
-    pub from_scm: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

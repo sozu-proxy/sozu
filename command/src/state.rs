@@ -13,12 +13,12 @@ use anyhow::{bail, Context};
 use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
-        AddBackend, AddCertificate, CertificateAndKey, Cluster, HttpListenerConfig,
-        HttpsListenerConfig, ListenerType, PathRule, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
-        TcpListenerConfig,
+        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
+        HttpListenerConfig, HttpsListenerConfig, ListenerType, PathRule, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        RequestTcpFrontend, TcpListenerConfig,
     },
-    request::{ActivateListener, DeactivateListener, Request},
+    request::{DeactivateListener, Request},
     response::{Backend, ClusterInformation, HttpFrontend, TcpFrontend},
 };
 
@@ -213,8 +213,8 @@ impl ConfigState {
     }
 
     fn activate_listener(&mut self, activate: &ActivateListener) -> anyhow::Result<()> {
-        match activate.proxy {
-            ListenerType::Http => {
+        match ListenerType::from_i32(activate.proxy) {
+            Some(ListenerType::Http) => {
                 if self
                     .http_listeners
                     .get_mut(&activate.address)
@@ -224,7 +224,7 @@ impl ConfigState {
                     bail!("No http listener found with address {}", activate.address)
                 }
             }
-            ListenerType::Https => {
+            Some(ListenerType::Https) => {
                 if self
                     .https_listeners
                     .get_mut(&activate.address)
@@ -234,7 +234,7 @@ impl ConfigState {
                     bail!("No https listener found with address {}", activate.address)
                 }
             }
-            ListenerType::Tcp => {
+            Some(ListenerType::Tcp) => {
                 if self
                     .tcp_listeners
                     .get_mut(&activate.address)
@@ -244,6 +244,7 @@ impl ConfigState {
                     bail!("No tcp listener found with address {}", activate.address)
                 }
             }
+            None => bail!("Wrong variant for ListenerType on request"),
         }
         Ok(())
     }
@@ -520,7 +521,7 @@ impl ConfigState {
             if listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: listener.address.clone(),
-                    proxy: ListenerType::Http,
+                    proxy: ListenerType::Http.into(),
                     from_scm: false,
                 }));
             }
@@ -531,7 +532,7 @@ impl ConfigState {
             if listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: listener.address.clone(),
-                    proxy: ListenerType::Https,
+                    proxy: ListenerType::Https.into(),
                     from_scm: false,
                 }));
             }
@@ -542,7 +543,7 @@ impl ConfigState {
             if listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: listener.address.clone(),
-                    proxy: ListenerType::Tcp,
+                    proxy: ListenerType::Tcp.into(),
                     from_scm: false,
                 }));
             }
@@ -595,7 +596,7 @@ impl ConfigState {
         {
             v.push(Request::ActivateListener(ActivateListener {
                 address: front.to_string(),
-                proxy: ListenerType::Http,
+                proxy: ListenerType::Http.into(),
                 from_scm: false,
             }));
         }
@@ -608,7 +609,7 @@ impl ConfigState {
         {
             v.push(Request::ActivateListener(ActivateListener {
                 address: front.to_string(),
-                proxy: ListenerType::Https,
+                proxy: ListenerType::Https.into(),
                 from_scm: false,
             }));
         }
@@ -620,7 +621,7 @@ impl ConfigState {
         {
             v.push(Request::ActivateListener(ActivateListener {
                 address: front.to_string(),
-                proxy: ListenerType::Tcp,
+                proxy: ListenerType::Tcp.into(),
                 from_scm: false,
             }));
         }
@@ -670,7 +671,7 @@ impl ConfigState {
             if other.tcp_listeners[*address].active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: address.to_string(),
-                    proxy: ListenerType::Tcp,
+                    proxy: ListenerType::Tcp.into(),
                     from_scm: false,
                 }));
             }
@@ -699,7 +700,7 @@ impl ConfigState {
             if other.http_listeners[*address].active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: address.to_string(),
-                    proxy: ListenerType::Http,
+                    proxy: ListenerType::Http.into(),
                     from_scm: false,
                 }));
             }
@@ -728,7 +729,7 @@ impl ConfigState {
             if other.https_listeners[*address].active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: address.to_string(),
-                    proxy: ListenerType::Https,
+                    proxy: ListenerType::Https.into(),
                     from_scm: false,
                 }));
             }
@@ -760,7 +761,7 @@ impl ConfigState {
             if !my_listener.active && their_listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: addr.to_string(),
-                    proxy: ListenerType::Tcp,
+                    proxy: ListenerType::Tcp.into(),
                     from_scm: false,
                 }));
             }
@@ -792,7 +793,7 @@ impl ConfigState {
             if !my_listener.active && their_listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: addr.to_string(),
-                    proxy: ListenerType::Http,
+                    proxy: ListenerType::Http.into(),
                     from_scm: false,
                 }));
             }
@@ -824,7 +825,7 @@ impl ConfigState {
             if !my_listener.active && their_listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: addr.to_string(),
-                    proxy: ListenerType::Https,
+                    proxy: ListenerType::Https.into(),
                     from_scm: false,
                 }));
             }
@@ -1001,7 +1002,7 @@ impl ConfigState {
             if listener.active {
                 v.push(Request::ActivateListener(ActivateListener {
                     address: listener.address.clone(),
-                    proxy: ListenerType::Tcp,
+                    proxy: ListenerType::Tcp.into(),
                     from_scm: false,
                 }));
             }
@@ -1606,7 +1607,7 @@ mod tests {
         state
             .dispatch(&Request::ActivateListener(ActivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
-                proxy: ListenerType::Tcp,
+                proxy: ListenerType::Tcp.into(),
                 from_scm: false,
             }))
             .expect("Could not execute request");
@@ -1628,7 +1629,7 @@ mod tests {
         state
             .dispatch(&Request::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
-                proxy: ListenerType::Https,
+                proxy: ListenerType::Https.into(),
                 from_scm: false,
             }))
             .expect("Could not execute request");
@@ -1653,7 +1654,7 @@ mod tests {
         state2
             .dispatch(&Request::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
-                proxy: ListenerType::Http,
+                proxy: ListenerType::Http.into(),
                 from_scm: false,
             }))
             .expect("Could not execute request");
@@ -1667,7 +1668,7 @@ mod tests {
         state2
             .dispatch(&Request::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
-                proxy: ListenerType::Https,
+                proxy: ListenerType::Https.into(),
                 from_scm: false,
             }))
             .expect("Could not execute request");
@@ -1700,7 +1701,7 @@ mod tests {
             }),
             Request::ActivateListener(ActivateListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
-                proxy: ListenerType::Http,
+                proxy: ListenerType::Http.into(),
                 from_scm: false,
             }),
             Request::RemoveListener(RemoveListener {

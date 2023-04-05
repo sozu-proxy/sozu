@@ -17,12 +17,12 @@ use sozu_command::{
     channel::Channel,
     config::Config,
     proto::command::{
-        AddBackend, Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadMetric, RemoveBackend,
+        ActivateListener, AddBackend, Cluster, HttpListenerConfig, HttpsListenerConfig,
+        ListenerType, LoadBalancingAlgorithms, LoadMetric, RemoveBackend,
         TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
-    request::{ActivateListener, DeactivateListener, Request, WorkerRequest},
+    request::{DeactivateListener, Request, WorkerRequest},
     response::{Event, MessageId, ResponseContent, ResponseStatus, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
@@ -1151,8 +1151,8 @@ impl Server {
             Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {}", e)),
         };
 
-        match activate.proxy {
-            ListenerType::Http => {
+        match ListenerType::from_i32(activate.proxy) {
+            Some(ListenerType::Http) => {
                 let listener = self
                     .scm_listeners
                     .as_mut()
@@ -1171,7 +1171,7 @@ impl Server {
                     }
                 }
             }
-            ListenerType::Https => {
+            Some(ListenerType::Https) => {
                 let listener = self
                     .scm_listeners
                     .as_mut()
@@ -1193,7 +1193,7 @@ impl Server {
                     }
                 }
             }
-            ListenerType::Tcp => {
+            Some(ListenerType::Tcp) => {
                 let listener = self
                     .scm_listeners
                     .as_mut()
@@ -1212,6 +1212,7 @@ impl Server {
                     }
                 }
             }
+            None => WorkerResponse::error(req_id, "Wrong variant for ListenerType on request"),
         }
     }
 

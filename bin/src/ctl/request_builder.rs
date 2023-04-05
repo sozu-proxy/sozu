@@ -6,12 +6,12 @@ use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
     config::{Config, ListenerBuilder},
     proto::command::{
-        AddBackend, AddCertificate, CertificateAndKey, Cluster, FrontendFilters, ListenerType,
-        LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig, RemoveBackend,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster, FrontendFilters,
+        ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
+        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
         RequestTcpFrontend, RulePosition, TlsVersion,
     },
-    request::{ActivateListener, DeactivateListener, Request},
+    request::{DeactivateListener, Request},
 };
 
 use crate::{
@@ -406,11 +406,11 @@ impl CommandManager {
     pub fn activate_listener(
         &mut self,
         address: String,
-        proxy: ListenerType,
+        listener_type: ListenerType,
     ) -> anyhow::Result<()> {
         self.order_request(Request::ActivateListener(ActivateListener {
             address: address.parse().with_context(|| "wrong socket address")?,
-            proxy,
+            proxy: listener_type.into(),
             from_scm: false,
         }))
     }

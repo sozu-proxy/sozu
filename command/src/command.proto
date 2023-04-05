@@ -65,6 +65,12 @@ message TcpListenerConfig {
     required bool active = 7 [default = false];
 }
 
+message ActivateListener {
+    required string address = 1;
+    required ListenerType proxy = 2;
+    required bool from_scm = 3;
+}
+
 message RemoveListener {
     required string address = 1;
     required ListenerType proxy = 2;
