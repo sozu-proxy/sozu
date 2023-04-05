@@ -8,9 +8,9 @@ use std::{
 
 use crate::{
     proto::command::{
-        AddBackend, AggregatedMetrics, CertificateSummary, Cluster, FilteredTimeSerie,
-        ListenersList, LoadBalancingParams, PathRule, PathRuleKind, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, RunState, WorkerInfo, WorkerMetrics,
+        AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, Cluster,
+        FilteredTimeSerie, ListenersList, LoadBalancingParams, PathRule, PathRuleKind,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, WorkerInfo, WorkerMetrics,
     },
     request::PROTOCOL_VERSION,
     state::{ClusterId, ConfigState},
@@ -99,13 +99,6 @@ pub struct ClusterInformation {
     pub https_frontends: Vec<HttpFrontend>,
     pub tcp_frontends: Vec<TcpFrontend>,
     pub backends: Vec<Backend>,
-}
-
-/// lists of available metrics in a worker, or in the main process (in which case there are no cluster metrics)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AvailableMetrics {
-    pub proxy_metrics: Vec<String>,
-    pub cluster_metrics: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]

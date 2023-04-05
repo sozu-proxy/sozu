@@ -4,8 +4,8 @@ use std::{collections::BTreeMap, str, time::Instant};
 use anyhow::Context;
 use hdrhistogram::Histogram;
 use sozu_command::{
-    proto::command::{filtered_metrics, BackendMetrics},
-    response::{AvailableMetrics, ResponseContent},
+    proto::command::{filtered_metrics, AvailableMetrics, BackendMetrics},
+    response::ResponseContent,
 };
 
 use crate::sozu_command::proto::command::{

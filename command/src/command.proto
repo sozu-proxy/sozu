@@ -295,6 +295,12 @@ enum RunState {
     NOT_ANSWERING = 3;
 }
 
+// lists of available metrics in a worker, or in the main process (in which case there are no cluster metrics)
+message AvailableMetrics {
+    repeated string proxy_metrics = 1;
+    repeated string cluster_metrics = 2;
+}
+
 // Aggregated metrics of main process & workers
 message AggregatedMetrics {
     map<string, FilteredMetrics> main = 1;

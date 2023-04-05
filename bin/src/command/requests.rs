@@ -18,11 +18,11 @@ use sozu_command_lib::{
     logging,
     parser::parse_several_commands,
     proto::command::{
-        AggregatedMetrics, FrontendFilters, ListenersList, MetricsConfiguration, RunState,
-        WorkerInfo,
+        AggregatedMetrics, AvailableMetrics, FrontendFilters, ListenersList, MetricsConfiguration,
+        RunState, WorkerInfo,
     },
     request::{Request, WorkerRequest},
-    response::{AvailableMetrics, ListedFrontends, Response, ResponseContent, ResponseStatus},
+    response::{ListedFrontends, Response, ResponseContent, ResponseStatus},
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
 };
