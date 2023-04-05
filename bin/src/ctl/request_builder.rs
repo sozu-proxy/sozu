@@ -8,10 +8,10 @@ use sozu_command_lib::{
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, Cluster, FrontendFilters, ListenerType,
         LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig, RemoveBackend,
-        RemoveCertificate, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
-        RulePosition, TlsVersion,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, TlsVersion,
     },
-    request::{ActivateListener, DeactivateListener, RemoveListener, Request},
+    request::{ActivateListener, DeactivateListener, Request},
 };
 
 use crate::{
@@ -392,10 +392,14 @@ impl CommandManager {
         self.order_request(Request::ListListeners)
     }
 
-    pub fn remove_listener(&mut self, address: String, proxy: ListenerType) -> anyhow::Result<()> {
+    pub fn remove_listener(
+        &mut self,
+        address: String,
+        listener_type: ListenerType,
+    ) -> anyhow::Result<()> {
         self.order_request(Request::RemoveListener(RemoveListener {
             address: address.parse().with_context(|| "wrong socket address")?,
-            proxy,
+            proxy: listener_type.into(),
         }))
     }
 

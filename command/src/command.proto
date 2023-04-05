@@ -65,6 +65,11 @@ message TcpListenerConfig {
     required bool active = 7 [default = false];
 }
 
+message RemoveListener {
+    required string address = 1;
+    required ListenerType proxy = 2;
+}
+
 enum ListenerType {
     HTTP = 0;
     HTTPS = 1;

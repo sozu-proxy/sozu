@@ -981,10 +981,11 @@ impl Server {
             Request::RemoveListener(ref remove) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
-                let response = match remove.proxy {
-                    ListenerType::Http => self.http.borrow_mut().notify(request.clone()),
-                    ListenerType::Https => self.https.borrow_mut().notify(request.clone()),
-                    ListenerType::Tcp => self.tcp.borrow_mut().notify(request.clone()),
+                let response = match ListenerType::from_i32(remove.proxy) {
+                    Some(ListenerType::Http) => self.http.borrow_mut().notify(request.clone()),
+                    Some(ListenerType::Https) => self.https.borrow_mut().notify(request.clone()),
+                    Some(ListenerType::Tcp) => self.tcp.borrow_mut().notify(request.clone()),
+                    None => WorkerResponse::error(req_id, "Wrong variant ListenerType"),
                 };
                 push_queue(response);
             }

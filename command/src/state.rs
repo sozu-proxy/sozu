@@ -15,9 +15,10 @@ use crate::{
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, Cluster, HttpListenerConfig,
         HttpsListenerConfig, ListenerType, PathRule, RemoveBackend, RemoveCertificate,
-        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, TcpListenerConfig,
+        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
+        TcpListenerConfig,
     },
-    request::{ActivateListener, DeactivateListener, RemoveListener, Request},
+    request::{ActivateListener, DeactivateListener, Request},
     response::{Backend, ClusterInformation, HttpFrontend, TcpFrontend},
 };
 
@@ -182,10 +183,11 @@ impl ConfigState {
     }
 
     fn remove_listener(&mut self, remove: &RemoveListener) -> anyhow::Result<()> {
-        match remove.proxy {
-            ListenerType::Http => self.remove_http_listener(&remove.address),
-            ListenerType::Https => self.remove_https_listener(&remove.address),
-            ListenerType::Tcp => self.remove_tcp_listener(&remove.address),
+        match ListenerType::from_i32(remove.proxy) {
+            Some(ListenerType::Http) => self.remove_http_listener(&remove.address),
+            Some(ListenerType::Https) => self.remove_https_listener(&remove.address),
+            Some(ListenerType::Tcp) => self.remove_tcp_listener(&remove.address),
+            None => bail!("Wrong ListenerType on RemoveListener request"),
         }
     }
 
@@ -656,7 +658,7 @@ impl ConfigState {
 
             v.push(Request::RemoveListener(RemoveListener {
                 address: address.to_string(),
-                proxy: ListenerType::Tcp,
+                proxy: ListenerType::Tcp.into(),
             }));
         }
 
@@ -685,7 +687,7 @@ impl ConfigState {
 
             v.push(Request::RemoveListener(RemoveListener {
                 address: address.to_string(),
-                proxy: ListenerType::Http,
+                proxy: ListenerType::Http.into(),
             }));
         }
 
@@ -714,7 +716,7 @@ impl ConfigState {
 
             v.push(Request::RemoveListener(RemoveListener {
                 address: address.to_string(),
-                proxy: ListenerType::Https,
+                proxy: ListenerType::Https.into(),
             }));
         }
 
@@ -739,7 +741,7 @@ impl ConfigState {
             if my_listener != their_listener {
                 v.push(Request::RemoveListener(RemoveListener {
                     address: addr.to_string(),
-                    proxy: ListenerType::Tcp,
+                    proxy: ListenerType::Tcp.into(),
                 }));
                 // any added listener should be unactive
                 let mut listener_to_add = their_listener.clone();
@@ -771,7 +773,7 @@ impl ConfigState {
             if my_listener != their_listener {
                 v.push(Request::RemoveListener(RemoveListener {
                     address: addr.to_string(),
-                    proxy: ListenerType::Http,
+                    proxy: ListenerType::Http.into(),
                 }));
                 // any added listener should be unactive
                 let mut listener_to_add = their_listener.clone();
@@ -803,7 +805,7 @@ impl ConfigState {
             if my_listener != their_listener {
                 v.push(Request::RemoveListener(RemoveListener {
                     address: addr.to_string(),
-                    proxy: ListenerType::Https,
+                    proxy: ListenerType::Https.into(),
                 }));
                 // any added listener should be unactive
                 let mut listener_to_add = their_listener.clone();
@@ -1673,7 +1675,7 @@ mod tests {
         let e = vec![
             Request::RemoveListener(RemoveListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
-                proxy: ListenerType::Tcp,
+                proxy: ListenerType::Tcp.into(),
             }),
             Request::AddTcpListener(TcpListenerConfig {
                 address: "0.0.0.0:1234".parse().unwrap(),
@@ -1687,7 +1689,7 @@ mod tests {
             }),
             Request::RemoveListener(RemoveListener {
                 address: "0.0.0.0:8080".parse().unwrap(),
-                proxy: ListenerType::Http,
+                proxy: ListenerType::Http.into(),
             }),
             Request::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
@@ -1703,7 +1705,7 @@ mod tests {
             }),
             Request::RemoveListener(RemoveListener {
                 address: "0.0.0.0:8443".parse().unwrap(),
-                proxy: ListenerType::Https,
+                proxy: ListenerType::Https.into(),
             }),
             Request::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),

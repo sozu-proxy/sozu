@@ -34,10 +34,10 @@ use sozu_command::{
     logging,
     proto::command::{
         AddCertificate, CertificateSummary, Cluster, HttpsListenerConfig, RemoveCertificate,
-        ReplaceCertificate, RequestHttpFrontend, TlsVersion,
+        RemoveListener, ReplaceCertificate, RequestHttpFrontend, TlsVersion,
     },
     ready::Ready,
-    request::{RemoveListener, Request, WorkerRequest},
+    request::{Request, WorkerRequest},
     response::{HttpFrontend, ResponseContent, WorkerResponse},
     scm_socket::ScmSocket,
     state::ClusterId,

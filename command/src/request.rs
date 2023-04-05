@@ -13,7 +13,7 @@ use crate::{
         AddBackend, AddCertificate, Cluster, FrontendFilters, HttpListenerConfig,
         HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, MetricsConfiguration,
         PathRuleKind, QueryClusterByDomain, QueryMetricsOptions, RemoveBackend, RemoveCertificate,
-        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
         TcpListenerConfig,
     },
     response::{HttpFrontend, MessageId},
@@ -210,12 +210,6 @@ pub struct ProxyDestinations {
 
 pub fn default_sticky_name() -> String {
     String::from("SOZUBALANCEID")
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RemoveListener {
-    pub address: String,
-    pub proxy: ListenerType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
