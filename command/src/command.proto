@@ -71,6 +71,12 @@ message ActivateListener {
     required bool from_scm = 3;
 }
 
+message DeactivateListener {
+    required string address = 1;
+    required ListenerType proxy = 2;
+    required bool to_scm = 3;
+}
+
 message RemoveListener {
     required string address = 1;
     required ListenerType proxy = 2;

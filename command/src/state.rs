@@ -14,11 +14,11 @@ use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        HttpListenerConfig, HttpsListenerConfig, ListenerType, PathRule, RemoveBackend,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        DeactivateListener, HttpListenerConfig, HttpsListenerConfig, ListenerType, PathRule,
+        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
         RequestTcpFrontend, TcpListenerConfig,
     },
-    request::{DeactivateListener, Request},
+    request::Request,
     response::{Backend, ClusterInformation, HttpFrontend, TcpFrontend},
 };
 
@@ -250,8 +250,8 @@ impl ConfigState {
     }
 
     fn deactivate_listener(&mut self, deactivate: &DeactivateListener) -> anyhow::Result<()> {
-        match deactivate.proxy {
-            ListenerType::Http => {
+        match ListenerType::from_i32(deactivate.proxy) {
+            Some(ListenerType::Http) => {
                 if self
                     .http_listeners
                     .get_mut(&deactivate.address)
@@ -261,7 +261,7 @@ impl ConfigState {
                     bail!("No http listener found with address {}", deactivate.address)
                 }
             }
-            ListenerType::Https => {
+            Some(ListenerType::Https) => {
                 if self
                     .https_listeners
                     .get_mut(&deactivate.address)
@@ -274,7 +274,7 @@ impl ConfigState {
                     )
                 }
             }
-            ListenerType::Tcp => {
+            Some(ListenerType::Tcp) => {
                 if self
                     .tcp_listeners
                     .get_mut(&deactivate.address)
@@ -284,6 +284,7 @@ impl ConfigState {
                     bail!("No tcp listener found with address {}", deactivate.address)
                 }
             }
+            None => bail!("Wrong variant for ListenerType on request"),
         }
         Ok(())
     }
@@ -652,7 +653,7 @@ impl ConfigState {
             if self.tcp_listeners[*address].active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: address.to_string(),
-                    proxy: ListenerType::Tcp,
+                    proxy: ListenerType::Tcp.into(),
                     to_scm: false,
                 }));
             }
@@ -681,7 +682,7 @@ impl ConfigState {
             if self.http_listeners[*address].active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: address.to_string(),
-                    proxy: ListenerType::Http,
+                    proxy: ListenerType::Http.into(),
                     to_scm: false,
                 }));
             }
@@ -710,7 +711,7 @@ impl ConfigState {
             if self.https_listeners[*address].active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: address.to_string(),
-                    proxy: ListenerType::Https,
+                    proxy: ListenerType::Https.into(),
                     to_scm: false,
                 }));
             }
@@ -753,7 +754,7 @@ impl ConfigState {
             if my_listener.active && !their_listener.active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: addr.to_string(),
-                    proxy: ListenerType::Tcp,
+                    proxy: ListenerType::Tcp.into(),
                     to_scm: false,
                 }));
             }
@@ -785,7 +786,7 @@ impl ConfigState {
             if my_listener.active && !their_listener.active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: addr.to_string(),
-                    proxy: ListenerType::Http,
+                    proxy: ListenerType::Http.into(),
                     to_scm: false,
                 }));
             }
@@ -817,7 +818,7 @@ impl ConfigState {
             if my_listener.active && !their_listener.active {
                 v.push(Request::DeactivateListener(DeactivateListener {
                     address: addr.to_string(),
-                    proxy: ListenerType::Https,
+                    proxy: ListenerType::Https.into(),
                     to_scm: false,
                 }));
             }
@@ -1685,7 +1686,7 @@ mod tests {
             }),
             Request::DeactivateListener(DeactivateListener {
                 address: "0.0.0.0:1234".parse().unwrap(),
-                proxy: ListenerType::Tcp,
+                proxy: ListenerType::Tcp.into(),
                 to_scm: false,
             }),
             Request::RemoveListener(RemoveListener {

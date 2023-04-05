@@ -17,12 +17,12 @@ use sozu_command::{
     channel::Channel,
     config::Config,
     proto::command::{
-        ActivateListener, AddBackend, Cluster, HttpListenerConfig, HttpsListenerConfig,
-        ListenerType, LoadBalancingAlgorithms, LoadMetric, RemoveBackend,
+        ActivateListener, AddBackend, Cluster, DeactivateListener, HttpListenerConfig,
+        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadMetric, RemoveBackend,
         TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
-    request::{DeactivateListener, Request, WorkerRequest},
+    request::{Request, WorkerRequest},
     response::{Event, MessageId, ResponseContent, ResponseStatus, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
@@ -1231,8 +1231,8 @@ impl Server {
             Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {}", e)),
         };
 
-        match deactivate.proxy {
-            ListenerType::Http => {
+        match ListenerType::from_i32(deactivate.proxy) {
+            Some(ListenerType::Http) => {
                 let (token, mut listener) = match self.http.borrow_mut().give_back_listener(address)
                 {
                     Some((token, listener)) => (token, listener),
@@ -1276,7 +1276,7 @@ impl Server {
                 }
                 WorkerResponse::ok(req_id)
             }
-            ListenerType::Https => {
+            Some(ListenerType::Https) => {
                 let (token, mut listener) = match self
                     .https
                     .borrow_mut()
@@ -1322,7 +1322,7 @@ impl Server {
                 }
                 WorkerResponse::ok(req_id)
             }
-            ListenerType::Tcp => {
+            Some(ListenerType::Tcp) => {
                 let (token, mut listener) = match self.tcp.borrow_mut().give_back_listener(address)
                 {
                     Some((token, listener)) => (token, listener),
@@ -1362,6 +1362,7 @@ impl Server {
                 }
                 WorkerResponse::ok(req_id)
             }
+            None => WorkerResponse::error(req_id, "Wrong variant for ListenerType on request"),
         }
     }
 
