@@ -48,7 +48,7 @@ slab = "^0.4.7"
 socket2 = { version = "^0.4.7", features = ["all"] }
 sozu-command-lib = { path = "../command" }
 regex = "^1.7.1"
-rustls = "^0.20.8"
+rustls = "^0.21.0"
 rustls-pemfile = "^1.0.2"
 rusty_ulid = "^2.0.0"
 thiserror = "^1.0.38"
