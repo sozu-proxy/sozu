@@ -292,9 +292,7 @@ fn set_up_proxying(
         hostname: String::from(hostname),
         address: frontend.to_string(),
         path: PathRule::prefix(path_begin.to_owned()),
-        method: None,
-        position: RulePosition::Tree.into(),
-        tags: BTreeMap::new(),
+        ..Default::default()
     });
 
     order_request(channel, add_http_front).with_context(|| "Request AddHttpFront failed")?;
@@ -303,9 +301,7 @@ fn set_up_proxying(
         cluster_id: cluster_id.to_string(),
         backend_id: format!("{cluster_id}-0"),
         address: server_address.to_string(),
-        load_balancing_parameters: None,
-        sticky_id: None,
-        backup: None,
+        ..Default::default()
     });
 
     order_request(channel, add_backend).with_context(|| "AddBackend request failed")?;
@@ -325,9 +321,7 @@ fn remove_proxying(
         address: frontend.to_string(),
         hostname: String::from(hostname),
         path: PathRule::prefix(path_begin.to_owned()),
-        method: None,
-        position: RulePosition::Tree.into(),
-        tags: BTreeMap::new(),
+        ..Default::default()
     });
     order_request(channel, remove_http_front).with_context(|| "RemoveHttpFront request failed")?;
 

@@ -1323,7 +1323,6 @@ mod tests {
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
                 address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Tree.into(),
                 ..Default::default()
             }))
             .expect("Could not execute request");
@@ -1416,7 +1415,6 @@ mod tests {
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
                 address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Tree.into(),
                 ..Default::default()
             }),
             Request::RemoveBackend(RemoveBackend {
@@ -1563,8 +1561,7 @@ mod tests {
                 backend_id: String::from("cluster_1-0"),
                 address: "127.0.0.1:1026".to_string(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id: None,
-                backup: None,
+                ..Default::default()
             }))
             .expect("Could not execute request");
 
@@ -1609,9 +1606,6 @@ mod tests {
         state
             .dispatch(&Request::AddHttpsListener(HttpsListenerConfig {
                 address: "0.0.0.0:8443".parse().unwrap(),
-                // answer_404: String::new(),
-                answer_503: String::new(),
-                sticky_name: String::new(),
                 ..Default::default()
             }))
             .expect("Could not execute request");
@@ -1635,8 +1629,6 @@ mod tests {
             .dispatch(&Request::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 answer_404: "test".to_string(),
-                answer_503: String::new(),
-                sticky_name: String::new(),
                 ..Default::default()
             }))
             .expect("Could not execute request");
@@ -1684,8 +1676,6 @@ mod tests {
             Request::AddHttpListener(HttpListenerConfig {
                 address: "0.0.0.0:8080".parse().unwrap(),
                 answer_404: String::from("test"),
-                answer_503: String::new(),
-                sticky_name: String::new(),
                 ..Default::default()
             }),
             Request::ActivateListener(ActivateListener {

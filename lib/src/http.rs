@@ -1162,9 +1162,7 @@ mod tests {
             address: "127.0.0.1:1024".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
-            method: None,
-            position: RulePosition::Tree.into(),
-            tags: BTreeMap::new(),
+            ..Default::default()
         };
         command
             .write_message(&WorkerRequest {
@@ -1245,11 +1243,9 @@ mod tests {
         let front = RequestHttpFrontend {
             address: "127.0.0.1:1031".to_string(),
             hostname: String::from("localhost"),
-            method: None,
             path: PathRule::prefix(String::from("/")),
-            position: RulePosition::Tree.into(),
             cluster_id: Some(String::from("cluster_1")),
-            tags: BTreeMap::new(),
+            ..Default::default()
         };
         command
             .write_message(&WorkerRequest {
@@ -1354,13 +1350,11 @@ mod tests {
         });
 
         let cluster = Cluster {
-            answer_503: None,
             cluster_id: String::from("cluster_1"),
             https_redirect: true,
             load_balancing: LoadBalancingAlgorithms::default() as i32,
-            load_metric: None,
-            proxy_protocol: None,
             sticky_session: false,
+            ..Default::default()
         };
         command
             .write_message(&WorkerRequest {
@@ -1371,11 +1365,9 @@ mod tests {
         let front = RequestHttpFrontend {
             address: "127.0.0.1:1041".to_string(),
             hostname: String::from("localhost"),
-            method: None,
             path: PathRule::prefix(String::from("/")),
-            position: RulePosition::Tree.into(),
             cluster_id: Some(String::from("cluster_1")),
-            tags: BTreeMap::new(),
+            ..Default::default()
         };
         command
             .write_message(&WorkerRequest {

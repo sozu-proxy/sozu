@@ -658,9 +658,7 @@ mod tests {
         let certificate_and_key = CertificateAndKey {
             certificate: String::from(include_str!("../assets/certificate.pem")),
             key: String::from(include_str!("../assets/key.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
-            names: vec![],
+            ..Default::default()
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
@@ -705,9 +703,8 @@ mod tests {
         let certificate_and_key = CertificateAndKey {
             certificate: String::from(include_str!("../assets/certificate.pem")),
             key: String::from(include_str!("../assets/key.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
             names: vec!["localhost".into(), "lolcatho.st".into()],
+            ..Default::default()
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
@@ -766,9 +763,7 @@ mod tests {
         let certificate_and_key_1y = CertificateAndKey {
             certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
             key: String::from(include_str!("../assets/tests/key-1y.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
-            names: vec![],
+            ..Default::default()
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key_1y.certificate.as_bytes())
@@ -790,9 +785,7 @@ mod tests {
         let certificate_and_key_2y = CertificateAndKey {
             certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
             key: String::from(include_str!("../assets/tests/key-2y.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
-            names: vec![],
+            ..Default::default()
         };
 
         let fingerprint_2y = resolver.add_certificate(&AddCertificate {
@@ -837,9 +830,7 @@ mod tests {
         let certificate_and_key_1y = CertificateAndKey {
             certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
             key: String::from(include_str!("../assets/tests/key-1y.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
-            names: vec![],
+            ..Default::default()
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key_1y.certificate.as_bytes())
@@ -865,9 +856,7 @@ mod tests {
         let certificate_and_key_2y = CertificateAndKey {
             certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
             key: String::from(include_str!("../assets/tests/key-2y.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
-            names: vec![],
+            ..Default::default()
         };
 
         let fingerprint_2y = resolver.add_certificate(&AddCertificate {
@@ -910,44 +899,32 @@ mod tests {
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-1.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
-                names: vec![],
+                ..Default::default()
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-2.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
-                names: vec![],
+                ..Default::default()
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-3.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
-                names: vec![],
+                ..Default::default()
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-4.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
-                names: vec![],
+                ..Default::default()
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-5.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
-                names: vec![],
+                ..Default::default()
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-6.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
-                names: vec![],
+                ..Default::default()
             },
         ];
 

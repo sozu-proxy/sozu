@@ -271,10 +271,7 @@ impl Worker {
             cluster_id: cluster_id.into(),
             sticky_session: false,
             https_redirect: false,
-            proxy_protocol: None,
-            load_balancing: LoadBalancingAlgorithms::default() as i32,
-            load_metric: None,
-            answer_503: None,
+            ..Default::default()
         }
     }
 
@@ -313,8 +310,7 @@ impl Worker {
             backend_id: backend_id.into(),
             address,
             load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
+            ..Default::default()
         }
     }
 }

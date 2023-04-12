@@ -283,7 +283,6 @@ impl FromStr for LoadBalancingAlgorithms {
     }
 }
 
-
 pub fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -312,10 +311,8 @@ mod tests {
                 cluster_id: Some(String::from("xxx")),
                 hostname: String::from("yyy"),
                 path: PathRule::prefix(String::from("xxx")),
-                method: None,
                 address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Tree.into(),
-                tags: BTreeMap::new(),
+                ..Default::default()
             })
         );
     }
@@ -346,8 +343,7 @@ mod tests {
             https_redirect: true,
             proxy_protocol: Some(ProxyProtocolConfig::ExpectHeader as i32),
             load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
-            load_metric: None,
-            answer_503: None,
+            ..Default::default()
         })
     );
 
@@ -366,10 +362,8 @@ mod tests {
             cluster_id: Some(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::prefix(String::from("xxx")),
-            method: None,
             address: "0.0.0.0:8080".to_string(),
-            position: RulePosition::Tree.into(),
-            tags: BTreeMap::new(),
+            ..Default::default()
         })
     );
 
@@ -380,16 +374,15 @@ mod tests {
             cluster_id: Some(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::prefix(String::from("xxx")),
-            method: None,
             address: "0.0.0.0:8080".to_string(),
-            position: RulePosition::Tree.into(),
             tags: BTreeMap::from([
                 ("owner".to_owned(), "John".to_owned()),
                 (
                     "uuid".to_owned(),
                     "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
                 )
-            ])
+            ]),
+            ..Default::default()
         })
     );
 
@@ -400,10 +393,8 @@ mod tests {
             cluster_id: Some(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::prefix(String::from("xxx")),
-            method: None,
             address: "0.0.0.0:8443".to_string(),
-            position: RulePosition::Tree.into(),
-            tags: BTreeMap::new(),
+            ..Default::default()
         })
     );
 
@@ -414,16 +405,15 @@ mod tests {
             cluster_id: Some(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::prefix(String::from("xxx")),
-            method: None,
             address: "0.0.0.0:8443".to_string(),
-            position: RulePosition::Tree.into(),
             tags: BTreeMap::from([
                 ("owner".to_owned(), "John".to_owned()),
                 (
                     "uuid".to_owned(),
                     "0dd8d7b1-a50a-461a-b1f9-5211a5f45a83".to_owned()
                 )
-            ])
+            ]),
+            ..Default::default()
         })
     );
 
@@ -532,10 +522,8 @@ mod tests {
             cluster_id: Some(String::from("xxx")),
             hostname: String::from("yyy"),
             path: PathRule::prefix(String::from("xxx")),
-            method: None,
             address: "127.0.0.1:4242".to_string(),
-            position: RulePosition::Tree.into(),
-            tags: BTreeMap::new(),
+            ..Default::default()
         });
         println!("expected: {:?}", add_http_frontend);
         assert!(parsed_request == add_http_frontend);
@@ -552,13 +540,12 @@ mod tests {
                     cluster_id: Some(String::from("xxx")),
                     hostname: String::from("yyy"),
                     path: PathRule::prefix(String::from("xxx")),
-                    method: None,
                     address: "127.0.0.1:4242".to_string(),
-                    position: RulePosition::Tree.into(),
                     tags: BTreeMap::from([
                         ("owner".to_owned(), "John".to_owned()),
                         ("id".to_owned(), "some-long-id".to_owned())
                     ]),
+                    ..Default::default()
                 })
         );
     }
@@ -574,9 +561,8 @@ mod tests {
                     cluster_id: String::from("xxx"),
                     backend_id: String::from("xxx-0"),
                     address: "0.0.0.0:8080".to_string(),
-                    sticky_id: None,
                     load_balancing_parameters: Some(LoadBalancingParams { weight: 0 }),
-                    backup: None,
+                    ..Default::default()
                 })
         );
     }
@@ -607,13 +593,12 @@ mod tests {
                 cluster_id: Some(String::from("aa")),
                 hostname: String::from("cltdl.fr"),
                 path: PathRule::prefix(String::from("")),
-                method: None,
                 address: "127.0.0.1:4242".to_string(),
-                position: RulePosition::Tree.into(),
                 tags: BTreeMap::from([
                     ("owner".to_owned(), "John".to_owned()),
                     ("id".to_owned(), "some-long-id".to_owned())
                 ]),
+                ..Default::default()
             })
         );
     }

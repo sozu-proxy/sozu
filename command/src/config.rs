@@ -290,6 +290,10 @@ impl ListenerBuilder {
             public_address: self.public_address.clone(),
             expect_proxy: self.expect_proxy.unwrap_or(false),
             sticky_name: self.sticky_name.clone(),
+            front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
+            back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
+            connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+            request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             answer_404,
             answer_503,
             ..Default::default()

@@ -65,9 +65,7 @@ fn main() -> anyhow::Result<()> {
         address: "127.0.0.1:8080".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
-        method: None,
-        position: RulePosition::Tree.into(),
-        tags: BTreeMap::new(),
+        ..Default::default()
     };
 
     let http_backend = AddBackend {
@@ -128,9 +126,7 @@ fn main() -> anyhow::Result<()> {
         address: "127.0.0.1:8443".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
-        method: None,
-        position: RulePosition::Tree.into(),
-        tags: BTreeMap::new(),
+        ..Default::default()
     };
 
     command2.write_message(&WorkerRequest {
@@ -178,9 +174,7 @@ fn main() -> anyhow::Result<()> {
         address: "127.0.0.1:8443".to_string(),
         hostname: String::from("test.local"),
         path: PathRule::prefix(String::from("/")),
-        method: None,
-        position: RulePosition::Tree.into(),
-        tags: BTreeMap::new(),
+        ..Default::default()
     };
 
     command2.write_message(&WorkerRequest {

@@ -161,8 +161,7 @@ impl CommandManager {
                     https_redirect,
                     proxy_protocol: proxy_protocol.and_then(|pp| Some(pp as i32)),
                     load_balancing: load_balancing_policy as i32,
-                    load_metric: None,
-                    answer_503: None,
+                    ..Default::default()
                 }))
             }
             ClusterCmd::Remove { id } => {
@@ -228,8 +227,7 @@ impl CommandManager {
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
-                position: RulePosition::Tree.into(),
-                tags: BTreeMap::new(),
+                ..Default::default()
             })),
         }
     }
@@ -271,8 +269,7 @@ impl CommandManager {
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
-                position: RulePosition::Tree.into(),
-                tags: BTreeMap::new(),
+                ..Default::default()
             })),
         }
     }
