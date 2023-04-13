@@ -2120,7 +2120,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         //replacing with a connection to another cluster
         if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
-            if let Some(_) = self.backend_token.take() {
+            if self.backend_token.take().is_some() {
                 self.close_backend(proxy.clone(), metrics);
             }
         }
