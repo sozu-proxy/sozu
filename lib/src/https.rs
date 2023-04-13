@@ -262,7 +262,7 @@ impl HttpsSession {
         let front_buf = self.pool.upgrade().and_then(|p| p.borrow_mut().checkout());
         front_buf.as_ref()?;
 
-        let sni = handshake.session.sni_hostname();
+        let sni = handshake.session.server_name();
         let alpn = handshake.session.alpn_protocol();
         let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
         info!(
@@ -1431,6 +1431,7 @@ impl L7Proxy for HttpsProxy {
     }
 }
 
+/// Used for metrics keeping
 fn rustls_version_str(version: ProtocolVersion) -> &'static str {
     match version {
         ProtocolVersion::SSLv2 => "tls.version.SSLv2",
@@ -1443,9 +1444,11 @@ fn rustls_version_str(version: ProtocolVersion) -> &'static str {
         ProtocolVersion::DTLSv1_2 => "tls.version.DTLSv1_2",
         ProtocolVersion::DTLSv1_3 => "tls.version.DTLSv1_3",
         ProtocolVersion::Unknown(_) => "tls.version.Unknown",
+        _ => "tls.version.unimplemented",
     }
 }
 
+/// Used for metrics keeping
 fn rustls_ciphersuite_str(cipher: SupportedCipherSuite) -> &'static str {
     match cipher.suite() {
         CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => {
