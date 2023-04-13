@@ -778,9 +778,9 @@ impl Server {
         let sessions_count = self.sessions.borrow().slab.len();
         let mut sessions_to_shut_down = HashSet::new();
 
-        for (key, session) in &self.sessions.borrow().slab {
+        for (_key, session) in &self.sessions.borrow().slab {
             if session.borrow_mut().shutting_down() {
-                sessions_to_shut_down.insert(Token(key));
+                sessions_to_shut_down.insert(Token(session.borrow().frontend_token().0));
             }
         }
         let _ = self.shut_down_sessions_by_frontend_tokens(sessions_to_shut_down);
