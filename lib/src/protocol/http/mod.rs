@@ -29,8 +29,8 @@ use crate::{
     timer::TimeoutContainer,
     util::UnwrapLog,
     Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler, L7Proxy,
-    ListenerHandler, LogDuration, ProxySession, SessionIsToBeClosed,
-    {Protocol, Readiness, SessionMetrics, StateResult},
+    ListenerHandler, LogDuration, Protocol, ProxySession, Readiness, SessionIsToBeClosed,
+    SessionMetrics, StateResult,
 };
 
 use self::parser::{

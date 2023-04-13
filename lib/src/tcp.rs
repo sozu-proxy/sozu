@@ -1625,15 +1625,17 @@ pub fn start_tcp_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sozu_command::channel::Channel;
-    use crate::sozu_command::proto::command::LoadBalancingParams;
-    use crate::sozu_command::scm_socket::Listeners;
-    use std::io::{Read, Write};
-    use std::net::{Shutdown, TcpListener, TcpStream};
-    use std::os::unix::io::IntoRawFd;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier};
-    use std::{str, thread};
+    use crate::sozu_command::{
+        channel::Channel, proto::command::LoadBalancingParams, scm_socket::Listeners,
+    };
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
+        os::unix::io::IntoRawFd,
+        sync::atomic::{AtomicBool, Ordering},
+        sync::{Arc, Barrier},
+        {str, thread},
+    };
     static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
 
     /*

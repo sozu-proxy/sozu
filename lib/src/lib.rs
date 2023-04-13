@@ -213,15 +213,14 @@ use std::{
 use anyhow::{bail, Context};
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
-use sozu_command::state::ClusterId;
-use time::{Duration, Instant};
-
-use crate::sozu_command::{
+use sozu_command::{
     proto::command::{Cluster, LoadBalancingParams},
     ready::Ready,
     request::WorkerRequest,
     response::{Event, WorkerResponse},
+    state::ClusterId,
 };
+use time::{Duration, Instant};
 
 use self::{backends::BackendMap, retry::RetryPolicy, router::Route};
 

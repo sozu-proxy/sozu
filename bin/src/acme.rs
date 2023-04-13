@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs::File, io::Write, iter, net::SocketAddr, thread, time};
+use std::{fs::File, io::Write, iter, net::SocketAddr, thread, time};
 
 use acme_lib::{create_p384_key, persist::FilePersist, Directory, DirectoryUrl};
 use anyhow::{bail, Context};
@@ -12,7 +12,7 @@ use sozu_command_lib::{
     config::Config,
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, PathRule, RemoveBackend, ReplaceCertificate,
-        RequestHttpFrontend, RulePosition, TlsVersion,
+        RequestHttpFrontend, TlsVersion,
     },
     request::Request,
     response::{Response, ResponseStatus},

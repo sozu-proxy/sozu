@@ -5,18 +5,17 @@ extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 extern crate time;
 
-use std::collections::BTreeMap;
 use std::{env, io::stdout, thread};
 
 use anyhow::Context;
-use sozu_command::config::ListenerBuilder;
 
 use sozu_command::{
     channel::Channel,
+    config::ListenerBuilder,
     logging::{Logger, LoggerBackend},
     proto::command::{
         AddBackend, AddCertificate, CertificateAndKey, LoadBalancingParams, PathRule,
-        RequestHttpFrontend, RulePosition,
+        RequestHttpFrontend,
     },
     request::{Request, WorkerRequest},
 };

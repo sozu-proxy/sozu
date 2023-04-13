@@ -17,8 +17,8 @@ use sozu_command::{
     config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
     proto::command::{
-        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, PathRule,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        AddBackend, Cluster, LoadBalancingParams, PathRule, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition,
     },
     request::{Request, WorkerRequest},
     response::WorkerResponse,

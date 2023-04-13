@@ -38,6 +38,7 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     logging::target_to_backend,
+    proto::command::{RunState, WorkerInfo},
     ready::Ready,
     request::{Request, WorkerRequest},
     response::WorkerResponse,
@@ -46,8 +47,6 @@ use sozu_command_lib::{
 };
 
 use crate::{logging, util};
-
-use sozu_command_lib::proto::command::{RunState, WorkerInfo};
 
 /// An instance of Sōzu, as seen from the main process
 pub struct Worker {

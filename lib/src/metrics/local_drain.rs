@@ -4,13 +4,11 @@ use std::{collections::BTreeMap, str, time::Instant};
 use anyhow::Context;
 use hdrhistogram::Histogram;
 use sozu_command::{
-    proto::command::{filtered_metrics, AvailableMetrics, BackendMetrics},
+    proto::command::{
+        filtered_metrics, AvailableMetrics, BackendMetrics, ClusterMetrics, FilteredMetrics,
+        MetricsConfiguration, Percentiles, QueryMetricsOptions, WorkerMetrics,
+    },
     response::ResponseContent,
-};
-
-use crate::sozu_command::proto::command::{
-    ClusterMetrics, FilteredMetrics, MetricsConfiguration, Percentiles, QueryMetricsOptions,
-    WorkerMetrics,
 };
 
 use super::{MetricData, Subscriber};

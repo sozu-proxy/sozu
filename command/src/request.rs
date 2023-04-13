@@ -292,12 +292,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::certificate::split_certificate_chain;
-    use crate::proto::command::{
-        CertificateAndKey, LoadBalancingParams, PathRule, ProxyProtocolConfig, RulePosition,
-        TlsVersion,
+    use crate::{
+        certificate::split_certificate_chain,
+        proto::command::{
+            CertificateAndKey, LoadBalancingParams, PathRule, ProxyProtocolConfig, RulePosition,
+            TlsVersion,
+        },
+        response::HttpFrontend,
     };
-    use crate::response::HttpFrontend;
     use serde_json;
 
     #[test]

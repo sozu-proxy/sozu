@@ -21,6 +21,7 @@ use sozu_command::{
     request::{Request, WorkerRequest},
     response::{HttpFrontend, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
+    state::ClusterId,
 };
 
 use crate::{
@@ -43,7 +44,6 @@ use super::{
     router::Route,
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager},
     socket::server_bind,
-    sozu_command::state::ClusterId,
     AcceptError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
     StateResult,
 };

@@ -1,5 +1,4 @@
-use std::fmt::Debug;
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use rand::{
     distributions::{Distribution, WeightedIndex},
