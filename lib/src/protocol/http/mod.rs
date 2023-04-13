@@ -2113,7 +2113,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
             if has_backend && self.check_backend_connection(metrics) {
                 return Ok(BackendConnectAction::Reuse);
-            } else if let Some(_) = self.backend_token.take() {
+            } else if self.backend_token.take().is_some() {
                 self.close_backend(proxy.clone(), metrics);
             }
         }
