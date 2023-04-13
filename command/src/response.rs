@@ -12,7 +12,7 @@ use crate::{
         default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams,
         RequestHttpFrontend, RequestTcpFrontend, PROTOCOL_VERSION,
     },
-    state::{ConfigState, ClusterId},
+    state::{ClusterId, ConfigState},
 };
 
 /// Responses of the main process to the CLI (or other client)

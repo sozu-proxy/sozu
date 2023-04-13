@@ -22,6 +22,7 @@ use crate::{
     pool::Pool,
     protocol::SessionResult,
     retry::RetryPolicy,
+    router::Route,
     server::{push_event, CONN_RETRIES},
     socket::{SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
@@ -29,7 +30,7 @@ use crate::{
     util::UnwrapLog,
     Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler, L7Proxy,
     ListenerHandler, LogDuration, ProxySession, SessionIsToBeClosed,
-    {Protocol, Readiness, SessionMetrics, StateResult}, router::Route,
+    {Protocol, Readiness, SessionMetrics, StateResult},
 };
 
 use self::parser::{
@@ -1837,7 +1838,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
     */
 
-    //FIXME: check the token passed as argument
+    /// WARNING: this function removes the backend entry in the session manager
+    /// IF the backend_token is set. I don't think this is a good idea, but it is a quick fix
     fn close_backend(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
         debug!(
             "{}\tPROXY [{} -> {}] CLOSED BACKEND",
@@ -1848,20 +1850,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 .unwrap_or_else(|| "-".to_string())
         );
 
-        if let Some(token) = self.backend_token {
-            if let Some(socket) = &mut self.backend_socket {
-                let proxy = proxy.borrow();
-                if let Err(e) = proxy.deregister_socket(socket) {
-                    error!("error deregistering back socket({:?}): {:?}", socket, e);
-                }
-                if let Err(e) = socket.shutdown(Shutdown::Both) {
-                    if e.kind() != ErrorKind::NotConnected {
-                        error!("error shutting down back socket({:?}): {:?}", socket, e);
-                    }
-                }
-
-                proxy.remove_session(token);
+        let proxy = proxy.borrow();
+        if let Some(socket) = &mut self.backend_socket {
+            if let Err(e) = proxy.deregister_socket(socket) {
+                error!("error deregistering back socket({:?}): {:?}", socket, e);
             }
+            if let Err(e) = socket.shutdown(Shutdown::Both) {
+                if e.kind() != ErrorKind::NotConnected {
+                    error!("error shutting down back socket({:?}): {:?}", socket, e);
+                }
+            }
+        }
+
+        if let Some(token) = self.backend_token {
+            proxy.remove_session(token);
 
             if self.backend_connection_status != BackendConnectionStatus::NotConnected {
                 self.backend_readiness.event = Ready::empty();
@@ -2111,23 +2113,15 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
             if has_backend && self.check_backend_connection(metrics) {
                 return Ok(BackendConnectAction::Reuse);
-            } else if let Some(token) = self.backend_token {
+            } else if let Some(_) = self.backend_token.take() {
                 self.close_backend(proxy.clone(), metrics);
-
-                //reset the back token here so we can remove it
-                //from the slab after backend_from* fails
-                self.set_backend_token(token);
             }
         }
 
         //replacing with a connection to another cluster
         if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
-            if let Some(token) = self.backend_token {
+            if let Some(_) = self.backend_token.take() {
                 self.close_backend(proxy.clone(), metrics);
-
-                //reset the back token here so we can remove it
-                //from the slab after backend_from* fails
-                self.set_backend_token(token);
             }
         }
 
@@ -2170,20 +2164,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 Ok(BackendConnectAction::Replace)
             }
             None => {
-                /*
-                TODO: rewrite elsewhere
-                let not_enough_memory = {
-                    let sessions = proxy.borrow().sessions.borrow();
-                    sessions.slab.len() >= sessions.slab_capacity()
-                };
-
-                if not_enough_memory {
-                    error!("not enough memory, cannot connect to backend");
-                    self.set_answer(DefaultAnswerStatus::Answer503, None);
-                    bail!(format!("Too many connections on cluster {}", cluster_id));
-                }
-                */
-
                 let backend_token = proxy.borrow().add_session(session_rc);
 
                 if let Err(e) = proxy.borrow().register_socket(

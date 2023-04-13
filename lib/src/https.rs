@@ -1553,7 +1553,7 @@ mod tests {
 
     use sozu_command::config::ListenerBuilder;
 
-    use crate::router::{trie::TrieNode, MethodRule, PathRule, Router, Route};
+    use crate::router::{trie::TrieNode, MethodRule, PathRule, Route, Router};
 
     use super::*;
 

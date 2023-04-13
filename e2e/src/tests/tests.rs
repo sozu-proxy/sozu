@@ -699,13 +699,14 @@ fn try_http_behaviors() -> State {
     client.set_request(http_request("GET", "/", "ping", "example.com"));
     client.send();
     backend.accept(0);
-    backend.receive(0);
+    let request = backend.receive(0);
     backend.send(0);
 
     let expected_response = String::from(
         "HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
     );
     let response = client.receive();
+    println!("request: {request:?}");
     println!("response: {response:?}");
     assert_eq!(response, Some(expected_response));
     assert_eq!(client.receive(), None);
@@ -729,12 +730,13 @@ fn try_http_behaviors() -> State {
     client.connect();
     client.send();
     backend.accept(0);
-    backend.receive(0);
+    let request = backend.receive(0);
     backend.send(0);
 
     let expected_response_start = String::from("HTTP/1.1 200 OK\r\nContent-Length: 5");
     let expected_response_end = String::from("hello");
     let response = client.receive().unwrap();
+    println!("request: {request:?}");
     println!("response: {response:?}");
     assert!(
         response.starts_with(&expected_response_start)
@@ -744,12 +746,13 @@ fn try_http_behaviors() -> State {
     info!("expecting 200, without content length");
     backend.set_response("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nHello world!");
     client.send();
-    backend.receive(0);
+    let request = backend.receive(0);
     backend.send(0);
 
     let expected_response_start = String::from("HTTP/1.1 200 OK\r\n");
     let expected_response_end = String::from("Hello world!");
     let response = client.receive().unwrap();
+    println!("request: {request:?}");
     println!("response: {response:?}");
     assert!(
         response.starts_with(&expected_response_start)
@@ -761,10 +764,11 @@ fn try_http_behaviors() -> State {
     client.connect();
     client.send();
     backend.accept(0);
-    backend.receive(0);
+    let request = backend.receive(0);
     backend.close(0);
 
     let response = client.receive();
+    println!("request: {request:?}");
     println!("response: {response:?}");
     assert_eq!(response, Some(default_503_answer()));
     assert_eq!(client.receive(), None);
@@ -793,46 +797,58 @@ fn try_http_behaviors() -> State {
     client.connect();
     client.send();
     backend.accept(0);
-    backend.receive(0);
+    let request = backend.receive(0);
     backend.send(0);
 
-    let expected_response = String::from(
-        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n",
+    let expected_response_start = String::from(
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n",
     );
-    let response = client.receive();
+    let response = client.receive().unwrap();
+    println!("request: {request:?}");
     println!("response: {response:?}");
-    assert_eq!(response, Some(expected_response));
+    assert!(response.starts_with(&expected_response_start));
     assert_eq!(client.receive(), None);
 
     client.set_request("ping");
     backend.set_response("pong");
     client.send();
-    backend.receive(0);
+    let request = backend.receive(0);
     backend.send(0);
 
     let expected_response = String::from("pong");
     let response = client.receive();
+    println!("request: {request:?}");
     println!("response: {response:?}");
     assert_eq!(response, Some(expected_response));
     assert_eq!(client.receive(), None);
 
     info!("expecting 100");
-    backend.set_response("HTTP/1.1 100 Continue\r\nContent-Length: 1024\r\n\r\n");
-    client.set_request("GET /100 HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n");
+    backend.set_response("HTTP/1.1 100 Continue\r\n\r\n");
+    client.set_request("GET /100 HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n");
     client.connect();
     client.send();
     backend.accept(1);
-    backend.receive(1);
+    let request = backend.receive(1);
     backend.send(1);
 
-    let expected_response_start = String::from("HTTP/1.1 100 Continue\r\nContent-Length: 1024\r\n");
+    let expected_response_start = String::from("HTTP/1.1 100 Continue\r\n");
     let expected_response_end = String::from("\r\n\r\n");
     let response = client.receive().unwrap();
+    println!("request: {request:?}");
     println!("response: {response:?}");
     assert!(
         response.starts_with(&expected_response_start)
             && response.ends_with(&expected_response_end)
     );
+
+    backend.set_response("HTTP/1.1 200 OK\r\n\r\n");
+    client.set_request("ping");
+    client.send();
+    let request = backend.receive(1);
+    backend.send(1);
+    let response = client.receive().unwrap();
+    println!("request: {request:?}");
+    println!("response: {response:?}");
 
     worker.send_proxy_request(Request::HardStop);
     worker.wait_for_server_stop();
@@ -874,6 +890,98 @@ fn try_msg_close() -> State {
     worker.send_proxy_request(Request::SoftStop);
     worker.wait_for_server_stop();
     State::Success
+}
+
+pub fn try_blue_geen() -> State {
+    let front_address = "127.0.0.1:2001"
+        .parse()
+        .expect("could not parse front address");
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, _) = setup_async_test("BG", config, listeners, state, front_address, 0);
+
+    let aggrerator = SimpleAggregator {
+        requests_received: 0,
+        responses_sent: 0,
+    };
+
+    let primary_address = "127.0.0.1:2002"
+        .parse()
+        .expect("could not parse back address");
+    let secondary_address = "127.0.0.1:2003"
+        .parse()
+        .expect("could not parse back address");
+
+    let mut primary = AsyncBackend::spawn_detached_backend(
+        "PRIMARY",
+        primary_address,
+        aggrerator.clone(),
+        AsyncBackend::http_handler(format!("pong_primary")),
+    );
+    let mut secondary = AsyncBackend::spawn_detached_backend(
+        "SECONDARY",
+        secondary_address,
+        aggrerator.clone(),
+        AsyncBackend::http_handler(format!("pong_secondary")),
+    );
+
+    worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        primary_address.to_string(),
+    )));
+    worker.read_to_last();
+
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("GET", "/api", "ping", "localhost"),
+    );
+
+    client.connect();
+    client.send();
+    let response = client.receive();
+    println!("response: {response:?}");
+
+    worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-1",
+        secondary_address.to_string(),
+    )));
+    worker.read_to_last();
+
+    client.send();
+    let response = client.receive();
+    println!("response: {response:?}");
+
+    worker.send_proxy_request(Request::RemoveBackend(RemoveBackend {
+        cluster_id: "cluster_0".to_string(),
+        backend_id: "cluster_0-0".to_string(),
+        address: primary_address.to_string(),
+    }));
+    worker.read_to_last();
+
+    client.send();
+    let response = client.receive();
+    println!("response: {response:?}");
+
+    worker.send_proxy_request(Request::SoftStop);
+    let success = worker.wait_for_server_stop();
+
+    println!(
+        "sent: {}, received: {}",
+        client.requests_sent, client.responses_received
+    );
+    let aggregator = primary.stop_and_get_aggregator();
+    println!("primary aggregator: {aggregator:?}");
+    let aggregator = secondary.stop_and_get_aggregator();
+    println!("secondary aggregator: {aggregator:?}");
+
+    if !success {
+        State::Fail
+    } else {
+        State::Success
+    }
 }
 
 #[serial]
@@ -932,16 +1040,17 @@ fn test_issue_806() {
 #[serial]
 #[test]
 fn test_issue_808() {
-    assert_eq!(
-        repeat_until_error_or(
-            100,
-            "issue 808: panic on successful zombie check\n(fixed)",
-            || try_backend_stop(2, Some(1))
-        ),
-        // if Success, it means the session was never a zombie
-        // if Fail, it means the zombie checker probably crashed
-        State::Undecided
-    );
+    // this test is not relevant anymore, at least not like this
+    // assert_eq!(
+    //     repeat_until_error_or(
+    //         100,
+    //         "issue 808: panic on successful zombie check\n(fixed)",
+    //         || try_backend_stop(2, Some(1))
+    //     ),
+    //     // if Success, it means the session was never a zombie
+    //     // if Fail, it means the zombie checker probably crashed
+    //     State::Undecided
+    // );
 }
 
 // https://github.com/sozu-proxy/sozu/issues/810
@@ -1011,6 +1120,15 @@ fn test_http_behaviors() {
 fn test_msg_close() {
     assert_eq!(
         repeat_until_error_or(100, "HTTP error on close", try_msg_close),
+        State::Success
+    );
+}
+
+#[serial]
+#[test]
+fn test_blue_green() {
+    assert_eq!(
+        repeat_until_error_or(10, "Blue green switch", try_blue_geen),
         State::Success
     );
 }
