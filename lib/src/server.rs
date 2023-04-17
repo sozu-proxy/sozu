@@ -158,20 +158,22 @@ impl SessionManager {
         }))
     }
 
-    pub fn slab_capacity(&self) -> usize {
-        10 + 2 * self.max_connections
+    /// The slab is considered at capacity if it contains more sessions than twice max_connections
+    pub fn at_capacity(&self) -> bool {
+        self.slab.len() >= 10 + 2 * self.max_connections
     }
 
+    /// Check the number of connections against max_connections, and the slab capacity.
+    /// Returns false if limits are reached.
     pub fn check_limits(&mut self) -> bool {
-        // this should be self.nb_connections >= self.max_connections
-        if self.nb_connections == self.max_connections {
+        if self.nb_connections >= self.max_connections {
             error!("max number of session connection reached, flushing the accept queue");
             gauge!("accept_queue.backpressure", 1);
             self.can_accept = false;
             return false;
         }
 
-        if self.slab.len() >= self.slab_capacity() {
+        if self.at_capacity() {
             error!("not enough memory to accept another session, flushing the accept queue");
             error!(
                 "nb_connections: {}, max_connections: {}",
@@ -1064,7 +1066,7 @@ impl Server {
     ) -> WorkerResponse {
         debug!("{} add http listener {:?}", req_id, listener);
 
-        if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
+        if self.sessions.borrow().at_capacity() {
             return WorkerResponse::error(
                 req_id.to_string(),
                 "session list is full, cannot add a listener",
@@ -1098,7 +1100,7 @@ impl Server {
     ) -> WorkerResponse {
         debug!("{} add https listener {:?}", req_id, listener);
 
-        if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
+        if self.sessions.borrow().at_capacity() {
             return WorkerResponse::error(req_id, "session list is full, cannot add a listener");
         }
 
@@ -1132,7 +1134,7 @@ impl Server {
     ) -> WorkerResponse {
         debug!("{} add tcp listener {:?}", req_id, listener);
 
-        if self.sessions.borrow().slab.len() >= self.sessions.borrow().slab_capacity() {
+        if self.sessions.borrow().at_capacity() {
             return WorkerResponse::error(req_id, "session list is full, cannot add a listener");
         }
 

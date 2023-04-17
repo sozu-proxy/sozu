@@ -870,9 +870,7 @@ impl TcpSession {
             bail!(format!("Too many connections on cluster {cluster_id}"));
         }
 
-        if self.proxy.borrow().sessions.borrow().slab.len()
-            >= self.proxy.borrow().sessions.borrow().slab_capacity()
-        {
+        if self.proxy.borrow().sessions.borrow().at_capacity() {
             bail!("not enough memory, cannot connect to backend");
         }
 
