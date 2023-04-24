@@ -7,15 +7,15 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use tiny_http::{Response as HttpResponse, Server};
 
 use sozu_command_lib::{
-    certificate::{
-        calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint, TlsVersion,
-    },
+    certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
     channel::Channel,
     config::Config,
-    request::{
-        AddBackend, AddCertificate, RemoveBackend, ReplaceCertificate, Request, RequestHttpFrontend,
+    proto::command::{
+        AddBackend, AddCertificate, CertificateAndKey, PathRule, RemoveBackend, ReplaceCertificate,
+        RequestHttpFrontend, TlsVersion,
     },
-    response::{PathRule, Response, ResponseStatus, RulePosition},
+    request::Request,
+    response::{Response, ResponseStatus},
 };
 
 use crate::util;
@@ -86,7 +86,7 @@ pub fn main(
         )
     })?;
 
-    let tls_versions = vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3];
+    let tls_versions = vec![TlsVersion::TlsV12, TlsVersion::TlsV13];
 
     let mut channel: Channel<Request, Response> = Channel::new(stream, 10000, 20000);
     channel
@@ -292,9 +292,7 @@ fn set_up_proxying(
         hostname: String::from(hostname),
         address: frontend.to_string(),
         path: PathRule::prefix(path_begin.to_owned()),
-        method: None,
-        position: RulePosition::Tree,
-        tags: None,
+        ..Default::default()
     });
 
     order_request(channel, add_http_front).with_context(|| "Request AddHttpFront failed")?;
@@ -303,9 +301,7 @@ fn set_up_proxying(
         cluster_id: cluster_id.to_string(),
         backend_id: format!("{cluster_id}-0"),
         address: server_address.to_string(),
-        load_balancing_parameters: None,
-        sticky_id: None,
-        backup: None,
+        ..Default::default()
     });
 
     order_request(channel, add_backend).with_context(|| "AddBackend request failed")?;
@@ -325,9 +321,7 @@ fn remove_proxying(
         address: frontend.to_string(),
         hostname: String::from(hostname),
         path: PathRule::prefix(path_begin.to_owned()),
-        method: None,
-        position: RulePosition::Tree,
-        tags: None,
+        ..Default::default()
     });
     order_request(channel, remove_http_front).with_context(|| "RemoveHttpFront request failed")?;
 
@@ -360,6 +354,8 @@ fn add_certificate(
         .map(split_certificate_chain)
         .with_context(|| "could not load certificate chain".to_string())?;
 
+    let versions = tls_versions.iter().map(|v| *v as i32).collect();
+
     let request = match old_fingerprint {
         None => Request::AddCertificate(AddCertificate {
             address: frontend.to_owned(),
@@ -367,9 +363,9 @@ fn add_certificate(
                 certificate,
                 certificate_chain,
                 key,
-                versions: tls_versions.clone(),
+                versions,
+                names: vec![hostname.to_string()],
             },
-            names: vec![hostname.to_string()],
             expired_at: None,
         }),
 
@@ -379,10 +375,10 @@ fn add_certificate(
                 certificate,
                 certificate_chain,
                 key,
-                versions: tls_versions.clone(),
+                versions,
+                names: vec![hostname.to_string()],
             },
-            old_fingerprint: Fingerprint(f),
-            new_names: vec![hostname.to_string()],
+            old_fingerprint: Fingerprint(f).to_string(),
             new_expired_at: None,
         }),
     };

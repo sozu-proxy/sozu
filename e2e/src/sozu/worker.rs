@@ -16,11 +16,12 @@ use sozu_command::{
     channel::Channel,
     config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
-    request::{
-        AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams, Request,
-        RequestHttpFrontend, RequestTcpFrontend, WorkerRequest,
+    proto::command::{
+        AddBackend, Cluster, LoadBalancingParams, PathRule, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition,
     },
-    response::{PathRule, RulePosition, WorkerResponse},
+    request::{Request, WorkerRequest},
+    response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
@@ -270,10 +271,7 @@ impl Worker {
             cluster_id: cluster_id.into(),
             sticky_session: false,
             https_redirect: false,
-            proxy_protocol: None,
-            load_balancing: LoadBalancingAlgorithms::default(),
-            load_metric: None,
-            answer_503: None,
+            ..Default::default()
         }
     }
 
@@ -284,7 +282,7 @@ impl Worker {
         RequestTcpFrontend {
             cluster_id: cluster_id.into(),
             address,
-            tags: None,
+            ..Default::default()
         }
     }
 
@@ -297,9 +295,8 @@ impl Worker {
             address: address.to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
-            method: None,
-            position: RulePosition::Tree,
-            tags: None,
+            position: RulePosition::Tree.into(),
+            ..Default::default()
         }
     }
 
@@ -313,8 +310,7 @@ impl Worker {
             backend_id: backend_id.into(),
             address,
             load_balancing_parameters: Some(LoadBalancingParams::default()),
-            sticky_id: None,
-            backup: None,
+            ..Default::default()
         }
     }
 }

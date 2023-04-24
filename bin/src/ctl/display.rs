@@ -3,9 +3,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
-use sozu_command_lib::response::{
-    AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics, ListedFrontends,
-    ListenersList, ResponseContent, WorkerInfo, WorkerMetrics,
+use sozu_command_lib::{
+    proto::command::{
+        filtered_metrics, AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics,
+        ListenersList, WorkerInfo, WorkerMetrics,
+    },
+    response::{ListedFrontends, ResponseContent},
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -219,7 +222,7 @@ pub fn print_metrics(
     // main process metrics
     println!("\nMAIN PROCESS\n============");
 
-    print_proxy_metrics(&Some(aggregated_metrics.main));
+    print_proxy_metrics(&aggregated_metrics.main);
 
     // workers
     for (worker_id, worker_metrics) in aggregated_metrics.workers.iter() {
@@ -236,33 +239,25 @@ fn print_worker_metrics(worker_metrics: &WorkerMetrics) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_proxy_metrics(proxy_metrics: &Option<BTreeMap<String, FilteredMetrics>>) {
-    if let Some(metrics) = proxy_metrics {
-        let filtered = filter_metrics(metrics);
-        print_gauges_and_counts(&filtered);
-        print_percentiles(&filtered);
-    }
+fn print_proxy_metrics(proxy_metrics: &BTreeMap<String, FilteredMetrics>) {
+    let filtered = filter_metrics(proxy_metrics);
+    print_gauges_and_counts(&filtered);
+    print_percentiles(&filtered);
 }
 
-fn print_cluster_metrics(cluster_metrics: &Option<BTreeMap<String, ClusterMetrics>>) {
-    if let Some(cluster_metrics) = cluster_metrics {
-        for (cluster_id, cluster_metrics_data) in cluster_metrics.iter() {
-            println!("\nCluster {cluster_id}\n--------");
+fn print_cluster_metrics(cluster_metrics: &BTreeMap<String, ClusterMetrics>) {
+    for (cluster_id, cluster_metrics_data) in cluster_metrics.iter() {
+        println!("\nCluster {cluster_id}\n--------");
 
-            if let Some(cluster) = &cluster_metrics_data.cluster {
-                let filtered = filter_metrics(cluster);
-                print_gauges_and_counts(&filtered);
-                print_percentiles(&filtered);
-            }
+        let filtered = filter_metrics(&cluster_metrics_data.cluster);
+        print_gauges_and_counts(&filtered);
+        print_percentiles(&filtered);
 
-            if let Some(backends) = &cluster_metrics_data.backends {
-                for backend_metrics in backends.iter() {
-                    println!("\n{cluster_id}/{}\n--------", backend_metrics.backend_id);
-                    let filtered = filter_metrics(&backend_metrics.metrics);
-                    print_gauges_and_counts(&filtered);
-                    print_percentiles(&filtered);
-                }
-            }
+        for backend_metrics in cluster_metrics_data.backends.iter() {
+            println!("\n{cluster_id}/{}\n--------", backend_metrics.backend_id);
+            let filtered = filter_metrics(&backend_metrics.metrics);
+            print_gauges_and_counts(&filtered);
+            print_percentiles(&filtered);
         }
     }
 }
@@ -284,8 +279,10 @@ fn filter_metrics(
 fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     let mut titles: Vec<String> = filtered_metrics
         .iter()
-        .filter_map(|(title, filtered_data)| match filtered_data {
-            FilteredMetrics::Count(_) | FilteredMetrics::Gauge(_) => Some(title.to_owned()),
+        .filter_map(|(title, filtered_data)| match filtered_data.inner {
+            Some(filtered_metrics::Inner::Count(_)) | Some(filtered_metrics::Inner::Gauge(_)) => {
+                Some(title.to_owned())
+            }
             _ => None,
         })
         .collect();
@@ -305,14 +302,17 @@ fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredMetrics>)
     for title in titles {
         let mut row = vec![cell!(title)];
         match filtered_metrics.get(&title) {
-            Some(FilteredMetrics::Count(c)) => {
-                row.push(cell!(""));
-                row.push(cell!(c))
-            }
-            Some(FilteredMetrics::Gauge(c)) => {
-                row.push(cell!(c));
-                row.push(cell!(""))
-            }
+            Some(filtered_metrics) => match filtered_metrics.inner {
+                Some(filtered_metrics::Inner::Count(c)) => {
+                    row.push(cell!(""));
+                    row.push(cell!(c))
+                }
+                Some(filtered_metrics::Inner::Gauge(c)) => {
+                    row.push(cell!(c));
+                    row.push(cell!(""))
+                }
+                _ => {}
+            },
             _ => row.push(cell!("")),
         }
         table.add_row(Row::new(row));
@@ -324,9 +324,12 @@ fn print_gauges_and_counts(filtered_metrics: &BTreeMap<String, FilteredMetrics>)
 fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     let mut percentile_titles: Vec<String> = filtered_metrics
         .iter()
-        .filter_map(|(title, filtered_data)| match filtered_data {
-            FilteredMetrics::Percentiles(_) => Some(title.to_owned()),
-            _ => None,
+        .filter_map(|(title, filtered_data)| match filtered_data.inner.clone() {
+            Some(filtered_metrics) => match filtered_metrics {
+                filtered_metrics::Inner::Percentiles(_) => Some(title.to_owned()),
+                _ => None,
+            },
+            None => None,
         })
         .collect();
 
@@ -354,20 +357,23 @@ fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
 
     for title in percentile_titles {
         match filtered_metrics.get(&title) {
-            Some(FilteredMetrics::Percentiles(p)) => {
-                percentile_table.add_row(Row::new(vec![
-                    cell!(title),
-                    cell!(p.samples),
-                    cell!(p.p_50),
-                    cell!(p.p_90),
-                    cell!(p.p_99),
-                    cell!(p.p_99_9),
-                    cell!(p.p_99_99),
-                    cell!(p.p_99_999),
-                    cell!(p.p_100),
-                ]));
-            }
-            _ => println!("Something went VERY wrong here"),
+            Some(filtered_metrics) => match filtered_metrics.inner.clone() {
+                Some(filtered_metrics::Inner::Percentiles(p)) => {
+                    percentile_table.add_row(Row::new(vec![
+                        cell!(title),
+                        cell!(p.samples),
+                        cell!(p.p_50),
+                        cell!(p.p_90),
+                        cell!(p.p_99),
+                        cell!(p.p_99_9),
+                        cell!(p.p_99_99),
+                        cell!(p.p_99_999),
+                        cell!(p.p_100),
+                    ]));
+                }
+                _ => {}
+            },
+            None => println!("Something went VERY wrong here"),
         }
     }
 
@@ -646,7 +652,7 @@ pub fn print_certificates(
                         println!(
                             "\t\t{}:\t{}",
                             summary.domain,
-                            hex::encode(summary.fingerprint.0.to_owned())
+                            hex::encode(summary.fingerprint.to_owned())
                         );
                     }
 

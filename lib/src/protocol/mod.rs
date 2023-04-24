@@ -56,8 +56,7 @@ pub mod pipe;
 pub mod proxy_protocol;
 pub mod rustls;
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc};
 
 use mio::Token;
 use sozu_command::ready::Ready;
@@ -66,11 +65,12 @@ use crate::{
     L7Proxy, ProxySession, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
 };
 
-pub use self::http::{Http, StickySession};
-pub use self::pipe::Pipe;
-pub use self::proxy_protocol::send::SendProxyProtocol;
-
-pub use self::rustls::TlsHandshake;
+pub use self::{
+    http::{Http, StickySession},
+    pipe::Pipe,
+    proxy_protocol::send::SendProxyProtocol,
+    rustls::TlsHandshake,
+};
 
 /// All States should satisfy this trait in order to receive and handle Session events
 pub trait SessionState {

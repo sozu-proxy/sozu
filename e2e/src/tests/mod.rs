@@ -4,8 +4,8 @@ use std::{io::stdin, net::SocketAddr};
 
 use sozu_command_lib::{
     config::{Config, ListenerBuilder},
+    proto::command::{ActivateListener, ListenerType},
     request::Request,
-    request::{ActivateListener, ListenerType},
     scm_socket::Listeners,
     state::ConfigState,
 };
@@ -48,7 +48,7 @@ pub fn setup_test<S: Into<String>>(
     ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address.to_string(),
-        proxy: ListenerType::HTTP,
+        proxy: ListenerType::Http.into(),
         from_scm: false,
     }));
     worker.send_proxy_request(Request::AddCluster(Worker::default_cluster("cluster_0")));

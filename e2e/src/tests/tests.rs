@@ -8,13 +8,14 @@ use std::{
 use serial_test::serial;
 
 use sozu_command_lib::{
-    certificate::CertificateAndKey,
     config::{FileConfig, ListenerBuilder},
     info,
     logging::{Logger, LoggerBackend},
-    request::{
-        ActivateListener, AddCertificate, ListenerType, RemoveBackend, Request, RequestHttpFrontend,
+    proto::command::{
+        ActivateListener, AddCertificate, CertificateAndKey, ListenerType, RemoveBackend,
+        RequestHttpFrontend,
     },
+    request::Request,
     state::ConfigState,
 };
 
@@ -289,7 +290,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address.to_string(),
-        proxy: ListenerType::TCP,
+        proxy: ListenerType::Tcp.into(),
         from_scm: false,
     }));
     worker.send_proxy_request(Request::AddCluster(Worker::default_cluster("cluster_0")));
@@ -355,7 +356,7 @@ pub fn try_tls_endpoint() -> State {
 
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address.to_string(),
-        proxy: ListenerType::HTTPS,
+        proxy: ListenerType::Https.into(),
         from_scm: false,
     }));
 
@@ -372,11 +373,11 @@ pub fn try_tls_endpoint() -> State {
         key: String::from(include_str!("../../../lib/assets/local-key.pem")),
         certificate_chain: vec![],
         versions: vec![],
+        names: vec![],
     };
     let add_certificate = AddCertificate {
         address: front_address.to_string(),
         certificate: certificate_and_key,
-        names: vec![],
         expired_at: None,
     };
     worker.send_proxy_request(Request::AddCertificate(add_certificate));
@@ -634,7 +635,7 @@ fn try_http_behaviors() -> State {
     ));
     worker.send_proxy_request(Request::ActivateListener(ActivateListener {
         address: front_address.to_string(),
-        proxy: ListenerType::HTTP,
+        proxy: ListenerType::Http.into(),
         from_scm: false,
     }));
     worker.read_to_last();

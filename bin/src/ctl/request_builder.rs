@@ -1,16 +1,18 @@
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Context};
 
 use sozu_command_lib::{
-    certificate::{
-        calculate_fingerprint, split_certificate_chain, CertificateAndKey, Fingerprint, TlsVersion,
+    certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
+    config::{Config, ListenerBuilder},
+    proto::command::{
+        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
+        DeactivateListener, FrontendFilters, ListenerType, LoadBalancingParams,
+        MetricsConfiguration, PathRule, ProxyProtocolConfig, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        TlsVersion,
     },
-    config::{Config, ListenerBuilder, ProxyProtocolConfig},
-    request::{
-        ActivateListener, AddBackend, AddCertificate, Cluster, DeactivateListener, FrontendFilters,
-        ListenerType, LoadBalancingParams, MetricsConfiguration, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend, RequestTcpFrontend,
-    },
-    response::{PathRule, RulePosition},
+    request::Request,
 };
 
 use crate::{
@@ -157,10 +159,9 @@ impl CommandManager {
                     cluster_id: id,
                     sticky_session,
                     https_redirect,
-                    proxy_protocol,
-                    load_balancing: load_balancing_policy,
-                    load_metric: None,
-                    answer_503: None,
+                    proxy_protocol: proxy_protocol.and_then(|pp| Some(pp as i32)),
+                    load_balancing: load_balancing_policy as i32,
+                    ..Default::default()
                 }))
             }
             ClusterCmd::Remove { id } => {
@@ -175,14 +176,14 @@ impl CommandManager {
                 self.order_request(Request::AddTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address: address.to_string(),
-                    tags,
+                    tags: tags.unwrap_or(BTreeMap::new()),
                 }))
             }
             TcpFrontendCmd::Remove { id, address } => {
                 self.order_request(Request::RemoveTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address: address.to_string(),
-                    tags: None,
+                    ..Default::default()
                 }))
             }
         }
@@ -205,8 +206,11 @@ impl CommandManager {
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
-                position: RulePosition::Tree,
-                tags,
+                position: RulePosition::Tree.into(),
+                tags: match tags {
+                    Some(tags) => tags,
+                    None => BTreeMap::new(),
+                },
             })),
 
             HttpFrontendCmd::Remove {
@@ -223,8 +227,7 @@ impl CommandManager {
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
-                position: RulePosition::Tree,
-                tags: None,
+                ..Default::default()
             })),
         }
     }
@@ -246,8 +249,11 @@ impl CommandManager {
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
-                position: RulePosition::Tree,
-                tags,
+                position: RulePosition::Tree.into(),
+                tags: match tags {
+                    Some(tags) => tags,
+                    None => BTreeMap::new(),
+                },
             })),
             HttpFrontendCmd::Remove {
                 hostname,
@@ -263,8 +269,7 @@ impl CommandManager {
                 hostname,
                 path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                 method: method.map(String::from),
-                position: RulePosition::Tree,
-                tags: None,
+                ..Default::default()
             })),
         }
     }
@@ -303,13 +308,13 @@ impl CommandManager {
                 self.order_request(Request::AddHttpsListener(https_listener))
             }
             HttpsListenerCmd::Remove { address } => {
-                self.remove_listener(address.to_string(), ListenerType::HTTPS)
+                self.remove_listener(address.to_string(), ListenerType::Https)
             }
             HttpsListenerCmd::Activate { address } => {
-                self.activate_listener(address.to_string(), ListenerType::HTTPS)
+                self.activate_listener(address.to_string(), ListenerType::Https)
             }
             HttpsListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.to_string(), ListenerType::HTTPS)
+                self.deactivate_listener(address.to_string(), ListenerType::Https)
             }
         }
     }
@@ -343,13 +348,13 @@ impl CommandManager {
                 self.order_request(Request::AddHttpListener(http_listener))
             }
             HttpListenerCmd::Remove { address } => {
-                self.remove_listener(address.to_string(), ListenerType::HTTP)
+                self.remove_listener(address.to_string(), ListenerType::Http)
             }
             HttpListenerCmd::Activate { address } => {
-                self.activate_listener(address.to_string(), ListenerType::HTTP)
+                self.activate_listener(address.to_string(), ListenerType::Http)
             }
             HttpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.to_string(), ListenerType::HTTP)
+                self.deactivate_listener(address.to_string(), ListenerType::Http)
             }
         }
     }
@@ -370,13 +375,13 @@ impl CommandManager {
                 self.order_request(Request::AddTcpListener(listener))
             }
             TcpListenerCmd::Remove { address } => {
-                self.remove_listener(address.to_string(), ListenerType::TCP)
+                self.remove_listener(address.to_string(), ListenerType::Tcp)
             }
             TcpListenerCmd::Activate { address } => {
-                self.activate_listener(address.to_string(), ListenerType::TCP)
+                self.activate_listener(address.to_string(), ListenerType::Tcp)
             }
             TcpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.to_string(), ListenerType::TCP)
+                self.deactivate_listener(address.to_string(), ListenerType::Tcp)
             }
         }
     }
@@ -385,21 +390,25 @@ impl CommandManager {
         self.order_request(Request::ListListeners)
     }
 
-    pub fn remove_listener(&mut self, address: String, proxy: ListenerType) -> anyhow::Result<()> {
+    pub fn remove_listener(
+        &mut self,
+        address: String,
+        listener_type: ListenerType,
+    ) -> anyhow::Result<()> {
         self.order_request(Request::RemoveListener(RemoveListener {
             address: address.parse().with_context(|| "wrong socket address")?,
-            proxy,
+            proxy: listener_type.into(),
         }))
     }
 
     pub fn activate_listener(
         &mut self,
         address: String,
-        proxy: ListenerType,
+        listener_type: ListenerType,
     ) -> anyhow::Result<()> {
         self.order_request(Request::ActivateListener(ActivateListener {
             address: address.parse().with_context(|| "wrong socket address")?,
-            proxy,
+            proxy: listener_type.into(),
             from_scm: false,
         }))
     }
@@ -407,12 +416,12 @@ impl CommandManager {
     pub fn deactivate_listener(
         &mut self,
         address: String,
-        proxy: ListenerType,
+        listener_type: ListenerType,
     ) -> anyhow::Result<()> {
         self.order_request(Request::DeactivateListener(DeactivateListener {
             // address,
             address: address.parse().with_context(|| "wrong socket address")?,
-            proxy,
+            proxy: listener_type.into(),
             to_scm: false,
         }))
     }
@@ -429,14 +438,18 @@ impl CommandManager {
         key_path: &str,
         versions: Vec<TlsVersion>,
     ) -> anyhow::Result<()> {
-        let new_certificate =
-            load_full_certificate(certificate_path, certificate_chain_path, key_path, versions)
-                .with_context(|| "Could not load the full certificate")?;
+        let new_certificate = load_full_certificate(
+            certificate_path,
+            certificate_chain_path,
+            key_path,
+            versions,
+            vec![],
+        )
+        .with_context(|| "Could not load the full certificate")?;
 
         self.order_request(Request::AddCertificate(AddCertificate {
             address,
             certificate: new_certificate,
-            names: vec![],
             expired_at: None,
         }))
     }
@@ -469,14 +482,14 @@ impl CommandManager {
             new_certificate_chain_path,
             new_key_path,
             versions,
+            vec![],
         )
         .with_context(|| "Could not load the full certificate")?;
 
         self.order_request(Request::ReplaceCertificate(ReplaceCertificate {
             address,
             new_certificate,
-            old_fingerprint,
-            new_names: vec![],
+            old_fingerprint: old_fingerprint.to_string(),
             new_expired_at: None,
         }))?;
 
@@ -504,7 +517,7 @@ impl CommandManager {
 
         self.order_request(Request::RemoveCertificate(RemoveCertificate {
             address,
-            fingerprint,
+            fingerprint: fingerprint.to_string(),
         }))
     }
 }
@@ -531,6 +544,7 @@ fn load_full_certificate(
     certificate_chain_path: &str,
     key_path: &str,
     versions: Vec<TlsVersion>,
+    names: Vec<String>,
 ) -> Result<CertificateAndKey, anyhow::Error> {
     let certificate = Config::load_file(certificate_path)
         .with_context(|| format!("Could not load certificate file on path {certificate_path}"))?;
@@ -544,10 +558,13 @@ fn load_full_certificate(
     let key = Config::load_file(key_path)
         .with_context(|| format!("Could not load key file on path {key_path}"))?;
 
+    let versions = versions.iter().map(|v| *v as i32).collect();
+
     Ok(CertificateAndKey {
         certificate,
         certificate_chain,
         key,
         versions,
+        names,
     })
 }

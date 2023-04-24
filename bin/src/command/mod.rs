@@ -25,8 +25,9 @@ use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
     config::Config,
-    request::{MetricsConfiguration, Request, WorkerRequest},
-    response::{Response, ResponseContent, ResponseStatus, RunState, WorkerResponse},
+    proto::command::{MetricsConfiguration, RunState},
+    request::{Request, WorkerRequest},
+    response::{Response, ResponseContent, ResponseStatus, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };

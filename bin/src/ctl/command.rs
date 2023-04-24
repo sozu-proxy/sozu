@@ -5,8 +5,9 @@ use serde::Serialize;
 
 use sozu_command_lib::{
     certificate::Fingerprint,
-    request::{QueryClusterByDomain, QueryMetricsOptions, Request},
-    response::{Response, ResponseContent, ResponseStatus, RunState, WorkerInfo},
+    proto::command::{QueryClusterByDomain, QueryMetricsOptions, RunState, WorkerInfo},
+    request::Request,
+    response::{Response, ResponseContent, ResponseStatus},
 };
 
 use crate::ctl::{
@@ -199,7 +200,7 @@ impl CommandManager {
                         // Do a rolling restart of the workers
                         let running_workers = workers
                             .iter()
-                            .filter(|worker| worker.run_state == RunState::Running)
+                            .filter(|worker| worker.run_state == RunState::Running as i32)
                             .collect::<Vec<_>>();
                         let running_count = running_workers.len();
                         for (i, worker) in running_workers.iter().enumerate() {

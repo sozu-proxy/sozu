@@ -34,11 +34,11 @@ use crate::{
     },
     socket::server_bind,
     sozu_command::{
-        config::ProxyProtocolConfig,
         logging,
+        proto::command::{ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig},
         ready::Ready,
-        request::{Request, RequestTcpFrontend, WorkerRequest},
-        response::{Event, TcpListenerConfig, WorkerResponse},
+        request::{Request, WorkerRequest},
+        response::{Event, WorkerResponse},
         scm_socket::ScmSocket,
         state::ClusterId,
     },
@@ -1298,7 +1298,7 @@ impl TcpProxy {
 
         self.fronts
             .insert(front.cluster_id.to_string(), listener.token);
-        listener.set_tags(front.address.to_string(), front.tags);
+        listener.set_tags(front.address.to_string(), Some(front.tags));
         listener.cluster_id = Some(front.cluster_id.to_string());
         Ok(())
     }
@@ -1382,7 +1382,9 @@ impl ProxyConfiguration for TcpProxy {
             }
             Request::AddCluster(cluster) => {
                 let config = ClusterConfiguration {
-                    proxy_protocol: cluster.proxy_protocol,
+                    proxy_protocol: cluster
+                        .proxy_protocol
+                        .and_then(|pp| ProxyProtocolConfig::from_i32(pp)),
                     //load_balancing: cluster.load_balancing,
                 };
                 self.configs.insert(cluster.cluster_id, config);
@@ -1623,15 +1625,17 @@ pub fn start_tcp_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sozu_command::channel::Channel;
-    use crate::sozu_command::request::LoadBalancingParams;
-    use crate::sozu_command::scm_socket::Listeners;
-    use std::io::{Read, Write};
-    use std::net::{Shutdown, TcpListener, TcpStream};
-    use std::os::unix::io::IntoRawFd;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Barrier};
-    use std::{str, thread};
+    use crate::sozu_command::{
+        channel::Channel, proto::command::LoadBalancingParams, scm_socket::Listeners,
+    };
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
+        os::unix::io::IntoRawFd,
+        sync::atomic::{AtomicBool, Ordering},
+        sync::{Arc, Barrier},
+        {str, thread},
+    };
     static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
 
     /*
@@ -1800,12 +1804,7 @@ mod tests {
             let mut configuration = TcpProxy::new(registry, sessions.clone(), backends.clone());
             let listener_config = TcpListenerConfig {
                 address: "127.0.0.1:1234".to_string(),
-                public_address: None,
-                expect_proxy: false,
-                front_timeout: 60,
-                back_timeout: 30,
-                connect_timeout: 3,
-                active: false,
+                ..Default::default()
             };
 
             {
@@ -1862,7 +1861,7 @@ mod tests {
             let front = RequestTcpFrontend {
                 cluster_id: String::from("yolo"),
                 address: "127.0.0.1:1234".to_string(),
-                tags: None,
+                ..Default::default()
             };
             let backend = sozu_command_lib::response::Backend {
                 cluster_id: String::from("yolo"),
@@ -1892,7 +1891,7 @@ mod tests {
             let front = RequestTcpFrontend {
                 cluster_id: String::from("yolo"),
                 address: "127.0.0.1:1235".to_string(),
-                tags: None,
+                ..Default::default()
             };
             let backend = sozu_command::response::Backend {
                 cluster_id: String::from("yolo"),

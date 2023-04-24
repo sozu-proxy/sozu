@@ -13,15 +13,14 @@ use anyhow::{bail, Context};
 use toml;
 
 use crate::{
-    certificate::{split_certificate_chain, CertificateAndKey, TlsVersion},
-    request::{
-        ActivateListener, AddBackend, AddCertificate, Cluster, ListenerType,
-        LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, Request, RequestHttpFrontend,
-        RequestTcpFrontend, WorkerRequest,
+    certificate::split_certificate_chain,
+    proto::command::{
+        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
+        HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
+        LoadBalancingParams, LoadMetric, PathRule, ProxyProtocolConfig, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, TcpListenerConfig, TlsVersion,
     },
-    response::{
-        HttpListenerConfig, HttpsListenerConfig, PathRule, RulePosition, TcpListenerConfig,
-    },
+    request::{Request, WorkerRequest},
 };
 
 /// [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS
@@ -285,6 +284,7 @@ impl ListenerBuilder {
             .parse_public_address()
             .with_context(|| "wrong public address")?;
 
+        // TODO: make sure the timeouts are passed from the builder, not the case here
         let configuration = HttpListenerConfig {
             address: self.address.clone(),
             public_address: self.public_address.clone(),
@@ -296,7 +296,7 @@ impl ListenerBuilder {
             request_timeout: self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT),
             answer_404,
             answer_503,
-            active: false,
+            ..Default::default()
         };
 
         Ok(configuration)
@@ -333,8 +333,8 @@ impl ListenerBuilder {
         let groups_list: Vec<String> = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
 
         let versions = match self.tls_versions {
-            None => vec![TlsVersion::TLSv1_2, TlsVersion::TLSv1_3],
-            Some(ref v) => v.clone(),
+            None => vec![TlsVersion::TlsV12 as i32, TlsVersion::TlsV13 as i32],
+            Some(ref v) => v.iter().map(|v| *v as i32).collect(),
         };
 
         let key = self.key.as_ref().and_then(|path| {
@@ -484,15 +484,6 @@ pub struct MetricsConfig {
     pub tagged_metrics: bool,
     #[serde(default)]
     pub prefix: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[serde(deny_unknown_fields)]
-pub enum ProxyProtocolConfig {
-    ExpectHeader,
-    SendHeader,
-    RelayHeader,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -750,6 +741,11 @@ impl HttpFrontendConfig {
     pub fn generate_requests(&self, cluster_id: &str) -> Vec<Request> {
         let mut v = Vec::new();
 
+        let tags = match self.tags.clone() {
+            Some(tags) => tags,
+            None => BTreeMap::new(),
+        };
+
         if self.key.is_some() && self.certificate.is_some() {
             v.push(Request::AddCertificate(AddCertificate {
                 address: self.address.to_string(),
@@ -757,9 +753,9 @@ impl HttpFrontendConfig {
                     key: self.key.clone().unwrap(),
                     certificate: self.certificate.clone().unwrap(),
                     certificate_chain: self.certificate_chain.clone().unwrap_or_default(),
-                    versions: self.tls_versions.clone(),
+                    versions: self.tls_versions.iter().map(|v| *v as i32).collect(),
+                    names: vec![self.hostname.clone()],
                 },
-                names: vec![self.hostname.clone()],
                 expired_at: None,
             }));
 
@@ -769,8 +765,8 @@ impl HttpFrontendConfig {
                 hostname: self.hostname.clone(),
                 path: self.path.clone(),
                 method: self.method.clone(),
-                position: self.position,
-                tags: self.tags.clone(),
+                position: self.position.into(),
+                tags,
             }));
         } else {
             //create the front both for HTTP and HTTPS if possible
@@ -780,8 +776,8 @@ impl HttpFrontendConfig {
                 hostname: self.hostname.clone(),
                 path: self.path.clone(),
                 method: self.method.clone(),
-                position: self.position,
-                tags: self.tags.clone(),
+                position: self.position.into(),
+                tags,
             }));
         }
 
@@ -809,9 +805,9 @@ impl HttpClusterConfig {
             sticky_session: self.sticky_session,
             https_redirect: self.https_redirect,
             proxy_protocol: None,
-            load_balancing: self.load_balancing,
+            load_balancing: self.load_balancing as i32,
             answer_503: self.answer_503.clone(),
-            load_metric: self.load_metric,
+            load_metric: self.load_metric.and_then(|s| Some(s as i32)),
         })];
 
         for frontend in &self.frontends {
@@ -821,7 +817,7 @@ impl HttpClusterConfig {
 
         for (backend_count, backend) in self.backends.iter().enumerate() {
             let load_balancing_parameters = Some(LoadBalancingParams {
-                weight: backend.weight.unwrap_or(100),
+                weight: backend.weight.unwrap_or(100) as i32,
             });
 
             v.push(Request::AddBackend(AddBackend {
@@ -863,9 +859,9 @@ impl TcpClusterConfig {
             cluster_id: self.cluster_id.clone(),
             sticky_session: false,
             https_redirect: false,
-            proxy_protocol: self.proxy_protocol.clone(),
-            load_balancing: self.load_balancing,
-            load_metric: self.load_metric,
+            proxy_protocol: self.proxy_protocol.and_then(|s| Some(s as i32)),
+            load_balancing: self.load_balancing as i32,
+            load_metric: self.load_metric.and_then(|s| Some(s as i32)),
             answer_503: None,
         })];
 
@@ -873,13 +869,13 @@ impl TcpClusterConfig {
             v.push(Request::AddTcpFrontend(RequestTcpFrontend {
                 cluster_id: self.cluster_id.clone(),
                 address: frontend.address.to_string(),
-                tags: frontend.tags.clone(),
+                tags: frontend.tags.clone().unwrap_or(BTreeMap::new()),
             }));
         }
 
         for (backend_count, backend) in self.backends.iter().enumerate() {
             let load_balancing_parameters = Some(LoadBalancingParams {
-                weight: backend.weight.unwrap_or(100),
+                weight: backend.weight.unwrap_or(100) as i32,
             });
 
             v.push(Request::AddBackend(AddBackend {
@@ -1369,7 +1365,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
                         address: listener.address.clone(),
-                        proxy: ListenerType::HTTP,
+                        proxy: ListenerType::Http.into(),
                         from_scm: false,
                     }),
                 });
@@ -1381,7 +1377,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
                         address: listener.address.clone(),
-                        proxy: ListenerType::HTTPS,
+                        proxy: ListenerType::Https.into(),
                         from_scm: false,
                     }),
                 });
@@ -1393,7 +1389,7 @@ impl Config {
                     id: format!("CONFIG-{count}"),
                     content: Request::ActivateListener(ActivateListener {
                         address: listener.address.clone(),
-                        proxy: ListenerType::TCP,
+                        proxy: ListenerType::Tcp.into(),
                         from_scm: false,
                     }),
                 });

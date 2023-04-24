@@ -7,11 +7,12 @@ use std::{
 };
 
 use crate::{
-    certificate::{CertificateSummary, TlsVersion},
-    request::{
-        default_sticky_name, is_false, AddBackend, Cluster, LoadBalancingParams,
-        RequestHttpFrontend, RequestTcpFrontend, PROTOCOL_VERSION,
+    proto::command::{
+        AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, Cluster,
+        FilteredTimeSerie, ListenersList, LoadBalancingParams, PathRule, PathRuleKind,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, WorkerInfo, WorkerMetrics,
     },
+    request::PROTOCOL_VERSION,
     state::{ClusterId, ConfigState},
 };
 
@@ -89,6 +90,8 @@ pub enum ResponseContent {
     CertificateByFingerprint(Option<(String, Vec<String>)>),
 }
 
+// TODO: the types HttpFrontend, TcpFrontend and Backend are not present,
+// and not meant to be present in proto::command. Find a fix, like using the type HttpRequestFrontend
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClusterInformation {
     pub configuration: Option<Cluster>,
@@ -96,13 +99,6 @@ pub struct ClusterInformation {
     pub https_frontends: Vec<HttpFrontend>,
     pub tcp_frontends: Vec<TcpFrontend>,
     pub backends: Vec<Backend>,
-}
-
-/// lists of available metrics in a worker, or in the main process (in which case there are no cluster metrics)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AvailableMetrics {
-    pub proxy_metrics: Vec<String>,
-    pub cluster_metrics: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -124,51 +120,20 @@ pub struct HttpFrontend {
 
 impl Into<RequestHttpFrontend> for HttpFrontend {
     fn into(self) -> RequestHttpFrontend {
+        let tags = match self.tags {
+            Some(tags) => tags,
+            None => BTreeMap::new(),
+        };
         RequestHttpFrontend {
             cluster_id: self.cluster_id,
             address: self.address.to_string(),
             hostname: self.hostname,
             path: self.path,
             method: self.method,
-            position: self.position,
-            tags: self.tags,
+            position: self.position.into(),
+            tags,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RulePosition {
-    Pre,
-    Post,
-    Tree,
-}
-
-impl Default for RulePosition {
-    fn default() -> Self {
-        RulePosition::Tree
-    }
-}
-
-/// A filter for the path of incoming requests
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-// #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub struct PathRule {
-    /// Either Prefix, Regex or Equals
-    pub kind: PathRuleKind,
-    pub value: String,
-}
-
-/// The kind of filter used for path rules
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum PathRuleKind {
-    /// filters paths that start with a pattern, typically "/api"
-    Prefix,
-    /// filters paths that match a regex pattern
-    Regex,
-    /// filters paths that exactly match a pattern, no more, no less
-    Equals,
 }
 
 impl PathRule {
@@ -177,7 +142,7 @@ impl PathRule {
         S: ToString,
     {
         Self {
-            kind: PathRuleKind::Prefix,
+            kind: PathRuleKind::Prefix.into(),
             value: value.to_string(),
         }
     }
@@ -187,7 +152,7 @@ impl PathRule {
         S: ToString,
     {
         Self {
-            kind: PathRuleKind::Regex,
+            kind: PathRuleKind::Regex.into(),
             value: value.to_string(),
         }
     }
@@ -197,7 +162,7 @@ impl PathRule {
         S: ToString,
     {
         Self {
-            kind: PathRuleKind::Equals,
+            kind: PathRuleKind::Equals.into(),
             value: value.to_string(),
         }
     }
@@ -209,15 +174,15 @@ impl PathRule {
     ) -> Self {
         match (path_prefix, path_regex, path_equals) {
             (Some(prefix), _, _) => PathRule {
-                kind: PathRuleKind::Prefix,
+                kind: PathRuleKind::Prefix as i32,
                 value: prefix,
             },
             (None, Some(regex), _) => PathRule {
-                kind: PathRuleKind::Regex,
+                kind: PathRuleKind::Regex as i32,
                 value: regex,
             },
             (None, None, Some(equals)) => PathRule {
-                kind: PathRuleKind::Equals,
+                kind: PathRuleKind::Equals as i32,
                 value: equals,
             },
             _ => PathRule::default(),
@@ -225,25 +190,17 @@ impl PathRule {
     }
 }
 
-impl Default for PathRule {
-    fn default() -> Self {
-        PathRule {
-            kind: PathRuleKind::Prefix,
-            value: String::new(),
-        }
-    }
-}
-
 pub fn is_default_path_rule(p: &PathRule) -> bool {
-    p.kind == PathRuleKind::Prefix && p.value.is_empty()
+    PathRuleKind::from_i32(p.kind) == Some(PathRuleKind::Prefix) && p.value.is_empty()
 }
 
 impl std::fmt::Display for PathRule {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.kind {
-            PathRuleKind::Prefix => write!(f, "prefix '{}'", self.value),
-            PathRuleKind::Regex => write!(f, "regexp '{}'", self.value),
-            PathRuleKind::Equals => write!(f, "equals '{}'", self.value),
+        match PathRuleKind::from_i32(self.kind) {
+            Some(PathRuleKind::Prefix) => write!(f, "prefix '{}'", self.value),
+            Some(PathRuleKind::Regex) => write!(f, "regexp '{}'", self.value),
+            Some(PathRuleKind::Equals) => write!(f, "equals '{}'", self.value),
+            None => write!(f, ""),
         }
     }
 }
@@ -252,6 +209,7 @@ impl std::fmt::Display for PathRule {
 pub struct TcpFrontend {
     pub cluster_id: String,
     pub address: SocketAddr,
+    // TODO: remove the Option here, the map may as well be empty
     pub tags: Option<BTreeMap<String, String>>,
 }
 
@@ -260,11 +218,12 @@ impl Into<RequestTcpFrontend> for TcpFrontend {
         RequestTcpFrontend {
             cluster_id: self.cluster_id,
             address: self.address.to_string(),
-            tags: self.tags,
+            tags: self.tags.unwrap_or(BTreeMap::new()),
         }
     }
 }
 
+// TODO: should contain HttpFrontendConfig and TcpFrontendConfig, or types written in protobuf
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ListedFrontends {
     pub http_frontends: Vec<HttpFrontend>,
@@ -322,115 +281,13 @@ impl Backend {
     }
 }
 
-/// All listeners, listed for the CLI.
-/// the bool indicates if it is active or not
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ListenersList {
-    /// address -> (listener_config, activated)
-    pub http_listeners: HashMap<String, HttpListenerConfig>,
-    pub https_listeners: HashMap<String, HttpsListenerConfig>,
-    pub tcp_listeners: HashMap<String, TcpListenerConfig>,
-}
-
-/// details of an HTTP listener, sent by the main process to the worker
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HttpListenerConfig {
-    pub address: String,
-    pub public_address: Option<String>,
-    pub answer_404: String,
-    pub answer_503: String,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_false")]
-    pub expect_proxy: bool,
-    /// identifies sticky sessions
-    #[serde(default = "default_sticky_name")]
-    pub sticky_name: String,
-    /// client inactive time
-    pub front_timeout: u32,
-    /// backend server inactive time
-    pub back_timeout: u32,
-    /// time to connect to the backend
-    pub connect_timeout: u32,
-    /// max time to send a complete request
-    pub request_timeout: u32,
-    /// should default to false
-    pub active: bool,
-}
-
-/// details of an HTTPS listener, sent by the main process to the worker
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HttpsListenerConfig {
-    pub address: String,
-    pub public_address: Option<String>,
-    pub answer_404: String,
-    pub answer_503: String,
-    pub versions: Vec<TlsVersion>,
-    pub cipher_list: Vec<String>,
-    #[serde(default)]
-    pub cipher_suites: Vec<String>,
-    #[serde(default)]
-    pub signature_algorithms: Vec<String>,
-    #[serde(default)]
-    pub groups_list: Vec<String>,
-    #[serde(default)]
-    pub expect_proxy: bool,
-    #[serde(default = "default_sticky_name")]
-    pub sticky_name: String,
-    #[serde(default)]
-    pub certificate: Option<String>,
-    #[serde(default)]
-    pub certificate_chain: Vec<String>,
-    #[serde(default)]
-    pub key: Option<String>,
-    pub front_timeout: u32,
-    pub back_timeout: u32,
-    pub connect_timeout: u32,
-    /// max time to send a complete request
-    pub request_timeout: u32,
-    /// should default to false
-    pub active: bool,
-}
-
-/// details of an TCP listener, sent by the main process to the worker
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TcpListenerConfig {
-    pub address: String,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub public_address: Option<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_false")]
-    pub expect_proxy: bool,
-    pub front_timeout: u32,
-    pub back_timeout: u32,
-    pub connect_timeout: u32,
-    /// should default to false
-    pub active: bool,
-}
-
-/// Runstate of a worker
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum RunState {
-    Running,
-    Stopping,
-    Stopped,
-    NotAnswering,
-}
-
 impl fmt::Display for RunState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WorkerInfo {
-    pub id: u32,
-    pub pid: i32,
-    pub run_state: RunState,
-}
-
+// TODO: remove the SocketAddr type
 /// a backend event that happened on a proxy
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -527,80 +384,15 @@ impl fmt::Display for WorkerResponse {
     }
 }
 
-/// Aggregated metrics of main process & workers, for the CLI
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AggregatedMetrics {
-    pub main: BTreeMap<String, FilteredMetrics>,
-    pub workers: BTreeMap<String, WorkerMetrics>,
-}
-
-/// All metrics of a worker: proxy and clusters
-/// Populated by Options so partial results can be sent
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerMetrics {
-    /// Metrics of the worker process, key -> value
-    pub proxy: Option<BTreeMap<String, FilteredMetrics>>,
-    /// cluster_id -> cluster_metrics
-    pub clusters: Option<BTreeMap<String, ClusterMetrics>>,
-}
-
-/// the metrics of a given cluster, with several backends
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusterMetrics {
-    /// metric name -> metric value
-    pub cluster: Option<BTreeMap<String, FilteredMetrics>>,
-    /// backend_id -> (metric name-> metric value)
-    pub backends: Option<Vec<BackendMetrics>>,
-}
-
-/// the metrics of a given backend
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackendMetrics {
-    pub backend_id: String,
-    /// metric name -> metric value
-    pub metrics: BTreeMap<String, FilteredMetrics>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum FilteredMetrics {
-    Gauge(usize),
-    Count(i64),
-    Time(usize),
-    Percentiles(Percentiles),
-    TimeSerie(FilteredTimeSerie),
-}
-
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct FilteredTimeSerie {
-    pub last_second: u32,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub last_minute: Vec<u32>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub last_hour: Vec<u32>,
-}
-
-impl fmt::Debug for FilteredTimeSerie {
+impl fmt::Display for FilteredTimeSerie {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "FilteredTimeSerie {{\nlast_second: {},\nlast_minute:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\nlast_hour:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n}}",
-      self.last_second,
-    &self.last_minute[0..10], &self.last_minute[10..20], &self.last_minute[20..30], &self.last_minute[30..40], &self.last_minute[40..50], &self.last_minute[50..60],
-    &self.last_hour[0..10], &self.last_hour[10..20], &self.last_hour[20..30], &self.last_hour[30..40], &self.last_hour[40..50], &self.last_hour[50..60])
+        write!(
+            f,
+            "FilteredTimeSerie {{\nlast_second: {},\nlast_minute:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\nlast_hour:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n}}",
+            self.last_second,
+            &self.last_minute[0..10], &self.last_minute[10..20], &self.last_minute[20..30], &self.last_minute[30..40], &self.last_minute[40..50], &self.last_minute[50..60],
+            &self.last_hour[0..10], &self.last_hour[10..20], &self.last_hour[20..30], &self.last_hour[30..40], &self.last_hour[40..50], &self.last_hour[50..60])
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-pub struct Percentiles {
-    pub samples: u64,
-    pub p_50: u64,
-    pub p_90: u64,
-    pub p_99: u64,
-    pub p_99_9: u64,
-    pub p_99_99: u64,
-    pub p_99_999: u64,
-    pub p_100: u64,
 }
 
 fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
@@ -609,6 +401,11 @@ fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
 
 #[cfg(test)]
 mod tests {
+    use crate::proto::command::{
+        filtered_metrics, AggregatedMetrics, BackendMetrics, ClusterMetrics, FilteredMetrics,
+        Percentiles, WorkerInfo, WorkerMetrics,
+    };
+
     use super::*;
 
     macro_rules! test_message_answer (
@@ -651,12 +448,12 @@ mod tests {
                 WorkerInfo {
                     id: 1,
                     pid: 5678,
-                    run_state: RunState::Running,
+                    run_state: RunState::Running as i32,
                 },
                 WorkerInfo {
                     id: 0,
                     pid: 1234,
-                    run_state: RunState::Stopping,
+                    run_state: RunState::Stopping as i32,
                 },
             ))),
         }
@@ -672,9 +469,24 @@ mod tests {
             message: String::from(""),
             content: Some(ResponseContent::Metrics(AggregatedMetrics {
                 main: [
-                    (String::from("sozu.gauge"), FilteredMetrics::Gauge(1)),
-                    (String::from("sozu.count"), FilteredMetrics::Count(-2)),
-                    (String::from("sozu.time"), FilteredMetrics::Time(1234)),
+                    (
+                        String::from("sozu.gauge"),
+                        FilteredMetrics {
+                            inner: Some(filtered_metrics::Inner::Gauge(1))
+                        }
+                    ),
+                    (
+                        String::from("sozu.count"),
+                        FilteredMetrics {
+                            inner: Some(filtered_metrics::Inner::Count(-2))
+                        }
+                    ),
+                    (
+                        String::from("sozu.time"),
+                        FilteredMetrics {
+                            inner: Some(filtered_metrics::Inner::Time(1234))
+                        }
+                    ),
                 ]
                 .iter()
                 .cloned()
@@ -682,24 +494,37 @@ mod tests {
                 workers: [(
                     String::from("0"),
                     WorkerMetrics {
-                        proxy: Some(
-                            [
-                                (String::from("sozu.gauge"), FilteredMetrics::Gauge(1)),
-                                (String::from("sozu.count"), FilteredMetrics::Count(-2)),
-                                (String::from("sozu.time"), FilteredMetrics::Time(1234)),
-                            ]
-                            .iter()
-                            .cloned()
-                            .collect()
-                        ),
-                        clusters: Some(
-                            [(
-                                String::from("cluster_1"),
-                                ClusterMetrics {
-                                    cluster: Some(
-                                        [(
-                                            String::from("request_time"),
-                                            FilteredMetrics::Percentiles(Percentiles {
+                        proxy: [
+                            (
+                                String::from("sozu.gauge"),
+                                FilteredMetrics {
+                                    inner: Some(filtered_metrics::Inner::Gauge(1))
+                                }
+                            ),
+                            (
+                                String::from("sozu.count"),
+                                FilteredMetrics {
+                                    inner: Some(filtered_metrics::Inner::Count(-2))
+                                }
+                            ),
+                            (
+                                String::from("sozu.time"),
+                                FilteredMetrics {
+                                    inner: Some(filtered_metrics::Inner::Time(1234))
+                                }
+                            ),
+                        ]
+                        .iter()
+                        .cloned()
+                        .collect(),
+                        clusters: [(
+                            String::from("cluster_1"),
+                            ClusterMetrics {
+                                cluster: [(
+                                    String::from("request_time"),
+                                    FilteredMetrics {
+                                        inner: Some(filtered_metrics::Inner::Percentiles(
+                                            Percentiles {
                                                 samples: 42,
                                                 p_50: 1,
                                                 p_90: 2,
@@ -708,44 +533,55 @@ mod tests {
                                                 p_99_99: 20,
                                                 p_99_999: 22,
                                                 p_100: 30,
-                                            })
-                                        )]
-                                        .iter()
-                                        .cloned()
-                                        .collect()
-                                    ),
-                                    backends: Some(vec![BackendMetrics {
-                                        backend_id: String::from("cluster_1-0"),
-                                        metrics: [
-                                            (String::from("bytes_in"), FilteredMetrics::Count(256)),
-                                            (
-                                                String::from("bytes_out"),
-                                                FilteredMetrics::Count(128)
-                                            ),
-                                            (
-                                                String::from("percentiles"),
-                                                FilteredMetrics::Percentiles(Percentiles {
-                                                    samples: 42,
-                                                    p_50: 1,
-                                                    p_90: 2,
-                                                    p_99: 10,
-                                                    p_99_9: 12,
-                                                    p_99_99: 20,
-                                                    p_99_999: 22,
-                                                    p_100: 30,
-                                                })
-                                            )
-                                        ]
-                                        .iter()
-                                        .cloned()
-                                        .collect()
-                                    }]),
-                                }
-                            )]
-                            .iter()
-                            .cloned()
-                            .collect()
-                        )
+                                            }
+                                        ))
+                                    }
+                                )]
+                                .iter()
+                                .cloned()
+                                .collect(),
+                                backends: vec![BackendMetrics {
+                                    backend_id: String::from("cluster_1-0"),
+                                    metrics: [
+                                        (
+                                            String::from("bytes_in"),
+                                            FilteredMetrics {
+                                                inner: Some(filtered_metrics::Inner::Count(256))
+                                            }
+                                        ),
+                                        (
+                                            String::from("bytes_out"),
+                                            FilteredMetrics {
+                                                inner: Some(filtered_metrics::Inner::Count(128))
+                                            }
+                                        ),
+                                        (
+                                            String::from("percentiles"),
+                                            FilteredMetrics {
+                                                inner: Some(filtered_metrics::Inner::Percentiles(
+                                                    Percentiles {
+                                                        samples: 42,
+                                                        p_50: 1,
+                                                        p_90: 2,
+                                                        p_99: 10,
+                                                        p_99_9: 12,
+                                                        p_99_99: 20,
+                                                        p_99_999: 22,
+                                                        p_100: 30,
+                                                    }
+                                                ))
+                                            }
+                                        )
+                                    ]
+                                    .iter()
+                                    .cloned()
+                                    .collect()
+                                }],
+                            }
+                        )]
+                        .iter()
+                        .cloned()
+                        .collect()
                     }
                 )]
                 .iter()

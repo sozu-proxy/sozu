@@ -1,5 +1,4 @@
-use std::fmt::Debug;
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, fmt::Debug, rc::Rc};
 
 use rand::{
     distributions::{Distribution, WeightedIndex},
@@ -7,7 +6,7 @@ use rand::{
     thread_rng, Rng,
 };
 
-use crate::{sozu_command::request::LoadMetric, Backend};
+use crate::{sozu_command::proto::command::LoadMetric, Backend};
 
 pub trait LoadBalancingAlgorithm: Debug {
     fn next_available_backend(
@@ -56,7 +55,7 @@ impl LoadBalancingAlgorithm for Random {
         backends: &mut Vec<Rc<RefCell<Backend>>>,
     ) -> Option<Rc<RefCell<Backend>>> {
         let mut rng = thread_rng();
-        let weights: Vec<u8> = backends
+        let weights: Vec<i32> = backends
             .iter()
             .map(|b| {
                 b.borrow()
@@ -177,7 +176,7 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
 mod test {
     use super::*;
     use crate::retry::{ExponentialBackoffPolicy, RetryPolicyWrapper};
-    use crate::sozu_command::request::LoadMetric;
+    use crate::sozu_command::proto::command::LoadMetric;
     use crate::{BackendStatus, PeakEWMA};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 

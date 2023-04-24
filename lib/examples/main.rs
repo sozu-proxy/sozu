@@ -8,17 +8,16 @@ extern crate time;
 use std::{env, io::stdout, thread};
 
 use anyhow::Context;
-use sozu_command::config::ListenerBuilder;
 
 use sozu_command::{
-    certificate::CertificateAndKey,
     channel::Channel,
+    config::ListenerBuilder,
     logging::{Logger, LoggerBackend},
-    request::{
-        AddBackend, AddCertificate, LoadBalancingParams, Request, RequestHttpFrontend,
-        WorkerRequest,
+    proto::command::{
+        AddBackend, AddCertificate, CertificateAndKey, LoadBalancingParams, PathRule,
+        RequestHttpFrontend,
     },
-    response::{PathRule, RulePosition},
+    request::{Request, WorkerRequest},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -65,9 +64,7 @@ fn main() -> anyhow::Result<()> {
         address: "127.0.0.1:8080".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
-        method: None,
-        position: RulePosition::Tree,
-        tags: None,
+        ..Default::default()
     };
 
     let http_backend = AddBackend {
@@ -110,6 +107,7 @@ fn main() -> anyhow::Result<()> {
         key: String::from(key1),
         certificate_chain: vec![],
         versions: vec![],
+        names: vec![],
     };
     command2.write_message(&WorkerRequest {
         id: String::from("ID_IJKL1"),
@@ -118,7 +116,6 @@ fn main() -> anyhow::Result<()> {
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
             certificate: certificate_and_key,
-            names: vec![],
             expired_at: None,
         }),
     });
@@ -128,9 +125,7 @@ fn main() -> anyhow::Result<()> {
         address: "127.0.0.1:8443".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
-        method: None,
-        position: RulePosition::Tree,
-        tags: None,
+        ..Default::default()
     };
 
     command2.write_message(&WorkerRequest {
@@ -159,6 +154,7 @@ fn main() -> anyhow::Result<()> {
         key: String::from(key2),
         certificate_chain: vec![],
         versions: vec![],
+        names: vec![],
     };
 
     command2.write_message(&WorkerRequest {
@@ -168,7 +164,6 @@ fn main() -> anyhow::Result<()> {
                 .parse()
                 .with_context(|| "Could not parse certificate address")?,
             certificate: certificate_and_key2,
-            names: vec![],
             expired_at: None,
         }),
     });
@@ -178,9 +173,7 @@ fn main() -> anyhow::Result<()> {
         address: "127.0.0.1:8443".to_string(),
         hostname: String::from("test.local"),
         path: PathRule::prefix(String::from("/")),
-        method: None,
-        position: RulePosition::Tree,
-        tags: None,
+        ..Default::default()
     };
 
     command2.write_message(&WorkerRequest {

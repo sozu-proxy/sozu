@@ -23,8 +23,8 @@ use x509_parser::{
 
 use crate::router::trie::*;
 use sozu_command::{
-    certificate::{CertificateAndKey, Fingerprint, TlsVersion},
-    request::{AddCertificate, RemoveCertificate, ReplaceCertificate},
+    certificate::Fingerprint,
+    proto::command::{AddCertificate, CertificateAndKey, ReplaceCertificate, TlsVersion},
 };
 
 // -----------------------------------------------------------------------------
@@ -42,7 +42,7 @@ pub trait CertificateResolver {
 
     // `remove_certificate` from the certificate resolver, may fail if there is no alternative for
     // a domain name
-    fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error>;
+    fn remove_certificate(&mut self, opts: &Fingerprint) -> Result<(), Self::Error>;
 
     // `replace_certificate` by a new one, this method is a short-hand for `add_certificate` and
     // then `remove_certificate`. It is possible that the certificate will not be replaced, if the
@@ -54,14 +54,10 @@ pub trait CertificateResolver {
         let fingerprint = self.add_certificate(&AddCertificate {
             address: opts.address.to_owned(),
             certificate: opts.new_certificate.to_owned(),
-            names: opts.new_names.to_owned(),
             expired_at: opts.new_expired_at.to_owned(),
         })?;
 
-        self.remove_certificate(&RemoveCertificate {
-            address: opts.address.to_owned(),
-            fingerprint: opts.old_fingerprint.to_owned(),
-        })?;
+        self.remove_certificate(&fingerprint)?;
 
         Ok(fingerprint)
     }
@@ -106,8 +102,8 @@ pub struct CertificateOverride {
 impl From<&AddCertificate> for CertificateOverride {
     fn from(opts: &AddCertificate) -> Self {
         let mut names = None;
-        if !opts.names.is_empty() {
-            names = Some(opts.names.iter().cloned().collect())
+        if !opts.certificate.names.is_empty() {
+            names = Some(opts.certificate.names.iter().cloned().collect())
         }
 
         Self {
@@ -191,7 +187,7 @@ impl CertificateResolver for GenericCertificateResolver {
         // error.
         let parsed_certificate_and_key = Self::parse(&opts.certificate)?;
         let fingerprint = Self::fingerprint(&parsed_certificate_and_key.certificate);
-        if !opts.names.is_empty() || opts.expired_at.is_some() {
+        if !opts.certificate.names.is_empty() || opts.expired_at.is_some() {
             self.overrides
                 .insert(fingerprint.to_owned(), CertificateOverride::from(opts));
         } else {
@@ -240,20 +236,20 @@ impl CertificateResolver for GenericCertificateResolver {
         Ok(fingerprint.to_owned())
     }
 
-    fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error> {
-        if let Some(certificate_and_key) = self.get_certificate(&opts.fingerprint) {
-            let names = match self.get_names_override(&opts.fingerprint) {
+    fn remove_certificate(&mut self, fingerprint: &Fingerprint) -> Result<(), Self::Error> {
+        if let Some(certificate_and_key) = self.get_certificate(fingerprint) {
+            let names = match self.get_names_override(fingerprint) {
                 Some(names) => names,
                 None => self.certificate_names(&certificate_and_key.certificate)?,
             };
 
-            if self.is_required_for_domain(&names, &opts.fingerprint) {
+            if self.is_required_for_domain(&names, fingerprint) {
                 return Err(GenericCertificateResolverError::IsStillInUseError);
             }
 
             for name in &names {
                 if let Some(fingerprints) = self.name_fingerprint_idx.get_mut(name) {
-                    fingerprints.remove(&opts.fingerprint);
+                    fingerprints.remove(fingerprint);
 
                     if fingerprints.is_empty() {
                         self.domains.domain_remove(&name.to_owned().into_bytes());
@@ -261,7 +257,7 @@ impl CertificateResolver for GenericCertificateResolver {
                 }
             }
 
-            self.certificates.remove(&opts.fingerprint);
+            self.certificates.remove(fingerprint);
         }
 
         Ok(())
@@ -350,11 +346,16 @@ impl CertificateResolverHelper for GenericCertificateResolver {
             if !keys.is_empty() {
                 let key = PrivateKey(keys.swap_remove(0));
                 if RsaSigningKey::new(&key).is_ok() {
+                    let versions = certificate_and_key
+                        .versions
+                        .iter()
+                        .filter_map(|v| TlsVersion::from_i32(*v))
+                        .collect();
                     return Ok(ParsedCertificateAndKey {
                         certificate,
                         chain: chains,
                         key: certificate_and_key.key.to_owned(),
-                        versions: certificate_and_key.versions.to_owned(),
+                        versions,
                     });
                 }
             }
@@ -366,23 +367,34 @@ impl CertificateResolverHelper for GenericCertificateResolver {
         if let Ok(mut keys) = parsed_keys {
             if !keys.is_empty() {
                 let key = PrivateKey(keys.swap_remove(0));
+
                 // try to read as rsa private key
                 if RsaSigningKey::new(&key).is_ok() {
+                    let versions = certificate_and_key
+                        .versions
+                        .iter()
+                        .filter_map(|v| TlsVersion::from_i32(*v))
+                        .collect();
                     return Ok(ParsedCertificateAndKey {
                         certificate,
                         chain: chains,
                         key: certificate_and_key.key.to_owned(),
-                        versions: certificate_and_key.versions.to_owned(),
+                        versions,
                     });
                 }
 
                 // try to read as ecdsa private key
                 if rustls::sign::any_ecdsa_type(&key).is_ok() {
+                    let versions = certificate_and_key
+                        .versions
+                        .iter()
+                        .filter_map(|v| TlsVersion::from_i32(*v))
+                        .collect();
                     return Ok(ParsedCertificateAndKey {
                         certificate,
                         chain: chains,
                         key: certificate_and_key.key.to_owned(),
-                        versions: certificate_and_key.versions.to_owned(),
+                        versions,
                     });
                 }
             }
@@ -635,10 +647,8 @@ mod tests {
         GenericCertificateResolverError,
     };
 
-    use crate::sozu_command::request::{AddCertificate, RemoveCertificate};
-
     use rand::{seq::SliceRandom, thread_rng};
-    use sozu_command::certificate::CertificateAndKey;
+    use sozu_command::proto::command::{AddCertificate, CertificateAndKey};
     use x509_parser::pem::parse_x509_pem;
 
     #[test]
@@ -648,8 +658,7 @@ mod tests {
         let certificate_and_key = CertificateAndKey {
             certificate: String::from(include_str!("../assets/certificate.pem")),
             key: String::from(include_str!("../assets/key.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
+            ..Default::default()
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
@@ -658,7 +667,6 @@ mod tests {
         let fingerprint = resolver.add_certificate(&AddCertificate {
             address: address.clone(),
             certificate: certificate_and_key,
-            names: vec![],
             expired_at: None,
         })?;
 
@@ -666,10 +674,7 @@ mod tests {
             return Err("failed to retrieve certificate".into());
         }
 
-        if let Err(err) = resolver.remove_certificate(&RemoveCertificate {
-            address,
-            fingerprint: fingerprint.to_owned(),
-        }) {
+        if let Err(err) = resolver.remove_certificate(&fingerprint) {
             match err {
                 GenericCertificateResolverError::IsStillInUseError => {}
                 _ => {
@@ -698,8 +703,8 @@ mod tests {
         let certificate_and_key = CertificateAndKey {
             certificate: String::from(include_str!("../assets/certificate.pem")),
             key: String::from(include_str!("../assets/key.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
+            names: vec!["localhost".into(), "lolcatho.st".into()],
+            ..Default::default()
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
@@ -708,7 +713,6 @@ mod tests {
         let fingerprint = resolver.add_certificate(&AddCertificate {
             address: address.clone(),
             certificate: certificate_and_key,
-            names: vec!["localhost".into(), "lolcatho.st".into()],
             expired_at: None,
         })?;
 
@@ -716,10 +720,7 @@ mod tests {
             return Err("failed to retrieve certificate".into());
         }
 
-        if let Err(err) = resolver.remove_certificate(&RemoveCertificate {
-            address,
-            fingerprint: fingerprint.to_owned(),
-        }) {
+        if let Err(err) = resolver.remove_certificate(&fingerprint) {
             match err {
                 GenericCertificateResolverError::IsStillInUseError => {}
                 _ => {
@@ -762,8 +763,7 @@ mod tests {
         let certificate_and_key_1y = CertificateAndKey {
             certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
             key: String::from(include_str!("../assets/tests/key-1y.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
+            ..Default::default()
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key_1y.certificate.as_bytes())
@@ -773,7 +773,6 @@ mod tests {
         let fingerprint_1y = resolver.add_certificate(&AddCertificate {
             address: address.clone(),
             certificate: certificate_and_key_1y,
-            names: vec![],
             expired_at: None,
         })?;
 
@@ -786,14 +785,12 @@ mod tests {
         let certificate_and_key_2y = CertificateAndKey {
             certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
             key: String::from(include_str!("../assets/tests/key-2y.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
+            ..Default::default()
         };
 
         let fingerprint_2y = resolver.add_certificate(&AddCertificate {
             address,
             certificate: certificate_and_key_2y,
-            names: vec![],
             expired_at: None,
         })?;
 
@@ -833,8 +830,7 @@ mod tests {
         let certificate_and_key_1y = CertificateAndKey {
             certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
             key: String::from(include_str!("../assets/tests/key-1y.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
+            ..Default::default()
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key_1y.certificate.as_bytes())
@@ -844,7 +840,6 @@ mod tests {
         let fingerprint_1y = resolver.add_certificate(&AddCertificate {
             address: address.clone(),
             certificate: certificate_and_key_1y,
-            names: vec![],
             expired_at: Some(
                 (SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?
                     + Duration::from_secs(3 * 365 * 24 * 3600))
@@ -861,14 +856,12 @@ mod tests {
         let certificate_and_key_2y = CertificateAndKey {
             certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
             key: String::from(include_str!("../assets/tests/key-2y.pem")),
-            certificate_chain: vec![],
-            versions: vec![],
+            ..Default::default()
         };
 
         let fingerprint_2y = resolver.add_certificate(&AddCertificate {
             address,
             certificate: certificate_and_key_2y,
-            names: vec![],
             expired_at: None,
         })?;
 
@@ -906,38 +899,32 @@ mod tests {
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-1.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
+                ..Default::default()
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-2.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
+                ..Default::default()
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-3.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
+                ..Default::default()
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-4.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
+                ..Default::default()
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-5.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
+                ..Default::default()
             },
             CertificateAndKey {
                 certificate: include_str!("../assets/tests/certificate-6.pem").to_string(),
                 key: include_str!("../assets/tests/key.pem").to_string(),
-                certificate_chain: vec![],
-                versions: vec![],
+                ..Default::default()
             },
         ];
 
@@ -961,7 +948,6 @@ mod tests {
             resolver.add_certificate(&AddCertificate {
                 address: address.clone(),
                 certificate: certificate.to_owned(),
-                names: vec![],
                 expired_at: None,
             })?;
         }

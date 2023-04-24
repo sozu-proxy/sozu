@@ -4,7 +4,7 @@ use anyhow::{bail, Context};
 use mio::net::TcpStream;
 
 use sozu_command::{
-    request::{LoadBalancingAlgorithms, LoadMetric},
+    proto::command::{LoadBalancingAlgorithms, LoadMetric},
     response::Event,
     state::ClusterId,
 };

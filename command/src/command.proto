@@ -1,0 +1,358 @@
+syntax = "proto2";
+package command;
+
+// details of an HTTP listener
+message HttpListenerConfig {
+    required string address = 1;
+    optional string public_address = 2;
+    required string answer_404 = 3;
+    required string answer_503 = 4;
+    required bool expect_proxy = 5 [default = false];
+    required string sticky_name = 6;
+    // client inactive time, in seconds
+    required uint32 front_timeout = 7 [default = 60];
+    // backend server inactive time, in seconds
+    required uint32 back_timeout = 8 [default = 30];
+    // time to connect to the backend, in seconds
+    required uint32 connect_timeout = 9 [default = 3];
+    // max time to send a complete request, in seconds
+    required uint32 request_timeout = 10 [default = 10];
+    // wether the listener is actively listening on its socket
+    required bool active = 11 [default = false];
+}
+
+// details of an HTTPS listener
+message HttpsListenerConfig {
+    required string address = 1;
+    optional string public_address = 2;
+    required string answer_404 = 3;
+    required string answer_503 = 4;
+    required bool expect_proxy = 5 [default = false];
+    required string sticky_name = 6;
+    // client inactive time, in seconds
+    required uint32 front_timeout = 7 [default = 60];
+    // backend server inactive time, in seconds
+    required uint32 back_timeout = 8 [default = 30];
+    // time to connect to the backend, in seconds
+    required uint32 connect_timeout = 9 [default = 3];
+    // max time to send a complete request, in seconds
+    required uint32 request_timeout = 10 [default = 10];
+    // wether the listener is actively listening on its socket
+    required bool active = 11 [default = false];
+    // TLS versions
+    repeated TlsVersion versions = 12;
+    repeated string cipher_list = 13;
+    repeated string cipher_suites = 14;
+    repeated string signature_algorithms = 15;
+    repeated string groups_list = 16;
+    optional string certificate = 17;
+    repeated string certificate_chain = 18;
+    optional string key = 19;
+}
+
+// details of an TCP listener
+message TcpListenerConfig {
+    required string address = 1;
+    optional string public_address = 2;
+    required bool expect_proxy = 3 [default = false];
+    // client inactive time, in seconds
+    required uint32 front_timeout = 4 [default = 60];
+    // backend server inactive time, in seconds
+    required uint32 back_timeout = 5 [default = 30];
+    // time to connect to the backend, in seconds
+    required uint32 connect_timeout = 6 [default = 3];
+    // wether the listener is actively listening on its socket
+    required bool active = 7 [default = false];
+}
+
+message ActivateListener {
+    required string address = 1;
+    required ListenerType proxy = 2;
+    required bool from_scm = 3;
+}
+
+message DeactivateListener {
+    required string address = 1;
+    required ListenerType proxy = 2;
+    required bool to_scm = 3;
+}
+
+message RemoveListener {
+    required string address = 1;
+    required ListenerType proxy = 2;
+}
+
+enum ListenerType {
+    HTTP = 0;
+    HTTPS = 1;
+    TCP = 2;
+}
+
+// All listeners, listed
+message ListenersList {
+    // address -> http listener config
+    map<string, HttpListenerConfig> http_listeners = 1;
+    // address -> https listener config
+    map<string, HttpsListenerConfig> https_listeners = 2;
+    // address -> tcp listener config
+    map<string, TcpListenerConfig> tcp_listeners = 3;
+}
+
+message RequestHttpFrontend {
+    optional string cluster_id = 1;
+    required string address = 2;
+    required string hostname = 3;
+    required PathRule path = 4;
+    optional string method = 5;
+    required RulePosition position = 6 [default = TREE];
+    // custom tags to identify the frontend in the access logs
+    map<string, string> tags = 7;
+}
+
+message RequestTcpFrontend {
+    required string cluster_id = 1;
+    // the socket address on which to listen for incoming traffic
+    required string address = 2;
+    // custom tags to identify the frontend in the access logs
+    map<string, string> tags = 3;
+}
+
+// list the frontends, filtered by protocol and/or domain
+message FrontendFilters {
+    required bool http = 1;
+    required bool https = 2;
+    required bool tcp = 3;
+    optional string domain = 4;
+}
+
+// A filter for the path of incoming requests
+message PathRule {
+    // The kind of filter used for path rules
+    required PathRuleKind kind = 1;
+    // the value of the given prefix, regex or equal pathrule
+    required string value = 2;
+}
+
+// The kind of filter used for path rules
+enum PathRuleKind {
+    // filters paths that start with a pattern, typically "/api"
+    PREFIX = 0;
+    // filters paths that match a regex pattern
+    REGEX = 1;
+    // filters paths that exactly match a pattern, no more, no less
+    EQUALS = 2;
+}
+
+// TODO: find a proper definition for this
+enum RulePosition {
+    PRE = 0;
+    POST = 1;
+    TREE = 2;
+}
+
+// Add a new TLS certificate to an HTTPs listener
+message AddCertificate {
+    required string address = 1;
+    required CertificateAndKey certificate = 2;
+    // A unix timestamp. Overrides certificate expiration.
+    optional int64 expired_at = 3;
+}
+
+message RemoveCertificate {
+    required string address = 1;
+    // a hex-encoded TLS fingerprint to identify the certificate to remove
+    required string fingerprint = 2;
+}
+
+message ReplaceCertificate {
+    required string address = 1;
+    required CertificateAndKey new_certificate = 2;
+    // a hex-encoded TLS fingerprint to identify the old certificate
+    required string old_fingerprint = 3;
+    // A unix timestamp. Overrides certificate expiration.
+    optional int64 new_expired_at = 4;
+}
+
+message CertificateAndKey {
+    required string certificate = 1;
+    repeated string certificate_chain = 2;
+    required string key = 3;
+    repeated TlsVersion versions = 4;
+    // hostnames linked to the certificate
+    repeated string names = 5;
+}
+
+// domain name and fingerprint of a certificate
+message CertificateSummary {
+    required string domain = 1;
+    // a hex-encoded TLS fingerprint
+    required string fingerprint = 2;
+}
+
+enum TlsVersion {
+    SSL_V2 = 0;
+    SSL_V3 = 1;
+    TLS_V1_0 = 2;
+    TLS_V1_1 = 3;
+    TLS_V1_2 = 4;
+    TLS_V1_3 = 5;
+}
+
+message Cluster {
+    required string cluster_id = 1;
+    required bool sticky_session = 2;
+    required bool https_redirect = 3;
+    optional ProxyProtocolConfig proxy_protocol = 4;
+    required LoadBalancingAlgorithms load_balancing = 5 [default = ROUND_ROBIN];
+    optional string answer_503 = 6;
+    optional LoadMetric load_metric = 7;
+}
+
+enum LoadBalancingAlgorithms {
+    ROUND_ROBIN = 0;
+    RANDOM = 1;
+    LEAST_LOADED = 2;
+    POWER_OF_TWO = 3;
+}
+
+enum ProxyProtocolConfig {
+    EXPECT_HEADER = 0;
+    SEND_HEADER = 1;
+    RELAY_HEADER = 2;
+}
+
+// how sozu measures which backend is less loaded
+enum LoadMetric {
+    // number of TCP connections
+    CONNECTIONS = 0;
+    // number of active HTTP requests
+    REQUESTS = 1;
+    // time to connect to the backend, weighted by the number of active connections (peak EWMA)
+    CONNECTION_TIME = 2;
+}
+
+// add a backend
+message AddBackend {
+    required string cluster_id = 1;
+    required string backend_id = 2;
+    // the socket address of the backend
+    required string address = 3;
+    optional string sticky_id = 4;
+    optional LoadBalancingParams load_balancing_parameters = 5;
+    optional bool backup = 6;
+}
+
+// remove an existing backend
+message RemoveBackend {
+    required string cluster_id = 1;
+    required string backend_id = 2;
+    // the socket address of the backend
+    required string address = 3 ;
+}
+
+message LoadBalancingParams {
+    required int32 weight = 1;
+}
+
+message QueryClusterByDomain {
+    required string hostname = 1;
+    optional string path = 2;
+}
+
+// Options when querying metrics
+message QueryMetricsOptions {
+    // query a list of available metrics
+    required bool list = 1;
+    // query metrics for these clusters
+    repeated string cluster_ids = 2;
+    // query metrics for these backends
+    repeated string backend_ids = 3;
+    // query only these metrics
+    repeated string metric_names = 4;
+}
+
+// options to configure metrics collection
+enum MetricsConfiguration {
+    // enable metrics collection
+    ENABLED = 0;
+    // disable metrics collection
+    DISABLED = 1;
+    // wipe the metrics memory
+    CLEAR = 2;
+}
+
+message WorkerInfo {
+    required uint32 id = 1;
+    required int32 pid = 2;
+    required RunState run_state = 3;
+}
+
+// Runstate of a worker
+enum RunState {
+    RUNNING = 0;
+    STOPPING = 1;
+    STOPPED = 2;
+    NOT_ANSWERING = 3;
+}
+
+// lists of available metrics in a worker, or in the main process (in which case there are no cluster metrics)
+message AvailableMetrics {
+    repeated string proxy_metrics = 1;
+    repeated string cluster_metrics = 2;
+}
+
+// Aggregated metrics of main process & workers
+message AggregatedMetrics {
+    map<string, FilteredMetrics> main = 1;
+    map<string, WorkerMetrics> workers = 2;
+}
+
+// All metrics of a worker: proxy and clusters
+// Populated by Options so partial results can be sent
+message WorkerMetrics {
+   // Metrics of the worker process, key -> value
+    map<string, FilteredMetrics> proxy = 1;
+    // cluster_id -> cluster_metrics
+    map<string, ClusterMetrics> clusters = 2;
+}
+
+// the metrics of a given cluster, with several backends
+message ClusterMetrics {
+    // metric name -> metric value
+    map<string, FilteredMetrics> cluster = 1;
+    // backend_id -> (metric name-> metric value)
+    repeated BackendMetrics backends = 2;
+}
+
+message BackendMetrics {
+    required string backend_id = 1;
+    map<string, FilteredMetrics> metrics = 2;
+}
+
+message FilteredMetrics {
+    oneof inner {
+        uint64 gauge = 1;
+        int64 count = 2;
+        uint64 time = 3;
+        Percentiles percentiles = 4;
+        FilteredTimeSerie time_serie = 5;
+    }
+}
+
+message FilteredTimeSerie {
+    required uint32 last_second = 1;
+    repeated uint32 last_minute = 2;
+    repeated uint32 last_hour = 3;
+}
+
+
+message Percentiles {
+    required uint64 samples = 1;
+    required uint64 p_50 = 2;
+    required uint64 p_90 = 3;
+    required uint64 p_99 = 4;
+    required uint64 p_99_9 = 5;
+    required uint64 p_99_99 = 6;
+    required uint64 p_99_999 = 7;
+    required uint64 p_100 = 8;
+}

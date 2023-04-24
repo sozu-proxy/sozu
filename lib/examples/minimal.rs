@@ -12,8 +12,10 @@ use crate::sozu_command::{
     channel::Channel,
     config::ListenerBuilder,
     logging::{Logger, LoggerBackend},
-    request::{AddBackend, LoadBalancingParams, Request, RequestHttpFrontend, WorkerRequest},
-    response::{PathRule, RulePosition},
+    proto::command::{
+        AddBackend, LoadBalancingParams, PathRule, RequestHttpFrontend, RulePosition,
+    },
+    request::{Request, WorkerRequest},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -51,12 +53,12 @@ fn main() -> anyhow::Result<()> {
         address: "127.0.0.1:8080".to_string(),
         hostname: String::from("example.com"),
         path: PathRule::prefix(String::from("/")),
-        method: None,
-        position: RulePosition::Pre,
-        tags: Some(BTreeMap::from([
+        position: RulePosition::Pre.into(),
+        tags: BTreeMap::from([
             ("owner".to_owned(), "John".to_owned()),
             ("id".to_owned(), "my-own-http-front".to_owned()),
-        ])),
+        ]),
+        ..Default::default()
     };
     let http_backend = AddBackend {
         cluster_id: String::from("test"),

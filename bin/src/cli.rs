@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, net::SocketAddr};
 use clap::{Parser, Subcommand};
 
 use sozu_command_lib::{
-    certificate::TlsVersion, request::LoadBalancingAlgorithms, state::ClusterId as StateClusterId,
+    proto::command::{LoadBalancingAlgorithms, TlsVersion},
+    state::ClusterId as StateClusterId,
 };
 
 #[derive(Parser, PartialEq, Eq, Clone, Debug)]
@@ -876,10 +877,10 @@ pub enum ConfigCmd {
 
 fn parse_tls_versions(i: &str) -> Result<TlsVersion, String> {
     match i {
-        "TLSv1" => Ok(TlsVersion::TLSv1_0),
-        "TLSv1.1" => Ok(TlsVersion::TLSv1_1),
-        "TLSv1.2" => Ok(TlsVersion::TLSv1_2),
-        "TLSv1.3" => Ok(TlsVersion::TLSv1_2),
+        "TLSv1" => Ok(TlsVersion::TlsV10),
+        "TLS_V11" => Ok(TlsVersion::TlsV11),
+        "TLS_V12" => Ok(TlsVersion::TlsV12),
+        "TLS_V13" => Ok(TlsVersion::TlsV12),
         s => Err(format!("unrecognized TLS version: {s}")),
     }
 }

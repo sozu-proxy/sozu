@@ -26,10 +26,22 @@ use rustls::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::{
-    certificate::CertificateSummary, config::DEFAULT_CIPHER_SUITES, request::RequestHttpFrontend,
-};
 use time::{Duration, Instant};
+
+use sozu_command::{
+    certificate::Fingerprint,
+    config::DEFAULT_CIPHER_SUITES,
+    logging,
+    proto::command::{
+        AddCertificate, CertificateSummary, Cluster, HttpsListenerConfig, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, RequestHttpFrontend, TlsVersion,
+    },
+    ready::Ready,
+    request::{Request, WorkerRequest},
+    response::{HttpFrontend, ResponseContent, WorkerResponse},
+    scm_socket::ScmSocket,
+    state::ClusterId,
+};
 
 use crate::{
     backends::BackendMap,
@@ -48,18 +60,6 @@ use crate::{
     router::{Route, Router},
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
-    sozu_command::{
-        certificate::{Fingerprint, TlsVersion},
-        logging,
-        ready::Ready,
-        request::{
-            AddCertificate, Cluster, RemoveCertificate, RemoveListener, ReplaceCertificate,
-            Request, WorkerRequest,
-        },
-        response::{HttpFrontend, HttpsListenerConfig, ResponseContent, WorkerResponse},
-        scm_socket::ScmSocket,
-        state::ClusterId,
-    },
     timer::TimeoutContainer,
     tls::{
         CertificateResolver, GenericCertificateResolverError, MutexWrappedCertificateResolver,
@@ -670,7 +670,7 @@ impl CertificateResolver for HttpsListener {
             .map_err(ListenerError::ResolverError)
     }
 
-    fn remove_certificate(&mut self, opts: &RemoveCertificate) -> Result<(), Self::Error> {
+    fn remove_certificate(&mut self, fingerprint: &Fingerprint) -> Result<(), Self::Error> {
         let mut resolver = self
             .resolver
             .0
@@ -678,7 +678,7 @@ impl CertificateResolver for HttpsListener {
             .map_err(|err| ListenerError::LockError(err.to_string()))?;
 
         resolver
-            .remove_certificate(opts)
+            .remove_certificate(fingerprint)
             .map_err(ListenerError::ResolverError)
     }
 }
@@ -775,11 +775,11 @@ impl HttpsListener {
         let versions = config
             .versions
             .iter()
-            .filter_map(|version| match version {
-                TlsVersion::TLSv1_2 => Some(&rustls::version::TLS12),
-                TlsVersion::TLSv1_3 => Some(&rustls::version::TLS13),
-                other_version => {
-                    error!("unsupported TLS version: {:?}", other_version);
+            .filter_map(|version| match TlsVersion::from_i32(*version) {
+                Some(TlsVersion::TlsV12) => Some(&rustls::version::TLS12),
+                Some(TlsVersion::TlsV13) => Some(&rustls::version::TLS13),
+                _other_version => {
+                    error!("unsupported TLS version: {:?}", _other_version);
                     None
                 }
             })
@@ -950,7 +950,7 @@ impl HttpsProxy {
                     .drain()
                     .map(|(k, fingerprint)| CertificateSummary {
                         domain: String::from_utf8(k).unwrap(),
-                        fingerprint,
+                        fingerprint: fingerprint.to_string(),
                     })
                     .collect();
 
@@ -983,7 +983,7 @@ impl HttpsProxy {
                     .map(|(k, fingerprint)| {
                         certificate_summary.push(CertificateSummary {
                             domain: String::from_utf8(k.to_vec()).unwrap(),
-                            fingerprint: fingerprint.clone(),
+                            fingerprint: fingerprint.to_string(),
                         });
                     });
                 (owned.address, certificate_summary)
@@ -1146,6 +1146,10 @@ impl HttpsProxy {
         remove_certificate: RemoveCertificate,
     ) -> anyhow::Result<Option<ResponseContent>> {
         let address = remove_certificate.address.parse()?;
+        let fingerprint = Fingerprint(
+            hex::decode(&remove_certificate.fingerprint)
+                .with_context(|| "Failed at decoding the string (expected hexadecimal data)")?,
+        );
         match self
             .listeners
             .values()
@@ -1153,7 +1157,7 @@ impl HttpsProxy {
         {
             Some(listener) => listener
                 .borrow_mut()
-                .remove_certificate(&remove_certificate)
+                .remove_certificate(&fingerprint)
                 .with_context(|| "Could not remove certificate from listener")?,
             None => bail!(
                 "removing certificate from unknown listener {}",

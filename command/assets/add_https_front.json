@@ -5,10 +5,11 @@
     "address": "0.0.0.0:8443",
     "hostname": "yyy",
     "path": {
-      "kind": "PREFIX",
+      "kind": 0,
       "value": "xxx"
     },
-    "position": "TREE",
-    "tags": null
+    "method": null,
+    "position": 2,
+    "tags": {}
   }
 }

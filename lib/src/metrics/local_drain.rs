@@ -3,11 +3,12 @@ use std::{collections::BTreeMap, str, time::Instant};
 
 use anyhow::Context;
 use hdrhistogram::Histogram;
-use sozu_command::response::{AvailableMetrics, BackendMetrics, ResponseContent};
-
-use crate::sozu_command::{
-    request::{MetricsConfiguration, QueryMetricsOptions},
-    response::{ClusterMetrics, FilteredMetrics, Percentiles, WorkerMetrics},
+use sozu_command::{
+    proto::command::{
+        filtered_metrics, AvailableMetrics, BackendMetrics, ClusterMetrics, FilteredMetrics,
+        MetricsConfiguration, Percentiles, QueryMetricsOptions, WorkerMetrics,
+    },
+    response::ResponseContent,
 };
 
 use super::{MetricData, Subscriber};
@@ -64,11 +65,17 @@ impl AggregatedMetric {
 
     pub fn to_filtered(&self) -> FilteredMetrics {
         match *self {
-            AggregatedMetric::Gauge(i) => FilteredMetrics::Gauge(i),
-            AggregatedMetric::Count(i) => FilteredMetrics::Count(i),
-            AggregatedMetric::Time(ref hist) => {
-                FilteredMetrics::Percentiles(histogram_to_percentiles(hist))
-            }
+            AggregatedMetric::Gauge(i) => FilteredMetrics {
+                inner: Some(filtered_metrics::Inner::Gauge(i as u64)),
+            },
+            AggregatedMetric::Count(i) => FilteredMetrics {
+                inner: Some(filtered_metrics::Inner::Count(i)),
+            },
+            AggregatedMetric::Time(ref hist) => FilteredMetrics {
+                inner: Some(filtered_metrics::Inner::Percentiles(
+                    histogram_to_percentiles(hist),
+                )),
+            },
         }
     }
 }
@@ -216,8 +223,8 @@ impl LocalDrain {
         metric_names: &Vec<String>,
     ) -> anyhow::Result<WorkerMetrics> {
         Ok(WorkerMetrics {
-            proxy: Some(self.dump_proxy_metrics(metric_names)),
-            clusters: Some(self.dump_cluster_metrics(metric_names)?),
+            proxy: self.dump_proxy_metrics(metric_names),
+            clusters: self.dump_cluster_metrics(metric_names)?,
         })
     }
 
@@ -287,10 +294,7 @@ impl LocalDrain {
                 ))?;
             backends.push(backend_metrics);
         }
-        Ok(ClusterMetrics {
-            cluster: Some(cluster),
-            backends: Some(backends),
-        })
+        Ok(ClusterMetrics { cluster, backends })
     }
 
     fn metrics_of_one_backend(
@@ -338,8 +342,8 @@ impl LocalDrain {
 
         trace!("query result: {:#?}", clusters);
         Ok(WorkerMetrics {
-            proxy: None,
-            clusters: Some(clusters),
+            proxy: BTreeMap::new(),
+            clusters,
         })
     }
 
@@ -357,22 +361,22 @@ impl LocalDrain {
                 .context(format!("No metrics found for backend with id {backend_id}"))?
                 .to_owned();
 
-            let mut backend_vec = Vec::new();
-            backend_vec.push(self.metrics_of_one_backend(backend_id, metric_names)?);
+            let mut backends = Vec::new();
+            backends.push(self.metrics_of_one_backend(backend_id, metric_names)?);
 
             clusters.insert(
                 cluster_id,
                 ClusterMetrics {
-                    cluster: None,
-                    backends: Some(backend_vec),
+                    cluster: BTreeMap::new(),
+                    backends,
                 },
             );
         }
 
         trace!("query result: {:#?}", clusters);
         Ok(WorkerMetrics {
-            proxy: None,
-            clusters: Some(clusters),
+            proxy: BTreeMap::new(),
+            clusters,
         })
     }
 

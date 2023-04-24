@@ -1,5 +1,7 @@
-use std::convert::From;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::{
+    convert::From,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+};
 
 use nom::{
     bytes::streaming::{tag, take},

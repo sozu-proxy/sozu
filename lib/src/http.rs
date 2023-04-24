@@ -16,10 +16,12 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     logging,
+    proto::command::{Cluster, HttpListenerConfig, RemoveListener, RequestHttpFrontend},
     ready::Ready,
-    request::{Cluster, RemoveListener, Request, RequestHttpFrontend, WorkerRequest},
-    response::{HttpFrontend, HttpListenerConfig, WorkerResponse},
+    request::{Request, WorkerRequest},
+    response::{HttpFrontend, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
+    state::ClusterId,
 };
 
 use crate::{
@@ -42,7 +44,6 @@ use super::{
     router::Route,
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager},
     socket::server_bind,
-    sozu_command::state::ClusterId,
     AcceptError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
     StateResult,
 };
@@ -1105,22 +1106,25 @@ pub fn start_http_worker(
 #[cfg(test)]
 mod tests {
     extern crate tiny_http;
-    use sozu_command::config::ListenerBuilder;
 
     use super::*;
     use crate::sozu_command::{
         channel::Channel,
-        request::{LoadBalancingAlgorithms, LoadBalancingParams, Request, WorkerRequest},
-        response::{Backend, HttpFrontend, PathRule, RulePosition},
+        config::ListenerBuilder,
+        proto::command::{LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RulePosition},
+        request::{Request, WorkerRequest},
+        response::{Backend, HttpFrontend},
     };
 
-    use std::io::{Read, Write};
-    use std::net::SocketAddr;
-    use std::net::TcpStream;
-    use std::str::FromStr;
-    use std::sync::{Arc, Barrier};
-    use std::time::Duration;
-    use std::{str, thread};
+    use std::{
+        io::{Read, Write},
+        net::{SocketAddr, TcpStream},
+        str,
+        str::FromStr,
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
 
     /*
     #[test]
@@ -1158,9 +1162,7 @@ mod tests {
             address: "127.0.0.1:1024".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
-            method: None,
-            position: RulePosition::Tree,
-            tags: None,
+            ..Default::default()
         };
         command
             .write_message(&WorkerRequest {
@@ -1241,11 +1243,9 @@ mod tests {
         let front = RequestHttpFrontend {
             address: "127.0.0.1:1031".to_string(),
             hostname: String::from("localhost"),
-            method: None,
             path: PathRule::prefix(String::from("/")),
-            position: RulePosition::Tree,
             cluster_id: Some(String::from("cluster_1")),
-            tags: None,
+            ..Default::default()
         };
         command
             .write_message(&WorkerRequest {
@@ -1350,13 +1350,11 @@ mod tests {
         });
 
         let cluster = Cluster {
-            answer_503: None,
             cluster_id: String::from("cluster_1"),
             https_redirect: true,
-            load_balancing: LoadBalancingAlgorithms::default(),
-            load_metric: None,
-            proxy_protocol: None,
+            load_balancing: LoadBalancingAlgorithms::default() as i32,
             sticky_session: false,
+            ..Default::default()
         };
         command
             .write_message(&WorkerRequest {
@@ -1367,11 +1365,9 @@ mod tests {
         let front = RequestHttpFrontend {
             address: "127.0.0.1:1041".to_string(),
             hostname: String::from("localhost"),
-            method: None,
             path: PathRule::prefix(String::from("/")),
-            position: RulePosition::Tree,
             cluster_id: Some(String::from("cluster_1")),
-            tags: None,
+            ..Default::default()
         };
         command
             .write_message(&WorkerRequest {

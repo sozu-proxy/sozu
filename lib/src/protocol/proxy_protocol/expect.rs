@@ -306,9 +306,9 @@ mod expect_test {
     use super::*;
     use mio::net::TcpListener;
     use rusty_ulid::Ulid;
-    use std::io::Write;
-    use std::net::TcpStream as StdTcpStream;
     use std::{
+        io::Write,
+        net::TcpStream as StdTcpStream,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::{Arc, Barrier},
         thread::{self, JoinHandle},

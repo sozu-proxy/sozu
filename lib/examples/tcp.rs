@@ -10,8 +10,8 @@ use anyhow::Context;
 use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    request::{AddBackend, LoadBalancingParams, Request, RequestTcpFrontend, WorkerRequest},
-    response::TcpListenerConfig,
+    proto::command::{AddBackend, LoadBalancingParams, RequestTcpFrontend, TcpListenerConfig},
+    request::{Request, WorkerRequest},
 };
 
 fn main() -> anyhow::Result<()> {
@@ -40,12 +40,7 @@ fn main() -> anyhow::Result<()> {
         let buffer_size = 16384;
         let listener = TcpListenerConfig {
             address: "127.0.0.1:8080".parse().expect("could not parse address"),
-            public_address: None,
-            expect_proxy: false,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-            active: false,
+            ..Default::default()
         };
         Logger::init(
             "TCP".to_string(),
@@ -59,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     let tcp_front = RequestTcpFrontend {
         cluster_id: String::from("test"),
         address: "127.0.0.1:8080".to_string(),
-        tags: None,
+        ..Default::default()
     };
     let tcp_backend = AddBackend {
         cluster_id: String::from("test"),
