@@ -1,3 +1,5 @@
 {
-  "type": "UPGRADE_MAIN"
+  "request_type": {
+    "UPGRADE_MAIN": {}
+  }
 }

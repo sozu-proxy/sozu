@@ -1,15 +1,16 @@
 {
-  "type": "ADD_HTTPS_FRONTEND",
-  "content": {
-    "cluster_id": "xxx",
-    "address": "0.0.0.0:8443",
-    "hostname": "yyy",
-    "path": {
-      "kind": 0,
-      "value": "xxx"
-    },
-    "method": null,
-    "position": 2,
-    "tags": {}
+  "request_type": {
+    "ADD_HTTPS_FRONTEND": {
+      "cluster_id": "xxx",
+      "address": "0.0.0.0:8443",
+      "hostname": "yyy",
+      "path": {
+        "kind": 0,
+        "value": "xxx"
+      },
+      "method": null,
+      "position": 2,
+      "tags": {}
+    }
   }
 }

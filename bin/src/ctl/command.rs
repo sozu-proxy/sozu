@@ -4,9 +4,10 @@ use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
 
 use sozu_command_lib::{
-    certificate::Fingerprint,
-    proto::command::{QueryClusterByDomain, QueryMetricsOptions, RunState, WorkerInfo},
-    request::Request,
+    proto::command::{
+        request::RequestType, ListWorkers, QueryAllCertificates, QueryClusterByDomain,
+        QueryClustersHashes, QueryMetricsOptions, Request, RunState, UpgradeMain, WorkerInfo,
+    },
     response::{Response, ResponseContent, ResponseStatus},
 };
 
@@ -132,7 +133,9 @@ impl CommandManager {
     pub fn upgrade_main(&mut self) -> Result<(), anyhow::Error> {
         println!("Preparing to upgrade proxy...");
 
-        self.send_request(Request::ListWorkers)?;
+        self.send_request(Request {
+            request_type: Some(RequestType::ListWorkers(ListWorkers {})),
+        })?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -161,7 +164,9 @@ impl CommandManager {
                         println!();
 
                         let id = generate_tagged_id("UPGRADE-MAIN");
-                        self.send_request(Request::UpgradeMain)?;
+                        self.send_request(Request {
+                            request_type: Some(RequestType::UpgradeMain(UpgradeMain {})),
+                        })?;
 
                         println!("Upgrading main process");
 
@@ -231,7 +236,9 @@ impl CommandManager {
         println!("upgrading worker {worker_id}");
 
         //FIXME: we should be able to soft stop one specific worker
-        self.send_request(Request::UpgradeWorker(worker_id))?;
+        self.send_request(Request {
+            request_type: Some(RequestType::UpgradeWorker(worker_id)),
+        })?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -265,12 +272,14 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let request = Request::QueryMetrics(QueryMetricsOptions {
-            list,
-            cluster_ids,
-            backend_ids,
-            metric_names,
-        });
+        let request = Request {
+            request_type: Some(RequestType::QueryMetrics(QueryMetricsOptions {
+                list,
+                cluster_ids,
+                backend_ids,
+                metric_names,
+            })),
+        };
 
         // a loop to reperform the query every refresh time
         loop {
@@ -334,7 +343,9 @@ impl CommandManager {
         }
 
         let request = if let Some(ref cluster_id) = cluster_id {
-            Request::QueryClusterById(cluster_id.to_string())
+            Request {
+                request_type: Some(RequestType::QueryClusterById(cluster_id.to_string())),
+            }
         } else if let Some(ref domain) = domain {
             let splitted: Vec<String> =
                 domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
@@ -351,9 +362,13 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
             };
 
-            Request::QueryClustersByDomain(query_domain)
+            Request {
+                request_type: Some(RequestType::QueryClustersByDomain(query_domain)),
+            }
         } else {
-            Request::QueryClustersHashes
+            Request {
+                request_type: Some(RequestType::QueryClustersHashes(QueryClustersHashes {})),
+            }
         };
 
         self.send_request(request)?;
@@ -388,14 +403,20 @@ impl CommandManager {
         domain: Option<String>,
     ) -> Result<(), anyhow::Error> {
         let request = match (fingerprint, domain) {
-            (None, None) => Request::QueryAllCertificates,
+            (None, None) => Request {
+                request_type: Some(RequestType::QueryAllCertificates(QueryAllCertificates {})),
+            },
             (Some(f), None) => match hex::decode(f) {
                 Err(e) => {
                     bail!("invalid fingerprint: {:?}", e);
                 }
-                Ok(f) => Request::QueryCertificateByFingerprint(Fingerprint(f)),
+                Ok(f) => Request {
+                    request_type: Some(RequestType::QueryCertificateByFingerprint(f)),
+                },
             },
-            (None, Some(d)) => Request::QueryCertificatesByDomain(d),
+            (None, Some(d)) => Request {
+                request_type: Some(RequestType::QueryCertificatesByDomain(d)),
+            },
             (Some(_), Some(_)) => {
                 bail!("Error: Either request a fingerprint or a domain name");
             }

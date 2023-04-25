@@ -1,3 +1,5 @@
 {
-  "type": "SOFT_STOP"
+  "request_type": {
+    "SOFT_STOP": {}
+  }
 }

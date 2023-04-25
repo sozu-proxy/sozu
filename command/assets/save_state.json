@@ -1,6 +1,5 @@
 {
-  "type": "SAVE_STATE",
-  "content": {
-    "path": "./config_dump.json"
+  "request_type": {
+    "SAVE_STATE": "./config_dump.json"
   }
 }

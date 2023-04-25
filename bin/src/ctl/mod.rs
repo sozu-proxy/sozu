@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use sozu_command_lib::{channel::Channel, config::Config, request::Request, response::Response};
+use sozu_command_lib::{channel::Channel, config::Config, proto::command::Request, response::Response};
 
 use crate::{
     cli::{self, *},

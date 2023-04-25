@@ -11,10 +11,9 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     proto::command::{
-        AddBackend, AddCertificate, CertificateAndKey, PathRule, RemoveBackend, ReplaceCertificate,
-        RequestHttpFrontend, TlsVersion,
+        request::RequestType, AddBackend, AddCertificate, CertificateAndKey, PathRule,
+        RemoveBackend, ReplaceCertificate, Request, RequestHttpFrontend, TlsVersion,
     },
-    request::Request,
     response::{Response, ResponseStatus},
 };
 
@@ -287,22 +286,26 @@ fn set_up_proxying(
     path_begin: &str,
     server_address: &SocketAddr,
 ) -> anyhow::Result<()> {
-    let add_http_front = Request::AddHttpFrontend(RequestHttpFrontend {
-        cluster_id: Some(cluster_id.to_owned()),
-        hostname: String::from(hostname),
-        address: frontend.to_string(),
-        path: PathRule::prefix(path_begin.to_owned()),
-        ..Default::default()
-    });
+    let add_http_front = Request {
+        request_type: Some(RequestType::AddHttpFrontend(RequestHttpFrontend {
+            cluster_id: Some(cluster_id.to_owned()),
+            hostname: String::from(hostname),
+            address: frontend.to_string(),
+            path: PathRule::prefix(path_begin.to_owned()),
+            ..Default::default()
+        })),
+    };
 
     order_request(channel, add_http_front).with_context(|| "Request AddHttpFront failed")?;
 
-    let add_backend = Request::AddBackend(AddBackend {
-        cluster_id: cluster_id.to_string(),
-        backend_id: format!("{cluster_id}-0"),
-        address: server_address.to_string(),
-        ..Default::default()
-    });
+    let add_backend = Request {
+        request_type: Some(RequestType::AddBackend(AddBackend {
+            cluster_id: cluster_id.to_string(),
+            backend_id: format!("{cluster_id}-0"),
+            address: server_address.to_string(),
+            ..Default::default()
+        })),
+    };
 
     order_request(channel, add_backend).with_context(|| "AddBackend request failed")?;
     Ok(())
@@ -316,20 +319,24 @@ fn remove_proxying(
     path_begin: &str,
     server_address: SocketAddr,
 ) -> anyhow::Result<()> {
-    let remove_http_front = Request::RemoveHttpFrontend(RequestHttpFrontend {
-        cluster_id: Some(cluster_id.to_owned()),
-        address: frontend.to_string(),
-        hostname: String::from(hostname),
-        path: PathRule::prefix(path_begin.to_owned()),
-        ..Default::default()
-    });
+    let remove_http_front = Request {
+        request_type: Some(RequestType::RemoveHttpFrontend(RequestHttpFrontend {
+            cluster_id: Some(cluster_id.to_owned()),
+            address: frontend.to_string(),
+            hostname: String::from(hostname),
+            path: PathRule::prefix(path_begin.to_owned()),
+            ..Default::default()
+        })),
+    };
     order_request(channel, remove_http_front).with_context(|| "RemoveHttpFront request failed")?;
 
-    let remove_backend = Request::RemoveBackend(RemoveBackend {
-        address: server_address.to_string(),
-        cluster_id: String::from(cluster_id),
-        backend_id: format!("{cluster_id}-0"),
-    });
+    let remove_backend = Request {
+        request_type: Some(RequestType::RemoveBackend(RemoveBackend {
+            address: server_address.to_string(),
+            cluster_id: String::from(cluster_id),
+            backend_id: format!("{cluster_id}-0"),
+        })),
+    };
 
     order_request(channel, remove_backend).with_context(|| "RemoveBackend request failed")?;
     Ok(())
@@ -357,30 +364,34 @@ fn add_certificate(
     let versions = tls_versions.iter().map(|v| *v as i32).collect();
 
     let request = match old_fingerprint {
-        None => Request::AddCertificate(AddCertificate {
-            address: frontend.to_owned(),
-            certificate: CertificateAndKey {
-                certificate,
-                certificate_chain,
-                key,
-                versions,
-                names: vec![hostname.to_string()],
-            },
-            expired_at: None,
-        }),
+        None => Request {
+            request_type: Some(RequestType::AddCertificate(AddCertificate {
+                address: frontend.to_owned(),
+                certificate: CertificateAndKey {
+                    certificate,
+                    certificate_chain,
+                    key,
+                    versions,
+                    names: vec![hostname.to_string()],
+                },
+                expired_at: None,
+            })),
+        },
 
-        Some(f) => Request::ReplaceCertificate(ReplaceCertificate {
-            address: frontend.to_owned(),
-            new_certificate: CertificateAndKey {
-                certificate,
-                certificate_chain,
-                key,
-                versions,
-                names: vec![hostname.to_string()],
-            },
-            old_fingerprint: Fingerprint(f).to_string(),
-            new_expired_at: None,
-        }),
+        Some(f) => Request {
+            request_type: Some(RequestType::ReplaceCertificate(ReplaceCertificate {
+                address: frontend.to_owned(),
+                new_certificate: CertificateAndKey {
+                    certificate,
+                    certificate_chain,
+                    key,
+                    versions,
+                    names: vec![hostname.to_string()],
+                },
+                old_fingerprint: Fingerprint(f).to_string(),
+                new_expired_at: None,
+            })),
+        },
     };
 
     info!("Sending the certificate request {:?}", request);
@@ -408,23 +419,23 @@ fn order_request(channel: &mut Channel<Request, Response>, request: Request) -> 
             }
             ResponseStatus::Ok => {
                 // TODO: remove the pattern matching and only display the response message
-                match request {
-                    Request::AddBackend(_) => {
+                match request.request_type {
+                    Some(RequestType::AddBackend(_)) => {
                         info!("backend added : {}", response.message)
                     }
-                    Request::RemoveBackend(_) => {
+                    Some(RequestType::RemoveBackend(_)) => {
                         info!("backend removed : {} ", response.message)
                     }
-                    Request::AddCertificate(_) => {
+                    Some(RequestType::AddCertificate(_)) => {
                         info!("certificate added: {}", response.message)
                     }
-                    Request::RemoveCertificate(_) => {
+                    Some(RequestType::RemoveCertificate(_)) => {
                         info!("certificate removed: {}", response.message)
                     }
-                    Request::AddHttpFrontend(_) => {
+                    Some(RequestType::AddHttpFrontend(_)) => {
                         info!("front added: {}", response.message)
                     }
-                    Request::RemoveHttpFrontend(_) => {
+                    Some(RequestType::RemoveHttpFrontend(_)) => {
                         info!("front removed: {}", response.message)
                     }
                     _ => {

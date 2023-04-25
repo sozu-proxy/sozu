@@ -1,12 +1,13 @@
 {
-  "type": "ADD_CLUSTER",
-  "content": {
-    "cluster_id": "xxx",
-    "sticky_session": true,
-    "https_redirect": true,
-    "proxy_protocol": 0,
-    "load_balancing": 0,
-    "answer_503": null,
-    "load_metric": null
+  "request_type": {
+    "ADD_CLUSTER": {
+      "cluster_id": "xxx",
+      "sticky_session": true,
+      "https_redirect": true,
+      "proxy_protocol": 0,
+      "load_balancing": 0,
+      "answer_503": null,
+      "load_metric": null
+    }
   }
 }

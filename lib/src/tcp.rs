@@ -16,6 +16,7 @@ use mio::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
+use sozu_command::proto::command::request::RequestType;
 use time::{Duration, Instant};
 
 use crate::{
@@ -37,7 +38,7 @@ use crate::{
         logging,
         proto::command::{ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig},
         ready::Ready,
-        request::{Request, WorkerRequest},
+        request::WorkerRequest,
         response::{Event, WorkerResponse},
         scm_socket::ScmSocket,
         state::ClusterId,
@@ -1328,22 +1329,26 @@ impl TcpProxy {
 
 impl ProxyConfiguration for TcpProxy {
     fn notify(&mut self, message: WorkerRequest) -> WorkerResponse {
-        match message.content {
-            Request::AddTcpFrontend(front) => {
+        let request_type = match message.content.request_type {
+            Some(t) => t,
+            None => return WorkerResponse::error(message.id, "Empty request"),
+        };
+        match request_type {
+            RequestType::AddTcpFrontend(front) => {
                 if let Err(err) = self.add_tcp_front(front) {
                     return WorkerResponse::error(message.id, err);
                 }
 
                 WorkerResponse::ok(message.id)
             }
-            Request::RemoveTcpFrontend(front) => {
+            RequestType::RemoveTcpFrontend(front) => {
                 if let Err(err) = self.remove_tcp_front(front) {
                     return WorkerResponse::error(message.id, err);
                 }
 
                 WorkerResponse::ok(message.id)
             }
-            Request::SoftStop => {
+            RequestType::SoftStop(_) => {
                 info!("{} processing soft shutdown", message.id);
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.iter() {
@@ -1354,7 +1359,7 @@ impl ProxyConfiguration for TcpProxy {
                 }
                 WorkerResponse::processing(message.id)
             }
-            Request::HardStop => {
+            RequestType::HardStop(_) => {
                 info!("{} hard shutdown", message.id);
                 let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
                 for (_, l) in listeners.drain() {
@@ -1365,11 +1370,11 @@ impl ProxyConfiguration for TcpProxy {
                 }
                 WorkerResponse::ok(message.id)
             }
-            Request::Status => {
+            RequestType::Status(_) => {
                 info!("{} status", message.id);
                 WorkerResponse::ok(message.id)
             }
-            Request::Logging(logging_filter) => {
+            RequestType::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     message.id, logging_filter
@@ -1380,7 +1385,7 @@ impl ProxyConfiguration for TcpProxy {
                 });
                 WorkerResponse::ok(message.id)
             }
-            Request::AddCluster(cluster) => {
+            RequestType::AddCluster(cluster) => {
                 let config = ClusterConfiguration {
                     proxy_protocol: cluster
                         .proxy_protocol
@@ -1390,11 +1395,11 @@ impl ProxyConfiguration for TcpProxy {
                 self.configs.insert(cluster.cluster_id, config);
                 WorkerResponse::ok(message.id)
             }
-            Request::RemoveCluster { cluster_id } => {
+            RequestType::RemoveCluster(cluster_id) => {
                 self.configs.remove(&cluster_id);
                 WorkerResponse::ok(message.id)
             }
-            Request::RemoveListener(remove) => {
+            RequestType::RemoveListener(remove) => {
                 let address = match remove.address.parse() {
                     Ok(a) => a,
                     Err(e) => {
@@ -1624,6 +1629,8 @@ pub fn start_tcp_worker(
 
 #[cfg(test)]
 mod tests {
+    use sozu_command::proto::command::Request;
+
     use super::*;
     use crate::sozu_command::{
         channel::Channel, proto::command::LoadBalancingParams, scm_socket::Listeners,
@@ -1877,13 +1884,17 @@ mod tests {
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO1"),
-                    content: Request::AddTcpFrontend(front),
+                    content: Request {
+                        request_type: Some(RequestType::AddTcpFrontend(front)),
+                    },
                 })
                 .unwrap();
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO2"),
-                    content: Request::AddBackend(backend.to_add_backend()),
+                    content: Request {
+                        request_type: Some(RequestType::AddBackend(backend.to_add_backend())),
+                    },
                 })
                 .unwrap();
         }
@@ -1906,13 +1917,17 @@ mod tests {
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO3"),
-                    content: Request::AddTcpFrontend(front),
+                    content: Request {
+                        request_type: Some(RequestType::AddTcpFrontend(front)),
+                    },
                 })
                 .unwrap();
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO4"),
-                    content: Request::AddBackend(backend.to_add_backend()),
+                    content: Request {
+                        request_type: Some(RequestType::AddBackend(backend.to_add_backend())),
+                    },
                 })
                 .unwrap();
         }

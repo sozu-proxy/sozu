@@ -1,8 +1,9 @@
 {
-  "type": "REMOVE_BACKEND",
-  "content": {
-    "cluster_id": "xxx",
-    "backend_id": "xxx-0",
-    "address": "127.0.0.1:8080"
+  "request_type": {
+    "REMOVE_BACKEND": {
+      "cluster_id": "xxx",
+      "backend_id": "xxx-0",
+      "address": "127.0.0.1:8080"
+    }
   }
 }

@@ -16,9 +16,11 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     logging,
-    proto::command::{Cluster, HttpListenerConfig, RemoveListener, RequestHttpFrontend},
+    proto::command::{
+        request::RequestType, Cluster, HttpListenerConfig, RemoveListener, RequestHttpFrontend,
+    },
     ready::Ready,
-    request::{Request, WorkerRequest},
+    request::WorkerRequest,
     response::{HttpFrontend, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::ClusterId,
@@ -797,34 +799,34 @@ impl ProxyConfiguration for HttpProxy {
     fn notify(&mut self, request: WorkerRequest) -> WorkerResponse {
         let request_id = request.id.clone();
 
-        let result = match request.content {
-            Request::AddCluster(cluster) => {
+        let result = match request.content.request_type {
+            Some(RequestType::AddCluster(cluster)) => {
                 info!("{} add cluster {:?}", request.id, cluster);
                 self.add_cluster(cluster.clone())
                     .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
-            Request::RemoveCluster { cluster_id } => {
+            Some(RequestType::RemoveCluster(cluster_id)) => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
                     .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
-            Request::AddHttpFrontend(front) => {
+            Some(RequestType::AddHttpFrontend(front)) => {
                 info!("{} add front {:?}", request_id, front);
                 self.add_http_frontend(front)
                     .with_context(|| "Could not add http frontend")
             }
-            Request::RemoveHttpFrontend(front) => {
+            Some(RequestType::RemoveHttpFrontend(front)) => {
                 info!("{} remove front {:?}", request_id, front);
                 self.remove_http_frontend(front)
                     .with_context(|| "Could not remove http frontend")
             }
-            Request::RemoveListener(remove) => {
+            Some(RequestType::RemoveListener(remove)) => {
                 info!("removing HTTP listener at address {:?}", remove.address);
                 self.remove_listener(remove.clone()).with_context(|| {
                     format!("Could not remove listener at address {:?}", remove.address)
                 })
             }
-            Request::SoftStop => {
+            Some(RequestType::SoftStop(_)) => {
                 info!("{} processing soft shutdown", request_id);
                 match self
                     .soft_stop()
@@ -837,7 +839,7 @@ impl ProxyConfiguration for HttpProxy {
                     Err(e) => Err(e),
                 }
             }
-            Request::HardStop => {
+            Some(RequestType::HardStop(_)) => {
                 info!("{} processing hard shutdown", request_id);
                 match self
                     .hard_stop()
@@ -850,11 +852,11 @@ impl ProxyConfiguration for HttpProxy {
                     Err(e) => Err(e),
                 }
             }
-            Request::Status => {
+            Some(RequestType::Status(_)) => {
                 info!("{} status", request_id);
                 Ok(())
             }
-            Request::Logging(logging_filter) => {
+            Some(RequestType::Logging(logging_filter)) => {
                 info!(
                     "{} changing logging filter to {}",
                     request_id, logging_filter
@@ -1111,8 +1113,10 @@ mod tests {
     use crate::sozu_command::{
         channel::Channel,
         config::ListenerBuilder,
-        proto::command::{LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RulePosition},
-        request::{Request, WorkerRequest},
+        proto::command::{
+            LoadBalancingAlgorithms, LoadBalancingParams, PathRule, Request, RulePosition,
+        },
+        request::WorkerRequest,
         response::{Backend, HttpFrontend},
     };
 
@@ -1167,7 +1171,9 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                content: Request::AddHttpFrontend(front),
+                content: Request {
+                    request_type: Some(RequestType::AddHttpFrontend(front)),
+                },
             })
             .unwrap();
         let backend = Backend {
@@ -1181,7 +1187,9 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Request::AddBackend(backend.to_add_backend()),
+                content: Request {
+                    request_type: Some(RequestType::AddBackend(backend.to_add_backend())),
+                },
             })
             .unwrap();
 
@@ -1250,7 +1258,9 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                content: Request::AddHttpFrontend(front),
+                content: Request {
+                    request_type: Some(RequestType::AddHttpFrontend(front)),
+                },
             })
             .unwrap();
         let backend = Backend {
@@ -1264,7 +1274,9 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Request::AddBackend(backend.to_add_backend()),
+                content: Request {
+                    request_type: Some(RequestType::AddBackend(backend.to_add_backend())),
+                },
             })
             .unwrap();
 
@@ -1359,7 +1371,9 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                content: Request::AddCluster(cluster),
+                content: Request {
+                    request_type: Some(RequestType::AddCluster(cluster)),
+                },
             })
             .unwrap();
         let front = RequestHttpFrontend {
@@ -1372,7 +1386,9 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Request::AddHttpFrontend(front),
+                content: Request {
+                    request_type: Some(RequestType::AddHttpFrontend(front)),
+                },
             })
             .unwrap();
         let backend = Backend {
@@ -1386,7 +1402,9 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_IJKL"),
-                content: Request::AddBackend(backend.to_add_backend()),
+                content: Request {
+                    request_type: Some(RequestType::AddBackend(backend.to_add_backend())),
+                },
             })
             .unwrap();
 

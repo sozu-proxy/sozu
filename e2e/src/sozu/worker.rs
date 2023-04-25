@@ -17,10 +17,10 @@ use sozu_command::{
     config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
     proto::command::{
-        AddBackend, Cluster, LoadBalancingParams, PathRule, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition,
+        request::RequestType, AddBackend, Cluster, LoadBalancingParams, PathRule, Request,
+        RequestHttpFrontend, RequestTcpFrontend, ReturnListenSockets, RulePosition, SoftStop,
     },
-    request::{Request, WorkerRequest},
+    request::WorkerRequest,
     response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -178,7 +178,9 @@ impl Worker {
     }
 
     pub fn upgrade<S: Into<String>>(&mut self, name: S) -> Self {
-        self.send_proxy_request(Request::ReturnListenSockets);
+        self.send_proxy_request(Request {
+            request_type: Some(RequestType::ReturnListenSockets(ReturnListenSockets {})),
+        });
         self.read_to_last();
 
         self.scm_main_to_worker
@@ -190,7 +192,9 @@ impl Worker {
             .expect("receive listeners");
         println!("Listeners from old worker: {listeners:?}");
         println!("State from old worker: {:?}", self.state);
-        self.send_proxy_request(Request::SoftStop);
+        self.send_proxy_request(Request {
+            request_type: Some(RequestType::SoftStop(SoftStop {})),
+        });
 
         let mut worker = Worker::start_new_worker(
             name,

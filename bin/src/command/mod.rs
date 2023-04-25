@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
     config::Config,
-    proto::command::{MetricsConfiguration, RunState},
-    request::{Request, WorkerRequest},
+    proto::command::{request::RequestType, MetricsConfiguration, Request, RunState, Status},
+    request::WorkerRequest,
     response::{Response, ResponseContent, ResponseStatus, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -506,7 +506,7 @@ impl CommandServer {
                 error!("Could not execute request on state: {:#}", e);
             }
 
-            if let &Request::AddCertificate(_) = &request {
+            if let &Some(RequestType::AddCertificate(_)) = &request.request_type {
                 debug!("config generated AddCertificate( ... )");
             } else {
                 debug!("config generated {:?}", request);
@@ -654,7 +654,12 @@ impl CommandServer {
         }
 
         new_worker
-            .send(format!("RESTART-{new_worker_id}-STATUS"), Request::Status)
+            .send(
+                format!("RESTART-{new_worker_id}-STATUS"),
+                Request {
+                    request_type: Some(RequestType::Status(Status {})),
+                },
+            )
             .await;
 
         self.workers.push(new_worker);

@@ -1,3 +1,5 @@
 {
-  "type": "LIST_WORKERS"
+  "request_type": {
+    "LIST_WORKERS": {}
+  }
 }

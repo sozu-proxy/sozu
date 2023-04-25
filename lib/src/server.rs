@@ -17,12 +17,12 @@ use sozu_command::{
     channel::Channel,
     config::Config,
     proto::command::{
-        ActivateListener, AddBackend, Cluster, DeactivateListener, HttpListenerConfig,
-        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadMetric, RemoveBackend,
-        TcpListenerConfig as CommandTcpListener,
+        request::RequestType, ActivateListener, AddBackend, Cluster, DeactivateListener,
+        HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadMetric,
+        MetricsConfiguration, RemoveBackend, Request, TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
-    request::{Request, WorkerRequest},
+    request::WorkerRequest,
     response::{Event, MessageId, ResponseContent, ResponseStatus, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
@@ -661,8 +661,8 @@ impl Server {
 
         loop {
             match self.channel.read_message() {
-                Ok(request) => match request.content {
-                    Request::HardStop => {
+                Ok(request) => match request.content.request_type {
+                    Some(RequestType::HardStop(_)) => {
                         let req_id = request.id.clone();
                         self.notify(request);
                         if let Err(e) = self.channel.write_message(&WorkerResponse::ok(req_id)) {
@@ -673,12 +673,12 @@ impl Server {
                         }
                         return true;
                     }
-                    Request::SoftStop => {
+                    Some(RequestType::SoftStop(_)) => {
                         self.shutting_down = Some(request.id.clone());
                         self.last_sessions_len = self.sessions.borrow().slab.len();
                         self.notify(request);
                     }
-                    Request::ReturnListenSockets => {
+                    Some(RequestType::ReturnListenSockets(_)) => {
                         info!("received ReturnListenSockets order");
                         self.return_listen_sockets();
                     }
@@ -866,31 +866,32 @@ impl Server {
     }
 
     fn notify(&mut self, message: WorkerRequest) {
-        if let Request::ConfigureMetrics(configuration) = &message.content {
-            //let id = message.id.clone();
-            METRICS.with(|metrics| {
-                (*metrics.borrow_mut()).configure(configuration);
+        if let Some(RequestType::ConfigureMetrics(configuration)) = &message.content.request_type {
+            if let Some(metrics_config) = MetricsConfiguration::from_i32(*configuration) {
+                METRICS.with(|metrics| {
+                    (*metrics.borrow_mut()).configure(&metrics_config);
 
-                push_queue(WorkerResponse::ok(message.id.clone()));
-            });
-            return;
+                    push_queue(WorkerResponse::ok(message.id.clone()));
+                });
+                return;
+            }
         }
 
-        match &message.content {
-            Request::QueryClustersHashes => {
+        match &message.content.request_type {
+            Some(RequestType::QueryClustersHashes(_)) => {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
                     ResponseContent::ClustersHashes(self.config_state.hash_state()),
                 ));
                 return;
             }
-            Request::QueryClusterById(cluster_id) => {
+            Some(RequestType::QueryClusterById(cluster_id)) => {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
                     ResponseContent::Clusters(vec![self.config_state.cluster_state(cluster_id)]),
                 ));
             }
-            Request::QueryClustersByDomain(domain) => {
+            Some(RequestType::QueryClustersByDomain(domain)) => {
                 let cluster_ids = get_cluster_ids_by_domain(
                     &self.config_state,
                     domain.hostname.clone(),
@@ -907,18 +908,18 @@ impl Server {
                 ));
                 return;
             }
-            Request::QueryCertificateByFingerprint(f) => {
+            Some(RequestType::QueryCertificateByFingerprint(f)) => {
                 // forward the query to the TLS implementation
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
                     ResponseContent::CertificateByFingerprint(get_certificate(
                         &self.config_state,
-                        &f.0,
+                        &f,
                     )),
                 ));
                 return;
             }
-            Request::QueryMetrics(query_metrics_options) => {
+            Some(RequestType::QueryMetrics(query_metrics_options)) => {
                 METRICS.with(|metrics| {
                     match (*metrics.borrow_mut()).query(query_metrics_options) {
                         Ok(c) => push_queue(WorkerResponse::ok_with_content(message.id.clone(), c)),
@@ -940,16 +941,16 @@ impl Server {
 
         let req_id = request.id.clone();
 
-        match request.content {
-            Request::AddCluster(ref cluster) => {
+        match request.content.request_type {
+            Some(RequestType::AddCluster(ref cluster)) => {
                 self.add_cluster(cluster);
                 //not returning because the message must still be handled by each proxy
             }
-            Request::AddBackend(ref backend) => {
+            Some(RequestType::AddBackend(ref backend)) => {
                 push_queue(self.add_backend(&req_id, backend));
                 return;
             }
-            Request::RemoveBackend(ref remove_backend) => {
+            Some(RequestType::RemoveBackend(ref remove_backend)) => {
                 push_queue(self.remove_backend(&req_id, remove_backend));
                 return;
             }
@@ -967,18 +968,18 @@ impl Server {
             push_queue(self.tcp.borrow_mut().notify(request.clone()));
         }
 
-        match request.content {
+        match request.content.request_type {
             // special case for adding listeners, because we need to register a listener
-            Request::AddHttpListener(ref listener) => {
+            Some(RequestType::AddHttpListener(ref listener)) => {
                 push_queue(self.notify_add_http_listener(&req_id, listener));
             }
-            Request::AddHttpsListener(ref listener) => {
+            Some(RequestType::AddHttpsListener(ref listener)) => {
                 push_queue(self.notify_add_https_listener(&req_id, listener));
             }
-            Request::AddTcpListener(listener) => {
+            Some(RequestType::AddTcpListener(listener)) => {
                 push_queue(self.notify_add_tcp_listener(&req_id, listener));
             }
-            Request::RemoveListener(ref remove) => {
+            Some(RequestType::RemoveListener(ref remove)) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
                 let response = match ListenerType::from_i32(remove.proxy) {
@@ -989,10 +990,10 @@ impl Server {
                 };
                 push_queue(response);
             }
-            Request::ActivateListener(ref activate) => {
+            Some(RequestType::ActivateListener(ref activate)) => {
                 push_queue(self.notify_activate_listener(&req_id, activate));
             }
-            Request::DeactivateListener(ref deactivate) => {
+            Some(RequestType::DeactivateListener(ref deactivate)) => {
                 push_queue(self.notify_deactivate_listener(&req_id, deactivate));
             }
             _other_request => {}

@@ -1,4 +1,5 @@
 {
-  "type": "UPGRADE_WORKER",
-  "content": 0
+  "request_type": {
+    "UPGRADE_WORKER": 0
+  }
 }

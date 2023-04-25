@@ -33,11 +33,12 @@ use sozu_command::{
     config::DEFAULT_CIPHER_SUITES,
     logging,
     proto::command::{
-        AddCertificate, CertificateSummary, Cluster, HttpsListenerConfig, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RequestHttpFrontend, TlsVersion,
+        request::RequestType, AddCertificate, CertificateSummary, Cluster, HttpsListenerConfig,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend,
+        TlsVersion,
     },
     ready::Ready,
-    request::{Request, WorkerRequest},
+    request::WorkerRequest,
     response::{HttpFrontend, ResponseContent, WorkerResponse},
     scm_socket::ScmSocket,
     state::ClusterId,
@@ -1276,33 +1277,38 @@ impl ProxyConfiguration for HttpsProxy {
     fn notify(&mut self, request: WorkerRequest) -> WorkerResponse {
         let request_id = request.id.clone();
 
-        let content_result = match request.content {
-            Request::AddCluster(cluster) => {
+        let request_type = match request.content.request_type {
+            Some(t) => t,
+            None => return WorkerResponse::error(request_id, "Empty request"),
+        };
+
+        let content_result = match request_type {
+            RequestType::AddCluster(cluster) => {
                 info!("{} add cluster {:?}", request_id, cluster);
                 self.add_cluster(cluster.clone())
                     .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
-            Request::RemoveCluster { cluster_id } => {
+            RequestType::RemoveCluster(cluster_id) => {
                 info!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
                     .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
-            Request::AddHttpsFrontend(front) => {
+            RequestType::AddHttpsFrontend(front) => {
                 info!("{} add https front {:?}", request_id, front);
                 self.add_https_frontend(front)
                     .with_context(|| "Could not add https frontend")
             }
-            Request::RemoveHttpsFrontend(front) => {
+            RequestType::RemoveHttpsFrontend(front) => {
                 info!("{} remove https front {:?}", request_id, front);
                 self.remove_https_frontend(front)
                     .with_context(|| "Could not remove https frontend")
             }
-            Request::AddCertificate(add_certificate) => {
+            RequestType::AddCertificate(add_certificate) => {
                 info!("{} add certificate: {:?}", request_id, add_certificate);
                 self.add_certificate(add_certificate)
                     .with_context(|| "Could not add certificate")
             }
-            Request::RemoveCertificate(remove_certificate) => {
+            RequestType::RemoveCertificate(remove_certificate) => {
                 info!(
                     "{} remove certificate: {:?}",
                     request_id, remove_certificate
@@ -1310,7 +1316,7 @@ impl ProxyConfiguration for HttpsProxy {
                 self.remove_certificate(remove_certificate)
                     .with_context(|| "Could not remove certificate")
             }
-            Request::ReplaceCertificate(replace_certificate) => {
+            RequestType::ReplaceCertificate(replace_certificate) => {
                 info!(
                     "{} replace certificate: {:?}",
                     request_id, replace_certificate
@@ -1318,13 +1324,13 @@ impl ProxyConfiguration for HttpsProxy {
                 self.replace_certificate(replace_certificate)
                     .with_context(|| "Could not replace certificate")
             }
-            Request::RemoveListener(remove) => {
+            RequestType::RemoveListener(remove) => {
                 info!("removing HTTPS listener at address {:?}", remove.address);
                 self.remove_listener(remove.clone()).with_context(|| {
                     format!("Could not remove listener at address {:?}", remove.address)
                 })
             }
-            Request::SoftStop => {
+            RequestType::SoftStop(_) => {
                 info!("{} processing soft shutdown", request_id);
                 match self
                     .soft_stop()
@@ -1337,7 +1343,7 @@ impl ProxyConfiguration for HttpsProxy {
                     Err(e) => Err(e),
                 }
             }
-            Request::HardStop => {
+            RequestType::HardStop(_) => {
                 info!("{} processing hard shutdown", request_id);
                 match self
                     .hard_stop()
@@ -1350,11 +1356,11 @@ impl ProxyConfiguration for HttpsProxy {
                     Err(e) => Err(e),
                 }
             }
-            Request::Status => {
+            RequestType::Status(_) => {
                 info!("{} status", request_id);
                 Ok(None)
             }
-            Request::Logging(logging_filter) => {
+            RequestType::Logging(logging_filter) => {
                 info!(
                     "{} changing logging filter to {}",
                     request_id, logging_filter
@@ -1362,12 +1368,12 @@ impl ProxyConfiguration for HttpsProxy {
                 self.logging(logging_filter.clone())
                     .with_context(|| format!("Could not set logging level to {logging_filter}"))
             }
-            Request::QueryAllCertificates => {
+            RequestType::QueryAllCertificates(_) => {
                 info!("{} query all certificates", request_id);
                 self.query_all_certificates()
                     .with_context(|| "Could not query all certificates")
             }
-            Request::QueryCertificatesByDomain(domain) => {
+            RequestType::QueryCertificatesByDomain(domain) => {
                 info!("{} query certificate for domain {}", request_id, domain);
                 self.query_certificate_for_domain(domain.clone())
                     .with_context(|| format!("Could not query certificate for domain {domain}"))

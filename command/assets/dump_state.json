@@ -1,3 +1,5 @@
 {
-  "type": "DUMP_STATE"
+  "request_type": {
+    "DUMP_STATE": {}
+  }
 }

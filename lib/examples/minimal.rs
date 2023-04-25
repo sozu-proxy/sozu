@@ -7,15 +7,16 @@ extern crate time;
 use std::{collections::BTreeMap, env, io::stdout, thread};
 
 use anyhow::Context;
+use sozu_command::proto::command::request::RequestType;
 
 use crate::sozu_command::{
     channel::Channel,
     config::ListenerBuilder,
     logging::{Logger, LoggerBackend},
     proto::command::{
-        AddBackend, LoadBalancingParams, PathRule, RequestHttpFrontend, RulePosition,
+        AddBackend, LoadBalancingParams, PathRule, Request, RequestHttpFrontend, RulePosition,
     },
-    request::{Request, WorkerRequest},
+    request::WorkerRequest,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -71,12 +72,16 @@ fn main() -> anyhow::Result<()> {
 
     command.write_message(&WorkerRequest {
         id: String::from("ID_ABCD"),
-        content: Request::AddHttpFrontend(http_front),
+        content: Request {
+            request_type: Some(RequestType::AddHttpFrontend(http_front)),
+        },
     });
 
     command.write_message(&WorkerRequest {
         id: String::from("ID_EFGH"),
-        content: Request::AddBackend(http_backend),
+        content: Request {
+            request_type: Some(RequestType::AddBackend(http_backend)),
+        },
     });
 
     println!("HTTP -> {:?}", command.read_message());
