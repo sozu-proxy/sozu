@@ -45,12 +45,12 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
             frontend_token,
             backend_token: None,
             frontend_readiness: Readiness {
-                interest: Ready::hup() | Ready::error(),
-                event: Ready::empty(),
+                interest: Ready::HUP | Ready::ERROR,
+                event: Ready::EMPTY,
             },
             backend_readiness: Readiness {
-                interest: Ready::hup() | Ready::error(),
-                event: Ready::empty(),
+                interest: Ready::HUP | Ready::ERROR,
+                event: Ready::EMPTY,
             },
             cursor_header: 0,
         }
@@ -94,7 +94,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
                         }
                         Err(e) => match e.kind() {
                             ErrorKind::WouldBlock => {
-                                self.backend_readiness.event.remove(Ready::writable());
+                                self.backend_readiness.event.remove(Ready::WRITABLE);
                                 return (SessionResult::Continue, StateResult::Continue);
                             }
                             e => {
@@ -142,7 +142,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
 
     pub fn set_back_connected(&mut self, status: BackendConnectionStatus) {
         if status == BackendConnectionStatus::Connected {
-            self.backend_readiness.interest.insert(Ready::writable());
+            self.backend_readiness.interest.insert(Ready::WRITABLE);
         }
     }
 
@@ -184,8 +184,8 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
         pipe.frontend_readiness = self.frontend_readiness;
         pipe.backend_readiness = self.backend_readiness;
 
-        pipe.frontend_readiness.interest.insert(Ready::readable());
-        pipe.backend_readiness.interest.insert(Ready::readable());
+        pipe.frontend_readiness.interest.insert(Ready::READABLE);
+        pipe.backend_readiness.interest.insert(Ready::READABLE);
 
         if let Some(back_token) = self.backend_token {
             pipe.set_back_token(back_token);

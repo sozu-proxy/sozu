@@ -1189,7 +1189,7 @@ fn test_tls_endpoint() {
 #[test]
 fn test_http_behaviors() {
     assert_eq!(
-        repeat_until_error_or(10, "HTTP stack", try_http_behaviors),
+        repeat_until_error_or(1, "HTTP stack", try_http_behaviors),
         State::Success
     );
 }

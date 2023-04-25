@@ -328,12 +328,11 @@
 #[cfg(all(feature = "unstable", test))]
 extern crate test;
 
-#[macro_use]
-extern crate nom;
 extern crate hdrhistogram;
 extern crate libc;
 extern crate log;
 extern crate mio;
+extern crate nom;
 extern crate pool as pool_crate;
 extern crate rand;
 extern crate rustls;
@@ -924,14 +923,14 @@ impl Default for Readiness {
 impl Readiness {
     pub const fn new() -> Readiness {
         Readiness {
-            event: Ready::empty(),
-            interest: Ready::empty(),
+            event: Ready::EMPTY,
+            interest: Ready::EMPTY,
         }
     }
 
     pub fn reset(&mut self) {
-        self.event = Ready::empty();
-        self.interest = Ready::empty();
+        self.event = Ready::EMPTY;
+        self.interest = Ready::EMPTY;
     }
 
     /// filters the readiness we actually want

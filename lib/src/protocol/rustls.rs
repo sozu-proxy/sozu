@@ -37,8 +37,8 @@ impl TlsHandshake {
         TlsHandshake {
             container_frontend_timeout,
             frontend_readiness: Readiness {
-                interest: Ready::readable() | Ready::hup() | Ready::error(),
-                event: Ready::empty(),
+                interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
+                event: Ready::EMPTY,
             },
             frontend_token,
             request_id,
@@ -64,7 +64,7 @@ impl TlsHandshake {
                     Ok(_) => {}
                     Err(e) => match e.kind() {
                         ErrorKind::WouldBlock => {
-                            self.frontend_readiness.event.remove(Ready::readable());
+                            self.frontend_readiness.event.remove(Ready::READABLE);
                             can_read = false
                         }
                         _ => {
@@ -86,11 +86,11 @@ impl TlsHandshake {
         }
 
         if !self.session.wants_read() {
-            self.frontend_readiness.interest.remove(Ready::readable());
+            self.frontend_readiness.interest.remove(Ready::READABLE);
         }
 
         if self.session.wants_write() {
-            self.frontend_readiness.interest.insert(Ready::writable());
+            self.frontend_readiness.interest.insert(Ready::WRITABLE);
         }
 
         if self.session.is_handshaking() {
@@ -100,9 +100,9 @@ impl TlsHandshake {
             if self.session.wants_write() {
                 SessionResult::Continue
             } else {
-                self.frontend_readiness.interest.insert(Ready::readable());
-                self.frontend_readiness.event.insert(Ready::readable());
-                self.frontend_readiness.interest.insert(Ready::writable());
+                self.frontend_readiness.interest.insert(Ready::READABLE);
+                self.frontend_readiness.event.insert(Ready::READABLE);
+                self.frontend_readiness.interest.insert(Ready::WRITABLE);
                 SessionResult::Upgrade
             }
         }
@@ -121,7 +121,7 @@ impl TlsHandshake {
                     Ok(_) => {}
                     Err(e) => match e.kind() {
                         ErrorKind::WouldBlock => {
-                            self.frontend_readiness.event.remove(Ready::writable());
+                            self.frontend_readiness.event.remove(Ready::WRITABLE);
                             can_write = false
                         }
                         _ => {
@@ -143,21 +143,21 @@ impl TlsHandshake {
         }
 
         if !self.session.wants_write() {
-            self.frontend_readiness.interest.remove(Ready::writable());
+            self.frontend_readiness.interest.remove(Ready::WRITABLE);
         }
 
         if self.session.wants_read() {
-            self.frontend_readiness.interest.insert(Ready::readable());
+            self.frontend_readiness.interest.insert(Ready::READABLE);
         }
 
         if self.session.is_handshaking() {
             SessionResult::Continue
         } else if self.session.wants_read() {
-            self.frontend_readiness.interest.insert(Ready::readable());
+            self.frontend_readiness.interest.insert(Ready::READABLE);
             SessionResult::Upgrade
         } else {
-            self.frontend_readiness.interest.insert(Ready::writable());
-            self.frontend_readiness.interest.insert(Ready::readable());
+            self.frontend_readiness.interest.insert(Ready::WRITABLE);
+            self.frontend_readiness.interest.insert(Ready::READABLE);
             SessionResult::Upgrade
         }
     }
@@ -222,7 +222,7 @@ impl SessionState for TlsHandshake {
                     "PROXY session {:?} front error, disconnecting",
                     self.frontend_token
                 );
-                self.frontend_readiness.interest = Ready::empty();
+                self.frontend_readiness.interest = Ready::EMPTY;
 
                 return SessionResult::Close;
             }

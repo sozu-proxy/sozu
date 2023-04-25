@@ -1,4 +1,5 @@
 pub mod answers;
+pub mod editor;
 pub mod parser;
 
 use std::{
@@ -18,7 +19,10 @@ use time::{Duration, Instant};
 
 use crate::{
     pool::{Checkout, Pool},
-    protocol::{http::parser::Method, SessionState},
+    protocol::{
+        http::{editor::HttpContext, parser::Method},
+        SessionState,
+    },
     retry::RetryPolicy,
     router::Route,
     server::{push_event, CONN_RETRIES},
@@ -102,8 +106,6 @@ pub enum TimeoutStatus {
 /// Http will be contained in State which itself is contained by Session
 pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     answers: Rc<RefCell<answers::HttpAnswers>>,
-    added_request_header: Option<AddedRequestHeader>,
-    added_response_header: String,
     pub backend: Option<Rc<RefCell<Backend>>>,
     backend_connection_status: BackendConnectionStatus,
     pub backend_id: Option<String>,
@@ -116,7 +118,6 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     configured_backend_timeout: Duration,
     configured_connect_timeout: Duration,
     configured_frontend_timeout: Duration,
-    closing: bool,
     pub cluster_id: Option<String>,
     connection_attempts: u8,
     pub frontend_readiness: Readiness,
@@ -124,15 +125,10 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     frontend_token: Token,
     keepalive_count: usize,
     listener: Rc<RefCell<L>>,
-    protocol: Protocol,
-    public_address: SocketAddr,
-    pub request_id: Ulid,
     pub htx_request: SozuHtx,
     pub htx_response: SozuHtx,
     status: SessionStatus,
-    pub session_address: Option<SocketAddr>,
-    sticky_name: String,
-    sticky_session: Option<StickySession>,
+    pub context: HttpContext,
 }
 
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
@@ -165,8 +161,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             None => panic!(),
         };
         Http {
-            added_request_header: None,
-            added_response_header: String::from(""),
             answers,
             backend_connection_status: BackendConnectionStatus::NotConnected,
             backend_id: None,
@@ -175,7 +169,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             backend_stop: None,
             backend_token: None,
             backend: None,
-            closing: false,
             cluster_id: None,
             configured_backend_timeout,
             configured_connect_timeout,
@@ -188,21 +181,25 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             frontend_token,
             keepalive_count: 0,
             listener,
-            protocol,
-            public_address,
-            request_id,
             htx_request: SozuHtx::new(htx::Kind::Request, htx::HtxBuffer::new(front_buffer)),
             htx_response: SozuHtx::new(htx::Kind::Response, htx::HtxBuffer::new(back_buffer)),
-            session_address,
             status: SessionStatus::Normal,
-            sticky_name,
-            sticky_session: None,
+            context: HttpContext {
+                closing: false,
+                id: request_id,
+                keep_alive: false,
+                protocol,
+                public_address,
+                session_address,
+                sticky_name,
+                sticky_session: None,
+            },
         }
     }
 
     pub fn reset(&mut self) {
         println!("==============reset");
-        self.request_id = Ulid::generate();
+        self.context.id = Ulid::generate();
         gauge_add!("http.active_requests", -1);
 
         self.htx_request.clear();
@@ -221,6 +218,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         // waiting for a new request
         self.container_frontend_timeout.reset();
         self.container_backend_timeout.cancel();
+        self.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        self.backend_readiness.interest = Ready::HUP | Ready::ERROR;
     }
 
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
@@ -230,7 +229,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 "could not reset front timeout {:?}",
                 self.configured_frontend_timeout
             );
-            self.print_state(&format!("{:?}", self.protocol));
+            self.print_state(&format!("{:?}", self.context.protocol));
         }
 
         if let SessionStatus::DefaultAnswer(_, _, _) = self.status {
@@ -238,20 +237,18 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 "{}\tsending default answer, should not read from front socket",
                 self.log_context()
             );
-            self.frontend_readiness.interest.insert(Ready::writable());
-            self.backend_readiness.interest.remove(Ready::writable());
-            self.backend_readiness.interest.remove(Ready::readable());
+            self.frontend_readiness.interest.remove(Ready::READABLE);
+            self.frontend_readiness.interest.insert(Ready::WRITABLE);
             return StateResult::Continue;
         }
 
         if self.htx_request.storage.is_full() {
-            self.frontend_readiness.interest.remove(Ready::readable());
-            if self.backend_token.is_none() {
-                // client has filled its HtxBuffer without a backend to empty it
-                self.set_answer(DefaultAnswerStatus::Answer413, None);
-                self.frontend_readiness.interest.insert(Ready::writable());
+            self.frontend_readiness.interest.remove(Ready::READABLE);
+            if self.htx_request.is_main_phase() {
+                self.backend_readiness.interest.insert(Ready::WRITABLE);
             } else {
-                self.backend_readiness.interest.insert(Ready::writable());
+                // client has filled its HtxBuffer and we can't empty it
+                self.set_answer(DefaultAnswerStatus::Answer413, None);
             }
             return StateResult::Continue;
         }
@@ -271,11 +268,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             self.htx_request.storage.fill(size);
             count!("bytes_in", size as i64);
             metrics.bin += size;
-            if self.htx_request.storage.is_full() {
-                self.frontend_readiness.interest.remove(Ready::readable());
-            }
+            // if self.htx_request.storage.is_full() {
+            //     self.frontend_readiness.interest.remove(Ready::READABLE);
+            // }
         } else {
-            self.frontend_readiness.event.remove(Ready::readable());
+            self.frontend_readiness.event.remove(Ready::READABLE);
         }
 
         match socket_state {
@@ -303,7 +300,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 return StateResult::CloseSession;
             }
             SocketResult::WouldBlock => {
-                self.frontend_readiness.event.remove(Ready::readable());
+                self.frontend_readiness.event.remove(Ready::READABLE);
             }
             SocketResult::Continue => {}
         };
@@ -315,7 +312,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         println!("==============readable_parse");
         let was_initial = self.htx_request.is_initial();
 
-        htx::h1::parse(&mut self.htx_request);
+        // let mut context = self.request_context();
+        htx::h1::parse(&mut self.htx_request, &mut self.context);
         htx::debug_htx(&self.htx_request);
 
         if was_initial && !self.htx_request.is_initial() {
@@ -330,57 +328,31 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             // "did we already sent byte?"
             if was_initial {
                 self.set_answer(DefaultAnswerStatus::Answer400, None);
-                gauge_add!("http.active_requests", 1);
+                // gauge_add!("http.active_requests", 1);
                 return StateResult::Continue;
             } else {
                 return StateResult::CloseSession;
             }
         }
 
-        // FIXME: handle host and backend connection
-        // match self.request_state.status_line() {
-        //     Some(htx::StatusLine::Request {
-        //         authority, path, ..
-        //     }) => {
-        //         self.backend_readiness.interest.insert(Ready::writable());
-        //         return StateResult::ConnectBackend;
-        //     }
-        //     _ => {
-        //         self.frontend_readiness.interest.insert(Ready::readable());
-        //         return StateResult::Continue;
-        //     }
-        // }
-        if let Some(htx::HtxBlock::StatusLine(htx::StatusLine::Request {
-            authority: htx::Store::Slice(_),
-            path: htx::Store::Slice(_),
-            ..
-        })) = self.htx_request.blocks.get(0)
-        {
-            println!("CONNECTING PLEASE!");
-            self.backend_readiness.interest.insert(Ready::writable());
-            return StateResult::ConnectBackend;
-        }
-
         if self.htx_request.is_main_phase() {
+            self.backend_readiness.interest.insert(Ready::WRITABLE);
             // if it was the first request, the front timeout duration
             // was set to request_timeout, which is much lower. For future
             // requests on this connection, we can wait a bit more
             self.container_frontend_timeout
                 .set_duration(self.configured_frontend_timeout);
         }
-
-        // If the body had no length information, we suppose it ends with the connection
-        // if socket_error
-        //     && self.request_state.parsing_phase == htx::ParsingPhase::Body
-        //     && self.request_state.body_size == htx::BodySize::Empty
-        // {
-        //     self.request_state.parsing_phase = htx::ParsingPhase::Terminated;
-        // }
-
         if self.htx_request.is_terminated() {
-            self.frontend_readiness.interest.remove(Ready::readable());
+            self.frontend_readiness.interest.remove(Ready::READABLE);
         }
-        self.backend_readiness.interest.insert(Ready::writable());
+
+        if was_initial {
+            if let htx::StatusLine::Request { .. } = self.htx_request.detached.status_line {
+                println!("============== HANDLE CONNECTION!");
+                return StateResult::ConnectBackend;
+            }
+        }
         StateResult::Continue
     }
 
@@ -394,22 +366,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.htx_response.prepare(&mut htx::h1::BlockConverter);
 
         let bufs = self.htx_response.as_io_slice();
-        // TODO: implement socket_write_vectored for FrontRustls
-        let (size, socket_state) = if self.frontend_socket.has_vectored_writes() {
-            self.frontend_socket.socket_write_vectored(&bufs)
-        } else {
-            let mut total_size = 0;
-            let mut socket_state = SocketResult::Continue;
-            let mut size;
-            for buf in bufs {
-                (size, socket_state) = self.frontend_socket.socket_write(&buf);
-                total_size += size;
-                if socket_state != SocketResult::Continue {
-                    break;
-                }
-            }
-            (total_size, socket_state)
-        };
+        if bufs.is_empty() {
+            self.frontend_readiness.interest.remove(Ready::WRITABLE);
+            return StateResult::Continue;
+        }
+
+        let (size, socket_state) = self.frontend_socket.socket_write_vectored(&bufs);
         debug!(
             "{}\tFRONT [{}<-{:?}]: wrote {} bytes",
             self.log_context(),
@@ -422,8 +384,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             self.htx_response.consume(size);
             count!("bytes_out", size as i64);
             metrics.bout += size;
+            self.backend_readiness.interest.insert(Ready::READABLE);
         } else {
-            self.frontend_readiness.event.remove(Ready::writable());
+            self.frontend_readiness.event.remove(Ready::WRITABLE);
         }
 
         match socket_state {
@@ -440,35 +403,37 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 return StateResult::CloseSession;
             }
             SocketResult::WouldBlock => {
-                self.frontend_readiness.event.remove(Ready::writable());
+                self.frontend_readiness.event.remove(Ready::WRITABLE);
             }
             SocketResult::Continue => {}
         }
 
-        // TODO: handle 100-continue
-        // if must_continue_response {
-        //     self.frontend_readiness.interest.insert(Ready::readable());
-        //     self.frontend_readiness.interest.remove(Ready::writable());
-        //     self.htx_response.clear();
-        //     return StateResult::Continue;
-        // }
-
-        // FIXME: this should only when COMPLETED
-        // meaning response_state is terminated AND everything was
-        // successfully sent
-        if self.htx_response.is_terminated() {
-            let frontend_keep_alive = true;
-            let backend_keep_alive = true;
-
+        if self.htx_response.is_terminated() && self.htx_response.is_completed() {
             save_http_status_metric(self.get_response_line().0);
 
             self.log_request_success(metrics);
             metrics.reset();
 
-            if self.closing {
+            if self.context.closing {
                 debug!("{} closing proxy, no keep alive", self.log_context());
                 return StateResult::CloseSession;
             }
+
+            match self.htx_response.detached.status_line {
+                htx::StatusLine::Response { code: 101, .. } => {
+                    println!("============== HANDLE UPGRADE!");
+                    return StateResult::Upgrade;
+                }
+                htx::StatusLine::Response { code: 100, .. } => {
+                    println!("============== HANDLE CONTINUE!");
+                    self.htx_response.clear();
+                    return StateResult::Continue;
+                }
+                _ => (),
+            }
+
+            let frontend_keep_alive = true;
+            let backend_keep_alive = true;
 
             // FIXME: we could get smarter about this
             // with no keepalive on backend, we could open a new backend ConnectionError
@@ -478,28 +443,19 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 (true, true) => {
                     debug!("{} keep alive front/back", self.log_context());
                     self.reset();
-                    self.frontend_readiness.interest =
-                        Ready::readable() | Ready::hup() | Ready::error();
-                    self.backend_readiness.interest = Ready::hup() | Ready::error();
                     StateResult::Continue
                 }
                 (true, false) => {
                     debug!("{} keep alive front", self.log_context());
                     self.reset();
-                    self.frontend_readiness.interest =
-                        Ready::readable() | Ready::hup() | Ready::error();
-                    self.backend_readiness.interest = Ready::hup() | Ready::error();
                     StateResult::CloseBackend
                 }
                 _ => {
                     debug!("{} no keep alive", self.log_context());
-                    self.frontend_readiness.reset();
-                    self.backend_readiness.reset();
                     StateResult::CloseSession
                 }
             };
         }
-        self.backend_readiness.interest.insert(Ready::readable());
         StateResult::Continue
     }
 
@@ -510,8 +466,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 "{}\tsending default answer, should not write to back",
                 self.log_context()
             );
-            self.backend_readiness.interest.remove(Ready::writable());
-            self.frontend_readiness.interest.insert(Ready::writable());
+            self.backend_readiness.interest.remove(Ready::WRITABLE);
+            self.frontend_readiness.interest.insert(Ready::WRITABLE);
             return SessionResult::Continue;
         }
 
@@ -526,9 +482,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         let bufs = self.htx_request.as_io_slice();
         if bufs.is_empty() {
-            self.backend_readiness.interest.remove(Ready::writable());
+            self.backend_readiness.interest.remove(Ready::WRITABLE);
             return SessionResult::Continue;
         }
+
         let (size, socket_state) = backend_socket.socket_write_vectored(&bufs);
         debug!(
             "{}\tBACK [{}->{:?}]: wrote {} bytes",
@@ -542,8 +499,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             self.htx_request.consume(size);
             count!("back_bytes_out", size as i64);
             metrics.backend_bout += size;
+            self.frontend_readiness.interest.insert(Ready::READABLE);
+            self.backend_readiness.interest.insert(Ready::READABLE);
         } else {
-            self.backend_readiness.event.remove(Ready::writable());
+            self.backend_readiness.event.remove(Ready::WRITABLE);
         }
 
         match socket_state {
@@ -557,31 +516,18 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             // the socket right after sending the response
             // FIXME: shouldn't we test for response_state then?
             SocketResult::Error | SocketResult::Closed => {
-                self.frontend_readiness.interest.remove(Ready::readable());
-                self.backend_readiness.reset();
+                self.frontend_readiness.interest.remove(Ready::READABLE);
+                self.backend_readiness.interest.remove(Ready::WRITABLE);
                 return SessionResult::Continue;
             }
             SocketResult::WouldBlock => {
-                self.backend_readiness.event.remove(Ready::writable());
+                self.backend_readiness.event.remove(Ready::WRITABLE);
             }
             SocketResult::Continue => {}
         }
 
-        // TODO: handle 100-continue
-        // if must_continue_request {
-        //     // wait for the 100 continue response from the backend
-        //     self.frontend_readiness.interest.remove(Ready::readable());
-        //     self.backend_readiness.interest.insert(Ready::readable());
-        //     self.backend_readiness.interest.remove(Ready::writable());
-        //     return SessionResult::Continue;
-        // }
-
-        // FIXME: this should only when COMPLETED
-        // meaning response_state is terminated AND everything was
-        // successfully sent
-        if self.htx_request.is_terminated() {
-            self.backend_readiness.interest.insert(Ready::readable());
-            self.backend_readiness.interest.remove(Ready::writable());
+        if self.htx_request.is_terminated() && self.htx_request.is_completed() {
+            self.backend_readiness.interest.remove(Ready::WRITABLE);
 
             // cancel the front timeout while we are waiting for the server to answer
             self.container_frontend_timeout.cancel();
@@ -589,7 +535,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 self.container_backend_timeout.set(token);
             }
         }
-        self.frontend_readiness.interest.insert(Ready::readable());
         SessionResult::Continue
     }
 
@@ -601,7 +546,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 "could not reset back timeout {:?}",
                 self.configured_backend_timeout
             );
-            self.print_state(&format!("{:?}", self.protocol));
+            self.print_state(&format!("{:?}", self.context.protocol));
         }
 
         if let SessionStatus::DefaultAnswer(_, _, _) = self.status {
@@ -609,9 +554,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 "{}\tsending default answer, should not read from back socket",
                 self.log_context()
             );
-            self.frontend_readiness.interest.insert(Ready::writable());
-            self.backend_readiness.interest.remove(Ready::writable());
-            self.backend_readiness.interest.remove(Ready::readable());
+            self.backend_readiness.interest.remove(Ready::READABLE);
+            self.frontend_readiness.interest.insert(Ready::WRITABLE);
             return StateResult::Continue;
         }
 
@@ -623,8 +567,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         };
 
         if self.htx_response.storage.is_full() {
-            self.backend_readiness.interest.remove(Ready::readable());
-            self.frontend_readiness.interest.insert(Ready::writable());
+            self.backend_readiness.interest.remove(Ready::READABLE);
+            if self.htx_response.is_main_phase() {
+                self.frontend_readiness.interest.insert(Ready::WRITABLE);
+            } else {
+                // server has filled its HtxBuffer and we can't empty it
+                // FIXME: what error code should we use?
+                self.set_answer(DefaultAnswerStatus::Answer502, None);
+            }
             return StateResult::Continue;
         }
 
@@ -641,11 +591,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             self.htx_response.storage.fill(size);
             count!("back_bytes_in", size as i64);
             metrics.backend_bin += size;
-            if self.htx_response.storage.is_full() {
-                self.backend_readiness.interest.remove(Ready::readable());
-            }
+            // if self.htx_response.storage.is_full() {
+            //     self.backend_readiness.interest.remove(Ready::READABLE);
+            // }
         } else {
-            self.backend_readiness.event.remove(Ready::readable());
+            self.backend_readiness.event.remove(Ready::READABLE);
         }
 
         // TODO: close delimited and backend_hup should be handled better
@@ -663,7 +613,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 return StateResult::CloseSession;
             }
             SocketResult::WouldBlock | SocketResult::Closed => {
-                self.backend_readiness.event.remove(Ready::readable());
+                self.backend_readiness.event.remove(Ready::READABLE);
             }
             SocketResult::Continue => {}
         }
@@ -675,7 +625,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         println!("==============backend_readable_parse");
         let was_initial = self.htx_response.is_initial();
 
-        htx::h1::parse(&mut self.htx_response);
+        // let mut context = self.response_context();
+        htx::h1::parse(&mut self.htx_response, &mut self.context);
         htx::debug_htx(&self.htx_response);
 
         if self.htx_response.is_error() {
@@ -691,33 +642,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         }
 
-        // FIXME: handle upgrade
-        // match self.request_state.upgrade() {
-        //     Some(protocol) => {
-        //         if compare_no_case(protocol, "websocket") {
-        //             return StateResult::Upgrade
-        //         } else {
-        //             // FIXME: what to do if protocol upgrade is not websocket?
-        //             // we can still upgrade to websocket and treat incoming traffic as opaque?
-        //         }
-        //     }
-        //     None => {}
-        // }
-
-        // If the body had no length information, we suppose it ends with the connection
-        // if socket_error
-        //     && self.response_state.parsing_phase == htx::ParsingPhase::Body
-        //     && self.response_state.body_size == htx::BodySize::Empty
-        // {
-        //     self.response_state.parsing_phase = htx::ParsingPhase::Terminated;
-        // }
-
+        if self.htx_response.is_main_phase() {
+            self.frontend_readiness.interest.insert(Ready::WRITABLE);
+        }
         if self.htx_response.is_terminated() {
             metrics.backend_stop();
             self.backend_stop = Some(Instant::now());
-            self.backend_readiness.interest.remove(Ready::readable());
+            self.backend_readiness.interest.remove(Ready::READABLE);
         }
-        self.frontend_readiness.interest.insert(Ready::writable());
         StateResult::Continue
     }
 }
@@ -725,7 +657,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
     fn log_context(&self) -> LogContext {
         LogContext {
-            request_id: self.request_id,
+            request_id: self.context.id,
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
         }
@@ -733,8 +665,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     /// (code, reason)
     pub fn get_response_line(&self) -> (Option<u16>, Option<&str>) {
-        if let Some(htx::HtxBlock::StatusLine(htx::StatusLine::Response { code, reason, .. })) =
-            self.htx_request.blocks.get(0)
+        if let htx::StatusLine::Response { code, reason, .. } =
+            &self.htx_request.detached.status_line
         {
             let buffer = self.htx_response.storage.buffer();
             let reason = reason
@@ -748,13 +680,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     /// (method, authority, path, uri)
     pub fn get_request_line(&self) -> (Option<Method>, Option<&str>, Option<&str>, Option<&str>) {
-        if let Some(htx::HtxBlock::StatusLine(htx::StatusLine::Request {
+        if let htx::StatusLine::Request {
             method,
             authority,
             path,
             uri,
             ..
-        })) = self.htx_request.blocks.get(0)
+        } = &self.htx_request.detached.status_line
         {
             let buffer = self.htx_request.storage.buffer();
             let method = method.data_opt(buffer).map(Method::new);
@@ -774,7 +706,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn get_session_address(&self) -> Option<SocketAddr> {
-        self.session_address
+        self.context
+            .session_address
             .or_else(|| self.frontend_socket.socket_ref().peer_addr().ok())
     }
 
@@ -790,7 +723,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     fn protocol_string(&self) -> &'static str {
-        match self.protocol {
+        match self.context.protocol {
             Protocol::HTTP => "HTTP",
             Protocol::HTTPS => match self.frontend_socket.protocol() {
                 TransportProtocol::Ssl2 => "HTTPS-SSL2",
@@ -1042,8 +975,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 .get(answer, self.cluster_id.as_deref())
         });
         self.status = SessionStatus::DefaultAnswer(answer, buf, 0);
-        self.frontend_readiness.interest = Ready::writable() | Ready::hup() | Ready::error();
-        self.backend_readiness.interest = Ready::hup() | Ready::error();
+        self.frontend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
+        self.backend_readiness.interest = Ready::HUP | Ready::ERROR;
     }
 
     fn writable_default_answer(&mut self, metrics: &mut SessionMetrics) -> StateResult {
@@ -1065,7 +998,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 metrics.bout += sz;
 
                 if res != SocketResult::Continue {
-                    self.frontend_readiness.event.remove(Ready::writable());
+                    self.frontend_readiness.event.remove(Ready::WRITABLE);
                 }
 
                 if index == len {
@@ -1169,7 +1102,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     /// IF the backend_token is set. I don't think this is a good idea, but it is a quick fix
     fn close_backend(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
         debug!(
-            "{}\tPROXY [{} -> {}] CLOSED BACKEND",
+            "{}\tPROXY [{}->{}] CLOSED BACKEND",
             self.log_context(),
             self.frontend_token.0,
             self.backend_token
@@ -1193,7 +1126,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             proxy.remove_session(token);
 
             if self.backend_connection_status != BackendConnectionStatus::NotConnected {
-                self.backend_readiness.event = Ready::empty();
+                self.backend_readiness.event = Ready::EMPTY;
             }
 
             if self.backend_connection_status == BackendConnectionStatus::Connected {
@@ -1330,7 +1263,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         if frontend_should_stick {
             let sticky_name = self.listener.borrow().get_sticky_name().to_string();
 
-            self.sticky_session = Some(StickySession::new(
+            self.context.sticky_session = Some(StickySession::new(
                 backend
                     .borrow()
                     .sticky_id
@@ -1339,7 +1272,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             ));
 
             // stick session to listener (how? why?)
-            self.sticky_name = sticky_name;
+            self.context.sticky_name = sticky_name;
         }
 
         metrics.backend_id = Some(backend.borrow().backend_id.clone());
@@ -1446,7 +1379,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             );
         }
 
-        self.backend_readiness.interest = Ready::writable() | Ready::hup() | Ready::error();
+        self.backend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
 
         self.backend_connection_status = BackendConnectionStatus::Connecting(Instant::now());
 
@@ -1582,12 +1515,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         {
             return StateResult::Continue;
         }
-        if self.htx_response.is_initial() {
-            self.set_answer(DefaultAnswerStatus::Answer503, None);
-            self.backend_readiness.interest = Ready::empty();
-            StateResult::Continue
-        } else {
-            StateResult::CloseSession
+        match (
+            self.htx_request.is_initial(),
+            self.htx_response.is_initial(),
+        ) {
+            // the backend started to answer so we close
+            (_, false) => StateResult::CloseSession,
+            // probably backend hup between keep alive request, change change backend
+            (true, true) => StateResult::CloseBackend,
+            // the frontend already transmitted data so we can't redirect
+            (false, true) => {
+                self.set_answer(DefaultAnswerStatus::Answer503, None);
+                self.backend_readiness.interest = Ready::EMPTY;
+                StateResult::Continue
+            }
         }
     }
 
@@ -1637,7 +1578,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 self.set_backend_connected(BackendConnectionStatus::Connected, metrics);
                 // we might get an early response from the backend, so we want to look
                 // at readable events
-                self.backend_readiness.interest.insert(Ready::readable());
+                self.backend_readiness.interest.insert(Ready::READABLE);
             }
         }
 
@@ -1732,15 +1673,15 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     self.frontend_token
                 );
 
-                self.frontend_readiness.interest = Ready::empty();
-                self.backend_readiness.interest = Ready::empty();
+                self.frontend_readiness.interest = Ready::EMPTY;
+                self.backend_readiness.interest = Ready::EMPTY;
 
                 return StateResult::CloseSession;
             }
 
             if backend_interest.is_error() && self.backend_hup() == StateResult::CloseSession {
-                self.frontend_readiness.interest = Ready::empty();
-                self.backend_readiness.interest = Ready::empty();
+                self.frontend_readiness.interest = Ready::EMPTY;
+                self.backend_readiness.interest = Ready::EMPTY;
 
                 error!(
                     "PROXY session {:?} back error, disconnecting",
@@ -1759,7 +1700,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             );
             incr!("http.infinite_loop.error");
 
-            self.print_state(&format!("{:?}", self.protocol));
+            self.print_state(&format!("{:?}", self.context.protocol));
 
             return StateResult::CloseSession;
         }
@@ -1906,7 +1847,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
         {
             true
         } else {
-            self.closing = true;
+            self.context.closing = true;
             false
         }
     }
@@ -1955,122 +1896,6 @@ impl<'a> std::fmt::Display for LogContext<'a> {
         )
     }
 }
-
-pub struct AddedRequestHeader {
-    pub request_id: Ulid,
-    pub public_address: SocketAddr,
-    pub peer_address: Option<SocketAddr>,
-    pub protocol: Protocol,
-    pub closing: bool,
-}
-
-/*
-impl AddedRequestHeader {
-    pub fn added_request_header(&self, headers: &parser::ForwardedHeaders) -> String {
-        use std::fmt::Write;
-
-        //FIXME: should update the Connection header directly if present
-        let closing_header = if self.closing {
-            "Connection: close\r\n"
-        } else {
-            ""
-        };
-
-        let frontend_ip = self.public_address.ip();
-        let frontend_port = self.public_address.port();
-        let proto = match self.protocol {
-            Protocol::HTTP => "http",
-            Protocol::HTTPS => "https",
-            _ => unreachable!(),
-        };
-
-        let mut s = String::new();
-
-        if !headers.x_proto {
-            if let Err(e) = write!(&mut s, "X-Forwarded-Proto: {proto}\r\n") {
-                error!("could not append request header: {:?}", e);
-            }
-        }
-
-        if !headers.x_port {
-            if let Err(e) = write!(&mut s, "X-Forwarded-Port: {frontend_port}\r\n") {
-                error!("could not append request header: {:?}", e);
-            }
-        }
-
-        if let Some(peer_addr) = self.peer_address {
-            let peer_ip = peer_addr.ip();
-            let peer_port = peer_addr.port();
-            match &headers.x_for {
-                None => {
-                    if let Err(e) = write!(&mut s, "X-Forwarded-For: {peer_ip}\r\n") {
-                        error!("could not append request header: {:?}", e);
-                    }
-                }
-                Some(value) => {
-                    if let Err(e) = write!(&mut s, "X-Forwarded-For: {value}, {peer_ip}\r\n") {
-                        error!("could not append request header: {:?}", e);
-                    }
-                }
-            }
-
-            match &headers.forwarded {
-                None => {
-                    if let Err(e) = write!(&mut s, "Forwarded: ") {
-                        error!("could not append request header: {:?}", e);
-                    }
-                }
-                Some(value) => {
-                    if let Err(e) = write!(&mut s, "Forwarded: {value}, ") {
-                        error!("could not append request header: {:?}", e);
-                    }
-                }
-            }
-
-            match (peer_ip, peer_port, frontend_ip) {
-                (IpAddr::V4(_), peer_port, IpAddr::V4(_)) => {
-                    if let Err(e) = write!(
-                        &mut s,
-                        "proto={proto};for={peer_ip}:{peer_port};by={frontend_ip}\r\n"
-                    ) {
-                        error!("could not append request header: {:?}", e);
-                    }
-                }
-                (IpAddr::V4(_), peer_port, IpAddr::V6(_)) => {
-                    if let Err(e) = write!(
-                        &mut s,
-                        "proto={proto};for={peer_ip}:{peer_port};by=\"{frontend_ip}\"\r\n"
-                    ) {
-                        error!("could not append request header: {:?}", e);
-                    }
-                }
-                (IpAddr::V6(_), peer_port, IpAddr::V4(_)) => {
-                    if let Err(e) = write!(
-                        &mut s,
-                        "proto={proto};for=\"{peer_ip}:{peer_port}\";by={frontend_ip}\r\n"
-                    ) {
-                        error!("could not append request header: {:?}", e);
-                    }
-                }
-                (IpAddr::V6(_), peer_port, IpAddr::V6(_)) => {
-                    if let Err(e) = write!(
-                        &mut s,
-                        "proto={proto};for=\"{peer_ip}:{peer_port}\";by=\"{frontend_ip}\"\r\n"
-                    ) {
-                        error!("could not append request header: {:?}", e);
-                    }
-                }
-            };
-        }
-
-        if let Err(e) = write!(&mut s, "Sozu-Id: {}\r\n{}", self.request_id, closing_header) {
-            error!("could not append request header: {:?}", e);
-        }
-
-        s
-    }
-}
-*/
 
 pub trait AsStr {
     fn as_str(&self) -> &str;

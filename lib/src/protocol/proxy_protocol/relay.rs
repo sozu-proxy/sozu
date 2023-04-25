@@ -39,16 +39,16 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
     ) -> Self {
         RelayProxyProtocol {
             backend_readiness: Readiness {
-                interest: Ready::hup() | Ready::error(),
-                event: Ready::empty(),
+                interest: Ready::HUP | Ready::ERROR,
+                event: Ready::EMPTY,
             },
             backend_token: None,
             backend,
             cursor_header: 0,
             frontend_buffer: front_buf,
             frontend_readiness: Readiness {
-                interest: Ready::readable() | Ready::hup() | Ready::error(),
-                event: Ready::empty(),
+                interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
+                event: Ready::EMPTY,
             },
             frontend_token,
             frontend,
@@ -83,13 +83,13 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
             }
 
             if res == SocketResult::WouldBlock {
-                self.frontend_readiness.event.remove(Ready::readable());
+                self.frontend_readiness.event.remove(Ready::READABLE);
             }
 
             let read_sz = match parse_v2_header(self.frontend_buffer.data()) {
                 Ok((rest, _)) => {
-                    self.frontend_readiness.interest.remove(Ready::readable());
-                    self.backend_readiness.interest.insert(Ready::writable());
+                    self.frontend_readiness.interest.remove(Ready::READABLE);
+                    self.backend_readiness.interest.insert(Ready::WRITABLE);
                     self.frontend_buffer.data().offset(rest)
                 }
                 Err(Err::Incomplete(_)) => return StateResult::Continue,

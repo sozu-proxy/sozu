@@ -7,25 +7,32 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::http::{parser::compare_no_case, SozuHtx},
+    protocol::http::{parser::compare_no_case, SozuHtx, StickySession},
     Protocol,
 };
 
-pub struct RequestContext {
+pub struct HttpContext {
     pub closing: bool,
     pub id: Ulid,
     pub protocol: Protocol,
     pub public_address: SocketAddr,
     pub session_address: Option<SocketAddr>,
+    pub sticky_name: String,
+    pub sticky_session: Option<StickySession>,
+    pub keep_alive: bool,
 }
 
-pub struct ResponseContext {
-    pub closing: bool,
-    pub id: Ulid,
+impl htx::h1::ParserCallbacks<Checkout> for HttpContext {
+    fn on_headers(&mut self, htx: &mut SozuHtx) {
+        match htx.kind {
+            htx::Kind::Request => self.on_request_headers(htx),
+            htx::Kind::Response => self.on_response_headers(htx),
+        }
+    }
 }
 
-impl htx::h1::ParserCallbacks<Checkout> for RequestContext {
-    fn on_headers(&mut self, request: &mut SozuHtx) {
+impl HttpContext {
+    fn on_request_headers(&mut self, request: &mut SozuHtx) {
         println!("REQUEST CALLBACK!!!!!!!!!!!!!!!!!!!!");
         let buf = &mut request.storage.mut_buffer();
 
@@ -131,10 +138,8 @@ impl htx::h1::ParserCallbacks<Checkout> for RequestContext {
             val: htx::Store::from_string(self.id.to_string()),
         }));
     }
-}
 
-impl htx::h1::ParserCallbacks<Checkout> for ResponseContext {
-    fn on_headers(&mut self, response: &mut SozuHtx) {
+    fn on_response_headers(&mut self, response: &mut SozuHtx) {
         println!("RESPONSE CALLBACK!!!!!!!!!!!!!!!!!!!!");
         let buf = &mut response.storage.mut_buffer();
 

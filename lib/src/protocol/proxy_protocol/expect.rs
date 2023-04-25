@@ -49,8 +49,8 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             container_frontend_timeout,
             frontend_buffer: [0; 232],
             frontend_readiness: Readiness {
-                interest: Ready::readable(),
-                event: Ready::empty(),
+                interest: Ready::READABLE,
+                event: Ready::EMPTY,
             },
             frontend_token,
             frontend,
@@ -86,10 +86,10 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             metrics.bin += sz;
 
             if self.index == self.frontend_buffer.len() {
-                self.frontend_readiness.interest.remove(Ready::readable());
+                self.frontend_readiness.interest.remove(Ready::READABLE);
             }
         } else {
-            self.frontend_readiness.event.remove(Ready::readable());
+            self.frontend_readiness.event.remove(Ready::READABLE);
         }
 
         match socket_result {
@@ -101,7 +101,7 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                 return SessionResult::Close;
             }
             SocketResult::WouldBlock => {
-                self.frontend_readiness.event.remove(Ready::readable());
+                self.frontend_readiness.event.remove(Ready::READABLE);
             }
             SocketResult::Closed | SocketResult::Continue => {}
         }
@@ -247,7 +247,7 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
                     "PROXY session {:?} front error, disconnecting",
                     self.frontend_token
                 );
-                self.frontend_readiness.interest = Ready::empty();
+                self.frontend_readiness.interest = Ready::EMPTY;
 
                 return SessionResult::Close;
             }

@@ -4,42 +4,14 @@ use std::fmt;
 #[derive(Copy, PartialEq, Eq, Clone, PartialOrd, Ord)]
 pub struct Ready(pub u16);
 
-const READABLE: u16 = 0b00001;
-const WRITABLE: u16 = 0b00010;
-const ERROR: u16 = 0b00100;
-/// Hang UP (see EPOLLHUP in epoll_ctl man page)
-const HUP: u16 = 0b01000;
-
 impl Ready {
-    #[inline]
-    pub const fn empty() -> Ready {
-        Ready(0)
-    }
-
-    #[inline]
-    pub const fn readable() -> Ready {
-        Ready(READABLE)
-    }
-
-    #[inline]
-    pub const fn writable() -> Ready {
-        Ready(WRITABLE)
-    }
-
-    #[inline]
-    pub const fn error() -> Ready {
-        Ready(ERROR)
-    }
-
-    #[inline]
-    pub const fn hup() -> Ready {
-        Ready(HUP)
-    }
-
-    #[inline]
-    pub const fn all() -> Ready {
-        Ready(READABLE | WRITABLE)
-    }
+    pub const EMPTY: Ready = Ready(0);
+    pub const READABLE: Ready = Ready(0b00001);
+    pub const WRITABLE: Ready = Ready(0b00010);
+    pub const ERROR: Ready = Ready(0b00100);
+    /// Hang UP (see EPOLLHUP in epoll_ctl man page)
+    pub const HUP: Ready = Ready(0b01000);
+    pub const ALL: Ready = Ready(0b00011);
 
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -48,20 +20,20 @@ impl Ready {
 
     #[inline]
     pub fn is_readable(&self) -> bool {
-        self.contains(Ready::readable())
+        self.contains(Ready::READABLE)
     }
 
     #[inline]
     pub fn is_writable(&self) -> bool {
-        self.contains(Ready::writable())
+        self.contains(Ready::WRITABLE)
     }
 
     pub fn is_error(&self) -> bool {
-        self.contains(Ready(ERROR))
+        self.contains(Ready::ERROR)
     }
 
     pub fn is_hup(&self) -> bool {
-        self.contains(Ready(HUP))
+        self.contains(Ready::HUP)
     }
 
     #[inline]
@@ -115,10 +87,10 @@ impl fmt::Debug for Ready {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         let mut one = false;
         let flags = [
-            (Ready::readable(), "Readable"),
-            (Ready::writable(), "Writable"),
-            (Ready(ERROR), "Error"),
-            (Ready(HUP), "Hup"),
+            (Ready::READABLE, "Readable"),
+            (Ready::WRITABLE, "Writable"),
+            (Ready::ERROR, "Error"),
+            (Ready::HUP, "Hup"),
         ];
 
         for &(flag, msg) in &flags {
@@ -142,12 +114,12 @@ impl fmt::Debug for Ready {
 
 impl std::convert::From<mio::Interest> for Ready {
     fn from(i: mio::Interest) -> Self {
-        let mut r = Ready::empty();
+        let mut r = Ready::EMPTY;
         if i.is_readable() {
-            r.insert(Ready::readable());
+            r.insert(Ready::READABLE);
         }
         if i.is_writable() {
-            r.insert(Ready::writable());
+            r.insert(Ready::WRITABLE);
         }
 
         r
@@ -156,19 +128,19 @@ impl std::convert::From<mio::Interest> for Ready {
 
 impl std::convert::From<&mio::event::Event> for Ready {
     fn from(e: &mio::event::Event) -> Self {
-        let mut r = Ready::empty();
+        let mut r = Ready::EMPTY;
         if e.is_readable() {
-            r.insert(Ready::readable());
+            r.insert(Ready::READABLE);
         }
         if e.is_writable() {
-            r.insert(Ready::writable());
+            r.insert(Ready::WRITABLE);
         }
         if e.is_error() {
-            r.insert(Ready::error());
+            r.insert(Ready::ERROR);
         }
         //FIXME: handle HUP events
         if e.is_read_closed() || e.is_write_closed() {
-            r.insert(Ready::hup());
+            r.insert(Ready::HUP);
         }
 
         r

@@ -122,7 +122,7 @@ impl Worker {
     /*
     pub fn push_message(&mut self, message: ProxyRequest) {
       self.queue.push_back(message);
-      self.channel.interest.insert(Ready::writable());
+      self.channel.interest.insert(Ready::WRITABLE);
     }
 
     pub fn can_handle_events(&self) -> bool {
@@ -265,7 +265,7 @@ pub fn begin_worker_process(
 
     let mut worker_to_main_channel: Channel<WorkerResponse, WorkerRequest> =
         worker_to_main_channel.into();
-    worker_to_main_channel.readiness.insert(Ready::readable());
+    worker_to_main_channel.readiness.insert(Ready::READABLE);
 
     if let Some(metrics) = worker_config.metrics.as_ref() {
         metrics::setup(

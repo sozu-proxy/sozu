@@ -172,8 +172,7 @@ impl HttpSession {
             sticky_name,
         };
 
-        session.state.front_readiness().interest =
-            Ready::readable() | Ready::hup() | Ready::error();
+        session.state.front_readiness().interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
         session
     }
 
@@ -227,8 +226,8 @@ impl HttpSession {
             http.frontend_socket,
             self.listener.clone(),
             Protocol::HTTP,
-            http.request_id,
-            http.session_address,
+            http.context.id,
+            http.context.session_address,
             Some(ws_context),
         );
 
@@ -250,7 +249,7 @@ impl HttpSession {
             .as_ref()
             .map(|add| (add.destination(), add.source()))
         {
-            Some((Some(public_address), Some(client_address))) => {
+            Some((Some(public_address), Some(session_address))) => {
                 let mut http = Http::new(
                     self.answers.clone(),
                     self.configured_backend_timeout,
@@ -264,7 +263,7 @@ impl HttpSession {
                     Protocol::HTTP,
                     public_address,
                     expect.request_id,
-                    Some(client_address),
+                    Some(session_address),
                     self.sticky_name.clone(),
                 );
                 http.frontend_readiness.event = expect.frontend_readiness.event;

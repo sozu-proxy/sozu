@@ -90,8 +90,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             backend_buffer,
             backend_id,
             backend_readiness: Readiness {
-                interest: Ready::all(),
-                event: Ready::empty(),
+                interest: Ready::ALL,
+                event: Ready::EMPTY,
             },
             backend_socket,
             backend_status,
@@ -102,8 +102,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             container_frontend_timeout,
             frontend_buffer,
             frontend_readiness: Readiness {
-                interest: Ready::all(),
-                event: Ready::empty(),
+                interest: Ready::ALL,
+                event: Ready::EMPTY,
             },
             frontend_status,
             frontend_token,
@@ -401,7 +401,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.backend_status = ConnectionStatus::Closed;
         if self.backend_buffer.available_data() == 0 {
             if self.backend_readiness.event.is_readable() {
-                self.back_readiness().interest.insert(Ready::readable());
+                self.back_readiness().interest.insert(Ready::READABLE);
                 error!("Pipe::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?} -> {:?}", self.frontend_readiness, self.backend_readiness);
                 StateResult::Continue
             } else {
@@ -409,9 +409,9 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 StateResult::CloseSession
             }
         } else {
-            self.front_readiness().interest.insert(Ready::writable());
+            self.front_readiness().interest.insert(Ready::WRITABLE);
             if self.backend_readiness.event.is_readable() {
-                self.backend_readiness.interest.insert(Ready::readable());
+                self.backend_readiness.interest.insert(Ready::READABLE);
             }
             StateResult::Continue
         }
@@ -423,8 +423,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         trace!("pipe readable");
         if self.frontend_buffer.available_space() == 0 {
-            self.frontend_readiness.interest.remove(Ready::readable());
-            self.backend_readiness.interest.insert(Ready::writable());
+            self.frontend_readiness.interest.remove(Ready::READABLE);
+            self.backend_readiness.interest.insert(Ready::WRITABLE);
             return StateResult::Continue;
         }
 
@@ -442,11 +442,11 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             metrics.bin += sz;
 
             if self.frontend_buffer.available_space() == 0 {
-                self.frontend_readiness.interest.remove(Ready::readable());
+                self.frontend_readiness.interest.remove(Ready::READABLE);
             }
-            self.backend_readiness.interest.insert(Ready::writable());
+            self.backend_readiness.interest.insert(Ready::WRITABLE);
         } else {
-            self.frontend_readiness.event.remove(Ready::readable());
+            self.frontend_readiness.event.remove(Ready::READABLE);
 
             if res == SocketResult::Continue {
                 self.frontend_status = match self.frontend_status {
@@ -482,12 +482,12 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 return StateResult::CloseSession;
             }
             SocketResult::WouldBlock => {
-                self.frontend_readiness.event.remove(Ready::readable());
+                self.frontend_readiness.event.remove(Ready::READABLE);
             }
             SocketResult::Continue => {}
         };
 
-        self.backend_readiness.interest.insert(Ready::writable());
+        self.backend_readiness.interest.insert(Ready::WRITABLE);
         StateResult::Continue
     }
 
@@ -495,8 +495,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     pub fn writable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         trace!("pipe writable");
         if self.backend_buffer.available_data() == 0 {
-            self.backend_readiness.interest.insert(Ready::readable());
-            self.frontend_readiness.interest.remove(Ready::writable());
+            self.backend_readiness.interest.insert(Ready::READABLE);
+            self.frontend_readiness.interest.remove(Ready::WRITABLE);
             return StateResult::Continue;
         }
 
@@ -507,8 +507,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             if self.backend_buffer.available_data() == 0 {
                 count!("bytes_out", sz as i64);
                 metrics.bout += sz;
-                self.backend_readiness.interest.insert(Ready::readable());
-                self.frontend_readiness.interest.remove(Ready::writable());
+                self.backend_readiness.interest.insert(Ready::READABLE);
+                self.frontend_readiness.interest.remove(Ready::WRITABLE);
                 return StateResult::Continue;
             }
             let (current_sz, current_res) = self.frontend.socket_write(self.backend_buffer.data());
@@ -537,7 +537,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         if sz > 0 {
             count!("bytes_out", sz as i64);
-            self.backend_readiness.interest.insert(Ready::readable());
+            self.backend_readiness.interest.insert(Ready::READABLE);
             metrics.bout += sz;
         }
 
@@ -569,7 +569,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 return StateResult::CloseSession;
             }
             SocketResult::WouldBlock => {
-                self.frontend_readiness.event.remove(Ready::writable());
+                self.frontend_readiness.event.remove(Ready::WRITABLE);
             }
             SocketResult::Continue => {}
         }
@@ -582,8 +582,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         trace!("pipe back_writable");
 
         if self.frontend_buffer.available_data() == 0 {
-            self.frontend_readiness.interest.insert(Ready::readable());
-            self.backend_readiness.interest.remove(Ready::writable());
+            self.frontend_readiness.interest.insert(Ready::READABLE);
+            self.backend_readiness.interest.remove(Ready::WRITABLE);
             return StateResult::Continue;
         }
 
@@ -596,8 +596,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             while socket_res == SocketResult::Continue {
                 // no more data in buffer, stop here
                 if self.frontend_buffer.available_data() == 0 {
-                    self.frontend_readiness.interest.insert(Ready::readable());
-                    self.backend_readiness.interest.remove(Ready::writable());
+                    self.frontend_readiness.interest.insert(Ready::READABLE);
+                    self.backend_readiness.interest.remove(Ready::WRITABLE);
                     return StateResult::Continue;
                 }
 
@@ -648,7 +648,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 return StateResult::CloseSession;
             }
             SocketResult::WouldBlock => {
-                self.backend_readiness.event.remove(Ready::writable());
+                self.backend_readiness.event.remove(Ready::WRITABLE);
             }
             SocketResult::Continue => {}
         }
@@ -661,7 +661,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         trace!("pipe back_readable");
         if self.backend_buffer.available_space() == 0 {
-            self.backend_readiness.interest.remove(Ready::readable());
+            self.backend_readiness.interest.remove(Ready::READABLE);
             return StateResult::Continue;
         }
 
@@ -675,10 +675,10 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             );
 
             if remaining != SocketResult::Continue || size == 0 {
-                self.backend_readiness.event.remove(Ready::readable());
+                self.backend_readiness.event.remove(Ready::READABLE);
             }
             if size > 0 {
-                self.frontend_readiness.interest.insert(Ready::writable());
+                self.frontend_readiness.interest.insert(Ready::WRITABLE);
                 metrics.backend_bin += size;
             }
 
@@ -717,7 +717,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                     }
                 }
                 SocketResult::WouldBlock => {
-                    self.backend_readiness.event.remove(Ready::readable());
+                    self.backend_readiness.event.remove(Ready::READABLE);
                 }
                 SocketResult::Continue => {}
             }
@@ -807,16 +807,16 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
                     self.frontend_token
                 );
 
-                self.frontend_readiness.interest = Ready::empty();
-                self.backend_readiness.interest = Ready::empty();
+                self.frontend_readiness.interest = Ready::EMPTY;
+                self.backend_readiness.interest = Ready::EMPTY;
 
                 return SessionResult::Close;
             }
 
             if backend_interest.is_error() && self.backend_hup(metrics) == StateResult::CloseSession
             {
-                self.frontend_readiness.interest = Ready::empty();
-                self.backend_readiness.interest = Ready::empty();
+                self.frontend_readiness.interest = Ready::EMPTY;
+                self.backend_readiness.interest = Ready::EMPTY;
 
                 error!(
                     "PROXY session {:?} back error, disconnecting",

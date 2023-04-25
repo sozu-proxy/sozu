@@ -310,6 +310,24 @@ impl SocketHandler for FrontRustls {
         }
     }
 
+    fn has_vectored_writes(&self) -> bool {
+        true
+    }
+
+    fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
+        let mut total_size = 0;
+        let mut socket_state = SocketResult::Continue;
+        let mut size;
+        for buf in bufs {
+            (size, socket_state) = self.socket_write(&buf);
+            total_size += size;
+            if socket_state != SocketResult::Continue {
+                break;
+            }
+        }
+        (total_size, socket_state)
+    }
+
     fn socket_ref(&self) -> &TcpStream {
         &self.stream
     }

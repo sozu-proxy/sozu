@@ -68,8 +68,8 @@ impl<Front: SocketHandler> Http2<Front> {
             state: Some(state::State::new()),
             request_id,
             back_readiness: Readiness {
-                interest: Ready::readable() | Ready::writable() | Ready::hup() | Ready::error(),
-                event: Ready::empty(),
+                interest: Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+                event: Ready::EMPTY,
             },
             log_ctx,
             public_address,
@@ -134,16 +134,16 @@ impl<Front: SocketHandler> Http2<Front> {
         /*
         if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
           if self.back_readiness.event.is_readable() {
-            self.back_readiness().interest.insert(Ready::readable());
+            self.back_readiness().interest.insert(Ready::READABLE);
             error!("Http2::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?} -> {:?}", self.frontend.readiness, self.back_readiness);
             SessionResult::Continue
           } else {
             SessionResult::CloseSession
           }
         } else {
-          self.frontend.readiness().interest.insert(Ready::writable());
+          self.frontend.readiness().interest.insert(Ready::WRITABLE);
           if self.back_readiness.event.is_readable() {
-            self.back_readiness.interest.insert(Ready::readable());
+            self.back_readiness.interest.insert(Ready::READABLE);
           }
           SessionResult::Continue
         }
@@ -172,11 +172,11 @@ impl<Front: SocketHandler> Http2<Front> {
             if self.backend_token == None {
                 //let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
                 //self.set_answer(DefaultAnswerStatus::Answer413, Rc::new(Vec::from(answer_413.as_bytes())));
-                self.frontend.readiness.interest.remove(Ready::readable());
-                self.frontend.readiness.interest.insert(Ready::writable());
+                self.frontend.readiness.interest.remove(Ready::READABLE);
+                self.frontend.readiness.interest.insert(Ready::WRITABLE);
             } else {
-                self.frontend.readiness.interest.remove(Ready::readable());
-                self.back_readiness.interest.insert(Ready::writable());
+                self.frontend.readiness.interest.remove(Ready::READABLE);
+                self.back_readiness.interest.insert(Ready::WRITABLE);
             }
             return StateResult::Continue;
         }
@@ -288,8 +288,8 @@ impl<Front: SocketHandler> Http2<Front> {
         StateResult::CloseSession
         /*
         if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
-          self.frontend.readiness.interest.insert(Ready::readable());
-          self.back_readiness.interest.remove(Ready::writable());
+          self.frontend.readiness.interest.insert(Ready::READABLE);
+          self.back_readiness.interest.remove(Ready::WRITABLE);
           return SessionResult::Continue;
         }
 
@@ -303,8 +303,8 @@ impl<Front: SocketHandler> Http2<Front> {
           while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
             // no more data in buffer, stop here
             if self.front_buf.next_output_data().len() == 0 {
-              self.frontend.readiness.interest.insert(Ready::readable());
-              self.back_readiness.interest.remove(Ready::writable());
+              self.frontend.readiness.interest.insert(Ready::READABLE);
+              self.back_readiness.interest.remove(Ready::WRITABLE);
               return SessionResult::Continue;
             }
 
@@ -331,7 +331,7 @@ impl<Front: SocketHandler> Http2<Front> {
             return SessionResult::CloseSession;
           },
           SocketResult::WouldBlock => {
-            self.back_readiness.event.remove(Ready::writable());
+            self.back_readiness.event.remove(Ready::WRITABLE);
 
           },
           SocketResult::Continue => {}
@@ -347,7 +347,7 @@ impl<Front: SocketHandler> Http2<Front> {
         StateResult::CloseSession
         /*
         if self.back_buf.buffer.available_space() == 0 {
-          self.back_readiness.interest.remove(Ready::readable());
+          self.back_readiness.interest.remove(Ready::READABLE);
           return SessionResult::Continue;
         }
 
@@ -365,10 +365,10 @@ impl<Front: SocketHandler> Http2<Front> {
           }
 
           if r != SocketResult::Continue || sz == 0 {
-            self.back_readiness.event.remove(Ready::readable());
+            self.back_readiness.event.remove(Ready::READABLE);
           }
           if sz > 0 {
-            self.frontend.readiness.interest.insert(Ready::writable());
+            self.frontend.readiness.interest.insert(Ready::WRITABLE);
             metrics.backend_bin += sz;
           }
 
@@ -388,7 +388,7 @@ impl<Front: SocketHandler> Http2<Front> {
               return SessionResult::CloseSession;
             },
             SocketResult::WouldBlock => {
-              self.back_readiness.event.remove(Ready::readable());
+              self.back_readiness.event.remove(Ready::READABLE);
             },
             SocketResult::Continue => {}
           }
@@ -411,8 +411,8 @@ impl<Socket: SocketHandler> Connection<Socket> {
         Connection {
             socket,
             readiness: Readiness {
-                interest: Ready::readable() | Ready::writable() | Ready::hup() | Ready::error(),
-                event: Ready::empty(),
+                interest: Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+                event: Ready::EMPTY,
             },
             //FIXME: capacity can be configured
             read_buffer,
@@ -431,14 +431,14 @@ impl<Socket: SocketHandler> Connection<Socket> {
             self.read_buffer.fill(sz);
 
             if self.read_buffer.available_space() == 0 {
-                self.readiness.interest.remove(Ready::readable());
+                self.readiness.interest.remove(Ready::READABLE);
             }
         } else {
-            self.readiness.event.remove(Ready::readable());
+            self.readiness.event.remove(Ready::READABLE);
         }
 
         if res == SocketResult::WouldBlock {
-            self.readiness.event.remove(Ready::readable());
+            self.readiness.event.remove(Ready::READABLE);
         }
 
         res
@@ -460,7 +460,7 @@ impl<Socket: SocketHandler> Connection<Socket> {
         }
 
         if res == SocketResult::WouldBlock {
-            self.readiness.event.remove(Ready::writable());
+            self.readiness.event.remove(Ready::WRITABLE);
         }
 
         res

@@ -623,7 +623,7 @@ impl TcpSession {
                         error!("Error connecting to backend: {:#}", connection_error)
                     }
                 }
-            } else if self.back_readiness().unwrap().event != Ready::empty() {
+            } else if self.back_readiness().unwrap().event != Ready::EMPTY {
                 self.reset_connection_attempt();
                 let back_token = self.backend_token.unwrap();
                 self.container_backend_timeout.set(back_token);
@@ -654,7 +654,7 @@ impl TcpSession {
                     return order;
                 }
                 _ => {
-                    self.front_readiness().event.remove(Ready::hup());
+                    self.front_readiness().event.remove(Ready::HUP);
                     return order;
                 }
             }
@@ -666,7 +666,7 @@ impl TcpSession {
             let back_interest = self
                 .back_readiness()
                 .map(|r| r.interest & r.event)
-                .unwrap_or_else(Ready::empty);
+                .unwrap_or(Ready::EMPTY);
 
             trace!(
                 "PROXY\t{} {:?} {:?} -> {:?}",
@@ -676,7 +676,7 @@ impl TcpSession {
                 self.back_readiness()
             );
 
-            if front_interest == Ready::empty() && back_interest == Ready::empty() {
+            if front_interest == Ready::EMPTY && back_interest == Ready::EMPTY {
                 break;
             }
 
@@ -744,7 +744,7 @@ impl TcpSession {
                     StateResult::Continue => {}
                     _ => {
                         if let Some(r) = self.back_readiness() {
-                            r.event.remove(Ready::hup());
+                            r.event.remove(Ready::HUP);
                         }
 
                         return order;
@@ -757,18 +757,18 @@ impl TcpSession {
                     "PROXY session {:?} front error, disconnecting",
                     self.frontend_token
                 );
-                self.front_readiness().interest = Ready::empty();
+                self.front_readiness().interest = Ready::EMPTY;
                 if let Some(r) = self.back_readiness() {
-                    r.interest = Ready::empty();
+                    r.interest = Ready::EMPTY;
                 }
 
                 return StateResult::CloseSession;
             }
 
             if back_interest.is_error() && self.back_hup() == StateResult::CloseSession {
-                self.front_readiness().interest = Ready::empty();
+                self.front_readiness().interest = Ready::EMPTY;
                 if let Some(r) = self.back_readiness() {
-                    r.interest = Ready::empty();
+                    r.interest = Ready::EMPTY;
                 }
 
                 error!(
@@ -789,7 +789,7 @@ impl TcpSession {
             let back_interest = self
                 .back_readiness()
                 .map(|r| r.interest & r.event)
-                .unwrap_or_else(Ready::empty);
+                .unwrap_or(Ready::EMPTY);
 
             let front_token = self.frontend_token;
             let back = self.back_readiness().cloned();
@@ -827,7 +827,7 @@ impl TcpSession {
         let back_connected = self.back_connected();
         if back_connected != BackendConnectionStatus::NotConnected {
             if let Some(r) = self.back_readiness() {
-                r.event = Ready::empty();
+                r.event = Ready::EMPTY;
             }
 
             if let Some(sock) = self.back_socket_mut() {

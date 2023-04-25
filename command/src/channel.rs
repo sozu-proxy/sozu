@@ -52,8 +52,8 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
             front_buf: Buffer::with_capacity(buffer_size),
             back_buf: Buffer::with_capacity(buffer_size),
             max_buffer_size,
-            readiness: Ready::empty(),
-            interest: Ready::readable(),
+            readiness: Ready::EMPTY,
+            interest: Ready::READABLE,
             blocking: false,
             phantom_tx: PhantomData,
             phantom_rx: PhantomData,
@@ -144,25 +144,25 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         loop {
             let size = self.front_buf.available_space();
             if size == 0 {
-                self.interest.remove(Ready::readable());
+                self.interest.remove(Ready::READABLE);
                 break;
             }
 
             match self.sock.read(self.front_buf.space()) {
                 Ok(0) => {
-                    self.interest = Ready::empty();
-                    self.readiness.remove(Ready::readable());
-                    self.readiness.insert(Ready::hup());
+                    self.interest = Ready::EMPTY;
+                    self.readiness.remove(Ready::READABLE);
+                    self.readiness.insert(Ready::HUP);
                     bail!("Error with the socket, reading on it return 0");
                 }
                 Err(read_error) => match read_error.kind() {
                     ErrorKind::WouldBlock => {
-                        self.readiness.remove(Ready::readable());
+                        self.readiness.remove(Ready::READABLE);
                         break;
                     }
                     other_error => {
-                        self.interest = Ready::empty();
-                        self.readiness = Ready::empty();
+                        self.interest = Ready::EMPTY;
+                        self.readiness = Ready::EMPTY;
                         bail!("Error with the socket: {}", other_error);
                     }
                 },
@@ -186,14 +186,14 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         loop {
             let size = self.back_buf.available_data();
             if size == 0 {
-                self.interest.remove(Ready::writable());
+                self.interest.remove(Ready::WRITABLE);
                 break;
             }
 
             match self.sock.write(self.back_buf.data()) {
                 Ok(0) => {
-                    self.interest = Ready::empty();
-                    self.readiness.insert(Ready::hup());
+                    self.interest = Ready::EMPTY;
+                    self.readiness.insert(Ready::HUP);
                     bail!("The write function returned 0");
                 }
                 Ok(bytes_written) => {
@@ -202,12 +202,12 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                 }
                 Err(write_error) => match write_error.kind() {
                     ErrorKind::WouldBlock => {
-                        self.readiness.remove(Ready::writable());
+                        self.readiness.remove(Ready::WRITABLE);
                         break;
                     }
                     other_error => {
-                        self.interest = Ready::empty();
-                        self.readiness = Ready::empty();
+                        self.interest = Ready::EMPTY;
+                        self.readiness = Ready::EMPTY;
                         bail!("channel write error: {:?}", other_error);
                     }
                 },
@@ -254,7 +254,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                     }
                 }
 
-                self.interest.insert(Ready::readable());
+                self.interest.insert(Ready::READABLE);
                 bail!("Could not read anything on the channel");
             }
         }
@@ -358,7 +358,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
             .write(&b"\0"[..])
             .with_context(|| "channel could not write to back buffer")?;
 
-        self.interest.insert(Ready::writable());
+        self.interest.insert(Ready::WRITABLE);
 
         Ok(())
     }
@@ -621,7 +621,7 @@ mod tests {
             .expect("Could not write message on channel");
 
         // set B as readable, normally mio tells when to, by giving events
-        channel_b.handle_events(Ready::readable());
+        channel_b.handle_events(Ready::READABLE);
 
         // read on B
         let should_err = channel_b.read_message();
@@ -633,7 +633,7 @@ mod tests {
             .expect("Could not write message on channel");
 
         // insert a handle_events Ready::writable on A
-        channel_a.handle_events(Ready::writable());
+        channel_a.handle_events(Ready::WRITABLE);
 
         // flush A with run()
         channel_a.run().expect("Failed to run the channel");

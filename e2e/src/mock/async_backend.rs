@@ -70,6 +70,7 @@ impl<A: Aggregator + Send + Sync + 'static> BackendHandle<A> {
                     _ => continue,
                 }
             }
+            drop(listener);
             aggregator_tx
                 .try_send(aggregator)
                 .expect("could not send aggregator");

@@ -187,8 +187,7 @@ impl HttpsSession {
             sticky_name,
         };
 
-        session.state.front_readiness().interest =
-            Ready::readable() | Ready::hup() | Ready::error();
+        session.state.front_readiness().interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
         session
     }
 
@@ -241,7 +240,7 @@ impl HttpsSession {
                     request_id,
                 );
                 handshake.frontend_readiness.event = readiness.event;
-                handshake.frontend_readiness.event.insert(Ready::readable());
+                handshake.frontend_readiness.event.insert(Ready::READABLE);
 
                 gauge_add!("protocol.proxy.expect", -1);
                 gauge_add!("protocol.tls.handshake", 1);
@@ -332,8 +331,7 @@ impl HttpsSession {
                 }
 
                 http.frontend_readiness = readiness;
-                http.frontend_readiness.interest =
-                    Ready::readable() | Ready::hup() | Ready::error();
+                http.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
 
                 gauge_add!("protocol.https", 1);
                 Some(HttpsStateMachine::Http(http))
@@ -349,8 +347,7 @@ impl HttpsSession {
                 );
 
                 http.frontend.readiness = readiness;
-                http.frontend.readiness.interest =
-                    Ready::readable() | Ready::hup() | Ready::error();
+                http.frontend.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
 
                 gauge_add!("protocol.http2", 1);
                 Some(HttpsStateMachine::Http2(http))
@@ -384,8 +381,8 @@ impl HttpsSession {
             http.frontend_socket,
             self.listener.clone(),
             Protocol::HTTPS,
-            http.request_id,
-            http.session_address,
+            http.context.id,
+            http.context.session_address,
             Some(ws_context),
         );
 
