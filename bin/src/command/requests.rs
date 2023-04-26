@@ -19,10 +19,11 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proto::command::{
         request::RequestType, AggregatedMetrics, AvailableMetrics, FrontendFilters, ListenersList,
-        MetricsConfiguration, Request, ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo,
+        MetricsConfiguration, Request, ResponseStatus, ReturnListenSockets, RunState, SoftStop,
+        Status, WorkerInfo,
     },
     request::WorkerRequest,
-    response::{ListedFrontends, Response, ResponseContent, ResponseStatus},
+    response::{ListedFrontends, Response, ResponseContent},
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
 };

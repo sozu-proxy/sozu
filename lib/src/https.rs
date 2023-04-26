@@ -34,8 +34,7 @@ use sozu_command::{
     logging,
     proto::command::{
         request::RequestType, AddCertificate, CertificateSummary, Cluster, HttpsListenerConfig,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend,
-        TlsVersion,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend, TlsVersion,
     },
     ready::Ready,
     request::WorkerRequest,

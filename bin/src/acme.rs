@@ -12,9 +12,10 @@ use sozu_command_lib::{
     config::Config,
     proto::command::{
         request::RequestType, AddBackend, AddCertificate, CertificateAndKey, PathRule,
-        RemoveBackend, ReplaceCertificate, Request, RequestHttpFrontend, TlsVersion,
+        RemoveBackend, ReplaceCertificate, Request, RequestHttpFrontend, ResponseStatus,
+        TlsVersion,
     },
-    response::{Response, ResponseStatus},
+    response::Response,
 };
 
 use crate::util;

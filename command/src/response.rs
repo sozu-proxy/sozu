@@ -10,7 +10,8 @@ use crate::{
     proto::command::{
         AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, Cluster,
         FilteredTimeSerie, ListenersList, LoadBalancingParams, PathRule, PathRuleKind,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, WorkerInfo, WorkerMetrics,
+        RequestHttpFrontend, RequestTcpFrontend, ResponseStatus, RulePosition, RunState,
+        WorkerInfo, WorkerMetrics,
     },
     request::PROTOCOL_VERSION,
     state::{ClusterId, ConfigState},
@@ -41,14 +42,6 @@ impl Response {
             content,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ResponseStatus {
-    Ok,
-    Processing,
-    Failure,
 }
 
 /// details of a response sent by the main process to the client

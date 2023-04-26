@@ -6,9 +6,10 @@ use serde::Serialize;
 use sozu_command_lib::{
     proto::command::{
         request::RequestType, ListWorkers, QueryAllCertificates, QueryClusterByDomain,
-        QueryClustersHashes, QueryMetricsOptions, Request, RunState, UpgradeMain, WorkerInfo,
+        QueryClustersHashes, QueryMetricsOptions, Request, ResponseStatus, RunState, UpgradeMain,
+        WorkerInfo,
     },
-    response::{Response, ResponseContent, ResponseStatus},
+    response::{Response, ResponseContent},
 };
 
 use crate::ctl::{
