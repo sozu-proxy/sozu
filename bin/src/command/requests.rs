@@ -49,7 +49,6 @@ impl CommandServer {
 
         let result: anyhow::Result<Option<Success>> = match request.request_type {
             Some(RequestType::SaveState(path)) => self.save_state(&path).await,
-            Some(RequestType::DumpState(_)) => self.dump_state().await,
             Some(RequestType::ListWorkers(_)) => self.list_workers().await,
             Some(RequestType::ListFrontends(filters)) => self.list_frontends(filters).await,
             Some(RequestType::ListListeners(_)) => self.list_listeners(),
@@ -74,7 +73,6 @@ impl CommandServer {
                 self.reload_configuration(client_id, path).await
             }
             Some(RequestType::Status(_)) => self.status(client_id).await,
-
             Some(RequestType::QueryCertificateByFingerprint(_))
             | Some(RequestType::QueryCertificatesByDomain(_))
             | Some(RequestType::QueryAllCertificates(_))
@@ -161,14 +159,6 @@ impl CommandServer {
         })();
 
         result.with_context(|| "Could not write the state onto the state file")
-    }
-
-    pub async fn dump_state(&mut self) -> anyhow::Result<Option<Success>> {
-        let state = self.state.clone();
-
-        Ok(Some(Success::DumpState(ResponseContent::State(Box::new(
-            state,
-        )))))
     }
 
     pub async fn load_state(
@@ -1393,8 +1383,7 @@ impl CommandServer {
 
                 let command_response_data = match success {
                     // should list Success::Metrics(crd) as well
-                    Success::DumpState(crd)
-                    | Success::ListFrontends(crd)
+                    Success::ListFrontends(crd)
                     | Success::ListWorkers(crd)
                     | Success::Query(crd)
                     | Success::ListListeners(crd)

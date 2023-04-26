@@ -82,9 +82,8 @@ pub enum Advancement {
 // in which case Success caries the response data.
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Success {
-    ClientClose(String),        // the client id
-    ClientNew(String),          // the client id
-    DumpState(ResponseContent), // the cloned state
+    ClientClose(String), // the client id
+    ClientNew(String),   // the client id
     HandledClientRequest,
     ListFrontends(ResponseContent), // the list of frontends
     ListListeners(ResponseContent), // the list of listeners
@@ -119,7 +118,6 @@ impl std::fmt::Display for Success {
         match self {
             Self::ClientClose(id) => write!(f, "Close client: {id}"),
             Self::ClientNew(id) => write!(f, "New client successfully added: {id}"),
-            Self::DumpState(_) => write!(f, "Successfully gathered state from the main process"),
             Self::HandledClientRequest => write!(f, "Successfully handled the client request"),
             Self::ListFrontends(_) => write!(f, "Successfully gathered the list of frontends"),
             Self::ListListeners(_) => write!(f, "Successfully listed all listeners"),

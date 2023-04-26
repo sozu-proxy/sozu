@@ -14,7 +14,7 @@ use crate::{
         WorkerInfos, WorkerMetrics,
     },
     request::PROTOCOL_VERSION,
-    state::{ClusterId, ConfigState},
+    state::ClusterId,
 };
 
 /// Responses of the main process to the CLI (or other client)
@@ -54,8 +54,6 @@ pub enum ResponseContent {
     Metrics(AggregatedMetrics),
     /// worker responses to a same query: worker_id -> response_content
     WorkerResponses(BTreeMap<String, ResponseContent>),
-    /// the state of Sōzu: frontends, backends, listeners, etc.
-    State(Box<ConfigState>),
     /// a proxy event
     Event(Event),
     /// a filtered list of frontend

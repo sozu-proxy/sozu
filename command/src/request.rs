@@ -214,9 +214,9 @@ mod tests {
     use crate::{
         certificate::split_certificate_chain,
         proto::command::{
-            AddBackend, AddCertificate, CertificateAndKey, Cluster, DumpState, HardStop,
-            ListWorkers, LoadBalancingParams, PathRule, ProxyProtocolConfig, RemoveBackend,
-            RemoveCertificate, RulePosition, SoftStop, Status, TlsVersion, UpgradeMain,
+            AddBackend, AddCertificate, CertificateAndKey, Cluster, HardStop, ListWorkers,
+            LoadBalancingParams, PathRule, ProxyProtocolConfig, RemoveBackend, RemoveCertificate,
+            RulePosition, SoftStop, Status, TlsVersion, UpgradeMain,
         },
         response::HttpFrontend,
     };
@@ -452,14 +452,6 @@ mod tests {
         "../assets/save_state.json",
         Request {
             request_type: Some(RequestType::SaveState(String::from("./config_dump.json")))
-        }
-    );
-
-    test_message!(
-        dump_state,
-        "../assets/dump_state.json",
-        Request {
-            request_type: Some(RequestType::DumpState(DumpState {}))
         }
     );
 

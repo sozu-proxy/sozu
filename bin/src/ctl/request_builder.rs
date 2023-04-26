@@ -7,11 +7,10 @@ use sozu_command_lib::{
     config::{Config, ListenerBuilder},
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        Cluster, DeactivateListener, DumpState, FrontendFilters, HardStop, ListListeners,
-        ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
-        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, SoftStop, Status, SubscribeEvents,
-        TlsVersion,
+        Cluster, DeactivateListener, FrontendFilters, HardStop, ListListeners, ListenerType,
+        LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend,
+        RequestTcpFrontend, RulePosition, SoftStop, Status, SubscribeEvents, TlsVersion,
     },
 };
 
@@ -38,17 +37,6 @@ impl CommandManager {
         self.order_request(Request {
             request_type: Some(RequestType::LoadState(path)),
         })
-    }
-
-    pub fn dump_state(&mut self, json: bool) -> anyhow::Result<()> {
-        println!("Dumping the state, json={json}");
-
-        self.order_request_to_all_workers(
-            Request {
-                request_type: Some(RequestType::DumpState(DumpState {})),
-            },
-            json,
-        )
     }
 
     pub fn soft_stop(&mut self) -> anyhow::Result<()> {

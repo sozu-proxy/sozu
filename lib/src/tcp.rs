@@ -16,6 +16,7 @@ use mio::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
+use sozu_command::proto::command::request::RequestType;
 use time::{Duration, Instant};
 
 use crate::{
@@ -36,8 +37,7 @@ use crate::{
     sozu_command::{
         logging,
         proto::command::{
-            request::RequestType, Event, EventKind, ProxyProtocolConfig, RequestTcpFrontend,
-            TcpListenerConfig,
+            Event, EventKind, ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig,
         },
         ready::Ready,
         request::WorkerRequest,

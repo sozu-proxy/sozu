@@ -102,10 +102,6 @@ impl CommandManager {
                             | ResponseContent::Certificates(_)
                             | ResponseContent::AvailableMetrics(_)
                             | ResponseContent::Event(_) => {}
-                            ResponseContent::State(state) => match json {
-                                true => print_json_response(&state)?,
-                                false => println!("{state:#?}"),
-                            },
                             ResponseContent::FrontendList(frontends) => {
                                 print_frontend_list(frontends)
                             }
