@@ -815,14 +815,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4a1e36c821dbe04574f602848a19f742f4fb3c98d40449f11bcad18d6b17421"
 
 [[package]]
-name = "htx"
-version = "0.4.1"
-source = "git+https://github.com/CleverCloud/htx#c366b60423ab2a9af083ee58da73748c75357850"
-dependencies = [
- "nom",
-]
-
-[[package]]
 name = "hyper"
 version = "0.14.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -954,6 +946,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f37a4a5928311ac501dee68b3c7613a1037d0edb30c8e5427bd832d55d1b790"
 dependencies = [
  "wasm-bindgen",
+]
+
+[[package]]
+name = "kawa"
+version = "0.5.0"
+source = "git+https://github.com/CleverCloud/kawa#d87c517d7a972afbe26bca08072f9374657e9d0b"
+dependencies = [
+ "nom",
 ]
 
 [[package]]
@@ -1829,8 +1829,8 @@ dependencies = [
  "hdrhistogram",
  "hex",
  "hpack",
- "htx",
  "idna",
+ "kawa",
  "lazycell",
  "libc",
  "log 0.4.17",

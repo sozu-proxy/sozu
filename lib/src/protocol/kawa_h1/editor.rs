@@ -7,32 +7,33 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::http::{parser::compare_no_case, SozuHtx, StickySession},
+    protocol::http::{parser::compare_no_case, GenericHttpStream, StickySession},
     Protocol,
 };
 
 pub struct HttpContext {
     pub closing: bool,
     pub id: Ulid,
+    pub keep_alive_backend: bool,
+    pub keep_alive_frontend: bool,
     pub protocol: Protocol,
     pub public_address: SocketAddr,
     pub session_address: Option<SocketAddr>,
     pub sticky_name: String,
     pub sticky_session: Option<StickySession>,
-    pub keep_alive: bool,
 }
 
-impl htx::h1::ParserCallbacks<Checkout> for HttpContext {
-    fn on_headers(&mut self, htx: &mut SozuHtx) {
-        match htx.kind {
-            htx::Kind::Request => self.on_request_headers(htx),
-            htx::Kind::Response => self.on_response_headers(htx),
+impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
+    fn on_headers(&mut self, stream: &mut GenericHttpStream) {
+        match stream.kind {
+            kawa::Kind::Request => self.on_request_headers(stream),
+            kawa::Kind::Response => self.on_response_headers(stream),
         }
     }
 }
 
 impl HttpContext {
-    fn on_request_headers(&mut self, request: &mut SozuHtx) {
+    fn on_request_headers(&mut self, request: &mut GenericHttpStream) {
         println!("REQUEST CALLBACK!!!!!!!!!!!!!!!!!!!!");
         let buf = &mut request.storage.mut_buffer();
 
@@ -48,16 +49,19 @@ impl HttpContext {
         let mut forwarded = None;
         for block in &mut request.blocks {
             match block {
-                htx::HtxBlock::Header(header) if !header.is_elided() => {
+                kawa::Block::Header(header) if !header.is_elided() => {
                     let key = header.key.data(buf);
                     if compare_no_case(key, b"connection") {
                         if self.closing {
-                            header.val = htx::Store::Static(b"close");
+                            header.val = kawa::Store::Static(b"close");
+                        } else {
+                            let val = header.val.data(buf);
+                            self.keep_alive_frontend &= !compare_no_case(val, b"close");
                         }
                     } else if compare_no_case(key, b"X-Forwarded-Proto") {
-                        header.val = htx::Store::Static(proto.as_bytes());
+                        header.val = kawa::Store::Static(proto.as_bytes());
                     } else if compare_no_case(key, b"X-Forwarded-Port") {
-                        header.val = htx::Store::from_string(public_port.to_string());
+                        header.val = kawa::Store::from_string(public_port.to_string());
                     } else if compare_no_case(key, b"X-Forwarded-For") {
                         x_for = Some(header);
                     } else if compare_no_case(key, b"Forwarded") {
@@ -74,7 +78,7 @@ impl HttpContext {
             let has_forwarded = forwarded.is_some();
 
             if let Some(header) = x_for {
-                header.val = htx::Store::from_string(format!(
+                header.val = kawa::Store::from_string(format!(
                     "{}, {}",
                     unsafe { from_utf8_unchecked(header.val.data(buf)) },
                     peer_ip.to_string()
@@ -102,13 +106,13 @@ impl HttpContext {
                     )
                     }
                 };
-                header.val = htx::Store::from_string(new_value);
+                header.val = kawa::Store::from_string(new_value);
             }
 
             if !has_x_for {
-                request.push_block(htx::HtxBlock::Header(htx::Header {
-                    key: htx::Store::Static(b"X-Forwarded-For"),
-                    val: htx::Store::from_string(peer_ip.to_string()),
+                request.push_block(kawa::Block::Header(kawa::Header {
+                    key: kawa::Store::Static(b"X-Forwarded-For"),
+                    val: kawa::Store::from_string(peer_ip.to_string()),
                 }));
             }
             if !has_forwarded {
@@ -126,40 +130,43 @@ impl HttpContext {
                         format!("proto={proto};for=\"{peer_ip}:{peer_port}\";by=\"{public_ip}\"")
                     }
                 };
-                request.push_block(htx::HtxBlock::Header(htx::Header {
-                    key: htx::Store::Static(b"Forwarded"),
-                    val: htx::Store::from_string(value),
+                request.push_block(kawa::Block::Header(kawa::Header {
+                    key: kawa::Store::Static(b"Forwarded"),
+                    val: kawa::Store::from_string(value),
                 }));
             }
         }
 
-        request.push_block(htx::HtxBlock::Header(htx::Header {
-            key: htx::Store::Static(b"Sozu-Id"),
-            val: htx::Store::from_string(self.id.to_string()),
+        request.push_block(kawa::Block::Header(kawa::Header {
+            key: kawa::Store::Static(b"Sozu-Id"),
+            val: kawa::Store::from_string(self.id.to_string()),
         }));
     }
 
-    fn on_response_headers(&mut self, response: &mut SozuHtx) {
+    fn on_response_headers(&mut self, response: &mut GenericHttpStream) {
         println!("RESPONSE CALLBACK!!!!!!!!!!!!!!!!!!!!");
         let buf = &mut response.storage.mut_buffer();
 
-        if self.closing {
-            for block in &mut response.blocks {
-                match block {
-                    htx::HtxBlock::Header(header) if !header.is_elided() => {
-                        let key = header.key.data(buf);
-                        if compare_no_case(key, b"connection") {
-                            header.val = htx::Store::Static(b"close");
+        for block in &mut response.blocks {
+            match block {
+                kawa::Block::Header(header) if !header.is_elided() => {
+                    let key = header.key.data(buf);
+                    if compare_no_case(key, b"connection") {
+                        if self.closing {
+                            header.val = kawa::Store::Static(b"close");
+                        } else {
+                            let val = header.val.data(buf);
+                            self.keep_alive_backend &= !compare_no_case(val, b"close");
                         }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
 
-        response.push_block(htx::HtxBlock::Header(htx::Header {
-            key: htx::Store::Static(b"Sozu-Id"),
-            val: htx::Store::from_string(self.id.to_string()),
+        response.push_block(kawa::Block::Header(kawa::Header {
+            key: kawa::Store::Static(b"Sozu-Id"),
+            val: kawa::Store::from_string(self.id.to_string()),
         }));
     }
 }

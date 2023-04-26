@@ -1063,6 +1063,97 @@ pub fn try_blue_geen() -> State {
     }
 }
 
+pub fn try_keep_alive() -> State {
+    use sozu_command_lib::log;
+    Logger::init(
+        "KA-OUT".to_string(),
+        "debug",
+        LoggerBackend::Stdout(stdout()),
+        None,
+    );
+
+    let front_address = "127.0.0.1:2001"
+        .parse()
+        .expect("could not parse front address");
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test("KA-WORKER", config, listeners, state, front_address, 1);
+
+    let mut backend = backends.pop().unwrap();
+    let mut client = Client::new(
+        format!("client"),
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+
+    backend
+        .set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\npong");
+    backend.connect();
+
+    info!("front: close / back: keep");
+    client.connect();
+    client.send();
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("request: {request:?}");
+    backend.send(0);
+    let response = client.receive();
+    println!("response: {response:?}");
+    assert!(!client.is_connected()); // front disconnected
+    assert!(!backend.is_connected(0)); // back disconnected
+
+    info!("front: keep / back: keep");
+    client.set_request("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+    client.connect();
+    client.send();
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("request: {request:?}");
+    backend.send(0);
+    let response = client.receive();
+    println!("response: {response:?}");
+    assert!(client.is_connected()); // front connected
+    assert!(backend.is_connected(0)); // back connected
+
+    info!("front: keep / back: close");
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong");
+    client.send();
+    let request = backend.receive(0);
+    println!("request: {request:?}");
+    backend.send(0);
+    let response = client.receive();
+    println!("response: {response:?}");
+    assert!(client.is_connected()); // front connected
+    assert!(!backend.is_connected(0)); // back disconnected
+
+    info!("front: close / back: close");
+    client.set_request("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    client.send();
+    backend.accept(0);
+    let request = backend.receive(0);
+    println!("request: {request:?}");
+    backend.send(0);
+    let response = client.receive();
+    println!("response: {response:?}");
+    assert!(!client.is_connected()); // front disconnected
+    assert!(!backend.is_connected(0)); // back disconnected
+
+    worker.send_proxy_request(Request::SoftStop);
+    worker.wait_for_server_stop();
+
+    println!(
+        "{} sent: {}, received: {}",
+        client.name, client.requests_sent, client.responses_received
+    );
+    println!(
+        "{} sent: {}, received: {}",
+        backend.name, backend.responses_sent, backend.requests_received
+    );
+
+    State::Success
+}
+
 #[serial]
 #[test]
 fn test_sync() {
@@ -1189,7 +1280,7 @@ fn test_tls_endpoint() {
 #[test]
 fn test_http_behaviors() {
     assert_eq!(
-        repeat_until_error_or(1, "HTTP stack", try_http_behaviors),
+        repeat_until_error_or(10, "HTTP stack", try_http_behaviors),
         State::Success
     );
 }
@@ -1208,6 +1299,15 @@ fn test_msg_close() {
 fn test_blue_green() {
     assert_eq!(
         repeat_until_error_or(10, "Blue green switch", try_blue_geen),
+        State::Success
+    );
+}
+
+#[serial]
+#[test]
+fn test_keep_alive() {
+    assert_eq!(
+        repeat_until_error_or(1, "Keep alive combinations", try_keep_alive),
         State::Success
     );
 }

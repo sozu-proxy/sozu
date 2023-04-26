@@ -317,11 +317,11 @@ impl HttpsSession {
                     .frontend_socket
                     .session
                     .reader()
-                    .read(http.htx_request.storage.space())
+                    .read(http.request_stream.storage.space())
                 {
                     Ok(sz) => {
                         //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-                        http.htx_request.storage.fill(sz);
+                        http.request_stream.storage.fill(sz);
                         count!("bytes_in", sz as i64);
                         self.metrics.bin += sz;
                     }
@@ -361,8 +361,8 @@ impl HttpsSession {
         let back_token = unwrap_msg!(http.backend_token);
         let ws_context = http.websocket_context();
 
-        let front_buf = http.htx_request.storage.buffer;
-        let back_buf = http.htx_response.storage.buffer;
+        let front_buf = http.request_stream.storage.buffer;
+        let back_buf = http.response_stream.storage.buffer;
 
         // TODO: is this necessary? Do we need to reset the timeouts?
         // http.container_frontend_timeout.reset();

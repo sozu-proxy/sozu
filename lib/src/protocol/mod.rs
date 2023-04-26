@@ -1,5 +1,5 @@
 pub mod h2;
-pub mod htx_h1;
+pub mod kawa_h1;
 pub mod pipe;
 pub mod proxy_protocol;
 pub mod rustls;
@@ -15,7 +15,7 @@ use crate::{
 
 pub use self::{
     http::{Http, StickySession},
-    htx_h1 as http,
+    kawa_h1 as http,
     pipe::Pipe,
     proxy_protocol::send::SendProxyProtocol,
     rustls::TlsHandshake,

@@ -201,8 +201,8 @@ impl HttpSession {
         let back_token = unwrap_msg!(http.backend_token);
         let ws_context = http.websocket_context();
 
-        let front_buf = http.htx_request.storage.buffer;
-        let back_buf = http.htx_response.storage.buffer;
+        let front_buf = http.request_stream.storage.buffer;
+        let back_buf = http.response_stream.storage.buffer;
 
         gauge_add!("protocol.http", -1);
         gauge_add!("protocol.ws", 1);
@@ -1111,7 +1111,7 @@ mod tests {
     */
 
     #[test]
-    fn mi() {
+    fn round_trip() {
         setup_test_logger!();
         let barrier = Arc::new(Barrier::new(2));
         start_server(1025, barrier.clone());

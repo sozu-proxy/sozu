@@ -1664,7 +1664,7 @@ mod tests {
     }*/
 
     #[test]
-    fn mi() {
+    fn round_trip() {
         setup_test_logger!();
         let barrier = Arc::new(Barrier::new(2));
         start_server(barrier.clone());
