@@ -38,7 +38,7 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     logging::target_to_backend,
-    proto::command::{Request, RunState, WorkerInfo, request::RequestType, Status},
+    proto::command::{request::RequestType, Request, RunState, Status, WorkerInfo},
     ready::Ready,
     request::WorkerRequest,
     response::WorkerResponse,

@@ -387,6 +387,20 @@ enum MetricsConfiguration {
     CLEAR = 2;
 }
 
+message Event {
+    required EventKind kind = 1;
+    optional string cluster_id = 2;
+    optional string backend_id = 3;
+    optional string address = 4;
+}
+
+enum EventKind {
+    BACKEND_DOWN = 0;
+    BACKEND_UP = 1;
+    NO_AVAILABLE_BACKENDS = 2;
+    REMOVED_BACKEND_HAS_NO_CONNECTIONS = 3;
+}
+
 enum ResponseStatus {
     OK = 0;
     PROCESSING = 1;

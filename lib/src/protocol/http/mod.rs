@@ -14,7 +14,7 @@ use std::{
 use anyhow::{bail, Context};
 use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
-use sozu_command::response::{Event, EventKind};
+use sozu_command::proto::command::{Event, EventKind};
 use time::{Duration, Instant};
 
 use crate::{
@@ -2221,7 +2221,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     );
 
                     push_event(Event {
-                        kind: EventKind::BackendUp,
+                        kind: EventKind::BackendUp as i32,
                         backend_id: Some(backend.backend_id.to_owned()),
                         address: Some(backend.address.to_string()),
                         cluster_id: None,
@@ -2264,7 +2264,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 );
 
                 push_event(Event {
-                    kind: EventKind::BackendDown,
+                    kind: EventKind::BackendDown as i32,
                     backend_id: Some(backend.backend_id.to_owned()),
                     address: Some(backend.address.to_string()),
                     cluster_id: None,

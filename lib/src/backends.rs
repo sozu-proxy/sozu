@@ -4,8 +4,7 @@ use anyhow::{bail, Context};
 use mio::net::TcpStream;
 
 use sozu_command::{
-    proto::command::{LoadBalancingAlgorithms, LoadMetric},
-    response::{Event, EventKind},
+    proto::command::{Event, EventKind, LoadBalancingAlgorithms, LoadMetric},
     state::ClusterId,
 };
 
@@ -106,7 +105,7 @@ impl BackendMap {
                     self.available = false;
 
                     push_event(Event {
-                        kind: EventKind::NoAvailableBackends,
+                        kind: EventKind::NoAvailableBackends as i32,
                         cluster_id: Some(cluster_id.to_owned()),
                         backend_id: None,
                         address: None,

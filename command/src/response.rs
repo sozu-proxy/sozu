@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     proto::command::{
-        AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, Cluster,
+        AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, Cluster, Event,
         FilteredTimeSerie, ListenersList, LoadBalancingParams, PathRule, PathRuleKind,
         RequestHttpFrontend, RequestTcpFrontend, ResponseStatus, RulePosition, RunState,
         WorkerInfos, WorkerMetrics,
@@ -276,23 +276,6 @@ impl fmt::Display for RunState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
     }
-}
-
-/// a backend event that happened on a proxy
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Event {
-    pub kind: EventKind,
-    pub cluster_id: Option<String>,
-    pub backend_id: Option<String>,
-    pub address: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EventKind {
-    BackendDown,
-    BackendUp,
-    NoAvailableBackends,
-    RemovedBackendHasNoConnections,
 }
 
 #[derive(Serialize)]

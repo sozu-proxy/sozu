@@ -17,13 +17,14 @@ use sozu_command::{
     channel::Channel,
     config::Config,
     proto::command::{
-        request::RequestType, ActivateListener, AddBackend, Cluster, DeactivateListener,
+        request::RequestType, ActivateListener, AddBackend, Cluster, DeactivateListener, Event,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadMetric,
-        RemoveBackend, ResponseStatus, TcpListenerConfig as CommandTcpListener, MetricsConfiguration,
+        MetricsConfiguration, RemoveBackend, ResponseStatus,
+        TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
     request::WorkerRequest,
-    response::{Event, MessageId, ResponseContent, WorkerResponse},
+    response::{MessageId, ResponseContent, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
 };

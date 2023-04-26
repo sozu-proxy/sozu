@@ -18,8 +18,6 @@ use rusty_ulid::Ulid;
 use slab::Slab;
 use time::{Duration, Instant};
 
-use sozu_command::{proto::command::request::RequestType, response::EventKind};
-
 use crate::{
     backends::BackendMap,
     pool::{Checkout, Pool},
@@ -37,10 +35,13 @@ use crate::{
     socket::server_bind,
     sozu_command::{
         logging,
-        proto::command::{ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig},
+        proto::command::{
+            request::RequestType, Event, EventKind, ProxyProtocolConfig, RequestTcpFrontend,
+            TcpListenerConfig,
+        },
         ready::Ready,
         request::WorkerRequest,
-        response::{Event, WorkerResponse},
+        response::WorkerResponse,
         scm_socket::ScmSocket,
         state::ClusterId,
     },
@@ -506,7 +507,7 @@ impl TcpSession {
                         backend.backend_id, backend.address
                     );
                     push_event(Event {
-                        kind: EventKind::BackendUp,
+                        kind: EventKind::BackendUp as i32,
                         backend_id: Some(backend.backend_id.to_owned()),
                         address: Some(backend.address.to_string()),
                         cluster_id: None,
@@ -560,7 +561,7 @@ impl TcpSession {
                 );
 
                 push_event(Event {
-                    kind: EventKind::BackendDown,
+                    kind: EventKind::BackendDown as i32,
                     backend_id: Some(backend.backend_id.to_owned()),
                     address: Some(backend.address.to_string()),
                     cluster_id: None,
