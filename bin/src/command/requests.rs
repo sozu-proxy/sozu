@@ -18,9 +18,9 @@ use sozu_command_lib::{
     logging,
     parser::parse_several_commands,
     proto::command::{
-        request::RequestType, AggregatedMetrics, AvailableMetrics, FrontendFilters, ListenersList,
-        MetricsConfiguration, Request, ResponseStatus, ReturnListenSockets, RunState, SoftStop,
-        Status, WorkerInfo, WorkerInfos,
+        request::RequestType, AggregatedMetrics, AvailableMetrics, ClusterHashes, FrontendFilters,
+        ListenersList, MetricsConfiguration, Request, ResponseStatus, ReturnListenSockets,
+        RunState, SoftStop, Status, WorkerInfo, WorkerInfos,
     },
     request::WorkerRequest,
     response::{ListedFrontends, Response, ResponseContent},
@@ -1080,8 +1080,9 @@ impl CommandServer {
         let mut main_response_content = None;
         match &request.request_type {
             Some(RequestType::QueryClustersHashes(_)) => {
-                main_response_content =
-                    Some(ResponseContent::ClustersHashes(self.state.hash_state()));
+                main_response_content = Some(ResponseContent::ClustersHashes(ClusterHashes {
+                    map: self.state.hash_state(),
+                }));
             }
             Some(RequestType::QueryClusterById(cluster_id)) => {
                 main_response_content = Some(ResponseContent::Clusters(vec![self

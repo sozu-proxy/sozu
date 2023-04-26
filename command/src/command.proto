@@ -401,6 +401,11 @@ enum EventKind {
     REMOVED_BACKEND_HAS_NO_CONNECTIONS = 3;
 }
 
+message ClusterHashes {
+    // cluster id -> hash of cluster information
+    map<string, uint64> map = 1;
+}
+
 enum ResponseStatus {
     OK = 0;
     PROCESSING = 1;

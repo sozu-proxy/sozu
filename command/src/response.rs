@@ -8,10 +8,10 @@ use std::{
 
 use crate::{
     proto::command::{
-        AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, Cluster, Event,
-        FilteredTimeSerie, ListenersList, LoadBalancingParams, PathRule, PathRuleKind,
-        RequestHttpFrontend, RequestTcpFrontend, ResponseStatus, RulePosition, RunState,
-        WorkerInfos, WorkerMetrics,
+        AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, Cluster,
+        ClusterHashes, Event, FilteredTimeSerie, ListenersList, LoadBalancingParams, PathRule,
+        PathRuleKind, RequestHttpFrontend, RequestTcpFrontend, ResponseStatus, RulePosition,
+        RunState, WorkerInfos, WorkerMetrics,
     },
     request::PROTOCOL_VERSION,
     state::ClusterId,
@@ -69,7 +69,7 @@ pub enum ResponseContent {
 
     Clusters(Vec<ClusterInformation>),
     /// cluster id -> hash of cluster information
-    ClustersHashes(BTreeMap<String, u64>),
+    ClustersHashes(ClusterHashes),
 
     /// a list of certificates for each socket address
     Certificates(HashMap<SocketAddr, Vec<CertificateSummary>>),

@@ -606,7 +606,7 @@ pub fn print_query_response_data(
         for metrics in data.values() {
             //let m: u8 = metrics;
             if let ResponseContent::ClustersHashes(clusters) = metrics {
-                for (key, value) in clusters.iter() {
+                for (key, value) in clusters.map.iter() {
                     query_data.entry(key).or_insert(Vec::new()).push(value);
                 }
             }

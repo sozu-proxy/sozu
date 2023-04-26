@@ -17,9 +17,9 @@ use sozu_command::{
     channel::Channel,
     config::Config,
     proto::command::{
-        request::RequestType, ActivateListener, AddBackend, Cluster, DeactivateListener, Event,
-        HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadMetric,
-        MetricsConfiguration, RemoveBackend, ResponseStatus,
+        request::RequestType, ActivateListener, AddBackend, Cluster, ClusterHashes,
+        DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, ListenerType,
+        LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, ResponseStatus,
         TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
@@ -882,7 +882,9 @@ impl Server {
             Some(RequestType::QueryClustersHashes(_)) => {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ResponseContent::ClustersHashes(self.config_state.hash_state()),
+                    ResponseContent::ClustersHashes(ClusterHashes {
+                        map: self.config_state.hash_state(),
+                    }),
                 ));
                 return;
             }
