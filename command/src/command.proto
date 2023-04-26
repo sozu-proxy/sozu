@@ -387,12 +387,19 @@ enum MetricsConfiguration {
     CLEAR = 2;
 }
 
+
 enum ResponseStatus {
     OK = 0;
     PROCESSING = 1;
     FAILURE = 2;
 }
 
+// A list of worker infos
+message WorkerInfos {
+    repeated WorkerInfo vec = 1;
+}
+
+// Information about a worker with id, pid, runstate
 message WorkerInfo {
     required uint32 id = 1;
     required int32 pid = 2;

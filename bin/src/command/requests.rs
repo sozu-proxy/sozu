@@ -20,7 +20,7 @@ use sozu_command_lib::{
     proto::command::{
         request::RequestType, AggregatedMetrics, AvailableMetrics, FrontendFilters, ListenersList,
         MetricsConfiguration, Request, ResponseStatus, ReturnListenSockets, RunState, SoftStop,
-        Status, WorkerInfo,
+        Status, WorkerInfo, WorkerInfos,
     },
     request::WorkerRequest,
     response::{ListedFrontends, Response, ResponseContent},
@@ -431,7 +431,7 @@ impl CommandServer {
         debug!("workers: {:#?}", workers);
 
         Ok(Some(Success::ListWorkers(ResponseContent::Workers(
-            workers,
+            WorkerInfos { vec: workers },
         ))))
     }
 
@@ -965,10 +965,12 @@ impl CommandServer {
                 }
             }
 
-            let worker_info_vec: Vec<WorkerInfo> = worker_info_map
-                .values()
-                .map(|worker_info| worker_info.to_owned())
-                .collect();
+            let worker_info_vec = WorkerInfos {
+                vec: worker_info_map
+                    .values()
+                    .map(|worker_info| worker_info.to_owned())
+                    .collect(),
+            };
 
             return_success(
                 command_tx,

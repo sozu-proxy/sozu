@@ -110,11 +110,11 @@ impl CommandManager {
                             ResponseContent::FrontendList(frontends) => {
                                 print_frontend_list(frontends)
                             }
-                            ResponseContent::Status(worker_info_vec) => {
+                            ResponseContent::Status(worker_infos) => {
                                 if json {
-                                    print_json_response(&worker_info_vec)?;
+                                    print_json_response(&worker_infos)?;
                                 } else {
-                                    print_status(worker_info_vec);
+                                    print_status(worker_infos);
                                 }
                             }
                             ResponseContent::ListenersList(list) => print_listeners(list),
@@ -152,11 +152,11 @@ impl CommandManager {
                     );
                 }
                 ResponseStatus::Ok => {
-                    if let Some(ResponseContent::Workers(ref workers)) = response.content {
+                    if let Some(ResponseContent::Workers(ref worker_infos)) = response.content {
                         let mut table = Table::new();
                         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
                         table.add_row(row!["Worker", "pid", "run state"]);
-                        for worker in workers.iter() {
+                        for worker in worker_infos.vec.iter() {
                             let run_state = format!("{:?}", worker.run_state);
                             table.add_row(row![worker.id, worker.pid, run_state]);
                         }
@@ -204,7 +204,7 @@ impl CommandManager {
                             .with_context(|| "could not reconnect to the command unix socket")?;
 
                         // Do a rolling restart of the workers
-                        let running_workers = workers
+                        let running_workers = worker_infos.vec
                             .iter()
                             .filter(|worker| worker.run_state == RunState::Running as i32)
                             .collect::<Vec<_>>();

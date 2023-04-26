@@ -6,7 +6,7 @@ use prettytable::{Row, Table};
 use sozu_command_lib::{
     proto::command::{
         filtered_metrics, AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics,
-        ListenersList, WorkerInfo, WorkerMetrics,
+        ListenersList, WorkerInfos, WorkerMetrics,
     },
     response::{ListedFrontends, ResponseContent},
 };
@@ -115,12 +115,12 @@ pub fn print_listeners(listeners_list: ListenersList) {
     }
 }
 
-pub fn print_status(worker_info_vec: Vec<WorkerInfo>) {
+pub fn print_status(worker_infos: WorkerInfos) {
     let mut table = Table::new();
     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
     table.add_row(row!["worker id", "pid", "run state"]);
 
-    for worker_info in worker_info_vec {
+    for worker_info in worker_infos.vec {
         let row = row!(worker_info.id, worker_info.pid, worker_info.run_state);
         table.add_row(row);
     }

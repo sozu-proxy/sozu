@@ -11,7 +11,7 @@ use crate::{
         AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, Cluster,
         FilteredTimeSerie, ListenersList, LoadBalancingParams, PathRule, PathRuleKind,
         RequestHttpFrontend, RequestTcpFrontend, ResponseStatus, RulePosition, RunState,
-        WorkerInfo, WorkerMetrics,
+        WorkerInfos, WorkerMetrics,
     },
     request::PROTOCOL_VERSION,
     state::{ClusterId, ConfigState},
@@ -49,7 +49,7 @@ impl Response {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ResponseContent {
     /// a list of workers, with ids, pids, statuses
-    Workers(Vec<WorkerInfo>),
+    Workers(WorkerInfos),
     /// aggregated metrics of main process and workers
     Metrics(AggregatedMetrics),
     /// worker responses to a same query: worker_id -> response_content
@@ -60,8 +60,8 @@ pub enum ResponseContent {
     Event(Event),
     /// a filtered list of frontend
     FrontendList(ListedFrontends),
-    // this is new
-    Status(Vec<WorkerInfo>),
+    // TODO: remove as it is redundant with the Workers variant
+    Status(WorkerInfos),
     /// all listeners
     ListenersList(ListenersList),
 
@@ -437,18 +437,20 @@ mod tests {
             version: 0,
             status: ResponseStatus::Ok,
             message: String::from(""),
-            content: Some(ResponseContent::Workers(vec!(
-                WorkerInfo {
-                    id: 1,
-                    pid: 5678,
-                    run_state: RunState::Running as i32,
-                },
-                WorkerInfo {
-                    id: 0,
-                    pid: 1234,
-                    run_state: RunState::Stopping as i32,
-                },
-            ))),
+            content: Some(ResponseContent::Workers(WorkerInfos {
+                vec: vec!(
+                    WorkerInfo {
+                        id: 1,
+                        pid: 5678,
+                        run_state: RunState::Running as i32,
+                    },
+                    WorkerInfo {
+                        id: 0,
+                        pid: 1234,
+                        run_state: RunState::Stopping as i32,
+                    },
+                )
+            })),
         }
     );
 
