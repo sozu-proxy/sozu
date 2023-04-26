@@ -217,7 +217,7 @@ use sozu_command::{
     proto::command::{Cluster, LoadBalancingParams},
     ready::Ready,
     request::WorkerRequest,
-    response::{Event, WorkerResponse},
+    response::{Event, EventKind, WorkerResponse},
     state::ClusterId,
 };
 use time::{Duration, Instant};
@@ -716,10 +716,12 @@ impl Backend {
 // can be safely stopped
 impl std::ops::Drop for Backend {
     fn drop(&mut self) {
-        server::push_event(Event::RemovedBackendHasNoConnections(
-            self.backend_id.clone(),
-            self.address,
-        ));
+        server::push_event(Event {
+            kind: EventKind::RemovedBackendHasNoConnections,
+            backend_id: Some(self.backend_id.clone()),
+            address: Some(self.address.to_string()),
+            cluster_id: None,
+        });
     }
 }
 

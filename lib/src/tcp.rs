@@ -16,8 +16,9 @@ use mio::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::proto::command::request::RequestType;
 use time::{Duration, Instant};
+
+use sozu_command::{proto::command::request::RequestType, response::EventKind};
 
 use crate::{
     backends::BackendMap,
@@ -504,10 +505,12 @@ impl TcpSession {
                         "backend server {} at {} is up",
                         backend.backend_id, backend.address
                     );
-                    push_event(Event::BackendUp(
-                        backend.backend_id.clone(),
-                        backend.address,
-                    ));
+                    push_event(Event {
+                        kind: EventKind::BackendUp,
+                        backend_id: Some(backend.backend_id.to_owned()),
+                        address: Some(backend.address.to_string()),
+                        cluster_id: None,
+                    });
                 }
 
                 if let BackendConnectionStatus::Connecting(start) = last {
@@ -556,10 +559,12 @@ impl TcpSession {
                     self.metrics.backend_id.as_deref()
                 );
 
-                push_event(Event::BackendDown(
-                    backend.backend_id.clone(),
-                    backend.address,
-                ));
+                push_event(Event {
+                    kind: EventKind::BackendDown,
+                    backend_id: Some(backend.backend_id.to_owned()),
+                    address: Some(backend.address.to_string()),
+                    cluster_id: None,
+                });
             }
         }
     }

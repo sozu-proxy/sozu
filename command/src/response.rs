@@ -278,17 +278,21 @@ impl fmt::Display for RunState {
     }
 }
 
-// TODO: remove the SocketAddr type
 /// a backend event that happened on a proxy
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Event {
-    BackendDown(String, SocketAddr),
-    BackendUp(String, SocketAddr),
-    NoAvailableBackends(String),
-    /// indicates a backend that was removed from configuration has no lingering connections
-    /// so it can be safely stopped
-    RemovedBackendHasNoConnections(String, SocketAddr),
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    pub kind: EventKind,
+    pub cluster_id: Option<String>,
+    pub backend_id: Option<String>,
+    pub address: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventKind {
+    BackendDown,
+    BackendUp,
+    NoAvailableBackends,
+    RemovedBackendHasNoConnections,
 }
 
 #[derive(Serialize)]

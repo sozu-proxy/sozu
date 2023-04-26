@@ -14,7 +14,7 @@ use std::{
 use anyhow::{bail, Context};
 use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
-use sozu_command::response::Event;
+use sozu_command::response::{Event, EventKind};
 use time::{Duration, Instant};
 
 use crate::{
@@ -2220,10 +2220,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         backend.backend_id, backend.address
                     );
 
-                    push_event(Event::BackendUp(
-                        backend.backend_id.clone(),
-                        backend.address,
-                    ));
+                    push_event(Event {
+                        kind: EventKind::BackendUp,
+                        backend_id: Some(backend.backend_id.to_owned()),
+                        address: Some(backend.address.to_string()),
+                        cluster_id: None,
+                    });
                 }
 
                 if let BackendConnectionStatus::Connecting(start) = last {
@@ -2261,10 +2263,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     metrics.backend_id.as_deref()
                 );
 
-                push_event(Event::BackendDown(
-                    backend.backend_id.clone(),
-                    backend.address,
-                ));
+                push_event(Event {
+                    kind: EventKind::BackendDown,
+                    backend_id: Some(backend.backend_id.to_owned()),
+                    address: Some(backend.address.to_string()),
+                    cluster_id: None,
+                });
             }
         }
     }

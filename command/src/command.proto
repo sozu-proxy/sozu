@@ -387,7 +387,6 @@ enum MetricsConfiguration {
     CLEAR = 2;
 }
 
-
 enum ResponseStatus {
     OK = 0;
     PROCESSING = 1;
