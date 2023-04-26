@@ -93,8 +93,7 @@ impl CommandManager {
                     }
                     match response.content {
                         Some(response_content) => match response_content {
-                            ResponseContent::Workers(_)
-                            | ResponseContent::Metrics(_)
+                            ResponseContent::Metrics(_)
                             | ResponseContent::WorkerResponses(_)
                             | ResponseContent::WorkerMetrics(_)
                             | ResponseContent::ClustersHashes(_)
@@ -110,7 +109,7 @@ impl CommandManager {
                             ResponseContent::FrontendList(frontends) => {
                                 print_frontend_list(frontends)
                             }
-                            ResponseContent::Status(worker_infos) => {
+                            ResponseContent::Workers(worker_infos) => {
                                 if json {
                                     print_json_response(&worker_infos)?;
                                 } else {
@@ -204,7 +203,8 @@ impl CommandManager {
                             .with_context(|| "could not reconnect to the command unix socket")?;
 
                         // Do a rolling restart of the workers
-                        let running_workers = worker_infos.vec
+                        let running_workers = worker_infos
+                            .vec
                             .iter()
                             .filter(|worker| worker.run_state == RunState::Running as i32)
                             .collect::<Vec<_>>();

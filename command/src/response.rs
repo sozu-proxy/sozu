@@ -60,8 +60,6 @@ pub enum ResponseContent {
     Event(Event),
     /// a filtered list of frontend
     FrontendList(ListedFrontends),
-    // TODO: remove as it is redundant with the Workers variant
-    Status(WorkerInfos),
     /// all listeners
     ListenersList(ListenersList),
 

@@ -975,7 +975,7 @@ impl CommandServer {
             return_success(
                 command_tx,
                 thread_client_id,
-                Success::Status(ResponseContent::Status(worker_info_vec)),
+                Success::Status(ResponseContent::Workers(worker_info_vec)),
             )
             .await;
         })
