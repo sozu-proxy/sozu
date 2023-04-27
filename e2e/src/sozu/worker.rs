@@ -269,10 +269,10 @@ impl Worker {
         result
     }
 
-    pub fn default_cluster<S: Into<String>>(cluster_id: S) -> Cluster {
+    pub fn default_cluster<S: Into<String>>(cluster_id: S, sticky_session: bool) -> Cluster {
         Cluster {
             cluster_id: cluster_id.into(),
-            sticky_session: false,
+            sticky_session,
             https_redirect: false,
             ..Default::default()
         }
@@ -307,13 +307,15 @@ impl Worker {
         cluster_id: S1,
         backend_id: S2,
         address: String,
+        sticky_id: Option<String>,
     ) -> AddBackend {
         AddBackend {
             cluster_id: cluster_id.into(),
             backend_id: backend_id.into(),
             address,
             load_balancing_parameters: Some(LoadBalancingParams::default()),
-            ..Default::default()
+            sticky_id,
+            backup: None,
         }
     }
 }

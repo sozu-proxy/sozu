@@ -1,16 +1,17 @@
 use std::{
     net::{IpAddr, SocketAddr},
-    str::from_utf8_unchecked,
+    str::{from_utf8, from_utf8_unchecked},
 };
 
 use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::http::{parser::compare_no_case, GenericHttpStream, StickySession},
+    protocol::http::{parser::compare_no_case, GenericHttpStream},
     Protocol,
 };
 
+#[derive(Debug)]
 pub struct HttpContext {
     pub closing: bool,
     pub id: Ulid,
@@ -20,7 +21,8 @@ pub struct HttpContext {
     pub public_address: SocketAddr,
     pub session_address: Option<SocketAddr>,
     pub sticky_name: String,
-    pub sticky_session: Option<StickySession>,
+    pub sticky_session: Option<String>,
+    pub sticky_session_found: Option<String>,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -35,6 +37,7 @@ impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
 impl HttpContext {
     fn on_request_headers(&mut self, request: &mut GenericHttpStream) {
         println!("REQUEST CALLBACK!!!!!!!!!!!!!!!!!!!!");
+        println!("{self:?}");
         let buf = &mut request.storage.mut_buffer();
 
         let public_ip = self.public_address.ip();
@@ -44,6 +47,15 @@ impl HttpContext {
             Protocol::HTTPS => "https",
             _ => unreachable!(),
         };
+
+        for cookie in &mut request.detached.jar {
+            let key = cookie.key.data(buf);
+            if key == self.sticky_name.as_bytes() {
+                let val = cookie.val.data(buf);
+                self.sticky_session_found = from_utf8(val).ok().map(|val| val.to_string());
+                cookie.elide();
+            }
+        }
 
         let mut x_for = None;
         let mut forwarded = None;
@@ -110,7 +122,7 @@ impl HttpContext {
             }
 
             if !has_x_for {
-                request.push_block(kawa::Block::Header(kawa::Header {
+                request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"X-Forwarded-For"),
                     val: kawa::Store::from_string(peer_ip.to_string()),
                 }));
@@ -130,14 +142,14 @@ impl HttpContext {
                         format!("proto={proto};for=\"{peer_ip}:{peer_port}\";by=\"{public_ip}\"")
                     }
                 };
-                request.push_block(kawa::Block::Header(kawa::Header {
+                request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"Forwarded"),
                     val: kawa::Store::from_string(value),
                 }));
             }
         }
 
-        request.push_block(kawa::Block::Header(kawa::Header {
+        request.push_block(kawa::Block::Header(kawa::Pair {
             key: kawa::Store::Static(b"Sozu-Id"),
             val: kawa::Store::from_string(self.id.to_string()),
         }));
@@ -145,6 +157,7 @@ impl HttpContext {
 
     fn on_response_headers(&mut self, response: &mut GenericHttpStream) {
         println!("RESPONSE CALLBACK!!!!!!!!!!!!!!!!!!!!");
+        println!("{self:?}");
         let buf = &mut response.storage.mut_buffer();
 
         for block in &mut response.blocks {
@@ -164,7 +177,19 @@ impl HttpContext {
             }
         }
 
-        response.push_block(kawa::Block::Header(kawa::Header {
+        if let Some(sticky_session) = &self.sticky_session {
+            if self.sticky_session != self.sticky_session_found {
+                response.push_block(kawa::Block::Header(kawa::Pair {
+                    key: kawa::Store::Static(b"Set-Cookie"),
+                    val: kawa::Store::from_string(format!(
+                        "{}={}; Path=/",
+                        self.sticky_name, sticky_session
+                    )),
+                }));
+            }
+        }
+
+        response.push_block(kawa::Block::Header(kawa::Pair {
             key: kawa::Store::Static(b"Sozu-Id"),
             val: kawa::Store::from_string(self.id.to_string()),
         }));

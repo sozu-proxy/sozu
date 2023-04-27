@@ -57,7 +57,7 @@ time = "^0.3.20"
 url = "^2.3.1"
 webpki = "^0.22.0"
 x509-parser = "^0.15.0"
-kawa = { version = "0.5.0", git = "https://github.com/CleverCloud/kawa"}
+kawa = { version = "0.5.1", git = "https://github.com/CleverCloud/kawa"}
 
 sozu-command-lib = { path = "../command" }
 

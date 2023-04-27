@@ -46,19 +46,6 @@ impl kawa::AsBuffer for Checkout {
     }
 }
 
-#[derive(Clone)]
-pub struct StickySession {
-    pub sticky_id: String,
-}
-
-impl StickySession {
-    pub fn new(backend_id: String) -> StickySession {
-        StickySession {
-            sticky_id: backend_id,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStatus {
     Normal,
@@ -201,12 +188,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 session_address,
                 sticky_name,
                 sticky_session: None,
+                sticky_session_found: None,
             },
         }
     }
 
     pub fn reset(&mut self) {
         println!("==============reset");
+        self.context.keep_alive_frontend = true;
+        self.context.keep_alive_backend = true;
+        self.context.sticky_session_found = None;
         self.context.id = Ulid::generate();
         gauge_add!("http.active_requests", -1);
 
@@ -320,7 +311,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         println!("==============readable_parse");
         let was_initial = self.request_stream.is_initial();
 
-        // let mut context = self.request_context();
         kawa::h1::parse(&mut self.request_stream, &mut self.context);
         kawa::debug_kawa(&self.request_stream);
 
@@ -637,7 +627,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         println!("==============backend_readable_parse");
         let was_initial = self.response_stream.is_initial();
 
-        // let mut context = self.response_context();
         kawa::h1::parse(&mut self.response_stream, &mut self.context);
         kawa::debug_kawa(&self.response_stream);
 
@@ -1256,12 +1245,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         proxy: Rc<RefCell<dyn L7Proxy>>,
         metrics: &mut SessionMetrics,
     ) -> anyhow::Result<TcpStream> {
-        // TODO: sticky session...
-        let sticky_session = None;
-
         let (backend, conn) = match self.get_backend_for_sticky_session(
             frontend_should_stick,
-            sticky_session,
+            self.context.sticky_session_found.as_deref(),
             cluster_id,
             proxy,
         ) {
@@ -1274,18 +1260,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         };
 
         if frontend_should_stick {
-            let sticky_name = self.listener.borrow().get_sticky_name().to_string();
+            // update sticky name in case it changed I guess?
+            self.context.sticky_name = self.listener.borrow().get_sticky_name().to_string();
 
-            self.context.sticky_session = Some(StickySession::new(
+            self.context.sticky_session = Some(
                 backend
                     .borrow()
                     .sticky_id
                     .clone()
                     .unwrap_or_else(|| backend.borrow().backend_id.clone()),
-            ));
-
-            // stick session to listener (how? why?)
-            self.context.sticky_name = sticky_name;
+            );
         }
 
         metrics.backend_id = Some(backend.borrow().backend_id.clone());

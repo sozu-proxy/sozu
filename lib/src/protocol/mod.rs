@@ -13,11 +13,8 @@ use crate::{
     L7Proxy, ProxySession, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
 };
 
-pub use self::{
-    http::{Http, StickySession},
-    kawa_h1 as http,
-    pipe::Pipe,
-    proxy_protocol::send::SendProxyProtocol,
+pub use crate::protocol::{
+    http::Http, kawa_h1 as http, pipe::Pipe, proxy_protocol::send::SendProxyProtocol,
     rustls::TlsHandshake,
 };
 

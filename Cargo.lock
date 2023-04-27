@@ -950,8 +950,8 @@ dependencies = [
 
 [[package]]
 name = "kawa"
-version = "0.5.0"
-source = "git+https://github.com/CleverCloud/kawa#d87c517d7a972afbe26bca08072f9374657e9d0b"
+version = "0.5.1"
+source = "git+https://github.com/CleverCloud/kawa#9154e101867a687a7c5ede302dfb9a1b30d8ea02"
 dependencies = [
  "nom",
 ]

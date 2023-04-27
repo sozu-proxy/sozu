@@ -44,6 +44,7 @@ pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> S
         state,
         front_address,
         nb_backends,
+        false,
     );
 
     let mut clients = (0..nb_clients)
@@ -102,7 +103,7 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
-        setup_sync_test("SYNC", config, listeners, state, front_address, 1);
+        setup_sync_test("SYNC", config, listeners, state, front_address, 1, false);
     let mut backend = backends.pop().unwrap();
 
     backend.connect();
@@ -179,8 +180,15 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
     });
     let listeners = Worker::empty_listeners();
     let state = ConfigState::new();
-    let (mut worker, mut backends) =
-        setup_async_test("BACKSTOP", config, listeners, state, front_address, 2);
+    let (mut worker, mut backends) = setup_async_test(
+        "BACKSTOP",
+        config,
+        listeners,
+        state,
+        front_address,
+        2,
+        false,
+    );
     let mut backend2 = backends.pop().expect("backend2");
     let mut backend1 = backends.pop().expect("backend1");
 
@@ -240,8 +248,15 @@ pub fn try_issue_810_timeout() -> State {
         .expect("could not parse front address");
 
     let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, mut backends) =
-        setup_sync_test("810-TIMEOUT", config, listeners, state, front_address, 1);
+    let (mut worker, mut backends) = setup_sync_test(
+        "810-TIMEOUT",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
     let mut backend = backends.pop().unwrap();
 
     let mut client = Client::new(
@@ -309,6 +324,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddCluster(Worker::default_cluster(
             "cluster_0",
+            false,
         ))),
     });
     worker.send_proxy_request(Request {
@@ -323,6 +339,7 @@ pub fn try_issue_810_panic(part2: bool) -> State {
             "cluster_0",
             "cluster_0-0",
             back_address.to_string(),
+            None,
         ))),
     });
     worker.read_to_last();
@@ -392,6 +409,7 @@ pub fn try_tls_endpoint() -> State {
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddCluster(Worker::default_cluster(
             "cluster_0",
+            false,
         ))),
     });
 
@@ -424,6 +442,7 @@ pub fn try_tls_endpoint() -> State {
             "cluster_0",
             "cluster_0-0",
             back_address.to_string(),
+            None,
         ))),
     });
     worker.read_to_last();
@@ -471,7 +490,7 @@ pub fn test_upgrade() -> State {
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
-        setup_sync_test("UPGRADE", config, listeners, state, front_address, 1);
+        setup_sync_test("UPGRADE", config, listeners, state, front_address, 1, false);
 
     let mut backend = backends.pop().expect("backend");
     let mut client = Client::new(
@@ -592,7 +611,7 @@ pub fn try_hard_or_soft_stop(soft: bool) -> State {
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
-        setup_sync_test("STOP", config, listeners, state, front_address, 1);
+        setup_sync_test("STOP", config, listeners, state, front_address, 1, false);
     let mut backend = backends.pop().unwrap();
 
     let mut client = Client::new(
@@ -733,6 +752,7 @@ fn try_http_behaviors() -> State {
             "cluster_0",
             "cluster_0-0".to_string(),
             back_address.to_string(),
+            None,
         ))),
     });
     worker.read_to_last();
@@ -783,6 +803,7 @@ fn try_http_behaviors() -> State {
             "cluster_0",
             "cluster_0-0".to_string(),
             back_address.to_string(),
+            None,
         ))),
     });
     backend.disconnect();
@@ -848,6 +869,7 @@ fn try_http_behaviors() -> State {
             "cluster_0",
             "cluster_0-0".to_string(),
             back_address.to_string(),
+            None,
         ))),
     });
     backend.disconnect();
@@ -932,8 +954,15 @@ fn try_msg_close() -> State {
         .expect("could not parse front address");
 
     let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, mut backends) =
-        setup_sync_test("MSG-CLOSE", config, listeners, state, front_address, 1);
+    let (mut worker, mut backends) = setup_sync_test(
+        "MSG-CLOSE",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
     let mut backend = backends.pop().unwrap();
 
     backend.connect();
@@ -969,7 +998,7 @@ pub fn try_blue_geen() -> State {
         .expect("could not parse front address");
 
     let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, _) = setup_async_test("BG", config, listeners, state, front_address, 0);
+    let (mut worker, _) = setup_async_test("BG", config, listeners, state, front_address, 0, false);
 
     let aggrerator = SimpleAggregator {
         requests_received: 0,
@@ -1001,6 +1030,7 @@ pub fn try_blue_geen() -> State {
             "cluster_0",
             "cluster_0-0",
             primary_address.to_string(),
+            None,
         ))),
     });
     worker.read_to_last();
@@ -1021,6 +1051,7 @@ pub fn try_blue_geen() -> State {
             "cluster_0",
             "cluster_0-1",
             secondary_address.to_string(),
+            None,
         ))),
     });
     worker.read_to_last();
@@ -1077,8 +1108,15 @@ pub fn try_keep_alive() -> State {
         .expect("could not parse front address");
 
     let (config, listeners, state) = Worker::empty_config();
-    let (mut worker, mut backends) =
-        setup_sync_test("KA-WORKER", config, listeners, state, front_address, 1);
+    let (mut worker, mut backends) = setup_sync_test(
+        "KA-WORKER",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
 
     let mut backend = backends.pop().unwrap();
     let mut client = Client::new(
@@ -1139,7 +1177,9 @@ pub fn try_keep_alive() -> State {
     assert!(!client.is_connected()); // front disconnected
     assert!(!backend.is_connected(0)); // back disconnected
 
-    worker.send_proxy_request(Request::SoftStop);
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::SoftStop(SoftStop {})),
+    });
     worker.wait_for_server_stop();
 
     println!(
@@ -1149,6 +1189,84 @@ pub fn try_keep_alive() -> State {
     println!(
         "{} sent: {}, received: {}",
         backend.name, backend.responses_sent, backend.requests_received
+    );
+
+    State::Success
+}
+
+pub fn try_stick() -> State {
+    let front_address = "127.0.0.1:2001"
+        .parse()
+        .expect("could not parse front address");
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test("STICK", config, listeners, state, front_address, 2, true);
+
+    let mut backend2 = backends.pop().unwrap();
+    let mut backend1 = backends.pop().unwrap();
+    let mut client = Client::new(
+        format!("client"),
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookies: foo=bar\r\n\r\n",
+    );
+
+    // Sozu choice order is determinist in round-bobin, so we will use backend1 then backend2
+    backend1.connect();
+    backend2.connect();
+
+    // no sticky_session
+    client.connect();
+    client.send();
+    backend1.accept(0);
+    let request = backend1.receive(0);
+    println!("request: {request:?}");
+    backend1.send(0);
+    let response = client.receive();
+    println!("response: {response:?}");
+    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookies: foo=bar; \r\nX-Forwarded-For:"));
+    assert!(response.unwrap().starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSet-Cookie: SOZUBALANCEID=sticky_cluster_0-0; Path=/\r\nSozu-Id:"));
+
+    // invalid sticky_session
+    client.set_request("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookies: foo=bar; SOZUBALANCEID=invalid\r\n\r\n");
+    client.connect();
+    client.send();
+    backend2.accept(0);
+    let request = backend2.receive(0);
+    println!("request: {request:?}");
+    backend2.send(0);
+    let response = client.receive();
+    println!("response: {response:?}");
+    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookies: foo=bar; \r\nX-Forwarded-For:"));
+    assert!(response.unwrap().starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSet-Cookie: SOZUBALANCEID=sticky_cluster_0-1; Path=/\r\nSozu-Id:"));
+
+    // good sticky_session (force use backend2, round-robin would have chosen backend1)
+    client.set_request("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookies: foo=bar; SOZUBALANCEID=sticky_cluster_0-1\r\n\r\n");
+    client.connect();
+    client.send();
+    backend2.accept(0);
+    let request = backend2.receive(0);
+    println!("request: {request:?}");
+    backend2.send(0);
+    let response = client.receive();
+    println!("response: {response:?}");
+    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookies: foo=bar; \r\nX-Forwarded-For:"));
+    assert!(response
+        .unwrap()
+        .starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSozu-Id:"));
+
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::SoftStop(SoftStop {})),
+    });
+    worker.wait_for_server_stop();
+
+    println!(
+        "{} sent: {}, received: {}",
+        client.name, client.requests_sent, client.responses_received
+    );
+    println!(
+        "{} sent: {}, received: {}",
+        backend1.name, backend1.responses_sent, backend1.requests_received
     );
 
     State::Success
@@ -1307,7 +1425,16 @@ fn test_blue_green() {
 #[test]
 fn test_keep_alive() {
     assert_eq!(
-        repeat_until_error_or(1, "Keep alive combinations", try_keep_alive),
+        repeat_until_error_or(10, "Keep alive combinations", try_keep_alive),
+        State::Success
+    );
+}
+
+#[serial]
+#[test]
+fn test_stick() {
+    assert_eq!(
+        repeat_until_error_or(10, "Sticky session", try_stick),
         State::Success
     );
 }
