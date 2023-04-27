@@ -19,11 +19,12 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proto::command::{
         request::RequestType, AggregatedMetrics, AvailableMetrics, ClusterHashes,
-        ClusterInformations, FrontendFilters, ListenersList, MetricsConfiguration, Request,
-        ResponseStatus, ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos,
+        ClusterInformations, FrontendFilters, ListedFrontends, ListenersList, MetricsConfiguration,
+        Request, ResponseStatus, ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo,
+        WorkerInfos,
     },
     request::WorkerRequest,
-    response::{ListedFrontends, Response, ResponseContent},
+    response::{Response, ResponseContent},
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
 };
@@ -368,7 +369,7 @@ impl CommandServer {
             }) {
                 listed_frontends
                     .http_frontends
-                    .push(http_frontend.1.to_owned());
+                    .push(http_frontend.1.to_owned().into());
             }
         }
 
@@ -382,13 +383,15 @@ impl CommandServer {
             }) {
                 listed_frontends
                     .https_frontends
-                    .push(https_frontend.1.to_owned());
+                    .push(https_frontend.1.to_owned().into());
             }
         }
 
         if (filters.tcp || list_all) && filters.domain.is_none() {
             for tcp_frontend in self.state.tcp_fronts.values().flat_map(|v| v.iter()) {
-                listed_frontends.tcp_frontends.push(tcp_frontend.to_owned())
+                listed_frontends
+                    .tcp_frontends
+                    .push(tcp_frontend.to_owned().into())
             }
         }
 

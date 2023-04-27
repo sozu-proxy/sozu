@@ -6,9 +6,9 @@ use prettytable::{Row, Table};
 use sozu_command_lib::{
     proto::command::{
         filtered_metrics, AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics,
-        ListenersList, WorkerInfos, WorkerMetrics,
+        ListedFrontends, ListenersList, WorkerInfos, WorkerMetrics,
     },
-    response::{ListedFrontends, ResponseContent},
+    response::ResponseContent,
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -155,7 +155,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
                 format!("{:?}", http_frontend.path),
                 format!("{:?}", http_frontend.method),
                 format!("{:?}", http_frontend.position),
-                format_tags_to_string(http_frontend.tags.as_ref())
+                format_tags_to_string(&http_frontend.tags)
             ));
         }
         table.printstd();
@@ -186,7 +186,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
                 format!("{:?}", https_frontend.path),
                 format!("{:?}", https_frontend.method),
                 format!("{:?}", https_frontend.position),
-                format_tags_to_string(https_frontend.tags.as_ref())
+                format_tags_to_string(&https_frontend.tags)
             ));
         }
         table.printstd();
@@ -202,7 +202,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
             table.add_row(row!(
                 tcp_frontend.cluster_id,
                 tcp_frontend.address,
-                format_tags_to_string(tcp_frontend.tags.as_ref())
+                format_tags_to_string(&tcp_frontend.tags)
             ));
         }
         table.printstd();
@@ -672,14 +672,11 @@ pub fn print_certificates(
     Ok(())
 }
 
-fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
-    tags.map(|tags| {
-        tags.iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    })
-    .unwrap_or_default()
+fn format_tags_to_string(tags: &BTreeMap<String, String>) -> String {
+    tags.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub fn print_available_metrics(available_metrics: &AvailableMetrics) -> anyhow::Result<()> {

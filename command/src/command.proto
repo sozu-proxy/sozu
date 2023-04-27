@@ -404,6 +404,13 @@ enum MetricsConfiguration {
     CLEAR = 2;
 }
 
+// lists of frontends present in the state
+message ListedFrontends {
+    repeated RequestHttpFrontend http_frontends = 1;
+    repeated RequestHttpFrontend https_frontends = 2;
+    repeated RequestTcpFrontend tcp_frontends = 3;
+}
+
 message ClusterInformations {
     repeated ClusterInformation vec = 1;
 }

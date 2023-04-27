@@ -3,9 +3,10 @@ use std::{cmp::Ordering, collections::BTreeMap, default::Default, fmt, net::Sock
 use crate::{
     proto::command::{
         AddBackend, AggregatedMetrics, AvailableMetrics, CertificateWithNames, ClusterHashes,
-        ClusterInformations, Event, FilteredTimeSerie, ListOfCertificatesByAddress, ListenersList,
-        LoadBalancingParams, PathRule, PathRuleKind, RequestHttpFrontend, RequestTcpFrontend,
-        ResponseStatus, RulePosition, RunState, WorkerInfos, WorkerMetrics,
+        ClusterInformations, Event, FilteredTimeSerie, ListOfCertificatesByAddress,
+        ListedFrontends, ListenersList, LoadBalancingParams, PathRule, PathRuleKind,
+        RequestHttpFrontend, RequestTcpFrontend, ResponseStatus, RulePosition, RunState,
+        WorkerInfos, WorkerMetrics,
     },
     request::PROTOCOL_VERSION,
     state::ClusterId,
@@ -206,14 +207,6 @@ impl Into<RequestTcpFrontend> for TcpFrontend {
             tags: self.tags.unwrap_or(BTreeMap::new()),
         }
     }
-}
-
-// TODO: should contain HttpFrontendConfig and TcpFrontendConfig, or types written in protobuf
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ListedFrontends {
-    pub http_frontends: Vec<HttpFrontend>,
-    pub https_frontends: Vec<HttpFrontend>,
-    pub tcp_frontends: Vec<TcpFrontend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
