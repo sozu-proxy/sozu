@@ -13,7 +13,6 @@ use crate::{
 /// Responses of the main process to the CLI (or other client)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
-    pub id: String,
     pub version: u8,
     pub status: ResponseStatus,
     pub message: String,
@@ -22,14 +21,12 @@ pub struct Response {
 
 impl Response {
     pub fn new(
-        // id: String,
         status: ResponseStatus,
         message: String,
         content: Option<ResponseContent>,
     ) -> Response {
         Response {
             version: PROTOCOL_VERSION,
-            id: "generic-response-id-to-be-removed".to_string(),
             status,
             message,
             content,
@@ -368,7 +365,6 @@ mod tests {
         answer_workers_status,
         "../assets/answer_workers_status.json",
         Response {
-            id: "ID_TEST".to_string(),
             version: 0,
             status: ResponseStatus::Ok,
             message: String::from(""),
@@ -395,7 +391,6 @@ mod tests {
         answer_metrics,
         "../assets/answer_metrics.json",
         Response {
-            id: "ID_TEST".to_string(),
             version: 0,
             status: ResponseStatus::Ok,
             message: String::from(""),

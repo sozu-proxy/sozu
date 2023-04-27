@@ -1,6 +1,5 @@
 use anyhow::{self, bail, Context};
 use prettytable::Table;
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
 
 use sozu_command_lib::{
@@ -9,7 +8,7 @@ use sozu_command_lib::{
         QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions, Request, ResponseContent,
         ResponseStatus, RunState, UpgradeMain, WorkerInfo,
     },
-    response::{Response},
+    response::Response,
 };
 
 use crate::ctl::{
@@ -26,26 +25,6 @@ use crate::ctl::{
 struct WorkerStatus<'a> {
     pub worker: &'a WorkerInfo,
     pub status: &'a String,
-}
-
-/*
-fn generate_id() -> String {
-    let s: String = thread_rng()
-    .sample_iter(&Alphanumeric)
-    .take(6)
-    .map(|c| c as char)
-    .collect();
-format!("ID-{s}")
-}
-*/
-
-fn generate_tagged_id(tag: &str) -> String {
-    let s: String = thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(6)
-        .map(|c| c as char)
-        .collect();
-    format!("{tag}-{s}")
 }
 
 impl CommandManager {
@@ -70,8 +49,6 @@ impl CommandManager {
         request: Request,
         json: bool,
     ) -> Result<(), anyhow::Error> {
-        // let id = generate_id();
-
         println!("Sending request : {request:?}");
 
         self.channel
@@ -154,7 +131,6 @@ impl CommandManager {
                         table.printstd();
                         println!();
 
-                        let id = generate_tagged_id("UPGRADE-MAIN");
                         self.send_request(Request {
                             request_type: Some(RequestType::UpgradeMain(UpgradeMain {})),
                         })?;
@@ -163,10 +139,6 @@ impl CommandManager {
 
                         loop {
                             let response = self.read_channel_message_with_timeout()?;
-
-                            // if id != response.id {
-                            //     bail!("Error: received unexpected message: {:?}", response);
-                            // }
 
                             match response.status {
                                 ResponseStatus::Processing => {
