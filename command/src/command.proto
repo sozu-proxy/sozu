@@ -404,6 +404,17 @@ enum MetricsConfiguration {
     CLEAR = 2;
 }
 
+// Response to a request
+message Response {
+    // wether the request was a success, a failure, or is processing
+    required ResponseStatus status = 1 [default = FAILURE];
+    // a success or error message
+    required string message = 2;
+    // response data, if any
+    optional ResponseContent content = 3;
+}
+
+
 // content of a response
 message ResponseContent {
     oneof content_type {

@@ -20,11 +20,10 @@ use sozu_command_lib::{
     proto::command::{
         request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
         ClusterHashes, ClusterInformations, FrontendFilters, ListedFrontends, ListenersList,
-        MetricsConfiguration, Request, ResponseContent, ResponseStatus, ReturnListenSockets,
-        RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
+        MetricsConfiguration, Request, Response, ResponseContent, ResponseStatus,
+        ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
     },
     request::WorkerRequest,
-    response::Response,
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
 };

@@ -3,19 +3,11 @@ use std::{cmp::Ordering, collections::BTreeMap, default::Default, fmt, net::Sock
 use crate::{
     proto::command::{
         AddBackend, FilteredTimeSerie, LoadBalancingParams, PathRule, PathRuleKind,
-        RequestHttpFrontend, RequestTcpFrontend, ResponseContent, ResponseStatus, RulePosition,
-        RunState,
+        RequestHttpFrontend, RequestTcpFrontend, Response, ResponseContent, ResponseStatus,
+        RulePosition, RunState,
     },
     state::ClusterId,
 };
-
-/// Responses of the main process to the CLI (or other client)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Response {
-    pub status: ResponseStatus,
-    pub message: String,
-    pub content: Option<ResponseContent>,
-}
 
 impl Response {
     pub fn new(
@@ -24,7 +16,7 @@ impl Response {
         content: Option<ResponseContent>,
     ) -> Response {
         Response {
-            status,
+            status: status as i32,
             message,
             content,
         }
@@ -362,7 +354,7 @@ mod tests {
         answer_workers_status,
         "../assets/answer_workers_status.json",
         Response {
-            status: ResponseStatus::Ok,
+            status: ResponseStatus::Ok as i32,
             message: String::from(""),
             content: Some(ResponseContent {
                 content_type: Some(ContentType::Workers(WorkerInfos {
@@ -387,7 +379,7 @@ mod tests {
         answer_metrics,
         "../assets/answer_metrics.json",
         Response {
-            status: ResponseStatus::Ok,
+            status: ResponseStatus::Ok as i32,
             message: String::from(""),
             content: Some(ResponseContent {
                 content_type: Some(ContentType::Metrics(AggregatedMetrics {

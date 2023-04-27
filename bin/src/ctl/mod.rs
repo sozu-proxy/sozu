@@ -8,7 +8,9 @@ use std::time::Duration;
 use anyhow::Context;
 
 use sozu_command_lib::{
-    channel::Channel, config::Config, proto::command::Request, response::Response,
+    channel::Channel,
+    config::Config,
+    proto::command::{Request, Response},
 };
 
 use crate::{

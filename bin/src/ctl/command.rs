@@ -2,13 +2,10 @@ use anyhow::{self, bail, Context};
 use prettytable::Table;
 use serde::Serialize;
 
-use sozu_command_lib::{
-    proto::command::{
-        request::RequestType, response_content::ContentType, ListWorkers, QueryAllCertificates,
-        QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions, Request, ResponseContent,
-        ResponseStatus, RunState, UpgradeMain, WorkerInfo,
-    },
-    response::Response,
+use sozu_command_lib::proto::command::{
+    request::RequestType, response_content::ContentType, ListWorkers, QueryAllCertificates,
+    QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions, Request, Response,
+    ResponseContent, ResponseStatus, RunState, UpgradeMain, WorkerInfo,
 };
 
 use crate::ctl::{
@@ -58,7 +55,7 @@ impl CommandManager {
         loop {
             let response = self.read_channel_message_with_timeout()?;
 
-            match response.status {
+            match response.status() {
                 ResponseStatus::Processing => println!("Proxy is processing: {}", response.message),
                 ResponseStatus::Failure => bail!("Request failed: {}", response.message),
                 ResponseStatus::Ok => {
@@ -105,7 +102,7 @@ impl CommandManager {
         loop {
             let response = self.read_channel_message_with_timeout()?;
 
-            match response.status {
+            match response.status() {
                 ResponseStatus::Processing => {
                     println!("Processing: {}", response.message);
                 }
@@ -140,7 +137,7 @@ impl CommandManager {
                         loop {
                             let response = self.read_channel_message_with_timeout()?;
 
-                            match response.status {
+                            match response.status() {
                                 ResponseStatus::Processing => {
                                     println!("Main process is upgrading");
                                 }
@@ -207,7 +204,7 @@ impl CommandManager {
         loop {
             let response = self.read_channel_message_with_timeout()?;
 
-            match response.status {
+            match response.status() {
                 ResponseStatus::Processing => info!("Proxy is processing: {}", response.message),
                 ResponseStatus::Failure => bail!(
                     "could not stop the worker {}: {}",
@@ -255,7 +252,7 @@ impl CommandManager {
             loop {
                 let response = self.read_channel_message_with_timeout()?;
 
-                match response.status {
+                match response.status() {
                     ResponseStatus::Processing => {
                         println!("Proxy is processing: {}", response.message);
                     }
@@ -343,7 +340,7 @@ impl CommandManager {
         loop {
             let response = self.read_channel_message_with_timeout()?;
 
-            match response.status {
+            match response.status() {
                 ResponseStatus::Processing => {
                     println!("Proxy is processing: {}", response.message);
                 }
@@ -399,7 +396,7 @@ impl CommandManager {
         loop {
             let response = self.read_channel_message_with_timeout()?;
 
-            match response.status {
+            match response.status() {
                 ResponseStatus::Processing => {
                     println!("Proxy is processing: {}", response.message);
                 }

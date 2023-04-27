@@ -27,10 +27,10 @@ use sozu_command_lib::{
     config::Config,
     proto::command::{
         request::RequestType, response_content::ContentType, MetricsConfiguration, Request,
-        ResponseContent, ResponseStatus, RunState, Status,
+        Response, ResponseContent, ResponseStatus, RunState, Status,
     },
     request::WorkerRequest,
-    response::{Response, WorkerResponse},
+    response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
