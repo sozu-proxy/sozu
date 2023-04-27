@@ -8,8 +8,8 @@ use std::{
 
 use crate::{
     proto::command::{
-        AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, Cluster,
-        ClusterHashes, Event, FilteredTimeSerie, ListenersList, LoadBalancingParams, PathRule,
+        AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, ClusterHashes,
+        ClusterInformation, Event, FilteredTimeSerie, ListenersList, LoadBalancingParams, PathRule,
         PathRuleKind, RequestHttpFrontend, RequestTcpFrontend, ResponseStatus, RulePosition,
         RunState, WorkerInfos, WorkerMetrics,
     },
@@ -79,17 +79,6 @@ pub enum ResponseContent {
     CertificateByFingerprint(Option<(String, Vec<String>)>),
 }
 
-// TODO: the types HttpFrontend, TcpFrontend and Backend are not present,
-// and not meant to be present in proto::command. Find a fix, like using the type HttpRequestFrontend
-#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ClusterInformation {
-    pub configuration: Option<Cluster>,
-    pub http_frontends: Vec<HttpFrontend>,
-    pub https_frontends: Vec<HttpFrontend>,
-    pub tcp_frontends: Vec<TcpFrontend>,
-    pub backends: Vec<Backend>,
-}
-
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpFrontend {
     /// Send a 401, DENY, if cluster_id is None
@@ -121,6 +110,19 @@ impl Into<RequestHttpFrontend> for HttpFrontend {
             method: self.method,
             position: self.position.into(),
             tags,
+        }
+    }
+}
+
+impl Into<AddBackend> for Backend {
+    fn into(self) -> AddBackend {
+        AddBackend {
+            cluster_id: self.cluster_id,
+            backend_id: self.backend_id,
+            address: self.address.to_string(),
+            sticky_id: self.sticky_id,
+            load_balancing_parameters: self.load_balancing_parameters,
+            backup: self.backup,
         }
     }
 }
