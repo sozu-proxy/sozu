@@ -5,11 +5,11 @@ use serde::Serialize;
 
 use sozu_command_lib::{
     proto::command::{
-        request::RequestType, ListWorkers, QueryAllCertificates, QueryClusterByDomain,
-        QueryClustersHashes, QueryMetricsOptions, Request, ResponseStatus, RunState, UpgradeMain,
-        WorkerInfo,
+        request::RequestType, response_content::ContentType, ListWorkers, QueryAllCertificates,
+        QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions, Request, ResponseContent,
+        ResponseStatus, RunState, UpgradeMain, WorkerInfo,
     },
-    response::{Response, ResponseContent},
+    response::{Response},
 };
 
 use crate::ctl::{
@@ -92,27 +92,19 @@ impl CommandManager {
                         println!("Success: {}", response.message);
                     }
                     match response.content {
-                        Some(response_content) => match response_content {
-                            ResponseContent::Metrics(_)
-                            | ResponseContent::WorkerResponses(_)
-                            | ResponseContent::WorkerMetrics(_)
-                            | ResponseContent::ClustersHashes(_)
-                            | ResponseContent::Clusters(_)
-                            | ResponseContent::CertificateByFingerprint(_)
-                            | ResponseContent::Certificates(_)
-                            | ResponseContent::AvailableMetrics(_)
-                            | ResponseContent::Event(_) => {}
-                            ResponseContent::FrontendList(frontends) => {
+                        Some(response_content) => match response_content.content_type {
+                            Some(ContentType::FrontendList(frontends)) => {
                                 print_frontend_list(frontends)
                             }
-                            ResponseContent::Workers(worker_infos) => {
+                            Some(ContentType::Workers(worker_infos)) => {
                                 if json {
                                     print_json_response(&worker_infos)?;
                                 } else {
                                     print_status(worker_infos);
                                 }
                             }
-                            ResponseContent::ListenersList(list) => print_listeners(list),
+                            Some(ContentType::ListenersList(list)) => print_listeners(list),
+                            _ => {}
                         },
                         None => {}
                     }
@@ -147,7 +139,10 @@ impl CommandManager {
                     );
                 }
                 ResponseStatus::Ok => {
-                    if let Some(ResponseContent::Workers(ref worker_infos)) = response.content {
+                    if let Some(ResponseContent {
+                        content_type: Some(ContentType::Workers(ref worker_infos)),
+                    }) = response.content
+                    {
                         let mut table = Table::new();
                         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
                         table.add_row(row!["Worker", "pid", "run state"]);
@@ -169,9 +164,9 @@ impl CommandManager {
                         loop {
                             let response = self.read_channel_message_with_timeout()?;
 
-                            if id != response.id {
-                                bail!("Error: received unexpected message: {:?}", response);
-                            }
+                            // if id != response.id {
+                            //     bail!("Error: received unexpected message: {:?}", response);
+                            // }
 
                             match response.status {
                                 ResponseStatus::Processing => {
@@ -300,15 +295,18 @@ impl CommandManager {
                         }
                     }
                     ResponseStatus::Ok => {
-                        match response.content {
-                            Some(ResponseContent::Metrics(aggregated_metrics_data)) => {
-                                print_metrics(aggregated_metrics_data, json)?
+                        if let Some(response_content) = response.content {
+                            match response_content.content_type {
+                                Some(ContentType::Metrics(aggregated_metrics_data)) => {
+                                    print_metrics(aggregated_metrics_data, json)?
+                                }
+                                Some(ContentType::AvailableMetrics(available)) => {
+                                    print_available_metrics(&available)?;
+                                }
+                                _ => println!("Wrong kind of response here"),
                             }
-                            Some(ResponseContent::AvailableMetrics(available)) => {
-                                print_available_metrics(&available)?;
-                            }
-                            _ => println!("Wrong kind of response here"),
                         }
+
                         break;
                     }
                 }
@@ -384,7 +382,12 @@ impl CommandManager {
                     bail!("could not query proxy state: {}", response.message);
                 }
                 ResponseStatus::Ok => {
-                    print_query_response_data(cluster_id, domain, response.content, json)?;
+                    match response.content {
+                        Some(content) => {
+                            print_query_response_data(cluster_id, domain, content, json)?
+                        }
+                        None => println!("No content in the response"),
+                    }
                     break;
                 }
             }
@@ -438,9 +441,9 @@ impl CommandManager {
                 }
                 ResponseStatus::Ok => {
                     match response.content {
-                        Some(ResponseContent::WorkerResponses(data)) => {
-                            print_certificates(data, json)?
-                        }
+                        Some(ResponseContent {
+                            content_type: Some(ContentType::WorkerResponses(worker_responses)),
+                        }) => print_certificates(worker_responses.map, json)?,
                         _ => bail!("unexpected response: {:?}", response.content),
                     }
                     break;

@@ -3,12 +3,10 @@ use std::{collections::BTreeMap, str, time::Instant};
 
 use anyhow::Context;
 use hdrhistogram::Histogram;
-use sozu_command::{
-    proto::command::{
-        filtered_metrics, AvailableMetrics, BackendMetrics, ClusterMetrics, FilteredMetrics,
-        MetricsConfiguration, Percentiles, QueryMetricsOptions, WorkerMetrics,
-    },
-    response::ResponseContent,
+use sozu_command::proto::command::{
+    filtered_metrics, response_content::ContentType, AvailableMetrics, BackendMetrics,
+    ClusterMetrics, FilteredMetrics, MetricsConfiguration, Percentiles, QueryMetricsOptions,
+    ResponseContent, WorkerMetrics,
 };
 
 use super::{MetricData, Subscriber};
@@ -199,7 +197,9 @@ impl LocalDrain {
             (true, true) => self.dump_all_metrics(metric_names)?,
         };
 
-        Ok(ResponseContent::WorkerMetrics(worker_metrics))
+        Ok(ResponseContent {
+            content_type: Some(ContentType::WorkerMetrics(worker_metrics)),
+        })
     }
 
     fn list_all_metric_names(&self) -> anyhow::Result<ResponseContent> {
@@ -212,10 +212,12 @@ impl LocalDrain {
                 cluster_metrics.push(metric_name.to_owned());
             }
         }
-        Ok(ResponseContent::AvailableMetrics(AvailableMetrics {
-            proxy_metrics,
-            cluster_metrics,
-        }))
+        Ok(ResponseContent {
+            content_type: Some(ContentType::AvailableMetrics(AvailableMetrics {
+                proxy_metrics,
+                cluster_metrics,
+            })),
+        })
     }
 
     pub fn dump_all_metrics(

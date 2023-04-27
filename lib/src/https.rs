@@ -33,13 +33,14 @@ use sozu_command::{
     config::DEFAULT_CIPHER_SUITES,
     logging,
     proto::command::{
-        request::RequestType, AddCertificate, CertificateSummary, CertificatesByAddress, Cluster,
-        HttpsListenerConfig, ListOfCertificatesByAddress, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, RequestHttpFrontend, TlsVersion,
+        request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
+        CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        ResponseContent, TlsVersion,
     },
     ready::Ready,
     request::WorkerRequest,
-    response::{HttpFrontend, ResponseContent, WorkerResponse},
+    response::{HttpFrontend, WorkerResponse},
     scm_socket::ScmSocket,
     state::ClusterId,
 };
@@ -967,9 +968,11 @@ impl HttpsProxy {
             certificates
         );
 
-        Ok(Some(ResponseContent::Certificates(
-            ListOfCertificatesByAddress { certificates },
-        )))
+        Ok(Some(ResponseContent {
+            content_type: Some(ContentType::Certificates(ListOfCertificatesByAddress {
+                certificates,
+            })),
+        }))
     }
 
     pub fn query_certificate_for_domain(
@@ -1004,9 +1007,11 @@ impl HttpsProxy {
             domain, certificates
         );
 
-        Ok(Some(ResponseContent::Certificates(
-            ListOfCertificatesByAddress { certificates },
-        )))
+        Ok(Some(ResponseContent {
+            content_type: Some(ContentType::Certificates(ListOfCertificatesByAddress {
+                certificates,
+            })),
+        }))
     }
 
     pub fn activate_listener(

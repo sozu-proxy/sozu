@@ -18,14 +18,15 @@ use sozu_command::{
     channel::Channel,
     config::Config,
     proto::command::{
-        request::RequestType, ActivateListener, AddBackend, Cluster, ClusterHashes,
-        ClusterInformations, DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig,
-        ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend,
-        ResponseStatus, TcpListenerConfig as CommandTcpListener,
+        request::RequestType, response_content::ContentType, ActivateListener, AddBackend, Cluster,
+        ClusterHashes, ClusterInformations, DeactivateListener, Event, HttpListenerConfig,
+        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadMetric,
+        MetricsConfiguration, RemoveBackend, ResponseContent, ResponseStatus,
+        TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
     request::WorkerRequest,
-    response::{MessageId, ResponseContent, WorkerResponse},
+    response::{MessageId, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
 };
@@ -62,7 +63,9 @@ pub fn push_event(event: Event) {
             id: "EVENT".to_string(),
             message: String::new(),
             status: ResponseStatus::Processing,
-            content: Some(ResponseContent::Event(event)),
+            content: Some(ResponseContent {
+                content_type: Some(ContentType::Event(event)),
+            }),
         });
     });
 }
@@ -883,18 +886,22 @@ impl Server {
             Some(RequestType::QueryClustersHashes(_)) => {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ResponseContent::ClustersHashes(ClusterHashes {
-                        map: self.config_state.hash_state(),
-                    }),
+                    ResponseContent {
+                        content_type: Some(ContentType::ClusterHashes(ClusterHashes {
+                            map: self.config_state.hash_state(),
+                        })),
+                    },
                 ));
                 return;
             }
             Some(RequestType::QueryClusterById(cluster_id)) => {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ResponseContent::Clusters(ClusterInformations {
-                        vec: vec![self.config_state.cluster_state(cluster_id)],
-                    }),
+                    ResponseContent {
+                        content_type: Some(ContentType::Clusters(ClusterInformations {
+                            vec: vec![self.config_state.cluster_state(cluster_id)],
+                        })),
+                    },
                 ));
             }
             Some(RequestType::QueryClustersByDomain(domain)) => {
@@ -910,7 +917,9 @@ impl Server {
 
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ResponseContent::Clusters(ClusterInformations { vec }),
+                    ResponseContent {
+                        content_type: Some(ContentType::Clusters(ClusterInformations { vec })),
+                    },
                 ));
                 return;
             }
@@ -918,7 +927,9 @@ impl Server {
                 let response = match get_certificate(&self.config_state, &f) {
                     Some(cert) => WorkerResponse::ok_with_content(
                         message.id.clone(),
-                        ResponseContent::CertificateByFingerprint(cert),
+                        ResponseContent {
+                            content_type: Some(ContentType::CertificateByFingerprint(cert)),
+                        },
                     ),
                     None => WorkerResponse::error(
                         message.id.clone(),

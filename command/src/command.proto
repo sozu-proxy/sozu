@@ -404,6 +404,41 @@ enum MetricsConfiguration {
     CLEAR = 2;
 }
 
+// content of a response
+message ResponseContent {
+    oneof content_type {
+        // a list of workers, with ids, pids, statuses
+        WorkerInfos workers = 1;
+        // aggregated metrics of main process and workers
+        AggregatedMetrics metrics = 2;
+        // a collection of worker responses to the same request
+        WorkerResponses worker_responses = 3;
+        // a proxy event
+        Event event = 4;
+        // a filtered list of frontend
+        ListedFrontends frontend_list = 5;
+        // all listeners
+        ListenersList listeners_list = 6;
+        // contains proxy & cluster metrics
+        WorkerMetrics worker_metrics = 7;
+        // Lists of metrics that are available
+        AvailableMetrics available_metrics = 8;
+        // a list of cluster informations
+        ClusterInformations clusters = 9;
+        // collection of hashes of cluster information, 
+        ClusterHashes cluster_hashes = 10;
+        // a list of certificates for each socket address
+        ListOfCertificatesByAddress certificates = 11;
+        // returns the certificate matching a request by fingerprint,
+        // and the list of domain names associated
+        CertificateWithNames certificate_by_fingerprint = 12;
+    }
+}
+
+message WorkerResponses {
+    map<string, ResponseContent> map = 1;
+}
+
 // lists of frontends present in the state
 message ListedFrontends {
     repeated RequestHttpFrontend http_frontends = 1;

@@ -4,20 +4,21 @@
   "status": "OK",
   "message": "",
   "content": {
-    "type": "WORKERS",
-    "data": {
-      "vec": [
-        {
-          "id": 1,
-          "pid": 5678,
-          "run_state": 0
-        },
-        {
-          "id": 0,
-          "pid": 1234,
-          "run_state": 1
-        }
-      ]
+    "content_type": {
+      "WORKERS": {
+        "vec": [
+          {
+            "id": 1,
+            "pid": 5678,
+            "run_state": 0
+          },
+          {
+            "id": 0,
+            "pid": 1234,
+            "run_state": 1
+          }
+        ]
+      }
     }
   }
 }
