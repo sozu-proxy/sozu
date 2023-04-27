@@ -644,11 +644,11 @@ pub fn print_certificates(
 
     for (_worker_id, response_content) in response_contents.iter() {
         match response_content {
-            ResponseContent::Certificates(h) => {
-                for (addr, h2) in h.iter() {
-                    println!("\t{addr}:");
+            ResponseContent::Certificates(list) => {
+                for certs in list.certificates.iter() {
+                    println!("\t{}:", certs.address);
 
-                    for summary in h2.iter() {
+                    for summary in certs.certificate_summaries.iter() {
                         println!(
                             "\t\t{}:\t{}",
                             summary.domain,

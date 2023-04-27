@@ -295,6 +295,15 @@ message CertificateSummary {
     required string fingerprint = 2;
 }
 
+message ListOfCertificatesByAddress {
+    repeated CertificatesByAddress certificates = 1;
+}
+
+message CertificatesByAddress {
+    required string address = 1;
+    repeated CertificateSummary certificate_summaries = 2;
+}
+
 // A certificate matching a request by fingerprint,
 // and the list of domain names associated
 message CertificateWithNames {

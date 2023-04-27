@@ -1,17 +1,11 @@
-use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, HashMap},
-    default::Default,
-    fmt,
-    net::SocketAddr,
-};
+use std::{cmp::Ordering, collections::BTreeMap, default::Default, fmt, net::SocketAddr};
 
 use crate::{
     proto::command::{
-        AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, ClusterHashes,
-        ClusterInformations, Event, FilteredTimeSerie, ListenersList, LoadBalancingParams,
-        PathRule, PathRuleKind, RequestHttpFrontend, RequestTcpFrontend, ResponseStatus,
-        RulePosition, RunState, WorkerInfos, WorkerMetrics, CertificateWithNames,
+        AddBackend, AggregatedMetrics, AvailableMetrics, CertificateWithNames, ClusterHashes,
+        ClusterInformations, Event, FilteredTimeSerie, ListOfCertificatesByAddress, ListenersList,
+        LoadBalancingParams, PathRule, PathRuleKind, RequestHttpFrontend, RequestTcpFrontend,
+        ResponseStatus, RulePosition, RunState, WorkerInfos, WorkerMetrics,
     },
     request::PROTOCOL_VERSION,
     state::ClusterId,
@@ -72,7 +66,7 @@ pub enum ResponseContent {
     ClustersHashes(ClusterHashes),
 
     /// a list of certificates for each socket address
-    Certificates(HashMap<SocketAddr, Vec<CertificateSummary>>),
+    Certificates(ListOfCertificatesByAddress),
 
     /// returns the certificate matching a request by fingerprint,
     /// and the list of domain names associated
