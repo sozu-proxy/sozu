@@ -295,6 +295,14 @@ message CertificateSummary {
     required string fingerprint = 2;
 }
 
+// A certificate matching a request by fingerprint,
+// and the list of domain names associated
+message CertificateWithNames {
+    required string certificate = 1;
+    // domain names associated to the fingerprint
+    repeated string names = 2;
+}
+
 enum TlsVersion {
     SSL_V2 = 0;
     SSL_V3 = 1;

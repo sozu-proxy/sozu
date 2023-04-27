@@ -14,6 +14,7 @@ use mio::{
 };
 use slab::Slab;
 use sozu_command::{
+    certificate::Fingerprint,
     channel::Channel,
     config::Config,
     proto::command::{
@@ -914,14 +915,20 @@ impl Server {
                 return;
             }
             Some(RequestType::QueryCertificateByFingerprint(f)) => {
-                // forward the query to the TLS implementation
-                push_queue(WorkerResponse::ok_with_content(
-                    message.id.clone(),
-                    ResponseContent::CertificateByFingerprint(get_certificate(
-                        &self.config_state,
-                        &f,
-                    )),
-                ));
+                let response = match get_certificate(&self.config_state, &f) {
+                    Some(cert) => WorkerResponse::ok_with_content(
+                        message.id.clone(),
+                        ResponseContent::CertificateByFingerprint(cert),
+                    ),
+                    None => WorkerResponse::error(
+                        message.id.clone(),
+                        format!(
+                            "Could not find certificate for fingerprint {}",
+                            Fingerprint(f.to_vec())
+                        ),
+                    ),
+                };
+                push_queue(response);
                 return;
             }
             Some(RequestType::QueryMetrics(query_metrics_options)) => {

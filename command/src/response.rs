@@ -11,7 +11,7 @@ use crate::{
         AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, ClusterHashes,
         ClusterInformations, Event, FilteredTimeSerie, ListenersList, LoadBalancingParams,
         PathRule, PathRuleKind, RequestHttpFrontend, RequestTcpFrontend, ResponseStatus,
-        RulePosition, RunState, WorkerInfos, WorkerMetrics,
+        RulePosition, RunState, WorkerInfos, WorkerMetrics, CertificateWithNames,
     },
     request::PROTOCOL_VERSION,
     state::ClusterId,
@@ -76,7 +76,7 @@ pub enum ResponseContent {
 
     /// returns the certificate matching a request by fingerprint,
     /// and the list of domain names associated
-    CertificateByFingerprint(Option<(String, Vec<String>)>),
+    CertificateByFingerprint(CertificateWithNames),
 }
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]

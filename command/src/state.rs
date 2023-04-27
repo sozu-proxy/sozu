@@ -14,9 +14,10 @@ use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        Cluster, ClusterInformation, DeactivateListener, HttpListenerConfig, HttpsListenerConfig,
-        ListenerType, PathRule, RemoveBackend, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, Request, RequestHttpFrontend, RequestTcpFrontend, TcpListenerConfig,
+        CertificateWithNames, Cluster, ClusterInformation, DeactivateListener, HttpListenerConfig,
+        HttpsListenerConfig, ListenerType, PathRule, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend, RequestTcpFrontend,
+        TcpListenerConfig,
     },
     response::{Backend, HttpFrontend, TcpFrontend},
 };
@@ -1247,12 +1248,15 @@ pub fn get_cluster_ids_by_domain(
     cluster_ids
 }
 
-pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(String, Vec<String>)> {
+pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<CertificateWithNames> {
     state
         .certificates
         .values()
         .filter_map(|h| h.get(&Fingerprint(fingerprint.to_vec())))
-        .map(|c| (c.certificate.clone(), c.names.clone()))
+        .map(|c| CertificateWithNames {
+            certificate: c.certificate.clone(),
+            names: c.names.clone(),
+        })
         .next()
 }
 

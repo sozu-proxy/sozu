@@ -659,12 +659,11 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            ResponseContent::CertificateByFingerprint(opt) => {
-                if let Some((s, v)) = opt {
-                    println!("\tfrontends: {v:?}\ncertificate:\n{s}");
-                } else {
-                    println!("\tnot found");
-                }
+            ResponseContent::CertificateByFingerprint(cert) => {
+                println!(
+                    "\tfrontends: {:?}\ncertificate:\n{}",
+                    cert.names, cert.certificate
+                );
             }
             _ => {}
         }
