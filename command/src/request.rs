@@ -15,8 +15,6 @@ use crate::{
     response::{HttpFrontend, MessageId},
 };
 
-pub const PROTOCOL_VERSION: u8 = 0;
-
 impl Request {
     /// determine to which of the three proxies (HTTP, HTTPS, TCP) a request is destined
     pub fn get_destinations(&self) -> ProxyDestinations {

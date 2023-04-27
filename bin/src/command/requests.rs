@@ -204,20 +204,6 @@ impl CommandServer {
                     }
                     offset = buffer.data().offset(i);
 
-                    /*
-                    TODO: maybe we should put on WorkerRequest the version field we had on CommandRequest: a u32 to track versionning
-                    if requests.iter().any(|o| {
-                        if o.version > PROTOCOL_VERSION {
-                            error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, o.version);
-                            true
-                        } else {
-                            false
-                        }
-                    }) {
-                        break;
-                    }
-                    */
-
                     for request in requests {
                         message_counter += 1;
 

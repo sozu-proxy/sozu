@@ -6,14 +6,12 @@ use crate::{
         RequestHttpFrontend, RequestTcpFrontend, ResponseContent, ResponseStatus, RulePosition,
         RunState,
     },
-    request::PROTOCOL_VERSION,
     state::ClusterId,
 };
 
 /// Responses of the main process to the CLI (or other client)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
-    pub version: u8,
     pub status: ResponseStatus,
     pub message: String,
     pub content: Option<ResponseContent>,
@@ -26,7 +24,6 @@ impl Response {
         content: Option<ResponseContent>,
     ) -> Response {
         Response {
-            version: PROTOCOL_VERSION,
             status,
             message,
             content,
@@ -328,7 +325,7 @@ fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
 mod tests {
     use crate::proto::command::{
         filtered_metrics, response_content::ContentType, AggregatedMetrics, BackendMetrics,
-        ClusterMetrics, FilteredMetrics, Percentiles, WorkerInfo, WorkerMetrics, WorkerInfos,
+        ClusterMetrics, FilteredMetrics, Percentiles, WorkerInfo, WorkerInfos, WorkerMetrics,
     };
 
     use super::*;
@@ -365,7 +362,6 @@ mod tests {
         answer_workers_status,
         "../assets/answer_workers_status.json",
         Response {
-            version: 0,
             status: ResponseStatus::Ok,
             message: String::from(""),
             content: Some(ResponseContent {
@@ -391,7 +387,6 @@ mod tests {
         answer_metrics,
         "../assets/answer_metrics.json",
         Response {
-            version: 0,
             status: ResponseStatus::Ok,
             message: String::from(""),
             content: Some(ResponseContent {
