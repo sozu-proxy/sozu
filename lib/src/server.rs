@@ -18,9 +18,9 @@ use sozu_command::{
     config::Config,
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, Cluster, ClusterHashes,
-        DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, ResponseStatus,
-        TcpListenerConfig as CommandTcpListener,
+        ClusterInformations, DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig,
+        ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend,
+        ResponseStatus, TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
     request::WorkerRequest,
@@ -891,7 +891,9 @@ impl Server {
             Some(RequestType::QueryClusterById(cluster_id)) => {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ResponseContent::Clusters(vec![self.config_state.cluster_state(cluster_id)]),
+                    ResponseContent::Clusters(ClusterInformations {
+                        vec: vec![self.config_state.cluster_state(cluster_id)],
+                    }),
                 ));
             }
             Some(RequestType::QueryClustersByDomain(domain)) => {
@@ -900,14 +902,14 @@ impl Server {
                     domain.hostname.clone(),
                     domain.path.clone(),
                 );
-                let answer = cluster_ids
+                let vec = cluster_ids
                     .iter()
                     .map(|cluster_id| self.config_state.cluster_state(cluster_id))
                     .collect();
 
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ResponseContent::Clusters(answer),
+                    ResponseContent::Clusters(ClusterInformations { vec }),
                 ));
                 return;
             }

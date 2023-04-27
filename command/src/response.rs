@@ -9,9 +9,9 @@ use std::{
 use crate::{
     proto::command::{
         AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, ClusterHashes,
-        ClusterInformation, Event, FilteredTimeSerie, ListenersList, LoadBalancingParams, PathRule,
-        PathRuleKind, RequestHttpFrontend, RequestTcpFrontend, ResponseStatus, RulePosition,
-        RunState, WorkerInfos, WorkerMetrics,
+        ClusterInformations, Event, FilteredTimeSerie, ListenersList, LoadBalancingParams,
+        PathRule, PathRuleKind, RequestHttpFrontend, RequestTcpFrontend, ResponseStatus,
+        RulePosition, RunState, WorkerInfos, WorkerMetrics,
     },
     request::PROTOCOL_VERSION,
     state::ClusterId,
@@ -67,7 +67,7 @@ pub enum ResponseContent {
     /// Lists of metrics that are available
     AvailableMetrics(AvailableMetrics),
 
-    Clusters(Vec<ClusterInformation>),
+    Clusters(ClusterInformations),
     /// cluster id -> hash of cluster information
     ClustersHashes(ClusterHashes),
 

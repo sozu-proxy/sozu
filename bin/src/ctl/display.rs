@@ -440,7 +440,7 @@ pub fn print_query_response_data(
             for (key, metrics) in data.iter() {
                 //let m: u8 = metrics;
                 if let ResponseContent::Clusters(clusters) = metrics {
-                    for cluster in clusters.iter() {
+                    for cluster in clusters.vec.iter() {
                         let entry = cluster_data.entry(cluster).or_insert(Vec::new());
                         entry.push(key.to_owned());
 

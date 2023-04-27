@@ -18,9 +18,9 @@ use sozu_command_lib::{
     logging,
     parser::parse_several_commands,
     proto::command::{
-        request::RequestType, AggregatedMetrics, AvailableMetrics, ClusterHashes, FrontendFilters,
-        ListenersList, MetricsConfiguration, Request, ResponseStatus, ReturnListenSockets,
-        RunState, SoftStop, Status, WorkerInfo, WorkerInfos,
+        request::RequestType, AggregatedMetrics, AvailableMetrics, ClusterHashes,
+        ClusterInformations, FrontendFilters, ListenersList, MetricsConfiguration, Request,
+        ResponseStatus, ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos,
     },
     request::WorkerRequest,
     response::{ListedFrontends, Response, ResponseContent},
@@ -1082,12 +1082,12 @@ impl CommandServer {
             Some(RequestType::QueryClustersHashes(_)) => {
                 main_response_content = Some(ResponseContent::ClustersHashes(ClusterHashes {
                     map: self.state.hash_state(),
-                }));
+                }))
             }
             Some(RequestType::QueryClusterById(cluster_id)) => {
-                main_response_content = Some(ResponseContent::Clusters(vec![self
-                    .state
-                    .cluster_state(cluster_id)]))
+                main_response_content = Some(ResponseContent::Clusters(ClusterInformations {
+                    vec: vec![self.state.cluster_state(cluster_id)],
+                }))
             }
             Some(RequestType::QueryClustersByDomain(domain)) => {
                 let cluster_ids = get_cluster_ids_by_domain(
@@ -1095,11 +1095,12 @@ impl CommandServer {
                     domain.hostname.clone(),
                     domain.path.clone(),
                 );
-                let clusters = cluster_ids
+                let vec = cluster_ids
                     .iter()
                     .map(|cluster_id| self.state.cluster_state(cluster_id))
                     .collect();
-                main_response_content = Some(ResponseContent::Clusters(clusters));
+                main_response_content =
+                    Some(ResponseContent::Clusters(ClusterInformations { vec }));
             }
             _ => {}
         };

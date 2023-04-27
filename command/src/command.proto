@@ -387,6 +387,10 @@ enum MetricsConfiguration {
     CLEAR = 2;
 }
 
+message ClusterInformations {
+    repeated ClusterInformation vec = 1;
+}
+
 // Information about a given cluster
 // Contains types usually used in requests, because they are readily available in protobuf
 message ClusterInformation {
