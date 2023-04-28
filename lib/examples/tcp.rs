@@ -11,7 +11,8 @@ use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
     proto::command::{
-        AddBackend, LoadBalancingParams, Request, RequestTcpFrontend, TcpListenerConfig, request::RequestType,
+        request::RequestType, AddBackend, LoadBalancingParams, Request, RequestTcpFrontend,
+        TcpListenerConfig,
     },
     request::WorkerRequest,
 };

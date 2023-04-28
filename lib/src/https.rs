@@ -33,13 +33,14 @@ use sozu_command::{
     config::DEFAULT_CIPHER_SUITES,
     logging,
     proto::command::{
-        request::RequestType, AddCertificate, CertificateSummary, Cluster, HttpsListenerConfig,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend,
-        TlsVersion,
+        request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
+        CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        ResponseContent, TlsVersion,
     },
     ready::Ready,
     request::WorkerRequest,
-    response::{HttpFrontend, ResponseContent, WorkerResponse},
+    response::{HttpFrontend, WorkerResponse},
     scm_socket::ScmSocket,
     state::ClusterId,
 };
@@ -955,16 +956,23 @@ impl HttpsProxy {
                     })
                     .collect();
 
-                (owned.address, certificate_summaries)
+                CertificatesByAddress {
+                    address: owned.address.to_string(),
+                    certificate_summaries,
+                }
             })
-            .collect::<HashMap<_, _>>();
+            .collect();
 
         info!(
             "got Certificates::All query, answering with {:?}",
             certificates
         );
 
-        Ok(Some(ResponseContent::Certificates(certificates)))
+        Ok(Some(ResponseContent {
+            content_type: Some(ContentType::Certificates(ListOfCertificatesByAddress {
+                certificates,
+            })),
+        }))
     }
 
     pub fn query_certificate_for_domain(
@@ -977,26 +985,33 @@ impl HttpsProxy {
             .map(|listener| {
                 let owned = listener.borrow();
                 let resolver = unwrap_msg!(owned.resolver.0.lock());
-                let mut certificate_summary = vec![];
+                let mut certificate_summaries = vec![];
 
                 resolver
                     .domain_lookup(domain.as_bytes(), true)
                     .map(|(k, fingerprint)| {
-                        certificate_summary.push(CertificateSummary {
+                        certificate_summaries.push(CertificateSummary {
                             domain: String::from_utf8(k.to_vec()).unwrap(),
                             fingerprint: fingerprint.to_string(),
                         });
                     });
-                (owned.address, certificate_summary)
+                CertificatesByAddress {
+                    address: owned.address.to_string(),
+                    certificate_summaries,
+                }
             })
-            .collect::<HashMap<_, _>>();
+            .collect();
 
         info!(
             "got Certificates::Domain({}) query, answering with {:?}",
             domain, certificates
         );
 
-        Ok(Some(ResponseContent::Certificates(certificates)))
+        Ok(Some(ResponseContent {
+            content_type: Some(ContentType::Certificates(ListOfCertificatesByAddress {
+                certificates,
+            })),
+        }))
     }
 
     pub fn activate_listener(

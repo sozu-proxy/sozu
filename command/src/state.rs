@@ -14,11 +14,12 @@ use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        Cluster, DeactivateListener, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        PathRule, RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
-        RequestHttpFrontend, RequestTcpFrontend, TcpListenerConfig,
+        CertificateWithNames, Cluster, ClusterInformation, DeactivateListener, HttpListenerConfig,
+        HttpsListenerConfig, ListenerType, PathRule, RemoveBackend, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend, RequestTcpFrontend,
+        TcpListenerConfig,
     },
-    response::{Backend, ClusterInformation, HttpFrontend, TcpFrontend},
+    response::{Backend, HttpFrontend, TcpFrontend},
 };
 
 /// To use throughout Sōzu
@@ -1152,41 +1153,44 @@ impl ConfigState {
             .collect()
     }
 
+    /// Gives details about a given cluster.
+    /// Types like `HttpFrontend` are converted into protobuf ones, like `RequestHttpFrontend`
     pub fn cluster_state(&self, cluster_id: &str) -> ClusterInformation {
+        let mut http_frontends = Vec::new();
+        let mut https_frontends = Vec::new();
+        let mut tcp_frontends = Vec::new();
+        let mut backends = Vec::new();
+
+        for (_k, http_frontend) in &self.http_fronts {
+            if let Some(id) = &http_frontend.cluster_id {
+                if id == cluster_id {
+                    http_frontends.push(http_frontend.clone().into());
+                }
+            }
+        }
+
+        for (_k, https_frontend) in &self.https_fronts {
+            if let Some(id) = &https_frontend.cluster_id {
+                if id == cluster_id {
+                    https_frontends.push(https_frontend.clone().into());
+                }
+            }
+        }
+
+        for tcp_f in self.tcp_fronts.get(cluster_id).cloned().unwrap_or_default() {
+            tcp_frontends.push(tcp_f.clone().into());
+        }
+
+        for backend in self.backends.get(cluster_id).cloned().unwrap_or_default() {
+            backends.push(backend.clone().into())
+        }
+
         ClusterInformation {
             configuration: self.clusters.get(cluster_id).cloned(),
-            http_frontends: self
-                .http_fronts
-                .iter()
-                .filter_map(|(_k, v)| match &v.cluster_id {
-                    None => None,
-                    Some(id) => {
-                        if id == cluster_id {
-                            Some(v)
-                        } else {
-                            None
-                        }
-                    }
-                })
-                .cloned()
-                .collect(),
-            https_frontends: self
-                .https_fronts
-                .iter()
-                .filter_map(|(_k, v)| match &v.cluster_id {
-                    None => None,
-                    Some(id) => {
-                        if id == cluster_id {
-                            Some(v)
-                        } else {
-                            None
-                        }
-                    }
-                })
-                .cloned()
-                .collect(),
-            tcp_frontends: self.tcp_fronts.get(cluster_id).cloned().unwrap_or_default(),
-            backends: self.backends.get(cluster_id).cloned().unwrap_or_default(),
+            http_frontends,
+            https_frontends,
+            tcp_frontends,
+            backends,
         }
     }
 
@@ -1244,12 +1248,15 @@ pub fn get_cluster_ids_by_domain(
     cluster_ids
 }
 
-pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(String, Vec<String>)> {
+pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<CertificateWithNames> {
     state
         .certificates
         .values()
         .filter_map(|h| h.get(&Fingerprint(fingerprint.to_vec())))
-        .map(|c| (c.certificate.clone(), c.names.clone()))
+        .map(|c| CertificateWithNames {
+            certificate: c.certificate.clone(),
+            names: c.names.clone(),
+        })
         .next()
 }
 

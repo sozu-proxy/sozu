@@ -1,104 +1,26 @@
-use std::{
-    cmp::Ordering,
-    collections::{BTreeMap, HashMap},
-    default::Default,
-    fmt,
-    net::SocketAddr,
-};
+use std::{cmp::Ordering, collections::BTreeMap, default::Default, fmt, net::SocketAddr};
 
 use crate::{
     proto::command::{
-        AddBackend, AggregatedMetrics, AvailableMetrics, CertificateSummary, Cluster,
-        FilteredTimeSerie, ListenersList, LoadBalancingParams, PathRule, PathRuleKind,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, RunState, WorkerInfo, WorkerMetrics,
+        AddBackend, FilteredTimeSerie, LoadBalancingParams, PathRule, PathRuleKind,
+        RequestHttpFrontend, RequestTcpFrontend, Response, ResponseContent, ResponseStatus,
+        RulePosition, RunState,
     },
-    request::PROTOCOL_VERSION,
-    state::{ClusterId, ConfigState},
+    state::ClusterId,
 };
-
-/// Responses of the main process to the CLI (or other client)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Response {
-    pub id: String,
-    pub version: u8,
-    pub status: ResponseStatus,
-    pub message: String,
-    pub content: Option<ResponseContent>,
-}
 
 impl Response {
     pub fn new(
-        // id: String,
         status: ResponseStatus,
         message: String,
         content: Option<ResponseContent>,
     ) -> Response {
         Response {
-            version: PROTOCOL_VERSION,
-            id: "generic-response-id-to-be-removed".to_string(),
-            status,
+            status: status as i32,
             message,
             content,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ResponseStatus {
-    Ok,
-    Processing,
-    Failure,
-}
-
-/// details of a response sent by the main process to the client
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ResponseContent {
-    /// a list of workers, with ids, pids, statuses
-    Workers(Vec<WorkerInfo>),
-    /// aggregated metrics of main process and workers
-    Metrics(AggregatedMetrics),
-    /// worker responses to a same query: worker_id -> response_content
-    WorkerResponses(BTreeMap<String, ResponseContent>),
-    /// the state of Sōzu: frontends, backends, listeners, etc.
-    State(Box<ConfigState>),
-    /// a proxy event
-    Event(Event),
-    /// a filtered list of frontend
-    FrontendList(ListedFrontends),
-    // this is new
-    Status(Vec<WorkerInfo>),
-    /// all listeners
-    ListenersList(ListenersList),
-
-    /// contains proxy & cluster metrics
-    WorkerMetrics(WorkerMetrics),
-
-    /// Lists of metrics that are available
-    AvailableMetrics(AvailableMetrics),
-
-    Clusters(Vec<ClusterInformation>),
-    /// cluster id -> hash of cluster information
-    ClustersHashes(BTreeMap<String, u64>),
-
-    /// a list of certificates for each socket address
-    Certificates(HashMap<SocketAddr, Vec<CertificateSummary>>),
-
-    /// returns the certificate matching a request by fingerprint,
-    /// and the list of domain names associated
-    CertificateByFingerprint(Option<(String, Vec<String>)>),
-}
-
-// TODO: the types HttpFrontend, TcpFrontend and Backend are not present,
-// and not meant to be present in proto::command. Find a fix, like using the type HttpRequestFrontend
-#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ClusterInformation {
-    pub configuration: Option<Cluster>,
-    pub http_frontends: Vec<HttpFrontend>,
-    pub https_frontends: Vec<HttpFrontend>,
-    pub tcp_frontends: Vec<TcpFrontend>,
-    pub backends: Vec<Backend>,
 }
 
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -132,6 +54,19 @@ impl Into<RequestHttpFrontend> for HttpFrontend {
             method: self.method,
             position: self.position.into(),
             tags,
+        }
+    }
+}
+
+impl Into<AddBackend> for Backend {
+    fn into(self) -> AddBackend {
+        AddBackend {
+            cluster_id: self.cluster_id,
+            backend_id: self.backend_id,
+            address: self.address.to_string(),
+            sticky_id: self.sticky_id,
+            load_balancing_parameters: self.load_balancing_parameters,
+            backup: self.backup,
         }
     }
 }
@@ -223,14 +158,6 @@ impl Into<RequestTcpFrontend> for TcpFrontend {
     }
 }
 
-// TODO: should contain HttpFrontendConfig and TcpFrontendConfig, or types written in protobuf
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ListedFrontends {
-    pub http_frontends: Vec<HttpFrontend>,
-    pub https_frontends: Vec<HttpFrontend>,
-    pub tcp_frontends: Vec<TcpFrontend>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Backend {
     pub cluster_id: String,
@@ -285,19 +212,6 @@ impl fmt::Display for RunState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
     }
-}
-
-// TODO: remove the SocketAddr type
-/// a backend event that happened on a proxy
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Event {
-    BackendDown(String, SocketAddr),
-    BackendUp(String, SocketAddr),
-    NoAvailableBackends(String),
-    /// indicates a backend that was removed from configuration has no lingering connections
-    /// so it can be safely stopped
-    RemovedBackendHasNoConnections(String, SocketAddr),
 }
 
 #[derive(Serialize)]
@@ -402,8 +316,8 @@ fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
 #[cfg(test)]
 mod tests {
     use crate::proto::command::{
-        filtered_metrics, AggregatedMetrics, BackendMetrics, ClusterMetrics, FilteredMetrics,
-        Percentiles, WorkerInfo, WorkerMetrics,
+        filtered_metrics, response_content::ContentType, AggregatedMetrics, BackendMetrics,
+        ClusterMetrics, FilteredMetrics, Percentiles, WorkerInfo, WorkerInfos, WorkerMetrics,
     };
 
     use super::*;
@@ -440,22 +354,24 @@ mod tests {
         answer_workers_status,
         "../assets/answer_workers_status.json",
         Response {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            status: ResponseStatus::Ok,
+            status: ResponseStatus::Ok as i32,
             message: String::from(""),
-            content: Some(ResponseContent::Workers(vec!(
-                WorkerInfo {
-                    id: 1,
-                    pid: 5678,
-                    run_state: RunState::Running as i32,
-                },
-                WorkerInfo {
-                    id: 0,
-                    pid: 1234,
-                    run_state: RunState::Stopping as i32,
-                },
-            ))),
+            content: Some(ResponseContent {
+                content_type: Some(ContentType::Workers(WorkerInfos {
+                    vec: vec!(
+                        WorkerInfo {
+                            id: 1,
+                            pid: 5678,
+                            run_state: RunState::Running as i32,
+                        },
+                        WorkerInfo {
+                            id: 0,
+                            pid: 1234,
+                            run_state: RunState::Stopping as i32,
+                        },
+                    )
+                }))
+            }),
         }
     );
 
@@ -463,131 +379,137 @@ mod tests {
         answer_metrics,
         "../assets/answer_metrics.json",
         Response {
-            id: "ID_TEST".to_string(),
-            version: 0,
-            status: ResponseStatus::Ok,
+            status: ResponseStatus::Ok as i32,
             message: String::from(""),
-            content: Some(ResponseContent::Metrics(AggregatedMetrics {
-                main: [
-                    (
-                        String::from("sozu.gauge"),
-                        FilteredMetrics {
-                            inner: Some(filtered_metrics::Inner::Gauge(1))
-                        }
-                    ),
-                    (
-                        String::from("sozu.count"),
-                        FilteredMetrics {
-                            inner: Some(filtered_metrics::Inner::Count(-2))
-                        }
-                    ),
-                    (
-                        String::from("sozu.time"),
-                        FilteredMetrics {
-                            inner: Some(filtered_metrics::Inner::Time(1234))
-                        }
-                    ),
-                ]
-                .iter()
-                .cloned()
-                .collect(),
-                workers: [(
-                    String::from("0"),
-                    WorkerMetrics {
-                        proxy: [
-                            (
-                                String::from("sozu.gauge"),
-                                FilteredMetrics {
-                                    inner: Some(filtered_metrics::Inner::Gauge(1))
-                                }
-                            ),
-                            (
-                                String::from("sozu.count"),
-                                FilteredMetrics {
-                                    inner: Some(filtered_metrics::Inner::Count(-2))
-                                }
-                            ),
-                            (
-                                String::from("sozu.time"),
-                                FilteredMetrics {
-                                    inner: Some(filtered_metrics::Inner::Time(1234))
-                                }
-                            ),
-                        ]
-                        .iter()
-                        .cloned()
-                        .collect(),
-                        clusters: [(
-                            String::from("cluster_1"),
-                            ClusterMetrics {
-                                cluster: [(
-                                    String::from("request_time"),
+            content: Some(ResponseContent {
+                content_type: Some(ContentType::Metrics(AggregatedMetrics {
+                    main: [
+                        (
+                            String::from("sozu.gauge"),
+                            FilteredMetrics {
+                                inner: Some(filtered_metrics::Inner::Gauge(1))
+                            }
+                        ),
+                        (
+                            String::from("sozu.count"),
+                            FilteredMetrics {
+                                inner: Some(filtered_metrics::Inner::Count(-2))
+                            }
+                        ),
+                        (
+                            String::from("sozu.time"),
+                            FilteredMetrics {
+                                inner: Some(filtered_metrics::Inner::Time(1234))
+                            }
+                        ),
+                    ]
+                    .iter()
+                    .cloned()
+                    .collect(),
+                    workers: [(
+                        String::from("0"),
+                        WorkerMetrics {
+                            proxy: [
+                                (
+                                    String::from("sozu.gauge"),
                                     FilteredMetrics {
-                                        inner: Some(filtered_metrics::Inner::Percentiles(
-                                            Percentiles {
-                                                samples: 42,
-                                                p_50: 1,
-                                                p_90: 2,
-                                                p_99: 10,
-                                                p_99_9: 12,
-                                                p_99_99: 20,
-                                                p_99_999: 22,
-                                                p_100: 30,
-                                            }
-                                        ))
+                                        inner: Some(filtered_metrics::Inner::Gauge(1))
                                     }
-                                )]
-                                .iter()
-                                .cloned()
-                                .collect(),
-                                backends: vec![BackendMetrics {
-                                    backend_id: String::from("cluster_1-0"),
-                                    metrics: [
-                                        (
-                                            String::from("bytes_in"),
-                                            FilteredMetrics {
-                                                inner: Some(filtered_metrics::Inner::Count(256))
-                                            }
-                                        ),
-                                        (
-                                            String::from("bytes_out"),
-                                            FilteredMetrics {
-                                                inner: Some(filtered_metrics::Inner::Count(128))
-                                            }
-                                        ),
-                                        (
-                                            String::from("percentiles"),
-                                            FilteredMetrics {
-                                                inner: Some(filtered_metrics::Inner::Percentiles(
-                                                    Percentiles {
-                                                        samples: 42,
-                                                        p_50: 1,
-                                                        p_90: 2,
-                                                        p_99: 10,
-                                                        p_99_9: 12,
-                                                        p_99_99: 20,
-                                                        p_99_999: 22,
-                                                        p_100: 30,
-                                                    }
-                                                ))
-                                            }
-                                        )
-                                    ]
+                                ),
+                                (
+                                    String::from("sozu.count"),
+                                    FilteredMetrics {
+                                        inner: Some(filtered_metrics::Inner::Count(-2))
+                                    }
+                                ),
+                                (
+                                    String::from("sozu.time"),
+                                    FilteredMetrics {
+                                        inner: Some(filtered_metrics::Inner::Time(1234))
+                                    }
+                                ),
+                            ]
+                            .iter()
+                            .cloned()
+                            .collect(),
+                            clusters: [(
+                                String::from("cluster_1"),
+                                ClusterMetrics {
+                                    cluster: [(
+                                        String::from("request_time"),
+                                        FilteredMetrics {
+                                            inner: Some(filtered_metrics::Inner::Percentiles(
+                                                Percentiles {
+                                                    samples: 42,
+                                                    p_50: 1,
+                                                    p_90: 2,
+                                                    p_99: 10,
+                                                    p_99_9: 12,
+                                                    p_99_99: 20,
+                                                    p_99_999: 22,
+                                                    p_100: 30,
+                                                }
+                                            ))
+                                        }
+                                    )]
                                     .iter()
                                     .cloned()
-                                    .collect()
-                                }],
-                            }
-                        )]
-                        .iter()
-                        .cloned()
-                        .collect()
-                    }
-                )]
-                .iter()
-                .cloned()
-                .collect()
-            }))
+                                    .collect(),
+                                    backends: vec![BackendMetrics {
+                                        backend_id: String::from("cluster_1-0"),
+                                        metrics: [
+                                            (
+                                                String::from("bytes_in"),
+                                                FilteredMetrics {
+                                                    inner: Some(filtered_metrics::Inner::Count(
+                                                        256
+                                                    ))
+                                                }
+                                            ),
+                                            (
+                                                String::from("bytes_out"),
+                                                FilteredMetrics {
+                                                    inner: Some(filtered_metrics::Inner::Count(
+                                                        128
+                                                    ))
+                                                }
+                                            ),
+                                            (
+                                                String::from("percentiles"),
+                                                FilteredMetrics {
+                                                    inner: Some(
+                                                        filtered_metrics::Inner::Percentiles(
+                                                            Percentiles {
+                                                                samples: 42,
+                                                                p_50: 1,
+                                                                p_90: 2,
+                                                                p_99: 10,
+                                                                p_99_9: 12,
+                                                                p_99_99: 20,
+                                                                p_99_999: 22,
+                                                                p_100: 30,
+                                                            }
+                                                        )
+                                                    )
+                                                }
+                                            )
+                                        ]
+                                        .iter()
+                                        .cloned()
+                                        .collect()
+                                    }],
+                                }
+                            )]
+                            .iter()
+                            .cloned()
+                            .collect()
+                        }
+                    )]
+                    .iter()
+                    .cloned()
+                    .collect()
+                }))
+            })
         }
     );
 }

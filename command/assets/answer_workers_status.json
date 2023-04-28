@@ -1,21 +1,22 @@
 {
-  "id": "ID_TEST",
-  "version": 0,
-  "status": "OK",
+  "status": 0,
   "message": "",
   "content": {
-    "type": "WORKERS",
-    "data": [
-      {
-        "id": 1,
-        "pid": 5678,
-        "run_state": 0
-      },
-      {
-        "id": 0,
-        "pid": 1234,
-        "run_state": 1
+    "content_type": {
+      "WORKERS": {
+        "vec": [
+          {
+            "id": 1,
+            "pid": 5678,
+            "run_state": 0
+          },
+          {
+            "id": 0,
+            "pid": 1234,
+            "run_state": 1
+          }
+        ]
       }
-    ]
+    }
   }
 }

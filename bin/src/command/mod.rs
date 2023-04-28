@@ -25,9 +25,12 @@ use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
     config::Config,
-    proto::command::{request::RequestType, MetricsConfiguration, Request, RunState, Status},
+    proto::command::{
+        request::RequestType, response_content::ContentType, MetricsConfiguration, Request,
+        Response, ResponseContent, ResponseStatus, RunState, Status,
+    },
     request::WorkerRequest,
-    response::{Response, ResponseContent, ResponseStatus, WorkerResponse},
+    response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
@@ -80,9 +83,8 @@ pub enum Advancement {
 // in which case Success caries the response data.
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Success {
-    ClientClose(String),        // the client id
-    ClientNew(String),          // the client id
-    DumpState(ResponseContent), // the cloned state
+    ClientClose(String), // the client id
+    ClientNew(String),   // the client id
     HandledClientRequest,
     ListFrontends(ResponseContent), // the list of frontends
     ListListeners(ResponseContent), // the list of listeners
@@ -117,7 +119,6 @@ impl std::fmt::Display for Success {
         match self {
             Self::ClientClose(id) => write!(f, "Close client: {id}"),
             Self::ClientNew(id) => write!(f, "New client successfully added: {id}"),
-            Self::DumpState(_) => write!(f, "Successfully gathered state from the main process"),
             Self::HandledClientRequest => write!(f, "Successfully handled the client request"),
             Self::ListFrontends(_) => write!(f, "Successfully gathered the list of frontends"),
             Self::ListListeners(_) => write!(f, "Successfully listed all listeners"),
@@ -713,14 +714,19 @@ impl CommandServer {
         response: WorkerResponse,
     ) -> anyhow::Result<Success> {
         // Notify the client with Processing in case of a proxy event
-        if let Some(ResponseContent::Event(event)) = response.content {
+        if let Some(ResponseContent {
+            content_type: Some(ContentType::Event(event)),
+        }) = response.content
+        {
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = Response::new(
                         // response.id.to_string(),
                         ResponseStatus::Processing,
                         format!("{worker_id}"),
-                        Some(ResponseContent::Event(event.clone())),
+                        Some(ResponseContent {
+                            content_type: Some(ContentType::Event(event.clone())),
+                        }),
                     );
                     client_tx
                         .send(event)

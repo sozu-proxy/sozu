@@ -309,15 +309,6 @@ pub enum StateCmd {
         #[clap(short = 'f', long = "file")]
         file: String,
     },
-    #[clap(name = "dump", about = "Dump current state to STDOUT")]
-    Dump {
-        #[clap(
-            short = 'j',
-            long = "json",
-            help = "Print the command result in JSON format"
-        )]
-        json: bool,
-    },
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]

@@ -13,9 +13,8 @@ use std::{
 
 use anyhow::Context;
 use mio::net::UdpSocket;
-use sozu_command::{
-    proto::command::{FilteredMetrics, MetricsConfiguration, QueryMetricsOptions},
-    response::ResponseContent,
+use sozu_command::proto::command::{
+    FilteredMetrics, MetricsConfiguration, QueryMetricsOptions, ResponseContent,
 };
 
 use self::{local_drain::LocalDrain, network_drain::NetworkDrain};

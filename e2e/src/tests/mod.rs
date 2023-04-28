@@ -4,7 +4,7 @@ use std::{io::stdin, net::SocketAddr};
 
 use sozu_command_lib::{
     config::{Config, ListenerBuilder},
-    proto::command::{ActivateListener, ListenerType, Request, request::RequestType},
+    proto::command::{request::RequestType, ActivateListener, ListenerType, Request},
     scm_socket::Listeners,
     state::ConfigState,
 };

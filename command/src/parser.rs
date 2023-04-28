@@ -75,7 +75,7 @@ mod test {
     use super::*;
 
     use crate::{
-        proto::command::{request::RequestType, DumpState, Request, SubscribeEvents},
+        proto::command::{request::RequestType, Request, Status, SubscribeEvents},
         request::WorkerRequest,
     };
 
@@ -84,7 +84,7 @@ mod test {
         let worker_request = WorkerRequest::new(
             "Some request".to_string(),
             Request {
-                request_type: Some(RequestType::DumpState(DumpState {})),
+                request_type: Some(RequestType::Status(Status {})),
             },
         );
 
@@ -122,7 +122,7 @@ mod test {
             WorkerRequest::new(
                 "Yet another request".to_string(),
                 Request {
-                    request_type: Some(RequestType::DumpState(DumpState {})),
+                    request_type: Some(RequestType::Status(Status {})),
                 },
             ),
         ];

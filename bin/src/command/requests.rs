@@ -18,11 +18,12 @@ use sozu_command_lib::{
     logging,
     parser::parse_several_commands,
     proto::command::{
-        request::RequestType, AggregatedMetrics, AvailableMetrics, FrontendFilters, ListenersList,
-        MetricsConfiguration, Request, ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo,
+        request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
+        ClusterHashes, ClusterInformations, FrontendFilters, ListedFrontends, ListenersList,
+        MetricsConfiguration, Request, Response, ResponseContent, ResponseStatus,
+        ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
     },
     request::WorkerRequest,
-    response::{ListedFrontends, Response, ResponseContent, ResponseStatus},
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
 };
@@ -48,7 +49,6 @@ impl CommandServer {
 
         let result: anyhow::Result<Option<Success>> = match request.request_type {
             Some(RequestType::SaveState(path)) => self.save_state(&path).await,
-            Some(RequestType::DumpState(_)) => self.dump_state().await,
             Some(RequestType::ListWorkers(_)) => self.list_workers().await,
             Some(RequestType::ListFrontends(filters)) => self.list_frontends(filters).await,
             Some(RequestType::ListListeners(_)) => self.list_listeners(),
@@ -73,7 +73,6 @@ impl CommandServer {
                 self.reload_configuration(client_id, path).await
             }
             Some(RequestType::Status(_)) => self.status(client_id).await,
-
             Some(RequestType::QueryCertificateByFingerprint(_))
             | Some(RequestType::QueryCertificatesByDomain(_))
             | Some(RequestType::QueryAllCertificates(_))
@@ -162,14 +161,6 @@ impl CommandServer {
         result.with_context(|| "Could not write the state onto the state file")
     }
 
-    pub async fn dump_state(&mut self) -> anyhow::Result<Option<Success>> {
-        let state = self.state.clone();
-
-        Ok(Some(Success::DumpState(ResponseContent::State(Box::new(
-            state,
-        )))))
-    }
-
     pub async fn load_state(
         &mut self,
         client_id: Option<String>,
@@ -211,20 +202,6 @@ impl CommandServer {
                         }
                     }
                     offset = buffer.data().offset(i);
-
-                    /*
-                    TODO: maybe we should put on WorkerRequest the version field we had on CommandRequest: a u32 to track versionning
-                    if requests.iter().any(|o| {
-                        if o.version > PROTOCOL_VERSION {
-                            error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, o.version);
-                            true
-                        } else {
-                            false
-                        }
-                    }) {
-                        break;
-                    }
-                    */
 
                     for request in requests {
                         message_counter += 1;
@@ -377,7 +354,7 @@ impl CommandServer {
             }) {
                 listed_frontends
                     .http_frontends
-                    .push(http_frontend.1.to_owned());
+                    .push(http_frontend.1.to_owned().into());
             }
         }
 
@@ -391,29 +368,31 @@ impl CommandServer {
             }) {
                 listed_frontends
                     .https_frontends
-                    .push(https_frontend.1.to_owned());
+                    .push(https_frontend.1.to_owned().into());
             }
         }
 
         if (filters.tcp || list_all) && filters.domain.is_none() {
             for tcp_frontend in self.state.tcp_fronts.values().flat_map(|v| v.iter()) {
-                listed_frontends.tcp_frontends.push(tcp_frontend.to_owned())
+                listed_frontends
+                    .tcp_frontends
+                    .push(tcp_frontend.to_owned().into())
             }
         }
 
-        Ok(Some(Success::ListFrontends(ResponseContent::FrontendList(
-            listed_frontends,
-        ))))
+        Ok(Some(Success::ListFrontends(ResponseContent {
+            content_type: Some(ContentType::FrontendList(listed_frontends)),
+        })))
     }
 
     fn list_listeners(&self) -> anyhow::Result<Option<Success>> {
-        Ok(Some(Success::ListListeners(
-            ResponseContent::ListenersList(ListenersList {
+        Ok(Some(Success::ListListeners(ResponseContent {
+            content_type: Some(ContentType::ListenersList(ListenersList {
                 http_listeners: self.state.http_listeners.clone(),
                 https_listeners: self.state.https_listeners.clone(),
                 tcp_listeners: self.state.tcp_listeners.clone(),
-            }),
-        )))
+            })),
+        })))
     }
 
     pub async fn list_workers(&mut self) -> anyhow::Result<Option<Success>> {
@@ -429,9 +408,9 @@ impl CommandServer {
 
         debug!("workers: {:#?}", workers);
 
-        Ok(Some(Success::ListWorkers(ResponseContent::Workers(
-            workers,
-        ))))
+        Ok(Some(Success::ListWorkers(ResponseContent {
+            content_type: Some(ContentType::Workers(WorkerInfos { vec: workers })),
+        })))
     }
 
     pub async fn launch_worker(
@@ -964,15 +943,19 @@ impl CommandServer {
                 }
             }
 
-            let worker_info_vec: Vec<WorkerInfo> = worker_info_map
-                .values()
-                .map(|worker_info| worker_info.to_owned())
-                .collect();
+            let worker_info_vec = WorkerInfos {
+                vec: worker_info_map
+                    .values()
+                    .map(|worker_info| worker_info.to_owned())
+                    .collect(),
+            };
 
             return_success(
                 command_tx,
                 thread_client_id,
-                Success::Status(ResponseContent::Status(worker_info_vec)),
+                Success::Status(ResponseContent {
+                    content_type: Some(ContentType::Workers(worker_info_vec)),
+                }),
             )
             .await;
         })
@@ -1084,30 +1067,32 @@ impl CommandServer {
         )
         .await;
 
-        let mut main_response_content = None;
-        match &request.request_type {
-            Some(RequestType::QueryClustersHashes(_)) => {
-                main_response_content =
-                    Some(ResponseContent::ClustersHashes(self.state.hash_state()));
-            }
-            Some(RequestType::QueryClusterById(cluster_id)) => {
-                main_response_content = Some(ResponseContent::Clusters(vec![self
-                    .state
-                    .cluster_state(cluster_id)]))
-            }
+        let main_response_content = match &request.request_type {
+            Some(RequestType::QueryClustersHashes(_)) => Some(ResponseContent {
+                content_type: Some(ContentType::ClusterHashes(ClusterHashes {
+                    map: self.state.hash_state(),
+                })),
+            }),
+            Some(RequestType::QueryClusterById(cluster_id)) => Some(ResponseContent {
+                content_type: Some(ContentType::Clusters(ClusterInformations {
+                    vec: vec![self.state.cluster_state(cluster_id)],
+                })),
+            }),
             Some(RequestType::QueryClustersByDomain(domain)) => {
                 let cluster_ids = get_cluster_ids_by_domain(
                     &self.state,
                     domain.hostname.clone(),
                     domain.path.clone(),
                 );
-                let clusters = cluster_ids
+                let vec = cluster_ids
                     .iter()
                     .map(|cluster_id| self.state.cluster_state(cluster_id))
                     .collect();
-                main_response_content = Some(ResponseContent::Clusters(clusters));
+                Some(ResponseContent {
+                    content_type: Some(ContentType::Clusters(ClusterInformations { vec })),
+                })
             }
-            _ => {}
+            _ => None,
         };
 
         // all these are passed to the thread
@@ -1158,46 +1143,58 @@ impl CommandServer {
                 | &Some(RequestType::QueryClustersByDomain(_)) => {
                     let main = main_response_content.unwrap(); // we should refactor to avoid this unwrap()
                     worker_responses.insert(String::from("main"), main);
-                    ResponseContent::WorkerResponses(worker_responses)
+                    ResponseContent {
+                        content_type: Some(ContentType::WorkerResponses(WorkerResponses {
+                            map: worker_responses,
+                        })),
+                    }
                 }
                 &Some(RequestType::QueryCertificatesByDomain(_))
                 | &Some(RequestType::QueryCertificateByFingerprint(_))
                 | &Some(RequestType::QueryAllCertificates(_)) => {
                     info!("certificates query answer received: {:?}", worker_responses);
-                    ResponseContent::WorkerResponses(worker_responses)
+                    ResponseContent {
+                        content_type: Some(ContentType::WorkerResponses(WorkerResponses {
+                            map: worker_responses,
+                        })),
+                    }
                 }
                 Some(RequestType::QueryMetrics(options)) => {
                     if options.list {
                         let mut summed_proxy_metrics = Vec::new();
                         let mut summed_cluster_metrics = Vec::new();
                         for (_, response) in worker_responses {
-                            if let ResponseContent::AvailableMetrics(AvailableMetrics {
+                            if let Some(ContentType::AvailableMetrics(AvailableMetrics {
                                 proxy_metrics,
                                 cluster_metrics,
-                            }) = response
+                            })) = response.content_type
                             {
                                 summed_proxy_metrics.append(&mut proxy_metrics.clone());
                                 summed_cluster_metrics.append(&mut cluster_metrics.clone());
                             }
                         }
-                        ResponseContent::AvailableMetrics(AvailableMetrics {
-                            proxy_metrics: summed_proxy_metrics,
-                            cluster_metrics: summed_cluster_metrics,
-                        })
+                        ResponseContent {
+                            content_type: Some(ContentType::AvailableMetrics(AvailableMetrics {
+                                proxy_metrics: summed_proxy_metrics,
+                                cluster_metrics: summed_cluster_metrics,
+                            })),
+                        }
                     } else {
                         let workers_metrics = worker_responses
                             .into_iter()
                             .filter_map(|(worker_id, worker_response)| match worker_response {
-                                ResponseContent::WorkerMetrics(worker_metrics) => {
-                                    Some((worker_id, worker_metrics))
-                                }
+                                ResponseContent {
+                                    content_type: Some(ContentType::WorkerMetrics(worker_metrics)),
+                                } => Some((worker_id, worker_metrics)),
                                 _ => None,
                             })
                             .collect();
-                        ResponseContent::Metrics(AggregatedMetrics {
-                            main: main_metrics,
-                            workers: workers_metrics,
-                        })
+                        ResponseContent {
+                            content_type: Some(ContentType::Metrics(AggregatedMetrics {
+                                main: main_metrics,
+                                workers: workers_metrics,
+                            })),
+                        }
                     }
                 }
                 _ => return, // very very unlikely
@@ -1390,8 +1387,7 @@ impl CommandServer {
 
                 let command_response_data = match success {
                     // should list Success::Metrics(crd) as well
-                    Success::DumpState(crd)
-                    | Success::ListFrontends(crd)
+                    Success::ListFrontends(crd)
                     | Success::ListWorkers(crd)
                     | Success::Query(crd)
                     | Success::ListListeners(crd)

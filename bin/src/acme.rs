@@ -12,9 +12,9 @@ use sozu_command_lib::{
     config::Config,
     proto::command::{
         request::RequestType, AddBackend, AddCertificate, CertificateAndKey, PathRule,
-        RemoveBackend, ReplaceCertificate, Request, RequestHttpFrontend, TlsVersion,
+        RemoveBackend, ReplaceCertificate, Request, RequestHttpFrontend, Response, ResponseStatus,
+        TlsVersion,
     },
-    response::{Response, ResponseStatus},
 };
 
 use crate::util;
@@ -408,7 +408,7 @@ fn order_request(channel: &mut Channel<Request, Response>, request: Request) -> 
             .read_message()
             .with_context(|| "Could not read response on channel")?;
 
-        match response.status {
+        match response.status() {
             ResponseStatus::Processing => {
                 // do nothing here
                 // for other messages, we would loop over read_message

@@ -295,6 +295,23 @@ message CertificateSummary {
     required string fingerprint = 2;
 }
 
+message ListOfCertificatesByAddress {
+    repeated CertificatesByAddress certificates = 1;
+}
+
+message CertificatesByAddress {
+    required string address = 1;
+    repeated CertificateSummary certificate_summaries = 2;
+}
+
+// A certificate matching a request by fingerprint,
+// and the list of domain names associated
+message CertificateWithNames {
+    required string certificate = 1;
+    // domain names associated to the fingerprint
+    repeated string names = 2;
+}
+
 enum TlsVersion {
     SSL_V2 = 0;
     SSL_V3 = 1;
@@ -387,6 +404,104 @@ enum MetricsConfiguration {
     CLEAR = 2;
 }
 
+// Response to a request
+message Response {
+    // wether the request was a success, a failure, or is processing
+    required ResponseStatus status = 1 [default = FAILURE];
+    // a success or error message
+    required string message = 2;
+    // response data, if any
+    optional ResponseContent content = 3;
+}
+
+
+// content of a response
+message ResponseContent {
+    oneof content_type {
+        // a list of workers, with ids, pids, statuses
+        WorkerInfos workers = 1;
+        // aggregated metrics of main process and workers
+        AggregatedMetrics metrics = 2;
+        // a collection of worker responses to the same request
+        WorkerResponses worker_responses = 3;
+        // a proxy event
+        Event event = 4;
+        // a filtered list of frontend
+        ListedFrontends frontend_list = 5;
+        // all listeners
+        ListenersList listeners_list = 6;
+        // contains proxy & cluster metrics
+        WorkerMetrics worker_metrics = 7;
+        // Lists of metrics that are available
+        AvailableMetrics available_metrics = 8;
+        // a list of cluster informations
+        ClusterInformations clusters = 9;
+        // collection of hashes of cluster information, 
+        ClusterHashes cluster_hashes = 10;
+        // a list of certificates for each socket address
+        ListOfCertificatesByAddress certificates = 11;
+        // returns the certificate matching a request by fingerprint,
+        // and the list of domain names associated
+        CertificateWithNames certificate_by_fingerprint = 12;
+    }
+}
+
+message WorkerResponses {
+    map<string, ResponseContent> map = 1;
+}
+
+// lists of frontends present in the state
+message ListedFrontends {
+    repeated RequestHttpFrontend http_frontends = 1;
+    repeated RequestHttpFrontend https_frontends = 2;
+    repeated RequestTcpFrontend tcp_frontends = 3;
+}
+
+message ClusterInformations {
+    repeated ClusterInformation vec = 1;
+}
+
+// Information about a given cluster
+// Contains types usually used in requests, because they are readily available in protobuf
+message ClusterInformation {
+    optional Cluster configuration = 1;
+    repeated RequestHttpFrontend http_frontends = 2;
+    repeated RequestHttpFrontend https_frontends = 3;
+    repeated RequestTcpFrontend tcp_frontends = 4;
+    repeated AddBackend backends = 5;
+}
+
+message Event {
+    required EventKind kind = 1;
+    optional string cluster_id = 2;
+    optional string backend_id = 3;
+    optional string address = 4;
+}
+
+enum EventKind {
+    BACKEND_DOWN = 0;
+    BACKEND_UP = 1;
+    NO_AVAILABLE_BACKENDS = 2;
+    REMOVED_BACKEND_HAS_NO_CONNECTIONS = 3;
+}
+
+message ClusterHashes {
+    // cluster id -> hash of cluster information
+    map<string, uint64> map = 1;
+}
+
+enum ResponseStatus {
+    OK = 0;
+    PROCESSING = 1;
+    FAILURE = 2;
+}
+
+// A list of worker infos
+message WorkerInfos {
+    repeated WorkerInfo vec = 1;
+}
+
+// Information about a worker with id, pid, runstate
 message WorkerInfo {
     required uint32 id = 1;
     required int32 pid = 2;

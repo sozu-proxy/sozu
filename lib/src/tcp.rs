@@ -36,10 +36,12 @@ use crate::{
     socket::server_bind,
     sozu_command::{
         logging,
-        proto::command::{ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig},
+        proto::command::{
+            Event, EventKind, ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig,
+        },
         ready::Ready,
         request::WorkerRequest,
-        response::{Event, WorkerResponse},
+        response::WorkerResponse,
         scm_socket::ScmSocket,
         state::ClusterId,
     },
@@ -504,10 +506,12 @@ impl TcpSession {
                         "backend server {} at {} is up",
                         backend.backend_id, backend.address
                     );
-                    push_event(Event::BackendUp(
-                        backend.backend_id.clone(),
-                        backend.address,
-                    ));
+                    push_event(Event {
+                        kind: EventKind::BackendUp as i32,
+                        backend_id: Some(backend.backend_id.to_owned()),
+                        address: Some(backend.address.to_string()),
+                        cluster_id: None,
+                    });
                 }
 
                 if let BackendConnectionStatus::Connecting(start) = last {
@@ -556,10 +560,12 @@ impl TcpSession {
                     self.metrics.backend_id.as_deref()
                 );
 
-                push_event(Event::BackendDown(
-                    backend.backend_id.clone(),
-                    backend.address,
-                ));
+                push_event(Event {
+                    kind: EventKind::BackendDown as i32,
+                    backend_id: Some(backend.backend_id.to_owned()),
+                    address: Some(backend.address.to_string()),
+                    cluster_id: None,
+                });
             }
         }
     }

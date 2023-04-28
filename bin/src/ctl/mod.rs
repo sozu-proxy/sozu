@@ -7,7 +7,11 @@ use std::time::Duration;
 
 use anyhow::Context;
 
-use sozu_command_lib::{channel::Channel, config::Config, proto::command::Request, response::Response};
+use sozu_command_lib::{
+    channel::Channel,
+    config::Config,
+    proto::command::{Request, Response},
+};
 
 use crate::{
     cli::{self, *},
@@ -78,7 +82,6 @@ impl CommandManager {
             SubCmd::State { cmd } => match cmd {
                 StateCmd::Save { file } => self.save_state(file),
                 StateCmd::Load { file } => self.load_state(file),
-                StateCmd::Dump { json } => self.dump_state(json),
             },
             SubCmd::Reload { file, json } => self.reload_configuration(file, json),
             SubCmd::Cluster { cmd } => self.cluster_command(cmd),

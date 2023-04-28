@@ -3,12 +3,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
-use sozu_command_lib::{
-    proto::command::{
-        filtered_metrics, AggregatedMetrics, AvailableMetrics, ClusterMetrics, FilteredMetrics,
-        ListenersList, WorkerInfo, WorkerMetrics,
-    },
-    response::{ListedFrontends, ResponseContent},
+use sozu_command_lib::proto::command::{
+    filtered_metrics, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
+    ClusterMetrics, FilteredMetrics, ListedFrontends, ListenersList, ResponseContent, WorkerInfos,
+    WorkerMetrics,
 };
 
 pub fn print_listeners(listeners_list: ListenersList) {
@@ -115,12 +113,12 @@ pub fn print_listeners(listeners_list: ListenersList) {
     }
 }
 
-pub fn print_status(worker_info_vec: Vec<WorkerInfo>) {
+pub fn print_status(worker_infos: WorkerInfos) {
     let mut table = Table::new();
     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
     table.add_row(row!["worker id", "pid", "run state"]);
 
-    for worker_info in worker_info_vec {
+    for worker_info in worker_infos.vec {
         let row = row!(worker_info.id, worker_info.pid, worker_info.run_state);
         table.add_row(row);
     }
@@ -155,7 +153,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
                 format!("{:?}", http_frontend.path),
                 format!("{:?}", http_frontend.method),
                 format!("{:?}", http_frontend.position),
-                format_tags_to_string(http_frontend.tags.as_ref())
+                format_tags_to_string(&http_frontend.tags)
             ));
         }
         table.printstd();
@@ -186,7 +184,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
                 format!("{:?}", https_frontend.path),
                 format!("{:?}", https_frontend.method),
                 format!("{:?}", https_frontend.position),
-                format_tags_to_string(https_frontend.tags.as_ref())
+                format_tags_to_string(&https_frontend.tags)
             ));
         }
         table.printstd();
@@ -202,7 +200,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
             table.add_row(row!(
                 tcp_frontend.cluster_id,
                 tcp_frontend.address,
-                format_tags_to_string(tcp_frontend.tags.as_ref())
+                format_tags_to_string(&tcp_frontend.tags)
             ));
         }
         table.printstd();
@@ -405,31 +403,36 @@ pub fn create_queried_cluster_table(
 pub fn print_query_response_data(
     cluster_id: Option<String>,
     domain: Option<String>,
-    data: Option<ResponseContent>,
+    content: ResponseContent,
     json: bool,
 ) -> anyhow::Result<()> {
     if let Some(needle) = cluster_id.or(domain) {
-        if let Some(ResponseContent::WorkerResponses(data)) = &data {
+        if let Some(ContentType::WorkerResponses(worker_responses)) = &content.content_type {
             if json {
-                return print_json_response(data);
+                return print_json_response(worker_responses);
             }
 
             let cluster_headers = vec!["id", "sticky_session", "https_redirect"];
-            let mut cluster_table = create_queried_cluster_table(cluster_headers, data);
+            let mut cluster_table =
+                create_queried_cluster_table(cluster_headers, &worker_responses.map);
 
             let http_headers = vec!["id", "hostname", "path"];
-            let mut frontend_table = create_queried_cluster_table(http_headers, data);
+            let mut frontend_table =
+                create_queried_cluster_table(http_headers, &worker_responses.map);
 
             let https_headers = vec!["id", "hostname", "path"];
-            let mut https_frontend_table = create_queried_cluster_table(https_headers, data);
+            let mut https_frontend_table =
+                create_queried_cluster_table(https_headers, &worker_responses.map);
 
             let tcp_headers = vec!["id", "address"];
-            let mut tcp_frontend_table = create_queried_cluster_table(tcp_headers, data);
+            let mut tcp_frontend_table =
+                create_queried_cluster_table(tcp_headers, &worker_responses.map);
 
             let backend_headers = vec!["backend id", "IP address", "Backup"];
-            let mut backend_table = create_queried_cluster_table(backend_headers, data);
+            let mut backend_table =
+                create_queried_cluster_table(backend_headers, &worker_responses.map);
 
-            let keys: HashSet<&String> = data.keys().collect();
+            let keys: HashSet<&String> = worker_responses.map.keys().collect();
 
             let mut cluster_data = HashMap::new();
             let mut frontend_data = HashMap::new();
@@ -437,10 +440,10 @@ pub fn print_query_response_data(
             let mut tcp_frontend_data = HashMap::new();
             let mut backend_data = HashMap::new();
 
-            for (key, metrics) in data.iter() {
+            for (key, response_content) in worker_responses.map.iter() {
                 //let m: u8 = metrics;
-                if let ResponseContent::Clusters(clusters) = metrics {
-                    for cluster in clusters.iter() {
+                if let Some(ContentType::Clusters(clusters)) = &response_content.content_type {
+                    for cluster in clusters.vec.iter() {
                         let entry = cluster_data.entry(cluster).or_insert(Vec::new());
                         entry.push(key.to_owned());
 
@@ -591,11 +594,11 @@ pub fn print_query_response_data(
 
             backend_table.printstd();
         }
-    } else if let Some(ResponseContent::WorkerResponses(data)) = &data {
+    } else if let Some(ContentType::WorkerResponses(worker_responses)) = &content.content_type {
         let mut table = Table::new();
         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
         let mut header = vec![cell!("key")];
-        for key in data.keys() {
+        for key in worker_responses.map.keys() {
             header.push(cell!(&key));
         }
         header.push(cell!("desynchronized"));
@@ -603,10 +606,10 @@ pub fn print_query_response_data(
 
         let mut query_data = HashMap::new();
 
-        for metrics in data.values() {
+        for response_content in worker_responses.map.values() {
             //let m: u8 = metrics;
-            if let ResponseContent::ClustersHashes(clusters) = metrics {
-                for (key, value) in clusters.iter() {
+            if let Some(ContentType::ClusterHashes(clusters)) = &response_content.content_type {
+                for (key, value) in clusters.map.iter() {
                     query_data.entry(key).or_insert(Vec::new()).push(value);
                 }
             }
@@ -643,12 +646,12 @@ pub fn print_certificates(
     }
 
     for (_worker_id, response_content) in response_contents.iter() {
-        match response_content {
-            ResponseContent::Certificates(h) => {
-                for (addr, h2) in h.iter() {
-                    println!("\t{addr}:");
+        match &response_content.content_type {
+            Some(ContentType::Certificates(list)) => {
+                for certs in list.certificates.iter() {
+                    println!("\t{}:", certs.address);
 
-                    for summary in h2.iter() {
+                    for summary in certs.certificate_summaries.iter() {
                         println!(
                             "\t\t{}:\t{}",
                             summary.domain,
@@ -659,12 +662,11 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            ResponseContent::CertificateByFingerprint(opt) => {
-                if let Some((s, v)) = opt {
-                    println!("\tfrontends: {v:?}\ncertificate:\n{s}");
-                } else {
-                    println!("\tnot found");
-                }
+            Some(ContentType::CertificateByFingerprint(cert)) => {
+                println!(
+                    "\tfrontends: {:?}\ncertificate:\n{}",
+                    cert.names, cert.certificate
+                );
             }
             _ => {}
         }
@@ -673,14 +675,11 @@ pub fn print_certificates(
     Ok(())
 }
 
-fn format_tags_to_string(tags: Option<&BTreeMap<String, String>>) -> String {
-    tags.map(|tags| {
-        tags.iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    })
-    .unwrap_or_default()
+fn format_tags_to_string(tags: &BTreeMap<String, String>) -> String {
+    tags.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub fn print_available_metrics(available_metrics: &AvailableMetrics) -> anyhow::Result<()> {

@@ -1,14 +1,11 @@
 use anyhow::{self, bail, Context};
 use prettytable::Table;
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::Serialize;
 
-use sozu_command_lib::{
-    proto::command::{
-        request::RequestType, ListWorkers, QueryAllCertificates, QueryClusterByDomain,
-        QueryClustersHashes, QueryMetricsOptions, Request, RunState, UpgradeMain, WorkerInfo,
-    },
-    response::{Response, ResponseContent, ResponseStatus},
+use sozu_command_lib::proto::command::{
+    request::RequestType, response_content::ContentType, ListWorkers, QueryAllCertificates,
+    QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions, Request, Response,
+    ResponseContent, ResponseStatus, RunState, UpgradeMain, WorkerInfo,
 };
 
 use crate::ctl::{
@@ -25,26 +22,6 @@ use crate::ctl::{
 struct WorkerStatus<'a> {
     pub worker: &'a WorkerInfo,
     pub status: &'a String,
-}
-
-/*
-fn generate_id() -> String {
-    let s: String = thread_rng()
-    .sample_iter(&Alphanumeric)
-    .take(6)
-    .map(|c| c as char)
-    .collect();
-format!("ID-{s}")
-}
-*/
-
-fn generate_tagged_id(tag: &str) -> String {
-    let s: String = thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(6)
-        .map(|c| c as char)
-        .collect();
-    format!("{tag}-{s}")
 }
 
 impl CommandManager {
@@ -69,8 +46,6 @@ impl CommandManager {
         request: Request,
         json: bool,
     ) -> Result<(), anyhow::Error> {
-        // let id = generate_id();
-
         println!("Sending request : {request:?}");
 
         self.channel
@@ -80,7 +55,7 @@ impl CommandManager {
         loop {
             let response = self.read_channel_message_with_timeout()?;
 
-            match response.status {
+            match response.status() {
                 ResponseStatus::Processing => println!("Proxy is processing: {}", response.message),
                 ResponseStatus::Failure => bail!("Request failed: {}", response.message),
                 ResponseStatus::Ok => {
@@ -91,32 +66,19 @@ impl CommandManager {
                         println!("Success: {}", response.message);
                     }
                     match response.content {
-                        Some(response_content) => match response_content {
-                            ResponseContent::Workers(_)
-                            | ResponseContent::Metrics(_)
-                            | ResponseContent::WorkerResponses(_)
-                            | ResponseContent::WorkerMetrics(_)
-                            | ResponseContent::ClustersHashes(_)
-                            | ResponseContent::Clusters(_)
-                            | ResponseContent::CertificateByFingerprint(_)
-                            | ResponseContent::Certificates(_)
-                            | ResponseContent::AvailableMetrics(_)
-                            | ResponseContent::Event(_) => {}
-                            ResponseContent::State(state) => match json {
-                                true => print_json_response(&state)?,
-                                false => println!("{state:#?}"),
-                            },
-                            ResponseContent::FrontendList(frontends) => {
+                        Some(response_content) => match response_content.content_type {
+                            Some(ContentType::FrontendList(frontends)) => {
                                 print_frontend_list(frontends)
                             }
-                            ResponseContent::Status(worker_info_vec) => {
+                            Some(ContentType::Workers(worker_infos)) => {
                                 if json {
-                                    print_json_response(&worker_info_vec)?;
+                                    print_json_response(&worker_infos)?;
                                 } else {
-                                    print_status(worker_info_vec);
+                                    print_status(worker_infos);
                                 }
                             }
-                            ResponseContent::ListenersList(list) => print_listeners(list),
+                            Some(ContentType::ListenersList(list)) => print_listeners(list),
+                            _ => {}
                         },
                         None => {}
                     }
@@ -140,7 +102,7 @@ impl CommandManager {
         loop {
             let response = self.read_channel_message_with_timeout()?;
 
-            match response.status {
+            match response.status() {
                 ResponseStatus::Processing => {
                     println!("Processing: {}", response.message);
                 }
@@ -151,11 +113,14 @@ impl CommandManager {
                     );
                 }
                 ResponseStatus::Ok => {
-                    if let Some(ResponseContent::Workers(ref workers)) = response.content {
+                    if let Some(ResponseContent {
+                        content_type: Some(ContentType::Workers(ref worker_infos)),
+                    }) = response.content
+                    {
                         let mut table = Table::new();
                         table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
                         table.add_row(row!["Worker", "pid", "run state"]);
-                        for worker in workers.iter() {
+                        for worker in worker_infos.vec.iter() {
                             let run_state = format!("{:?}", worker.run_state);
                             table.add_row(row![worker.id, worker.pid, run_state]);
                         }
@@ -163,7 +128,6 @@ impl CommandManager {
                         table.printstd();
                         println!();
 
-                        let id = generate_tagged_id("UPGRADE-MAIN");
                         self.send_request(Request {
                             request_type: Some(RequestType::UpgradeMain(UpgradeMain {})),
                         })?;
@@ -173,11 +137,7 @@ impl CommandManager {
                         loop {
                             let response = self.read_channel_message_with_timeout()?;
 
-                            if id != response.id {
-                                bail!("Error: received unexpected message: {:?}", response);
-                            }
-
-                            match response.status {
+                            match response.status() {
                                 ResponseStatus::Processing => {
                                     println!("Main process is upgrading");
                                 }
@@ -203,7 +163,8 @@ impl CommandManager {
                             .with_context(|| "could not reconnect to the command unix socket")?;
 
                         // Do a rolling restart of the workers
-                        let running_workers = workers
+                        let running_workers = worker_infos
+                            .vec
                             .iter()
                             .filter(|worker| worker.run_state == RunState::Running as i32)
                             .collect::<Vec<_>>();
@@ -243,7 +204,7 @@ impl CommandManager {
         loop {
             let response = self.read_channel_message_with_timeout()?;
 
-            match response.status {
+            match response.status() {
                 ResponseStatus::Processing => info!("Proxy is processing: {}", response.message),
                 ResponseStatus::Failure => bail!(
                     "could not stop the worker {}: {}",
@@ -291,7 +252,7 @@ impl CommandManager {
             loop {
                 let response = self.read_channel_message_with_timeout()?;
 
-                match response.status {
+                match response.status() {
                     ResponseStatus::Processing => {
                         println!("Proxy is processing: {}", response.message);
                     }
@@ -303,15 +264,18 @@ impl CommandManager {
                         }
                     }
                     ResponseStatus::Ok => {
-                        match response.content {
-                            Some(ResponseContent::Metrics(aggregated_metrics_data)) => {
-                                print_metrics(aggregated_metrics_data, json)?
+                        if let Some(response_content) = response.content {
+                            match response_content.content_type {
+                                Some(ContentType::Metrics(aggregated_metrics_data)) => {
+                                    print_metrics(aggregated_metrics_data, json)?
+                                }
+                                Some(ContentType::AvailableMetrics(available)) => {
+                                    print_available_metrics(&available)?;
+                                }
+                                _ => println!("Wrong kind of response here"),
                             }
-                            Some(ResponseContent::AvailableMetrics(available)) => {
-                                print_available_metrics(&available)?;
-                            }
-                            _ => println!("Wrong kind of response here"),
                         }
+
                         break;
                     }
                 }
@@ -376,7 +340,7 @@ impl CommandManager {
         loop {
             let response = self.read_channel_message_with_timeout()?;
 
-            match response.status {
+            match response.status() {
                 ResponseStatus::Processing => {
                     println!("Proxy is processing: {}", response.message);
                 }
@@ -387,7 +351,12 @@ impl CommandManager {
                     bail!("could not query proxy state: {}", response.message);
                 }
                 ResponseStatus::Ok => {
-                    print_query_response_data(cluster_id, domain, response.content, json)?;
+                    match response.content {
+                        Some(content) => {
+                            print_query_response_data(cluster_id, domain, content, json)?
+                        }
+                        None => println!("No content in the response"),
+                    }
                     break;
                 }
             }
@@ -427,7 +396,7 @@ impl CommandManager {
         loop {
             let response = self.read_channel_message_with_timeout()?;
 
-            match response.status {
+            match response.status() {
                 ResponseStatus::Processing => {
                     println!("Proxy is processing: {}", response.message);
                 }
@@ -441,9 +410,9 @@ impl CommandManager {
                 }
                 ResponseStatus::Ok => {
                     match response.content {
-                        Some(ResponseContent::WorkerResponses(data)) => {
-                            print_certificates(data, json)?
-                        }
+                        Some(ResponseContent {
+                            content_type: Some(ContentType::WorkerResponses(worker_responses)),
+                        }) => print_certificates(worker_responses.map, json)?,
                         _ => bail!("unexpected response: {:?}", response.content),
                     }
                     break;
