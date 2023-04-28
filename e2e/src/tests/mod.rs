@@ -4,8 +4,7 @@ use std::{io::stdin, net::SocketAddr};
 
 use sozu_command_lib::{
     config::{Config, ListenerBuilder},
-    proto::command::{ActivateListener, ListenerType},
-    request::Request,
+    proto::command::{ActivateListener, ListenerType, Request, request::RequestType},
     scm_socket::Listeners,
     state::ConfigState,
 };
@@ -43,30 +42,42 @@ pub fn setup_test<S: Into<String>>(
 ) -> (Worker, Vec<SocketAddr>) {
     let mut worker = Worker::start_new_worker(name, config, &listeners, state);
 
-    worker.send_proxy_request(Request::AddHttpListener(
-        ListenerBuilder::new_http(front_address).to_http().unwrap(),
-    ));
-    worker.send_proxy_request(Request::ActivateListener(ActivateListener {
-        address: front_address.to_string(),
-        proxy: ListenerType::Http.into(),
-        from_scm: false,
-    }));
-    worker.send_proxy_request(Request::AddCluster(Worker::default_cluster("cluster_0")));
-    worker.send_proxy_request(Request::AddHttpFrontend(Worker::default_http_frontend(
-        "cluster_0",
-        front_address,
-    )));
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::AddHttpListener(
+            ListenerBuilder::new_http(front_address).to_http().unwrap(),
+        )),
+    });
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::ActivateListener(ActivateListener {
+            address: front_address.to_string(),
+            proxy: ListenerType::Http.into(),
+            from_scm: false,
+        })),
+    });
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::AddCluster(Worker::default_cluster(
+            "cluster_0",
+        ))),
+    });
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+            "cluster_0",
+            front_address,
+        ))),
+    });
 
     let mut backends = Vec::new();
     for i in 0..nb_backends {
         let back_address: SocketAddr = format!("127.0.0.1:{}", 2002 + i)
             .parse()
             .expect("could not parse back address");
-        worker.send_proxy_request(Request::AddBackend(Worker::default_backend(
-            "cluster_0",
-            format!("cluster_0-{i}"),
-            back_address.to_string(),
-        )));
+        worker.send_proxy_request(Request {
+            request_type: Some(RequestType::AddBackend(Worker::default_backend(
+                "cluster_0",
+                format!("cluster_0-{i}"),
+                back_address.to_string(),
+            ))),
+        });
         backends.push(back_address);
     }
 

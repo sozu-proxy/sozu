@@ -6,13 +6,13 @@ use sozu_command_lib::{
     certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
     config::{Config, ListenerBuilder},
     proto::command::{
-        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        DeactivateListener, FrontendFilters, ListenerType, LoadBalancingParams,
-        MetricsConfiguration, PathRule, ProxyProtocolConfig, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
+        Cluster, DeactivateListener, DumpState, FrontendFilters, HardStop, ListListeners,
+        ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
+        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, SoftStop, Status, SubscribeEvents,
         TlsVersion,
     },
-    request::Request,
 };
 
 use crate::{
@@ -27,31 +27,50 @@ impl CommandManager {
     pub fn save_state(&mut self, path: String) -> anyhow::Result<()> {
         println!("Loading the state to file {path}");
 
-        self.order_request(Request::SaveState { path })
+        self.order_request(Request {
+            request_type: Some(RequestType::SaveState(path)),
+        })
     }
 
     pub fn load_state(&mut self, path: String) -> anyhow::Result<()> {
         println!("Loading the state on path {path}");
 
-        self.order_request(Request::LoadState { path })
+        self.order_request(Request {
+            request_type: Some(RequestType::LoadState(path)),
+        })
     }
 
     pub fn dump_state(&mut self, json: bool) -> anyhow::Result<()> {
         println!("Dumping the state, json={json}");
 
-        self.order_request_to_all_workers(Request::DumpState, json)
+        self.order_request_to_all_workers(
+            Request {
+                request_type: Some(RequestType::DumpState(DumpState {})),
+            },
+            json,
+        )
     }
 
     pub fn soft_stop(&mut self) -> anyhow::Result<()> {
         println!("shutting down proxy softly");
 
-        self.order_request_to_all_workers(Request::SoftStop, false)
+        self.order_request_to_all_workers(
+            Request {
+                request_type: Some(RequestType::SoftStop(SoftStop {})),
+            },
+            false,
+        )
     }
 
     pub fn hard_stop(&mut self) -> anyhow::Result<()> {
         println!("shutting down proxy the hard way");
 
-        self.order_request_to_all_workers(Request::HardStop, false)
+        self.order_request_to_all_workers(
+            Request {
+                request_type: Some(RequestType::HardStop(HardStop {})),
+            },
+            false,
+        )
     }
     /*
     pub fn upgrade_worker(&mut self, worker_id: u32) -> anyhow::Result<()> {
@@ -68,7 +87,12 @@ impl CommandManager {
     pub fn status(&mut self, json: bool) -> anyhow::Result<()> {
         println!("Requesting status…");
 
-        self.order_request_to_all_workers(Request::Status, json)
+        self.order_request_to_all_workers(
+            Request {
+                request_type: Some(RequestType::Status(Status {})),
+            },
+            json,
+        )
     }
 
     pub fn configure_metrics(&mut self, cmd: MetricsCmd) -> anyhow::Result<()> {
@@ -81,13 +105,23 @@ impl CommandManager {
             _ => bail!("The command passed to the configure_metrics function is wrong."),
         };
 
-        self.order_request(Request::ConfigureMetrics(configuration))
+        self.order_request(Request {
+            request_type: Some(RequestType::ConfigureMetrics(configuration as i32)),
+        })
     }
 
     pub fn reload_configuration(&mut self, path: Option<String>, json: bool) -> anyhow::Result<()> {
         println!("Reloading configuration…");
-
-        self.order_request_to_all_workers(Request::ReloadConfiguration { path }, json)
+        let path = match path {
+            Some(p) => p,
+            None => String::new(),
+        };
+        self.order_request_to_all_workers(
+            Request {
+                request_type: Some(RequestType::ReloadConfiguration(path)),
+            },
+            json,
+        )
     }
 
     pub fn list_frontends(
@@ -99,16 +133,20 @@ impl CommandManager {
     ) -> anyhow::Result<()> {
         println!("Listing frontends");
 
-        self.order_request(Request::ListFrontends(FrontendFilters {
-            http,
-            https,
-            tcp,
-            domain,
-        }))
+        self.order_request(Request {
+            request_type: Some(RequestType::ListFrontends(FrontendFilters {
+                http,
+                https,
+                tcp,
+                domain,
+            })),
+        })
     }
 
     pub fn events(&mut self) -> anyhow::Result<()> {
-        self.order_request(Request::SubscribeEvents)
+        self.order_request(Request {
+            request_type: Some(RequestType::SubscribeEvents(SubscribeEvents {})),
+        })
     }
 
     pub fn backend_command(&mut self, cmd: BackendCmd) -> anyhow::Result<()> {
@@ -119,23 +157,27 @@ impl CommandManager {
                 address,
                 sticky_id,
                 backup,
-            } => self.order_request(Request::AddBackend(AddBackend {
-                cluster_id: id,
-                address: address.to_string(),
-                backend_id,
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                sticky_id,
-                backup,
-            })),
+            } => self.order_request(Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: id,
+                    address: address.to_string(),
+                    backend_id,
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    sticky_id,
+                    backup,
+                })),
+            }),
             BackendCmd::Remove {
                 id,
                 backend_id,
                 address,
-            } => self.order_request(Request::RemoveBackend(RemoveBackend {
-                cluster_id: id,
-                address: address.to_string(),
-                backend_id,
-            })),
+            } => self.order_request(Request {
+                request_type: Some(RequestType::RemoveBackend(RemoveBackend {
+                    cluster_id: id,
+                    address: address.to_string(),
+                    backend_id,
+                })),
+            }),
         }
     }
 
@@ -155,37 +197,39 @@ impl CommandManager {
                     (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
                     _ => None,
                 };
-                self.order_request(Request::AddCluster(Cluster {
-                    cluster_id: id,
-                    sticky_session,
-                    https_redirect,
-                    proxy_protocol: proxy_protocol.and_then(|pp| Some(pp as i32)),
-                    load_balancing: load_balancing_policy as i32,
-                    ..Default::default()
-                }))
+                self.order_request(Request {
+                    request_type: Some(RequestType::AddCluster(Cluster {
+                        cluster_id: id,
+                        sticky_session,
+                        https_redirect,
+                        proxy_protocol: proxy_protocol.and_then(|pp| Some(pp as i32)),
+                        load_balancing: load_balancing_policy as i32,
+                        ..Default::default()
+                    })),
+                })
             }
-            ClusterCmd::Remove { id } => {
-                self.order_request(Request::RemoveCluster { cluster_id: id })
-            }
+            ClusterCmd::Remove { id } => self.order_request(Request {
+                request_type: Some(RequestType::RemoveCluster(id)),
+            }),
         }
     }
 
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> anyhow::Result<()> {
         match cmd {
-            TcpFrontendCmd::Add { id, address, tags } => {
-                self.order_request(Request::AddTcpFrontend(RequestTcpFrontend {
+            TcpFrontendCmd::Add { id, address, tags } => self.order_request(Request {
+                request_type: Some(RequestType::AddTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address: address.to_string(),
                     tags: tags.unwrap_or(BTreeMap::new()),
-                }))
-            }
-            TcpFrontendCmd::Remove { id, address } => {
-                self.order_request(Request::RemoveTcpFrontend(RequestTcpFrontend {
+                })),
+            }),
+            TcpFrontendCmd::Remove { id, address } => self.order_request(Request {
+                request_type: Some(RequestType::RemoveTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address: address.to_string(),
                     ..Default::default()
-                }))
-            }
+                })),
+            }),
         }
     }
 
@@ -200,18 +244,20 @@ impl CommandManager {
                 method,
                 cluster_id: route,
                 tags,
-            } => self.order_request(Request::AddHttpFrontend(RequestHttpFrontend {
-                cluster_id: route.into(),
-                address: address.to_string(),
-                hostname,
-                path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                method: method.map(String::from),
-                position: RulePosition::Tree.into(),
-                tags: match tags {
-                    Some(tags) => tags,
-                    None => BTreeMap::new(),
-                },
-            })),
+            } => self.order_request(Request {
+                request_type: Some(RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: route.into(),
+                    address: address.to_string(),
+                    hostname,
+                    path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
+                    method: method.map(String::from),
+                    position: RulePosition::Tree.into(),
+                    tags: match tags {
+                        Some(tags) => tags,
+                        None => BTreeMap::new(),
+                    },
+                })),
+            }),
 
             HttpFrontendCmd::Remove {
                 hostname,
@@ -221,14 +267,16 @@ impl CommandManager {
                 address,
                 method,
                 cluster_id: route,
-            } => self.order_request(Request::RemoveHttpFrontend(RequestHttpFrontend {
-                cluster_id: route.into(),
-                address: address.to_string(),
-                hostname,
-                path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                method: method.map(String::from),
-                ..Default::default()
-            })),
+            } => self.order_request(Request {
+                request_type: Some(RequestType::RemoveHttpFrontend(RequestHttpFrontend {
+                    cluster_id: route.into(),
+                    address: address.to_string(),
+                    hostname,
+                    path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
+                    method: method.map(String::from),
+                    ..Default::default()
+                })),
+            }),
         }
     }
 
@@ -243,18 +291,20 @@ impl CommandManager {
                 method,
                 cluster_id: route,
                 tags,
-            } => self.order_request(Request::AddHttpsFrontend(RequestHttpFrontend {
-                cluster_id: route.into(),
-                address: address.to_string(),
-                hostname,
-                path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                method: method.map(String::from),
-                position: RulePosition::Tree.into(),
-                tags: match tags {
-                    Some(tags) => tags,
-                    None => BTreeMap::new(),
-                },
-            })),
+            } => self.order_request(Request {
+                request_type: Some(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                    cluster_id: route.into(),
+                    address: address.to_string(),
+                    hostname,
+                    path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
+                    method: method.map(String::from),
+                    position: RulePosition::Tree.into(),
+                    tags: match tags {
+                        Some(tags) => tags,
+                        None => BTreeMap::new(),
+                    },
+                })),
+            }),
             HttpFrontendCmd::Remove {
                 hostname,
                 path_prefix,
@@ -263,14 +313,16 @@ impl CommandManager {
                 address,
                 method,
                 cluster_id: route,
-            } => self.order_request(Request::RemoveHttpsFrontend(RequestHttpFrontend {
-                cluster_id: route.into(),
-                address: address.to_string(),
-                hostname,
-                path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
-                method: method.map(String::from),
-                ..Default::default()
-            })),
+            } => self.order_request(Request {
+                request_type: Some(RequestType::RemoveHttpsFrontend(RequestHttpFrontend {
+                    cluster_id: route.into(),
+                    address: address.to_string(),
+                    hostname,
+                    path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
+                    method: method.map(String::from),
+                    ..Default::default()
+                })),
+            }),
         }
     }
 
@@ -305,7 +357,9 @@ impl CommandManager {
                     .to_tls()
                     .with_context(|| "Error creating HTTPS listener")?;
 
-                self.order_request(Request::AddHttpsListener(https_listener))
+                self.order_request(Request {
+                    request_type: Some(RequestType::AddHttpsListener(https_listener)),
+                })
             }
             HttpsListenerCmd::Remove { address } => {
                 self.remove_listener(address.to_string(), ListenerType::Https)
@@ -345,7 +399,9 @@ impl CommandManager {
                     .with_connect_timeout(connect_timeout)
                     .to_http()
                     .with_context(|| "Error creating HTTP listener")?;
-                self.order_request(Request::AddHttpListener(http_listener))
+                self.order_request(Request {
+                    request_type: Some(RequestType::AddHttpListener(http_listener)),
+                })
             }
             HttpListenerCmd::Remove { address } => {
                 self.remove_listener(address.to_string(), ListenerType::Http)
@@ -372,7 +428,9 @@ impl CommandManager {
                     .to_tcp()
                     .with_context(|| "Could not create TCP listener")?;
 
-                self.order_request(Request::AddTcpListener(listener))
+                self.order_request(Request {
+                    request_type: Some(RequestType::AddTcpListener(listener)),
+                })
             }
             TcpListenerCmd::Remove { address } => {
                 self.remove_listener(address.to_string(), ListenerType::Tcp)
@@ -387,7 +445,9 @@ impl CommandManager {
     }
 
     pub fn list_listeners(&mut self) -> anyhow::Result<()> {
-        self.order_request(Request::ListListeners)
+        self.order_request(Request {
+            request_type: Some(RequestType::ListListeners(ListListeners {})),
+        })
     }
 
     pub fn remove_listener(
@@ -395,10 +455,12 @@ impl CommandManager {
         address: String,
         listener_type: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_request(Request::RemoveListener(RemoveListener {
-            address: address.parse().with_context(|| "wrong socket address")?,
-            proxy: listener_type.into(),
-        }))
+        self.order_request(Request {
+            request_type: Some(RequestType::RemoveListener(RemoveListener {
+                address: address.parse().with_context(|| "wrong socket address")?,
+                proxy: listener_type.into(),
+            })),
+        })
     }
 
     pub fn activate_listener(
@@ -406,11 +468,13 @@ impl CommandManager {
         address: String,
         listener_type: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_request(Request::ActivateListener(ActivateListener {
-            address: address.parse().with_context(|| "wrong socket address")?,
-            proxy: listener_type.into(),
-            from_scm: false,
-        }))
+        self.order_request(Request {
+            request_type: Some(RequestType::ActivateListener(ActivateListener {
+                address: address.parse().with_context(|| "wrong socket address")?,
+                proxy: listener_type.into(),
+                from_scm: false,
+            })),
+        })
     }
 
     pub fn deactivate_listener(
@@ -418,16 +482,20 @@ impl CommandManager {
         address: String,
         listener_type: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_request(Request::DeactivateListener(DeactivateListener {
-            // address,
-            address: address.parse().with_context(|| "wrong socket address")?,
-            proxy: listener_type.into(),
-            to_scm: false,
-        }))
+        self.order_request(Request {
+            request_type: Some(RequestType::DeactivateListener(DeactivateListener {
+                // address,
+                address: address.parse().with_context(|| "wrong socket address")?,
+                proxy: listener_type.into(),
+                to_scm: false,
+            })),
+        })
     }
 
     pub fn logging_filter(&mut self, filter: &LoggingLevel) -> anyhow::Result<()> {
-        self.order_request(Request::Logging(filter.to_string().to_lowercase()))
+        self.order_request(Request {
+            request_type: Some(RequestType::Logging(filter.to_string().to_lowercase())),
+        })
     }
 
     pub fn add_certificate(
@@ -447,11 +515,13 @@ impl CommandManager {
         )
         .with_context(|| "Could not load the full certificate")?;
 
-        self.order_request(Request::AddCertificate(AddCertificate {
-            address,
-            certificate: new_certificate,
-            expired_at: None,
-        }))
+        self.order_request(Request {
+            request_type: Some(RequestType::AddCertificate(AddCertificate {
+                address,
+                certificate: new_certificate,
+                expired_at: None,
+            })),
+        })
     }
 
     pub fn replace_certificate(
@@ -486,12 +556,14 @@ impl CommandManager {
         )
         .with_context(|| "Could not load the full certificate")?;
 
-        self.order_request(Request::ReplaceCertificate(ReplaceCertificate {
-            address,
-            new_certificate,
-            old_fingerprint: old_fingerprint.to_string(),
-            new_expired_at: None,
-        }))?;
+        self.order_request(Request {
+            request_type: Some(RequestType::ReplaceCertificate(ReplaceCertificate {
+                address,
+                new_certificate,
+                old_fingerprint: old_fingerprint.to_string(),
+                new_expired_at: None,
+            })),
+        })?;
 
         Ok(())
     }
@@ -515,10 +587,12 @@ impl CommandManager {
                 .with_context(|| "Error decoding the given fingerprint")?,
         };
 
-        self.order_request(Request::RemoveCertificate(RemoveCertificate {
-            address,
-            fingerprint: fingerprint.to_string(),
-        }))
+        self.order_request(Request {
+            request_type: Some(RequestType::RemoveCertificate(RemoveCertificate {
+                address,
+                fingerprint: fingerprint.to_string(),
+            })),
+        })
     }
 }
 

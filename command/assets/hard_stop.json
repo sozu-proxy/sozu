@@ -1,3 +1,5 @@
 {
-  "type": "HARD_STOP"
+  "request_type": {
+    "HARD_STOP": {}
+  }
 }

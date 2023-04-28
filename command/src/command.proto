@@ -1,6 +1,112 @@
 syntax = "proto2";
 package command;
 
+// A request sent by the CLI (or other) to the main process
+message Request {
+  oneof request_type {
+    // save Sōzu's parseable state as a file, with a path
+    string save_state = 1;
+    // load a state file, given its path
+    string load_state = 2;
+    // dump the state in JSON
+    DumpState dump_state = 3;
+    // list the workers and their status
+    ListWorkers list_workers = 4;
+    // list the frontends, filtered by protocol and/or domain
+    FrontendFilters list_frontends = 5;
+    // list all listeners
+    ListListeners list_listeners = 6;
+    // launch a new worker, giving its tag
+    string launch_worker = 7;
+    // upgrade the main process
+    UpgradeMain upgrade_main = 8;
+    // upgrade an existing worker, giving its id
+    uint32 upgrade_worker = 9;
+    // subscribe to proxy events
+    SubscribeEvents subscribe_events = 10;
+    // reload the configuration from the config file, or a new file
+    // CHECK: this used to be an option. None => use the config file, Some(string) => path_to_file
+    // make sure it works using "" and "path_to_file"
+    string reload_configuration = 11;
+    // give status of main process and all workers
+    Status status = 12;
+    // add a cluster
+    Cluster add_cluster = 13;
+    // remove a cluster giving its id
+    string remove_cluster = 14;
+    // add an HTTP frontend
+    RequestHttpFrontend add_http_frontend = 15;
+    // remove an HTTP frontend
+    RequestHttpFrontend remove_http_frontend = 16;
+    // add an HTTPS frontend
+    RequestHttpFrontend add_https_frontend = 17;
+    // remove an HTTPS frontend
+    RequestHttpFrontend remove_https_frontend = 18;
+    // add a certificate
+    AddCertificate add_certificate = 19;
+    // replace a certificate
+    ReplaceCertificate replace_certificate = 20;
+    // remove a certificate
+    RemoveCertificate remove_certificate = 21;
+    // add a TCP frontend
+    RequestTcpFrontend add_tcp_frontend = 22;
+    // remove a TCP frontend
+    RequestTcpFrontend remove_tcp_frontend = 23;
+    // add a backend
+    AddBackend add_backend = 24;
+    // remove a backend
+    RemoveBackend remove_backend = 25;
+    // add an HTTP listener
+    HttpListenerConfig add_http_listener = 26;
+    // add an HTTPS listener
+    HttpsListenerConfig add_https_listener = 27;
+    // add a TCP listener
+    TcpListenerConfig add_tcp_listener = 28;
+    // remove a listener
+    RemoveListener remove_listener = 29;
+    // activate a listener
+    ActivateListener activate_listener = 30;
+    // deactivate a listener
+    DeactivateListener deactivate_listener = 31;
+    // query all certificates
+    QueryAllCertificates query_all_certificates = 32;
+    // query a certificate by fingerprint
+    bytes query_certificate_by_fingerprint = 33;
+    // query certificates by domain
+    string query_certificates_by_domain = 34;
+    // query a cluster by id
+    string query_cluster_by_id = 35;
+    // query clusters with a hostname and optional path
+    QueryClusterByDomain query_clusters_by_domain = 36;
+    // query clusters hashes
+    QueryClustersHashes query_clusters_hashes = 37;
+    // query metrics
+    QueryMetricsOptions query_metrics = 38;
+    // soft stop
+    SoftStop soft_stop = 39;
+    // hard stop
+    HardStop hard_stop = 40;
+    // enable, disable or clear the metrics 
+    MetricsConfiguration configure_metrics = 41;
+    // Change the logging level
+    string Logging = 42;
+    // Return the listen sockets
+    ReturnListenSockets return_listen_sockets = 43;
+  }
+}
+
+message DumpState {}
+message ListWorkers {}
+message ListListeners {}
+message UpgradeMain {}
+message SubscribeEvents {}
+message Status {}
+message QueryAllCertificates {}
+message QueryClustersHashes {}
+message SoftStop {}
+message HardStop {}
+message ReturnListenSockets {}
+
 // details of an HTTP listener
 message HttpListenerConfig {
     required string address = 1;

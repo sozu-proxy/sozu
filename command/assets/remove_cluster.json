@@ -1,6 +1,5 @@
 {
-  "type": "REMOVE_CLUSTER",
-  "content": {
-    "cluster_id": "xxx"
+  "request_type": {
+    "REMOVE_CLUSTER": "xxx"
   }
 }

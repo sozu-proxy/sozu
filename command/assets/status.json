@@ -1,3 +1,5 @@
 {
-  "type": "STATUS"
+  "request_type": {
+    "STATUS": {}
+  }
 }

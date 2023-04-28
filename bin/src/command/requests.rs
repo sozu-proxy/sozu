@@ -18,10 +18,10 @@ use sozu_command_lib::{
     logging,
     parser::parse_several_commands,
     proto::command::{
-        AggregatedMetrics, AvailableMetrics, FrontendFilters, ListenersList, MetricsConfiguration,
-        RunState, WorkerInfo,
+        request::RequestType, AggregatedMetrics, AvailableMetrics, FrontendFilters, ListenersList,
+        MetricsConfiguration, Request, ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo,
     },
-    request::{Request, WorkerRequest},
+    request::WorkerRequest,
     response::{ListedFrontends, Response, ResponseContent, ResponseStatus},
     scm_socket::Listeners,
     state::get_cluster_ids_by_domain,
@@ -44,43 +44,51 @@ impl CommandServer {
         trace!("Received request {:?}", request);
 
         let cloned_client_id = client_id.clone();
+        let cloned_request = request.clone();
 
-        let result: anyhow::Result<Option<Success>> = match request {
-            Request::SaveState { path } => self.save_state(&path).await,
-            Request::DumpState => self.dump_state().await,
-            Request::ListWorkers => self.list_workers().await,
-            Request::ListFrontends(filters) => self.list_frontends(filters).await,
-            Request::ListListeners => self.list_listeners(),
-            Request::LoadState { path } => self.load_state(Some(client_id), &path).await,
-            Request::LaunchWorker(tag) => self.launch_worker(client_id, &tag).await,
-            Request::UpgradeMain => self.upgrade_main(client_id).await,
-            Request::UpgradeWorker(worker_id) => self.upgrade_worker(client_id, worker_id).await,
-            Request::ConfigureMetrics(config) => self.configure_metrics(client_id, config).await,
-            // request::Query(query) => self.query(client_id, query).await,
-            Request::Logging(logging_filter) => self.set_logging_level(logging_filter),
-            Request::SubscribeEvents => {
+        let result: anyhow::Result<Option<Success>> = match request.request_type {
+            Some(RequestType::SaveState(path)) => self.save_state(&path).await,
+            Some(RequestType::DumpState(_)) => self.dump_state().await,
+            Some(RequestType::ListWorkers(_)) => self.list_workers().await,
+            Some(RequestType::ListFrontends(filters)) => self.list_frontends(filters).await,
+            Some(RequestType::ListListeners(_)) => self.list_listeners(),
+            Some(RequestType::LoadState(path)) => self.load_state(Some(client_id), &path).await,
+            Some(RequestType::LaunchWorker(tag)) => self.launch_worker(client_id, &tag).await,
+            Some(RequestType::UpgradeMain(_)) => self.upgrade_main(client_id).await,
+            Some(RequestType::UpgradeWorker(worker_id)) => {
+                self.upgrade_worker(client_id, worker_id).await
+            }
+            Some(RequestType::ConfigureMetrics(config)) => {
+                match MetricsConfiguration::from_i32(config) {
+                    Some(config) => self.configure_metrics(client_id, config).await,
+                    None => Err(anyhow::Error::msg("wrong i32 for metrics configuration")),
+                }
+            }
+            Some(RequestType::Logging(logging_filter)) => self.set_logging_level(logging_filter),
+            Some(RequestType::SubscribeEvents(_)) => {
                 self.event_subscribers.insert(client_id.clone());
                 Ok(Some(Success::SubscribeEvent(client_id.clone())))
             }
-            Request::ReloadConfiguration { path } => {
+            Some(RequestType::ReloadConfiguration(path)) => {
                 self.reload_configuration(client_id, path).await
             }
-            Request::Status => self.status(client_id).await,
+            Some(RequestType::Status(_)) => self.status(client_id).await,
 
-            Request::QueryCertificateByFingerprint(_)
-            | Request::QueryCertificatesByDomain(_)
-            | Request::QueryAllCertificates
-            | Request::QueryClusterById(_)
-            | Request::QueryClustersByDomain(_)
-            | Request::QueryClustersHashes
-            | Request::QueryMetrics(_) => self.query(client_id, request).await,
+            Some(RequestType::QueryCertificateByFingerprint(_))
+            | Some(RequestType::QueryCertificatesByDomain(_))
+            | Some(RequestType::QueryAllCertificates(_))
+            | Some(RequestType::QueryClusterById(_))
+            | Some(RequestType::QueryClustersByDomain(_))
+            | Some(RequestType::QueryClustersHashes(_))
+            | Some(RequestType::QueryMetrics(_)) => self.query(client_id, request).await,
 
             // any other case is an request for the workers, except for SoftStop and HardStop.
             // TODO: we should have something like:
             // RequestContent::SoftStop => self.do_something(),
             // RequestContent::HardStop => self.do_nothing_and_return_early(),
             // but it goes in there instead:
-            request_for_workers => self.worker_requests(client_id, request_for_workers).await,
+            Some(_request_for_workers) => self.worker_requests(client_id, cloned_request).await,
+            None => Err(anyhow::Error::msg("Empty request")),
         };
 
         // Notify the command server by sending using his command_tx
@@ -598,7 +606,9 @@ impl CommandServer {
             .with_context(|| "No sender on new worker".to_string())?
             .send(WorkerRequest {
                 id: format!("UPGRADE-{worker_id}-STATUS"),
-                content: Request::Status,
+                content: Request {
+                    request_type: Some(RequestType::Status(Status {})),
+                },
             })
             .await
             .with_context(|| {
@@ -626,7 +636,14 @@ impl CommandServer {
             let id = format!("{}-return-sockets", client_id);
             self.in_flight.insert(id.clone(), (sockets_return_tx, 1));
             old_worker
-                .send(id.clone(), Request::ReturnListenSockets)
+                .send(
+                    id.clone(),
+                    Request {
+                        request_type: Some(RequestType::ReturnListenSockets(
+                            ReturnListenSockets {},
+                        )),
+                    },
+                )
                 .await;
 
             info!("sent ReturnListenSockets to old worker");
@@ -685,7 +702,12 @@ impl CommandServer {
             let softstop_id = format!("{}-softstop", client_id);
             self.in_flight.insert(softstop_id.clone(), (softstop_tx, 1));
             old_worker
-                .send(softstop_id.clone(), Request::SoftStop)
+                .send(
+                    softstop_id.clone(),
+                    Request {
+                        request_type: Some(RequestType::SoftStop(SoftStop {})),
+                    },
+                )
                 .await;
 
             let mut command_tx = self.command_tx.clone();
@@ -767,10 +789,14 @@ impl CommandServer {
     pub async fn reload_configuration(
         &mut self,
         client_id: String,
-        config_path: Option<String>,
+        config_path: String,
     ) -> anyhow::Result<Option<Success>> {
         // check that this works
-        let path = config_path.as_deref().unwrap_or(&self.config.config_path);
+        let path = match config_path.is_empty() {
+            true => &self.config.config_path,
+            false => &config_path,
+        };
+        // config_path.as_deref().unwrap_or(&self.config.config_path);
         let new_config = Config::load_from_path(path)
             .with_context(|| format!("cannot load configuration from '{path}'"))?;
 
@@ -896,7 +922,12 @@ impl CommandServer {
             if worker.run_state == RunState::Running {
                 info!("Summoning status of worker {}", worker.id);
                 worker
-                    .send(worker_request_id.clone(), Request::Status)
+                    .send(
+                        worker_request_id.clone(),
+                        Request {
+                            request_type: Some(RequestType::Status(Status {})),
+                        },
+                    )
                     .await;
                 count += 1;
                 self.in_flight
@@ -965,7 +996,12 @@ impl CommandServer {
         {
             let req_id = format!("{}-metrics-{}", client_id, worker.id);
             worker
-                .send(req_id.clone(), Request::ConfigureMetrics(config.clone()))
+                .send(
+                    req_id.clone(),
+                    Request {
+                        request_type: Some(RequestType::ConfigureMetrics(config as i32)),
+                    },
+                )
                 .await;
             count += 1;
             self.in_flight.insert(req_id, (metrics_tx.clone(), 1));
@@ -1049,17 +1085,17 @@ impl CommandServer {
         .await;
 
         let mut main_response_content = None;
-        match &request {
-            Request::QueryClustersHashes => {
+        match &request.request_type {
+            Some(RequestType::QueryClustersHashes(_)) => {
                 main_response_content =
                     Some(ResponseContent::ClustersHashes(self.state.hash_state()));
             }
-            Request::QueryClusterById(cluster_id) => {
+            Some(RequestType::QueryClusterById(cluster_id)) => {
                 main_response_content = Some(ResponseContent::Clusters(vec![self
                     .state
                     .cluster_state(cluster_id)]))
             }
-            Request::QueryClustersByDomain(domain) => {
+            Some(RequestType::QueryClustersByDomain(domain)) => {
                 let cluster_ids = get_cluster_ids_by_domain(
                     &self.state,
                     domain.hostname.clone(),
@@ -1116,21 +1152,21 @@ impl CommandServer {
                 })
                 .collect();
 
-            let response_content = match &request {
-                &Request::QueryClustersHashes
-                | &Request::QueryClusterById(_)
-                | &Request::QueryClustersByDomain(_) => {
+            let response_content = match &request.request_type {
+                &Some(RequestType::QueryClustersHashes(_))
+                | &Some(RequestType::QueryClusterById(_))
+                | &Some(RequestType::QueryClustersByDomain(_)) => {
                     let main = main_response_content.unwrap(); // we should refactor to avoid this unwrap()
                     worker_responses.insert(String::from("main"), main);
                     ResponseContent::WorkerResponses(worker_responses)
                 }
-                &Request::QueryCertificatesByDomain(_)
-                | &Request::QueryCertificateByFingerprint(_)
-                | &Request::QueryAllCertificates => {
+                &Some(RequestType::QueryCertificatesByDomain(_))
+                | &Some(RequestType::QueryCertificateByFingerprint(_))
+                | &Some(RequestType::QueryAllCertificates(_)) => {
                     info!("certificates query answer received: {:?}", worker_responses);
                     ResponseContent::WorkerResponses(worker_responses)
                 }
-                Request::QueryMetrics(options) => {
+                Some(RequestType::QueryMetrics(options)) => {
                     if options.list {
                         let mut summed_proxy_metrics = Vec::new();
                         let mut summed_cluster_metrics = Vec::new();
@@ -1197,7 +1233,7 @@ impl CommandServer {
         client_id: String,
         request: Request,
     ) -> anyhow::Result<Option<Success>> {
-        if let &Request::AddCertificate(_) = &request {
+        if let &Some(RequestType::AddCertificate(_)) = &request.request_type {
             debug!("workerconfig client request AddCertificate()");
         } else {
             debug!("workerconfig client request {:?}", request);
@@ -1207,9 +1243,7 @@ impl CommandServer {
             .dispatch(&request)
             .with_context(|| "Could not execute request on the state")?;
 
-        if self.config.automatic_state_save
-            & (request != Request::SoftStop || request != Request::HardStop)
-        {
+        if self.config.automatic_state_save & !request.is_a_stop() {
             if let Some(path) = self.config.saved_state.clone() {
                 return_processing(
                     self.command_tx.clone(),
@@ -1238,8 +1272,7 @@ impl CommandServer {
         let mut stopping_workers = HashSet::new();
         let mut worker_count = 0usize;
         for worker in self.workers.iter_mut().filter(|worker| worker.is_active()) {
-            let should_stop_worker = request == Request::SoftStop || request == Request::HardStop;
-            if should_stop_worker {
+            if request.is_a_stop() {
                 worker.run_state = RunState::Stopping;
                 stopping_workers.insert(worker.id);
             }
@@ -1324,16 +1357,18 @@ impl CommandServer {
             bail!("no worker found");
         }
 
-        match request {
-            Request::AddBackend(_) | Request::RemoveBackend(_) => {
+        match request.request_type {
+            Some(RequestType::AddBackend(_)) | Some(RequestType::RemoveBackend(_)) => {
                 self.backends_count = self.state.count_backends()
             }
-            Request::AddHttpFrontend(_)
-            | Request::AddHttpsFrontend(_)
-            | Request::AddTcpFrontend(_)
-            | Request::RemoveHttpFrontend(_)
-            | Request::RemoveHttpsFrontend(_)
-            | Request::RemoveTcpFrontend(_) => self.frontends_count = self.state.count_frontends(),
+            Some(RequestType::AddHttpFrontend(_))
+            | Some(RequestType::AddHttpsFrontend(_))
+            | Some(RequestType::AddTcpFrontend(_))
+            | Some(RequestType::RemoveHttpFrontend(_))
+            | Some(RequestType::RemoveHttpsFrontend(_))
+            | Some(RequestType::RemoveTcpFrontend(_)) => {
+                self.frontends_count = self.state.count_frontends()
+            }
             _ => {}
         };
 

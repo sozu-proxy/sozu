@@ -74,11 +74,19 @@ where
 mod test {
     use super::*;
 
-    use crate::request::{Request, WorkerRequest};
+    use crate::{
+        proto::command::{request::RequestType, DumpState, Request, SubscribeEvents},
+        request::WorkerRequest,
+    };
 
     #[test]
     fn parse_one_worker_request() {
-        let worker_request = WorkerRequest::new("Some request".to_string(), Request::DumpState);
+        let worker_request = WorkerRequest::new(
+            "Some request".to_string(),
+            Request {
+                request_type: Some(RequestType::DumpState(DumpState {})),
+            },
+        );
 
         let mut string = serde_json::ser::to_string(&worker_request).unwrap();
 
@@ -101,12 +109,22 @@ mod test {
         let requests = vec![
             WorkerRequest::new(
                 "Some request".to_string(),
-                Request::SaveState {
-                    path: "/some/path".to_string(),
+                Request {
+                    request_type: Some(RequestType::SaveState("/some/path".to_string())),
                 },
             ),
-            WorkerRequest::new("Some other request".to_string(), Request::SubscribeEvents),
-            WorkerRequest::new("Yet another request".to_string(), Request::DumpState),
+            WorkerRequest::new(
+                "Some other request".to_string(),
+                Request {
+                    request_type: Some(RequestType::SubscribeEvents(SubscribeEvents {})),
+                },
+            ),
+            WorkerRequest::new(
+                "Yet another request".to_string(),
+                Request {
+                    request_type: Some(RequestType::DumpState(DumpState {})),
+                },
+            ),
         ];
 
         let mut serialized_requests = String::new();

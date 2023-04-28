@@ -10,8 +10,10 @@ use anyhow::Context;
 use sozu_command::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
-    proto::command::{AddBackend, LoadBalancingParams, RequestTcpFrontend, TcpListenerConfig},
-    request::{Request, WorkerRequest},
+    proto::command::{
+        AddBackend, LoadBalancingParams, Request, RequestTcpFrontend, TcpListenerConfig, request::RequestType,
+    },
+    request::WorkerRequest,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -67,12 +69,16 @@ fn main() -> anyhow::Result<()> {
 
     command.write_message(&WorkerRequest {
         id: String::from("ID_ABCD"),
-        content: Request::AddTcpFrontend(tcp_front),
+        content: Request {
+            request_type: Some(RequestType::AddTcpFrontend(tcp_front)),
+        },
     });
 
     command.write_message(&WorkerRequest {
         id: String::from("ID_EFGH"),
-        content: Request::AddBackend(tcp_backend),
+        content: Request {
+            request_type: Some(RequestType::AddBackend(tcp_backend)),
+        },
     });
 
     info!("TCP -> {:?}", command.read_message());

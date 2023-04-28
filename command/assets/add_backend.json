@@ -1,13 +1,14 @@
 {
-  "type": "ADD_BACKEND",
-  "content": {
-    "cluster_id": "xxx",
-    "backend_id": "xxx-0",
-    "address": "127.0.0.1:8080",
-    "sticky_id": "xxx-0",
-    "load_balancing_parameters": {
-      "weight": 0
-    },
-    "backup": false
+  "request_type": {
+    "ADD_BACKEND": {
+      "cluster_id": "xxx",
+      "backend_id": "xxx-0",
+      "address": "127.0.0.1:8080",
+      "sticky_id": "xxx-0",
+      "load_balancing_parameters": {
+        "weight": 0
+      },
+      "backup": false
+    }
   }
 }

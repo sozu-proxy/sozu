@@ -13,12 +13,11 @@ use anyhow::{bail, Context};
 use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
-        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
-        DeactivateListener, HttpListenerConfig, HttpsListenerConfig, ListenerType, PathRule,
-        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        RequestTcpFrontend, TcpListenerConfig,
+        request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
+        Cluster, DeactivateListener, HttpListenerConfig, HttpsListenerConfig, ListenerType,
+        PathRule, RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
+        RequestHttpFrontend, RequestTcpFrontend, TcpListenerConfig,
     },
-    request::Request,
     response::{Backend, ClusterInformation, HttpFrontend, TcpFrontend},
 };
 
@@ -51,75 +50,79 @@ impl ConfigState {
     }
 
     pub fn dispatch(&mut self, request: &Request) -> anyhow::Result<()> {
-        match request {
-            Request::AddCluster(cluster) => self
+        let request_type = match &request.request_type {
+            Some(t) => t,
+            None => bail!("Empty request!"),
+        };
+        match request_type {
+            RequestType::AddCluster(cluster) => self
                 .add_cluster(cluster)
                 .with_context(|| "Could not add cluster"),
-            Request::RemoveCluster { cluster_id } => self
+            RequestType::RemoveCluster(cluster_id) => self
                 .remove_cluster(cluster_id)
                 .with_context(|| "Could not remove cluster"),
-            Request::AddHttpListener(listener) => self
+            RequestType::AddHttpListener(listener) => self
                 .add_http_listener(listener)
                 .with_context(|| "Could not add HTTP listener"),
-            Request::AddHttpsListener(listener) => self
+            RequestType::AddHttpsListener(listener) => self
                 .add_https_listener(listener)
                 .with_context(|| "Could not add HTTPS listener"),
-            Request::AddTcpListener(listener) => self
+            RequestType::AddTcpListener(listener) => self
                 .add_tcp_listener(listener)
                 .with_context(|| "Could not add TCP listener"),
-            Request::RemoveListener(remove) => self
+            RequestType::RemoveListener(remove) => self
                 .remove_listener(remove)
                 .with_context(|| "Could not remove listener"),
-            Request::ActivateListener(activate) => self
+            RequestType::ActivateListener(activate) => self
                 .activate_listener(activate)
                 .with_context(|| "Could not activate listener"),
-            Request::DeactivateListener(deactivate) => self
+            RequestType::DeactivateListener(deactivate) => self
                 .deactivate_listener(deactivate)
                 .with_context(|| "Could not deactivate listener"),
-            Request::AddHttpFrontend(front) => self
+            RequestType::AddHttpFrontend(front) => self
                 .add_http_frontend(front)
                 .with_context(|| "Could not add HTTP frontend"),
-            Request::RemoveHttpFrontend(front) => self
+            RequestType::RemoveHttpFrontend(front) => self
                 .remove_http_frontend(front)
                 .with_context(|| "Could not remove HTTP frontend"),
-            Request::AddCertificate(add) => self
+            RequestType::AddCertificate(add) => self
                 .add_certificate(add)
                 .with_context(|| "Could not add certificate"),
-            Request::RemoveCertificate(remove) => self
+            RequestType::RemoveCertificate(remove) => self
                 .remove_certificate(remove)
                 .with_context(|| "Could not remove certificate"),
-            Request::ReplaceCertificate(replace) => self
+            RequestType::ReplaceCertificate(replace) => self
                 .replace_certificate(replace)
                 .with_context(|| "Could not replace certificate"),
-            Request::AddHttpsFrontend(front) => self
+            RequestType::AddHttpsFrontend(front) => self
                 .add_https_frontend(front)
                 .with_context(|| "Could not add HTTPS frontend"),
-            Request::RemoveHttpsFrontend(front) => self
+            RequestType::RemoveHttpsFrontend(front) => self
                 .remove_https_frontend(front)
                 .with_context(|| "Could not remove HTTPS frontend"),
-            Request::AddTcpFrontend(front) => self
+            RequestType::AddTcpFrontend(front) => self
                 .add_tcp_frontend(front)
                 .with_context(|| "Could not add TCP frontend"),
-            Request::RemoveTcpFrontend(front) => self
+            RequestType::RemoveTcpFrontend(front) => self
                 .remove_tcp_frontend(front)
                 .with_context(|| "Could not remove TCP frontend"),
-            Request::AddBackend(add_backend) => self
+            RequestType::AddBackend(add_backend) => self
                 .add_backend(add_backend)
                 .with_context(|| "Could not add backend"),
-            Request::RemoveBackend(backend) => self
+            RequestType::RemoveBackend(backend) => self
                 .remove_backend(backend)
                 .with_context(|| "Could not remove backend"),
             // This is to avoid the error message
-            &Request::Logging(_)
-            | &Request::Status
-            | &Request::SoftStop
-            | &Request::QueryClusterById(_)
-            | &Request::QueryClustersByDomain(_)
-            | &Request::QueryMetrics(_)
-            | &Request::QueryClustersHashes
-            | &Request::ConfigureMetrics(_)
-            | &Request::ReturnListenSockets
-            | &Request::HardStop => Ok(()),
+            &RequestType::Logging(_)
+            | &RequestType::Status(_)
+            | &RequestType::SoftStop(_)
+            | &RequestType::QueryClusterById(_)
+            | &RequestType::QueryClustersByDomain(_)
+            | &RequestType::QueryMetrics(_)
+            | &RequestType::QueryClustersHashes(_)
+            | &RequestType::ConfigureMetrics(_)
+            | &RequestType::ReturnListenSockets(_)
+            | &RequestType::HardStop(_) => Ok(()),
 
             other_request => {
                 bail!("state cannot handle request message: {:#?}", other_request);
@@ -506,69 +509,93 @@ impl ConfigState {
         let mut v = Vec::new();
 
         for listener in self.http_listeners.values() {
-            v.push(Request::AddHttpListener(listener.clone()));
+            v.push(Request {
+                request_type: Some(RequestType::AddHttpListener(listener.clone())),
+            });
             if listener.active {
-                v.push(Request::ActivateListener(ActivateListener {
-                    address: listener.address.clone(),
-                    proxy: ListenerType::Http.into(),
-                    from_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::ActivateListener(ActivateListener {
+                        address: listener.address.clone(),
+                        proxy: ListenerType::Http.into(),
+                        from_scm: false,
+                    })),
+                });
             }
         }
 
         for listener in self.https_listeners.values() {
-            v.push(Request::AddHttpsListener(listener.clone()));
+            v.push(Request {
+                request_type: Some(RequestType::AddHttpsListener(listener.clone())),
+            });
             if listener.active {
-                v.push(Request::ActivateListener(ActivateListener {
-                    address: listener.address.clone(),
-                    proxy: ListenerType::Https.into(),
-                    from_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::ActivateListener(ActivateListener {
+                        address: listener.address.clone(),
+                        proxy: ListenerType::Https.into(),
+                        from_scm: false,
+                    })),
+                });
             }
         }
 
         for listener in self.tcp_listeners.values() {
-            v.push(Request::AddTcpListener(listener.clone()));
+            v.push(Request {
+                request_type: Some(RequestType::AddTcpListener(listener.clone())),
+            });
             if listener.active {
-                v.push(Request::ActivateListener(ActivateListener {
-                    address: listener.address.clone(),
-                    proxy: ListenerType::Tcp.into(),
-                    from_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::ActivateListener(ActivateListener {
+                        address: listener.address.clone(),
+                        proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })),
+                });
             }
         }
 
         for cluster in self.clusters.values() {
-            v.push(Request::AddCluster(cluster.clone()));
+            v.push(Request {
+                request_type: Some(RequestType::AddCluster(cluster.clone())),
+            });
         }
 
         for front in self.http_fronts.values() {
-            v.push(Request::AddHttpFrontend(front.clone().into()));
+            v.push(Request {
+                request_type: Some(RequestType::AddHttpFrontend(front.clone().into())),
+            });
         }
 
         for (front, certs) in self.certificates.iter() {
             for certificate_and_key in certs.values() {
-                v.push(Request::AddCertificate(AddCertificate {
-                    address: front.to_string(),
-                    certificate: certificate_and_key.clone(),
-                    expired_at: None,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::AddCertificate(AddCertificate {
+                        address: front.to_string(),
+                        certificate: certificate_and_key.clone(),
+                        expired_at: None,
+                    })),
+                });
             }
         }
 
         for front in self.https_fronts.values() {
-            v.push(Request::AddHttpsFrontend(front.clone().into()));
+            v.push(Request {
+                request_type: Some(RequestType::AddHttpsFrontend(front.clone().into())),
+            });
         }
 
         for front_list in self.tcp_fronts.values() {
             for front in front_list {
-                v.push(Request::AddTcpFrontend(front.clone().into()));
+                v.push(Request {
+                    request_type: Some(RequestType::AddTcpFrontend(front.clone().into())),
+                });
             }
         }
 
         for backend_list in self.backends.values() {
             for backend in backend_list {
-                v.push(Request::AddBackend(backend.clone().to_add_backend()));
+                v.push(Request {
+                    request_type: Some(RequestType::AddBackend(backend.clone().to_add_backend())),
+                });
             }
         }
 
@@ -583,11 +610,13 @@ impl ConfigState {
             .filter(|(_, listener)| listener.active)
             .map(|(k, _)| k)
         {
-            v.push(Request::ActivateListener(ActivateListener {
-                address: front.to_string(),
-                proxy: ListenerType::Http.into(),
-                from_scm: false,
-            }));
+            v.push(Request {
+                request_type: Some(RequestType::ActivateListener(ActivateListener {
+                    address: front.to_string(),
+                    proxy: ListenerType::Http.into(),
+                    from_scm: false,
+                })),
+            });
         }
 
         for front in self
@@ -596,11 +625,13 @@ impl ConfigState {
             .filter(|(_, listener)| listener.active)
             .map(|(k, _)| k)
         {
-            v.push(Request::ActivateListener(ActivateListener {
-                address: front.to_string(),
-                proxy: ListenerType::Https.into(),
-                from_scm: false,
-            }));
+            v.push(Request {
+                request_type: Some(RequestType::ActivateListener(ActivateListener {
+                    address: front.to_string(),
+                    proxy: ListenerType::Https.into(),
+                    from_scm: false,
+                })),
+            });
         }
         for front in self
             .tcp_listeners
@@ -608,11 +639,13 @@ impl ConfigState {
             .filter(|(_, listener)| listener.active)
             .map(|(k, _)| k)
         {
-            v.push(Request::ActivateListener(ActivateListener {
-                address: front.to_string(),
-                proxy: ListenerType::Tcp.into(),
-                from_scm: false,
-            }));
+            v.push(Request {
+                request_type: Some(RequestType::ActivateListener(ActivateListener {
+                    address: front.to_string(),
+                    proxy: ListenerType::Tcp.into(),
+                    from_scm: false,
+                })),
+            });
         }
 
         v
@@ -639,88 +672,112 @@ impl ConfigState {
 
         for address in removed_tcp_listeners {
             if self.tcp_listeners[*address].active {
-                v.push(Request::DeactivateListener(DeactivateListener {
-                    address: address.to_string(),
-                    proxy: ListenerType::Tcp.into(),
-                    to_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::DeactivateListener(DeactivateListener {
+                        address: address.to_string(),
+                        proxy: ListenerType::Tcp.into(),
+                        to_scm: false,
+                    })),
+                });
             }
 
-            v.push(Request::RemoveListener(RemoveListener {
-                address: address.to_string(),
-                proxy: ListenerType::Tcp.into(),
-            }));
+            v.push(Request {
+                request_type: Some(RequestType::RemoveListener(RemoveListener {
+                    address: address.to_string(),
+                    proxy: ListenerType::Tcp.into(),
+                })),
+            });
         }
 
         for address in added_tcp_listeners.clone() {
-            v.push(Request::AddTcpListener(
-                other.tcp_listeners[*address].clone(),
-            ));
+            v.push(Request {
+                request_type: Some(RequestType::AddTcpListener(
+                    other.tcp_listeners[*address].clone(),
+                )),
+            });
 
             if other.tcp_listeners[*address].active {
-                v.push(Request::ActivateListener(ActivateListener {
-                    address: address.to_string(),
-                    proxy: ListenerType::Tcp.into(),
-                    from_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::ActivateListener(ActivateListener {
+                        address: address.to_string(),
+                        proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })),
+                });
             }
         }
 
         for address in removed_http_listeners {
             if self.http_listeners[*address].active {
-                v.push(Request::DeactivateListener(DeactivateListener {
-                    address: address.to_string(),
-                    proxy: ListenerType::Http.into(),
-                    to_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::DeactivateListener(DeactivateListener {
+                        address: address.to_string(),
+                        proxy: ListenerType::Http.into(),
+                        to_scm: false,
+                    })),
+                });
             }
 
-            v.push(Request::RemoveListener(RemoveListener {
-                address: address.to_string(),
-                proxy: ListenerType::Http.into(),
-            }));
+            v.push(Request {
+                request_type: Some(RequestType::RemoveListener(RemoveListener {
+                    address: address.to_string(),
+                    proxy: ListenerType::Http.into(),
+                })),
+            });
         }
 
         for address in added_http_listeners.clone() {
-            v.push(Request::AddHttpListener(
-                other.http_listeners[*address].clone(),
-            ));
+            v.push(Request {
+                request_type: Some(RequestType::AddHttpListener(
+                    other.http_listeners[*address].clone(),
+                )),
+            });
 
             if other.http_listeners[*address].active {
-                v.push(Request::ActivateListener(ActivateListener {
-                    address: address.to_string(),
-                    proxy: ListenerType::Http.into(),
-                    from_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::ActivateListener(ActivateListener {
+                        address: address.to_string(),
+                        proxy: ListenerType::Http.into(),
+                        from_scm: false,
+                    })),
+                });
             }
         }
 
         for address in removed_https_listeners {
             if self.https_listeners[*address].active {
-                v.push(Request::DeactivateListener(DeactivateListener {
-                    address: address.to_string(),
-                    proxy: ListenerType::Https.into(),
-                    to_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::DeactivateListener(DeactivateListener {
+                        address: address.to_string(),
+                        proxy: ListenerType::Https.into(),
+                        to_scm: false,
+                    })),
+                });
             }
 
-            v.push(Request::RemoveListener(RemoveListener {
-                address: address.to_string(),
-                proxy: ListenerType::Https.into(),
-            }));
+            v.push(Request {
+                request_type: Some(RequestType::RemoveListener(RemoveListener {
+                    address: address.to_string(),
+                    proxy: ListenerType::Https.into(),
+                })),
+            });
         }
 
         for address in added_https_listeners.clone() {
-            v.push(Request::AddHttpsListener(
-                other.https_listeners[*address].clone(),
-            ));
+            v.push(Request {
+                request_type: Some(RequestType::AddHttpsListener(
+                    other.https_listeners[*address].clone(),
+                )),
+            });
 
             if other.https_listeners[*address].active {
-                v.push(Request::ActivateListener(ActivateListener {
-                    address: address.to_string(),
-                    proxy: ListenerType::Https.into(),
-                    from_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::ActivateListener(ActivateListener {
+                        address: address.to_string(),
+                        proxy: ListenerType::Https.into(),
+                        from_scm: false,
+                    })),
+                });
             }
         }
 
@@ -729,30 +786,38 @@ impl ConfigState {
             let their_listener = &other.tcp_listeners[*addr];
 
             if my_listener != their_listener {
-                v.push(Request::RemoveListener(RemoveListener {
-                    address: addr.to_string(),
-                    proxy: ListenerType::Tcp.into(),
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::RemoveListener(RemoveListener {
+                        address: addr.to_string(),
+                        proxy: ListenerType::Tcp.into(),
+                    })),
+                });
                 // any added listener should be unactive
                 let mut listener_to_add = their_listener.clone();
                 listener_to_add.active = false;
-                v.push(Request::AddTcpListener(listener_to_add));
+                v.push(Request {
+                    request_type: Some(RequestType::AddTcpListener(listener_to_add)),
+                });
             }
 
             if my_listener.active && !their_listener.active {
-                v.push(Request::DeactivateListener(DeactivateListener {
-                    address: addr.to_string(),
-                    proxy: ListenerType::Tcp.into(),
-                    to_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::DeactivateListener(DeactivateListener {
+                        address: addr.to_string(),
+                        proxy: ListenerType::Tcp.into(),
+                        to_scm: false,
+                    })),
+                });
             }
 
             if !my_listener.active && their_listener.active {
-                v.push(Request::ActivateListener(ActivateListener {
-                    address: addr.to_string(),
-                    proxy: ListenerType::Tcp.into(),
-                    from_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::ActivateListener(ActivateListener {
+                        address: addr.to_string(),
+                        proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })),
+                });
             }
         }
 
@@ -761,30 +826,38 @@ impl ConfigState {
             let their_listener = &other.http_listeners[*addr];
 
             if my_listener != their_listener {
-                v.push(Request::RemoveListener(RemoveListener {
-                    address: addr.to_string(),
-                    proxy: ListenerType::Http.into(),
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::RemoveListener(RemoveListener {
+                        address: addr.to_string(),
+                        proxy: ListenerType::Http.into(),
+                    })),
+                });
                 // any added listener should be unactive
                 let mut listener_to_add = their_listener.clone();
                 listener_to_add.active = false;
-                v.push(Request::AddHttpListener(listener_to_add));
+                v.push(Request {
+                    request_type: Some(RequestType::AddHttpListener(listener_to_add)),
+                });
             }
 
             if my_listener.active && !their_listener.active {
-                v.push(Request::DeactivateListener(DeactivateListener {
-                    address: addr.to_string(),
-                    proxy: ListenerType::Http.into(),
-                    to_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::DeactivateListener(DeactivateListener {
+                        address: addr.to_string(),
+                        proxy: ListenerType::Http.into(),
+                        to_scm: false,
+                    })),
+                });
             }
 
             if !my_listener.active && their_listener.active {
-                v.push(Request::ActivateListener(ActivateListener {
-                    address: addr.to_string(),
-                    proxy: ListenerType::Http.into(),
-                    from_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::ActivateListener(ActivateListener {
+                        address: addr.to_string(),
+                        proxy: ListenerType::Http.into(),
+                        from_scm: false,
+                    })),
+                });
             }
         }
 
@@ -793,40 +866,50 @@ impl ConfigState {
             let their_listener = &other.https_listeners[*addr];
 
             if my_listener != their_listener {
-                v.push(Request::RemoveListener(RemoveListener {
-                    address: addr.to_string(),
-                    proxy: ListenerType::Https.into(),
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::RemoveListener(RemoveListener {
+                        address: addr.to_string(),
+                        proxy: ListenerType::Https.into(),
+                    })),
+                });
                 // any added listener should be unactive
                 let mut listener_to_add = their_listener.clone();
                 listener_to_add.active = false;
-                v.push(Request::AddHttpsListener(listener_to_add));
+                v.push(Request {
+                    request_type: Some(RequestType::AddHttpsListener(listener_to_add)),
+                });
             }
 
             if my_listener.active && !their_listener.active {
-                v.push(Request::DeactivateListener(DeactivateListener {
-                    address: addr.to_string(),
-                    proxy: ListenerType::Https.into(),
-                    to_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::DeactivateListener(DeactivateListener {
+                        address: addr.to_string(),
+                        proxy: ListenerType::Https.into(),
+                        to_scm: false,
+                    })),
+                });
             }
 
             if !my_listener.active && their_listener.active {
-                v.push(Request::ActivateListener(ActivateListener {
-                    address: addr.to_string(),
-                    proxy: ListenerType::Https.into(),
-                    from_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::ActivateListener(ActivateListener {
+                        address: addr.to_string(),
+                        proxy: ListenerType::Https.into(),
+                        from_scm: false,
+                    })),
+                });
             }
         }
 
         for (cluster_id, res) in diff_map(self.clusters.iter(), other.clusters.iter()) {
             match res {
-                DiffResult::Added | DiffResult::Changed => v.push(Request::AddCluster(
-                    other.clusters.get(cluster_id).unwrap().clone(),
-                )),
-                DiffResult::Removed => v.push(Request::RemoveCluster {
-                    cluster_id: cluster_id.to_string(),
+                DiffResult::Added | DiffResult::Changed => v.push(Request {
+                    request_type: Some(RequestType::AddCluster(
+                        other.clusters.get(cluster_id).unwrap().clone(),
+                    )),
+                }),
+                DiffResult::Removed => v.push(Request {
+                    request_type: Some(RequestType::RemoveCluster(cluster_id.to_string())),
                 }),
             }
         }
@@ -848,7 +931,11 @@ impl ConfigState {
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(Request::AddBackend(backend.clone().to_add_backend()));
+                    v.push(Request {
+                        request_type: Some(RequestType::AddBackend(
+                            backend.clone().to_add_backend(),
+                        )),
+                    });
                 }
                 DiffResult::Removed => {
                     let backend = self
@@ -857,11 +944,13 @@ impl ConfigState {
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
-                    v.push(Request::RemoveBackend(RemoveBackend {
-                        cluster_id: backend.cluster_id.clone(),
-                        backend_id: backend.backend_id.clone(),
-                        address: backend.address.to_string(),
-                    }));
+                    v.push(Request {
+                        request_type: Some(RequestType::RemoveBackend(RemoveBackend {
+                            cluster_id: backend.cluster_id.clone(),
+                            backend_id: backend.backend_id.clone(),
+                            address: backend.address.to_string(),
+                        })),
+                    });
                 }
                 DiffResult::Changed => {
                     let backend = self
@@ -870,18 +959,24 @@ impl ConfigState {
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
 
-                    v.push(Request::RemoveBackend(RemoveBackend {
-                        cluster_id: backend.cluster_id.clone(),
-                        backend_id: backend.backend_id.clone(),
-                        address: backend.address.to_string(),
-                    }));
+                    v.push(Request {
+                        request_type: Some(RequestType::RemoveBackend(RemoveBackend {
+                            cluster_id: backend.cluster_id.clone(),
+                            backend_id: backend.backend_id.clone(),
+                            address: backend.address.to_string(),
+                        })),
+                    });
 
                     let backend = other
                         .backends
                         .get(cluster_id)
                         .and_then(|v| v.iter().find(|b| &b.backend_id == backend_id))
                         .unwrap();
-                    v.push(Request::AddBackend(backend.clone().to_add_backend()));
+                    v.push(Request {
+                        request_type: Some(RequestType::AddBackend(
+                            backend.clone().to_add_backend(),
+                        )),
+                    });
                 }
             }
         }
@@ -899,11 +994,15 @@ impl ConfigState {
         let added_http_fronts = their_http_fronts.difference(&my_http_fronts);
 
         for &(_, front) in removed_http_fronts {
-            v.push(Request::RemoveHttpFrontend(front.clone().into()));
+            v.push(Request {
+                request_type: Some(RequestType::RemoveHttpFrontend(front.clone().into())),
+            });
         }
 
         for &(_, front) in added_http_fronts {
-            v.push(Request::AddHttpFrontend(front.clone().into()));
+            v.push(Request {
+                request_type: Some(RequestType::AddHttpFrontend(front.clone().into())),
+            });
         }
 
         let mut my_https_fronts: HashSet<(&String, &HttpFrontend)> = HashSet::new();
@@ -918,11 +1017,15 @@ impl ConfigState {
         let added_https_fronts = their_https_fronts.difference(&my_https_fronts);
 
         for &(_, front) in removed_https_fronts {
-            v.push(Request::RemoveHttpsFrontend(front.clone().into()));
+            v.push(Request {
+                request_type: Some(RequestType::RemoveHttpsFrontend(front.clone().into())),
+            });
         }
 
         for &(_, front) in added_https_fronts {
-            v.push(Request::AddHttpsFrontend(front.clone().into()));
+            v.push(Request {
+                request_type: Some(RequestType::AddHttpsFrontend(front.clone().into())),
+            });
         }
 
         let mut my_tcp_fronts: HashSet<(&ClusterId, &TcpFrontend)> = HashSet::new();
@@ -942,11 +1045,15 @@ impl ConfigState {
         let added_tcp_fronts = their_tcp_fronts.difference(&my_tcp_fronts);
 
         for &(_, front) in removed_tcp_fronts {
-            v.push(Request::RemoveTcpFrontend(front.clone().into()));
+            v.push(Request {
+                request_type: Some(RequestType::RemoveTcpFrontend(front.clone().into())),
+            });
         }
 
         for &(_, front) in added_tcp_fronts {
-            v.push(Request::AddTcpFrontend(front.clone().into()));
+            v.push(Request {
+                request_type: Some(RequestType::AddTcpFrontend(front.clone().into())),
+            });
         }
 
         //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -966,10 +1073,12 @@ impl ConfigState {
         let added_certificates = their_certificates.difference(&my_certificates);
 
         for &(address, fingerprint) in removed_certificates {
-            v.push(Request::RemoveCertificate(RemoveCertificate {
-                address: address.to_string(),
-                fingerprint: fingerprint.to_string(),
-            }));
+            v.push(Request {
+                request_type: Some(RequestType::RemoveCertificate(RemoveCertificate {
+                    address: address.to_string(),
+                    fingerprint: fingerprint.to_string(),
+                })),
+            });
         }
 
         for &(address, fingerprint) in added_certificates {
@@ -978,22 +1087,26 @@ impl ConfigState {
                 .get(&address)
                 .and_then(|certs| certs.get(fingerprint))
             {
-                v.push(Request::AddCertificate(AddCertificate {
-                    address: address.to_string(),
-                    certificate: certificate_and_key.clone(),
-                    expired_at: None,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::AddCertificate(AddCertificate {
+                        address: address.to_string(),
+                        certificate: certificate_and_key.clone(),
+                        expired_at: None,
+                    })),
+                });
             }
         }
 
         for address in added_tcp_listeners {
             let listener = &other.tcp_listeners[*address];
             if listener.active {
-                v.push(Request::ActivateListener(ActivateListener {
-                    address: listener.address.clone(),
-                    proxy: ListenerType::Tcp.into(),
-                    from_scm: false,
-                }));
+                v.push(Request {
+                    request_type: Some(RequestType::ActivateListener(ActivateListener {
+                        address: listener.address.clone(),
+                        proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })),
+                });
             }
         }
 
@@ -1225,72 +1338,83 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        proto::command::{LoadBalancingParams, RequestHttpFrontend, RulePosition},
-        request::Request,
-    };
+    use crate::proto::command::{LoadBalancingParams, RequestHttpFrontend, RulePosition};
 
     #[test]
     fn serialize() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
-                cluster_id: Some(String::from("cluster_1")),
-                hostname: String::from("lolcatho.st:8080"),
-                path: PathRule::prefix(String::from("/")),
-                address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Tree.into(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("lolcatho.st:8080"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: "0.0.0.0:8080".to_string(),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
-                cluster_id: Some(String::from("cluster_2")),
-                hostname: String::from("test.local"),
-                path: PathRule::prefix(String::from("/abc")),
-                address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Pre.into(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_2")),
+                    hostname: String::from("test.local"),
+                    path: PathRule::prefix(String::from("/abc")),
+                    address: "0.0.0.0:8080".to_string(),
+                    position: RulePosition::Pre.into(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-0"),
-                address: "127.0.0.1:1026".parse().unwrap(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: "127.0.0.1:1026".parse().unwrap(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-1"),
-                address: "127.0.0.2:1027".parse().unwrap(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-1"),
+                    address: "127.0.0.2:1027".parse().unwrap(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_2"),
-                backend_id: String::from("cluster_2-0"),
-                address: "192.167.1.2:1026".parse().unwrap(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_2"),
+                    backend_id: String::from("cluster_2-0"),
+                    address: "192.167.1.2:1026".parse().unwrap(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-3"),
-                address: "192.168.1.3:1027".parse().unwrap(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-3"),
+                    address: "192.168.1.3:1027".parse().unwrap(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::RemoveBackend(RemoveBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-3"),
-                address: "192.168.1.3:1027".parse().unwrap(),
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::RemoveBackend(RemoveBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-3"),
+                    address: "192.168.1.3:1027".parse().unwrap(),
+                })),
+            })
             .expect("Could not execute request");
 
         /*
@@ -1308,136 +1432,166 @@ mod tests {
     fn diff() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
-                cluster_id: Some(String::from("cluster_1")),
-                hostname: String::from("lolcatho.st:8080"),
-                path: PathRule::prefix(String::from("/")),
-                address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Post.into(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("lolcatho.st:8080"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: "0.0.0.0:8080".to_string(),
+                    position: RulePosition::Post.into(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
-                cluster_id: Some(String::from("cluster_2")),
-                hostname: String::from("test.local"),
-                path: PathRule::prefix(String::from("/abc")),
-                address: "0.0.0.0:8080".to_string(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_2")),
+                    hostname: String::from("test.local"),
+                    path: PathRule::prefix(String::from("/abc")),
+                    address: "0.0.0.0:8080".to_string(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-0"),
-                address: "127.0.0.1:1026".parse().unwrap(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: "127.0.0.1:1026".parse().unwrap(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-1"),
-                address: "127.0.0.2:1027".parse().unwrap(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-1"),
+                    address: "127.0.0.2:1027".parse().unwrap(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_2"),
-                backend_id: String::from("cluster_2-0"),
-                address: "192.167.1.2:1026".parse().unwrap(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_2"),
+                    backend_id: String::from("cluster_2-0"),
+                    address: "192.167.1.2:1026".parse().unwrap(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddCluster(Cluster {
-                cluster_id: String::from("cluster_2"),
-                sticky_session: true,
-                https_redirect: true,
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_2"),
+                    sticky_session: true,
+                    https_redirect: true,
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
 
         let mut state2: ConfigState = Default::default();
         state2
-            .dispatch(&Request::AddHttpFrontend(RequestHttpFrontend {
-                cluster_id: Some(String::from("cluster_1")),
-                hostname: String::from("lolcatho.st:8080"),
-                path: PathRule::prefix(String::from("/")),
-                address: "0.0.0.0:8080".to_string(),
-                position: RulePosition::Post.into(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_1")),
+                    hostname: String::from("lolcatho.st:8080"),
+                    path: PathRule::prefix(String::from("/")),
+                    address: "0.0.0.0:8080".to_string(),
+                    position: RulePosition::Post.into(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state2
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-0"),
-                address: "127.0.0.1:1026".parse().unwrap(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: "127.0.0.1:1026".parse().unwrap(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state2
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-1"),
-                address: "127.0.0.2:1027".parse().unwrap(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-1"),
+                    address: "127.0.0.2:1027".parse().unwrap(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state2
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-2"),
-                address: "127.0.0.2:1028".parse().unwrap(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-2"),
+                    address: "127.0.0.2:1028".parse().unwrap(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state2
-            .dispatch(&Request::AddCluster(Cluster {
-                cluster_id: String::from("cluster_3"),
-                sticky_session: false,
-                https_redirect: false,
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_3"),
+                    sticky_session: false,
+                    https_redirect: false,
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
 
         let e = vec![
-            Request::RemoveHttpFrontend(RequestHttpFrontend {
-                cluster_id: Some(String::from("cluster_2")),
-                hostname: String::from("test.local"),
-                path: PathRule::prefix(String::from("/abc")),
-                address: "0.0.0.0:8080".to_string(),
-                ..Default::default()
-            }),
-            Request::RemoveBackend(RemoveBackend {
-                cluster_id: String::from("cluster_2"),
-                backend_id: String::from("cluster_2-0"),
-                address: "192.167.1.2:1026".to_string(),
-            }),
-            Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-2"),
-                address: "127.0.0.2:1028".to_string(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                ..Default::default()
-            }),
-            Request::RemoveCluster {
-                cluster_id: String::from("cluster_2"),
+            Request {
+                request_type: Some(RequestType::RemoveHttpFrontend(RequestHttpFrontend {
+                    cluster_id: Some(String::from("cluster_2")),
+                    hostname: String::from("test.local"),
+                    path: PathRule::prefix(String::from("/abc")),
+                    address: "0.0.0.0:8080".to_string(),
+                    ..Default::default()
+                })),
             },
-            Request::AddCluster(Cluster {
-                cluster_id: String::from("cluster_3"),
-                sticky_session: false,
-                https_redirect: false,
-                ..Default::default()
-            }),
+            Request {
+                request_type: Some(RequestType::RemoveBackend(RemoveBackend {
+                    cluster_id: String::from("cluster_2"),
+                    backend_id: String::from("cluster_2-0"),
+                    address: "192.167.1.2:1026".to_string(),
+                })),
+            },
+            Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-2"),
+                    address: "127.0.0.2:1028".to_string(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })),
+            },
+            Request {
+                request_type: Some(RequestType::RemoveCluster(String::from("cluster_2"))),
+            },
+            Request {
+                request_type: Some(RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_3"),
+                    sticky_session: false,
+                    https_redirect: false,
+                    ..Default::default()
+                })),
+            },
         ];
         let expected_diff: HashSet<&Request> = HashSet::from_iter(e.iter());
 
@@ -1450,13 +1604,15 @@ mod tests {
         let hash2 = state2.hash_state();
         let mut state3 = state.clone();
         state3
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-2"),
-                address: "127.0.0.2:1028".to_string(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-2"),
+                    address: "127.0.0.2:1028".to_string(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         let hash3 = state3.hash_state();
         println!("state 1 hashes: {hash1:#?}");
@@ -1501,10 +1657,18 @@ mod tests {
             ..Default::default()
         };
 
-        let add_http_front_cluster1 = Request::AddHttpFrontend(http_front_cluster1);
-        let add_http_front_cluster2 = Request::AddHttpFrontend(http_front_cluster2);
-        let add_https_front_cluster1 = Request::AddHttpsFrontend(https_front_cluster1);
-        let add_https_front_cluster2 = Request::AddHttpsFrontend(https_front_cluster2);
+        let add_http_front_cluster1 = Request {
+            request_type: Some(RequestType::AddHttpFrontend(http_front_cluster1)),
+        };
+        let add_http_front_cluster2 = Request {
+            request_type: Some(RequestType::AddHttpFrontend(http_front_cluster2)),
+        };
+        let add_https_front_cluster1 = Request {
+            request_type: Some(RequestType::AddHttpsFrontend(https_front_cluster1)),
+        };
+        let add_https_front_cluster2 = Request {
+            request_type: Some(RequestType::AddHttpsFrontend(https_front_cluster2)),
+        };
         config
             .dispatch(&add_http_front_cluster1)
             .expect("Could not execute request");
@@ -1556,13 +1720,15 @@ mod tests {
     fn duplicate_backends() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&Request::AddBackend(AddBackend {
-                cluster_id: String::from("cluster_1"),
-                backend_id: String::from("cluster_1-0"),
-                address: "127.0.0.1:1026".to_string(),
-                load_balancing_parameters: Some(LoadBalancingParams::default()),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(AddBackend {
+                    cluster_id: String::from("cluster_1"),
+                    backend_id: String::from("cluster_1-0"),
+                    address: "127.0.0.1:1026".to_string(),
+                    load_balancing_parameters: Some(LoadBalancingParams::default()),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
 
         let b = Backend {
@@ -1575,7 +1741,9 @@ mod tests {
         };
 
         state
-            .dispatch(&Request::AddBackend(b.clone().to_add_backend()))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddBackend(b.clone().to_add_backend())),
+            })
             .expect("Could not execute order");
 
         assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
@@ -1585,113 +1753,149 @@ mod tests {
     fn listener_diff() {
         let mut state: ConfigState = Default::default();
         state
-            .dispatch(&Request::AddTcpListener(TcpListenerConfig {
-                address: "0.0.0.0:1234".parse().unwrap(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddTcpListener(TcpListenerConfig {
+                    address: "0.0.0.0:1234".parse().unwrap(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::ActivateListener(ActivateListener {
-                address: "0.0.0.0:1234".parse().unwrap(),
-                proxy: ListenerType::Tcp.into(),
-                from_scm: false,
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::ActivateListener(ActivateListener {
+                    address: "0.0.0.0:1234".parse().unwrap(),
+                    proxy: ListenerType::Tcp.into(),
+                    from_scm: false,
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddHttpListener(HttpListenerConfig {
-                address: "0.0.0.0:8080".parse().unwrap(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddHttpListener(HttpListenerConfig {
+                    address: "0.0.0.0:8080".parse().unwrap(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::AddHttpsListener(HttpsListenerConfig {
-                address: "0.0.0.0:8443".parse().unwrap(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddHttpsListener(HttpsListenerConfig {
+                    address: "0.0.0.0:8443".parse().unwrap(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state
-            .dispatch(&Request::ActivateListener(ActivateListener {
-                address: "0.0.0.0:8443".parse().unwrap(),
-                proxy: ListenerType::Https.into(),
-                from_scm: false,
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::ActivateListener(ActivateListener {
+                    address: "0.0.0.0:8443".parse().unwrap(),
+                    proxy: ListenerType::Https.into(),
+                    from_scm: false,
+                })),
+            })
             .expect("Could not execute request");
 
         let mut state2: ConfigState = Default::default();
         state2
-            .dispatch(&Request::AddTcpListener(TcpListenerConfig {
-                address: "0.0.0.0:1234".parse().unwrap(),
-                expect_proxy: true,
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddTcpListener(TcpListenerConfig {
+                    address: "0.0.0.0:1234".parse().unwrap(),
+                    expect_proxy: true,
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state2
-            .dispatch(&Request::AddHttpListener(HttpListenerConfig {
-                address: "0.0.0.0:8080".parse().unwrap(),
-                answer_404: "test".to_string(),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddHttpListener(HttpListenerConfig {
+                    address: "0.0.0.0:8080".parse().unwrap(),
+                    answer_404: "test".to_string(),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state2
-            .dispatch(&Request::ActivateListener(ActivateListener {
-                address: "0.0.0.0:8080".parse().unwrap(),
-                proxy: ListenerType::Http.into(),
-                from_scm: false,
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::ActivateListener(ActivateListener {
+                    address: "0.0.0.0:8080".parse().unwrap(),
+                    proxy: ListenerType::Http.into(),
+                    from_scm: false,
+                })),
+            })
             .expect("Could not execute request");
         state2
-            .dispatch(&Request::AddHttpsListener(HttpsListenerConfig {
-                address: "0.0.0.0:8443".parse().unwrap(),
-                answer_404: String::from("test"),
-                ..Default::default()
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddHttpsListener(HttpsListenerConfig {
+                    address: "0.0.0.0:8443".parse().unwrap(),
+                    answer_404: String::from("test"),
+                    ..Default::default()
+                })),
+            })
             .expect("Could not execute request");
         state2
-            .dispatch(&Request::ActivateListener(ActivateListener {
-                address: "0.0.0.0:8443".parse().unwrap(),
-                proxy: ListenerType::Https.into(),
-                from_scm: false,
-            }))
+            .dispatch(&Request {
+                request_type: Some(RequestType::ActivateListener(ActivateListener {
+                    address: "0.0.0.0:8443".parse().unwrap(),
+                    proxy: ListenerType::Https.into(),
+                    from_scm: false,
+                })),
+            })
             .expect("Could not execute request");
 
         let e = vec![
-            Request::RemoveListener(RemoveListener {
-                address: "0.0.0.0:1234".parse().unwrap(),
-                proxy: ListenerType::Tcp.into(),
-            }),
-            Request::AddTcpListener(TcpListenerConfig {
-                address: "0.0.0.0:1234".parse().unwrap(),
-                expect_proxy: true,
-                ..Default::default()
-            }),
-            Request::DeactivateListener(DeactivateListener {
-                address: "0.0.0.0:1234".parse().unwrap(),
-                proxy: ListenerType::Tcp.into(),
-                to_scm: false,
-            }),
-            Request::RemoveListener(RemoveListener {
-                address: "0.0.0.0:8080".parse().unwrap(),
-                proxy: ListenerType::Http.into(),
-            }),
-            Request::AddHttpListener(HttpListenerConfig {
-                address: "0.0.0.0:8080".parse().unwrap(),
-                answer_404: String::from("test"),
-                ..Default::default()
-            }),
-            Request::ActivateListener(ActivateListener {
-                address: "0.0.0.0:8080".parse().unwrap(),
-                proxy: ListenerType::Http.into(),
-                from_scm: false,
-            }),
-            Request::RemoveListener(RemoveListener {
-                address: "0.0.0.0:8443".parse().unwrap(),
-                proxy: ListenerType::Https.into(),
-            }),
-            Request::AddHttpsListener(HttpsListenerConfig {
-                address: "0.0.0.0:8443".parse().unwrap(),
-                answer_404: String::from("test"),
-                ..Default::default()
-            }),
+            Request {
+                request_type: Some(RequestType::RemoveListener(RemoveListener {
+                    address: "0.0.0.0:1234".parse().unwrap(),
+                    proxy: ListenerType::Tcp.into(),
+                })),
+            },
+            Request {
+                request_type: Some(RequestType::AddTcpListener(TcpListenerConfig {
+                    address: "0.0.0.0:1234".parse().unwrap(),
+                    expect_proxy: true,
+                    ..Default::default()
+                })),
+            },
+            Request {
+                request_type: Some(RequestType::DeactivateListener(DeactivateListener {
+                    address: "0.0.0.0:1234".parse().unwrap(),
+                    proxy: ListenerType::Tcp.into(),
+                    to_scm: false,
+                })),
+            },
+            Request {
+                request_type: Some(RequestType::RemoveListener(RemoveListener {
+                    address: "0.0.0.0:8080".parse().unwrap(),
+                    proxy: ListenerType::Http.into(),
+                })),
+            },
+            Request {
+                request_type: Some(RequestType::AddHttpListener(HttpListenerConfig {
+                    address: "0.0.0.0:8080".parse().unwrap(),
+                    answer_404: String::from("test"),
+                    ..Default::default()
+                })),
+            },
+            Request {
+                request_type: Some(RequestType::ActivateListener(ActivateListener {
+                    address: "0.0.0.0:8080".parse().unwrap(),
+                    proxy: ListenerType::Http.into(),
+                    from_scm: false,
+                })),
+            },
+            Request {
+                request_type: Some(RequestType::RemoveListener(RemoveListener {
+                    address: "0.0.0.0:8443".parse().unwrap(),
+                    proxy: ListenerType::Https.into(),
+                })),
+            },
+            Request {
+                request_type: Some(RequestType::AddHttpsListener(HttpsListenerConfig {
+                    address: "0.0.0.0:8443".parse().unwrap(),
+                    answer_404: String::from("test"),
+                    ..Default::default()
+                })),
+            },
         ];
 
         let diff = state.diff(&state2);
