@@ -1,5 +1,0 @@
-{
-  "request_type": {
-    "LOAD_STATE": "./config_dump.json"
-  }
-}
