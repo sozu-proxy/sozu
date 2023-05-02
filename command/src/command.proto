@@ -8,8 +8,6 @@ message Request {
     string save_state = 1;
     // load a state file, given its path
     string load_state = 2;
-    // dump the state in JSON
-    DumpState dump_state = 3;
     // list the workers and their status
     ListWorkers list_workers = 4;
     // list the frontends, filtered by protocol and/or domain
@@ -95,7 +93,6 @@ message Request {
   }
 }
 
-message DumpState {}
 message ListWorkers {}
 message ListListeners {}
 message UpgradeMain {}
