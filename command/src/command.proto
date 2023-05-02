@@ -1,10 +1,15 @@
 syntax = "proto2";
 package command;
 
-// A request sent by the CLI (or other) to the main process
+// A message received by Sōzu to change its state or query information
 message Request {
   oneof request_type {
-    // save Sōzu's parseable state as a file, with a path
+    // This message tells Sōzu to dump the current proxy state (backends,
+    // front domains, certificates, etc) as a list of JSON-serialized Requests,
+    // separated by a 0 byte, to a file. This file can be used later
+    // to bootstrap the proxy. This message is not forwarded to workers.
+    // If the specified path is relative, it will be calculated relative to the current
+    // working directory of the proxy.
     string save_state = 1;
     // load a state file, given its path
     string load_state = 2;
@@ -201,6 +206,7 @@ message ListenersList {
     map<string, TcpListenerConfig> tcp_listeners = 3;
 }
 
+// An HTTP or HTTPS frontend, as order to, or received from, Sōzu
 message RequestHttpFrontend {
     optional string cluster_id = 1;
     required string address = 2;
@@ -318,8 +324,10 @@ enum TlsVersion {
     TLS_V1_3 = 5;
 }
 
+// A cluster is what binds a frontend to backends with routing rules
 message Cluster {
     required string cluster_id = 1;
+    // wether a connection from a client shall be always redirected to the same backend
     required bool sticky_session = 2;
     required bool https_redirect = 3;
     optional ProxyProtocolConfig proxy_protocol = 4;
