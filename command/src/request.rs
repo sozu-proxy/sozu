@@ -198,7 +198,3 @@ impl FromStr for LoadBalancingAlgorithms {
         }
     }
 }
-
-pub fn is_false(b: &bool) -> bool {
-    !*b
-}
