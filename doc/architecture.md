@@ -16,7 +16,7 @@ All of the listening TCP sockets are opened with the [SO_REUSEPORT](https://lwn.
 External tools interact with the main process through a unix socket, and configuration change messages will be dispatched to the workers by the main.
 The configuration messages are "diffs", like "add a backend server", or "remove a HTTP frontend", instead of changing the whole configuration at once. This allows sōzu to be smarter about handling the configuration changes while under traffic.
 
-The configuration messages are transmitted in JSON format, and they are defined in the [command library](https://github.com/sozu-proxy/sozu/tree/main/command). There are three possible message answers: processing (meaning the message has been received but the change is not active yet), error or ok.
+The configuration messages are transmitted in protobuf binary format, and they are defined in the [command library](https://github.com/sozu-proxy/sozu/tree/main/command). There are three possible message answers: processing (meaning the message has been received but the change is not active yet), failure or ok.
 
 The main exposes a unix socket for configuration instead of a HTTP server on localhost because unix socket access can be secured through file system permissions.
 
@@ -78,9 +78,3 @@ All traffic is (briefly) stored in a pool of fix-sized (usually 16 kB), reusable
 ### channels
 
 They are an abstraction layer over a unix socket, making chatting with a sōzu easier.
-
-### futures
-
-Sōzu receives orders on a unix socket, in JSON format.
-Writing commands that way could be cumbersome.
-The `futures` lib is an asynchronous toolkit, based on tokio, that allows developers to write Sōzu-commanding software.

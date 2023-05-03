@@ -6,11 +6,11 @@
 
 If you used the `cargo install` way, `sozu` is already in your `$PATH`.
 
-`sozu start -c <path/to/your/config.toml>`
+    sozu start -c <path/to/your/config.toml>
 
 However, if you built the project from source, `sozu` is placed in the `target` directory.
 
-`./target/release/sozu start -c <path/to/your/config.toml>`
+    ./target/release/sozu start -c <path/to/your/config.toml>
 
 > `cargo build --release --locked` puts the resulting binary in `target/release` instead of `target/debug`.
 
@@ -26,9 +26,9 @@ You can edit the reverse proxy's configuration with the `config.toml` file. You 
 
 **But** for more flexibility, you should use the command socket (you can find one end of that unix socket at the path designed by `command_socket` in the configuration file).
 
-You can use `sozu` binary to interact with the reverse proxy.
+You can use the `sozu` binary as a CLI to interact with the reverse proxy.
 
-Checkout sozu's command line [documentation](./configure_cli.md) for more information.
+Check out the command line [documentation](./configure_cli.md) for more information.
 
 ## Run it with Docker
 
@@ -36,7 +36,7 @@ The repository provides a multi-stage [Dockerfile][df] image based on `alpine:ed
 
 You can build the image by doing:
 
-`docker build -t sozu .`
+    docker build -t sozu .
 
 There's also the [clevercloud/sozu](https://hub.docker.com/r/clevercloud/sozu/) image
 following the master branch (outdated).
@@ -57,27 +57,28 @@ docker run \
 
 To build an image with a specific version of Alpine:
 
-`docker build --build-arg ALPINE_VERSION=3.14 -t sozu:main-alpine-3.14 .`
+    docker build --build-arg ALPINE_VERSION=3.14 -t sozu:main-alpine-3.14 .
 
 ### Using a custom `config.toml` configuration file
 
 The default configuration for sozu can be found in `../os-build/docker/config.toml`.
 If `/my/custom/config.toml` is the path and name of your custom configuration file, you can start your sozu container with this in a volume to override the default configuration (note that only the directory path of the custom config file is used in this command):
 
-`docker run -v /my/custom:/etc/sozu sozu`
+    docker run -v /my/custom:/etc/sozu sozu
 
 ### Using sozu command line with the docker container
 
 To use `sozu` CLI from the host with the docker container you have to bind `/run/sozu` with the host by using a docker volume:
 
-`docker run -v /run/sozu:/run/sozu sozu`
+    docker run -v /run/sozu:/run/sozu sozu
 
 To change the path of the configuration socket, modify the `command_socket` option in the configuration file (default value is `/var/lib/sozu/sock`).
 
 ### Provide an initial configuration state
 
 Sōzu can use a JSON file to load an initial configuration state for its routing. You can mount it by using a volume, you can start your sozu container with this in a volume (note that only the directory path of the custom config file is used in this command):
-`docker run -v /my/state:/var/lib/sozu sozu`
+
+    docker run -v /my/state:/var/lib/sozu sozu
 
 To change the path of the saved state file, modify the `saved_state` option in the configuration file (default value is `/var/lib/sozu/state.json`).
 
@@ -96,10 +97,12 @@ This script will generate `sozu.service`, `sozu.conf` and `config.toml` files in
 
 Here is an example of those variables:
 
-- `__BINDIR__` : `/usr/local/bin`
-- `__SYSCONFDIR__` : `/etc`
-- `__DATADIR__` : `/var/lib/sozu`
-- `__RUNDIR__` : `/run`
+| variable | value |
+| :--- | :--- |
+| `__BINDIR__` | `/usr/local/bin` |
+| `__SYSCONFDIR__` | `/etc` |
+| `__DATADIR__` | `/var/lib/sozu` |
+| `__RUNDIR__` | `/run` |
 
 [un]: ../os-build/systemd/sozu.service.in
 [gen]: ../os-build/exherbo/generate.sh

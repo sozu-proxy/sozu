@@ -7,6 +7,7 @@ RUN apk update && apk add --no-cache --virtual .build-dependencies \
   file \
   libgcc \
   musl-dev \
+  protobuf protobuf-dev \
   rust
 RUN apk add --no-cache openssl-dev \
   llvm-libunwind \
