@@ -338,7 +338,6 @@ impl CertificateResolverHelper for GenericCertificateResolver {
 
             chains.push(chain);
         }
-
         // try to parse key as rsa private key
         let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
         let parsed_keys = rustls_pemfile::rsa_private_keys(&mut key_reader);
