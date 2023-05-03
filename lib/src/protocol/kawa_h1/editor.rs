@@ -125,7 +125,7 @@ impl HttpContext {
                 header.val = kawa::Store::from_string(format!(
                     "{}, {}",
                     unsafe { from_utf8_unchecked(header.val.data(buf)) },
-                    peer_ip.to_string()
+                    peer_ip
                 ));
             }
             if let Some(header) = &mut forwarded {

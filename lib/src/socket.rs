@@ -319,7 +319,7 @@ impl SocketHandler for FrontRustls {
         let mut socket_state = SocketResult::Continue;
         let mut size;
         for buf in bufs {
-            (size, socket_state) = self.socket_write(&buf);
+            (size, socket_state) = self.socket_write(buf);
             total_size += size;
             if socket_state != SocketResult::Continue {
                 break;

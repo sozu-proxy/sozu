@@ -120,13 +120,6 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         session
     }
 
-    fn debug_tokens(&self) -> Option<(Token, Token)> {
-        if let Some(back) = self.backend_token {
-            return Some((self.frontend_token, back));
-        }
-        None
-    }
-
     pub fn front_socket(&self) -> &TcpStream {
         self.frontend.socket_ref()
     }
@@ -541,16 +534,14 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             metrics.bout += sz;
         }
 
-        if let Some((front, back)) = self.debug_tokens() {
-            debug!(
-                "{}\tFRONT [{}<-{}]: wrote {} bytes of {}",
-                self.log_ctx,
-                front.0,
-                back.0,
-                sz,
-                self.backend_buffer.available_data()
-            );
-        }
+        debug!(
+            "{}\tFRONT [{}<-{:?}]: wrote {} bytes of {}",
+            self.log_ctx,
+            self.frontend_token.0,
+            self.backend_token,
+            sz,
+            self.backend_buffer.available_data()
+        );
 
         match res {
             SocketResult::Error => {

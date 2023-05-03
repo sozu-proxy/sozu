@@ -2,9 +2,12 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
+    os::fd::{FromRawFd, IntoRawFd},
     str::from_utf8,
     time::Duration,
 };
+
+use libc::setsockopt;
 
 use crate::BUFFER_SIZE;
 
@@ -42,6 +45,22 @@ impl Backend {
     /// Binds itself to its address, stores the yielded TCP listener
     pub fn connect(&mut self) {
         let listener = TcpListener::bind(self.address).expect("could not bind");
+        let timeout = Duration::from_millis(100);
+        let timeout = libc::timeval {
+            tv_sec: timeout.as_secs() as i64,
+            tv_usec: timeout.subsec_micros() as i64,
+        };
+        let listener = unsafe {
+            let fd = listener.into_raw_fd();
+            setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &timeout as *const libc::timeval as *const _,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+            TcpListener::from_raw_fd(fd)
+        };
         self.listener = Some(listener);
         self.clients = HashMap::new();
     }

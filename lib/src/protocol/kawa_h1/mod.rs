@@ -314,7 +314,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let was_initial = self.request_stream.is_initial();
 
         kawa::h1::parse(&mut self.request_stream, &mut self.context);
-        kawa::debug_kawa(&self.request_stream);
+        // kawa::debug_kawa(&self.request_stream);
 
         if was_initial && !self.request_stream.is_initial() {
             gauge_add!("http.active_requests", 1);
@@ -630,7 +630,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let was_initial = self.response_stream.is_initial();
 
         kawa::h1::parse(&mut self.response_stream, &mut self.context);
-        kawa::debug_kawa(&self.response_stream);
+        // kawa::debug_kawa(&self.response_stream);
 
         if self.response_stream.is_error() {
             incr!("http.backend_parse_errors");

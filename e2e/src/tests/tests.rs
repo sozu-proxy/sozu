@@ -1202,6 +1202,132 @@ pub fn try_stick() -> State {
     State::Success
 }
 
+fn try_max_connections() -> State {
+    let front_address = "127.0.0.1:2001"
+        .parse()
+        .expect("could not parse front address");
+
+    let (mut config, listeners, state) = Worker::empty_config();
+    config.max_connections = 15;
+    let (mut worker, mut backends) =
+        setup_sync_test("MAXCONN", config, listeners, state, front_address, 1, false);
+
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+    let expected_response_start = String::from("HTTP/1.1 200 OK\r\nContent-Length: 5");
+
+    let mut clients = Vec::new();
+    for i in 0..20 {
+        let mut client = Client::new(
+            format!("client{i}"),
+            front_address,
+            http_request("GET", "/api", format!("ping{i}"), "localhost"),
+        );
+        client.connect();
+        client.send();
+        if backend.accept(i) {
+            assert!(i < 15);
+            let request = backend.receive(i);
+            println!("request {i}: {request:?}");
+            backend.send(i);
+        } else {
+            assert!(i >= 15);
+        }
+        let response = client.receive();
+        println!("response {i}: {response:?}");
+        if i < 15 {
+            assert!(response.unwrap().starts_with(&expected_response_start));
+        } else {
+            assert_eq!(response, None);
+        }
+        clients.push(client);
+    }
+
+    for i in 0..20 {
+        let client = &mut clients[i];
+        if i < 15 {
+            client.send();
+            let request = backend.receive(i);
+            println!("request {i}: {request:?}");
+            backend.send(i);
+            let response = client.receive();
+            println!("response {i}: {response:?}");
+            assert!(client.is_connected());
+            assert!(response.unwrap().starts_with(&expected_response_start));
+        } else {
+            // assert!(!client.is_connected());
+        }
+    }
+
+    for i in 0..5 {
+        let new_client = &mut clients[15 + i];
+        new_client.set_request(format!(
+            "GET /api-{i} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ));
+        new_client.connect();
+        new_client.send();
+
+        let client = &mut clients[i];
+        client.set_request("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        client.send();
+        let request = backend.receive(i);
+        println!("request {i}: {request:?}");
+        backend.send(i);
+        let response = client.receive();
+        println!("response {i}: {response:?}");
+        assert!(!client.is_connected());
+        assert!(response.unwrap().starts_with(&expected_response_start));
+
+        if backend.accept(15 + i) {
+            assert!(i >= 2);
+        } else {
+            assert!(i < 2);
+        }
+    }
+
+    assert!(!backend.accept(100));
+
+    for i in 15..20 {
+        let request = backend.receive(i);
+        backend.send(i);
+        println!("request {i}: {request:?}");
+    }
+    for i in 15..20 {
+        let client = &mut clients[i];
+        client.is_connected();
+        let response = client.receive();
+        println!("response {i}: {response:?}");
+        client.is_connected();
+        // assert!(response.unwrap().starts_with(&expected_response_start));
+    }
+
+    for i in 15..20 {
+        let client = &mut clients[i];
+        client.is_connected();
+        let response = client.receive();
+        println!("response: {response:?}");
+    }
+
+    worker.hard_stop();
+    worker.wait_for_server_stop();
+
+    for client in clients {
+        println!(
+            "{} sent: {}, received: {}",
+            client.name, client.requests_sent, client.responses_received
+        );
+    }
+    println!(
+        "{} sent: {}, received: {}",
+        backend.name, backend.responses_sent, backend.requests_received
+    );
+
+    assert_eq!(backend.requests_received, 38);
+    assert_eq!(backend.responses_sent, 38);
+
+    State::Success
+}
+
 #[serial]
 #[test]
 fn test_sync() {
@@ -1365,6 +1491,15 @@ fn test_keep_alive() {
 fn test_stick() {
     assert_eq!(
         repeat_until_error_or(10, "Sticky session", try_stick),
+        State::Success
+    );
+}
+
+#[serial]
+#[test]
+fn test_max_connections() {
+    assert_eq!(
+        repeat_until_error_or(2, "Max connections reached", try_max_connections),
         State::Success
     );
 }
