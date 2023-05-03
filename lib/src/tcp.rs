@@ -1475,7 +1475,9 @@ impl ProxyConfiguration for TcpProxy {
             (Some(fb), Some(bb)) => (fb, bb),
             _ => {
                 error!("could not get buffers from pool");
-                error!("Buffer capacity has been reached, stopping to accept new connections for now");
+                error!(
+                    "Buffer capacity has been reached, stopping to accept new connections for now"
+                );
                 gauge!("accept_queue.backpressure", 1);
                 self.sessions.borrow_mut().can_accept = false;
 
