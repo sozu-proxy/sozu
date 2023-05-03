@@ -870,9 +870,7 @@ impl TcpSession {
             bail!(format!("Too many connections on cluster {cluster_id}"));
         }
 
-        if self.proxy.borrow().sessions.borrow().slab.len()
-            >= self.proxy.borrow().sessions.borrow().slab_capacity()
-        {
+        if self.proxy.borrow().sessions.borrow().at_capacity() {
             bail!("not enough memory, cannot connect to backend");
         }
 
@@ -1477,11 +1475,11 @@ impl ProxyConfiguration for TcpProxy {
             (Some(fb), Some(bb)) => (fb, bb),
             _ => {
                 error!("could not get buffers from pool");
-                error!("max number of session connection reached, flushing the accept queue");
+                error!("Buffer capacity has been reached, stopping to accept new connections for now");
                 gauge!("accept_queue.backpressure", 1);
                 self.sessions.borrow_mut().can_accept = false;
 
-                return Err(AcceptError::TooManySessions);
+                return Err(AcceptError::BufferCapacityReached);
             }
         };
 
