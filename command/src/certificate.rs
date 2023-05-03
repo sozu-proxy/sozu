@@ -99,7 +99,7 @@ impl<'de> serde::Deserialize<'de> for Fingerprint {
 
 pub fn calculate_fingerprint(certificate: &[u8]) -> anyhow::Result<Vec<u8>> {
     let parsed_certificate = parse(certificate).with_context(|| "Can not parse certificate")?;
-    let fingerprint = Sha256::digest(parsed_certificate.contents)
+    let fingerprint = Sha256::digest(parsed_certificate.contents())
         .iter()
         .cloned()
         .collect();
