@@ -435,6 +435,7 @@ pub enum AcceptError {
     WouldBlock,
     RegisterError,
     WrongSocketAddress,
+    BufferCapacityReached,
 }
 
 use self::server::ListenToken;
