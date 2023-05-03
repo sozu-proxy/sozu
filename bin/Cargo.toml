@@ -25,7 +25,6 @@ include = [
 name = "sozu"
 
 [dependencies]
-acme-lib = "^0.8.2"
 anyhow = "^1.0.71"
 async-dup = "^1.2.2"
 async-io = "^1.13.0"
@@ -49,7 +48,6 @@ rand = "^0.8.5"
 regex = "^1.8.1"
 slab = "^0.4.8"
 smol = "^1.3.0"
-tiny_http = "^0.12.0"
 tempfile = "^3.5.0"
 termion = "^2.0.1"
 

@@ -21,8 +21,6 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 #[macro_use]
 mod logging;
 
-/// CLI utility for Let's Encrypt configuration
-mod acme;
 /// the arguments to the sozu command line
 mod cli;
 /// Receives orders from the CLI, transmits to workers
@@ -93,29 +91,6 @@ fn main(args: Args) -> anyhow::Result<()> {
                 max_command_buffer_size,
             )
         }
-        cli::SubCmd::Acme {
-            config,
-            domain,
-            email,
-            cluster_id,
-            old_certificate_path,
-            new_certificate_path,
-            certificate_chain_path,
-            key_path,
-            http_frontend_address,
-            https_frontend_address,
-        } => acme::main(
-            config,
-            domain,
-            email,
-            cluster_id,
-            old_certificate_path,
-            new_certificate_path,
-            certificate_chain_path,
-            key_path,
-            http_frontend_address,
-            https_frontend_address,
-        ),
         _ => ctl::ctl(args),
     }
 }
