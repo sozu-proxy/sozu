@@ -23,6 +23,7 @@ impl Response {
     }
 }
 
+/// An HTTP or HTTPS frontend, as used *within* Sōzu
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpFrontend {
     /// Send a 401, DENY, if cluster_id is None
@@ -140,11 +141,13 @@ impl std::fmt::Display for PathRule {
     }
 }
 
+/// A TCP frontend, as used *within* Sōzu
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TcpFrontend {
     pub cluster_id: String,
     pub address: SocketAddr,
     // TODO: remove the Option here, the map may as well be empty
+    /// custom tags to identify the frontend in the access logs
     pub tags: Option<BTreeMap<String, String>>,
 }
 

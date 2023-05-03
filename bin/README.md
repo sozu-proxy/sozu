@@ -16,9 +16,9 @@ file.
 The proxy receives orders through a unix socket. The path to this unix socket can
 be defined by the `command_socket` option in the TOML configuration file.
 
-The messages are sent as JSON messages, separated by the 0 byte.
+The messages are sent as binary, using protobuf,
+separated by the 0 byte.
 
-Their format is defined in `../command/README.md`. Additionally, the
-`sozu_command_lib` crate in `../command` already provides the necessary
-structures, serialization and deserialization code to communicate with
+Their format is defined in `../command/command.proto`. Additionally, the
+provides the necessary channels to communicate with
 the command socket.

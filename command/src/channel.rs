@@ -19,6 +19,8 @@ use serde_json;
 
 use crate::{buffer::growable::Buffer, ready::Ready};
 
+/// A wrapper around unix socket using the mio crate.
+/// Used in pairs to communicate, in a blocking or non-blocking way.
 pub struct Channel<Tx, Rx> {
     pub sock: MioUnixStream,
     front_buf: Buffer,

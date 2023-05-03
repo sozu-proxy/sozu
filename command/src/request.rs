@@ -77,7 +77,6 @@ impl Request {
             // These won't ever reach a worker anyway
             RequestType::SaveState(_)
             | RequestType::LoadState(_)
-            | RequestType::DumpState(_)
             | RequestType::ListWorkers(_)
             | RequestType::ListFrontends(_)
             | RequestType::ListListeners(_)
