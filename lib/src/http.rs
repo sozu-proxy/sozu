@@ -201,8 +201,17 @@ impl HttpSession {
         let back_token = unwrap_msg!(http.backend_token);
         let ws_context = http.websocket_context();
 
-        let front_buf = http.request_stream.storage.buffer;
-        let back_buf = http.response_stream.storage.buffer;
+        let mut front_buf = http.request_stream.storage.buffer;
+        front_buf.sync(
+            http.request_stream.storage.end,
+            http.request_stream.storage.head,
+        );
+
+        let mut back_buf = http.response_stream.storage.buffer;
+        back_buf.sync(
+            http.response_stream.storage.end,
+            http.response_stream.storage.head,
+        );
 
         gauge_add!("protocol.http", -1);
         gauge_add!("protocol.ws", 1);

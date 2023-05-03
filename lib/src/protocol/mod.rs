@@ -32,14 +32,14 @@ pub trait SessionState {
     /// if the event loop got an event for a token associated with the session,
     /// it will call this method
     fn update_readiness(&mut self, token: Token, events: Ready);
-    /// closes the state
+    /// close the state
     fn close(&mut self, _proxy: Rc<RefCell<dyn L7Proxy>>, _metrics: &mut SessionMetrics) {}
     /// if a timeout associated with the session triggers, the event loop will
     /// call this method with the timeout's token
     fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> StateResult;
     /// cancel frontend timeout (and backend timeout if present)
     fn cancel_timeouts(&mut self);
-    /// displays the session's internal state (for debugging purpose),
+    /// display the session's internal state (for debugging purpose),
     /// ```plain
     /// <context> Session(<State name>):
     ///     Frontend:

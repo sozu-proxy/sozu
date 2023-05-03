@@ -116,6 +116,10 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     pub request_stream: GenericHttpStream,
     pub response_stream: GenericHttpStream,
     status: SessionStatus,
+    /// The HTTP context was separated from the State for borrowing reasons.
+    /// Calling a kawa parser mutably borrows the State through request_stream or response_stream,
+    /// so Http can't be borrowed again to be used in callbacks. HttContext is an independant
+    /// subsection of Http that can be mutably borrowed for parser callbacks.
     pub context: HttpContext,
 }
 
@@ -137,11 +141,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         session_address: Option<SocketAddr>,
         sticky_name: String,
     ) -> Http<Front, L> {
+        // TODO: handle properly these errors
         let (front_buffer, back_buffer) = match pool.upgrade() {
             Some(pool) => {
-                let a = pool.borrow_mut().checkout();
-                let b = pool.borrow_mut().checkout();
-                match (a, b) {
+                let mut pool = pool.borrow_mut();
+                match (pool.checkout(), pool.checkout()) {
                     (Some(front_buffer), Some(back_buffer)) => (front_buffer, back_buffer),
                     _ => panic!(),
                 }
@@ -193,20 +197,18 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
+    /// Reset the connection in case of keep-alive to be ready for the next request
     pub fn reset(&mut self) {
         println!("==============reset");
         self.context.keep_alive_frontend = true;
         self.context.keep_alive_backend = true;
         self.context.sticky_session_found = None;
         self.context.id = Ulid::generate();
-        gauge_add!("http.active_requests", -1);
 
         self.request_stream.clear();
         self.response_stream.clear();
-        // self.added_request_header = Some(self.added_request_header(self.session_address));
-        // self.added_response_header = self.added_response_header();
-
         self.keepalive_count += 1;
+        gauge_add!("http.active_requests", -1);
 
         if let Some(backend) = &mut self.backend {
             let mut backend = backend.borrow_mut();
@@ -664,7 +666,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    /// (code, reason)
+    /// Get the (code, reason) from the response_stream
     pub fn get_response_line(&self) -> (Option<u16>, Option<&str>) {
         if let kawa::StatusLine::Response { code, reason, .. } =
             &self.request_stream.detached.status_line
@@ -679,7 +681,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    /// (method, authority, path, uri)
+    /// Get the (method, authority, path, uri) from the request_stream
     pub fn get_request_line(&self) -> (Option<Method>, Option<&str>, Option<&str>, Option<&str>) {
         if let kawa::StatusLine::Request {
             method,
@@ -723,6 +725,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             })
     }
 
+    // The protocol name used in the access logs
     fn protocol_string(&self) -> &'static str {
         match self.context.protocol {
             Protocol::HTTP => "HTTP",
@@ -1151,6 +1154,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
+    /// Check the number of connection attempts against authorized connection retries
     fn check_circuit_breaker(&mut self) -> anyhow::Result<()> {
         if self.connection_attempts >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
@@ -1544,6 +1548,17 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
+    /// The main session loop, processing all events triggered by mio since last time
+    /// and proxying http traffic. The main flow can be summed up by:
+    ///
+    /// - if connecting an back has event:
+    ///   - if backend hanged up, try again
+    ///   - else, set as connected
+    /// - while front or back has event:
+    ///   - read request on front
+    ///   - write request to back
+    ///   - read response on back
+    ///   - write response to front
     fn ready_inner(
         &mut self,
         session: Rc<RefCell<dyn crate::ProxySession>>,
@@ -1747,8 +1762,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
         }
     }
 
-    // TODO: State should take responsibility for closing sockets and token entries?
-    // how about no
     fn close(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
         self.close_backend(proxy, metrics);
 
@@ -1847,7 +1860,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
     }
 }
 
-/// Save the backend http response status code metric
+/// Save the HTTP status code of the backend response
 fn save_http_status_metric(status: Option<u16>) {
     if let Some(status) = status {
         match status {
@@ -1867,8 +1880,9 @@ fn save_http_status_metric(status: Option<u16>) {
                 incr!("http.status.5xx");
             }
             _ => {
+                // http responses with other codes (protocol error)
                 incr!("http.status.other");
-            } // http responses with other codes (protocol error)
+            }
         }
     }
 }

@@ -17,8 +17,9 @@ use sozu_command::{
     config::{Config, ConfigBuilder, FileConfig},
     logging::{Logger, LoggerBackend},
     proto::command::{
-        request::RequestType, AddBackend, Cluster, LoadBalancingParams, PathRule, Request,
-        RequestHttpFrontend, RequestTcpFrontend, ReturnListenSockets, RulePosition, SoftStop,
+        request::RequestType, AddBackend, Cluster, HardStop, LoadBalancingParams, PathRule,
+        Request, RequestHttpFrontend, RequestTcpFrontend, ReturnListenSockets, RulePosition,
+        SoftStop,
     },
     request::WorkerRequest,
     response::WorkerResponse,
@@ -177,9 +178,7 @@ impl Worker {
     }
 
     pub fn upgrade<S: Into<String>>(&mut self, name: S) -> Self {
-        self.send_proxy_request(Request {
-            request_type: Some(RequestType::ReturnListenSockets(ReturnListenSockets {})),
-        });
+        self.send_proxy_request_type(RequestType::ReturnListenSockets(ReturnListenSockets {}));
         self.read_to_last();
 
         self.scm_main_to_worker
@@ -191,9 +190,7 @@ impl Worker {
             .expect("receive listeners");
         println!("Listeners from old worker: {listeners:?}");
         println!("State from old worker: {:?}", self.state);
-        self.send_proxy_request(Request {
-            request_type: Some(RequestType::SoftStop(SoftStop {})),
-        });
+        self.soft_stop();
 
         let mut worker = Worker::start_new_worker(
             name,
@@ -226,6 +223,9 @@ impl Worker {
             })
             .expect("Could not write message on command channel");
     }
+    pub fn send_proxy_request_type(&mut self, request: RequestType) {
+        self.send_proxy_request(request.into());
+    }
 
     pub fn read_proxy_response(&mut self) -> Option<WorkerResponse> {
         let response = self
@@ -243,6 +243,13 @@ impl Worker {
                 break;
             }
         }
+    }
+
+    pub fn hard_stop(&mut self) {
+        self.send_proxy_request_type(RequestType::HardStop(HardStop {}));
+    }
+    pub fn soft_stop(&mut self) {
+        self.send_proxy_request_type(RequestType::SoftStop(SoftStop {}));
     }
 
     pub fn wait_for_server_stop(self) -> bool {

@@ -432,7 +432,7 @@ pub trait ProxySession {
     /// if the event loop got an event for a token associated with the session,
     /// it will call this method on the session
     fn update_readiness(&mut self, token: Token, events: Ready);
-    /// closes a session, frontend and backend sockets,
+    /// close a session, frontend and backend sockets,
     /// remove the entries from the session manager slab
     fn close(&mut self);
     /// if a timeout associated with the session triggers, the event loop will
@@ -440,7 +440,7 @@ pub trait ProxySession {
     fn timeout(&mut self, t: Token) -> SessionIsToBeClosed;
     /// last time the session got an event
     fn last_event(&self) -> Instant;
-    /// displays the session's internal state (for debugging purpose)
+    /// display the session's internal state (for debugging purpose)
     fn print_session(&self);
     /// get the token associated with the frontend
     fn frontend_token(&self) -> Token;
