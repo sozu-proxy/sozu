@@ -25,8 +25,6 @@ use crate::{
 /// To use throughout Sōzu
 pub type ClusterId = String;
 
-// TODO: HttpFrontend and TcpFrontend and Backend are not present or meant to be
-// translated in protobuf, find a fix
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigState {
     pub clusters: BTreeMap<ClusterId, Cluster>,
@@ -40,8 +38,6 @@ pub struct ConfigState {
     /// indexed by (address, hostname, path)
     pub https_fronts: BTreeMap<String, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
-    // TODO: create an intermediate type to remove the nested maps
-    /// certificate and names
     pub certificates: HashMap<SocketAddr, HashMap<Fingerprint, CertificateAndKey>>,
 }
 

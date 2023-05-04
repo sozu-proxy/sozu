@@ -212,11 +212,7 @@ impl CommandManager {
                     response.message
                 ),
                 ResponseStatus::Ok => {
-                    // this is necessary because we may receive responses about other workers
-                    // TODO: is it though?
-                    // if id == response.id {
                     info!("Success: {}", response.message);
-                    // }
                     break;
                 }
             }
