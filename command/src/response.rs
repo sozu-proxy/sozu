@@ -146,9 +146,8 @@ impl std::fmt::Display for PathRule {
 pub struct TcpFrontend {
     pub cluster_id: String,
     pub address: SocketAddr,
-    // TODO: remove the Option here, the map may as well be empty
     /// custom tags to identify the frontend in the access logs
-    pub tags: Option<BTreeMap<String, String>>,
+    pub tags: BTreeMap<String, String>,
 }
 
 impl Into<RequestTcpFrontend> for TcpFrontend {
@@ -156,7 +155,7 @@ impl Into<RequestTcpFrontend> for TcpFrontend {
         RequestTcpFrontend {
             cluster_id: self.cluster_id,
             address: self.address.to_string(),
-            tags: self.tags.unwrap_or(BTreeMap::new()),
+            tags: self.tags.clone(),
         }
     }
 }
