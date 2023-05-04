@@ -1,20 +1,48 @@
+use std::{sync::Arc, time::SystemTime};
+
 use hyper::{
     self,
     client::{connect::dns::GaiResolver, HttpConnector, ResponseFuture},
     StatusCode,
 };
-use hyper_tls::HttpsConnector;
+use hyper_rustls::HttpsConnector;
+use rustls::{
+    client::{ClientConfig, ServerCertVerified, ServerCertVerifier},
+    Certificate, ServerName,
+};
+
+// We implement our own verifier to allow self-signed certificates
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub struct Verifier;
+
+impl ServerCertVerifier for Verifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &Certificate,
+        _intermediates: &[Certificate],
+        _server_name: &ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: SystemTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+}
 
 /// Build a Hyper HTTP Client that supports TLS and self signed certificates
 pub fn build_https_client() -> hyper::Client<HttpsConnector<HttpConnector<GaiResolver>>, hyper::Body>
 {
-    let mut http = HttpConnector::new();
-    http.enforce_http(false);
-    let tls = hyper_tls::native_tls::TlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .expect("Could not build TlsConnector");
-    let https = HttpsConnector::from((http, tls.into()));
+    let config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(Arc::new(Verifier))
+        .with_no_client_auth();
+
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(config)
+        .https_or_http()
+        .enable_http1()
+        .build();
+
     hyper::Client::builder().build::<_, hyper::Body>(https)
 }
 
