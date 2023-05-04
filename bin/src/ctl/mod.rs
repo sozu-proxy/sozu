@@ -1,12 +1,6 @@
-mod command;
-/// TODO: just create a display() method on sozu_command_lib::Response and put everything in there
-mod display;
-mod request_builder;
-
 use std::time::Duration;
 
 use anyhow::Context;
-
 use sozu_command_lib::{
     channel::Channel,
     config::Config,
@@ -18,13 +12,18 @@ use crate::{
     get_config_file_path, load_configuration, util,
 };
 
+mod command;
+/// TODO: just create a display() method on sozu_command_lib::Response and put everything in there
+mod display;
+mod request_builder;
+
 pub struct CommandManager {
     channel: Channel<Request, Response>,
     timeout: Duration,
     config: Config,
 }
 
-pub fn ctl(args: cli::Args) -> Result<(), anyhow::Error> {
+pub fn ctl(args: cli::Args) -> anyhow::Result<()> {
     let config_file_path = get_config_file_path(&args)?;
     let config = load_configuration(config_file_path)?;
 
@@ -32,7 +31,7 @@ pub fn ctl(args: cli::Args) -> Result<(), anyhow::Error> {
 
     // If the command is `config check` then exit because if we are here, the configuration is valid
     if let SubCmd::Config {
-        cmd: ConfigCmd::Check {},
+        cmd: ConfigCmd::Check,
     } = args.cmd
     {
         println!("Configuration file is valid");
@@ -50,6 +49,7 @@ pub fn ctl(args: cli::Args) -> Result<(), anyhow::Error> {
         timeout,
         config,
     };
+
     command_manager.handle_command(args.cmd)
 }
 
