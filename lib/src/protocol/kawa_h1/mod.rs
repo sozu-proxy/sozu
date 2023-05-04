@@ -535,9 +535,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
             // cancel the front timeout while we are waiting for the server to answer
             self.container_frontend_timeout.cancel();
-            if let Some(token) = self.backend_token {
-                self.container_backend_timeout.set(token);
-            }
+            self.container_backend_timeout.reset();
         }
         SessionResult::Continue
     }
@@ -1087,10 +1085,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.backend_token = None;
     }
 
-    pub fn cancel_backend_timeout(&mut self) {
-        self.container_backend_timeout.cancel();
-    }
-
     pub fn set_backend_timeout(&mut self, dur: Duration) {
         if let Some(token) = self.backend_token.as_ref() {
             self.container_backend_timeout.set_duration(dur);
@@ -1106,6 +1100,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     /// IF the backend_token is set, so that entry can be reused for new backend.
     /// I don't think this is a good idea, but it is a quick fix
     fn close_backend(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, metrics: &mut SessionMetrics) {
+        self.container_backend_timeout.cancel();
         debug!(
             "{}\tPROXY [{}->{}] CLOSED BACKEND",
             self.log_context(),
@@ -1127,7 +1122,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         }
 
-        if let Some(token) = self.backend_token {
+        if let Some(token) = self.backend_token.take() {
             proxy.remove_session(token);
 
             if self.backend_connection_status != BackendConnectionStatus::NotConnected {
@@ -1147,9 +1142,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             self.set_backend_connected(BackendConnectionStatus::NotConnected, metrics);
 
             if let Some(backend) = self.backend.take() {
-                self.clear_backend_token();
                 backend.borrow_mut().dec_connections();
-                self.cancel_backend_timeout();
             }
         }
     }
@@ -1381,7 +1374,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         self.backend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
-
         self.backend_connection_status = BackendConnectionStatus::Connecting(Instant::now());
 
         match old_backend_token {
@@ -1440,7 +1432,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             // the back timeout was of connect_timeout duration before,
             // now that we're connected, move to backend_timeout duration
             self.set_backend_timeout(self.configured_backend_timeout);
-            self.cancel_backend_timeout();
+            // if we are not waiting for the backend response, its timeout is concelled
+            // it should be set when the request has been entirely transmitted
+            if !self.backend_readiness.interest.is_readable() {
+                self.container_backend_timeout.cancel();
+            }
 
             if let Some(backend) = &self.backend {
                 let mut backend = backend.borrow_mut();
@@ -1571,8 +1567,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         if self.backend_connection_status.is_connecting()
             && !self.backend_readiness.event.is_empty()
         {
-            self.cancel_backend_timeout();
-
             if self.backend_readiness.event.is_hup() && !self.test_backend_socket() {
                 //retry connecting the backend
                 error!(
@@ -1751,7 +1745,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
         proxy: Rc<RefCell<dyn L7Proxy>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
-        self.ready_inner(session, proxy, metrics)
+        let session_result = self.ready_inner(session, proxy, metrics);
+        if session_result == SessionResult::Upgrade {
+            // sync the underlying Checkout buffers, if they contain remaining data
+            // it will be processed once upgraded to websocket
+            self.request_stream.storage.buffer.sync(
+                self.request_stream.storage.end,
+                self.request_stream.storage.head,
+            );
+            self.response_stream.storage.buffer.sync(
+                self.response_stream.storage.end,
+                self.response_stream.storage.head,
+            );
+        }
+        session_result
     }
 
     fn update_readiness(&mut self, token: Token, events: Ready) {

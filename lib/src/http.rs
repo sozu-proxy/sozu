@@ -142,20 +142,6 @@ impl HttpSession {
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
-        // let mut session = Session {
-        //     backend: None,
-        //     back_connected: BackendConnectionStatus::NotConnected,
-        //     protocol: Some(state),
-        //     proxy,
-        //     frontend_token: token,
-        //     pool,
-        //     metrics,
-        //     cluster_id: None,
-        //     sticky_name,
-        //     last_event: Instant::now(),
-        //     front_timeout,
-        //     listener_token,
-        //     connection_attempt: 0,
         let mut session = HttpSession {
             answers,
             configured_backend_timeout,
@@ -196,41 +182,25 @@ impl HttpSession {
     }
 
     fn upgrade_http(&mut self, http: Http<TcpStream, HttpListener>) -> Option<HttpStateMachine> {
-        debug!("switching to pipe");
+        debug!("http switching to ws");
         let front_token = self.frontend_token;
         let back_token = unwrap_msg!(http.backend_token);
         let ws_context = http.websocket_context();
 
-        let mut front_buf = http.request_stream.storage.buffer;
-        front_buf.sync(
-            http.request_stream.storage.end,
-            http.request_stream.storage.head,
-        );
-
-        let mut back_buf = http.response_stream.storage.buffer;
-        back_buf.sync(
-            http.response_stream.storage.end,
-            http.response_stream.storage.head,
-        );
-
-        gauge_add!("protocol.http", -1);
-        gauge_add!("protocol.ws", 1);
-        gauge_add!("http.active_requests", -1);
-        gauge_add!("websocket.active_requests", 1);
-
-        // TODO: is this necessary? Do we need to reset the timeouts?
-        // http.container_frontend_timeout.reset();
-        // http.container_backend_timeout.reset();
+        let mut container_frontend_timeout = http.container_frontend_timeout;
+        let mut container_backend_timeout = http.container_backend_timeout;
+        container_frontend_timeout.reset();
+        container_backend_timeout.reset();
 
         let mut pipe = Pipe::new(
-            back_buf,
+            http.response_stream.storage.buffer,
             http.backend_id,
-            Some(unwrap_msg!(http.backend_socket)),
+            http.backend_socket,
             http.backend,
-            Some(http.container_backend_timeout),
-            Some(http.container_frontend_timeout),
+            Some(container_backend_timeout),
+            Some(container_frontend_timeout),
             http.cluster_id,
-            front_buf,
+            http.request_stream.storage.buffer,
             front_token,
             http.frontend_socket,
             self.listener.clone(),
@@ -243,8 +213,11 @@ impl HttpSession {
         pipe.frontend_readiness.event = http.frontend_readiness.event;
         pipe.backend_readiness.event = http.backend_readiness.event;
         pipe.set_back_token(back_token);
-        //pipe.set_cluster_id(self.cluster_id.clone());
 
+        gauge_add!("protocol.http", -1);
+        gauge_add!("protocol.ws", 1);
+        gauge_add!("http.active_requests", -1);
+        gauge_add!("websocket.active_requests", 1);
         Some(HttpStateMachine::WebSocket(pipe))
     }
 

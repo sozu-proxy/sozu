@@ -361,26 +361,24 @@ impl HttpsSession {
         let back_token = unwrap_msg!(http.backend_token);
         let ws_context = http.websocket_context();
 
-        let front_buf = http.request_stream.storage.buffer;
-        let back_buf = http.response_stream.storage.buffer;
-
-        // TODO: is this necessary? Do we need to reset the timeouts?
-        // http.container_frontend_timeout.reset();
-        // http.container_backend_timeout.reset();
+        let mut container_frontend_timeout = http.container_frontend_timeout;
+        let mut container_backend_timeout = http.container_backend_timeout;
+        container_frontend_timeout.reset();
+        container_backend_timeout.reset();
 
         let mut pipe = Pipe::new(
-            back_buf,
+            http.response_stream.storage.buffer,
             http.backend_id,
             http.backend_socket,
             http.backend,
-            Some(http.container_backend_timeout),
-            Some(http.container_frontend_timeout),
-            http.cluster_id.clone(),
-            front_buf,
+            Some(container_backend_timeout),
+            Some(container_frontend_timeout),
+            http.cluster_id,
+            http.request_stream.storage.buffer,
             front_token,
             http.frontend_socket,
             self.listener.clone(),
-            Protocol::HTTPS,
+            Protocol::HTTP,
             http.context.id,
             http.context.session_address,
             Some(ws_context),
@@ -389,7 +387,6 @@ impl HttpsSession {
         pipe.frontend_readiness.event = http.frontend_readiness.event;
         pipe.backend_readiness.event = http.backend_readiness.event;
         pipe.set_back_token(back_token);
-        pipe.set_cluster_id(http.cluster_id.clone());
 
         gauge_add!("protocol.https", -1);
         gauge_add!("protocol.wss", 1);
