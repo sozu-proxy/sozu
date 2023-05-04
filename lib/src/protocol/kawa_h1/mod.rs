@@ -29,8 +29,8 @@ use crate::{
     socket::{SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
-    Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler, L7Proxy,
-    ListenerHandler, LogDuration, Protocol, ProxySession, Readiness, SessionIsToBeClosed,
+    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler,
+    L7Proxy, ListenerHandler, LogDuration, Protocol, ProxySession, Readiness, SessionIsToBeClosed,
     SessionMetrics, SessionResult, StateResult,
 };
 
@@ -140,19 +140,18 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         request_id: Ulid,
         session_address: Option<SocketAddr>,
         sticky_name: String,
-    ) -> Http<Front, L> {
-        // TODO: handle properly these errors
+    ) -> Result<Http<Front, L>, AcceptError> {
         let (front_buffer, back_buffer) = match pool.upgrade() {
             Some(pool) => {
                 let mut pool = pool.borrow_mut();
                 match (pool.checkout(), pool.checkout()) {
                     (Some(front_buffer), Some(back_buffer)) => (front_buffer, back_buffer),
-                    _ => panic!(),
+                    _ => return Err(AcceptError::BufferCapacityReached),
                 }
             }
-            None => panic!(),
+            None => return Err(AcceptError::BufferCapacityReached),
         };
-        Http {
+        Ok(Http {
             answers,
             backend_connection_status: BackendConnectionStatus::NotConnected,
             backend_id: None,
@@ -194,7 +193,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 sticky_session: None,
                 sticky_session_found: None,
             },
-        }
+        })
     }
 
     /// Reset the connection in case of keep-alive to be ready for the next request

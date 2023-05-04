@@ -311,7 +311,8 @@ impl HttpsSession {
                     handshake.request_id,
                     self.peer_address,
                     self.sticky_name.clone(),
-                );
+                )
+                .ok()?;
 
                 match http
                     .frontend_socket

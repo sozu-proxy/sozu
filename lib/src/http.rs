@@ -105,7 +105,7 @@ impl HttpSession {
         sticky_name: String,
         token: Token,
         wait_time: Duration,
-    ) -> Self {
+    ) -> Result<Self, AcceptError> {
         let request_id = Ulid::generate();
         let container_frontend_timeout = TimeoutContainer::new(configured_request_timeout, token);
 
@@ -138,7 +138,7 @@ impl HttpSession {
                 request_id,
                 session_address,
                 sticky_name.clone(),
-            ))
+            )?)
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
@@ -159,7 +159,7 @@ impl HttpSession {
         };
 
         session.state.front_readiness().interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
-        session
+        Ok(session)
     }
 
     pub fn upgrade(&mut self) -> SessionIsToBeClosed {
@@ -247,7 +247,8 @@ impl HttpSession {
                     expect.request_id,
                     Some(session_address),
                     self.sticky_name.clone(),
-                );
+                )
+                .ok()?;
                 http.frontend_readiness.event = expect.frontend_readiness.event;
 
                 gauge_add!("protocol.proxy.expect", -1);
@@ -902,7 +903,7 @@ impl ProxyConfiguration for HttpProxy {
             owned.config.sticky_name.clone(),
             session_token,
             wait_time,
-        );
+        )?;
 
         let session = Rc::new(RefCell::new(session));
         session_entry.insert(session);
