@@ -28,7 +28,7 @@ use sozu_command::{
     request::WorkerRequest,
     response::{MessageId, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
-    state::{get_certificate, ConfigState},
+    state::ConfigState,
 };
 use time::{Duration, Instant};
 
@@ -924,7 +924,7 @@ impl Server {
                 return;
             }
             Some(RequestType::QueryCertificateByFingerprint(f)) => {
-                let response = match get_certificate(&self.config_state, &f) {
+                let response = match self.config_state.get_certificate(&f) {
                     Some(cert) => WorkerResponse::ok_with_content(
                         message.id.clone(),
                         ResponseContent {

@@ -1229,6 +1229,17 @@ impl ConfigState {
 
         cluster_ids
     }
+
+    pub fn get_certificate(&self, fingerprint: &[u8]) -> Option<CertificateWithNames> {
+        self.certificates
+            .values()
+            .filter_map(|h| h.get(&Fingerprint(fingerprint.to_vec())))
+            .map(|c| CertificateWithNames {
+                certificate: c.certificate.clone(),
+                names: c.names.clone(),
+            })
+            .next()
+    }
 }
 
 fn domain_check(
@@ -1246,18 +1257,6 @@ fn domain_check(
     }
 
     true
-}
-
-pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<CertificateWithNames> {
-    state
-        .certificates
-        .values()
-        .filter_map(|h| h.get(&Fingerprint(fingerprint.to_vec())))
-        .map(|c| CertificateWithNames {
-            certificate: c.certificate.clone(),
-            names: c.names.clone(),
-        })
-        .next()
 }
 
 struct DiffMap<'a, K: Ord, V, I1, I2> {
