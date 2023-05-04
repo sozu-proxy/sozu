@@ -197,9 +197,7 @@ impl LocalDrain {
             (true, true) => self.dump_all_metrics(metric_names)?,
         };
 
-        Ok(ResponseContent {
-            content_type: Some(ContentType::WorkerMetrics(worker_metrics)),
-        })
+        Ok(ContentType::WorkerMetrics(worker_metrics).into())
     }
 
     fn list_all_metric_names(&self) -> anyhow::Result<ResponseContent> {
@@ -212,12 +210,11 @@ impl LocalDrain {
                 cluster_metrics.push(metric_name.to_owned());
             }
         }
-        Ok(ResponseContent {
-            content_type: Some(ContentType::AvailableMetrics(AvailableMetrics {
-                proxy_metrics,
-                cluster_metrics,
-            })),
+        Ok(ContentType::AvailableMetrics(AvailableMetrics {
+            proxy_metrics,
+            cluster_metrics,
         })
+        .into())
     }
 
     pub fn dump_all_metrics(

@@ -25,7 +25,6 @@ use sozu_command_lib::{
     },
     request::WorkerRequest,
     scm_socket::Listeners,
-    state::get_cluster_ids_by_domain,
 };
 
 use sozu::metrics::METRICS;
@@ -380,19 +379,20 @@ impl CommandServer {
             }
         }
 
-        Ok(Some(Success::ListFrontends(ResponseContent {
-            content_type: Some(ContentType::FrontendList(listed_frontends)),
-        })))
+        Ok(Some(Success::ListFrontends(
+            ContentType::FrontendList(listed_frontends).into(),
+        )))
     }
 
     fn list_listeners(&self) -> anyhow::Result<Option<Success>> {
-        Ok(Some(Success::ListListeners(ResponseContent {
-            content_type: Some(ContentType::ListenersList(ListenersList {
+        Ok(Some(Success::ListListeners(
+            ContentType::ListenersList(ListenersList {
                 http_listeners: self.state.http_listeners.clone(),
                 https_listeners: self.state.https_listeners.clone(),
                 tcp_listeners: self.state.tcp_listeners.clone(),
-            })),
-        })))
+            })
+            .into(),
+        )))
     }
 
     pub async fn list_workers(&mut self) -> anyhow::Result<Option<Success>> {
@@ -408,9 +408,9 @@ impl CommandServer {
 
         debug!("workers: {:#?}", workers);
 
-        Ok(Some(Success::ListWorkers(ResponseContent {
-            content_type: Some(ContentType::Workers(WorkerInfos { vec: workers })),
-        })))
+        Ok(Some(Success::ListWorkers(
+            ContentType::Workers(WorkerInfos { vec: workers }).into(),
+        )))
     }
 
     pub async fn launch_worker(
@@ -953,9 +953,7 @@ impl CommandServer {
             return_success(
                 command_tx,
                 thread_client_id,
-                Success::Status(ResponseContent {
-                    content_type: Some(ContentType::Workers(worker_info_vec)),
-                }),
+                Success::Status(ContentType::Workers(worker_info_vec).into()),
             )
             .await;
         })
@@ -1068,29 +1066,27 @@ impl CommandServer {
         .await;
 
         let main_response_content = match &request.request_type {
-            Some(RequestType::QueryClustersHashes(_)) => Some(ResponseContent {
-                content_type: Some(ContentType::ClusterHashes(ClusterHashes {
+            Some(RequestType::QueryClustersHashes(_)) => Some(
+                ContentType::ClusterHashes(ClusterHashes {
                     map: self.state.hash_state(),
-                })),
-            }),
-            Some(RequestType::QueryClusterById(cluster_id)) => Some(ResponseContent {
-                content_type: Some(ContentType::Clusters(ClusterInformations {
+                })
+                .into(),
+            ),
+            Some(RequestType::QueryClusterById(cluster_id)) => Some(
+                ContentType::Clusters(ClusterInformations {
                     vec: vec![self.state.cluster_state(cluster_id)],
-                })),
-            }),
+                })
+                .into(),
+            ),
             Some(RequestType::QueryClustersByDomain(domain)) => {
-                let cluster_ids = get_cluster_ids_by_domain(
-                    &self.state,
-                    domain.hostname.clone(),
-                    domain.path.clone(),
-                );
+                let cluster_ids = self
+                    .state
+                    .get_cluster_ids_by_domain(domain.hostname.clone(), domain.path.clone());
                 let vec = cluster_ids
                     .iter()
                     .map(|cluster_id| self.state.cluster_state(cluster_id))
                     .collect();
-                Some(ResponseContent {
-                    content_type: Some(ContentType::Clusters(ClusterInformations { vec })),
-                })
+                Some(ContentType::Clusters(ClusterInformations { vec }).into())
             }
             _ => None,
         };
@@ -1143,21 +1139,19 @@ impl CommandServer {
                 | &Some(RequestType::QueryClustersByDomain(_)) => {
                     let main = main_response_content.unwrap(); // we should refactor to avoid this unwrap()
                     worker_responses.insert(String::from("main"), main);
-                    ResponseContent {
-                        content_type: Some(ContentType::WorkerResponses(WorkerResponses {
-                            map: worker_responses,
-                        })),
-                    }
+                    ContentType::WorkerResponses(WorkerResponses {
+                        map: worker_responses,
+                    })
+                    .into()
                 }
                 &Some(RequestType::QueryCertificatesByDomain(_))
                 | &Some(RequestType::QueryCertificateByFingerprint(_))
                 | &Some(RequestType::QueryAllCertificates(_)) => {
                     info!("certificates query answer received: {:?}", worker_responses);
-                    ResponseContent {
-                        content_type: Some(ContentType::WorkerResponses(WorkerResponses {
-                            map: worker_responses,
-                        })),
-                    }
+                    ContentType::WorkerResponses(WorkerResponses {
+                        map: worker_responses,
+                    })
+                    .into()
                 }
                 Some(RequestType::QueryMetrics(options)) => {
                     if options.list {
@@ -1173,12 +1167,11 @@ impl CommandServer {
                                 summed_cluster_metrics.append(&mut cluster_metrics.clone());
                             }
                         }
-                        ResponseContent {
-                            content_type: Some(ContentType::AvailableMetrics(AvailableMetrics {
-                                proxy_metrics: summed_proxy_metrics,
-                                cluster_metrics: summed_cluster_metrics,
-                            })),
-                        }
+                        ContentType::AvailableMetrics(AvailableMetrics {
+                            proxy_metrics: summed_proxy_metrics,
+                            cluster_metrics: summed_cluster_metrics,
+                        })
+                        .into()
                     } else {
                         let workers_metrics = worker_responses
                             .into_iter()
@@ -1189,12 +1182,11 @@ impl CommandServer {
                                 _ => None,
                             })
                             .collect();
-                        ResponseContent {
-                            content_type: Some(ContentType::Metrics(AggregatedMetrics {
-                                main: main_metrics,
-                                workers: workers_metrics,
-                            })),
-                        }
+                        ContentType::Metrics(AggregatedMetrics {
+                            main: main_metrics,
+                            workers: workers_metrics,
+                        })
+                        .into()
                     }
                 }
                 _ => return, // very very unlikely

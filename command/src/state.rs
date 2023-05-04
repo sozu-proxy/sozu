@@ -25,8 +25,6 @@ use crate::{
 /// To use throughout Sōzu
 pub type ClusterId = String;
 
-// TODO: HttpFrontend and TcpFrontend and Backend are not present or meant to be
-// translated in protobuf, find a fix
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigState {
     pub clusters: BTreeMap<ClusterId, Cluster>,
@@ -40,8 +38,6 @@ pub struct ConfigState {
     /// indexed by (address, hostname, path)
     pub https_fronts: BTreeMap<String, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
-    // TODO: create an intermediate type to remove the nested maps
-    /// certificate and names
     pub certificates: HashMap<SocketAddr, HashMap<Fingerprint, CertificateAndKey>>,
 }
 
@@ -425,7 +421,7 @@ impl ConfigState {
                 .address
                 .parse()
                 .with_context(|| "wrong socket address")?,
-            tags: Some(front.tags.clone()),
+            tags: front.tags.clone(),
         };
         if tcp_frontends.contains(&tcp_frontend) {
             bail!("This tcp frontend is already present: {:?}", tcp_frontend);
@@ -1203,6 +1199,43 @@ impl ConfigState {
             + self.https_fronts.values().count()
             + self.tcp_fronts.values().fold(0, |acc, v| acc + v.len())
     }
+
+    pub fn get_cluster_ids_by_domain(
+        &self,
+        hostname: String,
+        path: Option<String>,
+    ) -> HashSet<ClusterId> {
+        let mut cluster_ids: HashSet<ClusterId> = HashSet::new();
+
+        self.http_fronts.values().for_each(|front| {
+            if domain_check(&front.hostname, &front.path, &hostname, &path) {
+                if let Some(id) = &front.cluster_id {
+                    cluster_ids.insert(id.to_string());
+                }
+            }
+        });
+
+        self.https_fronts.values().for_each(|front| {
+            if domain_check(&front.hostname, &front.path, &hostname, &path) {
+                if let Some(id) = &front.cluster_id {
+                    cluster_ids.insert(id.to_string());
+                }
+            }
+        });
+
+        cluster_ids
+    }
+
+    pub fn get_certificate(&self, fingerprint: &[u8]) -> Option<CertificateWithNames> {
+        self.certificates
+            .values()
+            .filter_map(|h| h.get(&Fingerprint(fingerprint.to_vec())))
+            .map(|c| CertificateWithNames {
+                certificate: c.certificate.clone(),
+                names: c.names.clone(),
+            })
+            .next()
+    }
 }
 
 fn domain_check(
@@ -1220,44 +1253,6 @@ fn domain_check(
     }
 
     true
-}
-
-pub fn get_cluster_ids_by_domain(
-    state: &ConfigState,
-    hostname: String,
-    path: Option<String>,
-) -> HashSet<ClusterId> {
-    let mut cluster_ids: HashSet<ClusterId> = HashSet::new();
-
-    state.http_fronts.values().for_each(|front| {
-        if domain_check(&front.hostname, &front.path, &hostname, &path) {
-            if let Some(id) = &front.cluster_id {
-                cluster_ids.insert(id.to_string());
-            }
-        }
-    });
-
-    state.https_fronts.values().for_each(|front| {
-        if domain_check(&front.hostname, &front.path, &hostname, &path) {
-            if let Some(id) = &front.cluster_id {
-                cluster_ids.insert(id.to_string());
-            }
-        }
-    });
-
-    cluster_ids
-}
-
-pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<CertificateWithNames> {
-    state
-        .certificates
-        .values()
-        .filter_map(|h| h.get(&Fingerprint(fingerprint.to_vec())))
-        .map(|c| CertificateWithNames {
-            certificate: c.certificate.clone(),
-            names: c.names.clone(),
-        })
-        .next()
 }
 
 struct DiffMap<'a, K: Ord, V, I1, I2> {
@@ -1698,27 +1693,21 @@ mod tests {
 
         let empty: HashSet<ClusterId> = HashSet::new();
         assert_eq!(
-            get_cluster_ids_by_domain(&config, String::from("lolcatho.st"), None),
+            config.get_cluster_ids_by_domain(String::from("lolcatho.st"), None),
             cluster1_cluster2
         );
         assert_eq!(
-            get_cluster_ids_by_domain(
-                &config,
-                String::from("lolcatho.st"),
-                Some(String::from("/api"))
-            ),
+            config
+                .get_cluster_ids_by_domain(String::from("lolcatho.st"), Some(String::from("/api"))),
             cluster2
         );
         assert_eq!(
-            get_cluster_ids_by_domain(&config, String::from("lolcathost"), None),
+            config.get_cluster_ids_by_domain(String::from("lolcathost"), None),
             empty
         );
         assert_eq!(
-            get_cluster_ids_by_domain(
-                &config,
-                String::from("lolcathost"),
-                Some(String::from("/sozu"))
-            ),
+            config
+                .get_cluster_ids_by_domain(String::from("lolcathost"), Some(String::from("/sozu"))),
             empty
         );
     }

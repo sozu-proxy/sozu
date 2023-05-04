@@ -21,14 +21,14 @@ use sozu_command::{
         request::RequestType, response_content::ContentType, ActivateListener, AddBackend, Cluster,
         ClusterHashes, ClusterInformations, DeactivateListener, Event, HttpListenerConfig,
         HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadMetric,
-        MetricsConfiguration, RemoveBackend, ResponseContent, ResponseStatus,
+        MetricsConfiguration, RemoveBackend, ResponseStatus,
         TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
     request::WorkerRequest,
     response::{MessageId, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
-    state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
+    state::ConfigState,
 };
 use time::{Duration, Instant};
 
@@ -63,9 +63,7 @@ pub fn push_event(event: Event) {
             id: "EVENT".to_string(),
             message: String::new(),
             status: ResponseStatus::Processing,
-            content: Some(ResponseContent {
-                content_type: Some(ContentType::Event(event)),
-            }),
+            content: Some(ContentType::Event(event).into()),
         });
     });
 }
@@ -888,30 +886,26 @@ impl Server {
             Some(RequestType::QueryClustersHashes(_)) => {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ResponseContent {
-                        content_type: Some(ContentType::ClusterHashes(ClusterHashes {
-                            map: self.config_state.hash_state(),
-                        })),
-                    },
+                    ContentType::ClusterHashes(ClusterHashes {
+                        map: self.config_state.hash_state(),
+                    })
+                    .into(),
                 ));
                 return;
             }
             Some(RequestType::QueryClusterById(cluster_id)) => {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ResponseContent {
-                        content_type: Some(ContentType::Clusters(ClusterInformations {
-                            vec: vec![self.config_state.cluster_state(cluster_id)],
-                        })),
-                    },
+                    ContentType::Clusters(ClusterInformations {
+                        vec: vec![self.config_state.cluster_state(cluster_id)],
+                    })
+                    .into(),
                 ));
             }
             Some(RequestType::QueryClustersByDomain(domain)) => {
-                let cluster_ids = get_cluster_ids_by_domain(
-                    &self.config_state,
-                    domain.hostname.clone(),
-                    domain.path.clone(),
-                );
+                let cluster_ids = self
+                    .config_state
+                    .get_cluster_ids_by_domain(domain.hostname.clone(), domain.path.clone());
                 let vec = cluster_ids
                     .iter()
                     .map(|cluster_id| self.config_state.cluster_state(cluster_id))
@@ -919,19 +913,15 @@ impl Server {
 
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
-                    ResponseContent {
-                        content_type: Some(ContentType::Clusters(ClusterInformations { vec })),
-                    },
+                    ContentType::Clusters(ClusterInformations { vec }).into(),
                 ));
                 return;
             }
             Some(RequestType::QueryCertificateByFingerprint(f)) => {
-                let response = match get_certificate(&self.config_state, &f) {
+                let response = match self.config_state.get_certificate(&f) {
                     Some(cert) => WorkerResponse::ok_with_content(
                         message.id.clone(),
-                        ResponseContent {
-                            content_type: Some(ContentType::CertificateByFingerprint(cert)),
-                        },
+                        ContentType::CertificateByFingerprint(cert).into(),
                     ),
                     None => WorkerResponse::error(
                         message.id.clone(),
