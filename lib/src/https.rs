@@ -968,11 +968,9 @@ impl HttpsProxy {
             certificates
         );
 
-        Ok(Some(ResponseContent {
-            content_type: Some(ContentType::Certificates(ListOfCertificatesByAddress {
-                certificates,
-            })),
-        }))
+        Ok(Some(
+            ContentType::Certificates(ListOfCertificatesByAddress { certificates }).into(),
+        ))
     }
 
     pub fn query_certificate_for_domain(
@@ -1007,11 +1005,9 @@ impl HttpsProxy {
             domain, certificates
         );
 
-        Ok(Some(ResponseContent {
-            content_type: Some(ContentType::Certificates(ListOfCertificatesByAddress {
-                certificates,
-            })),
-        }))
+        Ok(Some(
+            ContentType::Certificates(ListOfCertificatesByAddress { certificates }).into(),
+        ))
     }
 
     pub fn activate_listener(

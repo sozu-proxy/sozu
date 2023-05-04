@@ -721,12 +721,9 @@ impl CommandServer {
             for client_id in self.event_subscribers.iter() {
                 if let Some(client_tx) = self.clients.get_mut(client_id) {
                     let event = Response::new(
-                        // response.id.to_string(),
                         ResponseStatus::Processing,
                         format!("{worker_id}"),
-                        Some(ResponseContent {
-                            content_type: Some(ContentType::Event(event.clone())),
-                        }),
+                        Some(ContentType::Event(event.clone()).into()),
                     );
                     client_tx
                         .send(event)
