@@ -25,7 +25,6 @@ use sozu_command_lib::{
     },
     request::WorkerRequest,
     scm_socket::Listeners,
-    state::get_cluster_ids_by_domain,
 };
 
 use sozu::metrics::METRICS;
@@ -1079,11 +1078,9 @@ impl CommandServer {
                 })),
             }),
             Some(RequestType::QueryClustersByDomain(domain)) => {
-                let cluster_ids = get_cluster_ids_by_domain(
-                    &self.state,
-                    domain.hostname.clone(),
-                    domain.path.clone(),
-                );
+                let cluster_ids = self
+                    .state
+                    .get_cluster_ids_by_domain(domain.hostname.clone(), domain.path.clone());
                 let vec = cluster_ids
                     .iter()
                     .map(|cluster_id| self.state.cluster_state(cluster_id))

@@ -28,7 +28,7 @@ use sozu_command::{
     request::WorkerRequest,
     response::{MessageId, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
-    state::{get_certificate, get_cluster_ids_by_domain, ConfigState},
+    state::{get_certificate, ConfigState},
 };
 use time::{Duration, Instant};
 
@@ -907,11 +907,9 @@ impl Server {
                 ));
             }
             Some(RequestType::QueryClustersByDomain(domain)) => {
-                let cluster_ids = get_cluster_ids_by_domain(
-                    &self.config_state,
-                    domain.hostname.clone(),
-                    domain.path.clone(),
-                );
+                let cluster_ids = self
+                    .config_state
+                    .get_cluster_ids_by_domain(domain.hostname.clone(), domain.path.clone());
                 let vec = cluster_ids
                     .iter()
                     .map(|cluster_id| self.config_state.cluster_state(cluster_id))
