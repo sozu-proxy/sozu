@@ -55,6 +55,7 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
 }
 
 impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend_buffer: Checkout,
         backend_id: Option<String>,

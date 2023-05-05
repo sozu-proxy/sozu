@@ -41,33 +41,33 @@ pub struct HttpFrontend {
     pub tags: Option<BTreeMap<String, String>>,
 }
 
-impl Into<RequestHttpFrontend> for HttpFrontend {
-    fn into(self) -> RequestHttpFrontend {
-        let tags = match self.tags {
+impl From<HttpFrontend> for RequestHttpFrontend {
+    fn from(val: HttpFrontend) -> Self {
+        let tags = match val.tags {
             Some(tags) => tags,
             None => BTreeMap::new(),
         };
         RequestHttpFrontend {
-            cluster_id: self.cluster_id,
-            address: self.address.to_string(),
-            hostname: self.hostname,
-            path: self.path,
-            method: self.method,
-            position: self.position.into(),
+            cluster_id: val.cluster_id,
+            address: val.address.to_string(),
+            hostname: val.hostname,
+            path: val.path,
+            method: val.method,
+            position: val.position.into(),
             tags,
         }
     }
 }
 
-impl Into<AddBackend> for Backend {
-    fn into(self) -> AddBackend {
+impl From<Backend> for AddBackend {
+    fn from(val: Backend) -> Self {
         AddBackend {
-            cluster_id: self.cluster_id,
-            backend_id: self.backend_id,
-            address: self.address.to_string(),
-            sticky_id: self.sticky_id,
-            load_balancing_parameters: self.load_balancing_parameters,
-            backup: self.backup,
+            cluster_id: val.cluster_id,
+            backend_id: val.backend_id,
+            address: val.address.to_string(),
+            sticky_id: val.sticky_id,
+            load_balancing_parameters: val.load_balancing_parameters,
+            backup: val.backup,
         }
     }
 }
@@ -150,12 +150,12 @@ pub struct TcpFrontend {
     pub tags: BTreeMap<String, String>,
 }
 
-impl Into<RequestTcpFrontend> for TcpFrontend {
-    fn into(self) -> RequestTcpFrontend {
+impl From<TcpFrontend> for RequestTcpFrontend {
+    fn from(val: TcpFrontend) -> Self {
         RequestTcpFrontend {
-            cluster_id: self.cluster_id,
-            address: self.address.to_string(),
-            tags: self.tags.clone(),
+            cluster_id: val.cluster_id,
+            address: val.address.to_string(),
+            tags: val.tags,
         }
     }
 }

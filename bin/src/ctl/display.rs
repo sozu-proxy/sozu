@@ -323,11 +323,8 @@ fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     let mut percentile_titles: Vec<String> = filtered_metrics
         .iter()
         .filter_map(|(title, filtered_data)| match filtered_data.inner.clone() {
-            Some(filtered_metrics) => match filtered_metrics {
-                filtered_metrics::Inner::Percentiles(_) => Some(title.to_owned()),
-                _ => None,
-            },
-            None => None,
+            Some(filtered_metrics::Inner::Percentiles(_)) => Some(title.to_owned()),
+            _ => None,
         })
         .collect();
 
@@ -354,24 +351,23 @@ fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     ]));
 
     for title in percentile_titles {
-        match filtered_metrics.get(&title) {
-            Some(filtered_metrics) => match filtered_metrics.inner.clone() {
-                Some(filtered_metrics::Inner::Percentiles(p)) => {
-                    percentile_table.add_row(Row::new(vec![
-                        cell!(title),
-                        cell!(p.samples),
-                        cell!(p.p_50),
-                        cell!(p.p_90),
-                        cell!(p.p_99),
-                        cell!(p.p_99_9),
-                        cell!(p.p_99_99),
-                        cell!(p.p_99_999),
-                        cell!(p.p_100),
-                    ]));
-                }
-                _ => {}
-            },
-            None => println!("Something went VERY wrong here"),
+        if let Some(FilteredMetrics {
+            inner: Some(filtered_metrics::Inner::Percentiles(percentiles)),
+        }) = filtered_metrics.get(&title)
+        {
+            percentile_table.add_row(Row::new(vec![
+                cell!(title),
+                cell!(percentiles.samples),
+                cell!(percentiles.p_50),
+                cell!(percentiles.p_90),
+                cell!(percentiles.p_99),
+                cell!(percentiles.p_99_9),
+                cell!(percentiles.p_99_99),
+                cell!(percentiles.p_99_999),
+                cell!(percentiles.p_100),
+            ]));
+        } else {
+            println!("Something went VERY wrong here");
         }
     }
 
@@ -655,7 +651,7 @@ pub fn print_certificates(
                         println!(
                             "\t\t{}:\t{}",
                             summary.domain,
-                            hex::encode(summary.fingerprint.to_owned())
+                            hex::encode(&summary.fingerprint)
                         );
                     }
 
@@ -694,7 +690,7 @@ pub fn print_available_metrics(available_metrics: &AvailableMetrics) -> anyhow::
     Ok(())
 }
 
-fn list_string_vec(vec: &Vec<String>) -> String {
+fn list_string_vec(vec: &[String]) -> String {
     let mut output = String::new();
     for item in vec.iter() {
         output.push_str(item);

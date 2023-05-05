@@ -813,7 +813,7 @@ impl HttpClusterConfig {
                 proxy_protocol: None,
                 load_balancing: self.load_balancing as i32,
                 answer_503: self.answer_503.clone(),
-                load_metric: self.load_metric.and_then(|s| Some(s as i32)),
+                load_metric: self.load_metric.map(|s| s as i32),
             })),
         }];
 
@@ -869,9 +869,9 @@ impl TcpClusterConfig {
                 cluster_id: self.cluster_id.clone(),
                 sticky_session: false,
                 https_redirect: false,
-                proxy_protocol: self.proxy_protocol.and_then(|s| Some(s as i32)),
+                proxy_protocol: self.proxy_protocol.map(|s| s as i32),
                 load_balancing: self.load_balancing as i32,
-                load_metric: self.load_metric.and_then(|s| Some(s as i32)),
+                load_metric: self.load_metric.map(|s| s as i32),
                 answer_503: None,
             })),
         }];

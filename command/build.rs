@@ -1,5 +1,3 @@
-use prost_build;
-
 pub fn main() {
     prost_build::Config::new()
         .btree_map(["."])

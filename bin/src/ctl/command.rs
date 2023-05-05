@@ -65,8 +65,8 @@ impl CommandManager {
                     } else {
                         println!("Success: {}", response.message);
                     }
-                    match response.content {
-                        Some(response_content) => match response_content.content_type {
+                    if let Some(response_content) = response.content {
+                        match response_content.content_type {
                             Some(ContentType::FrontendList(frontends)) => {
                                 print_frontend_list(frontends)
                             }
@@ -79,8 +79,7 @@ impl CommandManager {
                             }
                             Some(ContentType::ListenersList(list)) => print_listeners(list),
                             _ => {}
-                        },
-                        None => {}
+                        }
                     }
                     break;
                 }

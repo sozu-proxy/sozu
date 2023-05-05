@@ -1,6 +1,7 @@
 [package]
 name = "sozu-e2e"
 version = "0.1.0"
+rust-version = "1.66.1"
 edition = "2021"
 
 [dependencies]

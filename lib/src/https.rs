@@ -123,6 +123,7 @@ pub struct HttpsSession {
 }
 
 impl HttpsSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         answers: Rc<RefCell<HttpAnswers>>,
         configured_backend_timeout: Duration,
@@ -985,14 +986,12 @@ impl HttpsProxy {
                 let resolver = unwrap_msg!(owned.resolver.0.lock());
                 let mut certificate_summaries = vec![];
 
-                resolver
-                    .domain_lookup(domain.as_bytes(), true)
-                    .map(|(k, fingerprint)| {
-                        certificate_summaries.push(CertificateSummary {
-                            domain: String::from_utf8(k.to_vec()).unwrap(),
-                            fingerprint: fingerprint.to_string(),
-                        });
+                if let Some((k, fingerprint)) = resolver.domain_lookup(domain.as_bytes(), true) {
+                    certificate_summaries.push(CertificateSummary {
+                        domain: String::from_utf8(k.to_vec()).unwrap(),
+                        fingerprint: fingerprint.to_string(),
                     });
+                }
                 CertificatesByAddress {
                     address: owned.address.to_string(),
                     certificate_summaries,

@@ -612,7 +612,7 @@ impl CommandServer {
             old_worker.channel.set_blocking(false);
             */
             let (sockets_return_tx, mut sockets_return_rx) = futures::channel::mpsc::channel(3);
-            let id = format!("{}-return-sockets", client_id);
+            let id = format!("{client_id}-return-sockets");
             self.in_flight.insert(id.clone(), (sockets_return_tx, 1));
             old_worker
                 .send(
@@ -678,7 +678,7 @@ impl CommandServer {
             old_worker.run_state = RunState::Stopping;
 
             let (softstop_tx, mut softstop_rx) = futures::channel::mpsc::channel(10);
-            let softstop_id = format!("{}-softstop", client_id);
+            let softstop_id = format!("{client_id}-softstop");
             self.in_flight.insert(softstop_id.clone(), (softstop_tx, 1));
             old_worker
                 .send(
@@ -754,7 +754,7 @@ impl CommandServer {
         let activate_requests = self.state.generate_activate_requests();
         for (count, request) in activate_requests.into_iter().enumerate() {
             new_worker
-                .send(format!("{}-ACTIVATE-{}", client_id, count), request)
+                .send(format!("{client_id}-ACTIVATE-{count}"), request)
                 .await;
         }
 
@@ -882,7 +882,7 @@ impl CommandServer {
         // create a status list with the available info of the main process
         let mut worker_info_map: BTreeMap<String, WorkerInfo> = BTreeMap::new();
 
-        let prefix = format!("{}-status-", client_id);
+        let prefix = format!("{client_id}-status-");
 
         return_processing(
             self.command_tx.clone(),
@@ -988,7 +988,7 @@ impl CommandServer {
             self.in_flight.insert(req_id, (metrics_tx.clone(), 1));
         }
 
-        let prefix = format!("{}-metrics-", client_id);
+        let prefix = format!("{client_id}-metrics-");
 
         let command_tx = self.command_tx.clone();
         let thread_client_id = client_id.clone();
@@ -1125,11 +1125,9 @@ impl CommandServer {
             let mut worker_responses: BTreeMap<String, ResponseContent> = responses
                 .into_iter()
                 .filter_map(|(worker_id, proxy_response)| {
-                    if let Some(response_content) = proxy_response.content {
-                        Some((worker_id.to_string(), response_content))
-                    } else {
-                        None
-                    }
+                    proxy_response
+                        .content
+                        .map(|response_content| (worker_id.to_string(), response_content))
                 })
                 .collect();
 
@@ -1407,7 +1405,7 @@ impl CommandServer {
             Some(client_tx) => {
                 trace!("sending from main process to client loop");
                 client_tx.send(command_response).await.with_context(|| {
-                    format!("Could not notify client {} about request", client_id)
+                    format!("Could not notify client {client_id} about request")
                 })?;
             }
             None => bail!(format!("Could not find client {client_id}")),

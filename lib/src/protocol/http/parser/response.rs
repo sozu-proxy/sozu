@@ -437,6 +437,7 @@ pub fn parse_response(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn parse_response_until_stop(
     mut current_state: ResponseState,
     mut header_end: Option<usize>,

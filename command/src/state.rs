@@ -427,7 +427,7 @@ impl ConfigState {
             bail!("This tcp frontend is already present: {:?}", tcp_frontend);
         }
 
-        tcp_frontends.push(tcp_frontend.clone());
+        tcp_frontends.push(tcp_frontend);
         Ok(())
     }
 
@@ -1157,7 +1157,7 @@ impl ConfigState {
         let mut tcp_frontends = Vec::new();
         let mut backends = Vec::new();
 
-        for (_k, http_frontend) in &self.http_fronts {
+        for http_frontend in self.http_fronts.values() {
             if let Some(id) = &http_frontend.cluster_id {
                 if id == cluster_id {
                     http_frontends.push(http_frontend.clone().into());
@@ -1165,7 +1165,7 @@ impl ConfigState {
             }
         }
 
-        for (_k, https_frontend) in &self.https_fronts {
+        for https_frontend in self.https_fronts.values() {
             if let Some(id) = &https_frontend.cluster_id {
                 if id == cluster_id {
                     https_frontends.push(https_frontend.clone().into());
