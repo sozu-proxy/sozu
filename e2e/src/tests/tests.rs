@@ -981,13 +981,13 @@ pub fn try_blue_geen() -> State {
         "PRIMARY",
         primary_address,
         aggrerator.clone(),
-        AsyncBackend::http_handler(format!("pong_primary")),
+        AsyncBackend::http_handler("pong_primary".to_string()),
     );
     let mut secondary = AsyncBackend::spawn_detached_backend(
         "SECONDARY",
         secondary_address,
-        aggrerator.clone(),
-        AsyncBackend::http_handler(format!("pong_secondary")),
+        aggrerator,
+        AsyncBackend::http_handler("pong_secondary".to_string()),
     );
 
     worker.send_proxy_request(Request {

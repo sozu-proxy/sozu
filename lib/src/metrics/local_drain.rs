@@ -360,8 +360,7 @@ impl LocalDrain {
                 .context(format!("No metrics found for backend with id {backend_id}"))?
                 .to_owned();
 
-            let mut backends = Vec::new();
-            backends.push(self.metrics_of_one_backend(backend_id, metric_names)?);
+            let backends = vec![self.metrics_of_one_backend(backend_id, metric_names)?];
 
             clusters.insert(
                 cluster_id,

@@ -91,10 +91,10 @@ impl Request {
 
     /// True if the request is a SoftStop or a HardStop
     pub fn is_a_stop(&self) -> bool {
-        match self.request_type {
-            Some(RequestType::SoftStop(_)) | Some(RequestType::HardStop(_)) => true,
-            _ => false,
-        }
+        matches!(
+            self.request_type,
+            Some(RequestType::SoftStop(_)) | Some(RequestType::HardStop(_))
+        )
     }
 }
 

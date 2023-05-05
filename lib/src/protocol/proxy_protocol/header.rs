@@ -157,7 +157,7 @@ impl HeaderV2 {
 
         header.push(self.family);
         header.extend_from_slice(&u16_to_array_of_u8(self.addr.len()));
-        self.addr.into_bytes(&mut header);
+        self.addr.write_bytes_to(&mut header);
         header
     }
 
@@ -228,7 +228,7 @@ impl ProxyAddr {
     }
 
     // TODO: rename to a less ambiguous name, like "write bytes to buffer"
-    fn into_bytes(&self, buf: &mut Vec<u8>) {
+    fn write_bytes_to(&self, buf: &mut Vec<u8>) {
         match *self {
             ProxyAddr::Ipv4Addr { src_addr, dst_addr } => {
                 buf.extend_from_slice(&src_addr.ip().octets());

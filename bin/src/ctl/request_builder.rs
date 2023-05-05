@@ -190,7 +190,7 @@ impl CommandManager {
                         cluster_id: id,
                         sticky_session,
                         https_redirect,
-                        proxy_protocol: proxy_protocol.and_then(|pp| Some(pp as i32)),
+                        proxy_protocol: proxy_protocol.map(|pp| pp as i32),
                         load_balancing: load_balancing_policy as i32,
                         ..Default::default()
                     })),
@@ -512,6 +512,7 @@ impl CommandManager {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn replace_certificate(
         &mut self,
         address: String,

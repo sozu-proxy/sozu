@@ -664,7 +664,7 @@ mod tests {
             .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
 
         let fingerprint = resolver.add_certificate(&AddCertificate {
-            address: address.clone(),
+            address: address,
             certificate: certificate_and_key,
             expired_at: None,
         })?;
@@ -710,7 +710,7 @@ mod tests {
             .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
 
         let fingerprint = resolver.add_certificate(&AddCertificate {
-            address: address.clone(),
+            address: address,
             certificate: certificate_and_key,
             expired_at: None,
         })?;

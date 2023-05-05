@@ -331,6 +331,7 @@ impl Server {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         poll: Poll,
         mut channel: ProxyChannel,
@@ -918,7 +919,7 @@ impl Server {
                 return;
             }
             Some(RequestType::QueryCertificateByFingerprint(f)) => {
-                let response = match self.config_state.get_certificate(&f) {
+                let response = match self.config_state.get_certificate(f) {
                     Some(cert) => WorkerResponse::ok_with_content(
                         message.id.clone(),
                         ContentType::CertificateByFingerprint(cert).into(),
@@ -1021,7 +1022,7 @@ impl Server {
             .set_load_balancing_policy_for_cluster(
                 &cluster.cluster_id,
                 LoadBalancingAlgorithms::from_i32(cluster.load_balancing).unwrap_or_default(),
-                cluster.load_metric.and_then(|lm| LoadMetric::from_i32(lm)),
+                cluster.load_metric.and_then(LoadMetric::from_i32),
             );
     }
 
@@ -1076,7 +1077,7 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Err(e) => {
-                let error = format!("Couldn't add HTTP listener: {:#}", e);
+                let error = format!("Couldn't add HTTP listener: {e:#}");
                 error!("{}", error);
                 WorkerResponse::error(req_id, error)
             }
@@ -1145,7 +1146,7 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Err(e) => {
-                let error = format!("Couldn't add TCP listener: {:#}", e);
+                let error = format!("Couldn't add TCP listener: {e:#}");
                 error!("{}", error);
                 WorkerResponse::error(req_id, error)
             }
@@ -1164,7 +1165,7 @@ impl Server {
 
         let address: std::net::SocketAddr = match activate.address.parse() {
             Ok(a) => a,
-            Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {}", e)),
+            Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {e}")),
         };
 
         match ListenerType::from_i32(activate.proxy) {
@@ -1244,7 +1245,7 @@ impl Server {
 
         let address: std::net::SocketAddr = match deactivate.address.parse() {
             Ok(a) => a,
-            Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {}", e)),
+            Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {e}")),
         };
 
         match ListenerType::from_i32(deactivate.proxy) {
@@ -1256,7 +1257,7 @@ impl Server {
                         error!("Couldn't deactivate HTTP listener at address {:?}", address);
                         return WorkerResponse::error(
                             req_id,
-                            format!("cannot deactivate HTTP listener at address {:?}", address),
+                            format!("cannot deactivate HTTP listener at address {address:?}"),
                         );
                     }
                 };
@@ -1293,24 +1294,21 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Some(ListenerType::Https) => {
-                let (token, mut listener) = match self
-                    .https
-                    .borrow_mut()
-                    .give_back_listener(address)
-                {
-                    Some((token, listener)) => (token, listener),
+                let (token, mut listener) =
+                    match self.https.borrow_mut().give_back_listener(address) {
+                        Some((token, listener)) => (token, listener),
 
-                    None => {
-                        error!(
-                            "Couldn't deactivate HTTPS listener at address {:?}",
-                            address
-                        );
-                        return WorkerResponse::error(
-                            req_id,
-                            format!("cannot deactivate HTTPS listener at address {:?}", address),
-                        );
-                    }
-                };
+                        None => {
+                            error!(
+                                "Couldn't deactivate HTTPS listener at address {:?}",
+                                address
+                            );
+                            return WorkerResponse::error(
+                                req_id,
+                                format!("cannot deactivate HTTPS listener at address {address:?}"),
+                            );
+                        }
+                    };
                 if let Err(e) = self.poll.registry().deregister(&mut listener) {
                     error!(
                         "error deregistering HTTPS listen socket({:?}): {:?}",
@@ -1346,7 +1344,7 @@ impl Server {
                         error!("Couldn't deactivate TCP listener at address {:?}", address);
                         return WorkerResponse::error(
                             req_id,
-                            format!("cannot deactivate TCP listener at address {:?}", address),
+                            format!("cannot deactivate TCP listener at address {address:?}"),
                         );
                     }
                 };

@@ -89,6 +89,7 @@ pub struct HttpSession {
 }
 
 impl HttpSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         answers: Rc<RefCell<HttpAnswers>>,
         configured_backend_timeout: Duration,

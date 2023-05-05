@@ -87,6 +87,7 @@ pub struct TcpSession {
 }
 
 impl TcpSession {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         backend_buffer: Checkout,
         backend_id: Option<String>,
@@ -1304,7 +1305,7 @@ impl TcpProxy {
         self.fronts
             .insert(front.cluster_id.to_string(), listener.token);
         listener.set_tags(front.address.to_string(), Some(front.tags));
-        listener.cluster_id = Some(front.cluster_id.to_string());
+        listener.cluster_id = Some(front.cluster_id);
         Ok(())
     }
 
@@ -1323,7 +1324,7 @@ impl TcpProxy {
             None => bail!(format!("no such listener for '{}'", front.address)),
         };
 
-        listener.set_tags(front.address.to_string(), None);
+        listener.set_tags(front.address, None);
         if let Some(cluster_id) = listener.cluster_id.take() {
             self.fronts.remove(&cluster_id);
         }
@@ -1393,7 +1394,7 @@ impl ProxyConfiguration for TcpProxy {
                 let config = ClusterConfiguration {
                     proxy_protocol: cluster
                         .proxy_protocol
-                        .and_then(|pp| ProxyProtocolConfig::from_i32(pp)),
+                        .and_then(ProxyProtocolConfig::from_i32),
                     //load_balancing: cluster.load_balancing,
                 };
                 self.configs.insert(cluster.cluster_id, config);
@@ -1409,7 +1410,7 @@ impl ProxyConfiguration for TcpProxy {
                     Err(e) => {
                         return WorkerResponse::error(
                             message.id,
-                            format!("Wrong socket address: {}", e),
+                            format!("Wrong socket address: {e}"),
                         )
                     }
                 };
@@ -1496,7 +1497,7 @@ impl ProxyConfiguration for TcpProxy {
         let proxy_protocol = self
             .configs
             .get(owned.cluster_id.as_ref().unwrap())
-            .and_then(|c| c.proxy_protocol.clone());
+            .and_then(|c| c.proxy_protocol);
 
         if let Err(e) = frontend_sock.set_nodelay(true) {
             error!(

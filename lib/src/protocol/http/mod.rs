@@ -140,6 +140,7 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
 }
 
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         answers: Rc<RefCell<answers::HttpAnswers>>,
         configured_backend_timeout: Duration,
@@ -1909,9 +1910,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         metrics.backend_id = self.backend.as_ref().map(|i| i.borrow().backend_id.clone());
 
         metrics.backend_start();
-        self.backend
-            .as_mut()
-            .map(|b| b.borrow_mut().active_requests += 1);
+        if let Some(b) = self.backend.as_mut() {
+            b.borrow_mut().active_requests += 1;
+        }
         true
     }
 
@@ -2119,10 +2120,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         //replacing with a connection to another cluster
-        if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
-            if self.backend_token.take().is_some() {
-                self.close_backend(proxy.clone(), metrics);
-            }
+        if old_cluster_id.is_some()
+            && old_cluster_id.as_ref() != Some(&cluster_id)
+            && self.backend_token.take().is_some()
+        {
+            self.close_backend(proxy.clone(), metrics);
         }
 
         self.cluster_id = Some(cluster_id.clone());
