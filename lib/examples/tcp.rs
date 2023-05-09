@@ -1,13 +1,13 @@
 #![allow(unused_variables, unused_must_use)]
-extern crate sozu_lib as sozu;
+extern crate sozu_lib;
 #[macro_use]
-extern crate sozu_command_lib as sozu_command;
+extern crate sozu_command_lib;
 extern crate time;
 
 use std::{io::stdout, thread};
 
 use anyhow::Context;
-use sozu_command::{
+use sozu_command_lib::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
     proto::command::{
@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<()> {
             LoggerBackend::Stdout(stdout()),
             None,
         );
-        sozu::tcp::start_tcp_worker(listener, max_buffers, buffer_size, channel);
+        sozu_lib::tcp::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 
     let tcp_front = RequestTcpFrontend {

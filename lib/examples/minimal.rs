@@ -1,20 +1,21 @@
-#![allow(unused_variables, unused_must_use)]
-extern crate sozu_lib as sozu;
 #[macro_use]
-extern crate sozu_command_lib as sozu_command;
 extern crate time;
+
+#[macro_use]
+extern crate sozu_command_lib;
 
 use std::{collections::BTreeMap, env, io::stdout, thread};
 
 use anyhow::Context;
-use sozu_command::proto::command::request::RequestType;
 
-use crate::sozu_command::{
+use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
+    info,
     logging::{Logger, LoggerBackend},
     proto::command::{
-        AddBackend, LoadBalancingParams, PathRule, Request, RequestHttpFrontend, RulePosition,
+        request::RequestType, AddBackend, LoadBalancingParams, PathRule, Request,
+        RequestHttpFrontend, RulePosition,
     },
     request::WorkerRequest,
 };
@@ -40,13 +41,14 @@ fn main() -> anyhow::Result<()> {
 
     let http_listener = ListenerBuilder::new_http("127.0.0.1:8080").to_http()?;
 
-    let (mut command, channel) =
+    let (mut command_channel, proxy_channel) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
 
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::http::start_http_worker(http_listener, channel, max_buffers, buffer_size);
+        sozu_lib::http::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size)
+            .expect("The worker could not be started, or shut down");
     });
 
     let http_front = RequestHttpFrontend {
@@ -66,26 +68,29 @@ fn main() -> anyhow::Result<()> {
         backend_id: String::from("test-0"),
         address: "127.0.0.1:8000".to_string(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
-        sticky_id: None,
-        backup: None,
+        ..Default::default()
     };
 
-    command.write_message(&WorkerRequest {
-        id: String::from("ID_ABCD"),
-        content: Request {
-            request_type: Some(RequestType::AddHttpFrontend(http_front)),
-        },
-    });
+    command_channel
+        .write_message(&WorkerRequest {
+            id: String::from("ID_ABCD"),
+            content: Request {
+                request_type: Some(RequestType::AddHttpFrontend(http_front)),
+            },
+        })
+        .expect("Could not send AddHttpFrontend request");
 
-    command.write_message(&WorkerRequest {
-        id: String::from("ID_EFGH"),
-        content: Request {
-            request_type: Some(RequestType::AddBackend(http_backend)),
-        },
-    });
+    command_channel
+        .write_message(&WorkerRequest {
+            id: String::from("ID_EFGH"),
+            content: Request {
+                request_type: Some(RequestType::AddBackend(http_backend)),
+            },
+        })
+        .expect("Could not send AddBackend request");
 
-    println!("HTTP -> {:?}", command.read_message());
-    println!("HTTP -> {:?}", command.read_message());
+    println!("HTTP -> {:?}", command_channel.read_message());
+    println!("HTTP -> {:?}", command_channel.read_message());
 
     let _ = jg.join();
     info!("good bye");
