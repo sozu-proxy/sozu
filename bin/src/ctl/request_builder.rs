@@ -169,7 +169,7 @@ impl CommandManager {
         }
     }
 
-    pub fn cluster_command(&mut self, cmd: ClusterCmd) -> anyhow::Result<()> {
+    pub fn cluster_command(&mut self, cmd: ClusterCmd, json: bool) -> anyhow::Result<()> {
         match cmd {
             ClusterCmd::Add {
                 id,
@@ -199,6 +199,7 @@ impl CommandManager {
             ClusterCmd::Remove { id } => self.order_request(Request {
                 request_type: Some(RequestType::RemoveCluster(id)),
             }),
+            ClusterCmd::Get { id, domain } => self.query_cluster(json, id, domain),
         }
     }
 
