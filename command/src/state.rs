@@ -1240,6 +1240,21 @@ impl ConfigState {
             .next()
     }
 
+    pub fn get_certificates_by_domain_name(
+        &self,
+        domain_name: String,
+    ) -> Vec<CertificateWithNames> {
+        self.certificates
+            .values()
+            .flat_map(|hash_map| hash_map.values())
+            .filter(|certificate_and_key| certificate_and_key.names.contains(&domain_name))
+            .map(|certificate_and_key| CertificateWithNames {
+                certificate: certificate_and_key.certificate.clone(),
+                names: certificate_and_key.names.clone(),
+            })
+            .collect()
+    }
+
     pub fn list_frontends(&self, filters: FrontendFilters) -> ListedFrontends {
         // if no http / https / tcp filter is provided, list all of them
         let list_all = !filters.http && !filters.https && !filters.tcp;
@@ -1994,5 +2009,10 @@ mod tests {
             .expect("could not retrieve certificate by fingerprint");
 
         println!("found certificate: {:#?}", certificate_found_by_fingerprint);
+
+        let certificate_found_by_domain_name =
+            state.get_certificates_by_domain_name("lolcatho.st".to_string());
+
+        assert!(certificate_found_by_domain_name.len() >= 1);
     }
 }
