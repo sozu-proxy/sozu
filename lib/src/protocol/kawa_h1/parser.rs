@@ -1,3 +1,5 @@
+use std::{fmt, str::from_utf8_unchecked};
+
 use nom::{
     bytes::{self, complete::take_while},
     character::{complete::digit1, is_alphanumeric},
@@ -6,7 +8,6 @@ use nom::{
     sequence::preceded,
     Err, IResult,
 };
-use std::{fmt, str::from_utf8_unchecked};
 
 pub fn compare_no_case(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
@@ -21,6 +22,7 @@ pub fn compare_no_case(left: &[u8], right: &[u8]) -> bool {
         _ => false,
     })
 }
+
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub enum Method {
     Get,

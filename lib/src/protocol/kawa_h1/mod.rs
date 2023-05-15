@@ -1045,19 +1045,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn is_valid_backend_socket(&self) -> bool {
-        // if socket was not used in the last second, test it
-        if self
-            .backend_stop
-            .as_ref()
-            .map(|t| {
+        // if socket was last used in the last second, test it
+        match self.backend_stop.as_ref() {
+            Some(stop_instant) => {
                 let now = Instant::now();
-                let dur = now - *t;
-
-                dur > Duration::seconds(1)
-            })
-            .unwrap_or(true)
-        {
-            return self.test_backend_socket();
+                let dur = now - *stop_instant;
+                if dur > Duration::seconds(1) {
+                    return self.test_backend_socket();
+                }
+            }
+            None => return self.test_backend_socket(),
         }
 
         true
@@ -1727,12 +1724,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             } else {
                 TimeoutStatus::Response
             }
+        } else if self.keepalive_count > 0 {
+            TimeoutStatus::WaitingForNewRequest
         } else {
-            if self.keepalive_count > 0 {
-                TimeoutStatus::WaitingForNewRequest
-            } else {
-                TimeoutStatus::Request
-            }
+            TimeoutStatus::Request
         }
     }
 }

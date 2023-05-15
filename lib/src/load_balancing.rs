@@ -66,7 +66,7 @@ impl LoadBalancingAlgorithm for Random {
             })
             .collect();
 
-        if let Ok(dist) = WeightedIndex::new(&weights) {
+        if let Ok(dist) = WeightedIndex::new(weights) {
             let index = dist.sample(&mut rng);
             backends.get(index).cloned()
         } else {

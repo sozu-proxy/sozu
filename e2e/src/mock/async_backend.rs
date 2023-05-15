@@ -23,12 +23,14 @@ pub struct BackendHandle<T> {
     pub aggregator_rx: mpsc::Receiver<T>,
 }
 
+type RequestHandler<A> = Box<dyn Fn(&TcpStream, &str, A) -> A + Send + Sync>;
+
 impl<A: Aggregator + Send + Sync + 'static> BackendHandle<A> {
     pub fn spawn_detached_backend<S: Into<String>>(
         name: S,
         address: SocketAddr,
         mut aggregator: A,
-        handler: Box<dyn Fn(&TcpStream, &String, A) -> A + Send + Sync>,
+        handler: RequestHandler<A>,
     ) -> Self {
         let name = name.into();
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
@@ -97,9 +99,7 @@ impl BackendHandle<SimpleAggregator> {
     /// This creates a callback that listens on a TcpStream
     /// and returns HTTP OK responses with the given content in the body
     /// it returns an updated aggregator
-    pub fn http_handler<S: Into<String>>(
-        content: S,
-    ) -> Box<dyn Fn(&TcpStream, &String, SimpleAggregator) -> SimpleAggregator + Send + Sync> {
+    pub fn http_handler<S: Into<String>>(content: S) -> RequestHandler<SimpleAggregator> {
         let content = content.into();
         Box::new(move |mut stream, backend_name, mut aggregator| {
             let mut buf = [0u8; BUFFER_SIZE];
@@ -125,10 +125,8 @@ impl BackendHandle<SimpleAggregator> {
     /// This creates a callback that listens on a TcpStream
     /// and returns the given content as raw bytes
     /// it returns an updated aggregator
-    pub fn tcp_handler<S: Into<String>>(
-        content: String,
-    ) -> Box<dyn Fn(&TcpStream, &String, SimpleAggregator) -> SimpleAggregator + Send + Sync> {
-        let content: String = content;
+    pub fn tcp_handler<S: Into<String>>(content: S) -> RequestHandler<SimpleAggregator> {
+        let content: String = content.into();
         Box::new(move |mut stream, backend_name, mut aggregator| {
             let mut buf = [0u8; BUFFER_SIZE];
             match stream.read(&mut buf) {
