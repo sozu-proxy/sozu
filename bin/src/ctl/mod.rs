@@ -103,7 +103,11 @@ impl CommandManager {
                 ListenerCmd::Tcp { cmd } => self.tcp_listener_command(cmd),
                 ListenerCmd::List => self.list_listeners(),
             },
-            SubCmd::Certificate { cmd } => match cmd {
+            SubCmd::Certificate { cmd, json } => match cmd {
+                CertificateCmd::Get {
+                    fingerprint,
+                    domain,
+                } => self.query_certificates(json, fingerprint, domain),
                 CertificateCmd::Add {
                     certificate,
                     chain,
@@ -146,10 +150,6 @@ impl CommandManager {
             },
             SubCmd::Query { cmd, json } => match cmd {
                 QueryCmd::Clusters { id, domain } => self.query_cluster(json, id, domain),
-                QueryCmd::Certificates {
-                    fingerprint,
-                    domain,
-                } => self.query_certificate(json, fingerprint, domain),
             },
             SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
             SubCmd::Events => self.events(),
