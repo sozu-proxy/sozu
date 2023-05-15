@@ -1226,7 +1226,10 @@ impl ConfigState {
         cluster_ids
     }
 
-    pub fn get_certificate(&self, fingerprint: &[u8]) -> Option<CertificateWithNames> {
+    pub fn get_certificate_by_fingerprint(
+        &self,
+        fingerprint: &[u8],
+    ) -> Option<CertificateWithNames> {
         self.certificates
             .values()
             .filter_map(|h| h.get(&Fingerprint(fingerprint.to_vec())))
@@ -1956,5 +1959,40 @@ mod tests {
         let _hash2 = state2.hash_state();
 
         assert_eq!(diff, e);
+    }
+
+    #[test]
+    fn certificate_retrieval() {
+        let mut state: ConfigState = Default::default();
+        let certificate_and_key = CertificateAndKey {
+            certificate: String::from(include_str!("../assets/certificate.pem")),
+            key: String::from(include_str!("../assets/key.pem")),
+            certificate_chain: vec![],
+            versions: vec![],
+            names: vec!["lolcatho.st".to_string()],
+        };
+        let add_certificate = AddCertificate {
+            address: "127.0.0.1:8080".to_string(),
+            certificate: certificate_and_key,
+            expired_at: None,
+        };
+        state
+            .dispatch(&Request {
+                request_type: Some(RequestType::AddCertificate(add_certificate)),
+            })
+            .expect("Could not add certificate");
+
+        println!("state: {:#?}", state);
+
+        let fingerprint: Fingerprint = serde_json::from_str(
+            "\"ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5\"",
+        )
+        .expect("Could not deserialize the fingerprint");
+
+        let certificate_found_by_fingerprint = state
+            .get_certificate_by_fingerprint(&fingerprint.0)
+            .expect("could not retrieve certificate by fingerprint");
+
+        println!("found certificate: {:#?}", certificate_found_by_fingerprint);
     }
 }
