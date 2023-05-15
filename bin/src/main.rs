@@ -1,3 +1,28 @@
+//! A lightweight, fast, hot-reloadable manager of reverse proxy workers.
+//!
+//! This crate provides a binary that takes a configuration file and
+//! launches a main process and proxy workers that all share the same state.
+//!
+//! ```
+//! sozu --config config.toml start
+//! ```
+//!
+//! The state is reloadable during runtime:
+//! the main process can receive requests via a UNIX socket,
+//! in order to add listeners, frontends, backends etc.
+//!
+//! The `sozu` binary works as a CLI to send requests to the main process via the UNIX socket.
+//! For instance:
+//!
+//! ```
+//! sozu --config config.toml listener http add --address 127.0.0.1:8080
+//! ```
+//!
+//!
+//! The requests sent to Sōzu are defined in protobuf in the `sozu_command_lib` crate,
+//! which means other programs can use the protobuf definition and send roquests
+//! to Sōzu via its UNIX socket.
+
 extern crate nom;
 #[macro_use]
 extern crate lazy_static;
