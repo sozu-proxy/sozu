@@ -19,7 +19,7 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proto::command::{
         request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
-        ClusterHashes, ClusterInformations, FrontendFilters, ListedFrontends, ListenersList,
+        ClusterHashes, ClusterInformations, FrontendFilters, ListenersList,
         MetricsConfiguration, Request, Response, ResponseContent, ResponseStatus,
         ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
     },
@@ -338,46 +338,7 @@ impl CommandServer {
             filters
         );
 
-        // if no http / https / tcp filter is provided, list all of them
-        let list_all = !filters.http && !filters.https && !filters.tcp;
-
-        let mut listed_frontends = ListedFrontends::default();
-
-        if filters.http || list_all {
-            for http_frontend in self.state.http_fronts.iter().filter(|f| {
-                if let Some(domain) = &filters.domain {
-                    f.1.hostname.contains(domain)
-                } else {
-                    true
-                }
-            }) {
-                listed_frontends
-                    .http_frontends
-                    .push(http_frontend.1.to_owned().into());
-            }
-        }
-
-        if filters.https || list_all {
-            for https_frontend in self.state.https_fronts.iter().filter(|f| {
-                if let Some(domain) = &filters.domain {
-                    f.1.hostname.contains(domain)
-                } else {
-                    true
-                }
-            }) {
-                listed_frontends
-                    .https_frontends
-                    .push(https_frontend.1.to_owned().into());
-            }
-        }
-
-        if (filters.tcp || list_all) && filters.domain.is_none() {
-            for tcp_frontend in self.state.tcp_fronts.values().flat_map(|v| v.iter()) {
-                listed_frontends
-                    .tcp_frontends
-                    .push(tcp_frontend.to_owned().into())
-            }
-        }
+        let listed_frontends = self.state.list_frontends(filters);
 
         Ok(Some(Success::ListFrontends(
             ContentType::FrontendList(listed_frontends).into(),

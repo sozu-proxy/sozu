@@ -14,10 +14,10 @@ use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        CertificateWithNames, Cluster, ClusterInformation, DeactivateListener, HttpListenerConfig,
-        HttpsListenerConfig, ListenerType, PathRule, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend, RequestTcpFrontend,
-        TcpListenerConfig,
+        CertificateWithNames, Cluster, ClusterInformation, DeactivateListener, FrontendFilters,
+        HttpListenerConfig, HttpsListenerConfig, ListedFrontends, ListenerType, PathRule,
+        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
+        RequestHttpFrontend, RequestTcpFrontend, TcpListenerConfig,
     },
     response::{Backend, HttpFrontend, TcpFrontend},
 };
@@ -1235,6 +1235,51 @@ impl ConfigState {
                 names: c.names.clone(),
             })
             .next()
+    }
+
+    pub fn list_frontends(&self, filters: FrontendFilters) -> ListedFrontends {
+        // if no http / https / tcp filter is provided, list all of them
+        let list_all = !filters.http && !filters.https && !filters.tcp;
+
+        let mut listed_frontends = ListedFrontends::default();
+
+        if filters.http || list_all {
+            for http_frontend in self.http_fronts.iter().filter(|f| {
+                if let Some(domain) = &filters.domain {
+                    f.1.hostname.contains(domain)
+                } else {
+                    true
+                }
+            }) {
+                listed_frontends
+                    .http_frontends
+                    .push(http_frontend.1.to_owned().into());
+            }
+        }
+
+        if filters.https || list_all {
+            for https_frontend in self.https_fronts.iter().filter(|f| {
+                if let Some(domain) = &filters.domain {
+                    f.1.hostname.contains(domain)
+                } else {
+                    true
+                }
+            }) {
+                listed_frontends
+                    .https_frontends
+                    .push(https_frontend.1.to_owned().into());
+            }
+        }
+
+        if (filters.tcp || list_all) && filters.domain.is_none() {
+            for tcp_frontend in self.tcp_fronts.values().flat_map(|v| v.iter()) {
+                listed_frontends
+                    .tcp_frontends
+                    .push(tcp_frontend.to_owned().into())
+            }
+        }
+
+        listed_frontends
     }
 }
 
