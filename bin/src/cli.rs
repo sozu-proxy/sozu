@@ -180,8 +180,15 @@ pub enum SubCmd {
         #[clap(subcommand)]
         cmd: ListenerCmd,
     },
-    #[clap(name = "certificate", about = "certificate management")]
-    Certificate {
+    #[clap(name = "certificates", about = "certificate management")]
+    Certificates {
+        #[clap(
+            short = 'j',
+            long = "json",
+            help = "Print the command result in JSON format",
+            global = true
+        )]
+        json: bool,
         #[clap(subcommand)]
         cmd: CertificateCmd,
     },
@@ -743,6 +750,16 @@ pub enum TcpListenerCmd {
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum CertificateCmd {
+    #[clap(
+        name = "get",
+        about = "query certificates, all or filtered by fingerprint or domain name"
+    )]
+    Get {
+        #[clap(short = 'f', long = "fingerprint", help = "certificate fingerprint")]
+        fingerprint: Option<String>,
+        #[clap(short = 'd', long = "domain", help = "domain name of the queried certificates")]
+        domain: Option<String>,
+    },
     #[clap(name = "add", about = "Add a certificate")]
     Add {
         #[clap(
@@ -816,16 +833,6 @@ pub enum QueryCmd {
         #[clap(short = 'i', long = "id", help = "cluster identifier")]
         id: Option<String>,
         #[clap(short = 'd', long = "domain", help = "cluster domain name")]
-        domain: Option<String>,
-    },
-    #[clap(
-        name = "certificates",
-        about = "Query certificates matching a specific filter"
-    )]
-    Certificates {
-        #[clap(short = 'f', long = "fingerprint", help = "certificate fingerprint")]
-        fingerprint: Option<String>,
-        #[clap(short = 'd', long = "domain", help = "domain name")]
         domain: Option<String>,
     },
 }

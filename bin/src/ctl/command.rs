@@ -360,7 +360,7 @@ impl CommandManager {
         Ok(())
     }
 
-    pub fn query_certificate(
+    pub fn query_certificates(
         &mut self,
         json: bool,
         fingerprint: Option<String>,
@@ -400,7 +400,7 @@ impl CommandManager {
                         print_json_response(&response.message)?;
                         bail!("We received an error message");
                     } else {
-                        bail!("could not query proxy state: {}", response.message);
+                        bail!("could not get certificate: {}", response.message);
                     }
                 }
                 ResponseStatus::Ok => {
