@@ -84,7 +84,7 @@ impl CommandManager {
                 StateCmd::Load { file } => self.load_state(file),
             },
             SubCmd::Reload { file, json } => self.reload_configuration(file, json),
-            SubCmd::Cluster { cmd } => self.cluster_command(cmd),
+            SubCmd::Clusters { cmd, json } => self.cluster_command(cmd, json),
             SubCmd::Backend { cmd } => self.backend_command(cmd),
             SubCmd::Frontend { cmd } => match cmd {
                 FrontendCmd::Http { cmd } => self.http_frontend_command(cmd),
@@ -147,9 +147,6 @@ impl CommandManager {
                     old_fingerprint.as_deref(),
                     tls_versions,
                 ),
-            },
-            SubCmd::Query { cmd, json } => match cmd {
-                QueryCmd::Clusters { id, domain } => self.query_cluster(json, id, domain),
             },
             SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
             SubCmd::Events => self.events(),
