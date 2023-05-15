@@ -19,9 +19,9 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proto::command::{
         request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
-        ClusterHashes, ClusterInformations, FrontendFilters, ListenersList,
-        MetricsConfiguration, Request, Response, ResponseContent, ResponseStatus,
-        ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
+        ClusterHashes, ClusterInformations, FrontendFilters, MetricsConfiguration, Request,
+        Response, ResponseContent, ResponseStatus, ReturnListenSockets, RunState, SoftStop, Status,
+        WorkerInfo, WorkerInfos, WorkerResponses,
     },
     request::WorkerRequest,
     scm_socket::Listeners,
@@ -346,13 +346,10 @@ impl CommandServer {
     }
 
     fn list_listeners(&self) -> anyhow::Result<Option<Success>> {
+        let listeners_list = self.state.list_listeners();
+
         Ok(Some(Success::ListListeners(
-            ContentType::ListenersList(ListenersList {
-                http_listeners: self.state.http_listeners.clone(),
-                https_listeners: self.state.https_listeners.clone(),
-                tcp_listeners: self.state.tcp_listeners.clone(),
-            })
-            .into(),
+            ContentType::ListenersList(listeners_list).into(),
         )))
     }
 

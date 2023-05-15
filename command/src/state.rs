@@ -15,8 +15,8 @@ use crate::{
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
         CertificateWithNames, Cluster, ClusterInformation, DeactivateListener, FrontendFilters,
-        HttpListenerConfig, HttpsListenerConfig, ListedFrontends, ListenerType, PathRule,
-        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
+        HttpListenerConfig, HttpsListenerConfig, ListedFrontends, ListenerType, ListenersList,
+        PathRule, RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
         RequestHttpFrontend, RequestTcpFrontend, TcpListenerConfig,
     },
     response::{Backend, HttpFrontend, TcpFrontend},
@@ -1280,6 +1280,14 @@ impl ConfigState {
         }
 
         listed_frontends
+    }
+
+    pub fn list_listeners(&self) -> ListenersList {
+        ListenersList {
+            http_listeners: self.http_listeners.clone(),
+            https_listeners: self.https_listeners.clone(),
+            tcp_listeners: self.tcp_listeners.clone(),
+        }
     }
 }
 
