@@ -1,148 +1,341 @@
-//! This library provides tools to build a HTTP proxy
+//! ## What this library does
 //!
-//! It handles network polling, HTTP parsing, TLS in a fast single threaded event
+//! This library provides tools to build and start HTTP, HTTPS and TCP reverse proxies.
+//!
+//! The proxies handles network polling, HTTP parsing, TLS in a fast single threaded event
 //! loop.
 //!
-//! It is designed to receive configuration changes at runtime instead of
+//! Each proxy is designed to receive configuration changes at runtime instead of
 //! reloading from a file regularly. The event loop runs in its own thread
 //! and receives commands through a message queue.
 //!
-//! To create a HTTP proxy, you first need to create a `HttpProxyConfiguration`
-//! structure (there are configuration structures for the HTTPS and TCP proxies
-//! too).
+//! ## Difference with the crate `sozu`
 //!
-//! ```ignore
-//! let config = proxy::HttpProxyConfiguration {
-//!   front: "198.51.100.0:80".parse().unwrap(),
-//!   ..Default::default()
-//! };
+//! To create several workers and manage them all at once (which is the most common way to
+//! use Sōzu), the crate `sozu` is more indicated than using the lib directly.
+//!
+//! The crate `sozu` provides a binary called the main process.
+//! The main process uses `sozu_lib` to start and manage workers.
+//! Each worker can handle HTTP, HTTPS and TCP traffic.
+//! The main process receives synchronizes the state of all workers, using UNIX sockets
+//! and custom channels to communicate with them.
+//! The main process itself is is configurable with a file, and has a CLI.
+//!
+//! ## How to use this library directly
+//!
+//! This documentation here explains how to write a binary that will start a single Sōzu
+//! worker and give it orders. The method has two steps:
+//!
+//! 1. Starts a Sōzu worker in a distinct thread
+//! 2. sends instructions to the worker on a UNIX socket via a Sōzu channel
+//!
+//! ### How to start a Sōzu worker
+//!
+//! Before creating an HTTP proxy, we first need to create an HTTP listener.
+//! The listener is an abstraction around a TCP socket provided by the kernel.
+//! We need the `sozu_command_lib` to build a listener.
+//!
+//! ```
+//! use sozu_command_lib::config::ListenerBuilder;
+//!
+//! let http_listener = ListenerBuilder::new_http("127.0.0.1:8080")
+//!     .to_http()
+//!     .expect("Could not create HTTP listener");
 //! ```
 //!
-//! Then create the required elements to communicate with the proxy thread,
-//! and launch the thread:
+//! The `http_listener` is of the type `HttpListenerConfig`, that we can be sent to the worker
+//! to start the proxy.
+//!
+//! Then create a pair of channels to communicate with the proxy.
+//! The channel is a wrapper around a unix socket.
 //!
 //! ```ignore
-//! let config = proxy::HttpProxyConfiguration {
-//!   front: "198.51.100.0:80".parse().unwrap(),
-//!   ..Default::default()
+//! use sozu_command_lib::{
+//!     channel::Channel,
+//!     request::WorkerRequest,
+//!     response::WorkerResponse,
 //! };
 //!
-//! let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
+//! let (mut command_channel, proxy_channel): (
+//!     Channel<WorkerRequest, WorkerResponse>,
+//!     Channel<WorkerResponse, WorkerRequest>,
+//! ) = Channel::generate(1000, 10000).expect("should create a channel");
+//!```
 //!
-//! let jg = thread::spawn(move || {
-//!    network::http::start(config, channel);
+//! Here, the `command_channel` end is blocking, it sends `WorkerRequest`s and receives
+//! `WorkerResponses`, while the `proxy_channel` end is non-blocking, and the types are reversed.
+//! Writing the types here isn't even necessary thanks to the compiler,
+//! but it brings the point accross.
+//!
+//! You can now launch the worker in a separate thread, providing the HTTP listener config,
+//! the proxy end of the channel, and your custom number of buffers and their size:
+//!
+//! ```ignore
+//! use std::thread;
+//! 
+//! let worker_thread_join_handle = thread::spawn(move || {
+//!     let max_buffers = 500;
+//!     let buffer_size = 16384;
+//!     sozu_lib::http::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size);
 //! });
-//!
 //! ```
 //!
-//! The `tx, rx` channel here is a mio channel through which the proxy will
-//! receive its orders, and it will use the `(sender,rec)` one to send
-//! acknowledgements and various data.
+//! ### Send orders
 //!
-//! Once the thread is launched, the proxy will start its event loop and handle
-//! events on the listening interface and port specified in the configuration
-//! object. Since no clusters were specified for the proxy, it will receive
-//! the connections, parse the request, then send a default (but configurable)
+//! Once the thread is launched, the proxy worker will start its event loop and handle
+//! events on the listening interface and port specified when building the HTTP Listener.
+//! Since no frontends or backends were specified for the proxy, it will receive
+//! the connections, parse the requests, then send a default (but configurable)
 //! answer.
 //!
-//! ```ignore
-//! let http_front = proxy::HttpFront {
-//!   cluster_id:     String::from("test"),
-//!   hostname:   String::from("example.com"),
-//!   path_begin: String::from("/")
+//! Before defining a frontend and backends, we need to define a cluster, which describes
+//! a routing configuration. A cluster contains:
+//!
+//! - one frontend
+//! - one or several backends
+//! - routing rules
+//!
+//! A cluster is identified by its `cluster_id`, which will be used to define frontends
+//! and backends later on.
+//!
+//! ```
+//! use sozu_command_lib::proto::command::{Cluster, LoadBalancingAlgorithms};
+//!
+//! let cluster = Cluster {
+//!     cluster_id: "my-cluster".to_string(),
+//!     sticky_session: false,
+//!     https_redirect: false,
+//!     load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+//!     answer_503: Some("A custom forbidden message".to_string()),
+//!     ..Default::default()
 //! };
-//! let http_backend = proxy::Backend {
-//!   cluster_id:     String::from("test"),
-//!   ip_address: String::from("192.0.2.1"),
-//!   port:       8080
-//! };
-//!
-//! command.write_message(&proxy::ProxyRequest {
-//!   id:    String::from("ID_ABCD"),
-//!   order: proxy::ProxyRequestOrder::AddHttpFront(http_front)
-//! });
-//!
-//! command.write_message(&proxy::ProxyRequest {
-//!   id:    String::from("ID_EFGH"),
-//!   order: proxy::ProxyRequestOrder::AddBackend(http_backend)
-//! });
-//!
-//! println!("HTTP -> {:?}", command.read_message());
-//! println!("HTTP -> {:?}", command.read_message());
 //! ```
 //!
-//! A cluster is identified by its `cluster_id`, a string that will be shared
-//! between one or multiple "fronts", and one or multiple "backends".
+//! The defaults are sensible, so we could define only the `cluster_id`.
 //!
-//! A "front" is a way to recognize a request and match it to an `cluster_id`,
-//! depending on the hostname and the beginning of the URL path.
+//! We can now define a frontend. A frontend is a way to recognize a request and match
+//! it to a `cluster_id`, depending on the hostname and the beginning of the URL path.
+//! The `address` field must match the one of the HTTP listener we defined before:
 //!
-//! A backend corresponds to one backend server, indicated by its IP and port.
+//! ```
+//! use std::collections::BTreeMap;
+//! 
+//!  use sozu_command_lib::proto::command::{PathRule, RequestHttpFrontend, RulePosition};
+//!
+//! let http_front = RequestHttpFrontend {
+//!     cluster_id: Some("my-cluster".to_string()),
+//!     address: "127.0.0.1:8080".to_string(),
+//!     hostname: "example.com".to_string(),
+//!     path: PathRule::prefix(String::from("/")),
+//!     position: RulePosition::Pre.into(),
+//!     tags: BTreeMap::from([
+//!         ("owner".to_owned(), "John".to_owned()),
+//!         ("id".to_owned(), "my-own-http-front".to_owned()),
+//!     ]),
+//!     ..Default::default()
+//! };
+//! ```
+//!
+//! The `tags` are keys and values that will appear in the access logs,
+//! which can come in handy.
+//!
+//! Now let's define a backend.
+//! A backend is an instance of a backend application we want to route traffic to.
+//! The `address` field must match the IP and port of the backend server.
+//!
+//! ```
+//! use sozu_command_lib::proto::command::{AddBackend, LoadBalancingParams};
+//! 
+//! let http_backend = AddBackend {
+//!     cluster_id: "my-cluster".to_string(),
+//!     backend_id: "test-backend".to_string(),
+//!     address: "127.0.0.1:8000".to_string(),
+//!     load_balancing_parameters: Some(LoadBalancingParams::default()),
+//!     ..Default::default()
+//! };
+//! ```
 //!
 //! A cluster can have multiple backend servers, and they can be added or
 //! removed while the proxy is running. If a backend is removed from the configuration
 //! while the proxy is handling a request to that server, it will finish that
 //! request and stop sending new traffic to that server.
 //!
-//! The fronts and backends are specified with messages sent through the
-//! communication channels with the proxy event loop. Once the configuration
-//! options are added to the proxy's state, it will send back an acknowledgement
-//! message.
 //!
-//! Here is the complete example for reference:
+//! Now we can use the other end of the channel to send all these requests to the worker,
+//! using the WorkerRequest type:
 //!
 //! ```ignore
-//! use std::thread;
-//! use std::sync::mpsc;
-//! use log::info;
-//! use sozu_command::messages;
-//! use sozu_command::channel::Channel;
-//! use sozu::network;
+//! use sozu_command_lib::{
+//!     proto::command::{Request, request::RequestType},
+//!     request::WorkerRequest,
+//! };
 //!
-//! fn main() {
-//!   env_logger::init().unwrap();
-//!   info!("starting up");
+//! command_channel
+//!     .write_message(&WorkerRequest {
+//!         id: String::from("add-the-cluster"),
+//!         content: Request {
+//!             request_type: Some(RequestType::AddCluster(cluster)),
+//!         },
+//!     })
+//!     .expect("Could not send AddHttpFrontend request");
 //!
-//!   let config = proxy::HttpProxyConfiguration {
-//!     front: "198.51.100.0:80".parse().unwrap(),
-//!     ..Default::default()
-//!   };
+//! command_channel
+//!     .write_message(&WorkerRequest {
+//!         id: String::from("add-the-frontend"),
+//!         content: Request {
+//!             request_type: Some(RequestType::AddHttpFrontend(http_front)),
+//!         },
+//!     })
+//!     .expect("Could not send AddHttpFrontend request");
 //!
-//!   let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
+//! command_channel
+//!     .write_message(&WorkerRequest {
+//!         id: String::from("add-the-backend"),
+//!         content: Request {
+//!             request_type: Some(RequestType::AddBackend(http_backend)),
+//!         },
+//!     })
+//!     .expect("Could not send AddBackend request");
 //!
-//!   let jg            = thread::spawn(move || {
-//!      network::http::start(config, channel);
-//!   });
-//!
-//!   let http_front = proxy::HttpFront {
-//!     cluster_id:     String::from("test"),
-//!     hostname:   String::from("example.com"),
-//!     path_begin: String::from("/")
-//!   };
-//!   let http_backend = proxy::Backend {
-//!     cluster_id:     String::from("test"),
-//!     ip_address: String::from("192.0.2.1"),
-//!     port:       8080
-//!   };
-//!
-//!   command.write_message(&proxy::ProxyRequest {
-//!     id:    String::from("ID_ABCD"),
-//!     order: proxy::ProxyRequestOrder::AddHttpFront(http_front)
-//!   });
-//!
-//!   command.write_message(&proxy::ProxyRequest {
-//!     id:    String::from("ID_EFGH"),
-//!     order: proxy::ProxyRequestOrder::AddBackend(http_backend)
-//!   });
-//!
-//!   println!("HTTP -> {:?}", command.read_message());
-//!   println!("HTTP -> {:?}", command.write_message());
-//!
-//!   let _ = jg.join();
-//!   info!("good bye");
-//! }
+//! println!("HTTP -> {:?}", command_channel.read_message());
+//! println!("HTTP -> {:?}", command_channel.read_message());
+//! println!("HTTP -> {:?}", command_channel.read_message());
 //! ```
 //!
+//!
+//! The event loop of the worker will process these instructions and add them to
+//! its state, and the worker will send back an acknowledgement
+//! message.
+//!
+//! Now we can let the worker thread run in the background:
+//!
+//! ```ignore
+//! let _ = worker_thread_join_handle.join();
+//! ```
+//!
+//! Here is the complete example for reference, it matches the `minimal.rs` example:
+//!
+//! ```
+//! extern crate time;
+//!
+//! #[macro_use]
+//! extern crate sozu_command_lib;
+//!
+//! use std::{collections::BTreeMap, env, io::stdout, thread};
+//!
+//! use anyhow::Context;
+//!
+//! use sozu_command_lib::{
+//!     channel::Channel,
+//!     config::ListenerBuilder,
+//!     info,
+//!     logging::{Logger, LoggerBackend},
+//!     proto::command::{
+//!         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
+//!         PathRule, Request, RequestHttpFrontend, RulePosition,
+//!     },
+//!     request::WorkerRequest,
+//! };
+//!
+//! fn main() -> anyhow::Result<()> {
+//!     if env::var("RUST_LOG").is_ok() {
+//!         Logger::init(
+//!             "EXAMPLE".to_string(),
+//!             &env::var("RUST_LOG").with_context(|| "could not get the RUST_LOG env var")?,
+//!             LoggerBackend::Stdout(stdout()),
+//!             None,
+//!         );
+//!     } else {
+//!         Logger::init(
+//!             "EXAMPLE".to_string(),
+//!             "info",
+//!             LoggerBackend::Stdout(stdout()),
+//!             None,
+//!         );
+//!     }
+//!
+//!     info!("starting up");
+//!
+//!     let http_listener = ListenerBuilder::new_http("127.0.0.1:8080")
+//!         .to_http()
+//!         .expect("Could not create HTTP listener");
+//!
+//!     let (mut command_channel, proxy_channel) =
+//!         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
+//!
+//!     let worker_thread_join_handle = thread::spawn(move || {
+//!         let max_buffers = 500;
+//!         let buffer_size = 16384;
+//!         sozu_lib::http::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size)
+//!             .expect("The worker could not be started, or shut down");
+//!     });
+//!
+//!     let cluster = Cluster {
+//!         cluster_id: "my-cluster".to_string(),
+//!         sticky_session: false,
+//!         https_redirect: false,
+//!         load_balancing: LoadBalancingAlgorithms::RoundRobin as i32,
+//!         answer_503: Some("A custom forbidden message".to_string()),
+//!         ..Default::default()
+//!     };
+//!
+//!     let http_front = RequestHttpFrontend {
+//!         cluster_id: Some("my-cluster".to_string()),
+//!         address: "127.0.0.1:8080".to_string(),
+//!         hostname: "example.com".to_string(),
+//!         path: PathRule::prefix(String::from("/")),
+//!         position: RulePosition::Pre.into(),
+//!         tags: BTreeMap::from([
+//!             ("owner".to_owned(), "John".to_owned()),
+//!             ("id".to_owned(), "my-own-http-front".to_owned()),
+//!         ]),
+//!         ..Default::default()
+//!     };
+//!     let http_backend = AddBackend {
+//!         cluster_id: "my-cluster".to_string(),
+//!         backend_id: "test-backend".to_string(),
+//!         address: "127.0.0.1:8000".to_string(),
+//!         load_balancing_parameters: Some(LoadBalancingParams::default()),
+//!         ..Default::default()
+//!     };
+//!
+//!     command_channel
+//!         .write_message(&WorkerRequest {
+//!             id: String::from("add-the-cluster"),
+//!             content: Request {
+//!                 request_type: Some(RequestType::AddCluster(cluster)),
+//!             },
+//!         })
+//!         .expect("Could not send AddHttpFrontend request");
+//!
+//!     command_channel
+//!         .write_message(&WorkerRequest {
+//!             id: String::from("add-the-frontend"),
+//!             content: Request {
+//!                 request_type: Some(RequestType::AddHttpFrontend(http_front)),
+//!             },
+//!         })
+//!         .expect("Could not send AddHttpFrontend request");
+//!
+//!     command_channel
+//!         .write_message(&WorkerRequest {
+//!             id: String::from("add-the-backend"),
+//!             content: Request {
+//!                 request_type: Some(RequestType::AddBackend(http_backend)),
+//!             },
+//!         })
+//!         .expect("Could not send AddBackend request");
+//!
+//!     println!("HTTP -> {:?}", command_channel.read_message());
+//!     println!("HTTP -> {:?}", command_channel.read_message());
+//!
+//!     // uncomment to let it run in the background
+//!     // let _ = worker_thread_join_handle.join();
+//!     info!("good bye");
+//!     Ok(())
+//! }
+//! ```
+
 #![cfg_attr(feature = "unstable", feature(test))]
 #[cfg(all(feature = "unstable", test))]
 extern crate test;
@@ -213,7 +406,7 @@ use std::{
 use anyhow::{bail, Context};
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
-use sozu_command::{
+use sozu_command_lib::{
     proto::command::{Cluster, Event, EventKind, LoadBalancingParams},
     ready::Ready,
     request::WorkerRequest,

@@ -485,6 +485,7 @@ impl Server {
         Ok(server)
     }
 
+    /// The server runs in a loop until a shutdown is ordered
     pub fn run(&mut self) {
         let mut events = Events::with_capacity(1024); // TODO: make event capacity configurable?
         self.last_sessions_len = self.sessions.borrow().slab.len();

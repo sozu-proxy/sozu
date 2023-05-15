@@ -1,15 +1,15 @@
 #![allow(unused_variables, unused_must_use)]
 #[macro_use]
-extern crate sozu_lib as sozu;
+extern crate sozu_lib;
 #[macro_use]
-extern crate sozu_command_lib as sozu_command;
+extern crate sozu_command_lib;
 extern crate time;
 
 use std::{env, io::stdout, thread};
 
 use anyhow::Context;
 
-use sozu_command::{
+use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
     logging::{Logger, LoggerBackend},
@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
 
     info!("MAIN\tstarting up");
 
-    sozu::metrics::setup(
+    sozu_lib::metrics::setup(
         &"127.0.0.1:8125"
             .parse()
             .with_context(|| "Could not parse address for metrics setup")?,
@@ -56,7 +56,7 @@ fn main() -> anyhow::Result<()> {
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::http::start_http_worker(http_listener, channel, max_buffers, buffer_size);
+        sozu_lib::http::start_http_worker(http_listener, channel, max_buffers, buffer_size);
     });
 
     let http_front = RequestHttpFrontend {
@@ -93,14 +93,14 @@ fn main() -> anyhow::Result<()> {
     info!("MAIN\tHTTP -> {:?}", command.read_message());
     info!("MAIN\tHTTP -> {:?}", command.read_message());
 
-    let https_listener = ListenerBuilder::new_tcp("127.0.0.1:8443").to_tls()?;
+    let https_listener = ListenerBuilder::new_https("127.0.0.1:8443").to_tls()?;
 
     let (mut command2, channel2) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
     let jg2 = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu::https::start_https_worker(https_listener, channel2, max_buffers, buffer_size)
+        sozu_lib::https::start_https_worker(https_listener, channel2, max_buffers, buffer_size)
     });
 
     let cert1 = include_str!("../assets/certificate.pem");

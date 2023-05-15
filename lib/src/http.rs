@@ -1001,7 +1001,8 @@ impl L7Proxy for HttpProxy {
     }
 }
 
-/// This is not directly used by Sōzu but is available for example and testing purposes
+/// This is starts an HTTP worker with an HTTP listener config.
+/// It activates the Listener automatically.
 pub fn start_http_worker(
     config: HttpListenerConfig,
     channel: ProxyChannel,
