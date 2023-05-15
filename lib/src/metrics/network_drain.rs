@@ -162,7 +162,7 @@ impl NetworkDrain {
         }*/
 
         if self.is_writable {
-            for (key, mut stored_metric) in self
+            for (key, stored_metric) in self
                 .cluster_metrics
                 .iter_mut()
                 .filter(|(_, value)| value.updated && now.duration_since(value.last_sent) > secs)
@@ -246,7 +246,7 @@ impl NetworkDrain {
         }*/
 
         if self.is_writable {
-            for (key, mut stored_metric) in self
+            for (key, stored_metric) in self
                 .backend_metrics
                 .iter_mut()
                 .filter(|(_, value)| value.updated && now.duration_since(value.last_sent) > secs)
