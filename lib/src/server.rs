@@ -920,7 +920,7 @@ impl Server {
                 return;
             }
             Some(RequestType::QueryCertificateByFingerprint(f)) => {
-                let response = match self.config_state.get_certificate(f) {
+                let response = match self.config_state.get_certificate_by_fingerprint(f) {
                     Some(cert) => WorkerResponse::ok_with_content(
                         message.id.clone(),
                         ContentType::CertificateByFingerprint(cert).into(),

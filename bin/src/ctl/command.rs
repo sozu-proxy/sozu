@@ -404,6 +404,7 @@ impl CommandManager {
                     }
                 }
                 ResponseStatus::Ok => {
+                    info!("We did get a response from the proxy");
                     match response.content {
                         Some(ResponseContent {
                             content_type: Some(ContentType::WorkerResponses(worker_responses)),

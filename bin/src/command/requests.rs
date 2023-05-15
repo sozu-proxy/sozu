@@ -1080,6 +1080,8 @@ impl CommandServer {
                 }
             }
 
+            debug!("Received these worker responses: {:?}", responses);
+
             let mut worker_responses: BTreeMap<String, ResponseContent> = responses
                 .into_iter()
                 .filter_map(|(worker_id, proxy_response)| {
