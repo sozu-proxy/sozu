@@ -760,12 +760,16 @@ pub enum CertificateCmd {
         about = "query certificates, all or filtered by fingerprint or domain name"
     )]
     Get {
-        #[clap(short = 'f', long = "fingerprint", help = "certificate fingerprint")]
+        #[clap(
+            short = 'f',
+            long = "fingerprint",
+            help = "show the certificate and domain names for a given fingerprint"
+        )]
         fingerprint: Option<String>,
         #[clap(
             short = 'd',
             long = "domain",
-            help = "domain name of the queried certificates"
+            help = "show certificate fingerprints for a domain name"
         )]
         domain: Option<String>,
     },

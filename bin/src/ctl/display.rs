@@ -648,11 +648,7 @@ pub fn print_certificates(
                     println!("\t{}:", certs.address);
 
                     for summary in certs.certificate_summaries.iter() {
-                        println!(
-                            "\t\t{}:\t{}",
-                            summary.domain,
-                            hex::encode(&summary.fingerprint)
-                        );
+                        println!("\t\t{}:\t{}", summary.domain, summary.fingerprint);
                     }
 
                     println!();

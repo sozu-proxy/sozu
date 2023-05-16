@@ -338,7 +338,10 @@ impl ConfigState {
             .or_insert_with(HashMap::new);
 
         if entry.contains_key(&fingerprint) {
-            info!("Skip loading of certificate '{}' for domain '{}' on listener '{}', the certificate is already present.", fingerprint, add.certificate.names.join(", "), add.address);
+            info!(
+                "Skip loading of certificate '{}' for domain '{}' on listener '{}', the certificate is already present.",
+                fingerprint, add.certificate.names.join(", "), add.address
+            );
             return Ok(());
         }
 
