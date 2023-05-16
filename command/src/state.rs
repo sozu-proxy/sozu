@@ -1243,18 +1243,12 @@ impl ConfigState {
             .next()
     }
 
-    pub fn get_certificates_by_domain_name(
-        &self,
-        domain_name: String,
-    ) -> Vec<CertificateWithNames> {
+    pub fn get_certificates_by_domain_name(&self, domain_name: String) -> Vec<CertificateAndKey> {
         self.certificates
             .values()
             .flat_map(|hash_map| hash_map.values())
             .filter(|certificate_and_key| certificate_and_key.names.contains(&domain_name))
-            .map(|certificate_and_key| CertificateWithNames {
-                certificate: certificate_and_key.certificate.clone(),
-                names: certificate_and_key.names.clone(),
-            })
+            .map(|cert| cert.clone())
             .collect()
     }
 
