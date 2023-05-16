@@ -417,4 +417,30 @@ impl CommandManager {
         }
         Ok(())
     }
+
+    pub fn query_state_for_certificate(&mut self, domain: String) -> anyhow::Result<()> {
+        self.send_request(Request {
+            request_type: Some(RequestType::QueryCertificateByDomainInTheState(domain)),
+        })?;
+
+        loop {
+            let response = self.read_channel_message_with_timeout()?;
+
+            match response.status() {
+                ResponseStatus::Processing => {
+                    println!("Proxy is processing: {}", response.message);
+                }
+                ResponseStatus::Failure => {
+                    bail!("could not get certificate: {}", response.message);
+                }
+                ResponseStatus::Ok => {
+                    info!("We did get a response from the proxy");
+                    println!("response message: {:?}", response.message);
+                    println!("response content: {:#?}", response.content);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
 }

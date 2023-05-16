@@ -19,9 +19,9 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proto::command::{
         request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
-        ClusterHashes, ClusterInformations, FrontendFilters, MetricsConfiguration, Request,
-        Response, ResponseContent, ResponseStatus, ReturnListenSockets, RunState, SoftStop, Status,
-        WorkerInfo, WorkerInfos, WorkerResponses,
+        CertificatesMatchingADomainName, ClusterHashes, ClusterInformations, FrontendFilters,
+        MetricsConfiguration, Request, Response, ResponseContent, ResponseStatus,
+        ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
     },
     request::WorkerRequest,
     scm_socket::Listeners,
@@ -72,6 +72,9 @@ impl CommandServer {
                 self.reload_configuration(client_id, path).await
             }
             Some(RequestType::Status(_)) => self.status(client_id).await,
+            Some(RequestType::QueryCertificateByDomainInTheState(domain)) => {
+                self.query_certificate_by_domain_in_the_state(domain)
+            }
             Some(RequestType::QueryCertificateByFingerprint(_))
             | Some(RequestType::QueryCertificatesByDomain(_))
             | Some(RequestType::QueryAllCertificates(_))
@@ -93,6 +96,7 @@ impl CommandServer {
         match result {
             Ok(Some(success)) => {
                 info!("{}", success);
+                trace!("details success of the client request: {:?}", success);
                 return_success(self.command_tx.clone(), cloned_client_id, success).await;
             }
             Err(anyhow_error) => {
@@ -368,6 +372,23 @@ impl CommandServer {
 
         Ok(Some(Success::ListWorkers(
             ContentType::Workers(WorkerInfos { vec: workers }).into(),
+        )))
+    }
+
+    pub fn query_certificate_by_domain_in_the_state(
+        &self,
+        domain_name: String,
+    ) -> anyhow::Result<Option<Success>> {
+        info!(
+            "querying certificates in the state for domain {}",
+            domain_name
+        );
+
+        let certs = self.state.get_certificates_by_domain_name(domain_name);
+
+        Ok(Some(Success::CertificatesByDomainNameFromTheState(
+            ContentType::CertificatesMatchingADomainName(CertificatesMatchingADomainName { certs })
+                .into(),
         )))
     }
 
@@ -1336,9 +1357,9 @@ impl CommandServer {
                 let success_message = success.to_string();
 
                 let command_response_data = match success {
-                    // should list Success::Metrics(crd) as well
                     Success::ListFrontends(crd)
                     | Success::ListWorkers(crd)
+                    | Success::CertificatesByDomainNameFromTheState(crd)
                     | Success::Query(crd)
                     | Success::ListListeners(crd)
                     | Success::Status(crd) => Some(crd),
@@ -1425,7 +1446,7 @@ async fn return_success(
         client_id,
         advancement: Advancement::Ok(success),
     };
-    trace!("return_success: sending event to the command server");
+    trace!("return_success: sending event to the command server: {:?}", advancement);
     if let Err(e) = command_tx.send(advancement).await {
         error!("Error while returning success to the command server: {}", e)
     }
