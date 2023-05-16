@@ -1,11 +1,16 @@
 use anyhow::{self, bail, Context};
 use prettytable::Table;
 use serde::Serialize;
+use time::format_description;
+use x509_parser::time::ASN1Time;
 
-use sozu_command_lib::proto::command::{
-    request::RequestType, response_content::ContentType, ListWorkers, QueryAllCertificates,
-    QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions, Request, Response,
-    ResponseContent, ResponseStatus, RunState, UpgradeMain, WorkerInfo,
+use sozu_command_lib::proto::{
+    command::{
+        request::RequestType, response_content::ContentType, CertificateAndKey, ListWorkers,
+        QueryAllCertificates, QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions,
+        Request, Response, ResponseContent, ResponseStatus, RunState, UpgradeMain, WorkerInfo,
+    },
+    display::concatenate_vector,
 };
 
 use crate::ctl::{
@@ -435,13 +440,18 @@ impl CommandManager {
                 }
                 ResponseStatus::Ok => {
                     info!("We did get a response from the proxy");
-                    println!("response message: {:?}", response.message);
+                    println!("response message: {:?}\n", response.message);
                     if let Some(ResponseContent {
                         content_type: Some(ContentType::CertificatesMatchingADomainName(certs)),
                     }) = response.content
                     {
-                        for cert in certs.certs {
-                            println!("{}", cert);
+                        if certs.certs.is_empty() {
+                            bail!("No certificates match this domain name");
+                        }
+
+                        for (fingerprint, cert) in certs.certs {
+                            print_certificate_with_validity(fingerprint, cert)
+                                .with_context(|| "Could not show certificate")?;
                         }
                     }
                     break;
@@ -450,4 +460,39 @@ impl CommandManager {
         }
         Ok(())
     }
+}
+
+fn print_certificate_with_validity(
+    fingerprint: String,
+    cert: CertificateAndKey,
+) -> anyhow::Result<()> {
+    let (_unparsed, pem_certificate) =
+        x509_parser::pem::parse_x509_pem(cert.certificate.as_bytes())
+            .with_context(|| "Could not parse pem certificate")?;
+
+    let x509_certificate = pem_certificate
+        .parse_x509()
+        .with_context(|| "Could not parse x509 certificate")?;
+
+    let validity = x509_certificate.validity();
+
+    println!(
+        "{}\n\tfingerprint: {}\n\tNot Before: {}\n\tNot After:  {}\n\tTLS versions: {:?}\n",
+        concatenate_vector(&cert.names),
+        fingerprint,
+        format_datetime(validity.not_before)?,
+        format_datetime(validity.not_after)?,
+        cert.versions
+    );
+    Ok(())
+}
+
+// ISO 8601
+fn format_datetime(asn1_time: ASN1Time) -> anyhow::Result<String> {
+    let datetime = asn1_time.to_datetime();
+
+    let formatted = datetime
+        .format(&format_description::well_known::Iso8601::DEFAULT)
+        .with_context(|| "Could not format the datetime to ISO 8601")?;
+    Ok(formatted)
 }

@@ -656,8 +656,8 @@ pub fn print_certificates(
             }
             Some(ContentType::CertificateByFingerprint(cert)) => println!("{}", cert),
             Some(ContentType::CertificatesMatchingADomainName(certs)) => {
-                for cert in &certs.certs {
-                    println!("{}", cert);
+                for (fingerprint, cert) in &certs.certs {
+                    println!("\tfingerprint: {}\n\tcertificate: {}", fingerprint, cert);
                 }
             }
             _ => {}

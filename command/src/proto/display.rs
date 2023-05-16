@@ -33,7 +33,7 @@ impl Display for CertificateAndKey {
     }
 }
 
-fn concatenate_vector(vec: &Vec<String>) -> String {
+pub fn concatenate_vector(vec: &Vec<String>) -> String {
     let mut vec = vec.clone();
     let mut concatenated = match vec.pop() {
         Some(s) => s,
