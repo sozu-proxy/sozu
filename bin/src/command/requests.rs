@@ -1446,7 +1446,10 @@ async fn return_success(
         client_id,
         advancement: Advancement::Ok(success),
     };
-    trace!("return_success: sending event to the command server: {:?}", advancement);
+    trace!(
+        "return_success: sending event to the command server: {:?}",
+        advancement
+    );
     if let Err(e) = command_tx.send(advancement).await {
         error!("Error while returning success to the command server: {}", e)
     }

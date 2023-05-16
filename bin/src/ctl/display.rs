@@ -654,11 +654,11 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            Some(ContentType::CertificateByFingerprint(cert)) => {
-                println!(
-                    "\tfrontends: {:?}\ncertificate:\n{}",
-                    cert.names, cert.certificate
-                );
+            Some(ContentType::CertificateByFingerprint(cert)) => println!("{}", cert),
+            Some(ContentType::CertificatesMatchingADomainName(certs)) => {
+                for cert in &certs.certs {
+                    println!("{}", cert);
+                }
             }
             _ => {}
         }
