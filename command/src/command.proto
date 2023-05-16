@@ -320,7 +320,8 @@ message CertificateWithNames {
 // TODO: tidy this up
 // to reply to QueryCertificateByDomainInTheState
 message CertificatesMatchingADomainName {
-    repeated CertificateAndKey certs = 1;
+    // a map of fingerprint -> certificate_and_key
+    map<string, CertificateAndKey> certs = 1;
 }
 
 enum TlsVersion {

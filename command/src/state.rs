@@ -1243,12 +1243,15 @@ impl ConfigState {
             .next()
     }
 
-    pub fn get_certificates_by_domain_name(&self, domain_name: String) -> Vec<CertificateAndKey> {
+    pub fn get_certificates_by_domain_name(
+        &self,
+        domain_name: String,
+    ) -> BTreeMap<String, CertificateAndKey> {
         self.certificates
             .values()
-            .flat_map(|hash_map| hash_map.values())
-            .filter(|certificate_and_key| certificate_and_key.names.contains(&domain_name))
-            .map(|cert| cert.clone())
+            .flat_map(|hash_map| hash_map.iter())
+            .filter(|(_, cert)| cert.names.contains(&domain_name))
+            .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
             .collect()
     }
 
