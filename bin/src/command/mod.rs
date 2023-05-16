@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use sozu_command_lib::{
     config::Config,
     proto::command::{
-        request::RequestType, response_content::ContentType, CertificateWithNames,
-        MetricsConfiguration, Request, Response, ResponseContent, ResponseStatus, RunState, Status,
+        request::RequestType, response_content::ContentType, MetricsConfiguration, Request,
+        Response, ResponseContent, ResponseStatus, RunState, Status,
     },
     request::WorkerRequest,
     response::WorkerResponse,
