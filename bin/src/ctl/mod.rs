@@ -147,6 +147,9 @@ impl CommandManager {
                     old_fingerprint.as_deref(),
                     tls_versions,
                 ),
+                CertificateCmd::QueryTheState { domain } => {
+                    self.query_state_for_certificate(domain)
+                }
             },
             SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
             SubCmd::Events => self.events(),
