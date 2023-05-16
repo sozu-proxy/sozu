@@ -320,7 +320,7 @@ message CertificateWithNames {
 // TODO: tidy this up
 // to reply to QueryCertificateByDomainInTheState
 message CertificatesMatchingADomainName {
-    repeated CertificateWithNames certs = 1;
+    repeated CertificateAndKey certs = 1;
 }
 
 enum TlsVersion {

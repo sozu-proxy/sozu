@@ -436,7 +436,14 @@ impl CommandManager {
                 ResponseStatus::Ok => {
                     info!("We did get a response from the proxy");
                     println!("response message: {:?}", response.message);
-                    println!("response content: {:#?}", response.content);
+                    if let Some(ResponseContent {
+                        content_type: Some(ContentType::CertificatesMatchingADomainName(certs)),
+                    }) = response.content
+                    {
+                        for cert in certs.certs {
+                            println!("{}", cert);
+                        }
+                    }
                     break;
                 }
             }
