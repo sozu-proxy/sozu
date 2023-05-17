@@ -649,12 +649,12 @@ pub fn print_certificates(
     for (worker_id, response_content) in response_contents.iter() {
         println!("Worker {}", worker_id);
         match &response_content.content_type {
-            Some(ContentType::Certificates(list)) => {
+            Some(ContentType::CertificatesByAddress(list)) => {
                 for certs in list.certificates.iter() {
                     println!("\t{}:", certs.address);
 
                     for summary in certs.certificate_summaries.iter() {
-                        println!("\t\t{}:\t{}", summary.domain, summary.fingerprint);
+                        println!("\t\t{}", summary);
                     }
 
                     println!();
