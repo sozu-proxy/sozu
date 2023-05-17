@@ -14,15 +14,14 @@ use mio::{
 };
 use slab::Slab;
 use sozu_command::{
-    certificate::Fingerprint,
     channel::Channel,
     config::Config,
     proto::command::{
-        request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
-        CertificatesMatchingAFingerprint, Cluster, ClusterHashes, ClusterInformations,
-        DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, ResponseStatus,
-        TcpListenerConfig as CommandTcpListener,
+        request::RequestType, response_content::ContentType, ActivateListener, AddBackend, Cluster,
+        ClusterHashes, ClusterInformations, DeactivateListener, Event, HttpListenerConfig,
+        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadMetric,
+        MetricsConfiguration, RemoveBackend, ResponseStatus,
+        TcpListenerConfig as CommandTcpListener, CertificatesWithFingerprints,
     },
     ready::Ready,
     request::WorkerRequest,
@@ -926,9 +925,9 @@ impl Server {
                 let response = if certs.len() >= 1 {
                     WorkerResponse::ok_with_content(
                         message.id.clone(),
-                        ContentType::CertificatesMatchingAFingerprint(
-                            CertificatesMatchingAFingerprint { certs },
-                        )
+                        ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints {
+                            certs,
+                        })
                         .into(),
                     )
                 } else {

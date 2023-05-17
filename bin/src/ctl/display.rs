@@ -6,7 +6,7 @@ use prettytable::{Row, Table};
 use sozu_command_lib::proto::{
     command::{
         filtered_metrics, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
-        CertificateAndKey, CertificatesMatchingAFingerprint, ClusterMetrics, FilteredMetrics,
+        CertificateAndKey, CertificatesWithFingerprints, ClusterMetrics, FilteredMetrics,
         ListedFrontends, ListenersList, ResponseContent, WorkerInfos, WorkerMetrics,
     },
     display::concatenate_vector,
@@ -660,14 +660,10 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            Some(ContentType::CertificatesMatchingAFingerprint(
-                CertificatesMatchingAFingerprint { certs },
-            )) => print_certificates_with_validity(certs.clone())?,
-            Some(ContentType::CertificatesMatchingADomainName(certs)) => {
-                for (fingerprint, cert) in &certs.certs {
-                    println!("\tfingerprint: {}\n\tcertificate: {}", fingerprint, cert);
-                }
-            }
+            Some(ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints {
+                certs,
+            })) => print_certificates_with_validity(certs.clone())?,
+
             _ => {}
         }
         println!();
