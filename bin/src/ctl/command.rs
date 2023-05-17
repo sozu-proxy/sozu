@@ -11,7 +11,7 @@ use sozu_command_lib::proto::command::{
 use crate::ctl::{
     create_channel,
     display::{
-        print_available_metrics, print_certificates, print_certificates_with_validity,
+        print_available_metrics, print_certificates_by_worker, print_certificates_with_validity,
         print_frontend_list, print_json_response, print_listeners, print_metrics,
         print_query_response_data, print_status,
     },
@@ -361,8 +361,22 @@ impl CommandManager {
         Ok(())
     }
 
-    // This queries all workers for certificates
     pub fn query_certificates(
+        &mut self,
+        json: bool,
+        fingerprint: Option<String>,
+        domain: Option<String>,
+        query_workers: bool,
+    ) -> Result<(), anyhow::Error> {
+        if query_workers {
+            self.query_certificates_from_workers(json, fingerprint, domain)
+        } else {
+            self.query_certificates_from_the_state(fingerprint, domain)
+        }
+    }
+
+    // This queries all workers for certificates
+    fn query_certificates_from_workers(
         &mut self,
         json: bool,
         fingerprint: Option<String>,
@@ -374,7 +388,7 @@ impl CommandManager {
             },
             (Some(f), None) => match hex::decode(&f) {
                 Err(e) => {
-                    bail!("invalid fingerprint: {:?}", e);
+                    bail!("invalid fingerprint {}: {:?}", f, e);
                 }
                 Ok(_) => Request {
                     request_type: Some(RequestType::QueryCertificateByFingerprint(f)),
@@ -410,7 +424,7 @@ impl CommandManager {
                     match response.content {
                         Some(ResponseContent {
                             content_type: Some(ContentType::WorkerResponses(worker_responses)),
-                        }) => print_certificates(worker_responses.map, json)?,
+                        }) => print_certificates_by_worker(worker_responses.map, json)?,
                         _ => bail!("unexpected response: {:?}", response.content),
                     }
                     break;
@@ -421,10 +435,10 @@ impl CommandManager {
     }
 
     // This queries only the state
-    pub fn query_state_for_certificate(
+    fn query_certificates_from_the_state(
         &mut self,
-        domain: Option<String>,
         fingerprint: Option<String>,
+        domain: Option<String>,
     ) -> anyhow::Result<()> {
         let request = match (domain, fingerprint) {
             (Some(domain), _) => Request {
@@ -432,10 +446,12 @@ impl CommandManager {
             },
             (_, Some(fingerprint)) => match hex::decode(&fingerprint) {
                 Err(e) => {
-                    bail!("invalid fingerprint: {:?}", e);
+                    bail!("invalid fingerprint {}: {:?}", fingerprint, e);
                 }
                 Ok(_) => Request {
-                    request_type: Some(RequestType::QueryCertificateByFingerprint(fingerprint)),
+                    request_type: Some(RequestType::QueryCertificateByFingerprintInTheState(
+                        fingerprint,
+                    )),
                 },
             },
             (_, _) => Request {

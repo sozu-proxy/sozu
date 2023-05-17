@@ -104,10 +104,6 @@ impl CommandManager {
                 ListenerCmd::List => self.list_listeners(),
             },
             SubCmd::Certificate { cmd, json } => match cmd {
-                CertificateCmd::Get {
-                    fingerprint,
-                    domain,
-                } => self.query_certificates(json, fingerprint, domain),
                 CertificateCmd::Add {
                     certificate,
                     chain,
@@ -147,10 +143,11 @@ impl CommandManager {
                     old_fingerprint.as_deref(),
                     tls_versions,
                 ),
-                CertificateCmd::QueryTheState {
-                    domain,
+                CertificateCmd::Get {
                     fingerprint,
-                } => self.query_state_for_certificate(domain, fingerprint),
+                    domain,
+                    query_workers,
+                } => self.query_certificates(json, fingerprint, domain, query_workers),
             },
             SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
             SubCmd::Events => self.events(),

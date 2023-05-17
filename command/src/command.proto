@@ -449,8 +449,8 @@ message ResponseContent {
         ClusterInformations clusters = 9;
         // collection of hashes of cluster information, 
         ClusterHashes cluster_hashes = 10;
-        // a list of certificates, sorted by socket address, returned by workers
-        ListOfCertificatesByAddress certificates = 11;
+        // a list of certificates summaries, grouped by socket address
+        ListOfCertificatesByAddress certificates_by_address = 11;
         // a map of complete certificates using fingerprints as key
         CertificatesWithFingerprints certificates_with_fingerprints = 12;
     }

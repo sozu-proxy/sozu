@@ -970,7 +970,7 @@ impl HttpsProxy {
         );
 
         Ok(Some(
-            ContentType::Certificates(ListOfCertificatesByAddress { certificates }).into(),
+            ContentType::CertificatesByAddress(ListOfCertificatesByAddress { certificates }).into(),
         ))
     }
 
@@ -1005,7 +1005,7 @@ impl HttpsProxy {
         );
 
         Ok(Some(
-            ContentType::Certificates(ListOfCertificatesByAddress { certificates }).into(),
+            ContentType::CertificatesByAddress(ListOfCertificatesByAddress { certificates }).into(),
         ))
     }
 
