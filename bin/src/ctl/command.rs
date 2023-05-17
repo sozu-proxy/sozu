@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use sozu_command_lib::proto::command::{
     request::RequestType, response_content::ContentType, ListWorkers, QueryAllCertificates,
-    QueryAllCertificatesInTheState, QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions,
+    QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions,
     Request, Response, ResponseContent, ResponseStatus, RunState, UpgradeMain, WorkerInfo,
 };
 
@@ -371,7 +371,10 @@ impl CommandManager {
         if query_workers {
             self.query_certificates_from_workers(json, fingerprint, domain)
         } else {
-            self.query_certificates_from_the_state(fingerprint, domain)
+            self.query_certificates_from_the_state(QueryCertificatesFilters {
+                domain,
+                fingerprint,
+            })
         }
     }
 
@@ -437,30 +440,11 @@ impl CommandManager {
     // This queries only the state
     fn query_certificates_from_the_state(
         &mut self,
-        fingerprint: Option<String>,
-        domain: Option<String>,
+        filters: QueryCertificatesFilters,
     ) -> anyhow::Result<()> {
-        let request = match (domain, fingerprint) {
-            (Some(domain), _) => Request {
-                request_type: Some(RequestType::QueryCertificateByDomainInTheState(domain)),
-            },
-            (_, Some(fingerprint)) => match hex::decode(&fingerprint) {
-                Err(e) => {
-                    bail!("invalid fingerprint {}: {:?}", fingerprint, e);
-                }
-                Ok(_) => Request {
-                    request_type: Some(RequestType::QueryCertificateByFingerprintInTheState(
-                        fingerprint,
-                    )),
-                },
-            },
-            (_, _) => Request {
-                request_type: Some(RequestType::QueryAllCertificatesInTheState(
-                    QueryAllCertificatesInTheState {},
-                )),
-            },
-        };
-        self.send_request(request)?;
+        self.send_request(Request {
+            request_type: Some(RequestType::QueryCertificatesFromTheState(filters)),
+        })?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;

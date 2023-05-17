@@ -2,7 +2,7 @@ use std::fmt::{Display, Formatter};
 
 use crate::proto::command::TlsVersion;
 
-use super::command::{CertificateAndKey, CertificateSummary};
+use super::command::{CertificateAndKey, CertificateSummary, QueryCertificatesFilters};
 
 impl Display for CertificateAndKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -25,6 +25,18 @@ impl Display for CertificateAndKey {
 impl Display for CertificateSummary {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:\t{}", self.fingerprint, self.domain)
+    }
+}
+
+impl Display for QueryCertificatesFilters {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if let Some(d) = self.domain.clone() {
+            write!(f, "domain:{}", d)
+        } else if let Some(fp) = self.fingerprint.clone() {
+            write!(f, "domain:{}", fp)
+        } else {
+            write!(f, "all certificates")
+        }
     }
 }
 
