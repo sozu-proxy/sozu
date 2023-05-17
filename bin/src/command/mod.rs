@@ -84,9 +84,7 @@ pub enum Advancement {
 /// in which case Success caries the response data.
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Success {
-    AllCertificatesInTheState(ResponseContent),
-    CertificatesByDomainNameFromTheState(ResponseContent),
-    CertificatesByFingerprintFromTheState(ResponseContent),
+    CertificatesFromTheState(ResponseContent),
     ClientClose(String), // the client id
     ClientNew(String),   // the client id
     HandledClientRequest,
@@ -121,10 +119,8 @@ pub enum Success {
 impl std::fmt::Display for Success {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::AllCertificatesInTheState(_)
-            | Self::CertificatesByDomainNameFromTheState(_)
-            | Self::CertificatesByFingerprintFromTheState(_) => {
-                write!(f, "Successfully queried certificates in the state",)
+            Self::CertificatesFromTheState(_) => {
+                write!(f, "Successfully queried certificates from the state")
             }
             Self::ClientClose(id) => write!(f, "Close client: {id}"),
             Self::ClientNew(id) => write!(f, "New client successfully added: {id}"),

@@ -20,8 +20,8 @@ use sozu_command::{
         request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
         CertificatesWithFingerprints, Cluster, ClusterHashes, ClusterInformations,
         DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, ResponseStatus,
-        TcpListenerConfig as CommandTcpListener,
+        LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, QueryCertificatesFilters,
+        RemoveBackend, ResponseStatus, TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
     request::WorkerRequest,
@@ -921,7 +921,10 @@ impl Server {
             Some(RequestType::QueryCertificateByFingerprint(f)) => {
                 let certs = self
                     .config_state
-                    .get_certificate_by_fingerprint(f.to_string());
+                    .get_certificates(QueryCertificatesFilters {
+                        domain: None,
+                        fingerprint: Some(f.to_string()),
+                    });
                 let response = if certs.len() >= 1 {
                     WorkerResponse::ok_with_content(
                         message.id.clone(),

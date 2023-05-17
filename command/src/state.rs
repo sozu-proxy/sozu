@@ -15,9 +15,9 @@ use crate::{
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
         Cluster, ClusterInformation, DeactivateListener, FrontendFilters, HttpListenerConfig,
-        HttpsListenerConfig, ListedFrontends, ListenerType, ListenersList, PathRule, RemoveBackend,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend,
-        RequestTcpFrontend, TcpListenerConfig,
+        HttpsListenerConfig, ListedFrontends, ListenerType, ListenersList, PathRule,
+        QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, Request, RequestHttpFrontend, RequestTcpFrontend, TcpListenerConfig,
     },
     response::{Backend, HttpFrontend, TcpFrontend},
 };
@@ -1229,36 +1229,31 @@ impl ConfigState {
         cluster_ids
     }
 
-    pub fn get_certificate_by_fingerprint(
+    pub fn get_certificates(
         &self,
-        fingerprint_to_find: String,
+        filters: QueryCertificatesFilters,
     ) -> BTreeMap<String, CertificateAndKey> {
-        self.certificates
-            .values()
-            .flat_map(|hash_map| hash_map.iter())
-            .filter(|(fingerprint, _cert)| fingerprint.to_string() == fingerprint_to_find)
-            .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
-            .collect()
-    }
-
-    pub fn get_all_certificates(&self) -> BTreeMap<String, CertificateAndKey> {
-        self.certificates
-            .values()
-            .flat_map(|hash_map| hash_map.iter())
-            .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
-            .collect()
-    }
-
-    pub fn get_certificates_by_domain_name(
-        &self,
-        domain_name: String,
-    ) -> BTreeMap<String, CertificateAndKey> {
-        self.certificates
-            .values()
-            .flat_map(|hash_map| hash_map.iter())
-            .filter(|(_, cert)| cert.names.contains(&domain_name))
-            .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
-            .collect()
+        if let Some(domain) = filters.domain {
+            self.certificates
+                .values()
+                .flat_map(|hash_map| hash_map.iter())
+                .filter(|(_, cert)| cert.names.contains(&domain))
+                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
+                .collect()
+        } else if let Some(f) = filters.fingerprint {
+            self.certificates
+                .values()
+                .flat_map(|hash_map| hash_map.iter())
+                .filter(|(fingerprint, _cert)| fingerprint.to_string() == f)
+                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
+                .collect()
+        } else {
+            self.certificates
+                .values()
+                .flat_map(|hash_map| hash_map.iter())
+                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
+                .collect()
+        }
     }
 
     pub fn list_frontends(&self, filters: FrontendFilters) -> ListedFrontends {
@@ -2005,13 +2000,17 @@ mod tests {
 
         println!("state: {:#?}", state);
 
-        let fingerprint: Fingerprint = serde_json::from_str(
-            "\"ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5\"",
-        )
-        .expect("Could not deserialize the fingerprint");
+        // let fingerprint: Fingerprint = serde_json::from_str(
+        //     "\"ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5\"",
+        // )
+        // .expect("Could not deserialize the fingerprint");
 
-        let certificates_found_by_fingerprint =
-            state.get_certificate_by_fingerprint(fingerprint.to_string());
+        let certificates_found_by_fingerprint = state.get_certificates(QueryCertificatesFilters {
+            domain: None,
+            fingerprint: Some(
+                "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5".to_string(),
+            ),
+        });
 
         println!(
             "found certificate: {:#?}",
@@ -2020,8 +2019,10 @@ mod tests {
 
         assert!(certificates_found_by_fingerprint.len() >= 1);
 
-        let certificate_found_by_domain_name =
-            state.get_certificates_by_domain_name("lolcatho.st".to_string());
+        let certificate_found_by_domain_name = state.get_certificates(QueryCertificatesFilters {
+            domain: Some("lolcatho.st".to_string()),
+            fingerprint: None,
+        });
 
         assert!(certificate_found_by_domain_name.len() >= 1);
     }

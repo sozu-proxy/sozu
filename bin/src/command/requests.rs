@@ -20,8 +20,9 @@ use sozu_command_lib::{
     proto::command::{
         request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
         CertificatesWithFingerprints, ClusterHashes, ClusterInformations, FrontendFilters,
-        MetricsConfiguration, Request, Response, ResponseContent, ResponseStatus,
-        ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
+        MetricsConfiguration, QueryCertificatesFilters, Request, Response, ResponseContent,
+        ResponseStatus, ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos,
+        WorkerResponses,
     },
     request::WorkerRequest,
     scm_socket::Listeners,
@@ -72,14 +73,8 @@ impl CommandServer {
                 self.reload_configuration(client_id, path).await
             }
             Some(RequestType::Status(_)) => self.status(client_id).await,
-            Some(RequestType::QueryCertificateByDomainInTheState(domain)) => {
-                self.query_certificate_by_domain_in_the_state(domain)
-            }
-            Some(RequestType::QueryCertificateByFingerprintInTheState(domain)) => {
-                self.query_certificate_by_fingerprint_in_the_state(domain)
-            }
-            Some(RequestType::QueryAllCertificatesInTheState(_)) => {
-                self.query_all_certificates_in_the_state()
+            Some(RequestType::QueryCertificatesFromTheState(filters)) => {
+                self.query_certificates_from_the_state(filters)
             }
             Some(RequestType::QueryCertificateByFingerprint(_))
             | Some(RequestType::QueryCertificatesByDomain(_))
@@ -381,39 +376,18 @@ impl CommandServer {
         )))
     }
 
-    pub fn query_certificate_by_domain_in_the_state(
+    pub fn query_certificates_from_the_state(
         &self,
-        domain_name: String,
+        filters: QueryCertificatesFilters,
     ) -> anyhow::Result<Option<Success>> {
-        info!(
-            "querying certificates in the state for domain {}",
-            domain_name
+        debug!(
+            "querying certificates in the state with filters {}",
+            filters
         );
 
-        let certs = self.state.get_certificates_by_domain_name(domain_name);
+        let certs = self.state.get_certificates(filters);
 
-        Ok(Some(Success::CertificatesByDomainNameFromTheState(
-            ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints { certs })
-                .into(),
-        )))
-    }
-
-    pub fn query_certificate_by_fingerprint_in_the_state(
-        &self,
-        fingerprint: String,
-    ) -> anyhow::Result<Option<Success>> {
-        let certs = self.state.get_certificate_by_fingerprint(fingerprint);
-
-        Ok(Some(Success::CertificatesByFingerprintFromTheState(
-            ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints { certs })
-                .into(),
-        )))
-    }
-
-    pub fn query_all_certificates_in_the_state(&self) -> anyhow::Result<Option<Success>> {
-        let certs = self.state.get_all_certificates();
-
-        Ok(Some(Success::AllCertificatesInTheState(
+        Ok(Some(Success::CertificatesFromTheState(
             ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints { certs })
                 .into(),
         )))
@@ -1386,9 +1360,7 @@ impl CommandServer {
                 let command_response_data = match success {
                     Success::ListFrontends(crd)
                     | Success::ListWorkers(crd)
-                    | Success::CertificatesByDomainNameFromTheState(crd)
-                    | Success::CertificatesByFingerprintFromTheState(crd)
-                    | Success::AllCertificatesInTheState(crd)
+                    | Success::CertificatesFromTheState(crd)
                     | Success::Query(crd)
                     | Success::ListListeners(crd)
                     | Success::Status(crd) => Some(crd),
