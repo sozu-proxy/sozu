@@ -18,10 +18,10 @@ use sozu_command::{
     channel::Channel,
     config::Config,
     proto::command::{
-        request::RequestType, response_content::ContentType, ActivateListener, AddBackend, Cluster,
-        ClusterHashes, ClusterInformations, DeactivateListener, Event, HttpListenerConfig,
-        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadMetric,
-        MetricsConfiguration, RemoveBackend, ResponseStatus,
+        request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
+        CertificatesMatchingAFingerprint, Cluster, ClusterHashes, ClusterInformations,
+        DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, ListenerType,
+        LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, ResponseStatus,
         TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
@@ -920,18 +920,22 @@ impl Server {
                 return;
             }
             Some(RequestType::QueryCertificateByFingerprint(f)) => {
-                let response = match self.config_state.get_certificate_by_fingerprint(f) {
-                    Some(cert) => WorkerResponse::ok_with_content(
+                let certs = self
+                    .config_state
+                    .get_certificate_by_fingerprint(f.to_string());
+                let response = if certs.len() >= 1 {
+                    WorkerResponse::ok_with_content(
                         message.id.clone(),
-                        ContentType::CertificateByFingerprint(cert).into(),
-                    ),
-                    None => WorkerResponse::error(
+                        ContentType::CertificatesMatchingAFingerprint(
+                            CertificatesMatchingAFingerprint { certs },
+                        )
+                        .into(),
+                    )
+                } else {
+                    WorkerResponse::error(
                         message.id.clone(),
-                        format!(
-                            "Could not find certificate for fingerprint {}",
-                            Fingerprint(f.to_vec())
-                        ),
-                    ),
+                        format!("Could not find certificate for fingerprint {}", f),
+                    )
                 };
                 push_queue(response);
                 return;

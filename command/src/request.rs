@@ -77,6 +77,7 @@ impl Request {
             // These won't ever reach a worker anyway
             RequestType::SaveState(_)
             | RequestType::QueryCertificateByDomainInTheState(_)
+            | RequestType::QueryCertificateByFingerprintInTheState(_)
             | RequestType::QueryAllCertificatesInTheState(_)
             | RequestType::LoadState(_)
             | RequestType::ListWorkers(_)

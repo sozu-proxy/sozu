@@ -3,11 +3,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
-use sozu_command_lib::proto::command::{
-    filtered_metrics, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
-    ClusterMetrics, FilteredMetrics, ListedFrontends, ListenersList, ResponseContent, WorkerInfos,
-    WorkerMetrics,
+use sozu_command_lib::proto::{
+    command::{
+        filtered_metrics, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
+        CertificateAndKey, CertificatesMatchingAFingerprint, ClusterMetrics, FilteredMetrics,
+        ListedFrontends, ListenersList, ResponseContent, WorkerInfos, WorkerMetrics,
+    },
+    display::concatenate_vector,
 };
+use time::format_description;
+use x509_parser::time::ASN1Time;
 
 pub fn print_listeners(listeners_list: ListenersList) {
     println!("\nHTTP LISTENERS\n================");
@@ -641,7 +646,8 @@ pub fn print_certificates(
         return Ok(());
     }
 
-    for (_worker_id, response_content) in response_contents.iter() {
+    for (worker_id, response_content) in response_contents.iter() {
+        println!("Worker {}", worker_id);
         match &response_content.content_type {
             Some(ContentType::Certificates(list)) => {
                 for certs in list.certificates.iter() {
@@ -654,7 +660,9 @@ pub fn print_certificates(
                     println!();
                 }
             }
-            Some(ContentType::CertificateByFingerprint(cert)) => println!("{}", cert),
+            Some(ContentType::CertificatesMatchingAFingerprint(
+                CertificatesMatchingAFingerprint { certs },
+            )) => print_certificates_with_validity(certs.clone())?,
             Some(ContentType::CertificatesMatchingADomainName(certs)) => {
                 for (fingerprint, cert) in &certs.certs {
                     println!("\tfingerprint: {}\n\tcertificate: {}", fingerprint, cert);
@@ -693,4 +701,49 @@ fn list_string_vec(vec: &[String]) -> String {
         output.push('\n');
     }
     output
+}
+
+pub fn print_certificates_with_validity(
+    certs: BTreeMap<String, CertificateAndKey>,
+) -> anyhow::Result<()> {
+    let mut table = Table::new();
+    table.set_format(*prettytable::format::consts::FORMAT_CLEAN);
+    table.add_row(row![
+        "fingeprint",
+        "valid not before",
+        "valide not after",
+        "domain names",
+    ]);
+
+    for (fingerprint, cert) in certs {
+        let (_unparsed, pem_certificate) =
+            x509_parser::pem::parse_x509_pem(cert.certificate.as_bytes())
+                .with_context(|| "Could not parse pem certificate")?;
+
+        let x509_certificate = pem_certificate
+            .parse_x509()
+            .with_context(|| "Could not parse x509 certificate")?;
+
+        let validity = x509_certificate.validity();
+
+        table.add_row(row!(
+            fingerprint,
+            format_datetime(validity.not_before)?,
+            format_datetime(validity.not_after)?,
+            concatenate_vector(&cert.names),
+        ));
+    }
+    table.printstd();
+
+    Ok(())
+}
+
+// ISO 8601
+fn format_datetime(asn1_time: ASN1Time) -> anyhow::Result<String> {
+    let datetime = asn1_time.to_datetime();
+
+    let formatted = datetime
+        .format(&format_description::well_known::Iso8601::DEFAULT)
+        .with_context(|| "Could not format the datetime to ISO 8601")?;
+    Ok(formatted)
 }
