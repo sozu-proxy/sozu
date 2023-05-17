@@ -305,6 +305,7 @@ message CertificateSummary {
     required string fingerprint = 2;
 }
 
+// Used by workers to reply to some certificate queries
 message ListOfCertificatesByAddress {
     repeated CertificatesByAddress certificates = 1;
 }
@@ -323,25 +324,11 @@ message CertificateWithNames {
     repeated string names = 2;
 }
 
-// TODO: tidy this up
-// to reply to QueryCertificateByDomainInTheState
-message CertificatesMatchingADomainName {
+// to reply to several certificate queries
+message CertificatesWithFingerprints {
     // a map of fingerprint -> certificate_and_key
     map<string, CertificateAndKey> certs = 1;
 }
-
-// to reply to QueryAllCertificatesInTheState
-message AllCertificatesInTheState {
-    // a map of fingerprint -> certificate_and_key
-    map<string, CertificateAndKey> certs = 1;
-}
-
-// to reply to QueryCertificateByFingerprintInTheState
-message CertificatesMatchingAFingerprint {
-    // a map of fingerprint -> certificate_and_key
-    map<string, CertificateAndKey> certs = 1;
-}
-
 
 enum TlsVersion {
     SSL_V2 = 0;
@@ -471,17 +458,10 @@ message ResponseContent {
         ClusterInformations clusters = 9;
         // collection of hashes of cluster information, 
         ClusterHashes cluster_hashes = 10;
-        // a list of certificates for each socket address
+        // a list of certificates, sorted by socket address, returned by workers
         ListOfCertificatesByAddress certificates = 11;
-        // returns the certificate matching a request by fingerprint,
-        // and the list of domain names associated
-        CertificatesMatchingAFingerprint certificate_by_fingerprint = 12;
-        // to reply to QueryCertificateByDomainInTheState
-        CertificatesMatchingADomainName certificates_matching_a_domain_name = 13;
-        // to reply to QueryAllCertificatesInTheState
-        AllCertificatesInTheState all_certificates_in_the_state = 14;
-        // to reply to QueryCertificateByFingerprintInTheState
-        CertificatesMatchingAFingerprint certificates_matching_a_fingerprint = 15;
+        // a map of complete certificates using fingerprints as key
+        CertificatesWithFingerprints certificates_with_fingerprints = 12;
     }
 }
 

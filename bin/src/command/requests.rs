@@ -18,9 +18,8 @@ use sozu_command_lib::{
     logging,
     parser::parse_several_commands,
     proto::command::{
-        request::RequestType, response_content::ContentType, AggregatedMetrics,
-        AllCertificatesInTheState, AvailableMetrics, CertificatesMatchingADomainName,
-        CertificatesMatchingAFingerprint, ClusterHashes, ClusterInformations, FrontendFilters,
+        request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
+        CertificatesWithFingerprints, ClusterHashes, ClusterInformations, FrontendFilters,
         MetricsConfiguration, Request, Response, ResponseContent, ResponseStatus,
         ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
     },
@@ -394,7 +393,7 @@ impl CommandServer {
         let certs = self.state.get_certificates_by_domain_name(domain_name);
 
         Ok(Some(Success::CertificatesByDomainNameFromTheState(
-            ContentType::CertificatesMatchingADomainName(CertificatesMatchingADomainName { certs })
+            ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints { certs })
                 .into(),
         )))
     }
@@ -406,10 +405,8 @@ impl CommandServer {
         let certs = self.state.get_certificate_by_fingerprint(fingerprint);
 
         Ok(Some(Success::CertificatesByFingerprintFromTheState(
-            ContentType::CertificatesMatchingAFingerprint(CertificatesMatchingAFingerprint {
-                certs,
-            })
-            .into(),
+            ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints { certs })
+                .into(),
         )))
     }
 
@@ -417,7 +414,8 @@ impl CommandServer {
         let certs = self.state.get_all_certificates();
 
         Ok(Some(Success::AllCertificatesInTheState(
-            ContentType::AllCertificatesInTheState(AllCertificatesInTheState { certs }).into(),
+            ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints { certs })
+                .into(),
         )))
     }
 

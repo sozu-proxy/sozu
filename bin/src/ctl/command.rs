@@ -462,10 +462,7 @@ impl CommandManager {
 
                     if let Some(response_content) = response.content {
                         let certs = match response_content.content_type {
-                            Some(ContentType::CertificatesMatchingADomainName(certs)) => {
-                                certs.certs
-                            }
-                            Some(ContentType::AllCertificatesInTheState(certs)) => certs.certs,
+                            Some(ContentType::CertificatesWithFingerprints(certs)) => certs.certs,
                             _ => bail!(format!("Wrong response content {:?}", response_content)),
                         };
                         if certs.is_empty() {
