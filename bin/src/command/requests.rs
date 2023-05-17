@@ -76,10 +76,8 @@ impl CommandServer {
             Some(RequestType::QueryCertificatesFromTheState(filters)) => {
                 self.query_certificates_from_the_state(filters)
             }
-            Some(RequestType::QueryCertificateByFingerprint(_))
-            | Some(RequestType::QueryCertificatesByDomain(_))
-            | Some(RequestType::QueryAllCertificates(_))
-            | Some(RequestType::QueryClusterById(_))
+            Some(RequestType::QueryClusterById(_))
+            | Some(RequestType::QueryCertificatesFromWorkers(_))
             | Some(RequestType::QueryClustersByDomain(_))
             | Some(RequestType::QueryClustersHashes(_))
             | Some(RequestType::QueryMetrics(_)) => self.query(client_id, request).await,
@@ -1117,17 +1115,19 @@ impl CommandServer {
                 &Some(RequestType::QueryClustersHashes(_))
                 | &Some(RequestType::QueryClusterById(_))
                 | &Some(RequestType::QueryClustersByDomain(_)) => {
-                    let main = main_response_content.unwrap(); // we should refactor to avoid this unwrap()
-                    worker_responses.insert(String::from("main"), main);
+                    if let Some(main_response) = main_response_content {
+                        worker_responses.insert(String::from("main"), main_response);
+                    }
                     ContentType::WorkerResponses(WorkerResponses {
                         map: worker_responses,
                     })
                     .into()
                 }
-                &Some(RequestType::QueryCertificatesByDomain(_))
-                | &Some(RequestType::QueryCertificateByFingerprint(_))
-                | &Some(RequestType::QueryAllCertificates(_)) => {
-                    info!("certificates query answer received: {:?}", worker_responses);
+                &Some(RequestType::QueryCertificatesFromWorkers(_)) => {
+                    info!(
+                        "Received a response to the certificates query: {:?}",
+                        worker_responses
+                    );
                     ContentType::WorkerResponses(WorkerResponses {
                         map: worker_responses,
                     })

@@ -71,12 +71,6 @@ message Request {
     ActivateListener activate_listener = 30;
     // deactivate a listener
     DeactivateListener deactivate_listener = 31;
-    // query all certificates
-    QueryAllCertificates query_all_certificates = 32;
-    // query a certificate by fingerprint
-    string query_certificate_by_fingerprint = 33;
-    // query certificates by domain
-    string query_certificates_by_domain = 34;
     // query a cluster by id
     string query_cluster_by_id = 35;
     // query clusters with a hostname and optional path
@@ -97,6 +91,8 @@ message Request {
     ReturnListenSockets return_listen_sockets = 43;
     // Get certificates from the state (rather than from the workers)
     QueryCertificatesFilters query_certificates_from_the_state = 44;
+    // Get certificates from the workers (rather than from the state)
+    QueryCertificatesFilters query_certificates_from_workers = 45;
   }
 }
 
@@ -105,12 +101,10 @@ message ListListeners {}
 message UpgradeMain {}
 message SubscribeEvents {}
 message Status {}
-message QueryAllCertificates {}
 message QueryClustersHashes {}
 message SoftStop {}
 message HardStop {}
 message ReturnListenSockets {}
-message QueryAllCertificatesInTheState {}
 
 // details of an HTTP listener
 message HttpListenerConfig {
@@ -315,6 +309,7 @@ message ListOfCertificatesByAddress {
     repeated CertificatesByAddress certificates = 1;
 }
 
+// Summaries of certificates for a given address
 message CertificatesByAddress {
     required string address = 1;
     repeated CertificateSummary certificate_summaries = 2;
