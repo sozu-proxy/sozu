@@ -1,26 +1,19 @@
-use std::collections::BTreeMap;
-
 use anyhow::{self, bail, Context};
 use prettytable::Table;
 use serde::Serialize;
-use time::format_description;
-use x509_parser::time::ASN1Time;
 
-use sozu_command_lib::proto::{
-    command::{
-        request::RequestType, response_content::ContentType, CertificateAndKey, ListWorkers,
-        QueryAllCertificates, QueryAllCertificatesInTheState, QueryClusterByDomain,
-        QueryClustersHashes, QueryMetricsOptions, Request, Response, ResponseContent,
-        ResponseStatus, RunState, UpgradeMain, WorkerInfo,
-    },
-    display::concatenate_vector,
+use sozu_command_lib::proto::command::{
+    request::RequestType, response_content::ContentType, ListWorkers, QueryAllCertificates,
+    QueryAllCertificatesInTheState, QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions,
+    Request, Response, ResponseContent, ResponseStatus, RunState, UpgradeMain, WorkerInfo,
 };
 
 use crate::ctl::{
     create_channel,
     display::{
-        print_available_metrics, print_certificates, print_frontend_list, print_json_response,
-        print_listeners, print_metrics, print_query_response_data, print_status,
+        print_available_metrics, print_certificates, print_certificates_with_validity,
+        print_frontend_list, print_json_response, print_listeners, print_metrics,
+        print_query_response_data, print_status,
     },
     CommandManager,
 };
@@ -368,6 +361,7 @@ impl CommandManager {
         Ok(())
     }
 
+    // This queries all workers for certificates
     pub fn query_certificates(
         &mut self,
         json: bool,
@@ -378,11 +372,11 @@ impl CommandManager {
             (None, None) => Request {
                 request_type: Some(RequestType::QueryAllCertificates(QueryAllCertificates {})),
             },
-            (Some(f), None) => match hex::decode(f) {
+            (Some(f), None) => match hex::decode(&f) {
                 Err(e) => {
                     bail!("invalid fingerprint: {:?}", e);
                 }
-                Ok(f) => Request {
+                Ok(_) => Request {
                     request_type: Some(RequestType::QueryCertificateByFingerprint(f)),
                 },
             },
@@ -426,12 +420,25 @@ impl CommandManager {
         Ok(())
     }
 
-    pub fn query_state_for_certificate(&mut self, domain: Option<String>) -> anyhow::Result<()> {
-        let request = match domain {
-            Some(domain) => Request {
+    // This queries only the state
+    pub fn query_state_for_certificate(
+        &mut self,
+        domain: Option<String>,
+        fingerprint: Option<String>,
+    ) -> anyhow::Result<()> {
+        let request = match (domain, fingerprint) {
+            (Some(domain), _) => Request {
                 request_type: Some(RequestType::QueryCertificateByDomainInTheState(domain)),
             },
-            None => Request {
+            (_, Some(fingerprint)) => match hex::decode(&fingerprint) {
+                Err(e) => {
+                    bail!("invalid fingerprint: {:?}", e);
+                }
+                Ok(_) => Request {
+                    request_type: Some(RequestType::QueryCertificateByFingerprint(fingerprint)),
+                },
+            },
+            (_, _) => Request {
                 request_type: Some(RequestType::QueryAllCertificatesInTheState(
                     QueryAllCertificatesInTheState {},
                 )),
@@ -477,49 +484,4 @@ impl CommandManager {
         }
         Ok(())
     }
-}
-
-fn print_certificates_with_validity(
-    certs: BTreeMap<String, CertificateAndKey>,
-) -> anyhow::Result<()> {
-    let mut table = Table::new();
-    table.set_format(*prettytable::format::consts::FORMAT_CLEAN);
-    table.add_row(row![
-        "fingeprint",
-        "valid not before",
-        "valide not after",
-        "domain names",
-    ]);
-
-    for (fingerprint, cert) in certs {
-        let (_unparsed, pem_certificate) =
-            x509_parser::pem::parse_x509_pem(cert.certificate.as_bytes())
-                .with_context(|| "Could not parse pem certificate")?;
-
-        let x509_certificate = pem_certificate
-            .parse_x509()
-            .with_context(|| "Could not parse x509 certificate")?;
-
-        let validity = x509_certificate.validity();
-
-        table.add_row(row!(
-            fingerprint,
-            format_datetime(validity.not_before)?,
-            format_datetime(validity.not_after)?,
-            concatenate_vector(&cert.names),
-        ));
-    }
-    table.printstd();
-
-    Ok(())
-}
-
-// ISO 8601
-fn format_datetime(asn1_time: ASN1Time) -> anyhow::Result<String> {
-    let datetime = asn1_time.to_datetime();
-
-    let formatted = datetime
-        .format(&format_description::well_known::Iso8601::DEFAULT)
-        .with_context(|| "Could not format the datetime to ISO 8601")?;
-    Ok(formatted)
 }

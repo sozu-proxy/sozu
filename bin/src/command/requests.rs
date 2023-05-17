@@ -20,9 +20,9 @@ use sozu_command_lib::{
     proto::command::{
         request::RequestType, response_content::ContentType, AggregatedMetrics,
         AllCertificatesInTheState, AvailableMetrics, CertificatesMatchingADomainName,
-        ClusterHashes, ClusterInformations, FrontendFilters, MetricsConfiguration, Request,
-        Response, ResponseContent, ResponseStatus, ReturnListenSockets, RunState, SoftStop, Status,
-        WorkerInfo, WorkerInfos, WorkerResponses,
+        CertificatesMatchingAFingerprint, ClusterHashes, ClusterInformations, FrontendFilters,
+        MetricsConfiguration, Request, Response, ResponseContent, ResponseStatus,
+        ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
     },
     request::WorkerRequest,
     scm_socket::Listeners,
@@ -75,6 +75,9 @@ impl CommandServer {
             Some(RequestType::Status(_)) => self.status(client_id).await,
             Some(RequestType::QueryCertificateByDomainInTheState(domain)) => {
                 self.query_certificate_by_domain_in_the_state(domain)
+            }
+            Some(RequestType::QueryCertificateByFingerprintInTheState(domain)) => {
+                self.query_certificate_by_fingerprint_in_the_state(domain)
             }
             Some(RequestType::QueryAllCertificatesInTheState(_)) => {
                 self.query_all_certificates_in_the_state()
@@ -393,6 +396,20 @@ impl CommandServer {
         Ok(Some(Success::CertificatesByDomainNameFromTheState(
             ContentType::CertificatesMatchingADomainName(CertificatesMatchingADomainName { certs })
                 .into(),
+        )))
+    }
+
+    pub fn query_certificate_by_fingerprint_in_the_state(
+        &self,
+        fingerprint: String,
+    ) -> anyhow::Result<Option<Success>> {
+        let certs = self.state.get_certificate_by_fingerprint(fingerprint);
+
+        Ok(Some(Success::CertificatesByFingerprintFromTheState(
+            ContentType::CertificatesMatchingAFingerprint(CertificatesMatchingAFingerprint {
+                certs,
+            })
+            .into(),
         )))
     }
 
@@ -1372,6 +1389,7 @@ impl CommandServer {
                     Success::ListFrontends(crd)
                     | Success::ListWorkers(crd)
                     | Success::CertificatesByDomainNameFromTheState(crd)
+                    | Success::CertificatesByFingerprintFromTheState(crd)
                     | Success::AllCertificatesInTheState(crd)
                     | Success::Query(crd)
                     | Success::ListListeners(crd)

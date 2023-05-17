@@ -86,6 +86,7 @@ pub enum Advancement {
 pub enum Success {
     AllCertificatesInTheState(ResponseContent),
     CertificatesByDomainNameFromTheState(ResponseContent),
+    CertificatesByFingerprintFromTheState(ResponseContent),
     ClientClose(String), // the client id
     ClientNew(String),   // the client id
     HandledClientRequest,
@@ -120,7 +121,9 @@ pub enum Success {
 impl std::fmt::Display for Success {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::AllCertificatesInTheState(_) | Self::CertificatesByDomainNameFromTheState(_) => {
+            Self::AllCertificatesInTheState(_)
+            | Self::CertificatesByDomainNameFromTheState(_)
+            | Self::CertificatesByFingerprintFromTheState(_) => {
                 write!(f, "Successfully queried certificates in the state",)
             }
             Self::ClientClose(id) => write!(f, "Close client: {id}"),

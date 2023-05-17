@@ -14,10 +14,10 @@ use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        CertificateWithNames, Cluster, ClusterInformation, DeactivateListener, FrontendFilters,
-        HttpListenerConfig, HttpsListenerConfig, ListedFrontends, ListenerType, ListenersList,
-        PathRule, RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
-        RequestHttpFrontend, RequestTcpFrontend, TcpListenerConfig,
+        Cluster, ClusterInformation, DeactivateListener, FrontendFilters, HttpListenerConfig,
+        HttpsListenerConfig, ListedFrontends, ListenerType, ListenersList, PathRule, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, Request, RequestHttpFrontend,
+        RequestTcpFrontend, TcpListenerConfig,
     },
     response::{Backend, HttpFrontend, TcpFrontend},
 };
@@ -1231,16 +1231,14 @@ impl ConfigState {
 
     pub fn get_certificate_by_fingerprint(
         &self,
-        fingerprint: &[u8],
-    ) -> Option<CertificateWithNames> {
+        fingerprint_to_find: String,
+    ) -> BTreeMap<String, CertificateAndKey> {
         self.certificates
             .values()
-            .filter_map(|h| h.get(&Fingerprint(fingerprint.to_vec())))
-            .map(|c| CertificateWithNames {
-                certificate: c.certificate.clone(),
-                names: c.names.clone(),
-            })
-            .next()
+            .flat_map(|hash_map| hash_map.iter())
+            .filter(|(fingerprint, _cert)| fingerprint.to_string() == fingerprint_to_find)
+            .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
+            .collect()
     }
 
     pub fn get_all_certificates(&self) -> BTreeMap<String, CertificateAndKey> {
@@ -2012,11 +2010,15 @@ mod tests {
         )
         .expect("Could not deserialize the fingerprint");
 
-        let certificate_found_by_fingerprint = state
-            .get_certificate_by_fingerprint(&fingerprint.0)
-            .expect("could not retrieve certificate by fingerprint");
+        let certificates_found_by_fingerprint =
+            state.get_certificate_by_fingerprint(fingerprint.to_string());
 
-        println!("found certificate: {:#?}", certificate_found_by_fingerprint);
+        println!(
+            "found certificate: {:#?}",
+            certificates_found_by_fingerprint
+        );
+
+        assert!(certificates_found_by_fingerprint.len() >= 1);
 
         let certificate_found_by_domain_name =
             state.get_certificates_by_domain_name("lolcatho.st".to_string());

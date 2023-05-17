@@ -74,7 +74,7 @@ message Request {
     // query all certificates
     QueryAllCertificates query_all_certificates = 32;
     // query a certificate by fingerprint
-    bytes query_certificate_by_fingerprint = 33;
+    string query_certificate_by_fingerprint = 33;
     // query certificates by domain
     string query_certificates_by_domain = 34;
     // query a cluster by id
@@ -97,7 +97,10 @@ message Request {
     ReturnListenSockets return_listen_sockets = 43;
     // Query only the Sōzu state (not the workers) for certificates matching given domain
     string query_certificate_by_domain_in_the_state = 44;
+    // Query only the Sōzu state (not the workers) for all certificates
     QueryAllCertificatesInTheState query_all_certificates_in_the_state = 45;
+    // Query only the Sōzu state (not the workers) for the certificate matching a fingerprint
+    string query_certificate_by_fingerprint_in_the_state = 46;
   }
 }
 
@@ -311,6 +314,7 @@ message CertificatesByAddress {
     repeated CertificateSummary certificate_summaries = 2;
 }
 
+// TODO: get rid of this type, use CertificateAndKey instead
 // A certificate matching a request by fingerprint,
 // and the list of domain names associated
 message CertificateWithNames {
@@ -328,6 +332,12 @@ message CertificatesMatchingADomainName {
 
 // to reply to QueryAllCertificatesInTheState
 message AllCertificatesInTheState {
+    // a map of fingerprint -> certificate_and_key
+    map<string, CertificateAndKey> certs = 1;
+}
+
+// to reply to QueryCertificateByFingerprintInTheState
+message CertificatesMatchingAFingerprint {
     // a map of fingerprint -> certificate_and_key
     map<string, CertificateAndKey> certs = 1;
 }
@@ -465,11 +475,13 @@ message ResponseContent {
         ListOfCertificatesByAddress certificates = 11;
         // returns the certificate matching a request by fingerprint,
         // and the list of domain names associated
-        CertificateWithNames certificate_by_fingerprint = 12;
+        CertificatesMatchingAFingerprint certificate_by_fingerprint = 12;
         // to reply to QueryCertificateByDomainInTheState
         CertificatesMatchingADomainName certificates_matching_a_domain_name = 13;
         // to reply to QueryAllCertificatesInTheState
         AllCertificatesInTheState all_certificates_in_the_state = 14;
+        // to reply to QueryCertificateByFingerprintInTheState
+        CertificatesMatchingAFingerprint certificates_matching_a_fingerprint = 15;
     }
 }
 
