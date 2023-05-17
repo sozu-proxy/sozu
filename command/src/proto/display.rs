@@ -2,18 +2,7 @@ use std::fmt::{Display, Formatter};
 
 use crate::proto::command::TlsVersion;
 
-use super::command::{CertificateAndKey, CertificateWithNames};
-
-impl Display for CertificateWithNames {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "\thostnames: {}\n\tcertificate: {}",
-            concatenate_vector(&self.names),
-            self.certificate
-        )
-    }
-}
+use super::command::CertificateAndKey;
 
 impl Display for CertificateAndKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
