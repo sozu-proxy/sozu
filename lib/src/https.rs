@@ -1378,15 +1378,16 @@ impl ProxyConfiguration for HttpsProxy {
                 self.logging(logging_filter.clone())
                     .with_context(|| format!("Could not set logging level to {logging_filter}"))
             }
-            RequestType::QueryAllCertificates(_) => {
-                info!("{} query all certificates", request_id);
-                self.query_all_certificates()
-                    .with_context(|| "Could not query all certificates")
-            }
-            RequestType::QueryCertificatesByDomain(domain) => {
-                info!("{} query certificate for domain {}", request_id, domain);
-                self.query_certificate_for_domain(domain.clone())
-                    .with_context(|| format!("Could not query certificate for domain {domain}"))
+            RequestType::QueryCertificatesFromWorkers(filters) => {
+                if let Some(domain) = filters.domain {
+                    info!("{} query certificate for domain {}", request_id, domain);
+                    self.query_certificate_for_domain(domain.clone())
+                        .with_context(|| format!("Could not query certificate for domain {domain}"))
+                } else {
+                    info!("{} query all certificates", request_id);
+                    self.query_all_certificates()
+                        .with_context(|| "Could not query all certificates")
+                }
             }
             other_request => {
                 error!(

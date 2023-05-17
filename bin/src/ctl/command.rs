@@ -3,9 +3,9 @@ use prettytable::Table;
 use serde::Serialize;
 
 use sozu_command_lib::proto::command::{
-    request::RequestType, response_content::ContentType, ListWorkers, QueryAllCertificates,
-    QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions,
-    Request, Response, ResponseContent, ResponseStatus, RunState, UpgradeMain, WorkerInfo,
+    request::RequestType, response_content::ContentType, ListWorkers, QueryCertificatesFilters,
+    QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions, Request, Response,
+    ResponseContent, ResponseStatus, RunState, UpgradeMain, WorkerInfo,
 };
 
 use crate::ctl::{
@@ -368,44 +368,26 @@ impl CommandManager {
         domain: Option<String>,
         query_workers: bool,
     ) -> Result<(), anyhow::Error> {
+        let filters = QueryCertificatesFilters {
+            domain,
+            fingerprint,
+        };
+
         if query_workers {
-            self.query_certificates_from_workers(json, fingerprint, domain)
+            self.query_certificates_from_workers(json, filters)
         } else {
-            self.query_certificates_from_the_state(QueryCertificatesFilters {
-                domain,
-                fingerprint,
-            })
+            self.query_certificates_from_the_state(json, filters)
         }
     }
 
-    // This queries all workers for certificates
     fn query_certificates_from_workers(
         &mut self,
         json: bool,
-        fingerprint: Option<String>,
-        domain: Option<String>,
+        filters: QueryCertificatesFilters,
     ) -> Result<(), anyhow::Error> {
-        let request = match (fingerprint, domain) {
-            (None, None) => Request {
-                request_type: Some(RequestType::QueryAllCertificates(QueryAllCertificates {})),
-            },
-            (Some(f), None) => match hex::decode(&f) {
-                Err(e) => {
-                    bail!("invalid fingerprint {}: {:?}", f, e);
-                }
-                Ok(_) => Request {
-                    request_type: Some(RequestType::QueryCertificateByFingerprint(f)),
-                },
-            },
-            (None, Some(d)) => Request {
-                request_type: Some(RequestType::QueryCertificatesByDomain(d)),
-            },
-            (Some(_), Some(_)) => {
-                bail!("Error: Either request a fingerprint or a domain name");
-            }
-        };
-
-        self.send_request(request)?;
+        self.send_request(Request {
+            request_type: Some(RequestType::QueryCertificatesFromWorkers(filters)),
+        })?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -437,9 +419,9 @@ impl CommandManager {
         Ok(())
     }
 
-    // This queries only the state
     fn query_certificates_from_the_state(
         &mut self,
+        json: bool,
         filters: QueryCertificatesFilters,
     ) -> anyhow::Result<()> {
         self.send_request(Request {
@@ -469,8 +451,13 @@ impl CommandManager {
                             bail!("No certificates match your request.");
                         }
 
-                        print_certificates_with_validity(certs)
-                            .with_context(|| "Could not show certificate")?;
+                        if json {
+                            print_json_response(&certs)
+                                .with_context(|| "Could not print certificates in JSON")?;
+                        } else {
+                            print_certificates_with_validity(certs)
+                                .with_context(|| "Could not show certificate")?;
+                        }
                     } else {
                         println!("No response content.");
                     }

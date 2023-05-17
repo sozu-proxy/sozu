@@ -113,6 +113,7 @@ impl ConfigState {
             &RequestType::Logging(_)
             | &RequestType::Status(_)
             | &RequestType::SoftStop(_)
+            | &RequestType::QueryCertificatesFromWorkers(_)
             | &RequestType::QueryClusterById(_)
             | &RequestType::QueryClustersByDomain(_)
             | &RequestType::QueryMetrics(_)
