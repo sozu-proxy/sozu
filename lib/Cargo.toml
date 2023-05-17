@@ -4,8 +4,8 @@ description = "sozu library to build hot reconfigurable HTTP reverse proxies"
 repository = "https://github.com/sozu-proxy/sozu"
 readme = "README.md"
 documentation = "https://docs.rs/sozu-lib"
-homepage = "http://sozu.io"
-version = "0.14.2"
+homepage = "https://sozu.io"
+version = "0.14.3"
 license = "AGPL-3.0"
 authors = [
   "Clément Delafargue <clement@delafargue.name>",
@@ -48,7 +48,6 @@ serial_test = "^2.0.0"
 sha2 = "^0.10.6"
 slab = "^0.4.8"
 socket2 = { version = "^0.5.2", features = ["all"] }
-sozu-command-lib = { path = "../command" }
 regex = "^1.8.1"
 rustls = "^0.21.1"
 rustls-pemfile = "^1.0.2"
@@ -58,6 +57,8 @@ time = "^0.3.20"
 url = "^2.3.1"
 webpki = "^0.22.0"
 x509-parser = "^0.15.0"
+
+sozu-command-lib = { path = "../command" }
 
 [dev-dependencies]
 quickcheck = "^1.0.3"

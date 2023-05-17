@@ -4,8 +4,8 @@ description = "configuration library to command a sozu instance"
 repository = "https://github.com/sozu-proxy/sozu"
 readme = "README.md"
 documentation = "https://docs.rs/sozu-command-lib"
-homepage = "http://sozu.io"
-version = "0.14.2"
+homepage = "https://sozu.io"
+version = "0.14.3"
 license = "LGPL-3.0"
 authors = [
   "Geoffroy Couprie <geo.couprie@gmail.com>",
