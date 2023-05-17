@@ -315,15 +315,6 @@ message CertificatesByAddress {
     repeated CertificateSummary certificate_summaries = 2;
 }
 
-// TODO: get rid of this type, use CertificateAndKey instead
-// A certificate matching a request by fingerprint,
-// and the list of domain names associated
-message CertificateWithNames {
-    required string certificate = 1;
-    // domain names associated to the fingerprint
-    repeated string names = 2;
-}
-
 // to reply to several certificate queries
 message CertificatesWithFingerprints {
     // a map of fingerprint -> certificate_and_key
