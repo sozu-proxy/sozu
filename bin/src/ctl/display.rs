@@ -637,7 +637,7 @@ pub fn print_query_response_data(
     Ok(())
 }
 
-pub fn print_certificates(
+pub fn print_certificates_by_worker(
     response_contents: BTreeMap<String, ResponseContent>,
     json: bool,
 ) -> anyhow::Result<()> {

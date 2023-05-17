@@ -756,26 +756,8 @@ pub enum TcpListenerCmd {
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum CertificateCmd {
     #[clap(
-        name = "query-state",
-        about = "query all certificates, or by domain name, in the state (not the workers)"
-    )]
-    QueryTheState {
-        #[clap(
-            short = 'd',
-            long = "domain",
-            help = "show certificates (with fingerprint and validities) for a domain name"
-        )]
-        domain: Option<String>,
-        #[clap(
-            short = 'f',
-            long = "fingerprint",
-            help = "show certificate (with fingerprint and validities) for a given fingerprint"
-        )]
-        fingerprint: Option<String>,
-    },
-    #[clap(
         name = "get",
-        about = "query certificates, all or filtered by fingerprint or domain name, in all workers"
+        about = "query all certificates, or filtered by fingerprint or domain name. This command queries the state of Sōzu by default, but can show results for all workers"
     )]
     Get {
         #[clap(
@@ -790,6 +772,12 @@ pub enum CertificateCmd {
             help = "show certificate fingerprints for a domain name"
         )]
         domain: Option<String>,
+        #[clap(
+            short = 'w',
+            long = "workers",
+            help = "Show the results for each worker"
+        )]
+        query_workers: bool,
     },
     #[clap(name = "add", about = "Add a certificate")]
     Add {
