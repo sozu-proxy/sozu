@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{self, bail, Context};
 use prettytable::Table;
 use serde::Serialize;
@@ -460,15 +462,14 @@ impl CommandManager {
                             _ => bail!(format!("Wrong response content {:?}", response_content)),
                         };
                         if certs.is_empty() {
-                            bail!("No certificates match this domain name");
+                            bail!("No certificates match your request.");
                         }
 
-                        for (fingerprint, cert) in certs {
-                            print_certificate_with_validity(fingerprint, cert)
-                                .with_context(|| "Could not show certificate")?;
-                        }
+                        print_certificates_with_validity(certs)
+                            .with_context(|| "Could not show certificate")?;
+                    } else {
+                        println!("No response content.");
                     }
-                    println!("nothing to show. No response content. Weird.");
 
                     break;
                 }
@@ -478,28 +479,38 @@ impl CommandManager {
     }
 }
 
-fn print_certificate_with_validity(
-    fingerprint: String,
-    cert: CertificateAndKey,
+fn print_certificates_with_validity(
+    certs: BTreeMap<String, CertificateAndKey>,
 ) -> anyhow::Result<()> {
-    let (_unparsed, pem_certificate) =
-        x509_parser::pem::parse_x509_pem(cert.certificate.as_bytes())
-            .with_context(|| "Could not parse pem certificate")?;
+    let mut table = Table::new();
+    table.set_format(*prettytable::format::consts::FORMAT_CLEAN);
+    table.add_row(row![
+        "fingeprint",
+        "valid not before",
+        "valide not after",
+        "domain names",
+    ]);
 
-    let x509_certificate = pem_certificate
-        .parse_x509()
-        .with_context(|| "Could not parse x509 certificate")?;
+    for (fingerprint, cert) in certs {
+        let (_unparsed, pem_certificate) =
+            x509_parser::pem::parse_x509_pem(cert.certificate.as_bytes())
+                .with_context(|| "Could not parse pem certificate")?;
 
-    let validity = x509_certificate.validity();
+        let x509_certificate = pem_certificate
+            .parse_x509()
+            .with_context(|| "Could not parse x509 certificate")?;
 
-    println!(
-        "{}\n\tfingerprint: {}\n\tNot Before: {}\n\tNot After:  {}\n\tTLS versions: {:?}\n",
-        concatenate_vector(&cert.names),
-        fingerprint,
-        format_datetime(validity.not_before)?,
-        format_datetime(validity.not_after)?,
-        cert.versions
-    );
+        let validity = x509_certificate.validity();
+
+        table.add_row(row!(
+            fingerprint,
+            format_datetime(validity.not_before)?,
+            format_datetime(validity.not_after)?,
+            concatenate_vector(&cert.names),
+        ));
+    }
+    table.printstd();
+
     Ok(())
 }
 
