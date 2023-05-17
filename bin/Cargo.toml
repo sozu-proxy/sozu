@@ -49,8 +49,8 @@ smol = "^1.3.0"
 tempfile = "^3.5.0"
 termion = "^2.0.1"
 
-sozu-command-lib = { path = "../command" }
-sozu-lib = { path = "../lib" }
+sozu-command-lib = "^0.14.3"
+sozu-lib = "^0.14.3"
 
 [target.'cfg(target_os="linux")'.dependencies]
 num_cpus = "^1.15.0"

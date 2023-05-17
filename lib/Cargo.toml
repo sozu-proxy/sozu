@@ -58,7 +58,7 @@ url = "^2.3.1"
 webpki = "^0.22.0"
 x509-parser = "^0.15.0"
 
-sozu-command-lib = { path = "../command" }
+sozu-command-lib = "^0.14.3"
 
 [dev-dependencies]
 quickcheck = "^1.0.3"
