@@ -757,15 +757,15 @@ pub enum TcpListenerCmd {
 pub enum CertificateCmd {
     #[clap(
         name = "query-state",
-        about = "query certificates by domain name, in the state (not the workers)"
+        about = "query all certificates, or by domain name, in the state (not the workers)"
     )]
     QueryTheState {
         #[clap(
             short = 'd',
             long = "domain",
-            help = "show certificate fingerprints for a domain name"
+            help = "show certificates (with fingerprint and validities) for a domain name"
         )]
-        domain: String,
+        domain: Option<String>,
     },
     #[clap(
         name = "get",

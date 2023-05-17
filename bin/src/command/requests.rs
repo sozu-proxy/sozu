@@ -18,10 +18,11 @@ use sozu_command_lib::{
     logging,
     parser::parse_several_commands,
     proto::command::{
-        request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
-        CertificatesMatchingADomainName, ClusterHashes, ClusterInformations, FrontendFilters,
-        MetricsConfiguration, Request, Response, ResponseContent, ResponseStatus,
-        ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
+        request::RequestType, response_content::ContentType, AggregatedMetrics,
+        AllCertificatesInTheState, AvailableMetrics, CertificatesMatchingADomainName,
+        ClusterHashes, ClusterInformations, FrontendFilters, MetricsConfiguration, Request,
+        Response, ResponseContent, ResponseStatus, ReturnListenSockets, RunState, SoftStop, Status,
+        WorkerInfo, WorkerInfos, WorkerResponses,
     },
     request::WorkerRequest,
     scm_socket::Listeners,
@@ -74,6 +75,9 @@ impl CommandServer {
             Some(RequestType::Status(_)) => self.status(client_id).await,
             Some(RequestType::QueryCertificateByDomainInTheState(domain)) => {
                 self.query_certificate_by_domain_in_the_state(domain)
+            }
+            Some(RequestType::QueryAllCertificatesInTheState(_)) => {
+                self.query_all_certificates_in_the_state()
             }
             Some(RequestType::QueryCertificateByFingerprint(_))
             | Some(RequestType::QueryCertificatesByDomain(_))
@@ -389,6 +393,14 @@ impl CommandServer {
         Ok(Some(Success::CertificatesByDomainNameFromTheState(
             ContentType::CertificatesMatchingADomainName(CertificatesMatchingADomainName { certs })
                 .into(),
+        )))
+    }
+
+    pub fn query_all_certificates_in_the_state(&self) -> anyhow::Result<Option<Success>> {
+        let certs = self.state.get_all_certificates();
+
+        Ok(Some(Success::AllCertificatesInTheState(
+            ContentType::AllCertificatesInTheState(AllCertificatesInTheState { certs }).into(),
         )))
     }
 
@@ -1360,6 +1372,7 @@ impl CommandServer {
                     Success::ListFrontends(crd)
                     | Success::ListWorkers(crd)
                     | Success::CertificatesByDomainNameFromTheState(crd)
+                    | Success::AllCertificatesInTheState(crd)
                     | Success::Query(crd)
                     | Success::ListListeners(crd)
                     | Success::Status(crd) => Some(crd),

@@ -7,8 +7,9 @@ use x509_parser::time::ASN1Time;
 use sozu_command_lib::proto::{
     command::{
         request::RequestType, response_content::ContentType, CertificateAndKey, ListWorkers,
-        QueryAllCertificates, QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions,
-        Request, Response, ResponseContent, ResponseStatus, RunState, UpgradeMain, WorkerInfo,
+        QueryAllCertificates, QueryAllCertificatesInTheState, QueryClusterByDomain,
+        QueryClustersHashes, QueryMetricsOptions, Request, Response, ResponseContent,
+        ResponseStatus, RunState, UpgradeMain, WorkerInfo,
     },
     display::concatenate_vector,
 };
@@ -423,10 +424,18 @@ impl CommandManager {
         Ok(())
     }
 
-    pub fn query_state_for_certificate(&mut self, domain: String) -> anyhow::Result<()> {
-        self.send_request(Request {
-            request_type: Some(RequestType::QueryCertificateByDomainInTheState(domain)),
-        })?;
+    pub fn query_state_for_certificate(&mut self, domain: Option<String>) -> anyhow::Result<()> {
+        let request = match domain {
+            Some(domain) => Request {
+                request_type: Some(RequestType::QueryCertificateByDomainInTheState(domain)),
+            },
+            None => Request {
+                request_type: Some(RequestType::QueryAllCertificatesInTheState(
+                    QueryAllCertificatesInTheState {},
+                )),
+            },
+        };
+        self.send_request(request)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -441,19 +450,26 @@ impl CommandManager {
                 ResponseStatus::Ok => {
                     info!("We did get a response from the proxy");
                     println!("response message: {:?}\n", response.message);
-                    if let Some(ResponseContent {
-                        content_type: Some(ContentType::CertificatesMatchingADomainName(certs)),
-                    }) = response.content
-                    {
-                        if certs.certs.is_empty() {
+
+                    if let Some(response_content) = response.content {
+                        let certs = match response_content.content_type {
+                            Some(ContentType::CertificatesMatchingADomainName(certs)) => {
+                                certs.certs
+                            }
+                            Some(ContentType::AllCertificatesInTheState(certs)) => certs.certs,
+                            _ => bail!(format!("Wrong response content {:?}", response_content)),
+                        };
+                        if certs.is_empty() {
                             bail!("No certificates match this domain name");
                         }
 
-                        for (fingerprint, cert) in certs.certs {
+                        for (fingerprint, cert) in certs {
                             print_certificate_with_validity(fingerprint, cert)
                                 .with_context(|| "Could not show certificate")?;
                         }
                     }
+                    println!("nothing to show. No response content. Weird.");
+
                     break;
                 }
             }

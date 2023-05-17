@@ -97,6 +97,7 @@ message Request {
     ReturnListenSockets return_listen_sockets = 43;
     // Query only the Sōzu state (not the workers) for certificates matching given domain
     string query_certificate_by_domain_in_the_state = 44;
+    QueryAllCertificatesInTheState query_all_certificates_in_the_state = 45;
   }
 }
 
@@ -110,6 +111,7 @@ message QueryClustersHashes {}
 message SoftStop {}
 message HardStop {}
 message ReturnListenSockets {}
+message QueryAllCertificatesInTheState {}
 
 // details of an HTTP listener
 message HttpListenerConfig {
@@ -324,6 +326,13 @@ message CertificatesMatchingADomainName {
     map<string, CertificateAndKey> certs = 1;
 }
 
+// to reply to QueryAllCertificatesInTheState
+message AllCertificatesInTheState {
+    // a map of fingerprint -> certificate_and_key
+    map<string, CertificateAndKey> certs = 1;
+}
+
+
 enum TlsVersion {
     SSL_V2 = 0;
     SSL_V3 = 1;
@@ -459,6 +468,8 @@ message ResponseContent {
         CertificateWithNames certificate_by_fingerprint = 12;
         // to reply to QueryCertificateByDomainInTheState
         CertificatesMatchingADomainName certificates_matching_a_domain_name = 13;
+        // to reply to QueryAllCertificatesInTheState
+        AllCertificatesInTheState all_certificates_in_the_state = 14;
     }
 }
 

@@ -1243,6 +1243,14 @@ impl ConfigState {
             .next()
     }
 
+    pub fn get_all_certificates(&self) -> BTreeMap<String, CertificateAndKey> {
+        self.certificates
+            .values()
+            .flat_map(|hash_map| hash_map.iter())
+            .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
+            .collect()
+    }
+
     pub fn get_certificates_by_domain_name(
         &self,
         domain_name: String,
