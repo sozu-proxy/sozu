@@ -69,7 +69,8 @@ _General parameters:_
 # possible values are http, https or tcp
 protocol = "http"
 # listening address
-address = "127.0.0.1:8080"
+address = "0.0.0.0:8080"
+# address = "[::]:8080"
 
 # specify a different IP than the one the socket sees, for logs and forwarded headers
 # public_address = "1.2.3.4:80
