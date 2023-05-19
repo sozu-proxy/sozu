@@ -289,11 +289,12 @@ message CertificateAndKey {
 }
 
 // Should be either a domain name or a fingerprint.
-// If both are None, all certificates will be returned.
+// These filter do not compound, use either one but not both.
+// If none of them is specified, all certificates will be returned.
 message QueryCertificatesFilters {
     // a domain name to filter certificate results
     optional string domain = 1;
-    // a fingerprint to find a certificate
+    // a hex-encoded fingerprint of the TLS certificate to find
     optional string fingerprint = 2;
 }
 

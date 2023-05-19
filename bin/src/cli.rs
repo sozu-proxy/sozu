@@ -187,7 +187,7 @@ pub enum SubCmd {
         #[clap(subcommand)]
         cmd: ListenerCmd,
     },
-    #[clap(name = "certificates", about = "certificate management")]
+    #[clap(name = "certificates", about = "list, add and remove certificates")]
     Certificates {
         #[clap(
             short = 'j',
@@ -757,25 +757,27 @@ pub enum TcpListenerCmd {
 pub enum CertificateCmd {
     #[clap(
         name = "get",
-        about = "query all certificates, or filtered by fingerprint or domain name. This command queries the state of Sōzu by default, but can show results for all workers"
+        about = "Query all certificates, or filtered by fingerprint or domain name.
+This command queries the state of Sōzu by default, but can show results for all workers.
+Use the --json option to get a much more verbose result, with certificate contents."
     )]
     Get {
         #[clap(
             short = 'f',
             long = "fingerprint",
-            help = "show the certificate and domain names for a given fingerprint"
+            help = "get the certificates for a given fingerprint"
         )]
         fingerprint: Option<String>,
         #[clap(
             short = 'd',
             long = "domain",
-            help = "show certificate fingerprints for a domain name"
+            help = "get certificates for a domain name"
         )]
         domain: Option<String>,
         #[clap(
             short = 'w',
             long = "workers",
-            help = "Show the results for each worker"
+            help = "Show results for each worker (slower)"
         )]
         query_workers: bool,
     },

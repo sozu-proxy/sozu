@@ -376,7 +376,7 @@ impl CommandManager {
         if query_workers {
             self.query_certificates_from_workers(json, filters)
         } else {
-            self.query_certificates_from_the_state(filters)
+            self.query_certificates_from_the_state(json, filters)
         }
     }
 
@@ -421,6 +421,7 @@ impl CommandManager {
 
     fn query_certificates_from_the_state(
         &mut self,
+        json: bool,
         filters: QueryCertificatesFilters,
     ) -> anyhow::Result<()> {
         self.send_request(Request {
@@ -450,8 +451,13 @@ impl CommandManager {
                             bail!("No certificates match your request.");
                         }
 
-                        print_certificates_with_validity(certs)
-                            .with_context(|| "Could not show certificate")?;
+                        if json {
+                            print_json_response(&certs)
+                                .with_context(|| "Could not print certificates in JSON")?;
+                        } else {
+                            print_certificates_with_validity(certs)
+                                .with_context(|| "Could not show certificate")?;
+                        }
                     } else {
                         println!("No response content.");
                     }
