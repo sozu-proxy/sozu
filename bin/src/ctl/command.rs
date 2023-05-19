@@ -12,8 +12,8 @@ use crate::ctl::{
     create_channel,
     display::{
         print_available_metrics, print_certificates_by_worker, print_certificates_with_validity,
-        print_frontend_list, print_json_response, print_listeners, print_metrics,
-        print_query_response_data, print_status,
+        print_cluster_responses, print_frontend_list, print_json_response, print_listeners,
+        print_metrics, print_status,
     },
     CommandManager,
 };
@@ -347,11 +347,11 @@ impl CommandManager {
                     bail!("could not query proxy state: {}", response.message);
                 }
                 ResponseStatus::Ok => {
-                    match response.content {
-                        Some(content) => {
-                            print_query_response_data(cluster_id, domain, content, json)?
-                        }
-                        None => println!("No content in the response"),
+                    if let Some(ResponseContent {
+                        content_type: Some(ContentType::WorkerResponses(worker_responses)),
+                    }) = response.content
+                    {
+                        print_cluster_responses(cluster_id, domain, worker_responses, json)?
                     }
                     break;
                 }
