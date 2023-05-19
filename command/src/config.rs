@@ -746,8 +746,8 @@ impl HttpFrontendConfig {
         };
 
         if self.key.is_some() && self.certificate.is_some() {
-            v.push(Request {
-                request_type: Some(RequestType::AddCertificate(AddCertificate {
+            v.push(
+                RequestType::AddCertificate(AddCertificate {
                     address: self.address.to_string(),
                     certificate: CertificateAndKey {
                         key: self.key.clone().unwrap(),
@@ -757,11 +757,12 @@ impl HttpFrontendConfig {
                         names: vec![self.hostname.clone()],
                     },
                     expired_at: None,
-                })),
-            });
+                })
+                .into(),
+            );
 
-            v.push(Request {
-                request_type: Some(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+            v.push(
+                RequestType::AddHttpsFrontend(RequestHttpFrontend {
                     cluster_id: Some(cluster_id.to_string()),
                     address: self.address.to_string(),
                     hostname: self.hostname.clone(),
@@ -769,12 +770,13 @@ impl HttpFrontendConfig {
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
-                })),
-            });
+                })
+                .into(),
+            );
         } else {
             //create the front both for HTTP and HTTPS if possible
-            v.push(Request {
-                request_type: Some(RequestType::AddHttpFrontend(RequestHttpFrontend {
+            v.push(
+                RequestType::AddHttpFrontend(RequestHttpFrontend {
                     cluster_id: Some(cluster_id.to_string()),
                     address: self.address.to_string(),
                     hostname: self.hostname.clone(),
@@ -782,8 +784,9 @@ impl HttpFrontendConfig {
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
-                })),
-            });
+                })
+                .into(),
+            );
         }
 
         v
@@ -805,17 +808,16 @@ pub struct HttpClusterConfig {
 
 impl HttpClusterConfig {
     pub fn generate_requests(&self) -> anyhow::Result<Vec<Request>> {
-        let mut v = vec![Request {
-            request_type: Some(RequestType::AddCluster(Cluster {
-                cluster_id: self.cluster_id.clone(),
-                sticky_session: self.sticky_session,
-                https_redirect: self.https_redirect,
-                proxy_protocol: None,
-                load_balancing: self.load_balancing as i32,
-                answer_503: self.answer_503.clone(),
-                load_metric: self.load_metric.map(|s| s as i32),
-            })),
-        }];
+        let mut v = vec![RequestType::AddCluster(Cluster {
+            cluster_id: self.cluster_id.clone(),
+            sticky_session: self.sticky_session,
+            https_redirect: self.https_redirect,
+            proxy_protocol: None,
+            load_balancing: self.load_balancing as i32,
+            answer_503: self.answer_503.clone(),
+            load_metric: self.load_metric.map(|s| s as i32),
+        })
+        .into()];
 
         for frontend in &self.frontends {
             let mut orders = frontend.generate_requests(&self.cluster_id);
@@ -827,8 +829,8 @@ impl HttpClusterConfig {
                 weight: backend.weight.unwrap_or(100) as i32,
             });
 
-            v.push(Request {
-                request_type: Some(RequestType::AddBackend(AddBackend {
+            v.push(
+                RequestType::AddBackend(AddBackend {
                     cluster_id: self.cluster_id.clone(),
                     backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                         format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
@@ -837,8 +839,9 @@ impl HttpClusterConfig {
                     load_balancing_parameters,
                     sticky_id: backend.sticky_id.clone(),
                     backup: backend.backup,
-                })),
-            });
+                })
+                .into(),
+            );
         }
 
         Ok(v)
@@ -864,26 +867,26 @@ pub struct TcpClusterConfig {
 
 impl TcpClusterConfig {
     pub fn generate_requests(&self) -> anyhow::Result<Vec<Request>> {
-        let mut v = vec![Request {
-            request_type: Some(RequestType::AddCluster(Cluster {
-                cluster_id: self.cluster_id.clone(),
-                sticky_session: false,
-                https_redirect: false,
-                proxy_protocol: self.proxy_protocol.map(|s| s as i32),
-                load_balancing: self.load_balancing as i32,
-                load_metric: self.load_metric.map(|s| s as i32),
-                answer_503: None,
-            })),
-        }];
+        let mut v = vec![RequestType::AddCluster(Cluster {
+            cluster_id: self.cluster_id.clone(),
+            sticky_session: false,
+            https_redirect: false,
+            proxy_protocol: self.proxy_protocol.map(|s| s as i32),
+            load_balancing: self.load_balancing as i32,
+            load_metric: self.load_metric.map(|s| s as i32),
+            answer_503: None,
+        })
+        .into()];
 
         for frontend in &self.frontends {
-            v.push(Request {
-                request_type: Some(RequestType::AddTcpFrontend(RequestTcpFrontend {
+            v.push(
+                RequestType::AddTcpFrontend(RequestTcpFrontend {
                     cluster_id: self.cluster_id.clone(),
                     address: frontend.address.to_string(),
                     tags: frontend.tags.clone().unwrap_or(BTreeMap::new()),
-                })),
-            });
+                })
+                .into(),
+            );
         }
 
         for (backend_count, backend) in self.backends.iter().enumerate() {
@@ -891,8 +894,8 @@ impl TcpClusterConfig {
                 weight: backend.weight.unwrap_or(100) as i32,
             });
 
-            v.push(Request {
-                request_type: Some(RequestType::AddBackend(AddBackend {
+            v.push(
+                RequestType::AddBackend(AddBackend {
                     cluster_id: self.cluster_id.clone(),
                     backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                         format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
@@ -901,8 +904,9 @@ impl TcpClusterConfig {
                     load_balancing_parameters,
                     sticky_id: backend.sticky_id.clone(),
                     backup: backend.backup,
-                })),
-            });
+                })
+                .into(),
+            );
         }
 
         Ok(v)
@@ -1342,9 +1346,7 @@ impl Config {
         for listener in &self.http_listeners {
             v.push(WorkerRequest {
                 id: format!("CONFIG-{count}"),
-                content: Request {
-                    request_type: Some(RequestType::AddHttpListener(listener.clone())),
-                },
+                content: RequestType::AddHttpListener(listener.clone()).into(),
             });
             count += 1;
         }
@@ -1352,9 +1354,7 @@ impl Config {
         for listener in &self.https_listeners {
             v.push(WorkerRequest {
                 id: format!("CONFIG-{count}"),
-                content: Request {
-                    request_type: Some(RequestType::AddHttpsListener(listener.clone())),
-                },
+                content: RequestType::AddHttpsListener(listener.clone()).into(),
             });
             count += 1;
         }
@@ -1362,9 +1362,7 @@ impl Config {
         for listener in &self.tcp_listeners {
             v.push(WorkerRequest {
                 id: format!("CONFIG-{count}"),
-                content: Request {
-                    request_type: Some(RequestType::AddTcpListener(listener.clone())),
-                },
+                content: RequestType::AddTcpListener(listener.clone()).into(),
             });
             count += 1;
         }
@@ -1384,13 +1382,12 @@ impl Config {
             for listener in &self.http_listeners {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
-                    content: Request {
-                        request_type: Some(RequestType::ActivateListener(ActivateListener {
-                            address: listener.address.clone(),
-                            proxy: ListenerType::Http.into(),
-                            from_scm: false,
-                        })),
-                    },
+                    content: RequestType::ActivateListener(ActivateListener {
+                        address: listener.address.clone(),
+                        proxy: ListenerType::Http.into(),
+                        from_scm: false,
+                    })
+                    .into(),
                 });
                 count += 1;
             }
@@ -1398,13 +1395,12 @@ impl Config {
             for listener in &self.https_listeners {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
-                    content: Request {
-                        request_type: Some(RequestType::ActivateListener(ActivateListener {
-                            address: listener.address.clone(),
-                            proxy: ListenerType::Https.into(),
-                            from_scm: false,
-                        })),
-                    },
+                    content: RequestType::ActivateListener(ActivateListener {
+                        address: listener.address.clone(),
+                        proxy: ListenerType::Https.into(),
+                        from_scm: false,
+                    })
+                    .into(),
                 });
                 count += 1;
             }
@@ -1412,13 +1408,12 @@ impl Config {
             for listener in &self.tcp_listeners {
                 v.push(WorkerRequest {
                     id: format!("CONFIG-{count}"),
-                    content: Request {
-                        request_type: Some(RequestType::ActivateListener(ActivateListener {
-                            address: listener.address.clone(),
-                            proxy: ListenerType::Tcp.into(),
-                            from_scm: false,
-                        })),
-                    },
+                    content: RequestType::ActivateListener(ActivateListener {
+                        address: listener.address.clone(),
+                        proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
                 });
                 count += 1;
             }

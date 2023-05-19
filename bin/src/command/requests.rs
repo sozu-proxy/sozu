@@ -563,9 +563,7 @@ impl CommandServer {
             .with_context(|| "No sender on new worker".to_string())?
             .send(WorkerRequest {
                 id: format!("UPGRADE-{worker_id}-STATUS"),
-                content: Request {
-                    request_type: Some(RequestType::Status(Status {})),
-                },
+                content: RequestType::Status(Status {}).into(),
             })
             .await
             .with_context(|| {
@@ -595,11 +593,7 @@ impl CommandServer {
             old_worker
                 .send(
                     id.clone(),
-                    Request {
-                        request_type: Some(RequestType::ReturnListenSockets(
-                            ReturnListenSockets {},
-                        )),
-                    },
+                    RequestType::ReturnListenSockets(ReturnListenSockets {}).into(),
                 )
                 .await;
 
@@ -661,9 +655,7 @@ impl CommandServer {
             old_worker
                 .send(
                     softstop_id.clone(),
-                    Request {
-                        request_type: Some(RequestType::SoftStop(SoftStop {})),
-                    },
+                    RequestType::SoftStop(SoftStop {}).into(),
                 )
                 .await;
 
@@ -881,9 +873,7 @@ impl CommandServer {
                 worker
                     .send(
                         worker_request_id.clone(),
-                        Request {
-                            request_type: Some(RequestType::Status(Status {})),
-                        },
+                        RequestType::Status(Status {}).into(),
                     )
                     .await;
                 count += 1;
@@ -957,9 +947,7 @@ impl CommandServer {
             worker
                 .send(
                     req_id.clone(),
-                    Request {
-                        request_type: Some(RequestType::ConfigureMetrics(config as i32)),
-                    },
+                    RequestType::ConfigureMetrics(config as i32).into(),
                 )
                 .await;
             count += 1;

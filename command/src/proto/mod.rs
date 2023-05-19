@@ -12,3 +12,12 @@ impl From<command::response_content::ContentType> for command::ResponseContent {
         }
     }
 }
+
+// Simple helper to build Request from RequestType
+impl From<command::request::RequestType> for command::Request {
+    fn from(value: command::request::RequestType) -> Self {
+        Self {
+            request_type: Some(value),
+        }
+    }
+}

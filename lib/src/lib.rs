@@ -72,7 +72,7 @@
 //!
 //! ```ignore
 //! use std::thread;
-//! 
+//!
 //! let worker_thread_join_handle = thread::spawn(move || {
 //!     let max_buffers = 500;
 //!     let buffer_size = 16384;
@@ -119,7 +119,7 @@
 //!
 //! ```
 //! use std::collections::BTreeMap;
-//! 
+//!
 //!  use sozu_command_lib::proto::command::{PathRule, RequestHttpFrontend, RulePosition};
 //!
 //! let http_front = RequestHttpFrontend {
@@ -145,7 +145,7 @@
 //!
 //! ```
 //! use sozu_command_lib::proto::command::{AddBackend, LoadBalancingParams};
-//! 
+//!
 //! let http_backend = AddBackend {
 //!     cluster_id: "my-cluster".to_string(),
 //!     backend_id: "test-backend".to_string(),
@@ -173,27 +173,21 @@
 //! command_channel
 //!     .write_message(&WorkerRequest {
 //!         id: String::from("add-the-cluster"),
-//!         content: Request {
-//!             request_type: Some(RequestType::AddCluster(cluster)),
-//!         },
+//!         content: RequestType::AddCluster(cluster).into(),
 //!     })
 //!     .expect("Could not send AddHttpFrontend request");
 //!
 //! command_channel
 //!     .write_message(&WorkerRequest {
 //!         id: String::from("add-the-frontend"),
-//!         content: Request {
-//!             request_type: Some(RequestType::AddHttpFrontend(http_front)),
-//!         },
+//!         content: RequestType::AddHttpFrontend(http_front).into(),
 //!     })
 //!     .expect("Could not send AddHttpFrontend request");
 //!
 //! command_channel
 //!     .write_message(&WorkerRequest {
 //!         id: String::from("add-the-backend"),
-//!         content: Request {
-//!             request_type: Some(RequestType::AddBackend(http_backend)),
-//!         },
+//!         content: RequestType::AddBackend(http_backend).into(),
 //!     })
 //!     .expect("Could not send AddBackend request");
 //!
@@ -302,27 +296,21 @@
 //!     command_channel
 //!         .write_message(&WorkerRequest {
 //!             id: String::from("add-the-cluster"),
-//!             content: Request {
-//!                 request_type: Some(RequestType::AddCluster(cluster)),
-//!             },
+//!             content: RequestType::AddCluster(cluster).into(),
 //!         })
 //!         .expect("Could not send AddHttpFrontend request");
 //!
 //!     command_channel
 //!         .write_message(&WorkerRequest {
 //!             id: String::from("add-the-frontend"),
-//!             content: Request {
-//!                 request_type: Some(RequestType::AddHttpFrontend(http_front)),
-//!             },
+//!             content: RequestType::AddHttpFrontend(http_front).into(),
 //!         })
 //!         .expect("Could not send AddHttpFrontend request");
 //!
 //!     command_channel
 //!         .write_message(&WorkerRequest {
 //!             id: String::from("add-the-backend"),
-//!             content: Request {
-//!                 request_type: Some(RequestType::AddBackend(http_backend)),
-//!             },
+//!             content: RequestType::AddBackend(http_backend).into(),
 //!         })
 //!         .expect("Could not send AddBackend request");
 //!

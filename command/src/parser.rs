@@ -75,7 +75,7 @@ mod test {
     use super::*;
 
     use crate::{
-        proto::command::{request::RequestType, Request, Status, SubscribeEvents},
+        proto::command::{request::RequestType, Status, SubscribeEvents},
         request::WorkerRequest,
     };
 
@@ -83,9 +83,7 @@ mod test {
     fn parse_one_worker_request() {
         let worker_request = WorkerRequest::new(
             "Some request".to_string(),
-            Request {
-                request_type: Some(RequestType::Status(Status {})),
-            },
+            RequestType::Status(Status {}).into(),
         );
 
         let mut string = serde_json::ser::to_string(&worker_request).unwrap();
@@ -109,21 +107,15 @@ mod test {
         let requests = vec![
             WorkerRequest::new(
                 "Some request".to_string(),
-                Request {
-                    request_type: Some(RequestType::SaveState("/some/path".to_string())),
-                },
+                RequestType::SaveState("/some/path".to_string()).into(),
             ),
             WorkerRequest::new(
                 "Some other request".to_string(),
-                Request {
-                    request_type: Some(RequestType::SubscribeEvents(SubscribeEvents {})),
-                },
+                RequestType::SubscribeEvents(SubscribeEvents {}).into(),
             ),
             WorkerRequest::new(
                 "Yet another request".to_string(),
-                Request {
-                    request_type: Some(RequestType::Status(Status {})),
-                },
+                RequestType::Status(Status {}).into(),
             ),
         ];
 

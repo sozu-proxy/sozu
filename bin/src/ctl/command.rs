@@ -95,9 +95,7 @@ impl CommandManager {
     pub fn upgrade_main(&mut self) -> Result<(), anyhow::Error> {
         println!("Preparing to upgrade proxy...");
 
-        self.send_request(Request {
-            request_type: Some(RequestType::ListWorkers(ListWorkers {})),
-        })?;
+        self.send_request(RequestType::ListWorkers(ListWorkers {}).into())?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -128,9 +126,7 @@ impl CommandManager {
                         table.printstd();
                         println!();
 
-                        self.send_request(Request {
-                            request_type: Some(RequestType::UpgradeMain(UpgradeMain {})),
-                        })?;
+                        self.send_request(RequestType::UpgradeMain(UpgradeMain {}).into())?;
 
                         println!("Upgrading main process");
 
@@ -197,9 +193,7 @@ impl CommandManager {
         println!("upgrading worker {worker_id}");
 
         //FIXME: we should be able to soft stop one specific worker
-        self.send_request(Request {
-            request_type: Some(RequestType::UpgradeWorker(worker_id)),
-        })?;
+        self.send_request(RequestType::UpgradeWorker(worker_id).into())?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -229,14 +223,13 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let request = Request {
-            request_type: Some(RequestType::QueryMetrics(QueryMetricsOptions {
-                list,
-                cluster_ids,
-                backend_ids,
-                metric_names,
-            })),
-        };
+        let request: Request = RequestType::QueryMetrics(QueryMetricsOptions {
+            list,
+            cluster_ids,
+            backend_ids,
+            metric_names,
+        })
+        .into();
 
         // a loop to reperform the query every refresh time
         loop {
@@ -303,9 +296,7 @@ impl CommandManager {
         }
 
         let request = if let Some(ref cluster_id) = cluster_id {
-            Request {
-                request_type: Some(RequestType::QueryClusterById(cluster_id.to_string())),
-            }
+            RequestType::QueryClusterById(cluster_id.to_string()).into()
         } else if let Some(ref domain) = domain {
             let splitted: Vec<String> =
                 domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
@@ -322,13 +313,9 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
             };
 
-            Request {
-                request_type: Some(RequestType::QueryClustersByDomain(query_domain)),
-            }
+            RequestType::QueryClustersByDomain(query_domain).into()
         } else {
-            Request {
-                request_type: Some(RequestType::QueryClustersHashes(QueryClustersHashes {})),
-            }
+            RequestType::QueryClustersHashes(QueryClustersHashes {}).into()
         };
 
         self.send_request(request)?;
@@ -385,9 +372,7 @@ impl CommandManager {
         json: bool,
         filters: QueryCertificatesFilters,
     ) -> Result<(), anyhow::Error> {
-        self.send_request(Request {
-            request_type: Some(RequestType::QueryCertificatesFromWorkers(filters)),
-        })?;
+        self.send_request(RequestType::QueryCertificatesFromWorkers(filters).into())?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -424,9 +409,7 @@ impl CommandManager {
         json: bool,
         filters: QueryCertificatesFilters,
     ) -> anyhow::Result<()> {
-        self.send_request(Request {
-            request_type: Some(RequestType::QueryCertificatesFromTheState(filters)),
-        })?;
+        self.send_request(RequestType::QueryCertificatesFromTheState(filters).into())?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
