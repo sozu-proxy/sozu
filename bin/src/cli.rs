@@ -286,10 +286,10 @@ pub enum StateCmd {
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum ClusterCmd {
     #[clap(
-        name = "get",
+        name = "list",
         about = "Query clusters, all of them, or filtered by id or domain"
     )]
-    Get {
+    List {
         #[clap(short = 'i', long = "id", help = "cluster identifier")]
         id: Option<String>,
         #[clap(short = 'd', long = "domain", help = "cluster domain name")]
@@ -756,22 +756,22 @@ pub enum TcpListenerCmd {
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum CertificateCmd {
     #[clap(
-        name = "get",
+        name = "list",
         about = "Query all certificates, or filtered by fingerprint or domain name.
 This command queries the state of Sōzu by default, but can show results for all workers.
 Use the --json option to get a much more verbose result, with certificate contents."
     )]
-    Get {
+    List {
         #[clap(
             short = 'f',
             long = "fingerprint",
-            help = "get the certificates for a given fingerprint"
+            help = "get the certificate for a given fingerprint"
         )]
         fingerprint: Option<String>,
         #[clap(
             short = 'd',
             long = "domain",
-            help = "get certificates for a domain name"
+            help = "list certificates for a domain name"
         )]
         domain: Option<String>,
         #[clap(

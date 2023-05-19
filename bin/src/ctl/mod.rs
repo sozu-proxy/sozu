@@ -143,7 +143,7 @@ impl CommandManager {
                     old_fingerprint.as_deref(),
                     tls_versions,
                 ),
-                CertificateCmd::Get {
+                CertificateCmd::List {
                     fingerprint,
                     domain,
                     query_workers,
