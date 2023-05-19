@@ -63,10 +63,10 @@ For a given cluster, Sōzu keeps a list of backends to which the connection is r
 Sōzu detects broken servers and redirects traffic only to healthy ones, with several available loadbalancing algorithms:
 round robin (default), random, least_loaded, and power of two.
 
-## SSL
+## TLS
 
-Sōzu is an SSL endpoint, powered by rustls.
-It decrypts the traffic using the SSL key and certificate, and forwards it, unencrypted, to the backends.
+Sōzu is an TLS endpoint, powered by rustls.
+It decrypts the traffic using the TLS key and certificate, and forwards it, unencrypted, to the backends.
 
 ## Deep dive
 
