@@ -11,7 +11,7 @@ use sozu_command_lib::{
     channel::Channel,
     logging::{Logger, LoggerBackend},
     proto::command::{
-        request::RequestType, AddBackend, LoadBalancingParams, Request, RequestTcpFrontend,
+        request::RequestType, AddBackend, LoadBalancingParams, RequestTcpFrontend,
         TcpListenerConfig,
     },
     request::WorkerRequest,
@@ -70,16 +70,12 @@ fn main() -> anyhow::Result<()> {
 
     command.write_message(&WorkerRequest {
         id: String::from("ID_ABCD"),
-        content: Request {
-            request_type: Some(RequestType::AddTcpFrontend(tcp_front)),
-        },
+        content: RequestType::AddTcpFrontend(tcp_front).into(),
     });
 
     command.write_message(&WorkerRequest {
         id: String::from("ID_EFGH"),
-        content: Request {
-            request_type: Some(RequestType::AddBackend(tcp_backend)),
-        },
+        content: RequestType::AddBackend(tcp_backend).into(),
     });
 
     info!("TCP -> {:?}", command.read_message());

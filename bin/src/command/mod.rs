@@ -662,9 +662,7 @@ impl CommandServer {
         new_worker
             .send(
                 format!("RESTART-{new_worker_id}-STATUS"),
-                Request {
-                    request_type: Some(RequestType::Status(Status {})),
-                },
+                RequestType::Status(Status {}).into(),
             )
             .await;
 

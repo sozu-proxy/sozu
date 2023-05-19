@@ -14,7 +14,7 @@ use sozu_command_lib::{
     logging::{Logger, LoggerBackend},
     proto::command::{
         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, Request, RequestHttpFrontend, RulePosition,
+        PathRule, RequestHttpFrontend, RulePosition,
     },
     request::WorkerRequest,
     response::WorkerResponse,
@@ -87,27 +87,21 @@ fn main() -> anyhow::Result<()> {
     command_channel
         .write_message(&WorkerRequest {
             id: String::from("add-the-cluster"),
-            content: Request {
-                request_type: Some(RequestType::AddCluster(cluster)),
-            },
+            content: RequestType::AddCluster(cluster).into(),
         })
         .expect("Could not send AddHttpFrontend request");
 
     command_channel
         .write_message(&WorkerRequest {
             id: String::from("add-the-frontend"),
-            content: Request {
-                request_type: Some(RequestType::AddHttpFrontend(http_front)),
-            },
+            content: RequestType::AddHttpFrontend(http_front).into(),
         })
         .expect("Could not send AddHttpFrontend request");
 
     command_channel
         .write_message(&WorkerRequest {
             id: String::from("add-the-backend"),
-            content: Request {
-                request_type: Some(RequestType::AddBackend(http_backend)),
-            },
+            content: RequestType::AddBackend(http_backend).into(),
         })
         .expect("Could not send AddBackend request");
 

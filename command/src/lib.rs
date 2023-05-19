@@ -50,10 +50,10 @@ pub mod parser;
 /// }
 /// ```
 ///
-/// and must be instantiated this way:
+/// but can be instantiated this way:
 ///
 /// ```ignore
-/// let load_state_request = Request { request_type: Some(RequestType::LoadState(path)) };
+/// let load_state_request: Request = RequestType::LoadState(path).into();
 /// ```
 ///
 /// A bit cumbersome, but it is the only way to benefit from protobuf in Rust.
