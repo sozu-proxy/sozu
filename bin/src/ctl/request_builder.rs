@@ -199,7 +199,7 @@ impl CommandManager {
             ClusterCmd::Remove { id } => self.order_request(Request {
                 request_type: Some(RequestType::RemoveCluster(id)),
             }),
-            ClusterCmd::Get { id, domain } => self.query_cluster(json, id, domain),
+            ClusterCmd::List { id, domain } => self.query_cluster(json, id, domain),
         }
     }
 
