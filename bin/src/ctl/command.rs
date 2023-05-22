@@ -26,7 +26,7 @@ struct WorkerStatus<'a> {
 }
 
 impl CommandManager {
-    fn send_request(&mut self, request: Request) -> anyhow::Result<()> {
+    fn write_request_on_channel(&mut self, request: Request) -> anyhow::Result<()> {
         self.channel
             .write_message(&request)
             .with_context(|| "Could not write the request")
@@ -38,11 +38,11 @@ impl CommandManager {
             .with_context(|| "Command timeout. The proxy didn't send an answer")
     }
 
-    pub fn order_request(&mut self, request: Request) -> Result<(), anyhow::Error> {
-        self.order_request_to_all_workers(request, false)
+    pub fn send_request(&mut self, request: Request) -> Result<(), anyhow::Error> {
+        self.send_request_to_workers(request, false)
     }
 
-    pub fn order_request_to_all_workers(
+    pub fn send_request_to_workers(
         &mut self,
         request: Request,
         json: bool,
@@ -95,7 +95,7 @@ impl CommandManager {
     pub fn upgrade_main(&mut self) -> Result<(), anyhow::Error> {
         println!("Preparing to upgrade proxy...");
 
-        self.send_request(RequestType::ListWorkers(ListWorkers {}).into())?;
+        self.write_request_on_channel(RequestType::ListWorkers(ListWorkers {}).into())?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -126,7 +126,9 @@ impl CommandManager {
                         table.printstd();
                         println!();
 
-                        self.send_request(RequestType::UpgradeMain(UpgradeMain {}).into())?;
+                        self.write_request_on_channel(
+                            RequestType::UpgradeMain(UpgradeMain {}).into(),
+                        )?;
 
                         println!("Upgrading main process");
 
@@ -193,7 +195,7 @@ impl CommandManager {
         println!("upgrading worker {worker_id}");
 
         //FIXME: we should be able to soft stop one specific worker
-        self.send_request(RequestType::UpgradeWorker(worker_id).into())?;
+        self.write_request_on_channel(RequestType::UpgradeWorker(worker_id).into())?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -233,7 +235,7 @@ impl CommandManager {
 
         // a loop to reperform the query every refresh time
         loop {
-            self.send_request(request.clone())?;
+            self.write_request_on_channel(request.clone())?;
 
             print!("{}", termion::cursor::Save);
 
@@ -318,7 +320,7 @@ impl CommandManager {
             RequestType::QueryClustersHashes(QueryClustersHashes {}).into()
         };
 
-        self.send_request(request)?;
+        self.write_request_on_channel(request)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -372,7 +374,7 @@ impl CommandManager {
         json: bool,
         filters: QueryCertificatesFilters,
     ) -> Result<(), anyhow::Error> {
-        self.send_request(RequestType::QueryCertificatesFromWorkers(filters).into())?;
+        self.write_request_on_channel(RequestType::QueryCertificatesFromWorkers(filters).into())?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -409,7 +411,7 @@ impl CommandManager {
         json: bool,
         filters: QueryCertificatesFilters,
     ) -> anyhow::Result<()> {
-        self.send_request(RequestType::QueryCertificatesFromTheState(filters).into())?;
+        self.write_request_on_channel(RequestType::QueryCertificatesFromTheState(filters).into())?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;

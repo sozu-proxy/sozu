@@ -389,7 +389,7 @@ pub fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), anyho
 }
 
 /// Creates an empty table of the form
-/// ```
+/// ```text
 /// ┌────────────┬─────────────┬───────────┬────────┐
 /// │            │ header      │ header    │ header │
 /// ├────────────┼─────────────┼───────────┼────────┤

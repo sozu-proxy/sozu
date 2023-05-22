@@ -26,42 +26,31 @@ impl CommandManager {
     pub fn save_state(&mut self, path: String) -> anyhow::Result<()> {
         println!("Loading the state to file {path}");
 
-        self.order_request(RequestType::SaveState(path).into())
+        self.send_request(RequestType::SaveState(path).into())
     }
 
     pub fn load_state(&mut self, path: String) -> anyhow::Result<()> {
         println!("Loading the state on path {path}");
 
-        self.order_request(RequestType::LoadState(path).into())
+        self.send_request(RequestType::LoadState(path).into())
     }
 
     pub fn soft_stop(&mut self) -> anyhow::Result<()> {
         println!("shutting down proxy softly");
 
-        self.order_request_to_all_workers(RequestType::SoftStop(SoftStop {}).into(), false)
+        self.send_request_to_workers(RequestType::SoftStop(SoftStop {}).into(), false)
     }
 
     pub fn hard_stop(&mut self) -> anyhow::Result<()> {
         println!("shutting down proxy the hard way");
 
-        self.order_request_to_all_workers(RequestType::HardStop(HardStop {}).into(), false)
+        self.send_request_to_workers(RequestType::HardStop(HardStop {}).into(), false)
     }
-    /*
-    pub fn upgrade_worker(&mut self, worker_id: u32) -> anyhow::Result<()> {
-        println!("upgrading worker {}", worker_id);
-
-        self.order_command_with_worker_id(
-            CommandRequestOrder::UpgradeWorker(worker_id),
-            Some(worker_id),
-            false,
-        )
-    }
-    */
 
     pub fn status(&mut self, json: bool) -> anyhow::Result<()> {
         println!("Requesting status…");
 
-        self.order_request_to_all_workers(RequestType::Status(Status {}).into(), json)
+        self.send_request_to_workers(RequestType::Status(Status {}).into(), json)
     }
 
     pub fn configure_metrics(&mut self, cmd: MetricsCmd) -> anyhow::Result<()> {
@@ -74,7 +63,7 @@ impl CommandManager {
             _ => bail!("The command passed to the configure_metrics function is wrong."),
         };
 
-        self.order_request(RequestType::ConfigureMetrics(configuration as i32).into())
+        self.send_request(RequestType::ConfigureMetrics(configuration as i32).into())
     }
 
     pub fn reload_configuration(&mut self, path: Option<String>, json: bool) -> anyhow::Result<()> {
@@ -83,7 +72,7 @@ impl CommandManager {
             Some(p) => p,
             None => String::new(),
         };
-        self.order_request_to_all_workers(RequestType::ReloadConfiguration(path).into(), json)
+        self.send_request_to_workers(RequestType::ReloadConfiguration(path).into(), json)
     }
 
     pub fn list_frontends(
@@ -95,7 +84,7 @@ impl CommandManager {
     ) -> anyhow::Result<()> {
         println!("Listing frontends");
 
-        self.order_request(
+        self.send_request(
             RequestType::ListFrontends(FrontendFilters {
                 http,
                 https,
@@ -107,7 +96,7 @@ impl CommandManager {
     }
 
     pub fn events(&mut self) -> anyhow::Result<()> {
-        self.order_request(RequestType::SubscribeEvents(SubscribeEvents {}).into())
+        self.send_request(RequestType::SubscribeEvents(SubscribeEvents {}).into())
     }
 
     pub fn backend_command(&mut self, cmd: BackendCmd) -> anyhow::Result<()> {
@@ -118,7 +107,7 @@ impl CommandManager {
                 address,
                 sticky_id,
                 backup,
-            } => self.order_request(
+            } => self.send_request(
                 RequestType::AddBackend(AddBackend {
                     cluster_id: id,
                     address: address.to_string(),
@@ -133,7 +122,7 @@ impl CommandManager {
                 id,
                 backend_id,
                 address,
-            } => self.order_request(
+            } => self.send_request(
                 RequestType::RemoveBackend(RemoveBackend {
                     cluster_id: id,
                     address: address.to_string(),
@@ -160,7 +149,7 @@ impl CommandManager {
                     (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
                     _ => None,
                 };
-                self.order_request(
+                self.send_request(
                     RequestType::AddCluster(Cluster {
                         cluster_id: id,
                         sticky_session,
@@ -172,14 +161,14 @@ impl CommandManager {
                     .into(),
                 )
             }
-            ClusterCmd::Remove { id } => self.order_request(RequestType::RemoveCluster(id).into()),
+            ClusterCmd::Remove { id } => self.send_request(RequestType::RemoveCluster(id).into()),
             ClusterCmd::List { id, domain } => self.query_cluster(json, id, domain),
         }
     }
 
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> anyhow::Result<()> {
         match cmd {
-            TcpFrontendCmd::Add { id, address, tags } => self.order_request(
+            TcpFrontendCmd::Add { id, address, tags } => self.send_request(
                 RequestType::AddTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address: address.to_string(),
@@ -187,7 +176,7 @@ impl CommandManager {
                 })
                 .into(),
             ),
-            TcpFrontendCmd::Remove { id, address } => self.order_request(
+            TcpFrontendCmd::Remove { id, address } => self.send_request(
                 RequestType::RemoveTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address: address.to_string(),
@@ -209,7 +198,7 @@ impl CommandManager {
                 method,
                 cluster_id: route,
                 tags,
-            } => self.order_request(
+            } => self.send_request(
                 RequestType::AddHttpFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
                     address: address.to_string(),
@@ -232,7 +221,7 @@ impl CommandManager {
                 address,
                 method,
                 cluster_id: route,
-            } => self.order_request(
+            } => self.send_request(
                 RequestType::RemoveHttpFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
                     address: address.to_string(),
@@ -257,7 +246,7 @@ impl CommandManager {
                 method,
                 cluster_id: route,
                 tags,
-            } => self.order_request(
+            } => self.send_request(
                 RequestType::AddHttpsFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
                     address: address.to_string(),
@@ -280,7 +269,7 @@ impl CommandManager {
                 address,
                 method,
                 cluster_id: route,
-            } => self.order_request(
+            } => self.send_request(
                 RequestType::RemoveHttpsFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
                     address: address.to_string(),
@@ -325,7 +314,7 @@ impl CommandManager {
                     .to_tls()
                     .with_context(|| "Error creating HTTPS listener")?;
 
-                self.order_request(RequestType::AddHttpsListener(https_listener).into())
+                self.send_request(RequestType::AddHttpsListener(https_listener).into())
             }
             HttpsListenerCmd::Remove { address } => {
                 self.remove_listener(address.to_string(), ListenerType::Https)
@@ -365,7 +354,7 @@ impl CommandManager {
                     .with_connect_timeout(connect_timeout)
                     .to_http()
                     .with_context(|| "Error creating HTTP listener")?;
-                self.order_request(RequestType::AddHttpListener(http_listener).into())
+                self.send_request(RequestType::AddHttpListener(http_listener).into())
             }
             HttpListenerCmd::Remove { address } => {
                 self.remove_listener(address.to_string(), ListenerType::Http)
@@ -392,7 +381,7 @@ impl CommandManager {
                     .to_tcp()
                     .with_context(|| "Could not create TCP listener")?;
 
-                self.order_request(RequestType::AddTcpListener(listener).into())
+                self.send_request(RequestType::AddTcpListener(listener).into())
             }
             TcpListenerCmd::Remove { address } => {
                 self.remove_listener(address.to_string(), ListenerType::Tcp)
@@ -407,7 +396,7 @@ impl CommandManager {
     }
 
     pub fn list_listeners(&mut self) -> anyhow::Result<()> {
-        self.order_request(RequestType::ListListeners(ListListeners {}).into())
+        self.send_request(RequestType::ListListeners(ListListeners {}).into())
     }
 
     pub fn remove_listener(
@@ -415,7 +404,7 @@ impl CommandManager {
         address: String,
         listener_type: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_request(
+        self.send_request(
             RequestType::RemoveListener(RemoveListener {
                 address: address.parse().with_context(|| "wrong socket address")?,
                 proxy: listener_type.into(),
@@ -429,7 +418,7 @@ impl CommandManager {
         address: String,
         listener_type: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_request(
+        self.send_request(
             RequestType::ActivateListener(ActivateListener {
                 address: address.parse().with_context(|| "wrong socket address")?,
                 proxy: listener_type.into(),
@@ -444,7 +433,7 @@ impl CommandManager {
         address: String,
         listener_type: ListenerType,
     ) -> anyhow::Result<()> {
-        self.order_request(
+        self.send_request(
             RequestType::DeactivateListener(DeactivateListener {
                 address: address.parse().with_context(|| "wrong socket address")?,
                 proxy: listener_type.into(),
@@ -455,7 +444,7 @@ impl CommandManager {
     }
 
     pub fn logging_filter(&mut self, filter: &LoggingLevel) -> anyhow::Result<()> {
-        self.order_request(RequestType::Logging(filter.to_string().to_lowercase()).into())
+        self.send_request(RequestType::Logging(filter.to_string().to_lowercase()).into())
     }
 
     pub fn add_certificate(
@@ -475,7 +464,7 @@ impl CommandManager {
         )
         .with_context(|| "Could not load the full certificate")?;
 
-        self.order_request(
+        self.send_request(
             RequestType::AddCertificate(AddCertificate {
                 address,
                 certificate: new_certificate,
@@ -518,7 +507,7 @@ impl CommandManager {
         )
         .with_context(|| "Could not load the full certificate")?;
 
-        self.order_request(
+        self.send_request(
             RequestType::ReplaceCertificate(ReplaceCertificate {
                 address,
                 new_certificate,
@@ -550,7 +539,7 @@ impl CommandManager {
                 .with_context(|| "Error decoding the given fingerprint")?,
         };
 
-        self.order_request(
+        self.send_request(
             RequestType::RemoveCertificate(RemoveCertificate {
                 address,
                 fingerprint: fingerprint.to_string(),
