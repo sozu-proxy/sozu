@@ -14,14 +14,13 @@ use mio::{
 };
 use slab::Slab;
 use sozu_command::{
-    certificate::Fingerprint,
     channel::Channel,
     config::Config,
     proto::command::{
-        request::RequestType, response_content::ContentType, ActivateListener, AddBackend, Cluster,
-        ClusterHashes, ClusterInformations, DeactivateListener, Event, HttpListenerConfig,
-        HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms, LoadMetric,
-        MetricsConfiguration, RemoveBackend, ResponseStatus,
+        request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
+        CertificatesWithFingerprints, Cluster, ClusterHashes, ClusterInformations,
+        DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, ListenerType,
+        LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, ResponseStatus,
         TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
@@ -919,22 +918,27 @@ impl Server {
                 ));
                 return;
             }
-            Some(RequestType::QueryCertificateByFingerprint(f)) => {
-                let response = match self.config_state.get_certificate(f) {
-                    Some(cert) => WorkerResponse::ok_with_content(
-                        message.id.clone(),
-                        ContentType::CertificateByFingerprint(cert).into(),
-                    ),
-                    None => WorkerResponse::error(
-                        message.id.clone(),
-                        format!(
-                            "Could not find certificate for fingerprint {}",
-                            Fingerprint(f.to_vec())
-                        ),
-                    ),
-                };
-                push_queue(response);
-                return;
+            Some(RequestType::QueryCertificatesFromWorkers(filters)) => {
+                if filters.fingerprint.is_some() {
+                    let certs = self.config_state.get_certificates(filters.clone());
+                    let response = if certs.len() >= 1 {
+                        WorkerResponse::ok_with_content(
+                            message.id.clone(),
+                            ContentType::CertificatesWithFingerprints(
+                                CertificatesWithFingerprints { certs },
+                            )
+                            .into(),
+                        )
+                    } else {
+                        WorkerResponse::error(
+                            message.id.clone(),
+                            format!("Could not find certificate for this fingerprint"),
+                        )
+                    };
+                    push_queue(response);
+                }
+                // if all certificates are queried, or filtered by domain name,
+                // the request will be handled by the https proxy
             }
             Some(RequestType::QueryMetrics(query_metrics_options)) => {
                 METRICS.with(|metrics| {

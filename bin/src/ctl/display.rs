@@ -3,11 +3,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use anyhow::{self, Context};
 use prettytable::{Row, Table};
 
-use sozu_command_lib::proto::command::{
-    filtered_metrics, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
-    ClusterMetrics, FilteredMetrics, ListedFrontends, ListenersList, ResponseContent, WorkerInfos,
-    WorkerMetrics,
+use sozu_command_lib::proto::{
+    command::{
+        filtered_metrics, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
+        CertificateAndKey, CertificatesWithFingerprints, ClusterMetrics, FilteredMetrics,
+        ListedFrontends, ListenersList, ResponseContent, WorkerInfos, WorkerMetrics,
+        WorkerResponses,
+    },
+    display::concatenate_vector,
 };
+use time::format_description;
+use x509_parser::time::ASN1Time;
 
 pub fn print_listeners(listeners_list: ListenersList) {
     println!("\nHTTP LISTENERS\n================");
@@ -382,10 +388,19 @@ pub fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), anyho
     Ok(())
 }
 
-pub fn create_queried_cluster_table(
-    headers: Vec<&str>,
-    data: &BTreeMap<String, ResponseContent>,
-) -> Table {
+/// Creates an empty table of the form
+/// ```text
+/// ┌────────────┬─────────────┬───────────┬────────┐
+/// │            │ header      │ header    │ header │
+/// ├────────────┼─────────────┼───────────┼────────┤
+/// │ cluster_id │             │           │        │
+/// ├────────────┼─────────────┼───────────┼────────┤
+/// │ cluster_id │             │           │        │
+/// ├────────────┼─────────────┼───────────┼────────┤
+/// │ cluster_id │             │           │        │
+/// └────────────┴─────────────┴───────────┴────────┘
+/// ```
+pub fn create_cluster_table(headers: Vec<&str>, data: &BTreeMap<String, ResponseContent>) -> Table {
     let mut table = Table::new();
     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
     let mut row_header: Vec<_> = headers.iter().map(|h| cell!(h)).collect();
@@ -396,243 +411,244 @@ pub fn create_queried_cluster_table(
     table
 }
 
-pub fn print_query_response_data(
+pub fn print_cluster_responses(
     cluster_id: Option<String>,
     domain: Option<String>,
-    content: ResponseContent,
+    worker_responses: WorkerResponses,
     json: bool,
 ) -> anyhow::Result<()> {
     if let Some(needle) = cluster_id.or(domain) {
-        if let Some(ContentType::WorkerResponses(worker_responses)) = &content.content_type {
-            if json {
-                return print_json_response(worker_responses);
-            }
-
-            let cluster_headers = vec!["id", "sticky_session", "https_redirect"];
-            let mut cluster_table =
-                create_queried_cluster_table(cluster_headers, &worker_responses.map);
-
-            let http_headers = vec!["id", "hostname", "path"];
-            let mut frontend_table =
-                create_queried_cluster_table(http_headers, &worker_responses.map);
-
-            let https_headers = vec!["id", "hostname", "path"];
-            let mut https_frontend_table =
-                create_queried_cluster_table(https_headers, &worker_responses.map);
-
-            let tcp_headers = vec!["id", "address"];
-            let mut tcp_frontend_table =
-                create_queried_cluster_table(tcp_headers, &worker_responses.map);
-
-            let backend_headers = vec!["backend id", "IP address", "Backup"];
-            let mut backend_table =
-                create_queried_cluster_table(backend_headers, &worker_responses.map);
-
-            let keys: HashSet<&String> = worker_responses.map.keys().collect();
-
-            let mut cluster_data = HashMap::new();
-            let mut frontend_data = HashMap::new();
-            let mut https_frontend_data = HashMap::new();
-            let mut tcp_frontend_data = HashMap::new();
-            let mut backend_data = HashMap::new();
-
-            for (key, response_content) in worker_responses.map.iter() {
-                //let m: u8 = metrics;
-                if let Some(ContentType::Clusters(clusters)) = &response_content.content_type {
-                    for cluster in clusters.vec.iter() {
-                        let entry = cluster_data.entry(cluster).or_insert(Vec::new());
-                        entry.push(key.to_owned());
-
-                        for frontend in cluster.http_frontends.iter() {
-                            let entry = frontend_data.entry(frontend).or_insert(Vec::new());
-                            entry.push(key.to_owned());
-                        }
-
-                        for frontend in cluster.https_frontends.iter() {
-                            let entry = https_frontend_data.entry(frontend).or_insert(Vec::new());
-                            entry.push(key.to_owned());
-                        }
-
-                        for frontend in cluster.tcp_frontends.iter() {
-                            let entry = tcp_frontend_data.entry(frontend).or_insert(Vec::new());
-                            entry.push(key.to_owned());
-                        }
-
-                        for backend in cluster.backends.iter() {
-                            let entry = backend_data.entry(backend).or_insert(Vec::new());
-                            entry.push(key.to_owned());
-                        }
-                    }
-                }
-            }
-
-            println!("Cluster level configuration for {needle}:\n");
-
-            for (key, values) in cluster_data.iter() {
-                let mut row = Vec::new();
-                row.push(cell!(key
-                    .configuration
-                    .as_ref()
-                    .map(|conf| conf.cluster_id.to_owned())
-                    .unwrap_or_else(String::new)));
-                row.push(cell!(key
-                    .configuration
-                    .as_ref()
-                    .map(|conf| conf.sticky_session)
-                    .unwrap_or_else(|| false)));
-                row.push(cell!(key
-                    .configuration
-                    .as_ref()
-                    .map(|conf| conf.https_redirect)
-                    .unwrap_or_else(|| false)));
-
-                for val in values {
-                    if keys.contains(val) {
-                        row.push(cell!("X"));
-                    } else {
-                        row.push(cell!(""));
-                    }
-                }
-
-                cluster_table.add_row(Row::new(row));
-            }
-
-            cluster_table.printstd();
-
-            println!("\nHTTP frontends configuration for {needle}:\n");
-
-            for (key, values) in frontend_data.iter() {
-                let mut row = Vec::new();
-                match &key.cluster_id {
-                    Some(cluster_id) => row.push(cell!(cluster_id)),
-                    None => row.push(cell!("-")),
-                }
-                row.push(cell!(key.hostname));
-                row.push(cell!(key.path));
-
-                for val in values.iter() {
-                    if keys.contains(val) {
-                        row.push(cell!("X"));
-                    } else {
-                        row.push(cell!(""));
-                    }
-                }
-
-                frontend_table.add_row(Row::new(row));
-            }
-
-            frontend_table.printstd();
-
-            println!("\nHTTPS frontends configuration for {needle}:\n");
-
-            for (key, values) in https_frontend_data.iter() {
-                let mut row = Vec::new();
-                match &key.cluster_id {
-                    Some(cluster_id) => row.push(cell!(cluster_id)),
-                    None => row.push(cell!("-")),
-                }
-                row.push(cell!(key.hostname));
-                row.push(cell!(key.path));
-
-                for val in values.iter() {
-                    if keys.contains(val) {
-                        row.push(cell!("X"));
-                    } else {
-                        row.push(cell!(""));
-                    }
-                }
-
-                https_frontend_table.add_row(Row::new(row));
-            }
-
-            https_frontend_table.printstd();
-
-            println!("\nTCP frontends configuration for {needle}:\n");
-
-            for (key, values) in tcp_frontend_data.iter() {
-                let mut row = vec![cell!(key.cluster_id), cell!(format!("{}", key.address))];
-
-                for val in values.iter() {
-                    if keys.contains(val) {
-                        row.push(cell!(String::from("X")));
-                    } else {
-                        row.push(cell!(String::from("")));
-                    }
-                }
-
-                tcp_frontend_table.add_row(Row::new(row));
-            }
-
-            tcp_frontend_table.printstd();
-
-            println!("\nbackends configuration for {needle}:\n");
-
-            for (key, values) in backend_data.iter() {
-                let mut row = vec![
-                    cell!(key.backend_id),
-                    cell!(format!("{}", key.address)),
-                    cell!(key
-                        .backup
-                        .map(|b| if b { "X" } else { "" })
-                        .unwrap_or_else(|| "")),
-                ];
-
-                for val in values {
-                    if keys.contains(&val) {
-                        row.push(cell!("X"));
-                    } else {
-                        row.push(cell!(""));
-                    }
-                }
-
-                backend_table.add_row(Row::new(row));
-            }
-
-            backend_table.printstd();
+        if json {
+            return print_json_response(&worker_responses);
         }
-    } else if let Some(ContentType::WorkerResponses(worker_responses)) = &content.content_type {
-        let mut table = Table::new();
-        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
-        let mut header = vec![cell!("key")];
-        for key in worker_responses.map.keys() {
-            header.push(cell!(&key));
-        }
-        header.push(cell!("desynchronized"));
-        table.add_row(Row::new(header));
 
-        let mut query_data = HashMap::new();
+        let mut cluster_table = create_cluster_table(
+            vec!["id", "sticky_session", "https_redirect"],
+            &worker_responses.map,
+        );
 
-        for response_content in worker_responses.map.values() {
-            //let m: u8 = metrics;
-            if let Some(ContentType::ClusterHashes(clusters)) = &response_content.content_type {
-                for (key, value) in clusters.map.iter() {
-                    query_data.entry(key).or_insert(Vec::new()).push(value);
+        let mut frontend_table =
+            create_cluster_table(vec!["id", "hostname", "path"], &worker_responses.map);
+
+        let mut https_frontend_table =
+            create_cluster_table(vec!["id", "hostname", "path"], &worker_responses.map);
+
+        let mut tcp_frontend_table =
+            create_cluster_table(vec!["id", "address"], &worker_responses.map);
+
+        let mut backend_table = create_cluster_table(
+            vec!["backend id", "IP address", "Backup"],
+            &worker_responses.map,
+        );
+
+        let worker_ids: HashSet<&String> = worker_responses.map.keys().collect();
+
+        let mut cluster_infos = HashMap::new();
+        let mut http_frontends = HashMap::new();
+        let mut https_frontends = HashMap::new();
+        let mut tcp_frontends = HashMap::new();
+        let mut backends = HashMap::new();
+
+        for (worker_id, response_content) in worker_responses.map.iter() {
+            if let Some(ContentType::Clusters(clusters)) = &response_content.content_type {
+                for cluster in clusters.vec.iter() {
+                    let entry = cluster_infos.entry(cluster).or_insert(Vec::new());
+                    entry.push(worker_id.to_owned());
+
+                    for frontend in cluster.http_frontends.iter() {
+                        let entry = http_frontends.entry(frontend).or_insert(Vec::new());
+                        entry.push(worker_id.to_owned());
+                    }
+
+                    for frontend in cluster.https_frontends.iter() {
+                        let entry = https_frontends.entry(frontend).or_insert(Vec::new());
+                        entry.push(worker_id.to_owned());
+                    }
+
+                    for frontend in cluster.tcp_frontends.iter() {
+                        let entry = tcp_frontends.entry(frontend).or_insert(Vec::new());
+                        entry.push(worker_id.to_owned());
+                    }
+
+                    for backend in cluster.backends.iter() {
+                        let entry = backends.entry(backend).or_insert(Vec::new());
+                        entry.push(worker_id.to_owned());
+                    }
                 }
             }
         }
 
-        for (key, values) in query_data.iter() {
-            let mut row = vec![cell!(key)];
+        println!("Cluster level configuration for {needle}:\n");
+
+        for (cluster_info, workers_the_cluster_is_present_on) in cluster_infos.iter() {
+            let mut row = Vec::new();
+            row.push(cell!(cluster_info
+                .configuration
+                .as_ref()
+                .map(|conf| conf.cluster_id.to_owned())
+                .unwrap_or_else(String::new)));
+            row.push(cell!(cluster_info
+                .configuration
+                .as_ref()
+                .map(|conf| conf.sticky_session)
+                .unwrap_or_else(|| false)));
+            row.push(cell!(cluster_info
+                .configuration
+                .as_ref()
+                .map(|conf| conf.https_redirect)
+                .unwrap_or_else(|| false)));
+
+            for worker in workers_the_cluster_is_present_on {
+                if worker_ids.contains(worker) {
+                    row.push(cell!("X"));
+                } else {
+                    row.push(cell!(""));
+                }
+            }
+
+            cluster_table.add_row(Row::new(row));
+        }
+
+        cluster_table.printstd();
+
+        println!("\nHTTP frontends configuration for {needle}:\n");
+
+        for (key, values) in http_frontends.iter() {
+            let mut row = Vec::new();
+            match &key.cluster_id {
+                Some(cluster_id) => row.push(cell!(cluster_id)),
+                None => row.push(cell!("-")),
+            }
+            row.push(cell!(key.hostname));
+            row.push(cell!(key.path));
+
             for val in values.iter() {
-                row.push(cell!(format!("{val}")));
+                if worker_ids.contains(val) {
+                    row.push(cell!("X"));
+                } else {
+                    row.push(cell!(""));
+                }
             }
 
-            let hs: HashSet<&u64> = values.iter().cloned().collect();
-            if hs.len() > 1 {
-                row.push(cell!("X"));
-            } else {
-                row.push(cell!(""));
-            }
-
-            table.add_row(Row::new(row));
+            frontend_table.add_row(Row::new(row));
         }
 
-        table.printstd();
+        frontend_table.printstd();
+
+        println!("\nHTTPS frontends configuration for {needle}:\n");
+
+        for (key, values) in https_frontends.iter() {
+            let mut row = Vec::new();
+            match &key.cluster_id {
+                Some(cluster_id) => row.push(cell!(cluster_id)),
+                None => row.push(cell!("-")),
+            }
+            row.push(cell!(key.hostname));
+            row.push(cell!(key.path));
+
+            for val in values.iter() {
+                if worker_ids.contains(val) {
+                    row.push(cell!("X"));
+                } else {
+                    row.push(cell!(""));
+                }
+            }
+
+            https_frontend_table.add_row(Row::new(row));
+        }
+
+        https_frontend_table.printstd();
+
+        println!("\nTCP frontends configuration for {needle}:\n");
+
+        for (key, values) in tcp_frontends.iter() {
+            let mut row = vec![cell!(key.cluster_id), cell!(format!("{}", key.address))];
+
+            for val in values.iter() {
+                if worker_ids.contains(val) {
+                    row.push(cell!(String::from("X")));
+                } else {
+                    row.push(cell!(String::from("")));
+                }
+            }
+
+            tcp_frontend_table.add_row(Row::new(row));
+        }
+
+        tcp_frontend_table.printstd();
+
+        println!("\nbackends configuration for {needle}:\n");
+
+        for (key, values) in backends.iter() {
+            let mut row = vec![
+                cell!(key.backend_id),
+                cell!(format!("{}", key.address)),
+                cell!(key
+                    .backup
+                    .map(|b| if b { "X" } else { "" })
+                    .unwrap_or_else(|| "")),
+            ];
+
+            for val in values {
+                if worker_ids.contains(&val) {
+                    row.push(cell!("X"));
+                } else {
+                    row.push(cell!(""));
+                }
+            }
+
+            backend_table.add_row(Row::new(row));
+        }
+
+        backend_table.printstd();
+
+        return Ok(());
     }
+
+    // display all clusters in a simplified table showing their hashes
+    let mut clusters_table = Table::new();
+    clusters_table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+    let mut header = vec![cell!("cluster id")];
+    for worker_id in worker_responses.map.keys() {
+        header.push(cell!(format!("worker {}", worker_id)));
+    }
+    header.push(cell!("desynchronized"));
+    clusters_table.add_row(Row::new(header));
+
+    let mut cluster_hashes = HashMap::new();
+
+    for response_content in worker_responses.map.values() {
+        if let Some(ContentType::ClusterHashes(hashes)) = &response_content.content_type {
+            for (cluster_id, hash) in hashes.map.iter() {
+                cluster_hashes
+                    .entry(cluster_id)
+                    .or_insert(Vec::new())
+                    .push(hash);
+            }
+        }
+    }
+
+    for (cluster_id, hashes) in cluster_hashes.iter() {
+        let mut row = vec![cell!(cluster_id)];
+        for val in hashes.iter() {
+            row.push(cell!(format!("{val}")));
+        }
+
+        let hs: HashSet<&u64> = hashes.iter().cloned().collect();
+        if hs.len() > 1 {
+            row.push(cell!("X"));
+        } else {
+            row.push(cell!(""));
+        }
+
+        clusters_table.add_row(Row::new(row));
+    }
+
+    clusters_table.printstd();
     Ok(())
 }
 
-pub fn print_certificates(
+pub fn print_certificates_by_worker(
     response_contents: BTreeMap<String, ResponseContent>,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -641,29 +657,24 @@ pub fn print_certificates(
         return Ok(());
     }
 
-    for (_worker_id, response_content) in response_contents.iter() {
+    for (worker_id, response_content) in response_contents.iter() {
+        println!("Worker {}", worker_id);
         match &response_content.content_type {
-            Some(ContentType::Certificates(list)) => {
+            Some(ContentType::CertificatesByAddress(list)) => {
                 for certs in list.certificates.iter() {
                     println!("\t{}:", certs.address);
 
                     for summary in certs.certificate_summaries.iter() {
-                        println!(
-                            "\t\t{}:\t{}",
-                            summary.domain,
-                            hex::encode(&summary.fingerprint)
-                        );
+                        println!("\t\t{}", summary);
                     }
 
                     println!();
                 }
             }
-            Some(ContentType::CertificateByFingerprint(cert)) => {
-                println!(
-                    "\tfrontends: {:?}\ncertificate:\n{}",
-                    cert.names, cert.certificate
-                );
-            }
+            Some(ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints {
+                certs,
+            })) => print_certificates_with_validity(certs.clone())?,
+
             _ => {}
         }
         println!();
@@ -697,4 +708,49 @@ fn list_string_vec(vec: &[String]) -> String {
         output.push('\n');
     }
     output
+}
+
+pub fn print_certificates_with_validity(
+    certs: BTreeMap<String, CertificateAndKey>,
+) -> anyhow::Result<()> {
+    let mut table = Table::new();
+    table.set_format(*prettytable::format::consts::FORMAT_CLEAN);
+    table.add_row(row![
+        "fingeprint",
+        "valid not before",
+        "valide not after",
+        "domain names",
+    ]);
+
+    for (fingerprint, cert) in certs {
+        let (_unparsed, pem_certificate) =
+            x509_parser::pem::parse_x509_pem(cert.certificate.as_bytes())
+                .with_context(|| "Could not parse pem certificate")?;
+
+        let x509_certificate = pem_certificate
+            .parse_x509()
+            .with_context(|| "Could not parse x509 certificate")?;
+
+        let validity = x509_certificate.validity();
+
+        table.add_row(row!(
+            fingerprint,
+            format_datetime(validity.not_before)?,
+            format_datetime(validity.not_after)?,
+            concatenate_vector(&cert.names),
+        ));
+    }
+    table.printstd();
+
+    Ok(())
+}
+
+// ISO 8601
+fn format_datetime(asn1_time: ASN1Time) -> anyhow::Result<String> {
+    let datetime = asn1_time.to_datetime();
+
+    let formatted = datetime
+        .format(&format_description::well_known::Iso8601::DEFAULT)
+        .with_context(|| "Could not format the datetime to ISO 8601")?;
+    Ok(formatted)
 }

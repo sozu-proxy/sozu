@@ -19,9 +19,10 @@ use sozu_command_lib::{
     parser::parse_several_commands,
     proto::command::{
         request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
-        ClusterHashes, ClusterInformations, FrontendFilters, ListedFrontends, ListenersList,
-        MetricsConfiguration, Request, Response, ResponseContent, ResponseStatus,
-        ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
+        CertificatesWithFingerprints, ClusterHashes, ClusterInformations, FrontendFilters,
+        MetricsConfiguration, QueryCertificatesFilters, Request, Response, ResponseContent,
+        ResponseStatus, ReturnListenSockets, RunState, SoftStop, Status, WorkerInfo, WorkerInfos,
+        WorkerResponses,
     },
     request::WorkerRequest,
     scm_socket::Listeners,
@@ -72,10 +73,11 @@ impl CommandServer {
                 self.reload_configuration(client_id, path).await
             }
             Some(RequestType::Status(_)) => self.status(client_id).await,
-            Some(RequestType::QueryCertificateByFingerprint(_))
-            | Some(RequestType::QueryCertificatesByDomain(_))
-            | Some(RequestType::QueryAllCertificates(_))
-            | Some(RequestType::QueryClusterById(_))
+            Some(RequestType::QueryCertificatesFromTheState(filters)) => {
+                self.query_certificates_from_the_state(filters)
+            }
+            Some(RequestType::QueryClusterById(_))
+            | Some(RequestType::QueryCertificatesFromWorkers(_))
             | Some(RequestType::QueryClustersByDomain(_))
             | Some(RequestType::QueryClustersHashes(_))
             | Some(RequestType::QueryMetrics(_)) => self.query(client_id, request).await,
@@ -93,6 +95,7 @@ impl CommandServer {
         match result {
             Ok(Some(success)) => {
                 info!("{}", success);
+                trace!("details success of the client request: {:?}", success);
                 return_success(self.command_tx.clone(), cloned_client_id, success).await;
             }
             Err(anyhow_error) => {
@@ -338,46 +341,7 @@ impl CommandServer {
             filters
         );
 
-        // if no http / https / tcp filter is provided, list all of them
-        let list_all = !filters.http && !filters.https && !filters.tcp;
-
-        let mut listed_frontends = ListedFrontends::default();
-
-        if filters.http || list_all {
-            for http_frontend in self.state.http_fronts.iter().filter(|f| {
-                if let Some(domain) = &filters.domain {
-                    f.1.hostname.contains(domain)
-                } else {
-                    true
-                }
-            }) {
-                listed_frontends
-                    .http_frontends
-                    .push(http_frontend.1.to_owned().into());
-            }
-        }
-
-        if filters.https || list_all {
-            for https_frontend in self.state.https_fronts.iter().filter(|f| {
-                if let Some(domain) = &filters.domain {
-                    f.1.hostname.contains(domain)
-                } else {
-                    true
-                }
-            }) {
-                listed_frontends
-                    .https_frontends
-                    .push(https_frontend.1.to_owned().into());
-            }
-        }
-
-        if (filters.tcp || list_all) && filters.domain.is_none() {
-            for tcp_frontend in self.state.tcp_fronts.values().flat_map(|v| v.iter()) {
-                listed_frontends
-                    .tcp_frontends
-                    .push(tcp_frontend.to_owned().into())
-            }
-        }
+        let listed_frontends = self.state.list_frontends(filters);
 
         Ok(Some(Success::ListFrontends(
             ContentType::FrontendList(listed_frontends).into(),
@@ -385,13 +349,10 @@ impl CommandServer {
     }
 
     fn list_listeners(&self) -> anyhow::Result<Option<Success>> {
+        let listeners_list = self.state.list_listeners();
+
         Ok(Some(Success::ListListeners(
-            ContentType::ListenersList(ListenersList {
-                http_listeners: self.state.http_listeners.clone(),
-                https_listeners: self.state.https_listeners.clone(),
-                tcp_listeners: self.state.tcp_listeners.clone(),
-            })
-            .into(),
+            ContentType::ListenersList(listeners_list).into(),
         )))
     }
 
@@ -410,6 +371,23 @@ impl CommandServer {
 
         Ok(Some(Success::ListWorkers(
             ContentType::Workers(WorkerInfos { vec: workers }).into(),
+        )))
+    }
+
+    pub fn query_certificates_from_the_state(
+        &self,
+        filters: QueryCertificatesFilters,
+    ) -> anyhow::Result<Option<Success>> {
+        debug!(
+            "querying certificates in the state with filters {}",
+            filters
+        );
+
+        let certs = self.state.get_certificates(filters);
+
+        Ok(Some(Success::CertificatesFromTheState(
+            ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints { certs })
+                .into(),
         )))
     }
 
@@ -585,9 +563,7 @@ impl CommandServer {
             .with_context(|| "No sender on new worker".to_string())?
             .send(WorkerRequest {
                 id: format!("UPGRADE-{worker_id}-STATUS"),
-                content: Request {
-                    request_type: Some(RequestType::Status(Status {})),
-                },
+                content: RequestType::Status(Status {}).into(),
             })
             .await
             .with_context(|| {
@@ -617,11 +593,7 @@ impl CommandServer {
             old_worker
                 .send(
                     id.clone(),
-                    Request {
-                        request_type: Some(RequestType::ReturnListenSockets(
-                            ReturnListenSockets {},
-                        )),
-                    },
+                    RequestType::ReturnListenSockets(ReturnListenSockets {}).into(),
                 )
                 .await;
 
@@ -683,9 +655,7 @@ impl CommandServer {
             old_worker
                 .send(
                     softstop_id.clone(),
-                    Request {
-                        request_type: Some(RequestType::SoftStop(SoftStop {})),
-                    },
+                    RequestType::SoftStop(SoftStop {}).into(),
                 )
                 .await;
 
@@ -903,9 +873,7 @@ impl CommandServer {
                 worker
                     .send(
                         worker_request_id.clone(),
-                        Request {
-                            request_type: Some(RequestType::Status(Status {})),
-                        },
+                        RequestType::Status(Status {}).into(),
                     )
                     .await;
                 count += 1;
@@ -979,9 +947,7 @@ impl CommandServer {
             worker
                 .send(
                     req_id.clone(),
-                    Request {
-                        request_type: Some(RequestType::ConfigureMetrics(config as i32)),
-                    },
+                    RequestType::ConfigureMetrics(config as i32).into(),
                 )
                 .await;
             count += 1;
@@ -1122,6 +1088,8 @@ impl CommandServer {
                 }
             }
 
+            debug!("Received these worker responses: {:?}", responses);
+
             let mut worker_responses: BTreeMap<String, ResponseContent> = responses
                 .into_iter()
                 .filter_map(|(worker_id, proxy_response)| {
@@ -1135,17 +1103,19 @@ impl CommandServer {
                 &Some(RequestType::QueryClustersHashes(_))
                 | &Some(RequestType::QueryClusterById(_))
                 | &Some(RequestType::QueryClustersByDomain(_)) => {
-                    let main = main_response_content.unwrap(); // we should refactor to avoid this unwrap()
-                    worker_responses.insert(String::from("main"), main);
+                    if let Some(main_response) = main_response_content {
+                        worker_responses.insert(String::from("main"), main_response);
+                    }
                     ContentType::WorkerResponses(WorkerResponses {
                         map: worker_responses,
                     })
                     .into()
                 }
-                &Some(RequestType::QueryCertificatesByDomain(_))
-                | &Some(RequestType::QueryCertificateByFingerprint(_))
-                | &Some(RequestType::QueryAllCertificates(_)) => {
-                    info!("certificates query answer received: {:?}", worker_responses);
+                &Some(RequestType::QueryCertificatesFromWorkers(_)) => {
+                    info!(
+                        "Received a response to the certificates query: {:?}",
+                        worker_responses
+                    );
                     ContentType::WorkerResponses(WorkerResponses {
                         map: worker_responses,
                     })
@@ -1376,9 +1346,9 @@ impl CommandServer {
                 let success_message = success.to_string();
 
                 let command_response_data = match success {
-                    // should list Success::Metrics(crd) as well
                     Success::ListFrontends(crd)
                     | Success::ListWorkers(crd)
+                    | Success::CertificatesFromTheState(crd)
                     | Success::Query(crd)
                     | Success::ListListeners(crd)
                     | Success::Status(crd) => Some(crd),
@@ -1465,7 +1435,10 @@ async fn return_success(
         client_id,
         advancement: Advancement::Ok(success),
     };
-    trace!("return_success: sending event to the command server");
+    trace!(
+        "return_success: sending event to the command server: {:?}",
+        advancement
+    );
     if let Err(e) = command_tx.send(advancement).await {
         error!("Error while returning success to the command server: {}", e)
     }

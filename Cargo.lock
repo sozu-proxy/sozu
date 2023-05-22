@@ -1763,6 +1763,7 @@ dependencies = [
  "tempfile",
  "termion",
  "time",
+ "x509-parser",
 ]
 
 [[package]]

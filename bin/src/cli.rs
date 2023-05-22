@@ -162,6 +162,13 @@ pub enum SubCmd {
     },
     #[clap(name = "cluster", about = "cluster management")]
     Cluster {
+        #[clap(
+            short = 'j',
+            long = "json",
+            help = "Print the command result in JSON format",
+            global = true
+        )]
+        json: bool,
         #[clap(subcommand)]
         cmd: ClusterCmd,
     },
@@ -180,13 +187,8 @@ pub enum SubCmd {
         #[clap(subcommand)]
         cmd: ListenerCmd,
     },
-    #[clap(name = "certificate", about = "certificate management")]
+    #[clap(name = "certificate", about = "list, add and remove certificates")]
     Certificate {
-        #[clap(subcommand)]
-        cmd: CertificateCmd,
-    },
-    #[clap(name = "query", about = "configuration state verification")]
-    Query {
         #[clap(
             short = 'j',
             long = "json",
@@ -195,7 +197,7 @@ pub enum SubCmd {
         )]
         json: bool,
         #[clap(subcommand)]
-        cmd: QueryCmd,
+        cmd: CertificateCmd,
     },
     #[clap(name = "config", about = "configuration file management")]
     Config {
@@ -283,6 +285,16 @@ pub enum StateCmd {
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum ClusterCmd {
+    #[clap(
+        name = "list",
+        about = "Query clusters, all of them, or filtered by id or domain"
+    )]
+    List {
+        #[clap(short = 'i', long = "id", help = "cluster identifier")]
+        id: Option<String>,
+        #[clap(short = 'd', long = "domain", help = "cluster domain name")]
+        domain: Option<String>,
+    },
     #[clap(name = "remove", about = "Remove a cluster")]
     Remove {
         #[clap(short = 'i', long = "id", help = "cluster id")]
@@ -743,6 +755,32 @@ pub enum TcpListenerCmd {
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum CertificateCmd {
+    #[clap(
+        name = "list",
+        about = "Query all certificates, or filtered by fingerprint or domain name.
+This command queries the state of Sōzu by default, but can show results for all workers.
+Use the --json option to get a much more verbose result, with certificate contents."
+    )]
+    List {
+        #[clap(
+            short = 'f',
+            long = "fingerprint",
+            help = "get the certificate for a given fingerprint"
+        )]
+        fingerprint: Option<String>,
+        #[clap(
+            short = 'd',
+            long = "domain",
+            help = "list certificates for a domain name"
+        )]
+        domain: Option<String>,
+        #[clap(
+            short = 'w',
+            long = "workers",
+            help = "Show results for each worker (slower)"
+        )]
+        query_workers: bool,
+    },
     #[clap(name = "add", about = "Add a certificate")]
     Add {
         #[clap(
@@ -806,27 +844,6 @@ pub enum CertificateCmd {
         #[clap(long = "tls-versions", help = "accepted TLS versions for this certificate",
                 value_parser = parse_tls_versions)]
         tls_versions: Vec<TlsVersion>,
-    },
-}
-
-#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
-pub enum QueryCmd {
-    #[clap(name = "clusters", about = "Query clusters matching a specific filter")]
-    Clusters {
-        #[clap(short = 'i', long = "id", help = "cluster identifier")]
-        id: Option<String>,
-        #[clap(short = 'd', long = "domain", help = "cluster domain name")]
-        domain: Option<String>,
-    },
-    #[clap(
-        name = "certificates",
-        about = "Query certificates matching a specific filter"
-    )]
-    Certificates {
-        #[clap(short = 'f', long = "fingerprint", help = "certificate fingerprint")]
-        fingerprint: Option<String>,
-        #[clap(short = 'd', long = "domain", help = "domain name")]
-        domain: Option<String>,
     },
 }
 

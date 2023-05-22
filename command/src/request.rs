@@ -36,9 +36,7 @@ impl Request {
             RequestType::AddHttpsFrontend(_)
             | RequestType::RemoveHttpsFrontend(_)
             | RequestType::AddCertificate(_)
-            | RequestType::QueryAllCertificates(_)
-            | RequestType::QueryCertificatesByDomain(_)
-            | RequestType::QueryCertificateByFingerprint(_)
+            | RequestType::QueryCertificatesFromWorkers(_)
             | RequestType::ReplaceCertificate(_)
             | RequestType::RemoveCertificate(_) => proxy_destination.to_https_proxy = true,
 
@@ -76,6 +74,7 @@ impl Request {
 
             // These won't ever reach a worker anyway
             RequestType::SaveState(_)
+            | RequestType::QueryCertificatesFromTheState(_)
             | RequestType::LoadState(_)
             | RequestType::ListWorkers(_)
             | RequestType::ListFrontends(_)

@@ -169,9 +169,7 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
             worker_channel
                 .write_message(&WorkerRequest {
                     id: format!("start-status-{index}"),
-                    content: Request {
-                        request_type: Some(RequestType::Status(Status {})),
-                    },
+                    content: RequestType::Status(Status {}).into(),
                 })
                 .with_context(|| "Could not send status request to the worker")?;
 

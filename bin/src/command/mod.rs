@@ -46,6 +46,7 @@ mod requests;
 
 /// The CommandServer receives these CommandMessages, either from within Sōzu,
 /// or from without, in which case they are ALWAYS of the Clientrequest variant.
+#[derive(Debug)]
 enum CommandMessage {
     ClientNew {
         client_id: String,
@@ -79,10 +80,11 @@ pub enum Advancement {
     Ok(Success),
 }
 
-// Indicates success of either inner Sōzu logic and of handling the ClientRequest,
-// in which case Success caries the response data.
+/// Indicates success of either inner Sōzu logic and of handling the ClientRequest,
+/// in which case Success caries the response data.
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub enum Success {
+    CertificatesFromTheState(ResponseContent),
     ClientClose(String), // the client id
     ClientNew(String),   // the client id
     HandledClientRequest,
@@ -117,6 +119,9 @@ pub enum Success {
 impl std::fmt::Display for Success {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
+            Self::CertificatesFromTheState(_) => {
+                write!(f, "Successfully queried certificates from the state")
+            }
             Self::ClientClose(id) => write!(f, "Close client: {id}"),
             Self::ClientNew(id) => write!(f, "New client successfully added: {id}"),
             Self::HandledClientRequest => write!(f, "Successfully handled the client request"),
@@ -657,9 +662,7 @@ impl CommandServer {
         new_worker
             .send(
                 format!("RESTART-{new_worker_id}-STATUS"),
-                Request {
-                    request_type: Some(RequestType::Status(Status {})),
-                },
+                RequestType::Status(Status {}).into(),
             )
             .await;
 

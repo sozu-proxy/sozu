@@ -15,7 +15,7 @@ use sozu_command_lib::{
     logging::{Logger, LoggerBackend},
     proto::command::{
         request::RequestType, AddBackend, AddCertificate, CertificateAndKey, LoadBalancingParams,
-        PathRule, Request, RequestHttpFrontend,
+        PathRule, RequestHttpFrontend,
     },
     request::WorkerRequest,
 };
@@ -78,16 +78,12 @@ fn main() -> anyhow::Result<()> {
 
     command.write_message(&WorkerRequest {
         id: String::from("ID_ABCD"),
-        content: Request {
-            request_type: Some(RequestType::AddHttpFrontend(http_front)),
-        },
+        content: RequestType::AddHttpFrontend(http_front).into(),
     });
 
     command.write_message(&WorkerRequest {
         id: String::from("ID_EFGH"),
-        content: Request {
-            request_type: Some(RequestType::AddBackend(http_backend)),
-        },
+        content: RequestType::AddBackend(http_backend).into(),
     });
 
     info!("MAIN\tHTTP -> {:?}", command.read_message());
@@ -115,15 +111,14 @@ fn main() -> anyhow::Result<()> {
     };
     command2.write_message(&WorkerRequest {
         id: String::from("ID_IJKL1"),
-        content: Request {
-            request_type: Some(RequestType::AddCertificate(AddCertificate {
-                address: "127.0.0.1:8443"
-                    .parse()
-                    .with_context(|| "Could not parse certificate address")?,
-                certificate: certificate_and_key,
-                expired_at: None,
-            })),
-        },
+        content: RequestType::AddCertificate(AddCertificate {
+            address: "127.0.0.1:8443"
+                .parse()
+                .with_context(|| "Could not parse certificate address")?,
+            certificate: certificate_and_key,
+            expired_at: None,
+        })
+        .into(),
     });
 
     let tls_front = RequestHttpFrontend {
@@ -136,9 +131,7 @@ fn main() -> anyhow::Result<()> {
 
     command2.write_message(&WorkerRequest {
         id: String::from("ID_IJKL2"),
-        content: Request {
-            request_type: Some(RequestType::AddHttpsFrontend(tls_front)),
-        },
+        content: RequestType::AddHttpsFrontend(tls_front).into(),
     });
     let tls_backend = AddBackend {
         cluster_id: String::from("cluster_1"),
@@ -151,9 +144,7 @@ fn main() -> anyhow::Result<()> {
 
     command2.write_message(&WorkerRequest {
         id: String::from("ID_MNOP"),
-        content: Request {
-            request_type: Some(RequestType::AddBackend(tls_backend)),
-        },
+        content: RequestType::AddBackend(tls_backend).into(),
     });
 
     let cert2 = include_str!("../assets/cert_test.pem");
@@ -169,15 +160,14 @@ fn main() -> anyhow::Result<()> {
 
     command2.write_message(&WorkerRequest {
         id: String::from("ID_QRST1"),
-        content: Request {
-            request_type: Some(RequestType::AddCertificate(AddCertificate {
-                address: "127.0.0.1:8443"
-                    .parse()
-                    .with_context(|| "Could not parse certificate address")?,
-                certificate: certificate_and_key2,
-                expired_at: None,
-            })),
-        },
+        content: RequestType::AddCertificate(AddCertificate {
+            address: "127.0.0.1:8443"
+                .parse()
+                .with_context(|| "Could not parse certificate address")?,
+            certificate: certificate_and_key2,
+            expired_at: None,
+        })
+        .into(),
     });
 
     let tls_front2 = RequestHttpFrontend {
@@ -190,9 +180,7 @@ fn main() -> anyhow::Result<()> {
 
     command2.write_message(&WorkerRequest {
         id: String::from("ID_QRST2"),
-        content: Request {
-            request_type: Some(RequestType::AddHttpsFrontend(tls_front2)),
-        },
+        content: RequestType::AddHttpsFrontend(tls_front2).into(),
     });
 
     let tls_backend2 = AddBackend {
@@ -206,9 +194,7 @@ fn main() -> anyhow::Result<()> {
 
     command2.write_message(&WorkerRequest {
         id: String::from("ID_UVWX"),
-        content: Request {
-            request_type: Some(RequestType::AddBackend(tls_backend2)),
-        },
+        content: RequestType::AddBackend(tls_backend2).into(),
     });
 
     info!("MAIN\tTLS -> {:?}", command2.read_message());

@@ -3,7 +3,7 @@ use prettytable::Table;
 use serde::Serialize;
 
 use sozu_command_lib::proto::command::{
-    request::RequestType, response_content::ContentType, ListWorkers, QueryAllCertificates,
+    request::RequestType, response_content::ContentType, ListWorkers, QueryCertificatesFilters,
     QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions, Request, Response,
     ResponseContent, ResponseStatus, RunState, UpgradeMain, WorkerInfo,
 };
@@ -11,8 +11,9 @@ use sozu_command_lib::proto::command::{
 use crate::ctl::{
     create_channel,
     display::{
-        print_available_metrics, print_certificates, print_frontend_list, print_json_response,
-        print_listeners, print_metrics, print_query_response_data, print_status,
+        print_available_metrics, print_certificates_by_worker, print_certificates_with_validity,
+        print_cluster_responses, print_frontend_list, print_json_response, print_listeners,
+        print_metrics, print_status,
     },
     CommandManager,
 };
@@ -25,7 +26,7 @@ struct WorkerStatus<'a> {
 }
 
 impl CommandManager {
-    fn send_request(&mut self, request: Request) -> anyhow::Result<()> {
+    fn write_request_on_channel(&mut self, request: Request) -> anyhow::Result<()> {
         self.channel
             .write_message(&request)
             .with_context(|| "Could not write the request")
@@ -37,11 +38,11 @@ impl CommandManager {
             .with_context(|| "Command timeout. The proxy didn't send an answer")
     }
 
-    pub fn order_request(&mut self, request: Request) -> Result<(), anyhow::Error> {
-        self.order_request_to_all_workers(request, false)
+    pub fn send_request(&mut self, request: Request) -> Result<(), anyhow::Error> {
+        self.send_request_to_workers(request, false)
     }
 
-    pub fn order_request_to_all_workers(
+    pub fn send_request_to_workers(
         &mut self,
         request: Request,
         json: bool,
@@ -94,9 +95,7 @@ impl CommandManager {
     pub fn upgrade_main(&mut self) -> Result<(), anyhow::Error> {
         println!("Preparing to upgrade proxy...");
 
-        self.send_request(Request {
-            request_type: Some(RequestType::ListWorkers(ListWorkers {})),
-        })?;
+        self.write_request_on_channel(RequestType::ListWorkers(ListWorkers {}).into())?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -127,9 +126,9 @@ impl CommandManager {
                         table.printstd();
                         println!();
 
-                        self.send_request(Request {
-                            request_type: Some(RequestType::UpgradeMain(UpgradeMain {})),
-                        })?;
+                        self.write_request_on_channel(
+                            RequestType::UpgradeMain(UpgradeMain {}).into(),
+                        )?;
 
                         println!("Upgrading main process");
 
@@ -196,9 +195,7 @@ impl CommandManager {
         println!("upgrading worker {worker_id}");
 
         //FIXME: we should be able to soft stop one specific worker
-        self.send_request(Request {
-            request_type: Some(RequestType::UpgradeWorker(worker_id)),
-        })?;
+        self.write_request_on_channel(RequestType::UpgradeWorker(worker_id).into())?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -228,18 +225,17 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
     ) -> Result<(), anyhow::Error> {
-        let request = Request {
-            request_type: Some(RequestType::QueryMetrics(QueryMetricsOptions {
-                list,
-                cluster_ids,
-                backend_ids,
-                metric_names,
-            })),
-        };
+        let request: Request = RequestType::QueryMetrics(QueryMetricsOptions {
+            list,
+            cluster_ids,
+            backend_ids,
+            metric_names,
+        })
+        .into();
 
         // a loop to reperform the query every refresh time
         loop {
-            self.send_request(request.clone())?;
+            self.write_request_on_channel(request.clone())?;
 
             print!("{}", termion::cursor::Save);
 
@@ -302,9 +298,7 @@ impl CommandManager {
         }
 
         let request = if let Some(ref cluster_id) = cluster_id {
-            Request {
-                request_type: Some(RequestType::QueryClusterById(cluster_id.to_string())),
-            }
+            RequestType::QueryClusterById(cluster_id.to_string()).into()
         } else if let Some(ref domain) = domain {
             let splitted: Vec<String> =
                 domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
@@ -321,16 +315,12 @@ impl CommandManager {
                 path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
             };
 
-            Request {
-                request_type: Some(RequestType::QueryClustersByDomain(query_domain)),
-            }
+            RequestType::QueryClustersByDomain(query_domain).into()
         } else {
-            Request {
-                request_type: Some(RequestType::QueryClustersHashes(QueryClustersHashes {})),
-            }
+            RequestType::QueryClustersHashes(QueryClustersHashes {}).into()
         };
 
-        self.send_request(request)?;
+        self.write_request_on_channel(request)?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -346,11 +336,11 @@ impl CommandManager {
                     bail!("could not query proxy state: {}", response.message);
                 }
                 ResponseStatus::Ok => {
-                    match response.content {
-                        Some(content) => {
-                            print_query_response_data(cluster_id, domain, content, json)?
-                        }
-                        None => println!("No content in the response"),
+                    if let Some(ResponseContent {
+                        content_type: Some(ContentType::WorkerResponses(worker_responses)),
+                    }) = response.content
+                    {
+                        print_cluster_responses(cluster_id, domain, worker_responses, json)?
                     }
                     break;
                 }
@@ -360,33 +350,31 @@ impl CommandManager {
         Ok(())
     }
 
-    pub fn query_certificate(
+    pub fn query_certificates(
         &mut self,
         json: bool,
         fingerprint: Option<String>,
         domain: Option<String>,
+        query_workers: bool,
     ) -> Result<(), anyhow::Error> {
-        let request = match (fingerprint, domain) {
-            (None, None) => Request {
-                request_type: Some(RequestType::QueryAllCertificates(QueryAllCertificates {})),
-            },
-            (Some(f), None) => match hex::decode(f) {
-                Err(e) => {
-                    bail!("invalid fingerprint: {:?}", e);
-                }
-                Ok(f) => Request {
-                    request_type: Some(RequestType::QueryCertificateByFingerprint(f)),
-                },
-            },
-            (None, Some(d)) => Request {
-                request_type: Some(RequestType::QueryCertificatesByDomain(d)),
-            },
-            (Some(_), Some(_)) => {
-                bail!("Error: Either request a fingerprint or a domain name");
-            }
+        let filters = QueryCertificatesFilters {
+            domain,
+            fingerprint,
         };
 
-        self.send_request(request)?;
+        if query_workers {
+            self.query_certificates_from_workers(json, filters)
+        } else {
+            self.query_certificates_from_the_state(json, filters)
+        }
+    }
+
+    fn query_certificates_from_workers(
+        &mut self,
+        json: bool,
+        filters: QueryCertificatesFilters,
+    ) -> Result<(), anyhow::Error> {
+        self.write_request_on_channel(RequestType::QueryCertificatesFromWorkers(filters).into())?;
 
         loop {
             let response = self.read_channel_message_with_timeout()?;
@@ -400,16 +388,65 @@ impl CommandManager {
                         print_json_response(&response.message)?;
                         bail!("We received an error message");
                     } else {
-                        bail!("could not query proxy state: {}", response.message);
+                        bail!("could not get certificate: {}", response.message);
                     }
                 }
                 ResponseStatus::Ok => {
+                    info!("We did get a response from the proxy");
                     match response.content {
                         Some(ResponseContent {
                             content_type: Some(ContentType::WorkerResponses(worker_responses)),
-                        }) => print_certificates(worker_responses.map, json)?,
+                        }) => print_certificates_by_worker(worker_responses.map, json)?,
                         _ => bail!("unexpected response: {:?}", response.content),
                     }
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn query_certificates_from_the_state(
+        &mut self,
+        json: bool,
+        filters: QueryCertificatesFilters,
+    ) -> anyhow::Result<()> {
+        self.write_request_on_channel(RequestType::QueryCertificatesFromTheState(filters).into())?;
+
+        loop {
+            let response = self.read_channel_message_with_timeout()?;
+
+            match response.status() {
+                ResponseStatus::Processing => {
+                    println!("Proxy is processing: {}", response.message);
+                }
+                ResponseStatus::Failure => {
+                    bail!("could not get certificate: {}", response.message);
+                }
+                ResponseStatus::Ok => {
+                    info!("We did get a response from the proxy");
+                    println!("response message: {:?}\n", response.message);
+
+                    if let Some(response_content) = response.content {
+                        let certs = match response_content.content_type {
+                            Some(ContentType::CertificatesWithFingerprints(certs)) => certs.certs,
+                            _ => bail!(format!("Wrong response content {:?}", response_content)),
+                        };
+                        if certs.is_empty() {
+                            bail!("No certificates match your request.");
+                        }
+
+                        if json {
+                            print_json_response(&certs)
+                                .with_context(|| "Could not print certificates in JSON")?;
+                        } else {
+                            print_certificates_with_validity(certs)
+                                .with_context(|| "Could not show certificate")?;
+                        }
+                    } else {
+                        println!("No response content.");
+                    }
+
                     break;
                 }
             }

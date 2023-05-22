@@ -1115,9 +1115,7 @@ mod tests {
     use crate::sozu_command::{
         channel::Channel,
         config::ListenerBuilder,
-        proto::command::{
-            LoadBalancingAlgorithms, LoadBalancingParams, PathRule, Request, RulePosition,
-        },
+        proto::command::{LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RulePosition},
         request::WorkerRequest,
         response::{Backend, HttpFrontend},
     };
@@ -1173,9 +1171,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                content: Request {
-                    request_type: Some(RequestType::AddHttpFrontend(front)),
-                },
+                content: RequestType::AddHttpFrontend(front).into(),
             })
             .unwrap();
         let backend = Backend {
@@ -1189,9 +1185,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Request {
-                    request_type: Some(RequestType::AddBackend(backend.to_add_backend())),
-                },
+                content: RequestType::AddBackend(backend.to_add_backend()).into(),
             })
             .unwrap();
 
@@ -1260,9 +1254,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                content: Request {
-                    request_type: Some(RequestType::AddHttpFrontend(front)),
-                },
+                content: RequestType::AddHttpFrontend(front).into(),
             })
             .unwrap();
         let backend = Backend {
@@ -1276,9 +1268,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Request {
-                    request_type: Some(RequestType::AddBackend(backend.to_add_backend())),
-                },
+                content: RequestType::AddBackend(backend.to_add_backend()).into(),
             })
             .unwrap();
 
@@ -1373,9 +1363,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_ABCD"),
-                content: Request {
-                    request_type: Some(RequestType::AddCluster(cluster)),
-                },
+                content: RequestType::AddCluster(cluster).into(),
             })
             .unwrap();
         let front = RequestHttpFrontend {
@@ -1388,9 +1376,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_EFGH"),
-                content: Request {
-                    request_type: Some(RequestType::AddHttpFrontend(front)),
-                },
+                content: RequestType::AddHttpFrontend(front).into(),
             })
             .unwrap();
         let backend = Backend {
@@ -1404,9 +1390,7 @@ mod tests {
         command
             .write_message(&WorkerRequest {
                 id: String::from("ID_IJKL"),
-                content: Request {
-                    request_type: Some(RequestType::AddBackend(backend.to_add_backend())),
-                },
+                content: RequestType::AddBackend(backend.to_add_backend()).into(),
             })
             .unwrap();
 

@@ -71,12 +71,6 @@ message Request {
     ActivateListener activate_listener = 30;
     // deactivate a listener
     DeactivateListener deactivate_listener = 31;
-    // query all certificates
-    QueryAllCertificates query_all_certificates = 32;
-    // query a certificate by fingerprint
-    bytes query_certificate_by_fingerprint = 33;
-    // query certificates by domain
-    string query_certificates_by_domain = 34;
     // query a cluster by id
     string query_cluster_by_id = 35;
     // query clusters with a hostname and optional path
@@ -95,6 +89,10 @@ message Request {
     string Logging = 42;
     // Return the listen sockets
     ReturnListenSockets return_listen_sockets = 43;
+    // Get certificates from the state (rather than from the workers)
+    QueryCertificatesFilters query_certificates_from_the_state = 44;
+    // Get certificates from the workers (rather than from the state)
+    QueryCertificatesFilters query_certificates_from_workers = 45;
   }
 }
 
@@ -103,7 +101,6 @@ message ListListeners {}
 message UpgradeMain {}
 message SubscribeEvents {}
 message Status {}
-message QueryAllCertificates {}
 message QueryClustersHashes {}
 message SoftStop {}
 message HardStop {}
@@ -291,6 +288,16 @@ message CertificateAndKey {
     repeated string names = 5;
 }
 
+// Should be either a domain name or a fingerprint.
+// These filter do not compound, use either one but not both.
+// If none of them is specified, all certificates will be returned.
+message QueryCertificatesFilters {
+    // a domain name to filter certificate results
+    optional string domain = 1;
+    // a hex-encoded fingerprint of the TLS certificate to find
+    optional string fingerprint = 2;
+}
+
 // domain name and fingerprint of a certificate
 message CertificateSummary {
     required string domain = 1;
@@ -298,21 +305,21 @@ message CertificateSummary {
     required string fingerprint = 2;
 }
 
+// Used by workers to reply to some certificate queries
 message ListOfCertificatesByAddress {
     repeated CertificatesByAddress certificates = 1;
 }
 
+// Summaries of certificates for a given address
 message CertificatesByAddress {
     required string address = 1;
     repeated CertificateSummary certificate_summaries = 2;
 }
 
-// A certificate matching a request by fingerprint,
-// and the list of domain names associated
-message CertificateWithNames {
-    required string certificate = 1;
-    // domain names associated to the fingerprint
-    repeated string names = 2;
+// to reply to several certificate queries
+message CertificatesWithFingerprints {
+    // a map of fingerprint -> certificate_and_key
+    map<string, CertificateAndKey> certs = 1;
 }
 
 enum TlsVersion {
@@ -443,11 +450,10 @@ message ResponseContent {
         ClusterInformations clusters = 9;
         // collection of hashes of cluster information, 
         ClusterHashes cluster_hashes = 10;
-        // a list of certificates for each socket address
-        ListOfCertificatesByAddress certificates = 11;
-        // returns the certificate matching a request by fingerprint,
-        // and the list of domain names associated
-        CertificateWithNames certificate_by_fingerprint = 12;
+        // a list of certificates summaries, grouped by socket address
+        ListOfCertificatesByAddress certificates_by_address = 11;
+        // a map of complete certificates using fingerprints as key
+        CertificatesWithFingerprints certificates_with_fingerprints = 12;
     }
 }
 

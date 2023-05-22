@@ -1636,8 +1636,6 @@ pub fn start_tcp_worker(
 
 #[cfg(test)]
 mod tests {
-    use sozu_command::proto::command::Request;
-
     use super::*;
     use crate::sozu_command::{
         channel::Channel, proto::command::LoadBalancingParams, scm_socket::Listeners,
@@ -1891,17 +1889,13 @@ mod tests {
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO1"),
-                    content: Request {
-                        request_type: Some(RequestType::AddTcpFrontend(front)),
-                    },
+                    content: RequestType::AddTcpFrontend(front).into(),
                 })
                 .unwrap();
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO2"),
-                    content: Request {
-                        request_type: Some(RequestType::AddBackend(backend.to_add_backend())),
-                    },
+                    content: RequestType::AddBackend(backend.to_add_backend()).into(),
                 })
                 .unwrap();
         }
@@ -1924,17 +1918,13 @@ mod tests {
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO3"),
-                    content: Request {
-                        request_type: Some(RequestType::AddTcpFrontend(front)),
-                    },
+                    content: RequestType::AddTcpFrontend(front).into(),
                 })
                 .unwrap();
             command
                 .write_message(&WorkerRequest {
                     id: String::from("ID_YOLO4"),
-                    content: Request {
-                        request_type: Some(RequestType::AddBackend(backend.to_add_backend())),
-                    },
+                    content: RequestType::AddBackend(backend.to_add_backend()).into(),
                 })
                 .unwrap();
         }
