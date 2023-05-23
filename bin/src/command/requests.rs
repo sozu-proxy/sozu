@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fs::File,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     os::unix::io::{FromRawFd, IntoRawFd},
     os::unix::net::UnixStream,
     time::{Duration, Instant},
@@ -168,8 +168,18 @@ impl CommandServer {
         client_id: Option<String>,
         path: &str,
     ) -> anyhow::Result<Option<Success>> {
-        let mut file =
-            File::open(path).with_context(|| format!("Cannot open file at path {path}"))?;
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
+                info!("The state file does not exists, skipping the loading.");
+                self.backends_count = self.state.count_backends();
+                self.frontends_count = self.state.count_frontends();
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("Cannot open file at path {path}"));
+            }
+        };
 
         let mut buffer = Buffer::with_capacity(200000);
 
@@ -326,9 +336,6 @@ impl CommandServer {
 
         self.backends_count = self.state.count_backends();
         self.frontends_count = self.state.count_frontends();
-        gauge!("configuration.clusters", self.state.clusters.len());
-        gauge!("configuration.backends", self.backends_count);
-        gauge!("configuration.frontends", self.frontends_count);
         Ok(None)
     }
 

@@ -23,7 +23,6 @@
 //! which means other programs can use the protobuf definition and send roquests
 //! to Sōzu via its UNIX socket.
 
-extern crate nom;
 #[macro_use]
 extern crate lazy_static;
 #[macro_use]
@@ -32,12 +31,8 @@ extern crate prettytable;
 extern crate sozu_lib as sozu;
 #[macro_use]
 extern crate sozu_command_lib;
-
 #[cfg(target_os = "linux")]
 extern crate num_cpus;
-use cli::Args;
-#[cfg(target_os = "linux")]
-use regex::Regex;
 
 #[cfg(feature = "jemallocator")]
 #[global_allocator]
@@ -59,14 +54,15 @@ mod util;
 /// Start and restart the worker UNIX processes
 mod worker;
 
-use std::panic;
-
 use anyhow::{bail, Context};
+use cli::Args;
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t, pid_t};
-
+#[cfg(target_os = "linux")]
+use regex::Regex;
 use sozu::metrics::METRICS;
 use sozu_command_lib::config::Config;
+use std::panic;
 
 use crate::worker::{get_executable_path, start_workers, Worker};
 
