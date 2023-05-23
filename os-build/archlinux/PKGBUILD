@@ -1,7 +1,7 @@
 # Maintainer: Jan-Erik Rediger <badboy at archlinux dot us>
 
 pkgname=sozu-git
-pkgver=0.1.1.r169.g0935643
+pkgver=0.14.3
 pkgrel=1
 pkgdesc="HTTP reverse proxy, configurable at runtime, fast and safe, built in Rust"
 arch=('i686' 'x86_64')
@@ -12,13 +12,10 @@ makedepends=('cargo')
 backup=('etc/sozu/config.toml')
 source=(
   'git://github.com/sozu-proxy/sozu'
-  'config.toml'
-  'sozu.service'
 )
+
 sha1sums=(
   'SKIP'
-  'fdd860bf0ae5328eccd4665ecaebb46a096d163c'
-  '63fba328c23712d3b83e36187d3016382c3c3a73'
 )
 
 _gitname='sozu'
@@ -31,7 +28,7 @@ pkgver() {
 build() {
   cd "$srcdir/$_gitname"
 
-  cargo build --release --all --locked
+  cargo build --release -p bin --locked
 }
 
 package() {
@@ -42,13 +39,14 @@ package() {
   install -d "$pkgdir/var/lib/sozu"
 
   install -d "$pkgdir/etc/sozu"
-  install -d "$pkgdir/etc/sozu/ssl"
+  install -d "$pkgdir/etc/sozu/pki"
   install -d "$pkgdir/etc/sozu/html"
 
   install -Dm644 "$srcdir/config.toml" "$pkgdir/etc/sozu/config.toml"
   for file in certificate.pem key.pem certificate_chain.pem; do
-    install -Dm644 "lib/assets/$file" "$pkgdir/etc/sozu/ssl/$file"
+    install -Dm644 "lib/assets/$file" "$pkgdir/etc/sozu/pki/$file"
   done
+
   for file in 404.html 503.html; do
     install -Dm644 "lib/assets/$file" "$pkgdir/etc/sozu/html/$file"
   done
@@ -56,7 +54,8 @@ package() {
   install -Dm644 "README.md" "$pkgdir/usr/share/doc/${pkgname}/README.md"
   install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/${pkgname}/LICENSE-MIT"
 
-  install -Dm644 ../sozu.service "$pkgdir"/usr/lib/systemd/system/sozu.service
+  install -Dm644 os-build/systemd/sozu.service "$pkgdir"/usr/lib/systemd/system/sozu.service
+  install -Dm644 os-build/systemd/sozu@.service "$pkgdir"/usr/lib/systemd/system/sozu@.service
 }
 
 # vim:set ts=2 sw=2 sts=2 et:
