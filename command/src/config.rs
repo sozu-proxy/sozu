@@ -2,8 +2,8 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
-    fs::File,
-    io::{self, Read},
+    fs::{create_dir_all, metadata, File},
+    io::{self, ErrorKind, Read},
     net::SocketAddr,
     ops::Range,
     path::PathBuf,
@@ -1460,23 +1460,38 @@ impl Config {
         };
 
         debug!("saved_stated path in the config: {}", path);
-
         let config_path_buf = PathBuf::from(self.config_path.clone());
-        debug!("Config path buffer: {:?}", config_path_buf);
 
+        debug!("Config path buffer: {:?}", config_path_buf);
         let config_folder = config_path_buf
             .parent()
             .with_context(|| "could not get parent folder of configuration file")?;
 
         debug!("Config folder: {:?}", config_folder);
+        if !config_folder.exists() {
+            create_dir_all(config_folder).with_context(|| {
+                format!(
+                    "failed to create state parent directory '{}'",
+                    config_folder.display()
+                )
+            })?;
+        }
 
         let mut saved_state_path_raw = config_folder.to_path_buf();
-
         saved_state_path_raw.push(path);
         debug!(
             "Looking for saved state on the path {:?}",
             saved_state_path_raw
         );
+
+        match metadata(path) {
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
+                info!("Create an empty state file at '{}'", path);
+                File::create(path)
+                    .with_context(|| format!("fail to create state file at '{path}'"))?;
+            }
+            _ => {}
+        }
 
         saved_state_path_raw.canonicalize().with_context(|| {
             format!("could not get saved state path from config file input {path:?}")

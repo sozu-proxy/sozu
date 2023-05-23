@@ -838,6 +838,7 @@ pub fn start_server(
         ))
         .detach();
 
+        // Create a copy of the state path to load state later
         let saved_state_path = config.saved_state.clone();
 
         let mut server = CommandServer::new(
@@ -865,6 +866,7 @@ pub fn start_server(
                 .await
                 .with_context(|| format!("Loading {:?} failed", &path))?;
         }
+
         gauge!("configuration.clusters", server.state.clusters.len());
         gauge!("configuration.backends", server.backends_count);
         gauge!("configuration.frontends", server.frontends_count);
