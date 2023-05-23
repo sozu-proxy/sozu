@@ -1,11 +1,2 @@
 .git
-.gitignore
-.travis.yml
 target
-LICENSE
-README.md
-doc
-CONTRIBUTING.md
-bin/command_folder
-os-build
-!os-build/docker
