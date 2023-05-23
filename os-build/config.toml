@@ -4,7 +4,7 @@
 # routing. You can generate this file from sozu's current routing by running
 # the command `sozu state save -f state.json`
 # this must be RELATIVE to config.toml
-# saved_state = "__RUNDIR__/sozu/tate.json"
+saved_state = "/var/lib/sozu/state.json"
 
 # save the configuration to the saved_state file every time we receive a
 # configuration message on the configuration socket
@@ -35,7 +35,7 @@ log_target = "stdout"
 
 # path to the unix socket file used to send commands to sozu
 # default value points to "sozu.sock" file in the current directory
-command_socket = "__RUNDIR__/sozu/sozu.sock"
+command_socket = "/run/sozu/sozu.sock"
 
 # size in bytes of the buffer used by the command socket protocol. If the message
 # sent to sozu is too large, or the data that sozu must return is too large, the
@@ -65,13 +65,13 @@ handle_process_affinity = false
 # there are new connections available, the worker will accept and close them
 # immediately to indicate it is too busy to handle traffic
 # defaults to 10000 maximum connections
-max_connections = 10000
+max_connections = 10_000
 
 # maximum number of buffers in the pool used by the protocol implementations
 # for active connections (ie currently serving a request). For now, you should
 # estimate that max_buffers = number of concurrent requests * 2
 # defaults to 1000
-max_buffers = 20000
+max_buffers = 20_000
 
 # minimum number of buffers preallocated in the pool
 # cannot be larger than max_buffers
@@ -84,7 +84,7 @@ max_buffers = 20000
 # leave enough memory for one more worker (also for the kernel, etc), so total
 # RAM should be larger than (worker count + 1) * max_buffers * 2 * buffer_size bytes
 # defaults to 16393 (minimum size for HTTP/2 is a 16384 bytes frame + 9 bytes of header
-buffer_size = 16393
+buffer_size = 16_393
 
 # how much time (in milliseconds) sozu command line will wait for a command to complete.
 # Defaults to 1000 milliseconds
@@ -94,15 +94,15 @@ buffer_size = 16393
 # It can be helpful to help systemd or any other service system to keep track
 # of the main process across upgrades. PID file is not created unless this option
 # is set or if SOZU_PID_FILE_PATH environment variable was defined at build time.
-pid_file_path = "__RUNDIR__/sozu/sozu.pid"
+pid_file_path = "/run/sozu/sozu.pid"
 
 # maximum time of inactivity for a frontend socket, in seconds
 # defaults to 60 seconds, can be specified at the listener level
-front_timeout = 3600
+front_timeout = 900
 
 # maximum time of inactivity for a backend socket, in seconds
 # defaults to 30 seconds, can be specified at the listener level
-back_timeout = 3600
+back_timeout = 900
 
 # maximum time to connect to a backend server, in seconds
 # defaults to 3 seconds, can be specified at the listener level
@@ -126,7 +126,7 @@ zombie_check_interval = 1800
 activate_listeners = true
 
 # various statistics can be sent to a server that supports the statsd protocol
-# You can see those statistics with sozu, like this: `sozu metrics get` or
+# You can see those statistics with sozu command line, like this: `sozu metrics get` or
 # `sozu metrics get --json` for machine consumption
 #
 #[metrics]
@@ -153,13 +153,13 @@ address = "0.0.0.0:80"
 # path to custom 404 and 503 answers
 # a 404 response is sent when sozu does not know about the requested domain or path
 # a 503 response is sent if there are no backend servers available
-answer_404 = "__DATADIR__/html/404.html"
-answer_503 = "__DATADIR__/html/503.html"
+answer_404 = "/etc/sozu/html/404.html"
+answer_503 = "/etc/sozu/html/503.html"
 
 # defines the sticky session cookie's name, if `sticky_session` is activated for
 # a cluster. Defaults to "SOZUBALANCEID"
 # sticky_name = "SOZUBALANCEID"
-
+#
 # Configures the client socket to receive a PROXY protocol header
 # this option is incompatible with public_address
 # expect_proxy = false
@@ -175,8 +175,8 @@ address = "0.0.0.0:443"
 # this option is incompatible with expect_proxy
 # public_address = "1.2.3.4:80"
 
-answer_404 = "__DATADIR__/html/404.html"
-answer_503 = "__DATADIR__/html/503.html"
+answer_404 = "/etc/sozu/html/404.html"
+answer_503 = "/etc/sozu/html/503.html"
 # sticky_name = "SOZUBALANCEID"
 
 # Configures the client socket to receive a PROXY protocol header
@@ -207,10 +207,3 @@ cipher_list = [
   "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
   "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
 ]
-
-# default certificate and key
-# in case you want to set up TLS without SNI, you can define the default
-# certificate here
-#certificate = "../lib/assets/cert_test.pem"
-#key = "../lib/assets/key_test.pem"
-#certificate_chain = "../lib/assets/certificate_chain.pem"

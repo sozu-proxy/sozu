@@ -5,12 +5,16 @@ After=network-online.target local-fs.target remote-fs.target time-sync.target
 Wants=network-online.target local-fs.target remote-fs.target time-sync.target
 
 [Service]
-RuntimeDirectory=sozu
+RuntimeDirectory=sozu-%i
 Type=simple
-PIDFile=__RUNDIR__/sozu/sozu.pid
-ExecStart=__BINDIR__/sozu start --config __SYSCONFDIR__/sozu/config.toml
-ExecReload=__BINDIR__/sozu reload --config __SYSCONFDIR__/sozu/config.toml
+PIDFile=/run/sozu/sozu-%i.pid
+ExecStartPre=/usr/bin/sozu config check --config /etc/sozu/%i.toml
+ExecStart=/usr/bin/sozu start --config /etc/sozu/%i.toml
+ExecReloadPre=/usr/bin/sozu config check --config /etc/sozu/%i.toml
+ExecReload=/usr/bin/sozu reload --config /etc/sozu/%i.toml
 Restart=on-failure
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
+
