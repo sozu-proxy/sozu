@@ -1,94 +1,75 @@
+---
 name: CI
-
-on: [push, pull_request]
-
+on: [ push, pull_request ]
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-
     strategy:
       matrix:
         rust:
           - stable
           - beta
           - nightly
-
     steps:
       - name: install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       - name: Checkout sources
         uses: actions/checkout@v2
-
       - name: Install rust (${{ matrix.rust }})
         uses: actions-rs/toolchain@v1
         with:
           toolchain: ${{ matrix.rust }}
           profile: minimal
           override: true
-
       - name: Build
         uses: actions-rs/cargo@v1
         with:
           command: build
           args: ${{ matrix.features }}
-
       - name: Test
         uses: actions-rs/cargo@v1
         with:
           command: test
           args: --verbose ${{ matrix.features }}
-
   doc:
     name: Build documentation
     runs-on: ubuntu-latest
-
     steps:
       - name: install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-
       - name: Checkout sources
         uses: actions/checkout@v2
-
       - name: Install rust
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           profile: minimal
           override: true
-
       - name: Build
         uses: actions-rs/cargo@v1
         with:
           command: doc
           args: --verbose
-
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
-
     steps:
       - name: install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       - name: Checkout sources
         uses: actions/checkout@v2
-
       - name: Install rust
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           profile: minimal
           override: true
-
       - name: Install cargo-tarpaulin
         uses: actions-rs/cargo@v1
         with:
           command: install
           args: cargo-tarpaulin
-
       - name: Run cargo tarpaulin
         uses: actions-rs/cargo@v1
         env:
@@ -96,13 +77,10 @@ jobs:
         with:
           command: tarpaulin
           args: --coveralls $TOKEN
-
   dockerhub:
     name: Docker build and push to Docker Hub
     runs-on: ubuntu-latest
-
     if: github.ref == 'refs/heads/main'
-
     steps:
       - uses: actions/checkout@v2
       - uses: docker/setup-qemu-action@v1
@@ -111,9 +89,9 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - uses: docker/build-push-action@v2
         with:
           context: .
           push: 'true'
           tags: clevercloud/sozu:${{ github.sha }}
+...
