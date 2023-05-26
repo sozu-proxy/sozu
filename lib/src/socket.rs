@@ -388,3 +388,135 @@ pub fn server_bind(addr: String) -> anyhow::Result<TcpListener> {
 
     Ok(TcpListener::from_std(sock.into()))
 }
+
+pub mod stat {
+    use std::os::fd::AsRawFd;
+    use time::Duration;
+
+    use internal::{TcpInfo, OPT_LEVEL, OPT_NAME};
+
+    pub fn socket_rtt<A: AsRawFd>(socket: &A) -> Option<Duration> {
+        socket_info(socket.as_raw_fd()).map(|info| Duration::microseconds(info.rtt() as i64))
+    }
+
+    #[cfg(unix)]
+    pub fn socket_info(fd: libc::c_int) -> Option<TcpInfo> {
+        let mut tcp_info: TcpInfo = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<TcpInfo>() as libc::socklen_t;
+        let status = unsafe {
+            libc::getsockopt(
+                fd,
+                OPT_LEVEL,
+                OPT_NAME,
+                &mut tcp_info as *mut _ as *mut _,
+                &mut len,
+            )
+        };
+        if status != 0 {
+            None
+        } else {
+            Some(tcp_info)
+        }
+    }
+    #[cfg(not(unix))]
+    pub fn socketinfo(fd: libc::c_int) -> Option<TcpInfo> {
+        None
+    }
+
+    #[cfg(unix)]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    mod internal {
+        pub const OPT_LEVEL: libc::c_int = libc::SOL_TCP;
+        pub const OPT_NAME: libc::c_int = libc::TCP_INFO;
+
+        #[derive(Clone, Debug)]
+        #[repr(C)]
+        pub struct TcpInfo {
+            // State
+            tcpi_state: u8,
+            tcpi_ca_state: u8,
+            tcpi_retransmits: u8,
+            tcpi_probes: u8,
+            tcpi_backoff: u8,
+            tcpi_options: u8,
+            tcpi_snd_rcv_wscale: u8, // 4bits|4bits
+
+            tcpi_rto: u32,
+            tcpi_ato: u32,
+            tcpi_snd_mss: u32,
+            tcpi_rcv_mss: u32,
+
+            tcpi_unacked: u32,
+            tcpi_sacked: u32,
+            tcpi_lost: u32,
+            tcpi_retrans: u32,
+            tcpi_fackets: u32,
+
+            // Times
+            tcpi_last_data_sent: u32,
+            tcpi_last_ack_sent: u32, // Not remembered
+            tcpi_last_data_recv: u32,
+            tcpi_last_ack_recv: u32,
+
+            // Metrics
+            tcpi_pmtu: u32,
+            tcpi_rcv_ssthresh: u32,
+            tcpi_rtt: u32,
+            tcpi_rttvar: u32,
+            tcpi_snd_ssthresh: u32,
+            tcpi_snd_cwnd: u32,
+            tcpi_advmss: u32,
+            tcpi_reordering: u32,
+        }
+        impl TcpInfo {
+            pub fn rtt(&self) -> u32 {
+                self.tcpi_rtt
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    mod internal {
+        pub const OPT_LEVEL: libc::c_int = libc::SOL_TCP;
+        pub const OPT_NAME: libc::c_int = 0x106;
+
+        #[derive(Clone, Debug)]
+        #[repr(C)]
+        pub struct TcpInfo {
+            tcpi_state: u8,
+            tcpi_snd_wscale: u8,
+            tcpi_rcv_wscale: u8,
+            __pad1: u8,
+            tcpi_options: u32,
+            tcpi_flags: u32,
+            tcpi_rto: u32,
+            tcpi_maxseg: u32,
+            tcpi_snd_ssthresh: u32,
+            tcpi_snd_cwnd: u32,
+            tcpi_snd_wnd: u32,
+            tcpi_snd_sbbytes: u32,
+            tcpi_rcv_wnd: u32,
+            tcpi_rttcur: u32,
+            tcpi_srtt: u32,
+            tcpi_rttvar: u32,
+            tcpi_tfo: u32,
+            tcpi_txpackets: u64,
+            tcpi_txbytes: u64,
+            tcpi_txretransmitbytes: u64,
+            tcpi_rxpackets: u64,
+            tcpi_rxbytes: u64,
+            tcpi_rxoutoforderbytes: u64,
+            tcpi_txretransmitpackets: u64,
+        }
+        impl TcpInfo {
+            pub fn rtt(&self) -> u32 {
+                self.tcpi_srtt
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[derive(Clone, Debug)]
+    struct TcpInfo {}
+}

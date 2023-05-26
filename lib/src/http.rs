@@ -29,7 +29,7 @@ use sozu_command::{
 use crate::{
     protocol::SessionState, router::Router, timer::TimeoutContainer, util::UnwrapLog,
     L7ListenerHandler, L7Proxy, ListenerHandler, SessionIsToBeClosed, SessionResult,
-    StateMachineBuilder,
+    StateMachineBuilder, CachedTags,
 };
 
 use super::{
@@ -382,7 +382,7 @@ pub struct HttpListener {
     config: HttpListenerConfig,
     fronts: Router,
     listener: Option<TcpListener>,
-    tags: BTreeMap<String, BTreeMap<String, String>>,
+    tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
 
@@ -391,13 +391,13 @@ impl ListenerHandler for HttpListener {
         &self.address
     }
 
-    fn get_tags(&self, key: &str) -> Option<&BTreeMap<String, String>> {
+    fn get_tags(&self, key: &str) -> Option<&CachedTags> {
         self.tags.get(key)
     }
 
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>) {
         match tags {
-            Some(tags) => self.tags.insert(key, tags),
+            Some(tags) => self.tags.insert(key, CachedTags::new(tags)),
             None => self.tags.remove(&key),
         };
     }

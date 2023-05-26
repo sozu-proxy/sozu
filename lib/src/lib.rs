@@ -359,6 +359,7 @@ extern crate foreign_types_shared;
 pub mod util;
 #[macro_use]
 pub mod metrics;
+mod logs;
 
 pub mod backends;
 pub mod buffer_queue;
@@ -567,10 +568,29 @@ macro_rules! StateMachineBuilder {
     }
 }
 
+pub struct CachedTags {
+    pub tags: BTreeMap<String, String>,
+    pub concatenated: String,
+}
+impl CachedTags {
+    fn new(tags: BTreeMap<String, String>) -> Self {
+        let concatenated = tags
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self { tags, concatenated }
+    }
+}
+
 pub trait ListenerHandler {
     fn get_addr(&self) -> &SocketAddr;
 
-    fn get_tags(&self, key: &str) -> Option<&BTreeMap<String, String>>;
+    fn get_tags(&self, key: &str) -> Option<&CachedTags>;
+
+    fn get_concatenated_tags(&self, key: &str) -> Option<&str> {
+        self.get_tags(key).map(|tags| tags.concatenated.as_str())
+    }
 
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
 }
@@ -1050,8 +1070,7 @@ impl SessionMetrics {
     }
 
     pub fn service_stop(&mut self) {
-        if self.service_start.is_some() {
-            let start = self.service_start.take().unwrap();
+        if let Some(start) = self.service_start.take() {
             let duration = Instant::now() - start;
             self.service_time += duration;
         }
@@ -1103,31 +1122,6 @@ impl SessionMetrics {
             (Some(start), Some(end)) => Some(end - start),
             _ => None,
         }
-    }
-}
-
-pub struct LogDuration(Duration);
-
-impl fmt::Display for LogDuration {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let secs = self.0.whole_seconds();
-        if secs >= 10 {
-            return write!(f, "{secs}s");
-        }
-
-        let ms = self.0.whole_milliseconds();
-
-        if ms < 10 {
-            let us = self.0.whole_microseconds();
-            if us >= 10 {
-                return write!(f, "{us}μs");
-            }
-
-            let ns = self.0.whole_nanoseconds();
-            return write!(f, "{ns}ns");
-        }
-
-        write!(f, "{ms}ms")
     }
 }
 

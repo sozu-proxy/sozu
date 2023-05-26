@@ -75,7 +75,6 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                     "[{:?}] front socket error, closing the connection",
                     self.frontend_token
                 );
-                metrics.service_stop();
                 incr!("proxy_protocol.errors");
                 self.frontend_readiness.reset();
                 self.backend_readiness.reset();
@@ -129,7 +128,6 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                             }
                         }
                         Err(e) => {
-                            metrics.service_stop();
                             incr!("proxy_protocol.errors");
                             self.frontend_readiness.reset();
                             self.backend_readiness.reset();

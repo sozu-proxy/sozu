@@ -103,6 +103,7 @@ fn is_hostname_char(i: u8) -> bool {
 }
 
 // FIXME: convert port to u16 here
+#[allow(clippy::type_complexity)]
 pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<&[u8]>)> {
     let (i, host) = take_while(is_hostname_char)(i)?;
     let (i, port) = opt(preceded(bytes::complete::tag(":"), digit1))(i)?;

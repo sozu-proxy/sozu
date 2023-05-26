@@ -5,10 +5,9 @@ use rustls::ServerConnection;
 use rusty_ulid::Ulid;
 
 use crate::{
-    timer::TimeoutContainer, Readiness, Ready, SessionMetrics, SessionResult, StateResult,
+    logs::LogContext, protocol::SessionState, timer::TimeoutContainer, Readiness, Ready,
+    SessionMetrics, SessionResult, StateResult,
 };
-
-use super::{http::LogContext, SessionState};
 
 pub enum TlsState {
     Initial,

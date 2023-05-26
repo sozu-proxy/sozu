@@ -5,9 +5,9 @@ use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
 
 use crate::{
+    logs::LogContext,
     pool::Checkout,
-    protocol::{http::LogContext, pipe::Pipe},
-    protocol::{SessionResult, SessionState},
+    protocol::{pipe::Pipe, SessionResult, SessionState},
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
     tcp::TcpListener,
@@ -95,7 +95,6 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
         match socket_result {
             SocketResult::Error => {
                 error!("[{:?}] (expect proxy) front socket error, closing the connection(read {}, wrote {})", self.frontend_token, metrics.bin, metrics.bout);
-                metrics.service_stop();
                 incr!("proxy_protocol.errors");
                 self.frontend_readiness.reset();
                 return SessionResult::Close;
@@ -134,7 +133,6 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                                 "[{:?}] front socket parse error, closing the connection",
                                 self.frontend_token
                             );
-                            metrics.service_stop();
                             incr!("proxy_protocol.errors");
                             self.frontend_readiness.reset();
                             return SessionResult::Continue;
@@ -145,7 +143,6 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             }
             Err(Err::Error(e)) | Err(Err::Failure(e)) => {
                 error!("[{:?}] expect proxy protocol front socket parse error, closing the connection:\n{}", self.frontend_token, e.input.to_hex(16));
-                metrics.service_stop();
                 incr!("proxy_protocol.errors");
                 self.frontend_readiness.reset();
                 SessionResult::Close

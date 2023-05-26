@@ -67,9 +67,9 @@ use crate::{
         ParsedCertificateAndKey,
     },
     util::UnwrapLog,
-    AcceptError, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxyConfiguration,
-    ProxySession, Readiness, SessionIsToBeClosed, SessionMetrics, SessionResult,
-    StateMachineBuilder, StateResult,
+    AcceptError, CachedTags, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol,
+    ProxyConfiguration, ProxySession, Readiness, SessionIsToBeClosed, SessionMetrics,
+    SessionResult, StateMachineBuilder, StateResult,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -545,7 +545,7 @@ pub struct HttpsListener {
     listener: Option<MioTcpListener>,
     resolver: Arc<MutexWrappedCertificateResolver>,
     rustls_details: Arc<ServerConfig>,
-    tags: BTreeMap<String, BTreeMap<String, String>>,
+    tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
 
@@ -554,13 +554,13 @@ impl ListenerHandler for HttpsListener {
         &self.address
     }
 
-    fn get_tags(&self, key: &str) -> Option<&BTreeMap<String, String>> {
+    fn get_tags(&self, key: &str) -> Option<&CachedTags> {
         self.tags.get(key)
     }
 
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>) {
         match tags {
-            Some(tags) => self.tags.insert(key, tags),
+            Some(tags) => self.tags.insert(key, CachedTags::new(tags)),
             None => self.tags.remove(&key),
         };
     }

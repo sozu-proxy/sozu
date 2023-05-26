@@ -819,10 +819,11 @@ fn try_http_behaviors() -> State {
     backend.disconnect();
     worker.read_to_last();
 
+    // transfer-encoding is an invalid header for 101 response, but Sozu should ignore it (see issue #885)
     let mut backend = SyncBackend::new(
         "backend",
         back_address,
-        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\nearly",
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\nTransfer-Encoding: Chunked\r\n\r\nearly",
     );
 
     info!("expecting upgrade (101 switching protocols)");

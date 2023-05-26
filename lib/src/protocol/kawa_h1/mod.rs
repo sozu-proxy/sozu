@@ -7,7 +7,6 @@ use std::{
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
-    str::from_utf8_unchecked,
 };
 
 use anyhow::{bail, Context};
@@ -18,6 +17,7 @@ use sozu_command::proto::command::{Event, EventKind};
 use time::{Duration, Instant};
 
 use crate::{
+    logs::{Endpoint, LogContext, RequestRecord},
     pool::{Checkout, Pool},
     protocol::{
         http::{editor::HttpContext, parser::Method},
@@ -26,11 +26,11 @@ use crate::{
     retry::RetryPolicy,
     router::Route,
     server::{push_event, CONN_RETRIES},
-    socket::{SocketHandler, SocketResult, TransportProtocol},
+    socket::{stat::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler,
-    L7Proxy, ListenerHandler, LogDuration, Protocol, ProxySession, Readiness, SessionIsToBeClosed,
+    L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness, SessionIsToBeClosed,
     SessionMetrics, SessionResult, StateResult,
 };
 
@@ -192,6 +192,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 sticky_name,
                 sticky_session: None,
                 sticky_session_found: None,
+
+                method: None,
+                authority: None,
+                path: None,
+                status: None,
+                reason: None,
+                user_agent: None,
             },
         })
     }
@@ -285,7 +292,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     if self.keepalive_count == 0 {
                         self.frontend_socket.read_error();
                     }
-                    metrics.service_stop();
                 } else {
                     self.frontend_socket.read_error();
                     self.log_request_error(
@@ -408,7 +414,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         if self.response_stream.is_terminated() && self.response_stream.is_completed() {
-            save_http_status_metric(self.get_response_line().0);
+            save_http_status_metric(self.context.status);
 
             self.log_request_success(metrics);
             metrics.reset();
@@ -663,48 +669,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    /// Get the (code, reason) from the response_stream
-    pub fn get_response_line(&self) -> (Option<u16>, Option<&str>) {
-        if let kawa::StatusLine::Response { code, reason, .. } =
-            &self.request_stream.detached.status_line
-        {
-            let buffer = self.response_stream.storage.buffer();
-            let reason = reason
-                .data_opt(buffer)
-                .map(|data| unsafe { from_utf8_unchecked(data) });
-            (Some(*code), reason)
-        } else {
-            (None, None)
-        }
-    }
-
-    /// Get the (method, authority, path, uri) from the request_stream
-    pub fn get_request_line(&self) -> (Option<Method>, Option<&str>, Option<&str>, Option<&str>) {
-        if let kawa::StatusLine::Request {
-            method,
-            authority,
-            path,
-            uri,
-            ..
-        } = &self.request_stream.detached.status_line
-        {
-            let buffer = self.request_stream.storage.buffer();
-            let method = method.data_opt(buffer).map(Method::new);
-            let authority = authority
-                .data_opt(buffer)
-                .map(|data| unsafe { from_utf8_unchecked(data) });
-            let path = path
-                .data_opt(buffer)
-                .map(|data| unsafe { from_utf8_unchecked(data) });
-            let uri = uri
-                .data_opt(buffer)
-                .map(|data| unsafe { from_utf8_unchecked(data) });
-            (method, authority, path, uri)
-        } else {
-            (None, None, None, None)
-        }
-    }
-
     pub fn get_session_address(&self) -> Option<SocketAddr> {
         self.context
             .session_address
@@ -739,215 +703,64 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
+    /// Format the context of the websocket into a loggable String
     pub fn websocket_context(&self) -> String {
-        let (method, authority, path, _) = self.get_request_line();
-        let (status, reason) = self.get_response_line();
         format!(
-            "{} {} {}\t{} {}",
-            authority.as_str(),
-            method.unwrap_or(Method::Get),
-            path.as_str(),
-            status.as_string(),
-            reason.as_str()
+            "{}",
+            Endpoint::Http {
+                method: self.context.method.as_ref(),
+                authority: self.context.authority.as_deref(),
+                path: self.context.path.as_deref(),
+                status: self.context.status,
+                reason: self.context.reason.as_deref(),
+            }
         )
     }
 
-    pub fn log_request_success(&self, metrics: &SessionMetrics) {
-        let session = self.get_session_address().as_string();
-        let backend = self.get_backend_address().as_string();
-
-        let (method, authority, path, _) = self.get_request_line();
-        let (status, _) = self.get_response_line();
-
-        let response_time = metrics.response_time();
-        let service_time = metrics.service_time();
-        let _wait_time = metrics.wait_time;
-
-        if let Some(cluster_id) = &self.cluster_id {
-            time!(
-                "response_time",
-                cluster_id,
-                response_time.whole_milliseconds()
-            );
-            time!(
-                "service_time",
-                cluster_id,
-                service_time.whole_milliseconds()
-            );
-        }
-        time!("response_time", response_time.whole_milliseconds());
-        time!("service_time", service_time.whole_milliseconds());
-
-        if let Some(backend_id) = metrics.backend_id.as_ref() {
-            if let Some(backend_response_time) = metrics.backend_response_time() {
-                record_backend_metrics!(
-                    self.cluster_id.as_str(),
-                    backend_id,
-                    backend_response_time.whole_milliseconds(),
-                    metrics.backend_connection_time(),
-                    metrics.backend_bin,
-                    metrics.backend_bout
-                );
-            }
-        }
-
-        let tags = authority.and_then(|host| {
+    pub fn log_request(&self, metrics: &SessionMetrics, message: Option<&str>) {
+        let listener = self.listener.borrow();
+        let tags = self.context.authority.as_ref().and_then(|host| {
             let hostname = match host.split_once(':') {
                 None => host,
-                Some((hn, _)) => hn,
+                Some((hostname, _)) => hostname,
             };
-
-            self.listener.borrow().get_tags(hostname).map(|tags| {
-                tags.iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
+            listener.get_concatenated_tags(hostname)
         });
-
-        info_access!(
-            "{}{} -> {}\t{} {} {} {}\t{}\t{} {} {} {}\t{}",
-            self.log_context(),
-            session,
-            backend,
-            LogDuration(response_time),
-            LogDuration(service_time),
-            metrics.bin,
-            metrics.bout,
-            tags.as_str(),
-            self.protocol_string(),
-            authority.as_str(),
-            method.unwrap_or(Method::Get),
-            path.as_str(),
-            status.as_string()
-        );
-    }
-
-    pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
-        let session = self.get_session_address().as_string();
-        let backend = self.get_backend_address().as_string();
-
-        let (method, authority, path, _) = self.get_request_line();
         let status = match self.status {
-            SessionStatus::Normal => "-".to_string(),
-            SessionStatus::DefaultAnswer(answers, ..) => {
-                let status: u16 = answers.into();
-                status.to_string()
-            }
+            SessionStatus::Normal => self.context.status,
+            SessionStatus::DefaultAnswer(answers, ..) => Some(answers.into()),
         };
 
-        let response_time = metrics.response_time();
-        let service_time = metrics.service_time();
-
-        if let Some(cluster_id) = &self.cluster_id {
-            time!(
-                "response_time",
-                cluster_id,
-                response_time.whole_milliseconds()
-            );
-            time!(
-                "service_time",
-                cluster_id,
-                service_time.whole_milliseconds()
-            );
+        RequestRecord {
+            error: message,
+            context: self.log_context(),
+            session_address: self.get_session_address(),
+            backend_address: self.get_backend_address(),
+            protocol: self.protocol_string(),
+            endpoint: Endpoint::Http {
+                method: self.context.method.as_ref(),
+                authority: self.context.authority.as_deref(),
+                path: self.context.path.as_deref(),
+                status,
+                reason: self.context.reason.as_deref(),
+            },
+            tags,
+            client_rtt: socket_rtt(self.front_socket()),
+            server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
+            metrics,
         }
-        time!("response_time", response_time.whole_milliseconds());
-        time!("service_time", service_time.whole_milliseconds());
-        incr!("http.errors");
-
-        let tags = authority.and_then(|host| {
-            let hostname = match host.split_once(':') {
-                None => host,
-                Some((hn, _)) => hn,
-            };
-
-            self.listener.borrow().get_tags(hostname).map(|tags| {
-                tags.iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-        });
-
-        info_access!(
-            "{}{} -> {}\t{} {} {} {}\t{}\t{} {} {} {}\t{}",
-            self.log_context(),
-            session,
-            backend,
-            LogDuration(response_time),
-            LogDuration(service_time),
-            metrics.bin,
-            metrics.bout,
-            tags.as_str(),
-            self.protocol_string(),
-            authority.as_str(),
-            method.unwrap_or(Method::Get),
-            path.as_str(),
-            status
-        );
+        .log();
     }
 
+    pub fn log_request_success(&self, metrics: &SessionMetrics) {
+        self.log_request(metrics, None);
+    }
+    pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
+        self.log_request(metrics, None);
+    }
     pub fn log_request_error(&mut self, metrics: &mut SessionMetrics, message: &str) {
-        metrics.service_stop();
-        self.frontend_readiness.reset();
-        self.backend_readiness.reset();
-
-        let session = self.get_session_address().as_string();
-        let backend = self.get_backend_address().as_string();
-
-        let (method, authority, path, _) = self.get_request_line();
-        let (status, _) = self.get_response_line();
-
-        let response_time = metrics.response_time();
-        let service_time = metrics.service_time();
-
-        if let Some(cluster_id) = &self.cluster_id {
-            time!(
-                "response_time",
-                cluster_id,
-                response_time.whole_milliseconds()
-            );
-            time!(
-                "service_time",
-                cluster_id,
-                service_time.whole_milliseconds()
-            );
-        }
-        time!("response_time", response_time.whole_milliseconds());
-        time!("service_time", service_time.whole_milliseconds());
         incr!("http.errors");
-
-        let tags = authority.and_then(|host| {
-            let hostname = match host.split_once(':') {
-                None => host,
-                Some((hn, _)) => hn,
-            };
-
-            self.listener.borrow().get_tags(hostname).map(|tags| {
-                tags.iter()
-                    .map(|(k, v)| format!("\"{k}={v}\""))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-        });
-
-        error_access!(
-            "{}{} -> {}\t{} {} {} {}\t{}\t{} {} {} {}\t{} | {}",
-            self.log_context(),
-            session,
-            backend,
-            LogDuration(response_time),
-            LogDuration(service_time),
-            metrics.bin,
-            metrics.bout,
-            tags.as_str(),
-            self.protocol_string(),
-            authority.as_str(),
-            method.unwrap_or(Method::Get),
-            path.as_str(),
-            status.as_string(),
-            message
-        );
+        self.log_request(metrics, Some(message));
     }
 
     pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>) {
@@ -1003,7 +816,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 }
 
                 if index == len {
-                    metrics.service_stop();
                     self.log_default_answer_success(metrics);
                     self.frontend_readiness.reset();
                     self.backend_readiness.reset();
@@ -1171,13 +983,24 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     // -> host, path, method
-    pub fn extract_route(&self) -> anyhow::Result<(&str, &str, Method)> {
-        let request_line = self.get_request_line();
-        let given_method = request_line.0.with_context(|| "No method given")?;
-        let given_host = request_line.1.with_context(|| "No host given")?;
-        let given_path = request_line.2.with_context(|| "No path given")?;
+    pub fn extract_route(&self) -> anyhow::Result<(&str, &str, &Method)> {
+        let given_method = self
+            .context
+            .method
+            .as_ref()
+            .with_context(|| "No method given")?;
+        let given_authority = self
+            .context
+            .authority
+            .as_deref()
+            .with_context(|| "No host given")?;
+        let given_path = self
+            .context
+            .path
+            .as_deref()
+            .with_context(|| "No path given")?;
 
-        Ok((given_host, given_path, given_method))
+        Ok((given_authority, given_path, given_method))
     }
 
     fn cluster_id_from_request(
@@ -1195,7 +1018,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let cluster_id_res = self
             .listener
             .borrow()
-            .frontend_from_request(host, uri, &method);
+            .frontend_from_request(host, uri, method);
 
         let cluster_id = match cluster_id_res {
             Ok(route) => match route {
@@ -1884,67 +1707,6 @@ fn save_http_status_metric(status: Option<u16>) {
                 // http responses with other codes (protocol error)
                 incr!("http.status.other");
             }
-        }
-    }
-}
-
-pub struct LogContext<'a> {
-    pub request_id: Ulid,
-    pub cluster_id: Option<&'a str>,
-    pub backend_id: Option<&'a str>,
-}
-
-impl<'a> std::fmt::Display for LogContext<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} {} {}\t",
-            self.request_id,
-            self.cluster_id.unwrap_or("-"),
-            self.backend_id.unwrap_or("-")
-        )
-    }
-}
-
-pub trait AsStr {
-    fn as_str(&self) -> &str;
-}
-pub trait AsString {
-    fn as_string(&self) -> String;
-}
-
-impl AsStr for Option<String> {
-    fn as_str(&self) -> &str {
-        match &self {
-            None => "-",
-            Some(s) => s,
-        }
-    }
-}
-
-impl AsStr for Option<&str> {
-    fn as_str(&self) -> &str {
-        match &self {
-            None => "-",
-            Some(s) => s,
-        }
-    }
-}
-
-impl AsString for Option<u16> {
-    fn as_string(&self) -> String {
-        match &self {
-            None => "-".to_string(),
-            Some(s) => s.to_string(),
-        }
-    }
-}
-
-impl AsString for Option<SocketAddr> {
-    fn as_string(&self) -> String {
-        match &self {
-            None => "X".to_string(),
-            Some(s) => s.to_string(),
         }
     }
 }

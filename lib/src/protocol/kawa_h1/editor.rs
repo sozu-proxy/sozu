@@ -7,7 +7,7 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::http::{parser::compare_no_case, GenericHttpStream},
+    protocol::http::{parser::compare_no_case, GenericHttpStream, Method},
     Protocol,
 };
 
@@ -15,12 +15,25 @@ use crate::{
 #[derive(Debug)]
 pub struct HttpContext {
     // ========== Write only
-    /// is set to false if Kawa finds a "Connection" header with a "close" value in the response
+    /// set to false if Kawa finds a "Connection" header with a "close" value in the response
     pub keep_alive_backend: bool,
-    /// is set to false if Kawa finds a "Connection" header with a "close" value in the request
+    /// set to false if Kawa finds a "Connection" header with a "close" value in the request
     pub keep_alive_frontend: bool,
-    /// takes the value of the sticky session cookie in the request
+    /// the value of the sticky session cookie in the request
     pub sticky_session_found: Option<String>,
+    // ---------- Status Line
+    /// the value of the method in the request line
+    pub method: Option<Method>,
+    /// the value of the authority of the request (in the request line of "Host" header)
+    pub authority: Option<String>,
+    /// the value of the path in the request line
+    pub path: Option<String>,
+    /// the value of the status code in the response line
+    pub status: Option<u16>,
+    /// the value of the reason in the response line
+    pub reason: Option<String>,
+    // ---------- Additional optional data
+    pub user_agent: Option<String>,
 
     // ========== Read only
     /// signals wether Kawa should write a "Connection" header with a "close" value (request and response)
@@ -53,9 +66,34 @@ impl HttpContext {
     /// Callback for request:
     ///
     /// - edit headers (connection, forwarded, sticky cookie, sozu-id)
-    /// - save some information (front keep-alive, sticky cookie)
+    /// - save information:
+    ///   - method
+    ///   - authority
+    ///   - path
+    ///   - front keep-alive
+    ///   - sticky cookie
+    ///   - user-agent
     fn on_request_headers(&mut self, request: &mut GenericHttpStream) {
         let buf = &mut request.storage.mut_buffer();
+
+        // Captures the request line
+        if let kawa::StatusLine::Request {
+            method,
+            authority,
+            path,
+            ..
+        } = &request.detached.status_line
+        {
+            self.method = method.data_opt(buf).map(Method::new);
+            self.authority = authority
+                .data_opt(buf)
+                .and_then(|data| from_utf8(data).ok())
+                .map(ToOwned::to_owned);
+            self.path = path
+                .data_opt(buf)
+                .and_then(|data| from_utf8(data).ok())
+                .map(ToOwned::to_owned);
+        }
 
         let public_ip = self.public_address.ip();
         let public_port = self.public_address.port();
@@ -83,6 +121,7 @@ impl HttpContext {
         // - update value of X-Forwarded-Port
         // - store X-Forwarded-For
         // - store Forwarded
+        // - store User-Agent
         let mut x_for = None;
         let mut forwarded = None;
         let mut has_connection = false;
@@ -106,6 +145,12 @@ impl HttpContext {
                         x_for = Some(header);
                     } else if compare_no_case(key, b"Forwarded") {
                         forwarded = Some(header);
+                    } else if compare_no_case(key, b"User-Agent") {
+                        self.user_agent = header
+                            .val
+                            .data_opt(buf)
+                            .and_then(|data| from_utf8(data).ok())
+                            .map(ToOwned::to_owned);
                     }
                 }
                 _ => {}
@@ -199,9 +244,21 @@ impl HttpContext {
     /// Callback for response:
     ///
     /// - edit headers (connection, set-cookie, sozu-id)
-    /// - save some information (back keep-alive)
+    /// - save information:
+    ///   - status code
+    ///   - reason
+    ///   - back keep-alive
     fn on_response_headers(&mut self, response: &mut GenericHttpStream) {
         let buf = &mut response.storage.mut_buffer();
+
+        // Captures the response line
+        if let kawa::StatusLine::Response { code, reason, .. } = &response.detached.status_line {
+            self.status = Some(*code);
+            self.reason = reason
+                .data_opt(buf)
+                .and_then(|data| from_utf8(data).ok())
+                .map(ToOwned::to_owned);
+        }
 
         // If found:
         // - set Connection to "close" if closing is set
