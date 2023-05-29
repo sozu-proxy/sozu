@@ -389,12 +389,14 @@ pub fn server_bind(addr: String) -> anyhow::Result<TcpListener> {
     Ok(TcpListener::from_std(sock.into()))
 }
 
-pub mod stat {
+/// Socket statistics
+pub mod stats {
     use std::os::fd::AsRawFd;
     use time::Duration;
 
     use internal::{TcpInfo, OPT_LEVEL, OPT_NAME};
 
+    /// Round trip time for a TCP socket
     pub fn socket_rtt<A: AsRawFd>(socket: &A) -> Option<Duration> {
         socket_info(socket.as_raw_fd()).map(|info| Duration::microseconds(info.rtt() as i64))
     }
@@ -519,4 +521,15 @@ pub mod stat {
     #[cfg(not(unix))]
     #[derive(Clone, Debug)]
     struct TcpInfo {}
+
+    #[test]
+    #[serial_test::serial]
+    fn test_rtt() {
+        let sock = std::net::TcpStream::connect("google.com:80").unwrap();
+        let fd = sock.as_raw_fd();
+        let info = socket_info(fd);
+        assert!(info.is_some());
+        println!("{:#?}", info);
+        println!("rtt: {}", crate::logs::LogDuration(socket_rtt(&sock)));
+    }
 }

@@ -8,7 +8,7 @@ use crate::{
     logs::{Endpoint, LogContext, RequestRecord},
     pool::Checkout,
     protocol::SessionState,
-    socket::{stat::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
+    socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
     Backend, L7Proxy, ListenerHandler, Protocol, Readiness, SessionMetrics, SessionResult,

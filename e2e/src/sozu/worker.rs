@@ -47,7 +47,7 @@ pub fn set_no_close_exec(fd: i32) {
     unsafe {
         let old_flags = libc::fcntl(fd, libc::F_GETFD);
         let new_flags = old_flags & !1;
-        println!("flags: {old_flags} -> {new_flags}");
+        // println!("flags: {old_flags} -> {new_flags}");
         libc::fcntl(fd, libc::F_SETFD, new_flags);
     }
 }

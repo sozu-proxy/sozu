@@ -34,7 +34,7 @@ use crate::{
         push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, CONN_RETRIES,
         TIMER,
     },
-    socket::{server_bind, stat::socket_rtt},
+    socket::{server_bind, stats::socket_rtt},
     sozu_command::{
         logging,
         proto::command::{

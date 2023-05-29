@@ -26,7 +26,7 @@ use crate::{
     retry::RetryPolicy,
     router::Route,
     server::{push_event, CONN_RETRIES},
-    socket::{stat::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
+    socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
     AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler,
@@ -205,7 +205,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     /// Reset the connection in case of keep-alive to be ready for the next request
     pub fn reset(&mut self) {
-        println!("==============reset");
+        trace!("==============reset");
         self.context.keep_alive_frontend = true;
         self.context.keep_alive_backend = true;
         self.context.sticky_session_found = None;
@@ -230,7 +230,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
-        println!("==============readable");
+        trace!("==============readable");
         if !self.container_frontend_timeout.reset() {
             error!(
                 "could not reset front timeout {:?}",
@@ -315,7 +315,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn readable_parse(&mut self, _metrics: &mut SessionMetrics) -> StateResult {
-        println!("==============readable_parse");
+        trace!("==============readable_parse");
         let was_initial = self.request_stream.is_initial();
 
         kawa::h1::parse(&mut self.request_stream, &mut self.context);
@@ -354,7 +354,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if was_initial {
             if let kawa::StatusLine::Request { .. } = self.request_stream.detached.status_line {
-                println!("============== HANDLE CONNECTION!");
+                trace!("============== HANDLE CONNECTION!");
                 return StateResult::ConnectBackend;
             }
         }
@@ -362,7 +362,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn writable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
-        println!("==============writable");
+        trace!("==============writable");
         //handle default answers
         if let SessionStatus::DefaultAnswer(_, _, _) = self.status {
             return self.writable_default_answer(metrics);
@@ -426,11 +426,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
             match self.response_stream.detached.status_line {
                 kawa::StatusLine::Response { code: 101, .. } => {
-                    println!("============== HANDLE UPGRADE!");
+                    trace!("============== HANDLE UPGRADE!");
                     return StateResult::Upgrade;
                 }
                 kawa::StatusLine::Response { code: 100, .. } => {
-                    println!("============== HANDLE CONTINUE!");
+                    trace!("============== HANDLE CONTINUE!");
                     self.response_stream.clear();
                     return StateResult::Continue;
                 }
@@ -441,9 +441,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             // with no keepalive on backend, we could open a new backend ConnectionError
             // with no keepalive on front but keepalive on backend, we could have
             // a pool of connections
-            println!(
+            trace!(
                 "============== HANDLE KEEP-ALIVE: {} {}",
-                self.context.keep_alive_frontend, self.context.keep_alive_backend,
+                self.context.keep_alive_frontend,
+                self.context.keep_alive_backend
             );
             return match (
                 self.context.keep_alive_frontend,
@@ -469,7 +470,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn backend_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        println!("==============backend_writable");
+        trace!("==============backend_writable");
         if let SessionStatus::DefaultAnswer(_, _, _) = self.status {
             error!(
                 "{}\tsending default answer, should not write to back",
@@ -547,7 +548,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     // Read content from cluster
     pub fn backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        println!("==============backend_readable");
+        trace!("==============backend_readable");
         if !self.container_backend_timeout.reset() {
             error!(
                 "could not reset back timeout {:?}",
@@ -629,7 +630,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn backend_readable_parse(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        println!("==============backend_readable_parse");
+        trace!("==============backend_readable_parse");
         let was_initial = self.response_stream.is_initial();
 
         kawa::h1::parse(&mut self.response_stream, &mut self.context);
@@ -1138,9 +1139,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             .cluster_id_from_request(proxy.clone())
             .with_context(|| "Could not get cluster id from request")?;
 
-        println!(
+        trace!(
             "connect_to_backend: {:?} {:?} {:?}",
-            self.cluster_id, cluster_id, self.backend_connection_status
+            self.cluster_id,
+            cluster_id,
+            self.backend_connection_status
         );
         // check if we can reuse the backend connection
         if (self.cluster_id.as_ref()) == Some(&cluster_id)
