@@ -76,6 +76,7 @@ impl CommandServer {
             Some(RequestType::QueryCertificatesFromTheState(filters)) => {
                 self.query_certificates_from_the_state(filters)
             }
+            Some(RequestType::CountRequests(_)) => self.query_request_count(),
             Some(RequestType::QueryClusterById(_))
             | Some(RequestType::QueryCertificatesFromWorkers(_))
             | Some(RequestType::QueryClustersByDomain(_))
@@ -110,6 +111,13 @@ impl CommandServer {
         }
 
         Ok(Success::HandledClientRequest)
+    }
+
+    pub fn query_request_count(&mut self) -> anyhow::Result<Option<Success>> {
+        let request_counts = self.state.get_request_counts();
+        Ok(Some(Success::RequestCounts(
+            ContentType::RequestCounts(request_counts).into(),
+        )))
     }
 
     pub async fn save_state(&mut self, path: &str) -> anyhow::Result<Option<Success>> {
@@ -1354,6 +1362,7 @@ impl CommandServer {
 
                 let command_response_data = match success {
                     Success::ListFrontends(crd)
+                    | Success::RequestCounts(crd)
                     | Success::ListWorkers(crd)
                     | Success::CertificatesFromTheState(crd)
                     | Success::Query(crd)

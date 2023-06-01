@@ -93,6 +93,9 @@ message Request {
     QueryCertificatesFilters query_certificates_from_the_state = 44;
     // Get certificates from the workers (rather than from the state)
     QueryCertificatesFilters query_certificates_from_workers = 45;
+    // query the state about how many requests of each type has been received
+    // since startup
+    CountRequests count_requests = 46;
   }
 }
 
@@ -105,6 +108,7 @@ message QueryClustersHashes {}
 message SoftStop {}
 message HardStop {}
 message ReturnListenSockets {}
+message CountRequests {}
 
 // details of an HTTP listener
 message HttpListenerConfig {
@@ -454,6 +458,8 @@ message ResponseContent {
         ListOfCertificatesByAddress certificates_by_address = 11;
         // a map of complete certificates using fingerprints as key
         CertificatesWithFingerprints certificates_with_fingerprints = 12;
+        // a census of the types of requests received since startup,
+        RequestCounts request_counts = 13;
     }
 }
 
@@ -587,4 +593,8 @@ message Percentiles {
     required uint64 p_99_99 = 6;
     required uint64 p_99_999 = 7;
     required uint64 p_100 = 8;
+}
+
+message RequestCounts {
+    map<string, int32> map = 1;
 }

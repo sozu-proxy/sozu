@@ -102,8 +102,9 @@ pub enum Success {
     PropagatedWorkerEvent,
     Query(ResponseContent),
     ReloadConfiguration(usize, usize), // ok, errors
-    SaveState(usize, String),          // amount of written commands, path of the saved state
-    Status(ResponseContent),           // Vec<WorkerInfo>
+    RequestCounts(ResponseContent),
+    SaveState(usize, String), // amount of written commands, path of the saved state
+    Status(ResponseContent),  // Vec<WorkerInfo>
     SubscribeEvent(String),
     UpgradeMain(i32),    // pid of the new main process
     UpgradeWorker(u32),  // worker id
@@ -150,6 +151,7 @@ impl std::fmt::Display for Success {
                 f,
                 "Successfully reloaded configuration, ok: {ok}, errors: {error}"
             ),
+            Self::RequestCounts(_) => write!(f, "count requests"),
             Self::SaveState(counter, path) => {
                 write!(f, "saved {counter} config messages to {path}")
             }

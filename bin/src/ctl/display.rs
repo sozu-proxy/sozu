@@ -8,7 +8,7 @@ use sozu_command_lib::proto::{
         filtered_metrics, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
         CertificateAndKey, CertificatesWithFingerprints, ClusterMetrics, FilteredMetrics,
         ListedFrontends, ListenersList, ResponseContent, WorkerInfos, WorkerMetrics,
-        WorkerResponses,
+        WorkerResponses, RequestCounts,
     },
     display::concatenate_vector,
 };
@@ -743,6 +743,17 @@ pub fn print_certificates_with_validity(
     table.printstd();
 
     Ok(())
+}
+
+pub fn print_request_counts(request_counts: &RequestCounts) {
+    let mut table = Table::new();
+    table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+    table.add_row(row!["request type", "count"]);
+
+    for (request_type, count) in &request_counts.map {
+        table.add_row(row!(request_type, count));
+    }
+    table.printstd();
 }
 
 // ISO 8601

@@ -74,6 +74,7 @@ impl Request {
 
             // These won't ever reach a worker anyway
             RequestType::SaveState(_)
+            | RequestType::CountRequests(_)
             | RequestType::QueryCertificatesFromTheState(_)
             | RequestType::LoadState(_)
             | RequestType::ListWorkers(_)

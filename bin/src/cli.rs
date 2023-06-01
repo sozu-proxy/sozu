@@ -281,6 +281,11 @@ pub enum StateCmd {
         #[clap(short = 'f', long = "file")]
         file: String,
     },
+    #[clap(
+        name = "stats",
+        about = "show the counts of requests that were received since startup"
+    )]
+    Stats,
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]

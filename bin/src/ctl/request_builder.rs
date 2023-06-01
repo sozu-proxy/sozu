@@ -7,9 +7,9 @@ use sozu_command_lib::{
     config::{Config, ListenerBuilder},
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        Cluster, DeactivateListener, FrontendFilters, HardStop, ListListeners, ListenerType,
-        LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig, RemoveBackend,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        Cluster, CountRequests, DeactivateListener, FrontendFilters, HardStop, ListListeners,
+        ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
+        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
         RequestTcpFrontend, RulePosition, SoftStop, Status, SubscribeEvents, TlsVersion,
     },
 };
@@ -33,6 +33,10 @@ impl CommandManager {
         println!("Loading the state on path {path}");
 
         self.send_request(RequestType::LoadState(path).into())
+    }
+
+    pub fn count_requests(&mut self) -> anyhow::Result<()> {
+        self.send_request(RequestType::CountRequests(CountRequests {}).into())
     }
 
     pub fn soft_stop(&mut self) -> anyhow::Result<()> {
