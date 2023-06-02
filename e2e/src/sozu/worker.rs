@@ -65,9 +65,8 @@ impl Worker {
     }
 
     pub fn into_config(file_config: FileConfig) -> Config {
-        let mut config_builder = ConfigBuilder::new(file_config);
-        config_builder
-            .into_config("")
+        ConfigBuilder::new(file_config, "")
+            .into_config()
             .expect("could not create Config")
     }
 

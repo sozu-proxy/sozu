@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
     info!("starting up");
 
     let http_listener = ListenerBuilder::new_http("127.0.0.1:8080")
-        .to_http()
+        .to_http(None)
         .expect("Could not create HTTP listener");
 
     let (mut command_channel, proxy_channel): (

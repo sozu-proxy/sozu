@@ -1151,7 +1151,7 @@ mod tests {
         barrier.wait();
 
         let config = ListenerBuilder::new_http("127.0.0.1:1024")
-            .to_http()
+            .to_http(None)
             .expect("could not create listener config");
 
         let (mut command, channel) =
@@ -1233,7 +1233,7 @@ mod tests {
         barrier.wait();
 
         let config = ListenerBuilder::new_http("127.0.0.1:1031")
-            .to_http()
+            .to_http(None)
             .expect("could not create listener config");
 
         let (mut command, channel) =
@@ -1343,7 +1343,7 @@ mod tests {
         setup_test_logger!();
 
         let config = ListenerBuilder::new_http("127.0.0.1:1041")
-            .to_http()
+            .to_http(None)
             .expect("could not create listener config");
 
         let (mut command, channel) =
@@ -1519,7 +1519,7 @@ mod tests {
             FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
 
         let default_config = ListenerBuilder::new_http(address)
-            .to_http()
+            .to_http(None)
             .expect("Could not create default HTTP listener config");
 
         let listener = HttpListener {

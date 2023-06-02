@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
     );
     gauge!("sozu.TEST", 42);
 
-    let http_listener = ListenerBuilder::new_http("127.0.0.1:8080").to_http()?;
+    let http_listener = ListenerBuilder::new_http("127.0.0.1:8080").to_http(None)?;
 
     let (mut command, channel) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
     info!("MAIN\tHTTP -> {:?}", command.read_message());
     info!("MAIN\tHTTP -> {:?}", command.read_message());
 
-    let https_listener = ListenerBuilder::new_https("127.0.0.1:8443").to_tls()?;
+    let https_listener = ListenerBuilder::new_https("127.0.0.1:8443").to_tls(None)?;
 
     let (mut command2, channel2) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;

@@ -294,7 +294,9 @@ pub fn try_issue_810_panic(part2: bool) -> State {
 
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddTcpListener(
-            ListenerBuilder::new_tcp(front_address).to_tcp().unwrap(),
+            ListenerBuilder::new_tcp(front_address)
+                .to_tcp(None)
+                .unwrap(),
         )),
     });
     worker.send_proxy_request(Request {
@@ -373,7 +375,9 @@ pub fn try_tls_endpoint() -> State {
 
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddHttpsListener(
-            ListenerBuilder::new_https(front_address).to_tls().unwrap(),
+            ListenerBuilder::new_https(front_address)
+                .to_tls(None)
+                .unwrap(),
         )),
     });
 
@@ -675,7 +679,9 @@ fn try_http_behaviors() -> State {
 
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddHttpListener(
-            ListenerBuilder::new_http(front_address).to_http().unwrap(),
+            ListenerBuilder::new_http(front_address)
+                .to_http(None)
+                .unwrap(),
         )),
     });
     worker.send_proxy_request(Request {

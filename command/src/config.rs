@@ -1,4 +1,52 @@
-//! parsing data from the configuration file
+//! # Sōzu's configuration
+//!
+//! This module is responsible for parsing the `config.toml` provided by the flag `--config`
+//! when starting Sōzu.
+//!
+//! Here is the workflow for generating a working config:
+//!
+//! ```text
+//!     config.toml   ->   FileConfig    ->  ConfigBuilder   ->  Config
+//! ```
+//!
+//! `config.toml` is parsed to `FileConfig`, a structure that itself contains a lot of substructures
+//! whose names end start with `File-`, like `FileHttpFrontendConfig` for instance.
+//!
+//! The instance of `FileConfig` is then passed to a `ConfigBuilder` that populates a final `Config`
+//! with listeners and clusters.
+//!
+//! To illustrate:
+//!
+//! ```ignore
+//! use sozu_command_lib::config::{FileConfig, ConfigBuilder};
+//!
+//! let file_config = FileConfig::load_from_path("../config.toml")
+//!     .expect("Could not load config.toml");
+//!
+//! let config = ConfigBuilder::new(file_config, "../assets/config.toml")
+//!     .into_config()
+//!     .expect("Could not build config");
+//! ```
+//!
+//! Note that the path to `config.toml` is used twice: the first time, to parse the file,
+//! the second time, to keep the path in the config for later use.
+//!
+//! However, there is a simpler way that combines all this:
+//!
+//! ```ignore
+//! use sozu_command_lib::config::Config;
+//!
+//! let config = Config::load_from_path("../assets/config.toml")
+//!     .expect("Could not build config from the path");
+//! ```
+//!
+//! ## How values are chosen
+//!
+//! Values are chosen in this order of priority:
+//!
+//! 1. values defined in a section of the TOML file, for instance, timeouts for a specific listener
+//! 2. values defined globally in the TOML file, like timeouts or buffer size
+//! 3. if a variable has not been set in the TOML file, it will be set to a default defined here
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
@@ -23,7 +71,7 @@ use crate::{
     request::WorkerRequest,
 };
 
-/// [`DEFAULT_RUSTLS_CIPHER_LIST`] provides all supported cipher suites exported by Rustls TLS
+/// provides all supported cipher suites exported by Rustls TLS
 /// provider as it support only strongly secure ones.
 ///
 /// See the [documentation](https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html)
@@ -62,16 +110,53 @@ pub const DEFAULT_SIGNATURE_ALGORITHMS: [&str; 9] = [
 
 pub const DEFAULT_GROUPS_LIST: [&str; 4] = ["P-521", "P-384", "P-256", "x25519"];
 
-// TODO: trickle default values from the config, see #873
+/// maximum time of inactivity for a frontend socket (60 seconds)
 pub const DEFAULT_FRONT_TIMEOUT: u32 = 60;
+
+/// maximum time of inactivity for a backend socket (30 seconds)
 pub const DEFAULT_BACK_TIMEOUT: u32 = 30;
+
+/// maximum time to connect to a backend server (3 seconds)
 pub const DEFAULT_CONNECT_TIMEOUT: u32 = 3;
+
+/// maximum time to receive a request since the connection started (10 seconds)
 pub const DEFAULT_REQUEST_TIMEOUT: u32 = 10;
 
+/// a name applied to sticky sessions ("SOZUBALANCEID")
 pub const DEFAULT_STICKY_NAME: &str = "SOZUBALANCEID";
 
-/// An HTTP, HTTPS or TCP listener as parsed from the config
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default, Deserialize)]
+/// Interval between checking for zombie sessions, (30 minutes)
+pub const DEFAULT_ZOMBIE_CHECK_INTERVAL: u32 = 1_800;
+
+/// timeout to accept connection events in the accept queue (60 seconds)
+pub const DEFAULT_ACCEPT_QUEUE_TIMEOUT: u32 = 60;
+
+/// number of workers, i.e. Sōzu processes that scale horizontally (2)
+pub const DEFAULT_WORKER_COUNT: u16 = 2;
+
+/// wether a worker is automatically restarted when it crashes (true)
+pub const DEFAULT_WORKER_AUTOMATIC_RESTART: bool = true;
+
+/// wether to save the state automatically (false)
+pub const DEFAULT_AUTOMATIC_STATE_SAVE: bool = false;
+
+/// maximum number of buffers (1 000)
+pub const DEFAULT_MAX_BUFFERS: usize = 1_000;
+
+/// size of the buffers, in bytes (16 KB)
+pub const DEFAULT_BUFFER_SIZE: usize = 16_393;
+
+/// maximum number of simultaneous connections (10 000)
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+
+/// size of the buffer for the channels, in bytes. Must be bigger than the size of the data received. (1 MB)
+pub const DEFAULT_COMMAND_BUFFER_SIZE: usize = 1_000_000;
+
+/// maximum size of the buffer for the channels, in bytes. (2 MB)
+pub const DEFAULT_MAX_COMMAND_BUFFER_SIZE: usize = 2_000_000;
+
+/// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerBuilder {
     pub address: String,
@@ -98,6 +183,8 @@ pub struct ListenerBuilder {
     pub connect_timeout: Option<u32>,
     /// maximum time to receive a request since the connection started
     pub request_timeout: Option<u32>,
+    /// A [Config] to pull defaults from
+    pub config: Option<Config>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -105,7 +192,8 @@ pub fn default_sticky_name() -> String {
 }
 
 impl ListenerBuilder {
-    /// starts building an HTTP Listener with default values
+    /// starts building an HTTP Listener with config values for timeouts,
+    /// or defaults if no config is provided
     pub fn new_http<S>(address: S) -> ListenerBuilder
     where
         S: ToString,
@@ -113,7 +201,8 @@ impl ListenerBuilder {
         Self::new(address, ListenerProtocol::Http)
     }
 
-    /// starts building an HTTPS Listener with default values
+    /// starts building an HTTPS Listener with config values for timeouts,
+    /// or defaults if no config is provided
     pub fn new_tcp<S>(address: S) -> ListenerBuilder
     where
         S: ToString,
@@ -121,7 +210,8 @@ impl ListenerBuilder {
         Self::new(address, ListenerProtocol::Tcp)
     }
 
-    /// starts building a TCP Listener with default values
+    /// starts building a TCP Listener with config values for timeouts,
+    /// or defaults if no config is provided
     pub fn new_https<S>(address: S) -> ListenerBuilder
     where
         S: ToString,
@@ -129,7 +219,7 @@ impl ListenerBuilder {
         Self::new(address, ListenerProtocol::Https)
     }
 
-    /// starts building a Listener with default values
+    /// starts building a Listener
     fn new<S>(address: S, protocol: ListenerProtocol) -> ListenerBuilder
     where
         S: ToString,
@@ -138,10 +228,6 @@ impl ListenerBuilder {
             address: address.to_string(),
             protocol: Some(protocol),
             sticky_name: DEFAULT_STICKY_NAME.to_string(),
-            front_timeout: Some(DEFAULT_FRONT_TIMEOUT),
-            back_timeout: Some(DEFAULT_BACK_TIMEOUT),
-            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
-            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
             ..Default::default()
         }
     }
@@ -263,13 +349,25 @@ impl ListenerBuilder {
         }
     }
 
-    /// build an HTTP listener using defaults if the values were not provided
-    pub fn to_http(&mut self) -> anyhow::Result<HttpListenerConfig> {
+    /// Assign the timeouts of the config to this listener, only if timeouts did not exist
+    fn assign_config_timeouts(&mut self, config: &Config) {
+        self.front_timeout = Some(self.front_timeout.unwrap_or(config.front_timeout));
+        self.back_timeout = Some(self.back_timeout.unwrap_or(config.back_timeout));
+        self.connect_timeout = Some(self.connect_timeout.unwrap_or(config.connect_timeout));
+        self.request_timeout = Some(self.request_timeout.unwrap_or(config.request_timeout));
+    }
+
+    /// build an HTTP listener with config timeouts, using defaults if no config is provided
+    pub fn to_http(&mut self, config: Option<&Config>) -> anyhow::Result<HttpListenerConfig> {
         if self.protocol != Some(ListenerProtocol::Http) {
             bail!(format!(
                 "Can not build an HTTP listener from a {:?} config",
                 self.protocol
             ));
+        }
+
+        if let Some(config) = config {
+            self.assign_config_timeouts(config);
         }
 
         let (answer_404, answer_503) = self
@@ -301,8 +399,8 @@ impl ListenerBuilder {
         Ok(configuration)
     }
 
-    /// build an HTTPS listener using defaults if the values were not provided
-    pub fn to_tls(&self) -> anyhow::Result<HttpsListenerConfig> {
+    /// build an HTTPS listener using defaults if no config or values were provided upstream
+    pub fn to_tls(&mut self, config: Option<&Config>) -> anyhow::Result<HttpsListenerConfig> {
         if self.protocol != Some(ListenerProtocol::Https) {
             bail!(format!(
                 "Can not build an HTTPS listener from a {:?} config",
@@ -378,6 +476,10 @@ impl ListenerBuilder {
             .parse_public_address()
             .with_context(|| "wrong public address")?;
 
+        if let Some(config) = config {
+            self.assign_config_timeouts(config);
+        }
+
         let https_listener_config = HttpsListenerConfig {
             address: self.address.clone(),
             sticky_name: self.sticky_name.clone(),
@@ -403,8 +505,8 @@ impl ListenerBuilder {
         Ok(https_listener_config)
     }
 
-    /// build a TCP listener using defaults if the values were not provided
-    pub fn to_tcp(&self) -> anyhow::Result<TcpListenerConfig> {
+    /// build an HTTPS listener using defaults if no config or values were provided upstream
+    pub fn to_tcp(&mut self, config: Option<&Config>) -> anyhow::Result<TcpListenerConfig> {
         if self.protocol != Some(ListenerProtocol::Tcp) {
             bail!(format!(
                 "Can not build a TCP listener from a {:?} config",
@@ -419,6 +521,10 @@ impl ListenerBuilder {
         let _public_address = self
             .parse_public_address()
             .with_context(|| "wrong public address")?;
+
+        if let Some(config) = config {
+            self.assign_config_timeouts(config);
+        }
 
         Ok(TcpListenerConfig {
             address: self.address.clone(),
@@ -928,7 +1034,7 @@ impl ClusterConfig {
     }
 }
 
-/// Built from the TOML config provided by the user.
+/// Parsed from the TOML config provided by the user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct FileConfig {
     pub command_socket: Option<String>,
@@ -1019,6 +1125,7 @@ impl FileConfig {
     }
 }
 
+/// A builder that converts [FileConfig] to [Config]
 pub struct ConfigBuilder {
     file: FileConfig,
     known_addresses: HashMap<SocketAddr, ListenerProtocol>,
@@ -1027,18 +1134,78 @@ pub struct ConfigBuilder {
 }
 
 impl ConfigBuilder {
-    pub fn new(file_config: FileConfig) -> Self {
+    /// starts building a [Config] with values from a [FileConfig], or defaults.
+    ///
+    /// please provide a config path, usefull for rebuilding the config later.
+    pub fn new<S>(file_config: FileConfig, config_path: S) -> Self
+    where
+        S: ToString,
+    {
+        let built = Config {
+            accept_queue_timeout: file_config
+                .accept_queue_timeout
+                .unwrap_or(DEFAULT_ACCEPT_QUEUE_TIMEOUT),
+            activate_listeners: file_config.activate_listeners.unwrap_or(true),
+            automatic_state_save: file_config
+                .automatic_state_save
+                .unwrap_or(DEFAULT_AUTOMATIC_STATE_SAVE),
+            back_timeout: file_config.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
+            buffer_size: file_config.buffer_size.unwrap_or(DEFAULT_BUFFER_SIZE),
+            command_buffer_size: file_config
+                .command_buffer_size
+                .unwrap_or(DEFAULT_COMMAND_BUFFER_SIZE),
+            config_path: config_path.to_string(),
+            connect_timeout: file_config.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+            ctl_command_timeout: file_config.ctl_command_timeout.unwrap_or(1_000),
+            front_timeout: file_config.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
+            handle_process_affinity: file_config.handle_process_affinity.unwrap_or(false),
+            log_access_target: file_config.log_access_target.clone(),
+            log_level: file_config
+                .log_level
+                .clone()
+                .unwrap_or_else(|| String::from("info")),
+            log_target: file_config
+                .log_target
+                .clone()
+                .unwrap_or_else(|| String::from("stdout")),
+            max_buffers: file_config.max_buffers.unwrap_or(DEFAULT_MAX_BUFFERS),
+            max_command_buffer_size: file_config
+                .command_buffer_size
+                .unwrap_or(DEFAULT_MAX_COMMAND_BUFFER_SIZE),
+            max_connections: file_config
+                .max_connections
+                .unwrap_or(DEFAULT_MAX_CONNECTIONS),
+            metrics: file_config.metrics.clone(),
+            min_buffers: std::cmp::min(
+                file_config.min_buffers.unwrap_or(1),
+                file_config.max_buffers.unwrap_or(1000),
+            ),
+            pid_file_path: file_config.pid_file_path.clone(),
+            request_timeout: file_config
+                .request_timeout
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT),
+            saved_state: file_config.saved_state.clone(),
+            worker_automatic_restart: file_config
+                .worker_automatic_restart
+                .unwrap_or(DEFAULT_WORKER_AUTOMATIC_RESTART),
+            worker_count: file_config.worker_count.unwrap_or(DEFAULT_WORKER_COUNT),
+            zombie_check_interval: file_config
+                .zombie_check_interval
+                .unwrap_or(DEFAULT_ZOMBIE_CHECK_INTERVAL),
+            ..Default::default()
+        };
+
         Self {
             file: file_config,
             known_addresses: HashMap::new(),
             expect_proxy_addresses: HashSet::new(),
-            built: Config::default(),
+            built,
         }
     }
 
-    fn push_tls_listener(&mut self, listener: ListenerBuilder) -> anyhow::Result<()> {
+    fn push_tls_listener(&mut self, mut listener: ListenerBuilder) -> anyhow::Result<()> {
         let listener = listener
-            .to_tls()
+            .to_tls(Some(&self.built))
             .with_context(|| "Cannot convert listener to TLS")?;
         self.built.https_listeners.push(listener);
         Ok(())
@@ -1046,15 +1213,15 @@ impl ConfigBuilder {
 
     fn push_http_listener(&mut self, mut listener: ListenerBuilder) -> anyhow::Result<()> {
         let listener = listener
-            .to_http()
+            .to_http(Some(&self.built))
             .with_context(|| "Cannot convert listener to HTTP")?;
         self.built.http_listeners.push(listener);
         Ok(())
     }
 
-    fn push_tcp_listener(&mut self, listener: ListenerBuilder) -> anyhow::Result<()> {
+    fn push_tcp_listener(&mut self, mut listener: ListenerBuilder) -> anyhow::Result<()> {
         let listener = listener
-            .to_tcp()
+            .to_tcp(Some(&self.built))
             .with_context(|| "Cannot convert listener to TCP")?;
         self.built.tcp_listeners.push(listener);
         Ok(())
@@ -1187,7 +1354,8 @@ impl ConfigBuilder {
         Ok(())
     }
 
-    pub fn into_config(&mut self, config_path: &str) -> anyhow::Result<Config> {
+    /// Builds a [`Config`], populated with listeners and clusters
+    pub fn into_config(&mut self) -> anyhow::Result<Config> {
         if let Some(listeners) = &self.file.listeners {
             self.populate_listeners(listeners.clone())?;
         }
@@ -1210,55 +1378,15 @@ impl ConfigBuilder {
         }
 
         Ok(Config {
-            config_path: config_path.to_string(),
             command_socket: command_socket_path,
-            command_buffer_size: self.file.command_buffer_size.unwrap_or(1_000_000),
-            max_command_buffer_size: self
-                .file
-                .max_command_buffer_size
-                .unwrap_or(self.file.command_buffer_size.unwrap_or(1_000_000) * 2),
-            max_connections: self.file.max_connections.unwrap_or(10000),
-            min_buffers: std::cmp::min(
-                self.file.min_buffers.unwrap_or(1),
-                self.file.max_buffers.unwrap_or(1000),
-            ),
-            max_buffers: self.file.max_buffers.unwrap_or(1000),
-            buffer_size: self.file.buffer_size.unwrap_or(16393),
-            saved_state: self.file.saved_state.clone(),
-            automatic_state_save: self.file.automatic_state_save.unwrap_or(false),
-            log_level: self
-                .file
-                .log_level
-                .clone()
-                .unwrap_or_else(|| String::from("info")),
-            log_target: self
-                .file
-                .log_target
-                .clone()
-                .unwrap_or_else(|| String::from("stdout")),
-            log_access_target: self.file.log_access_target.clone(),
-            worker_count: self.file.worker_count.unwrap_or(2),
-            worker_automatic_restart: self.file.worker_automatic_restart.unwrap_or(true),
-            metrics: self.file.metrics.clone(),
-            http_listeners: self.built.http_listeners.clone(),
-            https_listeners: self.built.https_listeners.clone(),
-            tcp_listeners: self.built.tcp_listeners.clone(),
-            clusters: self.built.clusters.clone(),
-            handle_process_affinity: self.file.handle_process_affinity.unwrap_or(false),
-            ctl_command_timeout: self.file.ctl_command_timeout.unwrap_or(1_000),
-            pid_file_path: self.file.pid_file_path.clone(),
-            activate_listeners: self.file.activate_listeners.unwrap_or(true),
-            front_timeout: self.file.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
-            back_timeout: self.file.front_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
-            connect_timeout: self.file.front_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
-            //defaults to 30mn
-            zombie_check_interval: self.file.zombie_check_interval.unwrap_or(30 * 60),
-            accept_queue_timeout: self.file.accept_queue_timeout.unwrap_or(60),
+            ..self.built.clone()
         })
     }
 }
 
-/// Sōzu config as parsed from the TOML config, used to create requests
+/// Sōzu configuration, populated with clusters and listeners.
+///
+/// This struct is used on startup to generate `WorkerRequest`s
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct Config {
     pub config_path: String,
@@ -1297,6 +1425,8 @@ pub struct Config {
     pub zombie_check_interval: u32,
     #[serde(default = "default_accept_queue_timeout")]
     pub accept_queue_timeout: u32,
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: u32,
 }
 
 fn default_front_timeout() -> u32 {
@@ -1311,24 +1441,26 @@ fn default_connect_timeout() -> u32 {
     DEFAULT_CONNECT_TIMEOUT
 }
 
-//defaults to 30mn
+fn default_request_timeout() -> u32 {
+    DEFAULT_REQUEST_TIMEOUT
+}
+
 fn default_zombie_check_interval() -> u32 {
-    30 * 60
+    DEFAULT_ZOMBIE_CHECK_INTERVAL
 }
 
 fn default_accept_queue_timeout() -> u32 {
-    60
+    DEFAULT_ACCEPT_QUEUE_TIMEOUT
 }
 
 impl Config {
+    /// Parse a TOML file and build a config out of it
     pub fn load_from_path(path: &str) -> anyhow::Result<Config> {
         let file_config =
             FileConfig::load_from_path(path).with_context(|| "Could not load the config file")?;
 
-        let mut config_builder = ConfigBuilder::new(file_config);
-
-        let mut config = config_builder
-            .into_config(path)
+        let mut config = ConfigBuilder::new(file_config, path)
+            .into_config()
             .with_context(|| "Could not build config from file")?;
 
         // replace saved_state with a verified path
@@ -1339,6 +1471,7 @@ impl Config {
         Ok(config)
     }
 
+    /// yields requests intended to recreate a proxy that match the config
     pub fn generate_config_messages(&self) -> anyhow::Result<Vec<WorkerRequest>> {
         let mut v = Vec::new();
         let mut count = 0u8;
@@ -1422,6 +1555,7 @@ impl Config {
         Ok(v)
     }
 
+    /// Get the path of the UNIX socket used to communicate with Sōzu
     pub fn command_socket_path(&self) -> anyhow::Result<String> {
         let config_path_buf = PathBuf::from(self.config_path.clone());
         let mut config_folder = match config_path_buf.parent() {
@@ -1453,6 +1587,7 @@ impl Config {
             .with_context(|| "could not parse command socket path")
     }
 
+    /// Get the path of where the state will be saved
     fn saved_state_path(&self) -> anyhow::Result<Option<String>> {
         let path = match self.saved_state.as_ref() {
             Some(path) => path,
@@ -1505,16 +1640,18 @@ impl Config {
         Ok(Some(stringified_path))
     }
 
+    /// read any file to a string
     pub fn load_file(path: &str) -> io::Result<String> {
         std::fs::read_to_string(path)
     }
 
+    /// read any file to bytes
     pub fn load_file_bytes(path: &str) -> io::Result<Vec<u8>> {
         std::fs::read(path)
     }
 }
 
-pub fn display_toml_error(file: &str, error: &toml::de::Error) {
+fn display_toml_error(file: &str, error: &toml::de::Error) {
     println!("error parsing the configuration file '{file}': {error}");
     if let Some(Range { start, end }) = error.span() {
         print!("error parsing the configuration file '{file}' at position: {start}, {end}");

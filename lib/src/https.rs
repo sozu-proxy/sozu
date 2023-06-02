@@ -1671,7 +1671,7 @@ mod tests {
         let rustls_details = Arc::new(server_config);
 
         let default_config = ListenerBuilder::new_https(address)
-            .to_tls()
+            .to_tls(None)
             .expect("Could not create default HTTPS listener config");
 
         let listener = HttpsListener {

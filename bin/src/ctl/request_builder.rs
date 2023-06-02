@@ -311,7 +311,7 @@ impl CommandManager {
                     .with_back_timeout(back_timeout)
                     .with_request_timeout(request_timeout)
                     .with_connect_timeout(connect_timeout)
-                    .to_tls()
+                    .to_tls(Some(&self.config))
                     .with_context(|| "Error creating HTTPS listener")?;
 
                 self.send_request(RequestType::AddHttpsListener(https_listener).into())
@@ -352,7 +352,7 @@ impl CommandManager {
                     .with_request_timeout(request_timeout)
                     .with_back_timeout(back_timeout)
                     .with_connect_timeout(connect_timeout)
-                    .to_http()
+                    .to_http(Some(&self.config))
                     .with_context(|| "Error creating HTTP listener")?;
                 self.send_request(RequestType::AddHttpListener(http_listener).into())
             }
@@ -378,7 +378,7 @@ impl CommandManager {
                 let listener = ListenerBuilder::new_tcp(address)
                     .with_public_address(public_address)
                     .with_expect_proxy(expect_proxy)
-                    .to_tcp()
+                    .to_tcp(Some(&self.config))
                     .with_context(|| "Could not create TCP listener")?;
 
                 self.send_request(RequestType::AddTcpListener(listener).into())
