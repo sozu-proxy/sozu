@@ -12,12 +12,16 @@ use anyhow::{bail, Context};
 
 use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
-    proto::command::{
-        request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        Cluster, ClusterInformation, DeactivateListener, FrontendFilters, HttpListenerConfig,
-        HttpsListenerConfig, ListedFrontends, ListenerType, ListenersList, PathRule,
-        QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, Request, RequestHttpFrontend, RequestTcpFrontend, TcpListenerConfig,
+    proto::{
+        command::{
+            request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
+            Cluster, ClusterInformation, DeactivateListener, FrontendFilters, HttpListenerConfig,
+            HttpsListenerConfig, ListedFrontends, ListenerType, ListenersList, PathRule,
+            QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
+            ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend, RequestTcpFrontend,
+            TcpListenerConfig,
+        },
+        display::format_request_type,
     },
     response::{Backend, HttpFrontend, TcpFrontend},
 };
@@ -25,12 +29,23 @@ use crate::{
 /// To use throughout Sōzu
 pub type ClusterId = String;
 
+/// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
+/// from frontends to backends. Hence, it contains all details about:
+///
+/// - listeners (socket addresses, for TCP and HTTP connections)
+/// - frontends (bind to a listener)
+/// - backends (to forward connections to)
+/// - clusters (routing rules from frontends to backends)
+/// - TLS certificates
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigState {
     pub clusters: BTreeMap<ClusterId, Cluster>,
     pub backends: BTreeMap<ClusterId, Vec<Backend>>,
+    /// socket address -> HTTP listener
     pub http_listeners: BTreeMap<String, HttpListenerConfig>,
+    /// socket address -> HTTPS listener
     pub https_listeners: BTreeMap<String, HttpsListenerConfig>,
+    /// socket address -> TCP listener
     pub tcp_listeners: BTreeMap<String, TcpListenerConfig>,
     /// HTTP frontends, indexed by a summary of each front's address;hostname;path, for uniqueness.
     /// For example: `"0.0.0.0:8080;lolcatho.st;P/api"`
@@ -39,6 +54,8 @@ pub struct ConfigState {
     pub https_fronts: BTreeMap<String, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
     pub certificates: HashMap<SocketAddr, HashMap<Fingerprint, CertificateAndKey>>,
+    /// A census of requests that were received. Name of the request -> number of occurences
+    pub request_counts: BTreeMap<String, i32>,
 }
 
 impl ConfigState {
@@ -51,6 +68,9 @@ impl ConfigState {
             Some(t) => t,
             None => bail!("Empty request!"),
         };
+
+        self.increment_request_count(request);
+
         match request_type {
             RequestType::AddCluster(cluster) => self
                 .add_cluster(cluster)
@@ -111,6 +131,7 @@ impl ConfigState {
                 .with_context(|| "Could not remove backend"),
             // This is to avoid the error message
             &RequestType::Logging(_)
+            | &RequestType::CountRequests(_)
             | &RequestType::Status(_)
             | &RequestType::SoftStop(_)
             | &RequestType::QueryCertificatesFromWorkers(_)
@@ -125,6 +146,23 @@ impl ConfigState {
             other_request => {
                 bail!("state cannot handle request message: {:#?}", other_request);
             }
+        }
+    }
+
+    /// Increments the count for this request type
+    fn increment_request_count(&mut self, request: &Request) {
+        if let Some(request_type) = &request.request_type {
+            let count = self
+                .request_counts
+                .entry(format_request_type(&request_type))
+                .or_insert(1);
+            *count += 1;
+        }
+    }
+
+    pub fn get_request_counts(&self) -> RequestCounts {
+        RequestCounts {
+            map: self.request_counts.clone(),
         }
     }
 

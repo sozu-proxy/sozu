@@ -13,7 +13,7 @@ use crate::ctl::{
     display::{
         print_available_metrics, print_certificates_by_worker, print_certificates_with_validity,
         print_cluster_responses, print_frontend_list, print_json_response, print_listeners,
-        print_metrics, print_status,
+        print_metrics, print_request_counts, print_status,
     },
     CommandManager,
 };
@@ -68,6 +68,9 @@ impl CommandManager {
                     }
                     if let Some(response_content) = response.content {
                         match response_content.content_type {
+                            Some(ContentType::RequestCounts(request_counts)) => {
+                                print_request_counts(&request_counts)
+                            }
                             Some(ContentType::FrontendList(frontends)) => {
                                 print_frontend_list(frontends)
                             }
