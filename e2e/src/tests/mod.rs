@@ -44,7 +44,9 @@ pub fn setup_test<S: Into<String>>(
 
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddHttpListener(
-            ListenerBuilder::new_http(front_address).to_http().unwrap(),
+            ListenerBuilder::new_http(front_address)
+                .to_http(None)
+                .unwrap(),
         )),
     });
     worker.send_proxy_request(Request {
