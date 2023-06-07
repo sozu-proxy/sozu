@@ -47,8 +47,8 @@ impl Backend {
         let listener = TcpListener::bind(self.address).expect("could not bind");
         let timeout = Duration::from_millis(100);
         let timeout = libc::timeval {
-            tv_sec: timeout.as_secs() as i64,
-            tv_usec: timeout.subsec_micros() as i64,
+            tv_sec: 0,
+            tv_usec: timeout.subsec_micros().try_into().unwrap(),
         };
         let listener = unsafe {
             let fd = listener.into_raw_fd();
