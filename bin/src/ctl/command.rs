@@ -260,8 +260,8 @@ impl CommandManager {
                     ResponseStatus::Ok => {
                         if let Some(response_content) = response.content {
                             match response_content.content_type {
-                                Some(ContentType::Metrics(aggregated_metrics_data)) => {
-                                    print_metrics(aggregated_metrics_data, json)?
+                                Some(ContentType::Metrics(aggregated_metrics)) => {
+                                    print_metrics(aggregated_metrics, json)?
                                 }
                                 Some(ContentType::AvailableMetrics(available)) => {
                                     print_available_metrics(&available)?;

@@ -77,7 +77,7 @@ message Request {
     QueryClusterByDomain query_clusters_by_domain = 36;
     // query clusters hashes
     QueryClustersHashes query_clusters_hashes = 37;
-    // query metrics
+    // query metrics, providing options (filter by cluster, by backend, query metrics names...)
     QueryMetricsOptions query_metrics = 38;
     // soft stop
     SoftStop soft_stop = 39;
@@ -398,15 +398,17 @@ message QueryClusterByDomain {
     optional string path = 2;
 }
 
-// Options when querying metrics
+// Options when querying metrics. You can filter by cluster id, backend id, or metric names.
+// If no filters are provided (by default), all metrics are queried.
+// If `list` is set to true, only names of available metrics will be queried.
 message QueryMetricsOptions {
-    // query a list of available metrics
-    required bool list = 1;
-    // query metrics for these clusters
+    // query a list of available metrics (defaults to false)
+    required bool list = 1 [default = false];
+    // query metrics for these clusters (defaults to empty)
     repeated string cluster_ids = 2;
-    // query metrics for these backends
+    // query metrics for these backends (defaults to empty)
     repeated string backend_ids = 3;
-    // query only these metrics
+    // query only these metrics (defaults to empty)
     repeated string metric_names = 4;
 }
 
