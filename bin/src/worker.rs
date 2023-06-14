@@ -1,15 +1,3 @@
-#[cfg(target_os = "freebsd")]
-use std::ffi::c_void;
-#[cfg(target_os = "macos")]
-use std::ffi::CString;
-#[cfg(target_os = "macos")]
-use std::iter::repeat;
-#[cfg(target_os = "freebsd")]
-use std::iter::repeat;
-#[cfg(target_os = "freebsd")]
-use std::mem::size_of;
-#[cfg(target_os = "macos")]
-use std::ptr::null_mut;
 use std::{
     collections::VecDeque,
     fmt,
@@ -19,12 +7,16 @@ use std::{
     os::unix::process::CommandExt,
     process::Command,
 };
+#[cfg(target_os = "freebsd")]
+use std::{ffi::c_void, iter::repeat, mem::size_of};
 
-use anyhow::{bail, Context};
+#[cfg(target_os = "linux")]
+use anyhow::bail;
+use anyhow::Context;
 use futures::SinkExt;
-use libc::{self, pid_t};
 #[cfg(target_os = "macos")]
-use libc::{c_char, PATH_MAX};
+use libc::c_char;
+use libc::{self, pid_t};
 #[cfg(target_os = "freebsd")]
 use libc::{sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
 use mio::net::UnixStream;
@@ -421,7 +413,8 @@ extern "C" {
 
 #[cfg(target_os = "macos")]
 pub unsafe fn get_executable_path() -> anyhow::Result<String> {
-    let path = std::env::current_exe().with_context(|| "failed to retrieve current executable path")?;
+    let path =
+        std::env::current_exe().with_context(|| "failed to retrieve current executable path")?;
     Ok(path.to_string_lossy().to_string())
 }
 
