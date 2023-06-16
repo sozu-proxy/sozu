@@ -1155,7 +1155,9 @@ impl ConfigBuilder {
                 .command_buffer_size
                 .unwrap_or(DEFAULT_COMMAND_BUFFER_SIZE),
             config_path: config_path.to_string(),
-            connect_timeout: file_config.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+            connect_timeout: file_config
+                .connect_timeout
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             ctl_command_timeout: file_config.ctl_command_timeout.unwrap_or(1_000),
             front_timeout: file_config.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
             handle_process_affinity: file_config.handle_process_affinity.unwrap_or(false),

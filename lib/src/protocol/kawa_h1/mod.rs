@@ -434,6 +434,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     self.response_stream.clear();
                     return StateResult::Continue;
                 }
+                kawa::StatusLine::Response { code: 103, .. } => {
+                    self.backend_readiness.event.insert(Ready::READABLE);
+                    trace!("============== HANDLE EARLY HINT!");
+                    self.response_stream.clear();
+                    return StateResult::Continue;
+                }
                 _ => (),
             }
 

@@ -27,9 +27,9 @@ use sozu_command::{
 };
 
 use crate::{
-    protocol::SessionState, router::Router, timer::TimeoutContainer, util::UnwrapLog,
+    protocol::SessionState, router::Router, timer::TimeoutContainer, util::UnwrapLog, CachedTags,
     L7ListenerHandler, L7Proxy, ListenerHandler, SessionIsToBeClosed, SessionResult,
-    StateMachineBuilder, CachedTags,
+    StateMachineBuilder,
 };
 
 use super::{
