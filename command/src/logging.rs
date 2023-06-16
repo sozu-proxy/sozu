@@ -406,11 +406,13 @@ impl LogLevelFilter {
 }
 
 /// Metadata about a log message.
+#[derive(Debug)]
 pub struct Metadata {
     pub level: LogLevel,
     pub target: &'static str,
 }
 
+#[derive(Debug)]
 pub struct LogDirective {
     name: Option<String>,
     level: LogLevelFilter,

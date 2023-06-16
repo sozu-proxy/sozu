@@ -27,7 +27,7 @@ use sozu_command::{
 };
 
 use crate::{
-    protocol::SessionState, router::Router, timer::TimeoutContainer, util::UnwrapLog,
+    protocol::SessionState, router::Router, timer::TimeoutContainer, util::UnwrapLog, CachedTags,
     L7ListenerHandler, L7Proxy, ListenerHandler, SessionIsToBeClosed, SessionResult,
     StateMachineBuilder,
 };
@@ -105,7 +105,7 @@ impl HttpSession {
         sticky_name: String,
         token: Token,
         wait_time: Duration,
-    ) -> Self {
+    ) -> Result<Self, AcceptError> {
         let request_id = Ulid::generate();
         let container_frontend_timeout = TimeoutContainer::new(configured_request_timeout, token);
 
@@ -138,24 +138,10 @@ impl HttpSession {
                 request_id,
                 session_address,
                 sticky_name.clone(),
-            ))
+            )?)
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
-        // let mut session = Session {
-        //     backend: None,
-        //     back_connected: BackendConnectionStatus::NotConnected,
-        //     protocol: Some(state),
-        //     proxy,
-        //     frontend_token: token,
-        //     pool,
-        //     metrics,
-        //     cluster_id: None,
-        //     sticky_name,
-        //     last_event: Instant::now(),
-        //     front_timeout,
-        //     listener_token,
-        //     connection_attempt: 0,
         let mut session = HttpSession {
             answers,
             configured_backend_timeout,
@@ -172,9 +158,8 @@ impl HttpSession {
             sticky_name,
         };
 
-        session.state.front_readiness().interest =
-            Ready::readable() | Ready::hup() | Ready::error();
-        session
+        session.state.front_readiness().interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        Ok(session)
     }
 
     pub fn upgrade(&mut self) -> SessionIsToBeClosed {
@@ -197,77 +182,42 @@ impl HttpSession {
     }
 
     fn upgrade_http(&mut self, http: Http<TcpStream, HttpListener>) -> Option<HttpStateMachine> {
-        debug!("switching to pipe");
+        debug!("http switching to ws");
         let front_token = self.frontend_token;
         let back_token = unwrap_msg!(http.backend_token);
         let ws_context = http.websocket_context();
 
-        let front_buf = match http.frontend_buffer {
-            Some(buf) => buf.buffer,
-            None => {
-                let pool = match self.pool.upgrade() {
-                    Some(p) => p,
-                    None => return None,
-                };
-
-                let buffer = match pool.borrow_mut().checkout() {
-                    Some(buf) => buf,
-                    None => return None,
-                };
-
-                buffer
-            }
-        };
-
-        let back_buf = match http.backend_buffer {
-            Some(buf) => buf.buffer,
-            None => {
-                let pool = match self.pool.upgrade() {
-                    Some(p) => p,
-                    None => return None,
-                };
-
-                let buffer = match pool.borrow_mut().checkout() {
-                    Some(buf) => buf,
-                    None => return None,
-                };
-
-                buffer
-            }
-        };
-
-        gauge_add!("protocol.http", -1);
-        gauge_add!("protocol.ws", 1);
-        gauge_add!("http.active_requests", -1);
-        gauge_add!("websocket.active_requests", 1);
-
-        // TODO: is this necessary? Do we need to reset the timeouts?
-        // http.container_frontend_timeout.reset();
-        // http.container_backend_timeout.reset();
+        let mut container_frontend_timeout = http.container_frontend_timeout;
+        let mut container_backend_timeout = http.container_backend_timeout;
+        container_frontend_timeout.reset();
+        container_backend_timeout.reset();
 
         let mut pipe = Pipe::new(
-            back_buf,
+            http.response_stream.storage.buffer,
             http.backend_id,
-            Some(unwrap_msg!(http.backend_socket)),
+            http.backend_socket,
             http.backend,
-            Some(http.container_backend_timeout),
-            Some(http.container_frontend_timeout),
+            Some(container_backend_timeout),
+            Some(container_frontend_timeout),
             http.cluster_id,
-            front_buf,
+            http.request_stream.storage.buffer,
             front_token,
             http.frontend_socket,
             self.listener.clone(),
             Protocol::HTTP,
-            http.request_id,
-            http.session_address,
+            http.context.id,
+            http.context.session_address,
             Some(ws_context),
         );
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
         pipe.backend_readiness.event = http.backend_readiness.event;
         pipe.set_back_token(back_token);
-        //pipe.set_cluster_id(self.cluster_id.clone());
 
+        gauge_add!("protocol.http", -1);
+        gauge_add!("protocol.ws", 1);
+        gauge_add!("http.active_requests", -1);
+        gauge_add!("websocket.active_requests", 1);
         Some(HttpStateMachine::WebSocket(pipe))
     }
 
@@ -281,8 +231,7 @@ impl HttpSession {
             .as_ref()
             .map(|add| (add.destination(), add.source()))
         {
-            Some((Some(public_address), Some(client_address))) => {
-                let readiness = expect.frontend_readiness;
+            Some((Some(public_address), Some(session_address))) => {
                 let mut http = Http::new(
                     self.answers.clone(),
                     self.configured_backend_timeout,
@@ -296,10 +245,11 @@ impl HttpSession {
                     Protocol::HTTP,
                     public_address,
                     expect.request_id,
-                    Some(client_address),
+                    Some(session_address),
                     self.sticky_name.clone(),
-                );
-                http.frontend_readiness.event = readiness.event;
+                )
+                .ok()?;
+                http.frontend_readiness.event = expect.frontend_readiness.event;
 
                 gauge_add!("protocol.proxy.expect", -1);
                 gauge_add!("protocol.http", 1);
@@ -432,7 +382,7 @@ pub struct HttpListener {
     config: HttpListenerConfig,
     fronts: Router,
     listener: Option<TcpListener>,
-    tags: BTreeMap<String, BTreeMap<String, String>>,
+    tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
 
@@ -441,13 +391,13 @@ impl ListenerHandler for HttpListener {
         &self.address
     }
 
-    fn get_tags(&self, key: &str) -> Option<&BTreeMap<String, String>> {
+    fn get_tags(&self, key: &str) -> Option<&CachedTags> {
         self.tags.get(key)
     }
 
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>) {
         match tags {
-            Some(tags) => self.tags.insert(key, tags),
+            Some(tags) => self.tags.insert(key, CachedTags::new(tags)),
             None => self.tags.remove(&key),
         };
     }
@@ -953,7 +903,7 @@ impl ProxyConfiguration for HttpProxy {
             owned.config.sticky_name.clone(),
             session_token,
             wait_time,
-        );
+        )?;
 
         let session = Rc::new(RefCell::new(session));
         session_entry.insert(session);
@@ -1144,7 +1094,7 @@ mod tests {
     */
 
     #[test]
-    fn mi() {
+    fn round_trip() {
         setup_test_logger!();
         let barrier = Arc::new(Barrier::new(2));
         start_server(1025, barrier.clone());

@@ -39,6 +39,7 @@ pub fn setup_test<S: Into<String>>(
     state: ConfigState,
     front_address: SocketAddr,
     nb_backends: usize,
+    should_stick: bool,
 ) -> (Worker, Vec<SocketAddr>) {
     let mut worker = Worker::start_new_worker(name, config, &listeners, state);
 
@@ -59,6 +60,7 @@ pub fn setup_test<S: Into<String>>(
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddCluster(Worker::default_cluster(
             "cluster_0",
+            should_stick,
         ))),
     });
     worker.send_proxy_request(Request {
@@ -78,6 +80,11 @@ pub fn setup_test<S: Into<String>>(
                 "cluster_0",
                 format!("cluster_0-{i}"),
                 back_address.to_string(),
+                if should_stick {
+                    Some(format!("sticky_cluster_0-{i}"))
+                } else {
+                    None
+                },
             ))),
         });
         backends.push(back_address);
@@ -94,8 +101,17 @@ pub fn setup_async_test<S: Into<String>>(
     state: ConfigState,
     front_address: SocketAddr,
     nb_backends: usize,
+    should_stick: bool,
 ) -> (Worker, Vec<AsyncBackend<SimpleAggregator>>) {
-    let (worker, backends) = setup_test(name, config, listeners, state, front_address, nb_backends);
+    let (worker, backends) = setup_test(
+        name,
+        config,
+        listeners,
+        state,
+        front_address,
+        nb_backends,
+        should_stick,
+    );
     let backends = backends
         .into_iter()
         .enumerate()
@@ -122,8 +138,17 @@ pub fn setup_sync_test<S: Into<String>>(
     state: ConfigState,
     front_address: SocketAddr,
     nb_backends: usize,
+    should_stick: bool,
 ) -> (Worker, Vec<SyncBackend>) {
-    let (worker, backends) = setup_test(name, config, listeners, state, front_address, nb_backends);
+    let (worker, backends) = setup_test(
+        name,
+        config,
+        listeners,
+        state,
+        front_address,
+        nb_backends,
+        should_stick,
+    );
     let backends = backends
         .into_iter()
         .enumerate()

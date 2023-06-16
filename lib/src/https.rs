@@ -47,7 +47,6 @@ use sozu_command::{
 
 use crate::{
     backends::BackendMap,
-    buffer_queue::BufferQueue,
     pool::Pool,
     protocol::{
         h2::Http2,
@@ -68,9 +67,9 @@ use crate::{
         ParsedCertificateAndKey,
     },
     util::UnwrapLog,
-    AcceptError, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxyConfiguration,
-    ProxySession, Readiness, SessionIsToBeClosed, SessionMetrics, SessionResult,
-    StateMachineBuilder, StateResult,
+    AcceptError, CachedTags, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol,
+    ProxyConfiguration, ProxySession, Readiness, SessionIsToBeClosed, SessionMetrics,
+    SessionResult, StateMachineBuilder, StateResult,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -188,8 +187,7 @@ impl HttpsSession {
             sticky_name,
         };
 
-        session.state.front_readiness().interest =
-            Ready::readable() | Ready::hup() | Ready::error();
+        session.state.front_readiness().interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
         session
     }
 
@@ -242,7 +240,7 @@ impl HttpsSession {
                     request_id,
                 );
                 handshake.frontend_readiness.event = readiness.event;
-                handshake.frontend_readiness.event.insert(Ready::readable());
+                handshake.frontend_readiness.event.insert(Ready::READABLE);
 
                 gauge_add!("protocol.proxy.expect", -1);
                 gauge_add!("protocol.tls.handshake", 1);
@@ -261,9 +259,6 @@ impl HttpsSession {
         // - get ALPN
         // - find corresponding listener
         // - determine next protocol (tcps, https ,http2)
-
-        let front_buf = self.pool.upgrade().and_then(|p| p.borrow_mut().checkout());
-        front_buf.as_ref()?;
 
         let sni = handshake.session.server_name();
         let alpn = handshake.session.alpn_protocol();
@@ -284,7 +279,6 @@ impl HttpsSession {
             None => AlpnProtocols::Http11,
         };
 
-        let mut front_buf = front_buf.unwrap();
         if let Some(version) = handshake.session.protocol_version() {
             incr!(rustls_version_str(version));
         };
@@ -317,17 +311,18 @@ impl HttpsSession {
                     handshake.request_id,
                     self.peer_address,
                     self.sticky_name.clone(),
-                );
+                )
+                .ok()?;
 
                 match http
                     .frontend_socket
                     .session
                     .reader()
-                    .read(front_buf.space())
+                    .read(http.request_stream.storage.space())
                 {
                     Ok(sz) => {
                         //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-                        front_buf.fill(sz);
+                        http.request_stream.storage.fill(sz);
                         count!("bytes_in", sz as i64);
                         self.metrics.bin += sz;
                     }
@@ -336,14 +331,8 @@ impl HttpsSession {
                     }
                 }
 
-                let size = front_buf.available_data();
-                let mut buf = BufferQueue::with_buffer(front_buf);
-                buf.sliced_input(size);
-
-                http.frontend_buffer = Some(buf);
                 http.frontend_readiness = readiness;
-                http.frontend_readiness.interest =
-                    Ready::readable() | Ready::hup() | Ready::error();
+                http.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
 
                 gauge_add!("protocol.https", 1);
                 Some(HttpsStateMachine::Http(http))
@@ -359,8 +348,7 @@ impl HttpsSession {
                 );
 
                 http.frontend.readiness = readiness;
-                http.frontend.readiness.interest =
-                    Ready::readable() | Ready::hup() | Ready::error();
+                http.frontend.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
 
                 gauge_add!("protocol.http2", 1);
                 Some(HttpsStateMachine::Http2(http))
@@ -374,63 +362,32 @@ impl HttpsSession {
         let back_token = unwrap_msg!(http.backend_token);
         let ws_context = http.websocket_context();
 
-        let front_buf = match http.frontend_buffer {
-            Some(buf) => buf.buffer,
-            None => {
-                let pool = match self.pool.upgrade() {
-                    Some(p) => p,
-                    None => return None,
-                };
-
-                let buffer = match pool.borrow_mut().checkout() {
-                    Some(buf) => buf,
-                    None => return None,
-                };
-                buffer
-            }
-        };
-        let back_buf = match http.backend_buffer {
-            Some(buf) => buf.buffer,
-            None => {
-                let pool = match self.pool.upgrade() {
-                    Some(p) => p,
-                    None => return None,
-                };
-
-                let buffer = match pool.borrow_mut().checkout() {
-                    Some(buf) => buf,
-                    None => return None,
-                };
-                buffer
-            }
-        };
-
-        // TODO: is this necessary? Do we need to reset the timeouts?
-        // http.container_frontend_timeout.reset();
-        // http.container_backend_timeout.reset();
+        let mut container_frontend_timeout = http.container_frontend_timeout;
+        let mut container_backend_timeout = http.container_backend_timeout;
+        container_frontend_timeout.reset();
+        container_backend_timeout.reset();
 
         let mut pipe = Pipe::new(
-            back_buf,
+            http.response_stream.storage.buffer,
             http.backend_id,
             http.backend_socket,
             http.backend,
-            Some(http.container_backend_timeout),
-            Some(http.container_frontend_timeout),
-            http.cluster_id.clone(),
-            front_buf,
+            Some(container_backend_timeout),
+            Some(container_frontend_timeout),
+            http.cluster_id,
+            http.request_stream.storage.buffer,
             front_token,
             http.frontend_socket,
             self.listener.clone(),
-            Protocol::HTTPS,
-            http.request_id,
-            http.session_address,
+            Protocol::HTTP,
+            http.context.id,
+            http.context.session_address,
             Some(ws_context),
         );
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
         pipe.backend_readiness.event = http.backend_readiness.event;
         pipe.set_back_token(back_token);
-        pipe.set_cluster_id(http.cluster_id.clone());
 
         gauge_add!("protocol.https", -1);
         gauge_add!("protocol.wss", 1);
@@ -588,7 +545,7 @@ pub struct HttpsListener {
     listener: Option<MioTcpListener>,
     resolver: Arc<MutexWrappedCertificateResolver>,
     rustls_details: Arc<ServerConfig>,
-    tags: BTreeMap<String, BTreeMap<String, String>>,
+    tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
 
@@ -597,13 +554,13 @@ impl ListenerHandler for HttpsListener {
         &self.address
     }
 
-    fn get_tags(&self, key: &str) -> Option<&BTreeMap<String, String>> {
+    fn get_tags(&self, key: &str) -> Option<&CachedTags> {
         self.tags.get(key)
     }
 
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>) {
         match tags {
-            Some(tags) => self.tags.insert(key, tags),
+            Some(tags) => self.tags.insert(key, CachedTags::new(tags)),
             None => self.tags.remove(&key),
         };
     }

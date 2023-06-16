@@ -1,15 +1,3 @@
-#[cfg(target_os = "freebsd")]
-use std::ffi::c_void;
-#[cfg(target_os = "macos")]
-use std::ffi::CString;
-#[cfg(target_os = "macos")]
-use std::iter::repeat;
-#[cfg(target_os = "freebsd")]
-use std::iter::repeat;
-#[cfg(target_os = "freebsd")]
-use std::mem::size_of;
-#[cfg(target_os = "macos")]
-use std::ptr::null_mut;
 use std::{
     collections::VecDeque,
     fmt,
@@ -19,12 +7,16 @@ use std::{
     os::unix::process::CommandExt,
     process::Command,
 };
+#[cfg(target_os = "freebsd")]
+use std::{ffi::c_void, iter::repeat, mem::size_of};
 
-use anyhow::{bail, Context};
+#[cfg(target_os = "linux")]
+use anyhow::bail;
+use anyhow::Context;
 use futures::SinkExt;
-use libc::{self, pid_t};
 #[cfg(target_os = "macos")]
-use libc::{c_char, PATH_MAX};
+use libc::c_char;
+use libc::{self, pid_t};
 #[cfg(target_os = "freebsd")]
 use libc::{sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
 use mio::net::UnixStream;
@@ -122,7 +114,7 @@ impl Worker {
     /*
     pub fn push_message(&mut self, message: ProxyRequest) {
       self.queue.push_back(message);
-      self.channel.interest.insert(Ready::writable());
+      self.channel.interest.insert(Ready::WRITABLE);
     }
 
     pub fn can_handle_events(&self) -> bool {
@@ -265,7 +257,7 @@ pub fn begin_worker_process(
 
     let mut worker_to_main_channel: Channel<WorkerResponse, WorkerRequest> =
         worker_to_main_channel.into();
-    worker_to_main_channel.readiness.insert(Ready::readable());
+    worker_to_main_channel.readiness.insert(Ready::READABLE);
 
     if let Some(metrics) = worker_config.metrics.as_ref() {
         metrics::setup(
@@ -420,8 +412,9 @@ extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-pub fn get_executable_path() -> anyhow::Result<String> {
-    let path = env::current_exe().with_context(|| "failed to retrieve current executable path")?;
+pub unsafe fn get_executable_path() -> anyhow::Result<String> {
+    let path =
+        std::env::current_exe().with_context(|| "failed to retrieve current executable path")?;
     Ok(path.to_string_lossy().to_string())
 }
 

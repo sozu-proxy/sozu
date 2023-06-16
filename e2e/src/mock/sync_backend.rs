@@ -2,8 +2,12 @@ use std::{
     collections::HashMap,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
+    os::fd::{FromRawFd, IntoRawFd},
     str::from_utf8,
+    time::Duration,
 };
+
+use libc::setsockopt;
 
 use crate::BUFFER_SIZE;
 
@@ -41,6 +45,22 @@ impl Backend {
     /// Binds itself to its address, stores the yielded TCP listener
     pub fn connect(&mut self) {
         let listener = TcpListener::bind(self.address).expect("could not bind");
+        let timeout = Duration::from_millis(100);
+        let timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: timeout.subsec_micros().try_into().unwrap(),
+        };
+        let listener = unsafe {
+            let fd = listener.into_raw_fd();
+            setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                &timeout as *const libc::timeval as *const _,
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+            TcpListener::from_raw_fd(fd)
+        };
         self.listener = Some(listener);
         self.clients = HashMap::new();
     }
@@ -50,15 +70,41 @@ impl Backend {
         self.clients = HashMap::new();
     }
 
+    pub fn is_connected(&self, client_id: usize) -> bool {
+        match self.clients.get(&client_id) {
+            None => false,
+            Some(stream) => match stream.peek(&mut [0]) {
+                Ok(1) => {
+                    println!("{} still connected", self.name);
+                    true
+                }
+                Ok(_) => {
+                    println!("{} disconnected", self.name);
+                    false
+                }
+                Err(e) => {
+                    println!("{} check_connection: {e:?}", self.name);
+                    true
+                }
+            },
+        }
+    }
+
     /// Tries to accept one connection on a TcpSocket
     /// and registers the resulting TcpStream as a client
     pub fn accept(&mut self, client_id: usize) -> bool {
         if let Some(listener) = &self.listener {
             let stream = listener.accept();
             match stream {
-                Ok(stream) => {
+                Ok((stream, _)) => {
                     println!("{} accepted {}", self.name, client_id);
-                    self.clients.insert(client_id, stream.0);
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(100)))
+                        .expect("could not set read timeout");
+                    stream
+                        .set_write_timeout(Some(Duration::from_millis(100)))
+                        .expect("could not set write timeout");
+                    self.clients.insert(client_id, stream);
                     return true;
                 }
                 Err(error) => {
@@ -75,7 +121,8 @@ impl Backend {
         match self.clients.get_mut(&client_id) {
             Some(stream) => match stream.write(self.response.as_bytes()) {
                 Ok(0) => {
-                    println!("{} received nothing", self.name);
+                    println!("{} sent nothing", self.name);
+                    return Some(0);
                 }
                 Ok(n) => {
                     println!("{} sent {} to {}", self.name, n, client_id);

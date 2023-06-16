@@ -36,37 +36,37 @@ pub struct HttpAnswers {
 impl HttpAnswers {
     pub fn new(answer_404: &str, answer_503: &str) -> Self {
         HttpAnswers {
-      default: DefaultAnswers {
-        BadRequest: Rc::new(Vec::from(
-          &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        )),
-        Unauthorized: Rc::new(Vec::from(
-          &b"HTTP/1.1 401 Unauthorized\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        )),
-        NotFound: Rc::new(Vec::from(answer_404.as_bytes())),
-        RequestTimeout: Rc::new(Vec::from(
-          &b"HTTP/1.1 408 Request Timeout\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        )),
-        PayloadTooLarge: Rc::new(Vec::from(
-          &b"HTTP/1.1 413 Payload Too Large\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        )),
-        BadGateway: Rc::new(Vec::from(
-          &b"HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        )),
-        ServiceUnavailable: Rc::new(Vec::from(answer_503.as_bytes())),
-        GatewayTimeout: Rc::new(Vec::from(
-          &b"HTTP/1.1 504 Gateway Timeout\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        )),
-      },
-      custom: HashMap::new(),
-    }
+            default: DefaultAnswers {
+                BadRequest: Rc::new(Vec::from(
+                    &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                )),
+                Unauthorized: Rc::new(Vec::from(
+                    &b"HTTP/1.1 401 Unauthorized\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                )),
+                NotFound: Rc::new(Vec::from(answer_404.as_bytes())),
+                RequestTimeout: Rc::new(Vec::from(
+                    &b"HTTP/1.1 408 Request Timeout\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                )),
+                PayloadTooLarge: Rc::new(Vec::from(
+                    &b"HTTP/1.1 413 Payload Too Large\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                )),
+                BadGateway: Rc::new(Vec::from(
+                    &b"HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                )),
+                ServiceUnavailable: Rc::new(Vec::from(answer_503.as_bytes())),
+                GatewayTimeout: Rc::new(Vec::from(
+                    &b"HTTP/1.1 504 Gateway Timeout\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                )),
+            },
+            custom: HashMap::new(),
+        }
     }
 
     pub fn add_custom_answer(&mut self, cluster_id: &str, answer_503: &str) {
-        let a = answer_503.to_owned();
+        let owned_answer_503 = answer_503.to_owned();
         self.custom
             .entry(cluster_id.to_string())
-            .and_modify(|c| c.ServiceUnavailable = Some(Rc::new(a.into_bytes())))
+            .and_modify(|c| c.ServiceUnavailable = Some(Rc::new(owned_answer_503.into_bytes())))
             .or_insert(CustomAnswers {
                 ServiceUnavailable: Some(Rc::new(answer_503.to_owned().into_bytes())),
             });

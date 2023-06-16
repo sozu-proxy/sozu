@@ -53,12 +53,33 @@ impl Client {
         self.stream = None;
     }
 
+    pub fn is_connected(&self) -> bool {
+        match &self.stream {
+            None => false,
+            Some(stream) => match stream.peek(&mut [0]) {
+                Ok(1) => {
+                    println!("{} still connected", self.name);
+                    true
+                }
+                Ok(_) => {
+                    println!("{} disconnected", self.name);
+                    false
+                }
+                Err(e) => {
+                    println!("{} check_connection: {e:?}", self.name);
+                    true
+                }
+            },
+        }
+    }
+
     /// Write its own request on the TcpStream, returns the number of bytes written
     pub fn send(&mut self) -> Option<usize> {
-        match self.stream {
-            Some(ref mut stream) => match stream.write(self.request.as_bytes()) {
+        match &mut self.stream {
+            Some(stream) => match stream.write(self.request.as_bytes()) {
                 Ok(0) => {
                     println!("{} sent nothing", self.name);
+                    return Some(0);
                 }
                 Ok(n) => {
                     println!("{} sent {}", self.name, n);
@@ -78,8 +99,8 @@ impl Client {
 
     /// Reads data arriving on the TcpStream, parses a UTF-8 string from it
     pub fn receive(&mut self) -> Option<String> {
-        match self.stream {
-            Some(ref mut stream) => {
+        match &mut self.stream {
+            Some(stream) => {
                 let mut buf = [0u8; BUFFER_SIZE];
                 match stream.read(&mut buf) {
                     Ok(0) => {

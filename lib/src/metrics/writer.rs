@@ -1,11 +1,16 @@
 #[cfg(target_env = "musl")]
 use std::mem;
 use std::{
-    io::{self, Error, ErrorKind, Write},
+    io::{self, Write},
     net::SocketAddr,
+};
+#[cfg(target_os = "linux")]
+use std::{
+    io::{Error, ErrorKind},
     os::unix::io::AsRawFd,
 };
 
+#[cfg(target_os = "linux")]
 use libc::{c_uint, c_void, iovec, msghdr};
 use mio::net::UdpSocket;
 

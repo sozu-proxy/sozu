@@ -7,8 +7,8 @@ use sozu_command_lib::proto::{
     command::{
         filtered_metrics, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
         CertificateAndKey, CertificatesWithFingerprints, ClusterMetrics, FilteredMetrics,
-        ListedFrontends, ListenersList, ResponseContent, WorkerInfos, WorkerMetrics,
-        WorkerResponses, RequestCounts,
+        ListedFrontends, ListenersList, RequestCounts, ResponseContent, WorkerInfos, WorkerMetrics,
+        WorkerResponses,
     },
     display::concatenate_vector,
 };

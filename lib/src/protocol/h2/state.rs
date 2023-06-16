@@ -42,7 +42,7 @@ impl State {
         State {
             output: VecDeque::new(),
             state: St::Init,
-            interest: Ready::readable() | Ready::hup() | Ready::error(),
+            interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
             max_frame_size: 16384,
             streams: HashMap::new(),
         }
@@ -101,7 +101,7 @@ impl State {
 
                         self.output.push_back(server_settings);
                         self.state = St::ServerPrefaceSent;
-                        self.interest.insert(Ready::writable());
+                        self.interest.insert(Ready::WRITABLE);
                         FrameResult::Continue
                     }
                     f => {
@@ -140,7 +140,7 @@ impl State {
                 Ok((sl, index)) => Ok(index),
             }
         } else {
-            self.interest.remove(Ready::writable());
+            self.interest.remove(Ready::WRITABLE);
             Ok(0)
         }
     }

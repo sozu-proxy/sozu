@@ -534,13 +534,13 @@ impl Server {
                         loop {
                             QUEUE.with(|queue| {
                                 if !(*queue.borrow()).is_empty() {
-                                    self.channel.interest.insert(Ready::writable());
+                                    self.channel.interest.insert(Ready::WRITABLE);
                                 }
                             });
 
                             //trace!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements",
                             //  line!(), self.channel.readiness, self.channel.interest, self.queue.len());
-                            if self.channel.readiness() == Ready::empty() {
+                            if self.channel.readiness() == Ready::EMPTY {
                                 break;
                             }
 
@@ -551,7 +551,7 @@ impl Server {
 
                             QUEUE.with(|queue| {
                                 if !(*queue.borrow()).is_empty() {
-                                    self.channel.interest.insert(Ready::writable());
+                                    self.channel.interest.insert(Ready::WRITABLE);
                                 }
                             });
 

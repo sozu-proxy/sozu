@@ -162,6 +162,11 @@ impl Checkout {
         self.inner.end = 0;
     }
 
+    pub fn sync(&mut self, end: usize, position: usize) {
+        self.inner.position = position;
+        self.inner.end = end;
+    }
+
     pub fn data(&self) -> &[u8] {
         &self.inner.extra()[self.inner.position..self.inner.end]
     }

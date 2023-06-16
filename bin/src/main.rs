@@ -54,7 +54,9 @@ mod util;
 /// Start and restart the worker UNIX processes
 mod worker;
 
-use anyhow::{bail, Context};
+#[cfg(target_os = "linux")]
+use anyhow::bail;
+use anyhow::Context;
 use cli::Args;
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t, pid_t};

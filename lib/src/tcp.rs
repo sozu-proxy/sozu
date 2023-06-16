@@ -21,6 +21,7 @@ use time::{Duration, Instant};
 
 use crate::{
     backends::BackendMap,
+    logs::{Endpoint, LogContext, RequestRecord},
     pool::{Checkout, Pool},
     protocol::{
         proxy_protocol::{
@@ -33,7 +34,7 @@ use crate::{
         push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, CONN_RETRIES,
         TIMER,
     },
-    socket::server_bind,
+    socket::{server_bind, stats::socket_rtt},
     sozu_command::{
         logging,
         proto::command::{
@@ -46,9 +47,9 @@ use crate::{
         state::ClusterId,
     },
     timer::TimeoutContainer,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, ListenerHandler, Protocol,
-    ProxyConfiguration, ProxySession, Readiness, SessionIsToBeClosed, SessionMetrics,
-    SessionResult, StateMachineBuilder, StateResult,
+    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, CachedTags,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionIsToBeClosed,
+    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
 
 StateMachineBuilder! {
@@ -197,52 +198,20 @@ impl TcpSession {
     }
 
     fn log_request(&self) {
-        let frontend = match self.frontend_address {
-            None => String::from("-"),
-            Some(SocketAddr::V4(addr)) => format!("{addr}"),
-            Some(SocketAddr::V6(addr)) => format!("{addr}"),
-        };
-
-        let backend_address = self
-            .backend
-            .as_ref()
-            .map(|backend| backend.borrow().address);
-
-        let backend = match backend_address {
-            None => String::from("-"),
-            Some(SocketAddr::V4(addr)) => format!("{addr}"),
-            Some(SocketAddr::V6(addr)) => format!("{addr}"),
-        };
-
-        let response_time = self.metrics.response_time().whole_milliseconds();
-        let service_time = self.metrics.service_time().whole_milliseconds();
-        let cluster_id = self.cluster_id.clone().unwrap_or_else(|| String::from("-"));
-        time!("response_time", &cluster_id, response_time);
-        time!("response_time", response_time);
-
-        if let Some(backend_id) = self.metrics.backend_id.as_ref() {
-            if let Some(backend_response_time) = self.metrics.backend_response_time() {
-                record_backend_metrics!(
-                    cluster_id,
-                    backend_id,
-                    backend_response_time.whole_milliseconds(),
-                    self.metrics.backend_response_time(),
-                    self.metrics.backend_bin,
-                    self.metrics.backend_bout
-                );
-            }
+        let listener = self.listener.borrow();
+        RequestRecord {
+            error: None,
+            context: self.log_context(),
+            session_address: self.frontend_address,
+            backend_address: None,
+            protocol: "TCP",
+            endpoint: Endpoint::Tcp { context: None },
+            tags: listener.get_concatenated_tags(&listener.get_addr().to_string()),
+            client_rtt: socket_rtt(self.state.front_socket()),
+            server_rtt: None,
+            metrics: &self.metrics,
         }
-
-        info!(
-            "{}{} -> {}\t{} {} {} {}",
-            self.log_context(),
-            frontend,
-            backend,
-            response_time,
-            service_time,
-            self.metrics.bin,
-            self.metrics.bout
-        );
+        .log();
     }
 
     fn front_hup(&mut self) -> StateResult {
@@ -265,13 +234,12 @@ impl TcpSession {
         }
     }
 
-    fn log_context(&self) -> String {
-        format!(
-            "{} {} {}\t",
-            self.request_id,
-            self.cluster_id.as_deref().unwrap_or("-"),
-            self.backend_id.as_deref().unwrap_or("-")
-        )
+    fn log_context(&self) -> LogContext {
+        LogContext {
+            request_id: self.request_id,
+            cluster_id: self.cluster_id.as_deref(),
+            backend_id: self.backend_id.as_deref(),
+        }
     }
 
     fn readable(&mut self) -> StateResult {
@@ -526,10 +494,6 @@ impl TcpSession {
         }
     }
 
-    fn metrics(&mut self) -> &mut SessionMetrics {
-        &mut self.metrics
-    }
-
     fn remove_backend(&mut self) {
         if let Some(backend) = self.backend.take() {
             (*backend.borrow_mut()).dec_connections();
@@ -623,7 +587,7 @@ impl TcpSession {
                         error!("Error connecting to backend: {:#}", connection_error)
                     }
                 }
-            } else if self.back_readiness().unwrap().event != Ready::empty() {
+            } else if self.back_readiness().unwrap().event != Ready::EMPTY {
                 self.reset_connection_attempt();
                 let back_token = self.backend_token.unwrap();
                 self.container_backend_timeout.set(back_token);
@@ -654,7 +618,7 @@ impl TcpSession {
                     return order;
                 }
                 _ => {
-                    self.front_readiness().event.remove(Ready::hup());
+                    self.front_readiness().event.remove(Ready::HUP);
                     return order;
                 }
             }
@@ -666,17 +630,17 @@ impl TcpSession {
             let back_interest = self
                 .back_readiness()
                 .map(|r| r.interest & r.event)
-                .unwrap_or_else(Ready::empty);
+                .unwrap_or(Ready::EMPTY);
 
             trace!(
                 "PROXY\t{} {:?} {:?} -> {:?}",
-                self.log_context(),
+                self.log_context().to_string(),
                 token,
                 self.front_readiness().clone(),
                 self.back_readiness()
             );
 
-            if front_interest == Ready::empty() && back_interest == Ready::empty() {
+            if front_interest == Ready::EMPTY && back_interest == Ready::EMPTY {
                 break;
             }
 
@@ -744,7 +708,7 @@ impl TcpSession {
                     StateResult::Continue => {}
                     _ => {
                         if let Some(r) = self.back_readiness() {
-                            r.event.remove(Ready::hup());
+                            r.event.remove(Ready::HUP);
                         }
 
                         return order;
@@ -757,18 +721,18 @@ impl TcpSession {
                     "PROXY session {:?} front error, disconnecting",
                     self.frontend_token
                 );
-                self.front_readiness().interest = Ready::empty();
+                self.front_readiness().interest = Ready::EMPTY;
                 if let Some(r) = self.back_readiness() {
-                    r.interest = Ready::empty();
+                    r.interest = Ready::EMPTY;
                 }
 
                 return StateResult::CloseSession;
             }
 
             if back_interest.is_error() && self.back_hup() == StateResult::CloseSession {
-                self.front_readiness().interest = Ready::empty();
+                self.front_readiness().interest = Ready::EMPTY;
                 if let Some(r) = self.back_readiness() {
-                    r.interest = Ready::empty();
+                    r.interest = Ready::EMPTY;
                 }
 
                 error!(
@@ -789,7 +753,7 @@ impl TcpSession {
             let back_interest = self
                 .back_readiness()
                 .map(|r| r.interest & r.event)
-                .unwrap_or_else(Ready::empty);
+                .unwrap_or(Ready::EMPTY);
 
             let front_token = self.frontend_token;
             let back = self.back_readiness().cloned();
@@ -827,7 +791,7 @@ impl TcpSession {
         let back_connected = self.back_connected();
         if back_connected != BackendConnectionStatus::NotConnected {
             if let Some(r) = self.back_readiness() {
-                r.event = Ready::empty();
+                r.event = Ready::EMPTY;
             }
 
             if let Some(sock) = self.back_socket_mut() {
@@ -1030,7 +994,7 @@ impl ProxySession for TcpSession {
     }
 
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
-        self.metrics().service_start();
+        self.metrics.service_start();
         let state_result = self.ready_inner(session);
 
         let to_bo_closed = match state_result {
@@ -1044,7 +1008,7 @@ impl ProxySession for TcpSession {
             StateResult::Upgrade => unreachable!(),
         };
 
-        self.metrics().service_stop();
+        self.metrics.service_stop();
         to_bo_closed
     }
 
@@ -1111,7 +1075,7 @@ pub struct TcpListener {
     config: TcpListenerConfig,
     listener: Option<MioTcpListener>,
     pool: Rc<RefCell<Pool>>,
-    tags: BTreeMap<String, BTreeMap<String, String>>,
+    tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
 
@@ -1120,13 +1084,13 @@ impl ListenerHandler for TcpListener {
         &self.address
     }
 
-    fn get_tags(&self, key: &str) -> Option<&BTreeMap<String, String>> {
+    fn get_tags(&self, key: &str) -> Option<&CachedTags> {
         self.tags.get(key)
     }
 
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>) {
         match tags {
-            Some(tags) => self.tags.insert(key, tags),
+            Some(tags) => self.tags.insert(key, CachedTags::new(tags)),
             None => self.tags.remove(&key),
         };
     }
@@ -1664,7 +1628,7 @@ mod tests {
     }*/
 
     #[test]
-    fn mi() {
+    fn round_trip() {
         setup_test_logger!();
         let barrier = Arc::new(Barrier::new(2));
         start_server(barrier.clone());

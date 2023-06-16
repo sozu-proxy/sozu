@@ -5,9 +5,9 @@ use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
 
 use crate::{
+    logs::LogContext,
     pool::Checkout,
-    protocol::{http::LogContext, pipe::Pipe},
-    protocol::{SessionResult, SessionState},
+    protocol::{pipe::Pipe, SessionResult, SessionState},
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
     tcp::TcpListener,
@@ -49,8 +49,8 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             container_frontend_timeout,
             frontend_buffer: [0; 232],
             frontend_readiness: Readiness {
-                interest: Ready::readable(),
-                event: Ready::empty(),
+                interest: Ready::READABLE,
+                event: Ready::EMPTY,
             },
             frontend_token,
             frontend,
@@ -86,22 +86,21 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             metrics.bin += sz;
 
             if self.index == self.frontend_buffer.len() {
-                self.frontend_readiness.interest.remove(Ready::readable());
+                self.frontend_readiness.interest.remove(Ready::READABLE);
             }
         } else {
-            self.frontend_readiness.event.remove(Ready::readable());
+            self.frontend_readiness.event.remove(Ready::READABLE);
         }
 
         match socket_result {
             SocketResult::Error => {
                 error!("[{:?}] (expect proxy) front socket error, closing the connection(read {}, wrote {})", self.frontend_token, metrics.bin, metrics.bout);
-                metrics.service_stop();
                 incr!("proxy_protocol.errors");
                 self.frontend_readiness.reset();
                 return SessionResult::Close;
             }
             SocketResult::WouldBlock => {
-                self.frontend_readiness.event.remove(Ready::readable());
+                self.frontend_readiness.event.remove(Ready::READABLE);
             }
             SocketResult::Closed | SocketResult::Continue => {}
         }
@@ -134,7 +133,6 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                                 "[{:?}] front socket parse error, closing the connection",
                                 self.frontend_token
                             );
-                            metrics.service_stop();
                             incr!("proxy_protocol.errors");
                             self.frontend_readiness.reset();
                             return SessionResult::Continue;
@@ -145,7 +143,6 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             }
             Err(Err::Error(e)) | Err(Err::Failure(e)) => {
                 error!("[{:?}] expect proxy protocol front socket parse error, closing the connection:\n{}", self.frontend_token, e.input.to_hex(16));
-                metrics.service_stop();
                 incr!("proxy_protocol.errors");
                 self.frontend_readiness.reset();
                 SessionResult::Close
@@ -247,7 +244,7 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
                     "PROXY session {:?} front error, disconnecting",
                     self.frontend_token
                 );
-                self.frontend_readiness.interest = Ready::empty();
+                self.frontend_readiness.interest = Ready::EMPTY;
 
                 return SessionResult::Close;
             }
