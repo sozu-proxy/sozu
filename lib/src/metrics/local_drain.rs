@@ -9,7 +9,7 @@ use sozu_command::proto::command::{
     ResponseContent, WorkerMetrics,
 };
 
-use super::{MetricData, Subscriber};
+use super::{MetricValue, Subscriber};
 
 /// This is how the metrics are stored in the local drain
 #[derive(Debug, Clone)]
@@ -20,12 +20,12 @@ pub enum AggregatedMetric {
 }
 
 impl AggregatedMetric {
-    fn new(metric: MetricData) -> anyhow::Result<AggregatedMetric> {
+    fn new(metric: MetricValue) -> anyhow::Result<AggregatedMetric> {
         match metric {
-            MetricData::Gauge(value) => Ok(AggregatedMetric::Gauge(value)),
-            MetricData::GaugeAdd(value) => Ok(AggregatedMetric::Gauge(value as usize)),
-            MetricData::Count(value) => Ok(AggregatedMetric::Count(value)),
-            MetricData::Time(value) => {
+            MetricValue::Gauge(value) => Ok(AggregatedMetric::Gauge(value)),
+            MetricValue::GaugeAdd(value) => Ok(AggregatedMetric::Gauge(value as usize)),
+            MetricValue::Count(value) => Ok(AggregatedMetric::Count(value)),
+            MetricValue::Time(value) => {
                 let mut histogram = ::hdrhistogram::Histogram::new(3).context(format!(
                     "Could not create histogram for time metric {metric:?}"
                 ))?;
@@ -39,18 +39,18 @@ impl AggregatedMetric {
         }
     }
 
-    fn update(&mut self, key: &str, m: MetricData) {
+    fn update(&mut self, key: &str, m: MetricValue) {
         match (self, m) {
-            (&mut AggregatedMetric::Gauge(ref mut v1), MetricData::Gauge(v2)) => {
+            (&mut AggregatedMetric::Gauge(ref mut v1), MetricValue::Gauge(v2)) => {
                 *v1 = v2;
             }
-            (&mut AggregatedMetric::Gauge(ref mut v1), MetricData::GaugeAdd(v2)) => {
+            (&mut AggregatedMetric::Gauge(ref mut v1), MetricValue::GaugeAdd(v2)) => {
                 *v1 = (*v1 as i64 + v2) as usize;
             }
-            (&mut AggregatedMetric::Count(ref mut v1), MetricData::Count(v2)) => {
+            (&mut AggregatedMetric::Count(ref mut v1), MetricValue::Count(v2)) => {
                 *v1 += v2;
             }
-            (&mut AggregatedMetric::Time(ref mut v1), MetricData::Time(v2)) => {
+            (&mut AggregatedMetric::Time(ref mut v1), MetricValue::Time(v2)) => {
                 if let Err(e) = (*v1).record(v2 as u64) {
                     error!("could not record time metric: {:?}", e.to_string());
                 }
@@ -383,7 +383,7 @@ impl LocalDrain {
         metric_name: &str,
         cluster_id: &str,
         backend_id: Option<&str>,
-        metric_value: MetricData,
+        metric_value: MetricValue,
     ) {
         if !self.enabled {
             return;
@@ -432,7 +432,7 @@ impl Subscriber for LocalDrain {
         key: &'static str,
         cluster_id: Option<&str>,
         backend_id: Option<&str>,
-        metric: MetricData,
+        metric: MetricValue,
     ) {
         trace!(
             "receiving metric with key {}, cluster_id: {:?}, backend_id: {:?}, metric data: {:?}",

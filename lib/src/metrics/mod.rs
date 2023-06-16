@@ -23,28 +23,27 @@ thread_local! {
   pub static METRICS: RefCell<Aggregator> = RefCell::new(Aggregator::new(String::from("sozu")));
 }
 
-/// We should rename this to MetricValue
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MetricData {
+pub enum MetricValue {
     Gauge(usize),
     GaugeAdd(i64),
     Count(i64),
     Time(usize),
 }
 
-impl MetricData {
+impl MetricValue {
     fn is_time(&self) -> bool {
-        matches!(self, &MetricData::Time(_))
+        matches!(self, &MetricValue::Time(_))
     }
 
-    fn update(&mut self, key: &'static str, m: MetricData) -> bool {
+    fn update(&mut self, key: &'static str, m: MetricValue) -> bool {
         match (self, m) {
-            (&mut MetricData::Gauge(ref mut v1), MetricData::Gauge(v2)) => {
+            (&mut MetricValue::Gauge(ref mut v1), MetricValue::Gauge(v2)) => {
                 let changed = *v1 != v2;
                 *v1 = v2;
                 changed
             }
-            (&mut MetricData::Gauge(ref mut v1), MetricData::GaugeAdd(v2)) => {
+            (&mut MetricValue::Gauge(ref mut v1), MetricValue::GaugeAdd(v2)) => {
                 debug_assert!(
                     *v1 as i64 + v2 >= 0,
                     "metric {key} underflow: previous value: {v1}, adding: {v2}"
@@ -63,7 +62,7 @@ impl MetricData {
 
                 changed
             }
-            (&mut MetricData::Count(ref mut v1), MetricData::Count(v2)) => {
+            (&mut MetricValue::Count(ref mut v1), MetricValue::Count(v2)) => {
                 let changed = v2 != 0;
                 *v1 += v2;
                 changed
@@ -76,22 +75,22 @@ impl MetricData {
 }
 
 #[derive(Debug, Clone)]
-pub struct StoredMetricData {
+pub struct StoredMetricValue {
     last_sent: Instant,
     updated: bool,
-    data: MetricData,
+    data: MetricValue,
 }
 
-impl StoredMetricData {
-    pub fn new(last_sent: Instant, data: MetricData) -> StoredMetricData {
-        StoredMetricData {
+impl StoredMetricValue {
+    pub fn new(last_sent: Instant, data: MetricValue) -> StoredMetricValue {
+        StoredMetricValue {
             last_sent,
             updated: true,
-            data: if let MetricData::GaugeAdd(v) = data {
+            data: if let MetricValue::GaugeAdd(v) = data {
                 if v >= 0 {
-                    MetricData::Gauge(v as usize)
+                    MetricValue::Gauge(v as usize)
                 } else {
-                    MetricData::Gauge(0)
+                    MetricValue::Gauge(0)
                 }
             } else {
                 data
@@ -99,7 +98,7 @@ impl StoredMetricData {
         }
     }
 
-    pub fn update(&mut self, key: &'static str, m: MetricData) {
+    pub fn update(&mut self, key: &'static str, m: MetricValue) {
         let updated = self.data.update(key, m);
         if !self.updated {
             self.updated = updated;
@@ -137,7 +136,7 @@ pub trait Subscriber {
         label: &'static str,
         cluster_id: Option<&str>,
         backend_id: Option<&str>,
-        metric: MetricData,
+        metric: MetricValue,
     );
 }
 
@@ -190,15 +189,15 @@ impl Aggregator {
     }
 
     pub fn count_add(&mut self, key: &'static str, count_value: i64) {
-        self.receive_metric(key, None, None, MetricData::Count(count_value));
+        self.receive_metric(key, None, None, MetricValue::Count(count_value));
     }
 
     pub fn set_gauge(&mut self, key: &'static str, gauge_value: usize) {
-        self.receive_metric(key, None, None, MetricData::Gauge(gauge_value));
+        self.receive_metric(key, None, None, MetricValue::Gauge(gauge_value));
     }
 
     pub fn gauge_add(&mut self, key: &'static str, gauge_value: i64) {
-        self.receive_metric(key, None, None, MetricData::GaugeAdd(gauge_value));
+        self.receive_metric(key, None, None, MetricValue::GaugeAdd(gauge_value));
     }
 
     pub fn writable(&mut self) {
@@ -209,7 +208,7 @@ impl Aggregator {
 
     pub fn send_data(&mut self) {
         if let Some(ref mut net) = self.network.as_mut() {
-            net.send_data();
+            net.send_metrics();
         }
     }
 
@@ -236,7 +235,7 @@ impl Subscriber for Aggregator {
         label: &'static str,
         cluster_id: Option<&str>,
         backend_id: Option<&str>,
-        metric: MetricData,
+        metric: MetricValue,
     ) {
         if let Some(ref mut net) = self.network.as_mut() {
             net.receive_metric(label, cluster_id, backend_id, metric.to_owned());
@@ -277,6 +276,7 @@ pub fn udp_bind() -> anyhow::Result<UdpSocket> {
     UdpSocket::bind(address).with_context(|| "Could not bind to 0.0.0.0:0 udp socket")
 }
 
+/// adds a value to a counter
 #[macro_export]
 macro_rules! count (
   ($key:expr, $value: expr) => ({
@@ -287,6 +287,7 @@ macro_rules! count (
   })
 );
 
+/// adds 1 to a counter
 #[macro_export]
 macro_rules! incr (
   ($key:expr) => (count!($key, 1));
@@ -294,7 +295,7 @@ macro_rules! incr (
     use $crate::metrics::Subscriber;
 
     $crate::metrics::METRICS.with(|metrics| {
-      (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricData::Count(1));
+      (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricValue::Count(1));
     });
   }
 );
@@ -327,7 +328,7 @@ macro_rules! gauge_add (
     let v = $value;
 
     $crate::metrics::METRICS.with(|metrics| {
-      (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricData::GaugeAdd(v));
+      (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricValue::GaugeAdd(v));
     });
   }
 );
@@ -335,22 +336,22 @@ macro_rules! gauge_add (
 #[macro_export]
 macro_rules! time (
   ($key:expr, $value: expr) => ({
-    use $crate::metrics::{MetricData,Subscriber};
+    use $crate::metrics::{MetricValue,Subscriber};
     let v = $value;
     $crate::metrics::METRICS.with(|metrics| {
       let m = &mut *metrics.borrow_mut();
 
-      m.receive_metric($key, None, None, MetricData::Time(v as usize));
+      m.receive_metric($key, None, None, MetricValue::Time(v as usize));
     });
   });
   ($key:expr, $cluster_id:expr, $value: expr) => ({
-    use $crate::metrics::{MetricData,Subscriber};
+    use $crate::metrics::{MetricValue,Subscriber};
     let v = $value;
     $crate::metrics::METRICS.with(|metrics| {
       let m = &mut *metrics.borrow_mut();
       let cluster: &str = $cluster_id;
 
-      m.receive_metric($key, Some(cluster), None, MetricData::Time(v as usize));
+      m.receive_metric($key, Some(cluster), None, MetricValue::Time(v as usize));
     });
   })
 );
@@ -358,20 +359,20 @@ macro_rules! time (
 #[macro_export]
 macro_rules! record_backend_metrics (
   ($cluster_id:expr, $backend_id:expr, $response_time: expr, $backend_connection_time: expr, $bin: expr, $bout: expr) => {
-    use $crate::metrics::{MetricData,Subscriber};
+    use $crate::metrics::{MetricValue,Subscriber};
     $crate::metrics::METRICS.with(|metrics| {
       let m = &mut *metrics.borrow_mut();
       let cluster_id: &str = $cluster_id;
       let backend_id: &str = $backend_id;
 
-      m.receive_metric("bytes_in", Some(cluster_id), Some(backend_id), MetricData::Count($bin as i64));
-      m.receive_metric("bytes_out", Some(cluster_id), Some(backend_id), MetricData::Count($bout as i64));
-      m.receive_metric("backend_response_time", Some(cluster_id), Some(backend_id), MetricData::Time($response_time as usize));
+      m.receive_metric("bytes_in", Some(cluster_id), Some(backend_id), MetricValue::Count($bin as i64));
+      m.receive_metric("bytes_out", Some(cluster_id), Some(backend_id), MetricValue::Count($bout as i64));
+      m.receive_metric("backend_response_time", Some(cluster_id), Some(backend_id), MetricValue::Time($response_time as usize));
       if let Some(t) = $backend_connection_time {
-        m.receive_metric("backend_connection_time", Some(cluster_id), Some(backend_id), MetricData::Time(t.whole_milliseconds() as usize));
+        m.receive_metric("backend_connection_time", Some(cluster_id), Some(backend_id), MetricValue::Time(t.whole_milliseconds() as usize));
       }
 
-      m.receive_metric("requests", Some(cluster_id), Some(backend_id), MetricData::Count(1));
+      m.receive_metric("requests", Some(cluster_id), Some(backend_id), MetricValue::Count(1));
     });
   }
 );

@@ -10,7 +10,7 @@ use mio::net::UdpSocket;
 
 use super::{
     writer::{MetricSocket, MetricsWriter},
-    MetricData, StoredMetricData, Subscriber,
+    MetricValue, StoredMetricValue, Subscriber,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,11 +32,11 @@ pub struct NetworkDrain {
     /// writes metrics onto a UDP socket
     pub remote: MetricsWriter,
     is_writable: bool,
-    proxy_metrics: HashMap<String, StoredMetricData>,
+    proxy_metrics: HashMap<String, StoredMetricValue>,
     /// (cluster_id, key) -> metric
-    cluster_metrics: HashMap<(String, String), StoredMetricData>,
+    cluster_metrics: HashMap<(String, String), StoredMetricValue>,
     /// (cluster_id, backend_id, key) -> metric
-    backend_metrics: HashMap<(String, String, String), StoredMetricData>,
+    backend_metrics: HashMap<(String, String, String), StoredMetricValue>,
     pub use_tagged_metrics: bool,
     pub origin: String,
     created: Instant,
@@ -64,7 +64,7 @@ impl NetworkDrain {
         self.is_writable = true;
     }
 
-    pub fn send_data(&mut self) {
+    pub fn send_metrics(&mut self) {
         let now = Instant::now();
         let secs = Duration::new(1, 0);
         let mut send_count = 0;
@@ -77,6 +77,10 @@ impl NetworkDrain {
             value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00)
         });
 
+        if !self.is_writable {
+            return;
+        }
+
         if self.is_writable {
             for (ref key, ref mut stored_metric) in self
                 .proxy_metrics
@@ -85,7 +89,7 @@ impl NetworkDrain {
             {
                 //info!("will write {} -> {:#?}", key, stored_metric);
                 let res = match stored_metric.data {
-                    MetricData::Gauge(value) => {
+                    MetricValue::Gauge(value) => {
                         if self.use_tagged_metrics {
                             self.remote.write_fmt(format_args!(
                                 "{}.{},origin={},version={}:{}|g\n",
@@ -98,7 +102,7 @@ impl NetworkDrain {
                             ))
                         }
                     }
-                    MetricData::Count(value) => {
+                    MetricValue::Count(value) => {
                         if value == 0 {
                             stored_metric.last_sent = now;
                         }
@@ -116,7 +120,7 @@ impl NetworkDrain {
                         };
 
                         if res.is_ok() {
-                            stored_metric.data = MetricData::Count(0);
+                            stored_metric.data = MetricValue::Count(0);
                         }
 
                         res
@@ -169,7 +173,7 @@ impl NetworkDrain {
             {
                 //info!("will write {:?} -> {:#?}", key, stored_metric);
                 let res = match stored_metric.data {
-                    MetricData::Gauge(value) => {
+                    MetricValue::Gauge(value) => {
                         if self.use_tagged_metrics {
                             self.remote.write_fmt(format_args!(
                                 "{}.cluster.{},origin={},version={},cluster_id={}:{}|g\n",
@@ -182,7 +186,7 @@ impl NetworkDrain {
                             ))
                         }
                     }
-                    MetricData::Count(value) => {
+                    MetricValue::Count(value) => {
                         if value == 0 {
                             stored_metric.last_sent = now;
                         }
@@ -200,7 +204,7 @@ impl NetworkDrain {
                         };
 
                         if res.is_ok() {
-                            stored_metric.data = MetricData::Count(0);
+                            stored_metric.data = MetricValue::Count(0);
                         }
 
                         res
@@ -253,7 +257,7 @@ impl NetworkDrain {
             {
                 //info!("will write {:?} -> {:#?}", key, stored_metric);
                 let res = match stored_metric.data {
-                    MetricData::Gauge(value) => {
+                    MetricValue::Gauge(value) => {
                         if self.use_tagged_metrics {
                             self.remote.write_fmt(format_args!(
                                 "{}.backend.{},origin={},version={},cluster_id={},backend_id={}:{}|g\n",
@@ -266,7 +270,7 @@ impl NetworkDrain {
                             ))
                         }
                     }
-                    MetricData::Count(value) => {
+                    MetricValue::Count(value) => {
                         if value == 0 {
                             stored_metric.last_sent = now;
                         }
@@ -284,7 +288,7 @@ impl NetworkDrain {
                         };
 
                         if res.is_ok() {
-                            stored_metric.data = MetricData::Count(0);
+                            stored_metric.data = MetricValue::Count(0);
                         }
 
                         res
@@ -425,10 +429,10 @@ impl Subscriber for NetworkDrain {
         key: &'static str,
         cluster_id: Option<&str>,
         backend_id: Option<&str>,
-        metric: MetricData,
+        metric: MetricValue,
     ) {
         if metric.is_time() {
-            if let MetricData::Time(millis) = metric {
+            if let MetricValue::Time(millis) = metric {
                 self.queue.push_back(MetricLine {
                     label: key,
                     cluster_id: cluster_id.map(|s| s.to_string()),
@@ -444,7 +448,7 @@ impl Subscriber for NetworkDrain {
             (Some(cid), None) => {
                 let k = (String::from(cid), String::from(key));
                 if let Entry::Vacant(e) = self.cluster_metrics.entry(k.to_owned()) {
-                    e.insert(StoredMetricData::new(self.created, metric));
+                    e.insert(StoredMetricValue::new(self.created, metric));
                 } else if let Some(stored_metric) = self.cluster_metrics.get_mut(&k) {
                     stored_metric.update(key, metric);
                 }
@@ -453,7 +457,7 @@ impl Subscriber for NetworkDrain {
             (Some(cid), Some(bid)) => {
                 let k = (String::from(cid), String::from(bid), String::from(key));
                 if let Entry::Vacant(e) = self.backend_metrics.entry(k.to_owned()) {
-                    e.insert(StoredMetricData::new(self.created, metric));
+                    e.insert(StoredMetricValue::new(self.created, metric));
                 } else if let Some(stored_metric) = self.backend_metrics.get_mut(&k) {
                     stored_metric.update(key, metric);
                 }
@@ -466,7 +470,7 @@ impl Subscriber for NetworkDrain {
                 Some(bid) => {
                     let k = (String::from(id), String::from(bid), String::from(key));
                     if let Entry::Vacant(e) = self.backend_metrics.entry(k.to_owned()) {
-                        e.insert(StoredMetricData::new(self.created, metric));
+                        e.insert(StoredMetricValue::new(self.created, metric));
                     } else if let Some(stored_metric) = self.backend_metrics.get_mut(&k) {
                         stored_metric.update(key, metric);
                     }
@@ -474,7 +478,7 @@ impl Subscriber for NetworkDrain {
                 None => {
                     let k = (String::from(id), String::from(key));
                     if let Entry::Vacant(e) = self.cluster_metrics.entry(k.to_owned()) {
-                        e.insert(StoredMetricData::new(self.created, metric));
+                        e.insert(StoredMetricValue::new(self.created, metric));
                     } else if let Some(stored_metric) = self.cluster_metrics.get_mut(&k) {
                         stored_metric.update(key, metric);
                     }
@@ -487,7 +491,7 @@ impl Subscriber for NetworkDrain {
         if !self.proxy_metrics.contains_key(key) {
             self.proxy_metrics.insert(
                 String::from(key),
-                StoredMetricData::new(self.created, metric),
+                StoredMetricValue::new(self.created, metric),
             );
             return;
         }
