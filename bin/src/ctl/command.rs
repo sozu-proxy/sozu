@@ -47,8 +47,6 @@ impl CommandManager {
         request: Request,
         json: bool,
     ) -> Result<(), anyhow::Error> {
-        println!("Sending request : {request:?}");
-
         self.channel
             .write_message(&request)
             .with_context(|| "Could not write the request")?;
@@ -57,15 +55,16 @@ impl CommandManager {
             let response = self.read_channel_message_with_timeout()?;
 
             match response.status() {
-                ResponseStatus::Processing => println!("Proxy is processing: {}", response.message),
+                ResponseStatus::Processing => { debug!("Proxy is processing: {}", response.message); },
                 ResponseStatus::Failure => bail!("Request failed: {}", response.message),
                 ResponseStatus::Ok => {
                     if json {
                         // why do we need to print a success message in json?
                         print_json_response(&response.message)?;
                     } else {
-                        println!("Success: {}", response.message);
+                        println!("{}", response.message);
                     }
+
                     if let Some(response_content) = response.content {
                         match response_content.content_type {
                             Some(ContentType::RequestCounts(request_counts)) => {
@@ -96,7 +95,7 @@ impl CommandManager {
     // 2. Send an UpgradeMain
     // 3. Send an UpgradeWorker to each worker
     pub fn upgrade_main(&mut self) -> Result<(), anyhow::Error> {
-        println!("Preparing to upgrade proxy...");
+        info!("Preparing to upgrade proxy...");
 
         self.write_request_on_channel(RequestType::ListWorkers(ListWorkers {}).into())?;
 
@@ -105,7 +104,7 @@ impl CommandManager {
 
             match response.status() {
                 ResponseStatus::Processing => {
-                    println!("Processing: {}", response.message);
+                    debug!("Processing: {}", response.message);
                 }
                 ResponseStatus::Failure => {
                     bail!(
@@ -125,6 +124,7 @@ impl CommandManager {
                             let run_state = format!("{:?}", worker.run_state);
                             table.add_row(row![worker.id, worker.pid, run_state]);
                         }
+
                         println!();
                         table.printstd();
                         println!();
@@ -133,14 +133,14 @@ impl CommandManager {
                             RequestType::UpgradeMain(UpgradeMain {}).into(),
                         )?;
 
-                        println!("Upgrading main process");
+                        info!("Upgrading main process");
 
                         loop {
                             let response = self.read_channel_message_with_timeout()?;
 
                             match response.status() {
                                 ResponseStatus::Processing => {
-                                    println!("Main process is upgrading");
+                                    debug!("Main process is upgrading");
                                 }
                                 ResponseStatus::Failure => {
                                     bail!(
@@ -149,7 +149,7 @@ impl CommandManager {
                                     );
                                 }
                                 ResponseStatus::Ok => {
-                                    println!(
+                                    info!(
                                         "Main process upgrade succeeded: {}",
                                         response.message
                                     );
@@ -159,7 +159,7 @@ impl CommandManager {
                         }
 
                         // Reconnect to the new main
-                        println!("Reconnecting to new main process...");
+                        info!("Reconnecting to new main process...");
                         self.channel = create_channel(&self.config)
                             .with_context(|| "could not reconnect to the command unix socket")?;
 
@@ -171,7 +171,7 @@ impl CommandManager {
                             .collect::<Vec<_>>();
                         let running_count = running_workers.len();
                         for (i, worker) in running_workers.iter().enumerate() {
-                            println!(
+                            info!(
                                 "Upgrading worker {} (#{} out of {})",
                                 worker.id,
                                 i + 1,
@@ -183,9 +183,9 @@ impl CommandManager {
                             //thread::sleep(Duration::from_millis(1000));
                         }
 
-                        println!("Proxy successfully upgraded!");
+                        info!("Proxy successfully upgraded!");
                     } else {
-                        println!("Received a response of the wrong kind: {response:?}");
+                        info!("Received a response of the wrong kind: {:?}", response);
                     }
                     break;
                 }
@@ -195,7 +195,7 @@ impl CommandManager {
     }
 
     pub fn upgrade_worker(&mut self, worker_id: u32) -> Result<(), anyhow::Error> {
-        println!("upgrading worker {worker_id}");
+        trace!("upgrading worker {}", worker_id);
 
         //FIXME: we should be able to soft stop one specific worker
         self.write_request_on_channel(RequestType::UpgradeWorker(worker_id).into())?;
@@ -248,7 +248,7 @@ impl CommandManager {
 
                 match response.status() {
                     ResponseStatus::Processing => {
-                        println!("Proxy is processing: {}", response.message);
+                        debug!("Proxy is processing: {}", response.message);
                     }
                     ResponseStatus::Failure => {
                         if json {
@@ -266,7 +266,7 @@ impl CommandManager {
                                 Some(ContentType::AvailableMetrics(available)) => {
                                     print_available_metrics(&available)?;
                                 }
-                                _ => println!("Wrong kind of response here"),
+                                _ => { debug!("Wrong kind of response here"); },
                             }
                         }
 
@@ -330,7 +330,7 @@ impl CommandManager {
 
             match response.status() {
                 ResponseStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
+                    debug!("Proxy is processing: {}", response.message);
                 }
                 ResponseStatus::Failure => {
                     if json {
@@ -384,7 +384,7 @@ impl CommandManager {
 
             match response.status() {
                 ResponseStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
+                    debug!("Proxy is processing: {}", response.message);
                 }
                 ResponseStatus::Failure => {
                     if json {
@@ -421,14 +421,14 @@ impl CommandManager {
 
             match response.status() {
                 ResponseStatus::Processing => {
-                    println!("Proxy is processing: {}", response.message);
+                    debug!("Proxy is processing: {}", response.message);
                 }
                 ResponseStatus::Failure => {
                     bail!("could not get certificate: {}", response.message);
                 }
                 ResponseStatus::Ok => {
-                    info!("We did get a response from the proxy");
-                    println!("response message: {:?}\n", response.message);
+                    debug!("We did get a response from the proxy");
+                    trace!("response message: {:?}\n", response.message);
 
                     if let Some(response_content) = response.content {
                         let certs = match response_content.content_type {
@@ -447,7 +447,7 @@ impl CommandManager {
                                 .with_context(|| "Could not show certificate")?;
                         }
                     } else {
-                        println!("No response content.");
+                        debug!("No response content.");
                     }
 
                     break;

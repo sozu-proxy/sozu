@@ -60,7 +60,6 @@ pub fn init(
     let directives = crate::sozu_command_lib::logging::parse_logging_spec(spec);
     let mut logger = MAIN_LOGGER.lock().unwrap();
     if !logger.initialized {
-        println!("initializing logger");
         logger.set_directives(directives);
         logger.backend = backend;
         logger.access_backend = access_backend;
@@ -68,7 +67,6 @@ pub fn init(
         logger.pid = unsafe { libc::getpid() };
         logger.initialized = true;
 
-        //let _ = log::set_logger(&crate::sozu_command::logging::COMPAT_LOGGER).map_err(|e| println!("could not register compat logger: {:?}", e));
         log::set_max_level(log::LevelFilter::Info);
     }
 }

@@ -752,33 +752,33 @@ impl ProxyConfiguration for HttpProxy {
 
         let result = match request.content.request_type {
             Some(RequestType::AddCluster(cluster)) => {
-                info!("{} add cluster {:?}", request.id, cluster);
+                debug!("{} add cluster {:?}", request.id, cluster);
                 self.add_cluster(cluster.clone())
                     .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
             Some(RequestType::RemoveCluster(cluster_id)) => {
-                info!("{} remove cluster {:?}", request_id, cluster_id);
+                debug!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
                     .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
             Some(RequestType::AddHttpFrontend(front)) => {
-                info!("{} add front {:?}", request_id, front);
+                debug!("{} add front {:?}", request_id, front);
                 self.add_http_frontend(front)
                     .with_context(|| "Could not add http frontend")
             }
             Some(RequestType::RemoveHttpFrontend(front)) => {
-                info!("{} remove front {:?}", request_id, front);
+                debug!("{} remove front {:?}", request_id, front);
                 self.remove_http_frontend(front)
                     .with_context(|| "Could not remove http frontend")
             }
             Some(RequestType::RemoveListener(remove)) => {
-                info!("removing HTTP listener at address {:?}", remove.address);
+                debug!("removing HTTP listener at address {:?}", remove.address);
                 self.remove_listener(remove.clone()).with_context(|| {
                     format!("Could not remove listener at address {:?}", remove.address)
                 })
             }
             Some(RequestType::SoftStop(_)) => {
-                info!("{} processing soft shutdown", request_id);
+                debug!("{} processing soft shutdown", request_id);
                 match self
                     .soft_stop()
                     .with_context(|| "Could not perform soft stop")
@@ -791,7 +791,7 @@ impl ProxyConfiguration for HttpProxy {
                 }
             }
             Some(RequestType::HardStop(_)) => {
-                info!("{} processing hard shutdown", request_id);
+                debug!("{} processing hard shutdown", request_id);
                 match self
                     .hard_stop()
                     .with_context(|| "Could not perform hard stop")
@@ -804,11 +804,11 @@ impl ProxyConfiguration for HttpProxy {
                 }
             }
             Some(RequestType::Status(_)) => {
-                info!("{} status", request_id);
+                debug!("{} status", request_id);
                 Ok(())
             }
             Some(RequestType::Logging(logging_filter)) => {
-                info!(
+                debug!(
                     "{} changing logging filter to {}",
                     request_id, logging_filter
                 );
@@ -816,7 +816,7 @@ impl ProxyConfiguration for HttpProxy {
                     .with_context(|| format!("Could not set logging level to {logging_filter}"))
             }
             other_command => {
-                info!(
+                debug!(
                     "{} unsupported message for HTTP proxy, ignoring: {:?}",
                     request.id, other_command
                 );
@@ -826,11 +826,11 @@ impl ProxyConfiguration for HttpProxy {
 
         match result {
             Ok(()) => {
-                info!("{} successful", request_id);
+                debug!("{} successful", request_id);
                 WorkerResponse::ok(request_id)
             }
             Err(error_message) => {
-                error!("{} unsuccessful: {:#}", request_id, error_message);
+                debug!("{} unsuccessful: {:#}", request_id, error_message);
                 WorkerResponse::error(request_id, format!("{error_message:#}"))
             }
         }
@@ -1051,9 +1051,9 @@ pub fn start_http_worker(
     )
     .with_context(|| "Failed at creating server")?;
 
-    println!("starting event loop");
+    debug!("starting event loop");
     server.run();
-    println!("ending event loop");
+    debug!("ending event loop");
     Ok(())
 }
 

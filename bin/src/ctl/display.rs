@@ -219,13 +219,12 @@ pub fn print_metrics(
     json: bool,
 ) -> anyhow::Result<()> {
     if json {
-        println!("Here are the metrics, per worker");
+        debug!("Here are the metrics, per worker");
         return print_json_response(&aggregated_metrics);
     }
 
     // main process metrics
     println!("\nMAIN PROCESS\n============");
-
     print_proxy_metrics(&aggregated_metrics.main);
 
     // workers

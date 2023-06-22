@@ -1300,8 +1300,8 @@ impl ConfigBuilder {
                                         frontend.key = https_listener.key.clone();
                                     }
                                     if frontend.certificate.is_none() {
-                                        println!("known addresses: {:#?}", self.known_addresses);
-                                        println!("frontend: {frontend:#?}");
+                                        debug!("known addresses: {:#?}", self.known_addresses);
+                                        debug!("frontend: {:#?}", frontend);
                                         bail!("cannot set up a HTTP frontend on a HTTPS listener");
                                     }
                                 }

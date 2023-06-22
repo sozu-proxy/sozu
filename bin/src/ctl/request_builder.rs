@@ -24,13 +24,13 @@ use crate::{
 
 impl CommandManager {
     pub fn save_state(&mut self, path: String) -> anyhow::Result<()> {
-        println!("Loading the state to file {path}");
+        debug!("Loading the state to file {}", path);
 
         self.send_request(RequestType::SaveState(path).into())
     }
 
     pub fn load_state(&mut self, path: String) -> anyhow::Result<()> {
-        println!("Loading the state on path {path}");
+        debug!("Loading the state on path {}", path);
 
         self.send_request(RequestType::LoadState(path).into())
     }
@@ -40,25 +40,25 @@ impl CommandManager {
     }
 
     pub fn soft_stop(&mut self) -> anyhow::Result<()> {
-        println!("shutting down proxy softly");
+        debug!("shutting down proxy softly");
 
         self.send_request_to_workers(RequestType::SoftStop(SoftStop {}).into(), false)
     }
 
     pub fn hard_stop(&mut self) -> anyhow::Result<()> {
-        println!("shutting down proxy the hard way");
+        debug!("shutting down proxy the hard way");
 
         self.send_request_to_workers(RequestType::HardStop(HardStop {}).into(), false)
     }
 
     pub fn status(&mut self, json: bool) -> anyhow::Result<()> {
-        println!("Requesting status…");
+        debug!("Requesting status…");
 
         self.send_request_to_workers(RequestType::Status(Status {}).into(), json)
     }
 
     pub fn configure_metrics(&mut self, cmd: MetricsCmd) -> anyhow::Result<()> {
-        println!("Configuring metrics: {cmd:?}");
+        debug!("Configuring metrics: {:?}", cmd);
 
         let configuration = match cmd {
             MetricsCmd::Enable => MetricsConfiguration::Enabled,
@@ -71,7 +71,7 @@ impl CommandManager {
     }
 
     pub fn reload_configuration(&mut self, path: Option<String>, json: bool) -> anyhow::Result<()> {
-        println!("Reloading configuration…");
+        debug!("Reloading configuration…");
         let path = match path {
             Some(p) => p,
             None => String::new(),
@@ -86,7 +86,7 @@ impl CommandManager {
         tcp: bool,
         domain: Option<String>,
     ) -> anyhow::Result<()> {
-        println!("Listing frontends");
+        debug!("Listing frontends");
 
         self.send_request(
             RequestType::ListFrontends(FrontendFilters {
