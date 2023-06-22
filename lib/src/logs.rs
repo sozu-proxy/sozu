@@ -191,21 +191,24 @@ impl RequestRecord<'_> {
         }
 
         match self.error {
-            None => info_access!(
-                "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {} {} {}",
-                context,
-                session_address.as_str_or("X"),
-                backend_address.as_str_or("X"),
-                LogDuration(Some(response_time)),
-                LogDuration(Some(service_time)),
-                LogDuration(client_rtt),
-                LogDuration(server_rtt),
-                metrics.bin,
-                metrics.bout,
-                tags.as_str_or("-"),
-                protocol,
-                endpoint
-            ),
+            None => {
+                info_access!(
+                    "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {} {} {}",
+                    context,
+                    session_address.as_str_or("X"),
+                    backend_address.as_str_or("X"),
+                    LogDuration(Some(response_time)),
+                    LogDuration(Some(service_time)),
+                    LogDuration(client_rtt),
+                    LogDuration(server_rtt),
+                    metrics.bin,
+                    metrics.bout,
+                    tags.as_str_or("-"),
+                    protocol,
+                    endpoint
+                );
+                incr!("access_logs.count");
+            }
             Some(message) => error_access!(
                 "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {} {} {} | {}",
                 context,
