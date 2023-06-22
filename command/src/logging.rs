@@ -72,6 +72,7 @@ impl Logger {
 
                 let _ = log::set_logger(&COMPAT_LOGGER)
                     .map_err(|e| println!("could not register compat logger: {e:?}"));
+
                 log::set_max_level(log::LevelFilter::Info);
             }
         });

@@ -1251,32 +1251,32 @@ impl ProxyConfiguration for HttpsProxy {
 
         let content_result = match request_type {
             RequestType::AddCluster(cluster) => {
-                info!("{} add cluster {:?}", request_id, cluster);
+                debug!("{} add cluster {:?}", request_id, cluster);
                 self.add_cluster(cluster.clone())
                     .with_context(|| format!("Could not add cluster {}", cluster.cluster_id))
             }
             RequestType::RemoveCluster(cluster_id) => {
-                info!("{} remove cluster {:?}", request_id, cluster_id);
+                debug!("{} remove cluster {:?}", request_id, cluster_id);
                 self.remove_cluster(&cluster_id)
                     .with_context(|| format!("Could not remove cluster {cluster_id}"))
             }
             RequestType::AddHttpsFrontend(front) => {
-                info!("{} add https front {:?}", request_id, front);
+                debug!("{} add https front {:?}", request_id, front);
                 self.add_https_frontend(front)
                     .with_context(|| "Could not add https frontend")
             }
             RequestType::RemoveHttpsFrontend(front) => {
-                info!("{} remove https front {:?}", request_id, front);
+                debug!("{} remove https front {:?}", request_id, front);
                 self.remove_https_frontend(front)
                     .with_context(|| "Could not remove https frontend")
             }
             RequestType::AddCertificate(add_certificate) => {
-                info!("{} add certificate: {:?}", request_id, add_certificate);
+                debug!("{} add certificate: {:?}", request_id, add_certificate);
                 self.add_certificate(add_certificate)
                     .with_context(|| "Could not add certificate")
             }
             RequestType::RemoveCertificate(remove_certificate) => {
-                info!(
+                debug!(
                     "{} remove certificate: {:?}",
                     request_id, remove_certificate
                 );
@@ -1284,7 +1284,7 @@ impl ProxyConfiguration for HttpsProxy {
                     .with_context(|| "Could not remove certificate")
             }
             RequestType::ReplaceCertificate(replace_certificate) => {
-                info!(
+                debug!(
                     "{} replace certificate: {:?}",
                     request_id, replace_certificate
                 );
@@ -1292,13 +1292,13 @@ impl ProxyConfiguration for HttpsProxy {
                     .with_context(|| "Could not replace certificate")
             }
             RequestType::RemoveListener(remove) => {
-                info!("removing HTTPS listener at address {:?}", remove.address);
+                debug!("removing HTTPS listener at address {:?}", remove.address);
                 self.remove_listener(remove.clone()).with_context(|| {
                     format!("Could not remove listener at address {:?}", remove.address)
                 })
             }
             RequestType::SoftStop(_) => {
-                info!("{} processing soft shutdown", request_id);
+                debug!("{} processing soft shutdown", request_id);
                 match self
                     .soft_stop()
                     .with_context(|| "Could not perform soft stop")
@@ -1311,24 +1311,24 @@ impl ProxyConfiguration for HttpsProxy {
                 }
             }
             RequestType::HardStop(_) => {
-                info!("{} processing hard shutdown", request_id);
+                debug!("{} processing hard shutdown", request_id);
                 match self
                     .hard_stop()
                     .with_context(|| "Could not perform hard stop")
                 {
                     Ok(_) => {
-                        info!("{} hard stop successful", request_id);
+                        debug!("{} hard stop successful", request_id);
                         return WorkerResponse::processing(request.id);
                     }
                     Err(e) => Err(e),
                 }
             }
             RequestType::Status(_) => {
-                info!("{} status", request_id);
+                debug!("{} status", request_id);
                 Ok(None)
             }
             RequestType::Logging(logging_filter) => {
-                info!(
+                debug!(
                     "{} changing logging filter to {}",
                     request_id, logging_filter
                 );
@@ -1337,11 +1337,11 @@ impl ProxyConfiguration for HttpsProxy {
             }
             RequestType::QueryCertificatesFromWorkers(filters) => {
                 if let Some(domain) = filters.domain {
-                    info!("{} query certificate for domain {}", request_id, domain);
+                    debug!("{} query certificate for domain {}", request_id, domain);
                     self.query_certificate_for_domain(domain.clone())
                         .with_context(|| format!("Could not query certificate for domain {domain}"))
                 } else {
-                    info!("{} query all certificates", request_id);
+                    debug!("{} query all certificates", request_id);
                     self.query_all_certificates()
                         .with_context(|| "Could not query all certificates")
                 }
@@ -1357,14 +1357,14 @@ impl ProxyConfiguration for HttpsProxy {
 
         match content_result {
             Ok(content) => {
-                info!("{} successful", request_id);
+                debug!("{} successful", request_id);
                 match content {
                     Some(content) => WorkerResponse::ok_with_content(request_id, content),
                     None => WorkerResponse::ok(request_id),
                 }
             }
             Err(error_message) => {
-                error!("{} unsuccessful: {:#}", request_id, error_message);
+                debug!("{} unsuccessful: {:#}", request_id, error_message);
                 WorkerResponse::error(request_id, format!("{error_message:#}"))
             }
         }

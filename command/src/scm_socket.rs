@@ -140,14 +140,14 @@ impl ScmSocket {
         };
 
         if fds.is_empty() {
-            println!("{} send empty", self.fd);
+            debug!("{} send empty", self.fd);
             socket::sendmsg::<()>(self.fd, &iov, &[], flags, None)
                 .with_context(|| "Could not send empty message per socket")?;
             return Ok(());
         };
 
         let control_message = [socket::ControlMessage::ScmRights(fds)];
-        println!("{} send with data", self.fd);
+        debug!("{} send with data", self.fd);
         socket::sendmsg::<()>(self.fd, &iov, &control_message, flags, None)
             .with_context(|| "Could not send message per socket")?;
         Ok(())
