@@ -2,7 +2,114 @@
 
 ## [Unreleased]
 
-See milestone [`v0.15.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av0.15.0)
+See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av0.16.0)
+
+## 0.15.0 - 2024-06-23
+
+### 🌟 Features
+
+- We have added on the command line a way to check for certificate validity that print the "not after" and "not before" field of the certificate, see [`8ea3768`](https://github.com/sozu-proxy/sozu/commit/8ea3768be11e1dcdcb2b951d310618dacec34061)
+- This release is also the first one of that use the crate [`kawa`](https://github.com/CleverCloud/kawa) to parse HTTP requests and translate them into an intermediate representation. It will be a foundation of the H2 integration in Sōzu, see [`144bdb6`](https://github.com/sozu-proxy/sozu/commit/144bdb6dfb5707418a82221a4d5e594bbabce038), [`5ac6fd7`](https://github.com/sozu-proxy/sozu/commit/5ac6fd7dba7494fe26c9fc8f0ff2f244f34a4c0d), [`5ac6fd7`](https://github.com/sozu-proxy/sozu/commit/5ac6fd7dba7494fe26c9fc8f0ff2f244f34a4c0d), [`1cff096`](https://github.com/sozu-proxy/sozu/commit/1cff096fa281e20467aada9e231f85dde200288e), [`c4fbef0`](https://github.com/sozu-proxy/sozu/commit/c4fbef01740ea81b241eb1eb25e218e6b79bc965), [`5c17acf`](https://github.com/sozu-proxy/sozu/commit/5c17acf5f529026d0bab2ef3c12caa91ae30cb9e), [`b8fb52e`](https://github.com/sozu-proxy/sozu/commit/b8fb52e86721cc3e9b15f9dcfc76c56d461e2a38), [`cd55235`](https://github.com/sozu-proxy/sozu/commit/cd552357893334fc42c74a0fe5d467490a04b8db), [`3eec22c`](https://github.com/sozu-proxy/sozu/commit/3eec22cf7fbc2b8e030d5b03411d86f1b8583984), [`dc78bc0`](https://github.com/sozu-proxy/sozu/commit/dc78bc07f6f2b4667274deae2f7f56550c5056e4), [`1b3bbf2`](https://github.com/sozu-proxy/sozu/commit/1b3bbf22795e66b2cf1b379bddc55716da8a1066) and [`737072f`](https://github.com/sozu-proxy/sozu/commit/737072f8d625e5964a59f8ddb394f445f066a8ad).
+- We have updated the packaging for Arch Linux, Docker, Fedora, Exherbo and systemd, see [`f2176a3`](https://github.com/sozu-proxy/sozu/commit/f2176a333c492f9ca703d3355d88b981f75b0a45), [`81f25b6`](https://github.com/sozu-proxy/sozu/commit/81f25b66dd22d1462af781fb6627d762310f2e82) and [`d088468`](https://github.com/sozu-proxy/sozu/commit/d0884685806b5ef88097d24f36fa80e6b2bd5e79)
+
+### ⛑️ Fixed
+
+- We have fixed some issues that Mac OS users could be met, see [`a93f66e`](https://github.com/sozu-proxy/sozu/commit/a93f66e0525759cb7ce0118af08f0505fc4ff903) and [`0b435b6`](https://github.com/sozu-proxy/sozu/commit/0b435b654f6a998ca5d49101b85d558f8aed8909).
+- We have also reduce the number of logs that Sōzu could be create using debug logging level as it may slow down it in few cases, see [`09b0bf0`](https://github.com/sozu-proxy/sozu/commit/09b0bf02a5fcfe240bf0c00114da2a42e789f51a).
+
+### ⚡ Breaking changes
+
+- We have renamed the command `query cluster` into `cluster list`, see [`cf5964b`](https://github.com/sozu-proxy/sozu/commit/cf5964b67ebbbe35f32bb8ae1e2433c988547b1c).
+- We have renamed the command `query certifcate` into `certificate list`, see [`ec6c58e`](https://github.com/sozu-proxy/sozu/commit/ec6c58ef42ead1e8213fb38db66e2343042be37b) and [`acdc8c9`](https://github.com/sozu-proxy/sozu/commit/acdc8c9203fbca8f6e5119673de4526afe6006cc).
+
+### Changelog
+
+#### 🌟 Features
+
+- [ [`8ea3768`](https://github.com/sozu-proxy/sozu/commit/8ea3768be11e1dcdcb2b951d310618dacec34061) ] CLI: show certificate validity [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`144bdb6`](https://github.com/sozu-proxy/sozu/commit/144bdb6dfb5707418a82221a4d5e594bbabce038) ] First integration of HTX in H1 state [`Eloi DEMOLIS`] (`2023-06-05`)
+- [ [`5ac6fd7`](https://github.com/sozu-proxy/sozu/commit/5ac6fd7dba7494fe26c9fc8f0ff2f244f34a4c0d) ] Continue HTX integration for H1: [`Eloi DEMOLIS`] (`2023-06-05`)
+- [ [`1cff096`](https://github.com/sozu-proxy/sozu/commit/1cff096fa281e20467aada9e231f85dde200288e) ] Remove unused macros [`Eloi DEMOLIS`] (`2023-06-05`)
+- [ [`c4fbef0`](https://github.com/sozu-proxy/sozu/commit/c4fbef01740ea81b241eb1eb25e218e6b79bc965) ] Continue HTX (now Kawa) integration: [`Eloi DEMOLIS`] (`2023-06-05`)
+- [ [`5c17acf`](https://github.com/sozu-proxy/sozu/commit/5c17acf5f529026d0bab2ef3c12caa91ae30cb9e) ] Continue Kawa integration: [`Eloi DEMOLIS`] (`2023-06-05`)
+- [ [`b8fb52e`](https://github.com/sozu-proxy/sozu/commit/b8fb52e86721cc3e9b15f9dcfc76c56d461e2a38) ] Continue Kawa integration: [`Eloi DEMOLIS`] (`2023-06-05`)
+- [ [`cd55235`](https://github.com/sozu-proxy/sozu/commit/cd552357893334fc42c74a0fe5d467490a04b8db) ] Add e2e test max_connections, add accept timeout on e2e sync_backend [`Eloi DEMOLIS`] (`2023-06-05`)
+- [ [`3eec22c`](https://github.com/sozu-proxy/sozu/commit/3eec22cf7fbc2b8e030d5b03411d86f1b8583984) ] Revisit HTTP timeouts, move Checkout synching to also benifit WSS [`Eloi DEMOLIS`] (`2023-06-05`)
+- [ [`dc78bc0`](https://github.com/sozu-proxy/sozu/commit/dc78bc07f6f2b4667274deae2f7f56550c5056e4) ] Propagate AcceptError if no Checkout could be assigned to new HTTP session [`Eloi DEMOLIS`] (`2023-06-05`)
+- [ [`1b3bbf2`](https://github.com/sozu-proxy/sozu/commit/1b3bbf22795e66b2cf1b379bddc55716da8a1066) ] Support 103 Responses: [`Eloi DEMOLIS`] (`2023-06-16`)
+- [ [`737072f`](https://github.com/sozu-proxy/sozu/commit/737072f8d625e5964a59f8ddb394f445f066a8ad) ] introduce access_logs.count metric [`Emmanuel Bosquet`] (`2023-06-16`)
+
+#### ✍️ Changed
+
+- [ [`f193370`](https://github.com/sozu-proxy/sozu/commit/f1933702c50632a19b35bf6801550b4fa8688528) ] test ConfigState::get_certificate_by_fingerprint [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`ca18682`](https://github.com/sozu-proxy/sozu/commit/ca18682e5b20f0d5c248fb7d2f12f8fbd2a79308) ] query the state for a certificate, by domain [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`308f22f`](https://github.com/sozu-proxy/sozu/commit/308f22f18e560fae220fd1f0a07d318865ca820c) ] remove type CertificateWithNames [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`3286204`](https://github.com/sozu-proxy/sozu/commit/32862043141ce3368d5ece8be613aeb8afeb545b) ] display certificates from the state in a table [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`2863c31`](https://github.com/sozu-proxy/sozu/commit/2863c312c406c09a7ff6f63b03dee0fab8b10a65) ] CLI: query all certificates in the state [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`a71f485`](https://github.com/sozu-proxy/sozu/commit/a71f485477b73b95f3b89bfe2fbb99bd921795d2) ] query certificates from the state with fingerprint [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`294c164`](https://github.com/sozu-proxy/sozu/commit/294c164648b07f2ea261023b77207e6cacf9d866) ] Update gitignore [`Florentin Dubois`] (`2023-05-23`)
+- [ [`ffcec1c`](https://github.com/sozu-proxy/sozu/commit/ffcec1c9a0262fbfbb26e73adf69822e9bff778f) ] chore: update dependencies [`Florentin Dubois`] (`2023-06-22`)
+- [ [`b73122b`](https://github.com/sozu-proxy/sozu/commit/b73122b53a4d7f19da959a5d7a500a6dffa7d81c) ] chore: update dependencies [`Florentin Dubois`] (`2023-06-22`)
+- [ [`cdc4e29`](https://github.com/sozu-proxy/sozu/commit/cdc4e294900057fd76b06b9a09523a7c3f238134) ] chore: update dependencies [`Florentin Dubois`] (`2023-06-22`)
+- [ [`3c56fbc`](https://github.com/sozu-proxy/sozu/commit/3c56fbc105b5a93ebd5d912153943f1e55dc9e6c) ] chore: update dependencies [`Florentin Dubois`] (`2023-06-22`)
+
+#### ➖ Removed
+
+- [ [`774d1af`](https://github.com/sozu-proxy/sozu/commit/774d1afd01acd679ecb99502c2b4bba757eb53d3) ] Remove legacy folder and script [`Florentin Dubois`] (`2023-05-23`)
+
+#### ⚡ Breaking changes
+
+- [ [`cf5964b`](https://github.com/sozu-proxy/sozu/commit/cf5964b67ebbbe35f32bb8ae1e2433c988547b1c) ] transform CLI command "query clusters" to "cluster get" [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`acdc8c9`](https://github.com/sozu-proxy/sozu/commit/acdc8c9203fbca8f6e5119673de4526afe6006cc) ] transform CLI command "query certificates" to "certificate get" [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`ec6c58e`](https://github.com/sozu-proxy/sozu/commit/ec6c58ef42ead1e8213fb38db66e2343042be37b) ] CLI: rename 'clusters get' to 'clusters list', same for certificates [`Emmanuel Bosquet`] (`2023-05-22`)
+
+#### ➕ Added
+
+- [ [`2f79f3c`](https://github.com/sozu-proxy/sozu/commit/2f79f3cb11b873d6c42579cc2398a06622fffe1c) ] create ConfigState::get_certificates_by_domain_name [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`787ae9e`](https://github.com/sozu-proxy/sozu/commit/787ae9e7317e27824f377339507d80fce25c33d9) ] implement Display for CertificateWithNames [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`1797600`](https://github.com/sozu-proxy/sozu/commit/179760038cc1420893fcdec48b229e20e42da0e2) ] implement From<RequestType> for Request [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`c19ef26`](https://github.com/sozu-proxy/sozu/commit/c19ef26958488781cbfacc35b2e375b16390215f) ] rename order_request to send_request [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`538653f`](https://github.com/sozu-proxy/sozu/commit/538653f170d0c040aba167589b6de8b92c4e3aa0) ] Create state directory and file if it does not exists [`Florentin Dubois`] (`2023-05-23`)
+- [ [`b34b60f`](https://github.com/sozu-proxy/sozu/commit/b34b60f60bc32fb3fc61fe3511cd10d25650457b) ] count request types received in ConfigState [`Emmanuel Bosquet`] (`2023-06-01`)
+- [ [`3a92069`](https://github.com/sozu-proxy/sozu/commit/3a9206979b3323213b79eec49dff49a3e76049cf) ] define defaults in sozu_command_lib::config [`Emmanuel Bosquet`] (`2023-06-02`)
+- [ [`f6e011f`](https://github.com/sozu-proxy/sozu/commit/f6e011f0c2626d4b097f6e247d9b50f3f86f62a2) ] Add socketstats unittest [`Eloi DEMOLIS`] (`2023-06-05`)
+
+#### 📚 Documentation
+
+- [ [`de7660d`](https://github.com/sozu-proxy/sozu/commit/de7660d078f2abe48d8dd716099ab10b548e7fc0) ] doc: Changed all instances of SSL to TLS. [`Jonathan Davies`] (`2023-05-19`)
+
+#### 🚀 Refactored
+
+- [ [`9085a20`](https://github.com/sozu-proxy/sozu/commit/9085a207c6b869e0d71dc5ea7fe6df8af011c699) ] isolate method ConfigState::list_listeners [`Emmanuel Bosquet`] (`2023-05-19`)
+- [ [`c85f65f`](https://github.com/sozu-proxy/sozu/commit/c85f65f607138d1477b7d29b0079928548d1b072) ] isolate method ConfigState::list_frontends [`Emmanuel Bosquet`] (`2023-05-19`)
+- [ [`e24659d`](https://github.com/sozu-proxy/sozu/commit/e24659d51ce2ecfcd2eb23961bf59e50e680a5d3) ] introduce type QueryCertificatesFilters [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`9d554a5`](https://github.com/sozu-proxy/sozu/commit/9d554a5e92757636f844b7821b73acc12e92aada) ] rename ContentType::Certificates to CertificatesByAddress [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`4776d5f`](https://github.com/sozu-proxy/sozu/commit/4776d5f7147c3737cdd030d2ba28f7f63ca7ae71) ] merge certificate types in CertificatesWithFingerprints [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`91dc12d`](https://github.com/sozu-proxy/sozu/commit/91dc12d83adab360fd1e27f0aac19e85420c5376) ] CertificatesMatchingADomainName contains CertificateAndKey [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`721a951`](https://github.com/sozu-proxy/sozu/commit/721a951192a03340ace6867cf5e16733a1e17eec) ] merge request types into RequestType::QueryCertificatesFromWorkers [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`fcbe244`](https://github.com/sozu-proxy/sozu/commit/fcbe244a0a5eff32c989197f61a4b65b9aa9aace) ] CLI: simplify display::print_cluster_responses [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`57a0fc6`](https://github.com/sozu-proxy/sozu/commit/57a0fc6c212968eafee827832afef307d3722e16) ] Format GitHub Action workflow [`Florentin Dubois`] (`2023-05-23`)
+- [ [`f2176a3`](https://github.com/sozu-proxy/sozu/commit/f2176a333c492f9ca703d3355d88b981f75b0a45) ] Update systemd services and configuration [`Florentin Dubois`] (`2023-05-23`)
+- [ [`81f25b6`](https://github.com/sozu-proxy/sozu/commit/81f25b66dd22d1462af781fb6627d762310f2e82) ] Update Arch Linux packaging [`Florentin Dubois`] (`2023-05-23`)
+- [ [`458bb5a`](https://github.com/sozu-proxy/sozu/commit/458bb5adb49ed1dc5f73b1077ce86e6f3fb33e28) ] Update RPM and selinux packaging [`Florentin Dubois`] (`2023-05-23`)
+- [ [`d088468`](https://github.com/sozu-proxy/sozu/commit/d0884685806b5ef88097d24f36fa80e6b2bd5e79) ] Update Docker image [`Florentin Dubois`] (`2023-05-23`)
+- [ [`fe9097e`](https://github.com/sozu-proxy/sozu/commit/fe9097ea80fde5b6ec419d989d13954a702c056e) ] Apply clippy suggestions [`Eloi DEMOLIS`] (`2023-06-05`)
+- [ [`72f200b`](https://github.com/sozu-proxy/sozu/commit/72f200bcfe3671f04d62b347cc6eba82bd4abb43) ] Refactor access logs: [`Eloi DEMOLIS`] (`2023-06-05`)
+- [ [`0ff7b31`](https://github.com/sozu-proxy/sozu/commit/0ff7b31e674b2cf4c1fc24e1c5098f84b8da9003) ] rename MetricData to MetricValue [`Emmanuel Bosquet`] (`2023-06-16`)
+
+#### ⛑️ Fixed
+
+- [ [`584e0bf`](https://github.com/sozu-proxy/sozu/commit/584e0bff812f91e6b6b5aff8930b984a43845fd3) ] fix display of hex fingerprint in the CLI [`Emmanuel Bosquet`] (`2023-05-22`)
+- [ [`a93f66e`](https://github.com/sozu-proxy/sozu/commit/a93f66e0525759cb7ce0118af08f0505fc4ff903) ] Fix some MacOS related issues [`Eloi DEMOLIS`] (`2023-06-14`)
+- [ [`0b435b6`](https://github.com/sozu-proxy/sozu/commit/0b435b654f6a998ca5d49101b85d558f8aed8909) ] Fix some MacOS related warnings [`Eloi DEMOLIS`] (`2023-06-14`)
+- [ [`09b0bf0`](https://github.com/sozu-proxy/sozu/commit/09b0bf02a5fcfe240bf0c00114da2a42e789f51a) ] chore: decrease logging verbosity [`Florentin Dubois`] (`2023-06-22`)
+
+### 🥹 Contributors
+* @Wonshtrum
+* @Keksoj
+* @FlorentinDUBOIS
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.14.3...0.15.0
 
 ## 0.14.3 - 2023-05-17
 
