@@ -5,12 +5,16 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       matrix:
+        experimental: [false]
         rust:
           - stable
           - beta
-          - nightly
+        include:
+          - rust: nightly
+            experimental: true
     steps:
       - name: install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
