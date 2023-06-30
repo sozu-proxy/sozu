@@ -29,10 +29,10 @@ include = [
 [dependencies]
 anyhow = "^1.0.71"
 hex = "^0.4.3"
-libc = "^0.2.146"
+libc = "^0.2.147"
 log = "^0.4.19"
 time = "^0.3.22"
-toml = "^0.7.4"
+toml = "^0.7.5"
 memchr = "^2.5.0"
 mio = { version = "^0.8.8", features = ["os-poll", "net"] }
 nix = "^0.26.2"
