@@ -18,6 +18,7 @@ Source0:	https://github.com/sozu-proxy/sozu/archive/%{version}.tar.gz
 BuildRequires: m4
 BuildRequires: selinux-policy-devel
 BuildRequires: systemd
+BuildRequires: protobuf
 # BuildRequires: rust
 BuildRoot:	%{_tmppath}/%{name}-%{version}-%{release}-root
 

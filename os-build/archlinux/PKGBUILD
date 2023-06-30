@@ -8,7 +8,7 @@ arch=('i686' 'x86_64')
 url="https://github.com/sozu-proxy/sozu"
 license=('GPL')
 depends=()
-makedepends=('cargo')
+makedepends=('cargo' 'protobuf')
 backup=('etc/sozu/config.toml')
 source=(
   'git://github.com/sozu-proxy/sozu'
