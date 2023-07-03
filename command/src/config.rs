@@ -10,7 +10,7 @@
 //! ```
 //!
 //! `config.toml` is parsed to `FileConfig`, a structure that itself contains a lot of substructures
-//! whose names end start with `File-`, like `FileHttpFrontendConfig` for instance.
+//! whose names start with `File-` and end with `-Config`, like `FileHttpFrontendConfig` for instance.
 //!
 //! The instance of `FileConfig` is then passed to a `ConfigBuilder` that populates a final `Config`
 //! with listeners and clusters.

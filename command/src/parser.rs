@@ -41,7 +41,8 @@ impl nom::error::ParseError<&[u8]> for CustomError {
     }
 }
 
-pub fn parse_one_command<'a, T>(input: &'a [u8]) -> IResult<&[u8], T, CustomError>
+/// Parse a single Request or WorkerRequest
+pub fn parse_one_request<'a, T>(input: &'a [u8]) -> IResult<&[u8], T, CustomError>
 where
     T: serde::de::Deserialize<'a>,
 {
@@ -63,11 +64,12 @@ where
     Ok((next_input, command))
 }
 
-pub fn parse_several_commands<'a, T>(input: &'a [u8]) -> IResult<&[u8], Vec<T>, CustomError>
+/// Parse a Requests or WorkerRequests using nom
+pub fn parse_several_requests<'a, T>(input: &'a [u8]) -> IResult<&[u8], Vec<T>, CustomError>
 where
     T: serde::de::Deserialize<'a>,
 {
-    many0(parse_one_command)(input)
+    many0(parse_one_request)(input)
 }
 
 #[cfg(test)]
@@ -97,7 +99,7 @@ mod test {
         let empty_vec: Vec<u8> = vec![];
 
         assert_eq!(
-            parse_one_command(bytes).unwrap(),
+            parse_one_request(bytes).unwrap(),
             (&empty_vec[..], worker_request)
         )
     }
@@ -128,7 +130,7 @@ mod test {
 
         let bytes_to_parse = &serialized_requests.as_bytes();
 
-        let parsed_requests = parse_several_commands(bytes_to_parse).unwrap();
+        let parsed_requests = parse_several_requests(bytes_to_parse).unwrap();
 
         println!("parsed commands: {parsed_requests:?}");
 

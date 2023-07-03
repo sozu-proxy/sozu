@@ -160,6 +160,7 @@ impl From<TcpFrontend> for RequestTcpFrontend {
     }
 }
 
+/// A backend, as used *within* Sōzu
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Backend {
     pub cluster_id: String,
@@ -223,6 +224,7 @@ struct StatePath {
 
 pub type MessageId = String;
 
+/// A response as sent by a worker
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerResponse {
     pub id: MessageId,

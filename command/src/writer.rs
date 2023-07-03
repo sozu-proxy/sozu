@@ -1,5 +1,6 @@
 use std::io::{self, Error, ErrorKind, Write};
 
+/// A multiline writer used for logging
 pub struct MultiLineWriter<W: Write> {
     inner: Option<W>,
     buf: Vec<u8>,
