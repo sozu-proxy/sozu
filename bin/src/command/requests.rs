@@ -16,7 +16,7 @@ use sozu_command_lib::{
     buffer::fixed::Buffer,
     config::Config,
     logging,
-    parser::parse_several_commands,
+    parser::parse_several_requests,
     proto::command::{
         request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
         CertificatesWithFingerprints, ClusterHashes, ClusterInformations, FrontendFilters,
@@ -213,7 +213,7 @@ impl CommandServer {
             }
 
             let mut offset = 0usize;
-            match parse_several_commands::<WorkerRequest>(buffer.data()) {
+            match parse_several_requests::<WorkerRequest>(buffer.data()) {
                 Ok((i, requests)) => {
                     if !i.is_empty() {
                         debug!("could not parse {} bytes", i.len());

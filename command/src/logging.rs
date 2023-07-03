@@ -540,6 +540,7 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
     }
 }
 
+/// write a log with the custom logger (used in other macros, do not use directly)
 #[macro_export]
 macro_rules! log {
     (__inner__ $target:expr, $lvl:expr, $format:expr, $level_tag:expr,
@@ -581,6 +582,7 @@ macro_rules! log {
     };
 }
 
+/// log a failure concerning an HTTP or TCP request
 #[macro_export]
 macro_rules! log_access {
     (__inner__ $target:expr, $lvl:expr, $format:expr, $level_tag:expr,
@@ -622,6 +624,7 @@ macro_rules! log_access {
     };
 }
 
+/// log an error with Sōzu's custom log stack
 #[macro_export]
 macro_rules! error {
     ($format:expr, $($arg:tt)*) => {
@@ -632,6 +635,7 @@ macro_rules! error {
     };
 }
 
+/// log a failure concerning an HTTP or TCP request
 #[macro_export]
 macro_rules! error_access {
     ($format:expr, $($arg:tt)*) => {
@@ -642,6 +646,7 @@ macro_rules! error_access {
     };
 }
 
+/// log a warning with Sōzu’s custom log stack
 #[macro_export]
 macro_rules! warn {
     ($format:expr, $($arg:tt)*) => {
@@ -653,6 +658,7 @@ macro_rules! warn {
     }
 }
 
+/// log an info with Sōzu’s custom log stack
 #[macro_export]
 macro_rules! info {
     ($format:expr, $($arg:tt)*) => {
@@ -663,6 +669,7 @@ macro_rules! info {
     }
 }
 
+/// log the success of an HTTP or TCP request
 #[macro_export]
 macro_rules! info_access {
     ($format:expr, $($arg:tt)*) => {
@@ -673,6 +680,7 @@ macro_rules! info_access {
     }
 }
 
+/// log a debug with Sōzu’s custom log stack
 #[macro_export]
 macro_rules! debug {
     ($format:expr, $($arg:tt)*) => {
@@ -687,6 +695,7 @@ macro_rules! debug {
     }
 }
 
+/// log a trace with Sōzu’s custom log stack
 #[macro_export]
 macro_rules! trace {
     ($format:expr, $($arg:tt)*) => (
@@ -701,6 +710,7 @@ macro_rules! trace {
     )
 }
 
+/// write a log with a "FIXME" prefix on an info level
 #[macro_export]
 macro_rules! fixme {
     () => {
@@ -754,6 +764,7 @@ impl log::Log for CompatLogger {
     fn flush(&self) {}
 }
 
+/// start a logger used in test environment
 #[macro_export]
 macro_rules! setup_test_logger {
     () => {
