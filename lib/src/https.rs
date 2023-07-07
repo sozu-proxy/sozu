@@ -439,10 +439,13 @@ impl ProxySession for HttpsSession {
 
         let front_socket = self.state.front_socket();
         if let Err(e) = front_socket.shutdown(Shutdown::Both) {
-            error!(
-                "error shutting down front socket({:?}): {:?}",
-                front_socket, e
-            );
+            // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
+            if e.kind() != ErrorKind::NotConnected {
+                error!(
+                    "error shutting down front socket({:?}): {:?}",
+                    front_socket, e
+                );
+            }
         }
 
         // deregister the frontend and remove it

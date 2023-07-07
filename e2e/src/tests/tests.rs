@@ -878,13 +878,41 @@ fn try_http_behaviors() -> State {
     );
 
     backend.set_response("HTTP/1.1 200 OK\r\n\r\n");
-    client.set_request("ping");
+    client.set_request("0123456789");
     client.send();
-    let request = backend.receive(1);
+    let request = backend.receive(1).unwrap();
     backend.send(1);
+
+    let expected_response_start = String::from("HTTP/1.1 200 OK\r\n");
+    let expected_response_end = String::from("\r\n\r\n");
     let response = client.receive().unwrap();
     println!("request: {request:?}");
     println!("response: {response:?}");
+    assert!(
+        response.starts_with(&expected_response_start)
+            && response.ends_with(&expected_response_end)
+    );
+    assert_eq!(request, String::from("0123"));
+
+
+    info!("expecting 100 BAD");
+    backend.set_response("HTTP/1.1 200 Ok\r\n\r\nRESPONSE_BODY_NO_LENGTH");
+    client.set_request("GET /100 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nExpect: 100-continue\r\n\r\n");
+    client.connect();
+    client.send();
+    backend.accept(1);
+    let request = backend.receive(1);
+    backend.send(1);
+
+    let expected_response_start = String::from("HTTP/1.1 200 Ok\r\n");
+    let expected_response_end = String::from("RESPONSE_BODY_NO_LENGTH");
+    let response = client.receive().unwrap();
+    println!("request: {request:?}");
+    println!("response: {response:?}");
+    assert!(
+        response.starts_with(&expected_response_start)
+            && response.ends_with(&expected_response_end)
+    );
 
     info!("expecting 103");
     backend.set_response("HTTP/1.1 103 Early Hint\r\nLink: </style.css>; rel=preload; as=style\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong");
