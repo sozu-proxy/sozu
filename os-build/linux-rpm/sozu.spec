@@ -6,7 +6,7 @@
 
 Summary:	A lightweight, fast, always-up reverse proxy server.
 Name:		sozu
-Version:	0.14.3
+Version:	0.15.1
 Release:	1%{?dist}
 Epoch:		1
 License:	AGPL-3.0
@@ -104,6 +104,8 @@ semodule -r %{name}
 %license LICENSE
 
 %changelog
+* Tue Jul 11 2023 Florentin Dubois <florentin.dubois@clever-cloud.com>
+- release 0.15.1
 * Mon May 22 2023 Florentin Dubois <florentin.dubois@clever-cloud.com>
 - release 0.14.3
 * Mon Jan 23 2023 Florentin Dubois <florentin.dubois@clever-cloud.com>
