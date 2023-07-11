@@ -4,6 +4,50 @@
 
 See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av0.16.0)
 
+## 0.15.1 - 2024-07-11
+
+### 🌟 Features
+
+- We have reduce the number of noisy logs to focus on what is really important on Sōzu, see [ [`39f4170`](https://github.com/sozu-proxy/sozu/commit/39f4170ccb15c8f6dd0e9f9855275362f2880674) ], [ [`362cd82`](https://github.com/sozu-proxy/sozu/commit/362cd823cedb52f88ddd5669b34be07609d9ff02) ] and [ [`c92d6bd`](https://github.com/sozu-proxy/sozu/commit/c92d6bdda283ed9bbceabdf15df1da061831722d) ].
+- We have added the `100 Continue` use case in e2e tests to ensure no regression on it, see [ [`c92d6bd`](https://github.com/sozu-proxy/sozu/commit/c92d6bdda283ed9bbceabdf15df1da061831722d) ].
+
+### ⛑️ Fixed
+
+- We have identified a bug that create a loop on cluster that have the `https redirect` enabled, see [ [`675c99d`](https://github.com/sozu-proxy/sozu/commit/675c99d803be559ebf90c051501b5bdc322f3775) ].
+
+### Changelog
+
+#### ✍️ Changed
+
+- [ [`5a3b9b2`](https://github.com/sozu-proxy/sozu/commit/5a3b9b20000c871b874d39830c03b637669422bf) ] Update changelog to add v0.15.0 [`Florentin Dubois`] (`2023-06-23`)
+- [ [`dfbd4b0`](https://github.com/sozu-proxy/sozu/commit/dfbd4b09de1def171b5575cfe2d697c9aa58ade7) ] chore: update dependencies [`Florentin Dubois`] (`2023-06-30`)
+- [ [`1753869`](https://github.com/sozu-proxy/sozu/commit/17538690a61fbedd953a60ecfbb77a2e08391357) ] ci: continue ci even if rust nightly build fail [`Florentin Dubois`] (`2023-06-30`)
+- [ [`39f4170`](https://github.com/sozu-proxy/sozu/commit/39f4170ccb15c8f6dd0e9f9855275362f2880674) ] comments on logging macros [`Emmanuel Bosquet`] (`2023-07-03`)
+- [ [`362cd82`](https://github.com/sozu-proxy/sozu/commit/362cd823cedb52f88ddd5669b34be07609d9ff02) ] chore(https): reduce log level for debug logs [`Florentin Dubois`] (`2023-07-11`)
+- [ [`0d33f89`](https://github.com/sozu-proxy/sozu/commit/0d33f8993a0c18a7de5e3c72c1ce6a17c4e62d45) ] chore: update dependencies [`Florentin Dubois`] (`2023-07-11`)
+
+#### ➕ Added
+
+- [ [`c92d6bd`](https://github.com/sozu-proxy/sozu/commit/c92d6bdda283ed9bbceabdf15df1da061831722d) ] Ignore 107 error on front socket, add 100-continue case in e2e tests [`Eloi DEMOLIS`] (`2023-07-07`)
+
+#### 🚀 Refactored
+
+- [ [`b26d34c`](https://github.com/sozu-proxy/sozu/commit/b26d34c09ca034e37634c5123445d56822ba7ac5) ] rename parse_one_command to parse_one_request [`Emmanuel Bosquet`] (`2023-07-03`)
+
+#### ⛑️ Fixed
+
+- [ [`675c99d`](https://github.com/sozu-proxy/sozu/commit/675c99d803be559ebf90c051501b5bdc322f3775) ] fix: redirect to https only if the listener is a http [`Florentin Dubois`] (`2023-07-11`)
+- [ [`45e97a9`](https://github.com/sozu-proxy/sozu/commit/45e97a9eacf342e49c5fdfce14fd89cd3b969fb7) ] fix(os-build): add missing protobuf dependency [`Florentin Dubois`] (`2023-06-30`)
+- [ [`fa5a910`](https://github.com/sozu-proxy/sozu/commit/fa5a910662e4c9c8278fadf0acbb79c7583db220) ] fix(os-build): add missing protobuf dependency [`Florentin Dubois`] (`2023-06-30`)
+- [ [`97034bd`](https://github.com/sozu-proxy/sozu/commit/97034bd671cd71145f7988d43bb0aacaf42e8a48) ] fix: update `start_tcp_worker` to use `TCPListen` variant of `Protocol` enum [`Florentin Dubois`] (`2023-07-11`)
+
+### 🥹 Contributors
+* @Wonshtrum
+* @Keksoj
+* @FlorentinDUBOIS
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.0...0.15.1
+
 ## 0.15.0 - 2024-06-23
 
 ### 🌟 Features
