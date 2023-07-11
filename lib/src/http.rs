@@ -17,7 +17,8 @@ use time::{Duration, Instant};
 use sozu_command::{
     logging,
     proto::command::{
-        request::RequestType, Cluster, HttpListenerConfig, RemoveListener, RequestHttpFrontend,
+        request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,
+        RequestHttpFrontend,
     },
     ready::Ready,
     request::WorkerRequest,
@@ -916,6 +917,10 @@ impl ProxyConfiguration for HttpProxy {
 }
 
 impl L7Proxy for HttpProxy {
+    fn kind(&self) -> ListenerType {
+        ListenerType::Http
+    }
+
     fn register_socket(
         &self,
         source: &mut TcpStream,

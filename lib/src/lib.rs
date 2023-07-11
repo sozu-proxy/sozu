@@ -394,6 +394,7 @@ use std::{
 use anyhow::{bail, Context};
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
+use sozu_command::proto::command::ListenerType;
 use sozu_command_lib::{
     proto::command::{Cluster, Event, EventKind, LoadBalancingParams},
     ready::Ready,
@@ -653,6 +654,8 @@ pub trait ProxyConfiguration {
 }
 
 pub trait L7Proxy {
+    fn kind(&self) -> ListenerType;
+
     fn register_socket(
         &self,
         socket: &mut TcpStream,
