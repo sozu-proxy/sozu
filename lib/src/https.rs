@@ -35,7 +35,7 @@ use sozu_command::{
     proto::command::{
         request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
         CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        ListenerType, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
         ResponseContent, TlsVersion,
     },
     ready::Ready,
@@ -1374,6 +1374,10 @@ impl ProxyConfiguration for HttpsProxy {
     }
 }
 impl L7Proxy for HttpsProxy {
+    fn kind(&self) -> ListenerType {
+        ListenerType::Https
+    }
+
     fn register_socket(
         &self,
         socket: &mut MioTcpStream,

@@ -13,7 +13,7 @@ use anyhow::{bail, Context};
 use kawa;
 use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
-use sozu_command::proto::command::{Event, EventKind};
+use sozu_command::proto::command::{Event, EventKind, ListenerType};
 use time::{Duration, Instant};
 
 use crate::{
@@ -1042,12 +1042,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         };
 
-        let frontend_should_redirect_https = proxy
-            .borrow()
-            .clusters()
-            .get(&cluster_id)
-            .map(|cluster| cluster.https_redirect)
-            .unwrap_or(false);
+        let frontend_should_redirect_https = matches!(proxy.borrow().kind(), ListenerType::Http)
+            && proxy
+                .borrow()
+                .clusters()
+                .get(&cluster_id)
+                .map(|cluster| cluster.https_redirect)
+                .unwrap_or(false);
 
         if frontend_should_redirect_https {
             let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{host}{uri}\r\n\r\n");

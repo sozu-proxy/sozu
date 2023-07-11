@@ -55,7 +55,9 @@ impl CommandManager {
             let response = self.read_channel_message_with_timeout()?;
 
             match response.status() {
-                ResponseStatus::Processing => { debug!("Proxy is processing: {}", response.message); },
+                ResponseStatus::Processing => {
+                    debug!("Proxy is processing: {}", response.message);
+                }
                 ResponseStatus::Failure => bail!("Request failed: {}", response.message),
                 ResponseStatus::Ok => {
                     if json {
@@ -149,10 +151,7 @@ impl CommandManager {
                                     );
                                 }
                                 ResponseStatus::Ok => {
-                                    info!(
-                                        "Main process upgrade succeeded: {}",
-                                        response.message
-                                    );
+                                    info!("Main process upgrade succeeded: {}", response.message);
                                     break;
                                 }
                             }
@@ -266,7 +265,9 @@ impl CommandManager {
                                 Some(ContentType::AvailableMetrics(available)) => {
                                     print_available_metrics(&available)?;
                                 }
-                                _ => { debug!("Wrong kind of response here"); },
+                                _ => {
+                                    debug!("Wrong kind of response here");
+                                }
                             }
                         }
 

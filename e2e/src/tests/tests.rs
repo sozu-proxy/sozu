@@ -894,7 +894,6 @@ fn try_http_behaviors() -> State {
     );
     assert_eq!(request, String::from("0123"));
 
-
     info!("expecting 100 BAD");
     backend.set_response("HTTP/1.1 200 Ok\r\n\r\nRESPONSE_BODY_NO_LENGTH");
     client.set_request("GET /100 HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nExpect: 100-continue\r\n\r\n");
