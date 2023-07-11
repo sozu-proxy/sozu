@@ -1534,21 +1534,21 @@ pub fn start_tcp_worker(
         let entry = sessions.vacant_entry();
         info!("taking token {:?} for channel", entry.key());
         entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
+            protocol: Protocol::TCPListen,
         })));
     }
     {
         let entry = sessions.vacant_entry();
         info!("taking token {:?} for timer", entry.key());
         entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
+            protocol: Protocol::TCPListen,
         })));
     }
     {
         let entry = sessions.vacant_entry();
         info!("taking token {:?} for metrics", entry.key());
         entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
+            protocol: Protocol::TCPListen,
         })));
     }
 
@@ -1556,7 +1556,7 @@ pub fn start_tcp_worker(
         let entry = sessions.vacant_entry();
         let key = entry.key();
         let _e = entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
+            protocol: Protocol::TCPListen,
         })));
         Token(key)
     };
