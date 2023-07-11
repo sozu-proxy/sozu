@@ -263,7 +263,7 @@ impl HttpsSession {
         let sni = handshake.session.server_name();
         let alpn = handshake.session.alpn_protocol();
         let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
-        info!(
+        debug!(
             "Successful TLS Handshake with, received: {:?} {:?}",
             sni, alpn
         );
@@ -416,7 +416,7 @@ impl ProxySession for HttpsSession {
             return;
         }
 
-        info!("Closing HTTPS session");
+        debug!("Closing HTTPS session");
         self.metrics.service_stop();
 
         // Restore gauges
