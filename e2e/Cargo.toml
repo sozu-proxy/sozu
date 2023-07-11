@@ -7,14 +7,14 @@ edition = "2021"
 [dependencies]
 futures = "^0.3.28"
 futures-lite = "^1.13.0"
-hyper = { version = "^0.14.26", features = ["client", "http1"] }
-hyper-rustls = { version = "^0.24.0", default-features = false, features = ["webpki-tokio", "http1", "tls12", "logging"] }
+hyper = { version = "^0.14.27", features = ["client", "http1"] }
+hyper-rustls = { version = "^0.24.1", default-features = false, features = ["webpki-tokio", "http1", "tls12", "logging"] }
 libc = "^0.2.147"
 mio = "^0.8.8"
-rustls = { version = "^0.21.2", features = ["dangerous_configuration"] }
+rustls = { version = "^0.21.5", features = ["dangerous_configuration"] }
 serial_test = "^2.0.0"
 slab = "^0.4.8"
-time = "^0.3.22"
+time = "^0.3.23"
 tokio = { version = "1.29.1", features = ["net", "rt-multi-thread"] }
 
 sozu-command-lib = { path = "../command", version = "^0.15.0" }
