@@ -8,8 +8,6 @@ use std::{
     net::SocketAddr,
 };
 
-use anyhow::{bail, Context};
-
 use crate::{
     certificate::{calculate_fingerprint, Fingerprint},
     proto::{
@@ -28,6 +26,48 @@ use crate::{
 
 /// To use throughout Sōzu
 pub type ClusterId = String;
+
+#[derive(thiserror::Error, Debug)]
+pub enum StateError {
+    #[error("Request came in empty")]
+    EmptyRequest,
+    #[error("dispatching this request did not bring any change to the state")]
+    NoChange,
+    #[error("State can not handle this request")]
+    UndispatchableRequest,
+    #[error("Did not find cluster {0}")]
+    ClusterNotFound(String),
+    #[error("Listener exists already on address {0}")]
+    ListenerExistsAlready(String),
+    #[error("Wrong request: {0}")]
+    WrongRequest(String),
+    #[error("No listener to remove at address {0}")]
+    NoListenerToRemove(String),
+    #[error("No backend to remove with id {0}")]
+    NoBackendToRemove(String),
+    #[error("No listener to activate at address {0}")]
+    NoListenerToActivate(String),
+    #[error("No listener to deactivate at address {0}")]
+    NoListenerToDeactivate(String),
+    #[error("Can not add the frontend, it is already there: {0}")]
+    FrontendAlreadyThere(String),
+    #[error("Can not remove this frontend, it is not found: {0}")]
+    NoFrontendToRemove(String),
+    #[error("Could not add certificate: {0}")]
+    AddCertificateError(String),
+    #[error("Could not remove certificate: {0}")]
+    RemoveCertificateError(String),
+    #[error("Could not replace certificate: {0}")]
+    ReplaceCertificateError(String),
+    #[error("The provided socket address '{address}' is wrong: {error}")]
+    WrongSocketAddress { address: String, error: String },
+    #[error("Certificate not found")]
+    CertificateNotFound,
+    #[error(
+        "Could not convert the frontend to an insertable one. Frontend: {frontend} error: {error}"
+    )]
+    FrontendConversionError { frontend: String, error: String },
+}
 
 /// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
 /// from frontends to backends. Hence, it contains all details about:
@@ -63,72 +103,35 @@ impl ConfigState {
         Self::default()
     }
 
-    pub fn dispatch(&mut self, request: &Request) -> anyhow::Result<()> {
+    pub fn dispatch(&mut self, request: &Request) -> Result<(), StateError> {
         let request_type = match &request.request_type {
             Some(t) => t,
-            None => bail!("Empty request!"),
+            None => return Err(StateError::EmptyRequest),
         };
 
         self.increment_request_count(request);
 
         match request_type {
-            RequestType::AddCluster(cluster) => self
-                .add_cluster(cluster)
-                .with_context(|| "Could not add cluster"),
-            RequestType::RemoveCluster(cluster_id) => self
-                .remove_cluster(cluster_id)
-                .with_context(|| "Could not remove cluster"),
-            RequestType::AddHttpListener(listener) => self
-                .add_http_listener(listener)
-                .with_context(|| "Could not add HTTP listener"),
-            RequestType::AddHttpsListener(listener) => self
-                .add_https_listener(listener)
-                .with_context(|| "Could not add HTTPS listener"),
-            RequestType::AddTcpListener(listener) => self
-                .add_tcp_listener(listener)
-                .with_context(|| "Could not add TCP listener"),
-            RequestType::RemoveListener(remove) => self
-                .remove_listener(remove)
-                .with_context(|| "Could not remove listener"),
-            RequestType::ActivateListener(activate) => self
-                .activate_listener(activate)
-                .with_context(|| "Could not activate listener"),
-            RequestType::DeactivateListener(deactivate) => self
-                .deactivate_listener(deactivate)
-                .with_context(|| "Could not deactivate listener"),
-            RequestType::AddHttpFrontend(front) => self
-                .add_http_frontend(front)
-                .with_context(|| "Could not add HTTP frontend"),
-            RequestType::RemoveHttpFrontend(front) => self
-                .remove_http_frontend(front)
-                .with_context(|| "Could not remove HTTP frontend"),
-            RequestType::AddCertificate(add) => self
-                .add_certificate(add)
-                .with_context(|| "Could not add certificate"),
-            RequestType::RemoveCertificate(remove) => self
-                .remove_certificate(remove)
-                .with_context(|| "Could not remove certificate"),
-            RequestType::ReplaceCertificate(replace) => self
-                .replace_certificate(replace)
-                .with_context(|| "Could not replace certificate"),
-            RequestType::AddHttpsFrontend(front) => self
-                .add_https_frontend(front)
-                .with_context(|| "Could not add HTTPS frontend"),
-            RequestType::RemoveHttpsFrontend(front) => self
-                .remove_https_frontend(front)
-                .with_context(|| "Could not remove HTTPS frontend"),
-            RequestType::AddTcpFrontend(front) => self
-                .add_tcp_frontend(front)
-                .with_context(|| "Could not add TCP frontend"),
-            RequestType::RemoveTcpFrontend(front) => self
-                .remove_tcp_frontend(front)
-                .with_context(|| "Could not remove TCP frontend"),
-            RequestType::AddBackend(add_backend) => self
-                .add_backend(add_backend)
-                .with_context(|| "Could not add backend"),
-            RequestType::RemoveBackend(backend) => self
-                .remove_backend(backend)
-                .with_context(|| "Could not remove backend"),
+            RequestType::AddCluster(cluster) => self.add_cluster(cluster),
+            RequestType::RemoveCluster(cluster_id) => self.remove_cluster(cluster_id),
+            RequestType::AddHttpListener(listener) => self.add_http_listener(listener),
+            RequestType::AddHttpsListener(listener) => self.add_https_listener(listener),
+            RequestType::AddTcpListener(listener) => self.add_tcp_listener(listener),
+            RequestType::RemoveListener(remove) => self.remove_listener(remove),
+            RequestType::ActivateListener(activate) => self.activate_listener(activate),
+            RequestType::DeactivateListener(deactivate) => self.deactivate_listener(deactivate),
+            RequestType::AddHttpFrontend(front) => self.add_http_frontend(front),
+            RequestType::RemoveHttpFrontend(front) => self.remove_http_frontend(front),
+            RequestType::AddCertificate(add) => self.add_certificate(add),
+            RequestType::RemoveCertificate(remove) => self.remove_certificate(remove),
+            RequestType::ReplaceCertificate(replace) => self.replace_certificate(replace),
+            RequestType::AddHttpsFrontend(front) => self.add_https_frontend(front),
+            RequestType::RemoveHttpsFrontend(front) => self.remove_https_frontend(front),
+            RequestType::AddTcpFrontend(front) => self.add_tcp_frontend(front),
+            RequestType::RemoveTcpFrontend(front) => self.remove_tcp_frontend(front),
+            RequestType::AddBackend(add_backend) => self.add_backend(add_backend),
+            RequestType::RemoveBackend(backend) => self.remove_backend(backend),
+
             // This is to avoid the error message
             &RequestType::Logging(_)
             | &RequestType::CountRequests(_)
@@ -143,9 +146,7 @@ impl ConfigState {
             | &RequestType::ReturnListenSockets(_)
             | &RequestType::HardStop(_) => Ok(()),
 
-            other_request => {
-                bail!("state cannot handle request message: {:#?}", other_request);
-            }
+            _other_request => return Err(StateError::UndispatchableRequest),
         }
     }
 
@@ -166,80 +167,79 @@ impl ConfigState {
         }
     }
 
-    fn add_cluster(&mut self, cluster: &Cluster) -> anyhow::Result<()> {
+    fn add_cluster(&mut self, cluster: &Cluster) -> Result<(), StateError> {
         let cluster = cluster.clone();
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
         Ok(())
     }
 
-    fn remove_cluster(&mut self, cluster_id: &str) -> anyhow::Result<()> {
+    fn remove_cluster(&mut self, cluster_id: &str) -> Result<(), StateError> {
         match self.clusters.remove(cluster_id) {
             Some(_) => Ok(()),
-            None => bail!("No cluster found with this id"),
+            None => Err(StateError::ClusterNotFound(cluster_id.to_owned())),
         }
     }
 
-    fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> anyhow::Result<()> {
-        match self.http_listeners.entry(listener.address.to_string()) {
+    fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> Result<(), StateError> {
+        let address = listener.address.to_string();
+        match self.http_listeners.entry(address.clone()) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
-            BTreeMapEntry::Occupied(_) => {
-                bail!("The entry is occupied for address {}", listener.address)
-            }
+            BTreeMapEntry::Occupied(_) => return Err(StateError::ListenerExistsAlready(address)),
         };
         Ok(())
     }
 
-    fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> anyhow::Result<()> {
-        match self.https_listeners.entry(listener.address.clone()) {
+    fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> Result<(), StateError> {
+        let address = listener.address.to_string();
+        match self.https_listeners.entry(address.clone()) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
-            BTreeMapEntry::Occupied(_) => {
-                bail!("The entry is occupied for address {}", listener.address)
-            }
+            BTreeMapEntry::Occupied(_) => return Err(StateError::ListenerExistsAlready(address)),
         };
         Ok(())
     }
 
-    fn add_tcp_listener(&mut self, listener: &TcpListenerConfig) -> anyhow::Result<()> {
-        match self.tcp_listeners.entry(listener.address.clone()) {
+    fn add_tcp_listener(&mut self, listener: &TcpListenerConfig) -> Result<(), StateError> {
+        let address = listener.address.to_string();
+        match self.tcp_listeners.entry(address.clone()) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
-            BTreeMapEntry::Occupied(_) => {
-                bail!("The entry is occupied for address {}", listener.address)
-            }
+            BTreeMapEntry::Occupied(_) => return Err(StateError::ListenerExistsAlready(address)),
         };
         Ok(())
     }
 
-    fn remove_listener(&mut self, remove: &RemoveListener) -> anyhow::Result<()> {
+    fn remove_listener(&mut self, remove: &RemoveListener) -> Result<(), StateError> {
         match ListenerType::from_i32(remove.proxy) {
             Some(ListenerType::Http) => self.remove_http_listener(&remove.address),
             Some(ListenerType::Https) => self.remove_https_listener(&remove.address),
             Some(ListenerType::Tcp) => self.remove_tcp_listener(&remove.address),
-            None => bail!("Wrong ListenerType on RemoveListener request"),
+            None => Err(StateError::WrongRequest(
+                "Wrong ListenerType on RemoveListener request".to_string(),
+            )),
         }
     }
 
-    fn remove_http_listener(&mut self, address: &str) -> anyhow::Result<()> {
+    fn remove_http_listener(&mut self, address: &str) -> Result<(), StateError> {
         if self.http_listeners.remove(address).is_none() {
-            bail!("No http listener to remove at address {}", address);
+            return Err(StateError::NoListenerToRemove(address.to_owned()));
         }
         Ok(())
     }
 
-    fn remove_https_listener(&mut self, address: &str) -> anyhow::Result<()> {
+    fn remove_https_listener(&mut self, address: &str) -> Result<(), StateError> {
         if self.https_listeners.remove(address).is_none() {
-            bail!("No https listener to remove at address {}", address);
+            return Err(StateError::NoListenerToRemove(address.to_owned()));
         }
         Ok(())
     }
 
-    fn remove_tcp_listener(&mut self, address: &str) -> anyhow::Result<()> {
+    fn remove_tcp_listener(&mut self, address: &str) -> Result<(), StateError> {
         if self.tcp_listeners.remove(address).is_none() {
-            bail!("No tcp listener to remove at address {}", address);
+            return Err(StateError::NoListenerToRemove(address.to_owned()));
         }
         Ok(())
     }
 
-    fn activate_listener(&mut self, activate: &ActivateListener) -> anyhow::Result<()> {
+    fn activate_listener(&mut self, activate: &ActivateListener) -> Result<(), StateError> {
         match ListenerType::from_i32(activate.proxy) {
             Some(ListenerType::Http) => {
                 if self
@@ -248,7 +248,9 @@ impl ConfigState {
                     .map(|listener| listener.active = true)
                     .is_none()
                 {
-                    bail!("No http listener found with address {}", activate.address)
+                    return Err(StateError::NoListenerToActivate(
+                        activate.address.to_owned(),
+                    ));
                 }
             }
             Some(ListenerType::Https) => {
@@ -258,7 +260,9 @@ impl ConfigState {
                     .map(|listener| listener.active = true)
                     .is_none()
                 {
-                    bail!("No https listener found with address {}", activate.address)
+                    return Err(StateError::NoListenerToActivate(
+                        activate.address.to_owned(),
+                    ));
                 }
             }
             Some(ListenerType::Tcp) => {
@@ -268,15 +272,21 @@ impl ConfigState {
                     .map(|listener| listener.active = true)
                     .is_none()
                 {
-                    bail!("No tcp listener found with address {}", activate.address)
+                    return Err(StateError::NoListenerToActivate(
+                        activate.address.to_owned(),
+                    ));
                 }
             }
-            None => bail!("Wrong variant for ListenerType on request"),
+            None => {
+                return Err(StateError::WrongRequest(
+                    "Wrong variant for ListenerType on request".to_string(),
+                ))
+            }
         }
         Ok(())
     }
 
-    fn deactivate_listener(&mut self, deactivate: &DeactivateListener) -> anyhow::Result<()> {
+    fn deactivate_listener(&mut self, deactivate: &DeactivateListener) -> Result<(), StateError> {
         match ListenerType::from_i32(deactivate.proxy) {
             Some(ListenerType::Http) => {
                 if self
@@ -285,7 +295,9 @@ impl ConfigState {
                     .map(|listener| listener.active = false)
                     .is_none()
                 {
-                    bail!("No http listener found with address {}", deactivate.address)
+                    return Err(StateError::NoListenerToDeactivate(
+                        deactivate.address.to_owned(),
+                    ));
                 }
             }
             Some(ListenerType::Https) => {
@@ -295,10 +307,9 @@ impl ConfigState {
                     .map(|listener| listener.active = false)
                     .is_none()
                 {
-                    bail!(
-                        "No https listener found with address {}",
-                        deactivate.address
-                    )
+                    return Err(StateError::NoListenerToDeactivate(
+                        deactivate.address.to_owned(),
+                    ));
                 }
             }
             Some(ListenerType::Tcp) => {
@@ -308,68 +319,80 @@ impl ConfigState {
                     .map(|listener| listener.active = false)
                     .is_none()
                 {
-                    bail!("No tcp listener found with address {}", deactivate.address)
+                    return Err(StateError::NoListenerToDeactivate(
+                        deactivate.address.to_owned(),
+                    ));
                 }
             }
-            None => bail!("Wrong variant for ListenerType on request"),
+            None => {
+                return Err(StateError::WrongRequest(
+                    "Wrong variant for ListenerType on request".to_string(),
+                ))
+            }
         }
         Ok(())
     }
 
-    fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
+    fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+        let front_as_key = front.to_string();
+
         match self.http_fronts.entry(front.to_string()) {
-            BTreeMapEntry::Vacant(e) => e.insert(front.clone().to_frontend()?),
-            BTreeMapEntry::Occupied(_) => bail!("This frontend is already present: {:?}", front),
+            BTreeMapEntry::Vacant(e) => {
+                e.insert(front.clone().to_frontend().map_err(|into_error| {
+                    StateError::FrontendConversionError {
+                        frontend: front_as_key,
+                        error: into_error.to_string(),
+                    }
+                })?)
+            }
+            BTreeMapEntry::Occupied(_) => {
+                return Err(StateError::FrontendAlreadyThere(front.to_string()))
+            }
         };
         Ok(())
     }
 
-    fn add_https_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
+    fn add_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+        let front_as_key = front.to_string();
+
         match self.https_fronts.entry(front.to_string()) {
-            BTreeMapEntry::Vacant(e) => e.insert(front.clone().to_frontend()?),
-            BTreeMapEntry::Occupied(_) => bail!("This frontend is already present: {:?}", front),
+            BTreeMapEntry::Vacant(e) => {
+                e.insert(front.clone().to_frontend().map_err(|into_error| {
+                    StateError::FrontendConversionError {
+                        frontend: front_as_key,
+                        error: into_error.to_string(),
+                    }
+                })?)
+            }
+            BTreeMapEntry::Occupied(_) => {
+                return Err(StateError::FrontendAlreadyThere(front.to_string()))
+            }
         };
         Ok(())
     }
 
-    fn remove_http_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
+    fn remove_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
         if self.http_fronts.remove(&front.to_string()).is_none() {
-            let error_msg = match &front.cluster_id {
-                Some(cluster_id) => format!(
-                    "No such frontend at {} for the cluster {}",
-                    front.address, cluster_id
-                ),
-                None => format!("No such frontend at {}", front.address),
-            };
-            bail!(error_msg);
+            return Err(StateError::NoFrontendToRemove(front.to_string()));
         }
         Ok(())
     }
 
-    fn remove_https_frontend(&mut self, front: &RequestHttpFrontend) -> anyhow::Result<()> {
+    fn remove_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
         if self.https_fronts.remove(&front.to_string()).is_none() {
-            let error_msg = match &front.cluster_id {
-                Some(cluster_id) => format!(
-                    "No such frontend at {} for the cluster {}",
-                    front.address, cluster_id
-                ),
-                None => format!("No such frontend at {}", front.address),
-            };
-            bail!(error_msg);
+            return Err(StateError::NoFrontendToRemove(front.to_string()));
         }
         Ok(())
     }
 
-    fn add_certificate(&mut self, add: &AddCertificate) -> anyhow::Result<()> {
+    fn add_certificate(&mut self, add: &AddCertificate) -> Result<(), StateError> {
         let fingerprint = Fingerprint(
-            calculate_fingerprint(add.certificate.certificate.as_bytes())
-                .with_context(|| "cannot calculate the certificate's fingerprint")?,
+            calculate_fingerprint(add.certificate.certificate.as_bytes()).map_err(
+                |fingerprint_err| StateError::AddCertificateError(format!("{:#}", fingerprint_err)),
+            )?,
         );
 
-        let address = add
-            .address
-            .parse()
-            .with_context(|| "Could not parse socket address")?;
+        let address = parse_socket_address(&add.address)?;
 
         let entry = self
             .certificates
@@ -388,16 +411,13 @@ impl ConfigState {
         Ok(())
     }
 
-    fn remove_certificate(&mut self, remove: &RemoveCertificate) -> anyhow::Result<()> {
-        let fingerprint = Fingerprint(
-            hex::decode(&remove.fingerprint)
-                .with_context(|| "Failed at decoding the string (expected hexadecimal data)")?,
-        );
+    fn remove_certificate(&mut self, remove: &RemoveCertificate) -> Result<(), StateError> {
+        let fingerprint =
+            Fingerprint(hex::decode(&remove.fingerprint).map_err(|decode_error| {
+                StateError::RemoveCertificateError(decode_error.to_string())
+            })?);
 
-        let address = remove
-            .address
-            .parse()
-            .with_context(|| "Could not parse socket address")?;
+        let address = parse_socket_address(&remove.address)?;
 
         if let Some(index) = self.certificates.get_mut(&address) {
             index.remove(&fingerprint);
@@ -410,25 +430,24 @@ impl ConfigState {
     /// - calculate the new fingerprint
     /// - insert the new certificate with the new fingerprint as key
     /// - check that the new entry is present in the certificates hashmap
-    fn replace_certificate(&mut self, replace: &ReplaceCertificate) -> anyhow::Result<()> {
-        let address = replace
-            .address
-            .parse()
-            .with_context(|| "Could not parse socket address")?;
+    fn replace_certificate(&mut self, replace: &ReplaceCertificate) -> Result<(), StateError> {
+        let address = parse_socket_address(&replace.address)?;
 
-        let old_fingerprint = Fingerprint(
-            hex::decode(&replace.old_fingerprint)
-                .with_context(|| "Failed at decoding the string (expected hexadecimal data)")?,
-        );
+        let old_fingerprint = Fingerprint(hex::decode(&replace.old_fingerprint).map_err(
+            |decode_error| StateError::RemoveCertificateError(decode_error.to_string()),
+        )?);
 
         self.certificates
             .get_mut(&address)
-            .with_context(|| format!("No certificate to replace for address {}", replace.address))?
+            .ok_or(StateError::CertificateNotFound)?
             .remove(&old_fingerprint);
 
         let new_fingerprint = Fingerprint(
-            calculate_fingerprint(replace.new_certificate.certificate.as_bytes())
-                .with_context(|| "cannot obtain the certificate's fingerprint")?,
+            calculate_fingerprint(replace.new_certificate.certificate.as_bytes()).map_err(
+                |fingerprint_err| {
+                    StateError::ReplaceCertificateError(format!("{:#}", fingerprint_err))
+                },
+            )?,
         );
 
         self.certificates
@@ -438,20 +457,21 @@ impl ConfigState {
         if !self
             .certificates
             .get(&address)
-            .with_context(|| {
+            .ok_or(StateError::ReplaceCertificateError(
                 "Unlikely error. This entry in the certificate hashmap should be present"
-            })?
+                    .to_string(),
+            ))?
             .contains_key(&new_fingerprint)
         {
-            bail!(format!(
+            return Err(StateError::ReplaceCertificateError(format!(
                 "Failed to insert the new certificate for address {}",
                 replace.address
-            ))
+            )));
         }
         Ok(())
     }
 
-    fn add_tcp_frontend(&mut self, front: &RequestTcpFrontend) -> anyhow::Result<()> {
+    fn add_tcp_frontend(&mut self, front: &RequestTcpFrontend) -> Result<(), StateError> {
         let tcp_frontends = self
             .tcp_fronts
             .entry(front.cluster_id.clone())
@@ -459,50 +479,41 @@ impl ConfigState {
 
         let tcp_frontend = TcpFrontend {
             cluster_id: front.cluster_id.clone(),
-            address: front
-                .address
-                .parse()
-                .with_context(|| "wrong socket address")?,
+            address: parse_socket_address(&front.address)?,
             tags: front.tags.clone(),
         };
         if tcp_frontends.contains(&tcp_frontend) {
-            bail!("This tcp frontend is already present: {:?}", tcp_frontend);
+            return Err(StateError::FrontendAlreadyThere(format!(
+                "This tcp frontend is already present: {:?}",
+                tcp_frontend
+            )));
         }
 
         tcp_frontends.push(tcp_frontend);
         Ok(())
     }
 
-    fn remove_tcp_frontend(&mut self, front_to_remove: &RequestTcpFrontend) -> anyhow::Result<()> {
-        let address = front_to_remove
-            .address
-            .parse()
-            .with_context(|| "wrong socket address")?;
+    fn remove_tcp_frontend(
+        &mut self,
+        front_to_remove: &RequestTcpFrontend,
+    ) -> Result<(), StateError> {
+        let address = parse_socket_address(&front_to_remove.address)?;
 
-        let tcp_frontends = self
-            .tcp_fronts
-            .get_mut(&front_to_remove.cluster_id)
-            .with_context(|| {
-                format!(
-                    "cluster {} has no frontends at {} (custom tags: {:?})",
-                    front_to_remove.cluster_id, front_to_remove.address, front_to_remove.tags
-                )
-            })?;
+        let tcp_frontends = self.tcp_fronts.get_mut(&front_to_remove.cluster_id).ok_or(
+            StateError::NoFrontendToRemove(format!("{:?}", front_to_remove)),
+        )?;
 
         let len = tcp_frontends.len();
         tcp_frontends.retain(|front| front.address != address);
         if tcp_frontends.len() == len {
-            bail!("Removed no frontend");
+            return Err(StateError::NoChange);
         }
         Ok(())
     }
 
-    fn add_backend(&mut self, add_backend: &AddBackend) -> anyhow::Result<()> {
+    fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
         let backend = Backend {
-            address: add_backend
-                .address
-                .parse()
-                .with_context(|| "wrong socket address")?,
+            address: parse_socket_address(&add_backend.address)?,
             cluster_id: add_backend.cluster_id.clone(),
             backend_id: add_backend.backend_id.clone(),
             sticky_id: add_backend.sticky_id.clone(),
@@ -522,16 +533,11 @@ impl ConfigState {
         Ok(())
     }
 
-    fn remove_backend(&mut self, backend: &RemoveBackend) -> anyhow::Result<()> {
+    fn remove_backend(&mut self, backend: &RemoveBackend) -> Result<(), StateError> {
         let backend_list = self
             .backends
             .get_mut(&backend.cluster_id)
-            .with_context(|| {
-                format!(
-                    "cluster {} has no backends {} at {}",
-                    backend.cluster_id, backend.backend_id, backend.address,
-                )
-            })?;
+            .ok_or(StateError::NoBackendToRemove(backend.backend_id.to_owned()))?;
 
         let len = backend_list.len();
         backend_list.retain(|b| {
@@ -539,7 +545,7 @@ impl ConfigState {
         });
         backend_list.sort();
         if backend_list.len() == len {
-            bail!("Removed no backend");
+            return Err(StateError::NoChange);
         }
         Ok(())
     }
@@ -1321,6 +1327,15 @@ impl ConfigState {
             tcp_listeners: self.tcp_listeners.clone(),
         }
     }
+}
+
+fn parse_socket_address(address: &str) -> Result<SocketAddr, StateError> {
+    address
+        .parse::<SocketAddr>()
+        .map_err(|parse_error| StateError::WrongSocketAddress {
+            address: address.to_owned(),
+            error: parse_error.to_string(),
+        })
 }
 
 fn domain_check(

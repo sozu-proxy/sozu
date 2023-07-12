@@ -46,6 +46,7 @@ sha2 = "^0.10.7"
 trailer = "^0.1.2"
 pool = "^0.1.4"
 poule = "^0.3.2"
+thiserror = "^1.0.43"
 
 [features]
 unstable = []
