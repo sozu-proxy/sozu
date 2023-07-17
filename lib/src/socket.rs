@@ -3,10 +3,27 @@ use std::{
     net::SocketAddr,
 };
 
-use anyhow::Context;
 use mio::net::{TcpListener, TcpStream};
 use rustls::{ProtocolVersion, ServerConnection};
 use socket2::{Domain, Protocol, Socket, Type};
+
+#[derive(thiserror::Error, Debug)]
+pub enum ServerBindError {
+    #[error("could not set bind to socket: {0}")]
+    BindError(String),
+    #[error("could not listen on socket: {0}")]
+    Listen(String),
+    #[error("could not set socket to nonblocking: {0}")]
+    SetNonBlocking(String),
+    #[error("could not set reuse address: {0}")]
+    SetReuseAddress(String),
+    #[error("could not set reuse address: {0}")]
+    SetReusePort(String),
+    #[error("Could not create socket: {0}")]
+    SocketCreationError(String),
+    #[error("Wrong socket address '{address}': {error}")]
+    WrongAddress { address: String, error: String },
+}
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum SocketResult {
@@ -360,31 +377,42 @@ impl SocketHandler for FrontRustls {
     }
 }
 
-// TODO: Do we want to add context here or is it overkill?
-pub fn server_bind(addr: String) -> anyhow::Result<TcpListener> {
-    let address: SocketAddr = addr.parse().with_context(|| "Wrong socket address")?;
+pub fn server_bind(addr: String) -> Result<TcpListener, ServerBindError> {
+    let address =
+        addr.parse::<SocketAddr>()
+            .map_err(|parse_error| ServerBindError::WrongAddress {
+                address: addr.clone(),
+                error: parse_error.to_string(),
+            })?;
+
     let sock = Socket::new(
         Domain::for_address(address),
         Type::STREAM,
         Some(Protocol::TCP),
-    )?;
+    )
+    .map_err(|io_error| ServerBindError::SocketCreationError(io_error.to_string()))?;
 
     // set so_reuseaddr, but only on unix (mirrors what libstd does)
     if cfg!(unix) {
-        sock.set_reuse_address(true)?;
+        sock.set_reuse_address(true)
+            .map_err(|io_error| ServerBindError::SetReuseAddress(io_error.to_string()))?;
     }
 
-    sock.set_reuse_port(true)?;
+    sock.set_reuse_port(true)
+        .map_err(|io_error| ServerBindError::SetReusePort(io_error.to_string()))?;
 
     // bind the socket
     let addr = address.into();
-    sock.bind(&addr)?;
+    sock.bind(&addr)
+        .map_err(|io_error| ServerBindError::BindError(io_error.to_string()))?;
 
-    sock.set_nonblocking(true)?;
+    sock.set_nonblocking(true)
+        .map_err(|io_error| ServerBindError::SetNonBlocking(io_error.to_string()))?;
 
     // listen
     // FIXME: make the backlog configurable?
-    sock.listen(1024)?;
+    sock.listen(1024)
+        .map_err(|io_error| ServerBindError::Listen(io_error.to_string()))?;
 
     Ok(TcpListener::from_std(sock.into()))
 }
