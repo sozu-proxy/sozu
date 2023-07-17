@@ -28,7 +28,7 @@ include = [
 ]
 
 [dependencies]
-anyhow = "^1.0.71"
+anyhow = "^1.0.72"
 cookie-factory = "^0.3.2"
 foreign-types-shared = "^0.3.1"
 hdrhistogram = "^7.5.2"
