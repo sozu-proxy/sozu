@@ -30,6 +30,9 @@ pub struct RelayProxyProtocol<Front: SocketHandler> {
 }
 
 impl<Front: SocketHandler> RelayProxyProtocol<Front> {
+    /// Instantiate a new RelayProxyProtocol SessionState with:
+    /// - frontend_interest: READABLE | HUP | ERROR
+    /// - frontend_event: EMPTY
     pub fn new(
         frontend: Front,
         frontend_token: Token,

@@ -26,6 +26,10 @@ pub struct TlsHandshake {
 }
 
 impl TlsHandshake {
+    /// Instantiate a new TlsHandshake SessionState with:
+    /// - frontend_interest: READABLE | HUP | ERROR
+    /// - frontend_event: EMPTY
+    /// Remember to set the events from the previous State!
     pub fn new(
         container_frontend_timeout: TimeoutContainer,
         session: ServerConnection,

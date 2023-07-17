@@ -53,6 +53,12 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
 }
 
 impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
+    /// Instantiate a new Pipe SessionState with:
+    /// - frontend_interest: READABLE | WRITABLE | HUP | ERROR
+    /// - frontend_event: EMPTY
+    /// - backend_interest: READABLE | WRITABLE | HUP | ERROR
+    /// - backend_event: EMPTY
+    /// Remember to set the events from the previous State!
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         backend_buffer: Checkout,
@@ -82,7 +88,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             backend_buffer,
             backend_id,
             backend_readiness: Readiness {
-                interest: Ready::ALL,
+                interest: Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
             backend_socket,
@@ -94,7 +100,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             container_frontend_timeout,
             frontend_buffer,
             frontend_readiness: Readiness {
-                interest: Ready::ALL,
+                interest: Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
             frontend_status,

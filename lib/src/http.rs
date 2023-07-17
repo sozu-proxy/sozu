@@ -143,7 +143,7 @@ impl HttpSession {
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
-        let mut session = HttpSession {
+        Ok(HttpSession {
             answers,
             configured_backend_timeout,
             configured_connect_timeout,
@@ -157,10 +157,7 @@ impl HttpSession {
             proxy,
             state,
             sticky_name,
-        };
-
-        session.state.front_readiness().interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
-        Ok(session)
+        })
     }
 
     pub fn upgrade(&mut self) -> SessionIsToBeClosed {
@@ -179,6 +176,44 @@ impl HttpSession {
             }
             // The state stays FailedUpgrade, but the Session should be closed right after
             None => true,
+        }
+    }
+
+    fn upgrade_expect(
+        &mut self,
+        expect: ExpectProxyProtocol<TcpStream>,
+    ) -> Option<HttpStateMachine> {
+        debug!("switching to HTTP");
+        match expect
+            .addresses
+            .as_ref()
+            .map(|add| (add.destination(), add.source()))
+        {
+            Some((Some(public_address), Some(session_address))) => {
+                let mut http = Http::new(
+                    self.answers.clone(),
+                    self.configured_backend_timeout,
+                    self.configured_connect_timeout,
+                    self.configured_frontend_timeout,
+                    expect.container_frontend_timeout,
+                    expect.frontend,
+                    expect.frontend_token,
+                    self.listener.clone(),
+                    self.pool.clone(),
+                    Protocol::HTTP,
+                    public_address,
+                    expect.request_id,
+                    Some(session_address),
+                    self.sticky_name.clone(),
+                )
+                .ok()?;
+                http.frontend_readiness.event = expect.frontend_readiness.event;
+
+                gauge_add!("protocol.proxy.expect", -1);
+                gauge_add!("protocol.http", 1);
+                Some(HttpStateMachine::Http(http))
+            }
+            _ => None,
         }
     }
 
@@ -220,44 +255,6 @@ impl HttpSession {
         gauge_add!("http.active_requests", -1);
         gauge_add!("websocket.active_requests", 1);
         Some(HttpStateMachine::WebSocket(pipe))
-    }
-
-    fn upgrade_expect(
-        &mut self,
-        expect: ExpectProxyProtocol<TcpStream>,
-    ) -> Option<HttpStateMachine> {
-        debug!("switching to HTTP");
-        match expect
-            .addresses
-            .as_ref()
-            .map(|add| (add.destination(), add.source()))
-        {
-            Some((Some(public_address), Some(session_address))) => {
-                let mut http = Http::new(
-                    self.answers.clone(),
-                    self.configured_backend_timeout,
-                    self.configured_connect_timeout,
-                    self.configured_frontend_timeout,
-                    expect.container_frontend_timeout,
-                    expect.frontend,
-                    expect.frontend_token,
-                    self.listener.clone(),
-                    self.pool.clone(),
-                    Protocol::HTTP,
-                    public_address,
-                    expect.request_id,
-                    Some(session_address),
-                    self.sticky_name.clone(),
-                )
-                .ok()?;
-                http.frontend_readiness.event = expect.frontend_readiness.event;
-
-                gauge_add!("protocol.proxy.expect", -1);
-                gauge_add!("protocol.http", 1);
-                Some(HttpStateMachine::Http(http))
-            }
-            _ => None,
-        }
     }
 
     fn upgrade_websocket(&self, ws: Pipe<TcpStream, HttpListener>) -> Option<HttpStateMachine> {

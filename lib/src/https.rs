@@ -169,7 +169,7 @@ impl HttpsSession {
         };
 
         let metrics = SessionMetrics::new(Some(wait_time));
-        let mut session = HttpsSession {
+        HttpsSession {
             answers,
             configured_backend_timeout,
             configured_connect_timeout,
@@ -185,10 +185,7 @@ impl HttpsSession {
             public_address,
             state,
             sticky_name,
-        };
-
-        session.state.front_readiness().interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
-        session
+        }
     }
 
     pub fn upgrade(&mut self) -> SessionIsToBeClosed {
@@ -240,6 +237,8 @@ impl HttpsSession {
                     request_id,
                 );
                 handshake.frontend_readiness.event = readiness.event;
+                // Can we remove this? If not why?
+                // Add e2e test for proto-proxy upgrades
                 handshake.frontend_readiness.event.insert(Ready::READABLE);
 
                 gauge_add!("protocol.proxy.expect", -1);
@@ -291,8 +290,6 @@ impl HttpsSession {
             session: handshake.session,
         };
 
-        let readiness = handshake.frontend_readiness.clone();
-
         gauge_add!("protocol.tls.handshake", -1);
         match alpn {
             AlpnProtocols::Http11 => {
@@ -331,8 +328,7 @@ impl HttpsSession {
                     }
                 }
 
-                http.frontend_readiness = readiness;
-                http.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+                http.frontend_readiness.event = handshake.frontend_readiness.event;
 
                 gauge_add!("protocol.https", 1);
                 Some(HttpsStateMachine::Http(http))
@@ -347,8 +343,7 @@ impl HttpsSession {
                     self.sticky_name.clone(),
                 );
 
-                http.frontend.readiness = readiness;
-                http.frontend.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+                http.frontend.readiness.event = handshake.frontend_readiness.event;
 
                 gauge_add!("protocol.http2", 1);
                 Some(HttpsStateMachine::Http2(http))

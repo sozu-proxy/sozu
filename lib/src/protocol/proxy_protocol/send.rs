@@ -31,6 +31,11 @@ pub struct SendProxyProtocol<Front: SocketHandler> {
 }
 
 impl<Front: SocketHandler> SendProxyProtocol<Front> {
+    /// Instantiate a new SendProxyProtocol SessionState with:
+    /// - frontend_interest: HUP | ERROR
+    /// - frontend_event: EMPTY
+    /// - backend_interest: HUP | ERROR
+    /// - backend_event: EMPTY
     pub fn new(
         frontend: Front,
         frontend_token: Token,
