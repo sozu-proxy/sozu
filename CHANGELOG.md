@@ -4,6 +4,30 @@
 
 See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av0.16.0)
 
+## 0.15.2 - 2024-07-17
+
+### ⛑️ Fixed
+
+- We have found out a bug around the upgrade from proxy-protocol to http, see [`211db27`](https://github.com/sozu-proxy/sozu/commit/211db27fb16bede8765487370fb46020aab10c53).
+
+### Changelog
+
+#### ⛑️ Fixed
+
+- [ [`211db27`](https://github.com/sozu-proxy/sozu/commit/211db27fb16bede8765487370fb46020aab10c53) ] Fix empty interest on expect proxy proto upgrade [`Eloi DEMOLIS`] (`2023-07-17`)
+
+#### ✍️ Changed
+
+- [ [`0a31489`](https://github.com/sozu-proxy/sozu/commit/0a314890e58f321ef0f108346b750e6d06c6108e) ] chore(http): reduce log verbosity around the http close method [`Florentin Dubois`] (`2023-07-13`)
+- [ [`748bf0f`](https://github.com/sozu-proxy/sozu/commit/748bf0f0917a2d0694460234d83d16b0181aeff2) ] chore: update dependencies [`Florentin Dubois`] (`2023-07-17`)
+- [ [`c6446e1`](https://github.com/sozu-proxy/sozu/commit/c6446e17e77b2bb603c6933066da40964f1d0c38) ] chore: add changelog entry for release v0.15.1 [`Florentin Dubois`] (`2023-07-11`)
+
+### 🥹 Contributors
+* @Wonshtrum
+* @FlorentinDUBOIS
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.1...0.15.2
+
 ## 0.15.1 - 2024-07-11
 
 ### 🌟 Features
