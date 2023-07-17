@@ -27,7 +27,6 @@ include = [
 ]
 
 [dependencies]
-anyhow = "^1.0.72"
 hex = "^0.4.3"
 libc = "^0.2.147"
 log = "^0.4.19"

@@ -1868,7 +1868,6 @@ dependencies = [
 name = "sozu-command-lib"
 version = "0.15.2"
 dependencies = [
- "anyhow",
  "hex",
  "libc",
  "log 0.4.19",
