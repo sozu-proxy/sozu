@@ -1,12 +1,17 @@
 use std::{error, fmt, str::FromStr};
 
-use anyhow::{self, Context};
 use hex::FromHex;
 use pem::parse;
 use serde::de::{self, Visitor};
 use sha2::{Digest, Sha256};
 
 use crate::proto::command::TlsVersion;
+
+#[derive(thiserror::Error, Debug)]
+pub enum CertificateError {
+    #[error("Could not parse PEM certificate from bytes: {0}")]
+    ParseError(String),
+}
 
 #[derive(Debug)]
 pub struct ParseErrorTlsVersion;
@@ -97,8 +102,9 @@ impl<'de> serde::Deserialize<'de> for Fingerprint {
     }
 }
 
-pub fn calculate_fingerprint(certificate: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let parsed_certificate = parse(certificate).with_context(|| "Can not parse certificate")?;
+pub fn calculate_fingerprint(certificate: &[u8]) -> Result<Vec<u8>, CertificateError> {
+    let parsed_certificate = parse(certificate)
+        .map_err(|parse_error| CertificateError::ParseError(parse_error.to_string()))?;
     let fingerprint = Sha256::digest(parsed_certificate.contents())
         .iter()
         .cloned()
