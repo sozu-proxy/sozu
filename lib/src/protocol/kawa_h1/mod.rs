@@ -124,6 +124,12 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
 }
 
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L> {
+    /// Instantiate a new HTTP SessionState with:
+    /// - frontend_interest: READABLE | HUP | ERROR
+    /// - frontend_event: EMPTY
+    /// - backend_interest: EMPTY
+    /// - backend_event: EMPTY
+    /// Remember to set the events from the previous State!
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         answers: Rc<RefCell<answers::HttpAnswers>>,
@@ -167,7 +173,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             connection_attempts: 0,
             container_backend_timeout: TimeoutContainer::new_empty(configured_connect_timeout),
             container_frontend_timeout,
-            frontend_readiness: Readiness::new(),
+            frontend_readiness: Readiness {
+                interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
+                event: Ready::EMPTY,
+            },
             frontend_socket,
             frontend_token,
             keepalive_count: 0,

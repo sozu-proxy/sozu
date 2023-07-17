@@ -38,6 +38,9 @@ pub struct ExpectProxyProtocol<Front: SocketHandler> {
 }
 
 impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
+    /// Instantiate a new ExpectProxyProtocol SessionState with:
+    /// - frontend_interest: READABLE | HUP | ERROR
+    /// - frontend_event: EMPTY
     pub fn new(
         container_frontend_timeout: TimeoutContainer,
         frontend: Front,
@@ -49,7 +52,7 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             container_frontend_timeout,
             frontend_buffer: [0; 232],
             frontend_readiness: Readiness {
-                interest: Ready::READABLE,
+                interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
             frontend_token,
