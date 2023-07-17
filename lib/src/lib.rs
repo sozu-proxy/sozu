@@ -391,20 +391,16 @@ use std::{
     str,
 };
 
-use anyhow::{bail, Context};
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
 use sozu_command::proto::command::ListenerType;
 use sozu_command_lib::{
-    proto::command::{Cluster, Event, EventKind, LoadBalancingParams},
-    ready::Ready,
-    request::WorkerRequest,
-    response::WorkerResponse,
+    proto::command::Cluster, ready::Ready, request::WorkerRequest, response::WorkerResponse,
     state::ClusterId,
 };
 use time::{Duration, Instant};
 
-use self::{backends::BackendMap, retry::RetryPolicy, router::Route};
+use self::{backends::BackendMap, router::Route};
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -786,148 +782,7 @@ pub enum SocketType {
     FrontClient,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum BackendStatus {
-    Normal,
-    Closing,
-    Closed,
-}
-
 type SessionIsToBeClosed = bool;
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct Backend {
-    pub sticky_id: Option<String>,
-    pub backend_id: String,
-    pub address: SocketAddr,
-    pub status: BackendStatus,
-    pub retry_policy: retry::RetryPolicyWrapper,
-    pub active_connections: usize,
-    pub active_requests: usize,
-    pub failures: usize,
-    pub load_balancing_parameters: Option<LoadBalancingParams>,
-    pub backup: bool,
-    pub connection_time: PeakEWMA,
-}
-
-impl Backend {
-    pub fn new(
-        backend_id: &str,
-        address: SocketAddr,
-        sticky_id: Option<String>,
-        load_balancing_parameters: Option<LoadBalancingParams>,
-        backup: Option<bool>,
-    ) -> Backend {
-        let desired_policy = retry::ExponentialBackoffPolicy::new(6);
-        Backend {
-            sticky_id,
-            backend_id: backend_id.to_string(),
-            address,
-            status: BackendStatus::Normal,
-            retry_policy: desired_policy.into(),
-            active_connections: 0,
-            active_requests: 0,
-            failures: 0,
-            load_balancing_parameters,
-            backup: backup.unwrap_or(false),
-            connection_time: PeakEWMA::new(),
-        }
-    }
-
-    pub fn set_closing(&mut self) {
-        self.status = BackendStatus::Closing;
-    }
-
-    pub fn retry_policy(&mut self) -> &mut retry::RetryPolicyWrapper {
-        &mut self.retry_policy
-    }
-
-    pub fn can_open(&self) -> bool {
-        if let Some(action) = self.retry_policy.can_try() {
-            self.status == BackendStatus::Normal && action == retry::RetryAction::OKAY
-        } else {
-            false
-        }
-    }
-
-    pub fn inc_connections(&mut self) -> Option<usize> {
-        if self.status == BackendStatus::Normal {
-            self.active_connections += 1;
-            Some(self.active_connections)
-        } else {
-            None
-        }
-    }
-
-    /// TODO: normalize with saturating_sub()
-    pub fn dec_connections(&mut self) -> Option<usize> {
-        match self.status {
-            BackendStatus::Normal => {
-                if self.active_connections > 0 {
-                    self.active_connections -= 1;
-                }
-                Some(self.active_connections)
-            }
-            BackendStatus::Closed => None,
-            BackendStatus::Closing => {
-                if self.active_connections > 0 {
-                    self.active_connections -= 1;
-                }
-                if self.active_connections == 0 {
-                    self.status = BackendStatus::Closed;
-                    None
-                } else {
-                    Some(self.active_connections)
-                }
-            }
-        }
-    }
-
-    pub fn set_connection_time(&mut self, dur: Duration) {
-        self.connection_time.observe(dur.whole_nanoseconds() as f64);
-    }
-
-    pub fn peak_ewma_connection(&mut self) -> f64 {
-        self.connection_time.get(self.active_connections)
-    }
-
-    pub fn try_connect(&mut self) -> anyhow::Result<mio::net::TcpStream> {
-        if self.status != BackendStatus::Normal {
-            bail!("This backend is not in a normal status");
-        }
-
-        match mio::net::TcpStream::connect(self.address) {
-            Ok(tcp_stream) => {
-                //self.retry_policy.succeed();
-                self.inc_connections();
-                Ok(tcp_stream)
-            }
-            Err(mio_error) => {
-                self.retry_policy.fail();
-                self.failures += 1;
-                // TODO: handle EINPROGRESS. It is difficult. It is discussed here:
-                // https://docs.rs/mio/latest/mio/net/struct.TcpStream.html#method.connect
-                // with an example code here:
-                // https://github.com/Thomasdezeeuw/heph/blob/0c4f1ab3eaf08bea1d65776528bfd6114c9f8374/src/net/tcp/stream.rs#L560-L622
-                Err(mio_error).with_context(|| "Failed to connect to socket with MIO")
-            }
-        }
-    }
-}
-
-// when a backend has been removed from configuration and the last connection to
-// it has stopped, it will be dropped, so we can notify that the backend server
-// can be safely stopped
-impl std::ops::Drop for Backend {
-    fn drop(&mut self) {
-        server::push_event(Event {
-            kind: EventKind::RemovedBackendHasNoConnections as i32,
-            backend_id: Some(self.backend_id.clone()),
-            address: Some(self.address.to_string()),
-            cluster_id: None,
-        });
-    }
-}
 
 #[derive(Clone)]
 pub struct Readiness {

@@ -20,7 +20,7 @@ use sozu_command::proto::command::request::RequestType;
 use time::{Duration, Instant};
 
 use crate::{
-    backends::BackendMap,
+    backends::{Backend, BackendMap},
     logs::{Endpoint, LogContext, RequestRecord},
     pool::{Checkout, Pool},
     protocol::{
@@ -47,9 +47,9 @@ use crate::{
         state::ClusterId,
     },
     timer::TimeoutContainer,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, CachedTags,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionIsToBeClosed,
-    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
+    AcceptError, BackendConnectAction, BackendConnectionStatus, CachedTags, ListenerHandler,
+    Protocol, ProxyConfiguration, ProxySession, Readiness, SessionIsToBeClosed, SessionMetrics,
+    SessionResult, StateMachineBuilder, StateResult,
 };
 
 StateMachineBuilder! {

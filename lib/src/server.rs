@@ -32,9 +32,14 @@ use sozu_command::{
 use time::{Duration, Instant};
 
 use crate::{
-    backends::BackendMap, features::FEATURES, http, https, metrics::METRICS, pool::Pool, tcp,
-    timer::Timer, AcceptError, Backend, Protocol, ProxyConfiguration, ProxySession,
-    SessionIsToBeClosed,
+    backends::{Backend, BackendMap},
+    features::FEATURES,
+    http, https,
+    metrics::METRICS,
+    pool::Pool,
+    tcp,
+    timer::Timer,
+    AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionIsToBeClosed,
 };
 
 // Number of retries to perform on a server after a connection failure

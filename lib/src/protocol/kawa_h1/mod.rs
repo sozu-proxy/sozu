@@ -17,6 +17,7 @@ use sozu_command::proto::command::{Event, EventKind, ListenerType};
 use time::{Duration, Instant};
 
 use crate::{
+    backends::Backend,
     logs::{Endpoint, LogContext, RequestRecord},
     pool::{Checkout, Pool},
     protocol::{
@@ -29,9 +30,9 @@ use crate::{
     socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler,
-    L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness, SessionIsToBeClosed,
-    SessionMetrics, SessionResult, StateResult,
+    AcceptError, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler, L7Proxy,
+    ListenerHandler, Protocol, ProxySession, Readiness, SessionIsToBeClosed, SessionMetrics,
+    SessionResult, StateResult,
 };
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
@@ -1131,11 +1132,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         "Couldn't find a backend corresponding to sticky_session {sticky_session} for cluster {cluster_id}"
                     )
                 }),
-            _ => proxy
+            _ => Ok(proxy
                 .borrow()
                 .backends()
                 .borrow_mut()
-                .backend_from_cluster_id(cluster_id),
+                .backend_from_cluster_id(cluster_id)?),
         }
     }
 
