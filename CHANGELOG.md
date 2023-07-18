@@ -4,7 +4,7 @@
 
 See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av0.16.0)
 
-## 0.15.2 - 2024-07-17
+## 0.15.2 - 2023-07-17
 
 ### ⛑️ Fixed
 
@@ -28,7 +28,7 @@ See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_fil
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.1...0.15.2
 
-## 0.15.1 - 2024-07-11
+## 0.15.1 - 2023-07-11
 
 ### 🌟 Features
 
@@ -72,7 +72,7 @@ See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_fil
 
 **Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.0...0.15.1
 
-## 0.15.0 - 2024-06-23
+## 0.15.0 - 2023-06-23
 
 ### 🌟 Features
 
