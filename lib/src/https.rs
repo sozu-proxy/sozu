@@ -67,8 +67,8 @@ use crate::{
         ParsedCertificateAndKey,
     },
     util::UnwrapLog,
-    AcceptError, CachedTags, L7ListenerHandler, L7Proxy, ListenerHandler, Protocol,
-    ProxyConfiguration, ProxySession, Readiness, SessionIsToBeClosed, SessionMetrics,
+    AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerHandler,
+    Protocol, ProxyConfiguration, ProxySession, Readiness, SessionIsToBeClosed, SessionMetrics,
     SessionResult, StateMachineBuilder, StateResult,
 };
 
@@ -578,17 +578,22 @@ impl L7ListenerHandler for HttpsListener {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> anyhow::Result<Route> {
+    ) -> Result<Route, FrontendFromRequestError> {
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
             Err(parse_error) => {
                 // parse_error contains a slice of given_host, which should NOT escape this scope
-                bail!("Hostname parsing failed for host {host}: {parse_error}");
+                return Err(FrontendFromRequestError::HostParsingFailure {
+                    host: host.to_owned(),
+                    error: parse_error.to_string(),
+                });
             }
         };
 
         if remaining_input != &b""[..] {
-            bail!("frontend_from_request: invalid remaining chars after hostname. Host: {host}");
+            return Err(FrontendFromRequestError::InvalidCharsAfterHost(
+                host.to_owned(),
+            ));
         }
 
         // it is alright to call from_utf8_unchecked,
@@ -598,7 +603,7 @@ impl L7ListenerHandler for HttpsListener {
 
         self.fronts
             .lookup(host.as_bytes(), uri.as_bytes(), method)
-            .with_context(|| "No cluster found")
+            .ok_or(FrontendFromRequestError::NoClusterFound)
     }
 }
 

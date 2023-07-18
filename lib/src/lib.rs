@@ -592,17 +592,28 @@ pub trait ListenerHandler {
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum FrontendFromRequestError {
+    #[error("Could not parse hostname from '{host}': {error}")]
+    HostParsingFailure { host: String, error: String },
+    #[error("invalid remaining chars after hostname. Host: {0}")]
+    InvalidCharsAfterHost(String),
+    #[error("no cluster found")]
+    NoClusterFound,
+}
+
 pub trait L7ListenerHandler {
     fn get_sticky_name(&self) -> &str;
 
     fn get_connect_timeout(&self) -> u32;
 
+    /// retrieve a frontend by parsing a request's hostname, uri and method
     fn frontend_from_request(
         &self,
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> anyhow::Result<Route>;
+    ) -> Result<Route, FrontendFromRequestError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
