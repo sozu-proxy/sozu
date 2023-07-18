@@ -1392,7 +1392,9 @@ impl ConfigBuilder {
         let command_socket_path = self.file.command_socket.clone().unwrap_or({
             let mut path = env::current_dir().map_err(|e| ConfigError::EnvError(e.to_string()))?;
             path.push("sozu.sock");
-            let verified_path = path.to_str().ok_or(ConfigError::InvalidPath(path.clone()))?;
+            let verified_path = path
+                .to_str()
+                .ok_or(ConfigError::InvalidPath(path.clone()))?;
             verified_path.to_owned()
         });
 

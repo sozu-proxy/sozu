@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 use std::{collections::BTreeMap, str, time::Instant};
 
-use anyhow::Context;
 use hdrhistogram::Histogram;
 use sozu_command::proto::command::{
     filtered_metrics, response_content::ContentType, AvailableMetrics, BackendMetrics,
@@ -9,7 +8,7 @@ use sozu_command::proto::command::{
     ResponseContent, WorkerMetrics,
 };
 
-use super::{MetricValue, Subscriber};
+use super::{MetricError, MetricValue, Subscriber};
 
 /// This is how the metrics are stored in the local drain
 #[derive(Debug, Clone)]
@@ -20,19 +19,25 @@ pub enum AggregatedMetric {
 }
 
 impl AggregatedMetric {
-    fn new(metric: MetricValue) -> anyhow::Result<AggregatedMetric> {
+    fn new(metric: MetricValue) -> Result<AggregatedMetric, MetricError> {
         match metric {
             MetricValue::Gauge(value) => Ok(AggregatedMetric::Gauge(value)),
             MetricValue::GaugeAdd(value) => Ok(AggregatedMetric::Gauge(value as usize)),
             MetricValue::Count(value) => Ok(AggregatedMetric::Count(value)),
             MetricValue::Time(value) => {
-                let mut histogram = ::hdrhistogram::Histogram::new(3).context(format!(
-                    "Could not create histogram for time metric {metric:?}"
-                ))?;
+                let mut histogram = ::hdrhistogram::Histogram::new(3).map_err(|error| {
+                    MetricError::HistogramCreation {
+                        time_metric: metric.clone(),
+                        error: error.to_string(),
+                    }
+                })?;
 
-                histogram
-                    .record(value as u64)
-                    .context(format!("could not record time metric: {metric:?}"))?;
+                histogram.record(value as u64).map_err(|error| {
+                    MetricError::TimeMetricRecordingError {
+                        time_metric: metric.clone(),
+                        error: error.to_string(),
+                    }
+                })?;
 
                 Ok(AggregatedMetric::Time(histogram))
             }
@@ -174,7 +179,7 @@ impl LocalDrain {
             .collect()
     }
 
-    pub fn query(&mut self, options: &QueryMetricsOptions) -> anyhow::Result<ResponseContent> {
+    pub fn query(&mut self, options: &QueryMetricsOptions) -> Result<ResponseContent, MetricError> {
         trace!(
             "The local drain received a metrics query with this options: {:?}",
             options
@@ -200,7 +205,7 @@ impl LocalDrain {
         Ok(ContentType::WorkerMetrics(worker_metrics).into())
     }
 
-    fn list_all_metric_names(&self) -> anyhow::Result<ResponseContent> {
+    fn list_all_metric_names(&self) -> Result<ResponseContent, MetricError> {
         let proxy_metrics = self.proxy_metrics.keys().cloned().collect();
 
         let mut cluster_metrics = Vec::new();
@@ -220,7 +225,7 @@ impl LocalDrain {
     pub fn dump_all_metrics(
         &mut self,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<WorkerMetrics> {
+    ) -> Result<WorkerMetrics, MetricError> {
         Ok(WorkerMetrics {
             proxy: self.dump_proxy_metrics(metric_names),
             clusters: self.dump_cluster_metrics(metric_names)?,
@@ -247,15 +252,11 @@ impl LocalDrain {
     pub fn dump_cluster_metrics(
         &mut self,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<BTreeMap<String, ClusterMetrics>> {
+    ) -> Result<BTreeMap<String, ClusterMetrics>, MetricError> {
         let mut cluster_data = BTreeMap::new();
 
         for cluster_id in self.get_cluster_ids() {
-            let cluster_metrics = self
-                .metrics_of_one_cluster(&cluster_id, metric_names)
-                .context(format!(
-                    "Could not retrieve metrics of cluster {cluster_id}"
-                ))?;
+            let cluster_metrics = self.metrics_of_one_cluster(&cluster_id, metric_names)?;
             cluster_data.insert(cluster_id.to_owned(), cluster_metrics);
         }
 
@@ -266,11 +267,11 @@ impl LocalDrain {
         &self,
         cluster_id: &str,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<ClusterMetrics> {
+    ) -> Result<ClusterMetrics, MetricError> {
         let raw_metrics = self
             .cluster_metrics
             .get(cluster_id)
-            .context(format!("No metrics found for cluster with id {cluster_id}"))?;
+            .ok_or(MetricError::NoMetricsForCluster(cluster_id.to_owned()))?;
 
         let cluster: BTreeMap<String, FilteredMetrics> = raw_metrics
             .iter()
@@ -286,11 +287,7 @@ impl LocalDrain {
 
         let mut backends = Vec::new();
         for backend_id in self.get_backend_ids(cluster_id) {
-            let backend_metrics = self
-                .metrics_of_one_backend(&backend_id, metric_names)
-                .context(format!(
-                    "Could not retrieve metrics for backend {backend_id} of cluster {cluster_id}"
-                ))?;
+            let backend_metrics = self.metrics_of_one_backend(&backend_id, metric_names)?;
             backends.push(backend_metrics);
         }
         Ok(ClusterMetrics { cluster, backends })
@@ -300,11 +297,11 @@ impl LocalDrain {
         &self,
         backend_id: &str,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<BackendMetrics> {
+    ) -> Result<BackendMetrics, MetricError> {
         let backend_metrics = self
             .cluster_metrics
             .get(backend_id)
-            .context(format!("No metrics found for backend with id {backend_id}"))?;
+            .ok_or(MetricError::NoMetricsForBackend(backend_id.to_owned()))?;
 
         let filtered_backend_metrics = backend_metrics
             .iter()
@@ -328,7 +325,7 @@ impl LocalDrain {
         &mut self,
         cluster_ids: &Vec<String>,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<WorkerMetrics> {
+    ) -> Result<WorkerMetrics, MetricError> {
         debug!("Querying cluster with ids: {:?}", cluster_ids);
         let mut clusters: BTreeMap<String, ClusterMetrics> = BTreeMap::new();
 
@@ -350,14 +347,14 @@ impl LocalDrain {
         &mut self,
         backend_ids: &Vec<String>,
         metric_names: &Vec<String>,
-    ) -> anyhow::Result<WorkerMetrics> {
+    ) -> Result<WorkerMetrics, MetricError> {
         let mut clusters: BTreeMap<String, ClusterMetrics> = BTreeMap::new();
 
         for backend_id in backend_ids {
             let cluster_id = self
                 .backend_to_cluster
                 .get(backend_id)
-                .context(format!("No metrics found for backend with id {backend_id}"))?
+                .ok_or(MetricError::NoMetricsForBackend(backend_id.to_owned()))?
                 .to_owned();
 
             let backends = vec![self.metrics_of_one_backend(backend_id, metric_names)?];
