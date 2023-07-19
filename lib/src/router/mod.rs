@@ -1,7 +1,6 @@
 pub mod pattern_trie;
 pub mod trie;
 
-use anyhow::{bail, Context};
 use regex::bytes::Regex;
 use std::str::from_utf8;
 
@@ -13,6 +12,18 @@ use sozu_command::{
 };
 
 use self::pattern_trie::TrieNode;
+
+#[derive(thiserror::Error, Debug)]
+pub enum RouterError {
+    #[error("Could not parse rule from frontend path {0:?}")]
+    UnparsablePathRule(String),
+    #[error("parsing hostname {hostname} failed")]
+    UnparsableDomain { hostname: String },
+    #[error("Could not add route {0}")]
+    AddRouteFailure(String),
+    #[error("Could not remove route {0}")]
+    RemoveRouteFailure(String),
+}
 
 pub struct Router {
     pre: Vec<(DomainRule, PathRule, MethodRule, Route)>,
@@ -98,13 +109,9 @@ impl Router {
         None
     }
 
-    pub fn add_http_front(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
-        let path_rule = PathRule::from_config(front.path.clone()).with_context(|| {
-            format!(
-                "Could not parse path rulo from frontend path {}",
-                front.path
-            )
-        })?;
+    pub fn add_http_front(&mut self, front: &HttpFrontend) -> Result<(), RouterError> {
+        let path_rule = PathRule::from_config(front.path.clone())
+            .ok_or(RouterError::UnparsablePathRule(front.path.to_string()))?;
 
         let method_rule = MethodRule::new(front.method.clone());
 
@@ -114,52 +121,67 @@ impl Router {
         };
 
         let success = match front.position {
-            RulePosition::Pre => match front.hostname.parse::<DomainRule>() {
-                Ok(domain) => self.add_pre_rule(&domain, &path_rule, &method_rule, &route),
-                Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
-            },
-            RulePosition::Post => match front.hostname.parse::<DomainRule>() {
-                Ok(domain) => self.add_post_rule(&domain, &path_rule, &method_rule, &route),
-                Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
-            },
+            RulePosition::Pre => {
+                let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
+                    RouterError::UnparsableDomain {
+                        hostname: front.hostname.clone(),
+                    }
+                })?;
+
+                self.add_pre_rule(&domain, &path_rule, &method_rule, &route)
+            }
+            RulePosition::Post => {
+                let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
+                    RouterError::UnparsableDomain {
+                        hostname: front.hostname.clone(),
+                    }
+                })?;
+
+                self.add_post_rule(&domain, &path_rule, &method_rule, &route)
+            }
             RulePosition::Tree => {
                 self.add_tree_rule(front.hostname.as_bytes(), &path_rule, &method_rule, &route)
             }
         };
-        match success {
-            true => Ok(()),
-            false => bail!("Could not add rule to the router"),
+        if !success {
+            return Err(RouterError::AddRouteFailure(format!("{:?}", front)));
         }
+        Ok(())
     }
 
-    pub fn remove_http_front(&mut self, front: &HttpFrontend) -> anyhow::Result<()> {
-        let path_rule = PathRule::from_config(front.path.clone()).with_context(|| {
-            format!(
-                "Could not parse path rulo from frontend path {}",
-                front.path
-            )
-        })?;
+    pub fn remove_http_front(&mut self, front: &HttpFrontend) -> Result<(), RouterError> {
+        let path_rule = PathRule::from_config(front.path.clone())
+            .ok_or(RouterError::UnparsablePathRule(front.path.to_string()))?;
 
         let method_rule = MethodRule::new(front.method.clone());
 
         let remove_success = match front.position {
-            RulePosition::Pre => match front.hostname.parse::<DomainRule>() {
-                Ok(domain) => self.remove_pre_rule(&domain, &path_rule, &method_rule),
-                Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
-            },
-            RulePosition::Post => match front.hostname.parse::<DomainRule>() {
-                Ok(domain) => self.remove_post_rule(&domain, &path_rule, &method_rule),
-                Err(e) => bail!("Parsing hostname {} failed: {:?}", front.hostname, e),
-            },
+            RulePosition::Pre => {
+                let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
+                    RouterError::UnparsableDomain {
+                        hostname: front.hostname.clone(),
+                    }
+                })?;
+
+                self.remove_pre_rule(&domain, &path_rule, &method_rule)
+            }
+            RulePosition::Post => {
+                let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
+                    RouterError::UnparsableDomain {
+                        hostname: front.hostname.clone(),
+                    }
+                })?;
+
+                self.remove_post_rule(&domain, &path_rule, &method_rule)
+            }
             RulePosition::Tree => {
                 self.remove_tree_rule(front.hostname.as_bytes(), &path_rule, &method_rule)
             }
         };
-
-        match remove_success {
-            true => Ok(()),
-            false => bail!("could not remove the rule from router"),
+        if !remove_success {
+            return Err(RouterError::RemoveRouteFailure(format!("{:?}", front)));
         }
+        Ok(())
     }
 
     pub fn add_tree_rule(

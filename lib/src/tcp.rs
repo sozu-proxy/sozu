@@ -47,9 +47,9 @@ use crate::{
         state::ClusterId,
     },
     timer::TimeoutContainer,
-    AcceptError, BackendConnectAction, BackendConnectionStatus, CachedTags, ListenerHandler,
-    Protocol, ProxyConfiguration, ProxySession, Readiness, SessionIsToBeClosed, SessionMetrics,
-    SessionResult, StateMachineBuilder, StateResult,
+    AcceptError, BackendConnectAction, BackendConnectionStatus, CachedTags, ListenerError,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, Readiness,
+    SessionIsToBeClosed, SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
 
 StateMachineBuilder! {
@@ -1104,11 +1104,15 @@ impl TcpListener {
         config: TcpListenerConfig,
         pool: Rc<RefCell<Pool>>,
         token: Token,
-    ) -> anyhow::Result<TcpListener> {
+    ) -> Result<TcpListener, ListenerError> {
         let address = config
             .address
-            .parse()
-            .with_context(|| "wrong socket address")?;
+            .parse::<SocketAddr>()
+            .map_err(|parse_error| ListenerError::SocketParseError {
+                address: config.address.clone(),
+                error: parse_error.to_string(),
+            })?;
+
         Ok(TcpListener {
             cluster_id: None,
             listener: None,
@@ -1194,15 +1198,15 @@ impl TcpProxy {
         config: TcpListenerConfig,
         pool: Rc<RefCell<Pool>>,
         token: Token,
-    ) -> anyhow::Result<Token> {
+    ) -> Result<Token, ProxyError> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
                 let tcp_listener = TcpListener::new(config, pool, token)
-                    .with_context(|| "Could not create TCP listener")?;
+                    .map_err(|listener_error| ProxyError::AddListenerError(listener_error))?;
                 entry.insert(Rc::new(RefCell::new(tcp_listener)));
                 Ok(token)
             }
-            _ => bail!("It seems a listener already exists for this token"),
+            _ => Err(ProxyError::ListenerAlreadyPresent),
         }
     }
 
@@ -1254,20 +1258,20 @@ impl TcpProxy {
             })
     }
 
-    pub fn add_tcp_front(&mut self, front: RequestTcpFrontend) -> anyhow::Result<()> {
-        let address = front
-            .address
-            .parse()
-            .with_context(|| "wrong socket address")?;
+    pub fn add_tcp_front(&mut self, front: RequestTcpFrontend) -> Result<(), ProxyError> {
+        let address = front.address.parse::<SocketAddr>().map_err(|parse_error| {
+            ProxyError::SocketParseError {
+                address: front.address.clone(),
+                error: parse_error.to_string(),
+            }
+        })?;
 
-        let mut listener = match self
+        let mut listener = self
             .listeners
             .values()
             .find(|l| l.borrow().address == address)
-        {
-            Some(l) => l.borrow_mut(),
-            None => bail!(format!("no such listener for '{}'", front.address)),
-        };
+            .ok_or(ProxyError::NoListenerFound(address))?
+            .borrow_mut();
 
         self.fronts
             .insert(front.cluster_id.to_string(), listener.token);

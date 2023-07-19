@@ -393,14 +393,20 @@ use std::{
 
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
-use sozu_command::proto::command::ListenerType;
+use router::RouterError;
+use sozu_command::proto::command::{ListenerType, RequestHttpFrontend};
 use sozu_command_lib::{
     proto::command::Cluster, ready::Ready, request::WorkerRequest, response::WorkerResponse,
     state::ClusterId,
 };
 use time::{Duration, Instant};
+use tls::GenericCertificateResolverError;
 
 use self::{backends::BackendMap, router::Route};
+
+/// returned by proxies when dispatching changes to their state
+#[derive(thiserror::Error, Debug)]
+pub enum NotifyError {}
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,6 +642,7 @@ pub enum BackendConnectAction {
     Replace,
 }
 
+// Used in sessions
 #[derive(Debug, PartialEq, Eq)]
 pub enum AcceptError {
     IoError,
@@ -644,6 +651,75 @@ pub enum AcceptError {
     RegisterError,
     WrongSocketAddress,
     BufferCapacityReached,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ListenerError {
+    #[error("failed to acquire the lock, {0}")]
+    LockError(String),
+    #[error("failed to handle certificate request, got a resolver error, {0}")]
+    ResolverError(GenericCertificateResolverError),
+    #[error("failed to parse pem, {0}")]
+    PemParseError(String),
+    #[error("failed to build rustls context, {0}")]
+    BuildRustlsError(String),
+    #[error("Wrong socket address")]
+    SocketParseError { address: String, error: String },
+    #[error("could not activate listener with address {address}: {error}")]
+    ActivationError { address: String, error: String },
+    #[error("Could not register listener socket: {0}")]
+    SocketRegistrationFailure(String),
+    #[error("could not add frontend: {0}")]
+    AddFrontendError(RouterError),
+    #[error("could not remove frontend: {0}")]
+    RemoveFrontendError(RouterError),
+}
+
+/// Returned by the HTTP, HTTPS and TCP proxies
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyError {
+    #[error("error while soft stopping {proxy_protocol} proxy: {error}")]
+    SoftStopError {
+        proxy_protocol: String,
+        error: String,
+    },
+    #[error("error while hard stopping {proxy_protocol} proxy: {error}")]
+    HardStopError {
+        proxy_protocol: String,
+        error: String,
+    },
+    #[error("found no listener with address {0:?}")]
+    NoListenerFound(SocketAddr),
+    #[error("a listener is already present for this token")]
+    ListenerAlreadyPresent,
+    #[error("could not create add listener: {0}")]
+    AddListenerError(ListenerError),
+    #[error("failed to activate listener with address {address:?}: {listener_error}")]
+    ListenerActivationFailure {
+        address: SocketAddr,
+        listener_error: ListenerError,
+    },
+    #[error("can not add frontend {front:?}: {error}")]
+    WrongInputFrontend {
+        front: RequestHttpFrontend,
+        error: String,
+    },
+    #[error("could not add frontend: {0}")]
+    AddFrontendError(ListenerError),
+    #[error("could not remove frontend: {0}")]
+    RemoveFrontendError(ListenerError),
+    #[error("could not add certificate: {0}")]
+    AddCertificateError(ListenerError),
+    #[error("could not remove certificate: {0}")]
+    RemoveCertificateError(ListenerError),
+    #[error("could not replace certificate: {0}")]
+    ReplaceCertificateError(ListenerError),
+    #[error("Wrong address {address}: {error}")]
+    SocketParseError { address: String, error: String },
+    #[error("wrong certificate fingerprint: {0}")]
+    WrongCertificateFingerprint(String),
+    #[error("this request is not supported by the proxy")]
+    UnsupportedMessage,
 }
 
 use self::server::ListenToken;
