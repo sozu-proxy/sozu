@@ -391,6 +391,7 @@ use std::{
     str,
 };
 
+use backends::BackendError;
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
 use router::RouterError;
@@ -642,7 +643,38 @@ pub enum BackendConnectAction {
     Replace,
 }
 
-// Used in sessions
+#[derive(thiserror::Error, Debug)]
+pub enum BackendConnectionError {
+    #[error("Found no TCP cluster")]
+    FoundNoTcpCluster,
+    #[error("Too many connections on cluster {0}")]
+    TooManyConnections(String),
+    #[error("the sessions slab has reached maximum capacity")]
+    SessionsMemoryAtCapacity,
+    #[error("error from the backend: {0}")]
+    BackendError(BackendError),
+    #[error("Reached maximum attempts to connect to this backend")]
+    TooManyAttempts,
+    #[error("failed to retrieve the cluster: {0}")]
+    RetrieveClusterError(RetrieveClusterError),
+}
+
+/// used in kawa_h1 module for the Http session state
+#[derive(thiserror::Error, Debug)]
+pub enum RetrieveClusterError {
+    #[error("No method given")]
+    NoMethod,
+    #[error("No host given")]
+    NoHost,
+    #[error("No path given")]
+    NoPath,
+    #[error("unauthorized route")]
+    UnauthorizedRoute,
+    #[error("failed to retrieve the frontend for the request: {0}")]
+    FrontendFromRequestError(FrontendFromRequestError),
+}
+
+/// Used in sessions
 #[derive(Debug, PartialEq, Eq)]
 pub enum AcceptError {
     IoError,
@@ -653,6 +685,7 @@ pub enum AcceptError {
     BufferCapacityReached,
 }
 
+/// returned by the HTTP, HTTPS and TCP listeners
 #[derive(thiserror::Error, Debug)]
 pub enum ListenerError {
     #[error("failed to acquire the lock, {0}")]

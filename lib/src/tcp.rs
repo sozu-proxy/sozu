@@ -47,9 +47,10 @@ use crate::{
         state::ClusterId,
     },
     timer::TimeoutContainer,
-    AcceptError, BackendConnectAction, BackendConnectionStatus, CachedTags, ListenerError,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, Readiness,
-    SessionIsToBeClosed, SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
+    AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus, CachedTags,
+    ListenerError, ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession,
+    Readiness, SessionIsToBeClosed, SessionMetrics, SessionResult, StateMachineBuilder,
+    StateResult,
 };
 
 StateMachineBuilder! {
@@ -819,24 +820,23 @@ impl TcpSession {
     fn connect_to_backend(
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
-    ) -> anyhow::Result<BackendConnectAction> {
-        let cluster_id = match self.listener.borrow().cluster_id.clone() {
-            Some(cluster_id) => cluster_id,
-            None => {
-                error!("no TCP cluster corresponds to that front address");
-                bail!("no TCP cluster found.")
-            }
-        };
+    ) -> Result<BackendConnectAction, BackendConnectionError> {
+        let cluster_id = self
+            .listener
+            .borrow()
+            .cluster_id
+            .clone()
+            .ok_or(BackendConnectionError::FoundNoTcpCluster)?;
 
         self.cluster_id = Some(cluster_id.clone());
 
         if self.connection_attempt >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
-            bail!(format!("Too many connections on cluster {cluster_id}"));
+            return Err(BackendConnectionError::TooManyConnections(cluster_id));
         }
 
         if self.proxy.borrow().sessions.borrow().at_capacity() {
-            bail!("not enough memory, cannot connect to backend");
+            return Err(BackendConnectionError::SessionsMemoryAtCapacity);
         }
 
         let (backend, mut stream) = self
@@ -845,9 +845,8 @@ impl TcpSession {
             .backends
             .borrow_mut()
             .backend_from_cluster_id(&cluster_id)
-            .with_context(|| {
-                format!("Could not get backend and TCP stream from cluster id {cluster_id}")
-            })?;
+            .map_err(|backend_error| BackendConnectionError::BackendError(backend_error))?;
+
         /*
         this was the old error matching for backend_from_cluster_id.
         panic! is called in case of mio::net::MioTcpStream::connect() error
