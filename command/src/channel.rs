@@ -21,7 +21,7 @@ use crate::{buffer::growable::Buffer, ready::Ready};
 #[derive(thiserror::Error, Debug)]
 pub enum ChannelError {
     #[error("io read error")]
-    IoError(std::io::Error),
+    Read(std::io::Error),
     #[error("no byte written on the channel")]
     NoByteWritten,
     #[error("no byte left to read on the channel")]
@@ -29,23 +29,21 @@ pub enum ChannelError {
     #[error("message too large for the capacity of the back fuffer ({0}. Consider increasing the back buffer size")]
     MessageTooLarge(usize),
     #[error("channel could not write on the back buffer")]
-    WriteError(std::io::Error),
-    #[error("channel buffer is full, cannot grow more, ignoring")]
+    Write(std::io::Error),
+    #[error("channel buffer is full, cannot grow more")]
     BufferFull,
     #[error("Timeout is reached: {0:?}")]
     TimeoutReached(Duration),
     #[error("Could not read anything on the channel")]
     NothingRead,
-    #[error("invalid utf-8 encoding in command message, ignoring: {0}")]
-    Utf8Error(String),
+    #[error("invalid char set in command message, ignoring: {0}")]
+    InvalidCharSet(String),
     #[error("Error deserializing message")]
-    SerdeError(serde_json::error::Error),
+    Serde(serde_json::error::Error),
     #[error("Could not change the blocking status ef the unix stream with file descriptor {fd}: {error}")]
-    BlockingStatusError { fd: i32, error: String },
-    #[error("Connection error, continuing")]
-    ConnectionError,
-    #[error("Could not connect to socket with path {path}: {error}")]
-    FromPathError { path: String, error: String },
+    BlockingStatus { fd: i32, error: String },
+    #[error("Connection error: {0:?}")]
+    Connection(Option<std::io::Error>),
 }
 
 /// A wrapper around unix socket using the mio crate.
@@ -69,11 +67,8 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         buffer_size: usize,
         max_buffer_size: usize,
     ) -> Result<Channel<Tx, Rx>, ChannelError> {
-        let unix_stream =
-            MioUnixStream::connect(path).map_err(|error| ChannelError::FromPathError {
-                path: path.to_owned(),
-                error: error.to_string(),
-            })?;
+        let unix_stream = MioUnixStream::connect(path)
+            .map_err(|io_error| ChannelError::Connection(Some(io_error)))?;
         Ok(Channel::new(unix_stream, buffer_size, max_buffer_size))
     }
 
@@ -113,12 +108,12 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         unsafe {
             let fd = self.sock.as_raw_fd();
             let stream = StdUnixStream::from_raw_fd(fd);
-            stream.set_nonblocking(nonblocking).map_err(|error| {
-                ChannelError::BlockingStatusError {
+            stream
+                .set_nonblocking(nonblocking)
+                .map_err(|error| ChannelError::BlockingStatus {
                     fd,
                     error: error.to_string(),
-                }
-            })?;
+                })?;
             let _fd = stream.into_raw_fd();
         }
         self.blocking = !nonblocking;
@@ -168,7 +163,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     /// Handles readability by filling the front buffer with the socket data.
     pub fn readable(&mut self) -> Result<usize, ChannelError> {
         if !(self.interest & self.readiness).is_readable() {
-            return Err(ChannelError::ConnectionError);
+            return Err(ChannelError::Connection(None));
         }
 
         let mut count = 0usize;
@@ -191,10 +186,10 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                         self.readiness.remove(Ready::READABLE);
                         break;
                     }
-                    _other_error => {
+                    _ => {
                         self.interest = Ready::EMPTY;
                         self.readiness = Ready::EMPTY;
-                        return Err(ChannelError::IoError(read_error));
+                        return Err(ChannelError::Read(read_error));
                     }
                 },
                 Ok(bytes_read) => {
@@ -210,7 +205,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     /// Handles writability by writing the content of the back buffer onto the socket
     pub fn writable(&mut self) -> Result<usize, ChannelError> {
         if !(self.interest & self.readiness).is_writable() {
-            return Err(ChannelError::ConnectionError);
+            return Err(ChannelError::Connection(None));
         }
 
         let mut count = 0usize;
@@ -236,10 +231,10 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                         self.readiness.remove(Ready::WRITABLE);
                         break;
                     }
-                    _other_error => {
+                    _ => {
                         self.interest = Ready::EMPTY;
                         self.readiness = Ready::EMPTY;
-                        return Err(ChannelError::IoError(write_error));
+                        return Err(ChannelError::Read(write_error));
                     }
                 },
             }
@@ -314,7 +309,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                     match self
                         .sock
                         .read(self.front_buf.space())
-                        .map_err(ChannelError::IoError)?
+                        .map_err(ChannelError::Read)?
                     {
                         0 => return Err(ChannelError::NoByteToRead),
                         bytes_read => self.front_buf.fill(bytes_read),
@@ -326,9 +321,9 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
 
     fn read_and_parse_from_front_buffer(&mut self, position: usize) -> Result<Rx, ChannelError> {
         let utf8_str = from_utf8(&self.front_buf.data()[..position])
-            .map_err(|from_error| ChannelError::Utf8Error(from_error.to_string()))?;
+            .map_err(|from_error| ChannelError::InvalidCharSet(from_error.to_string()))?;
 
-        let json_parsed = serde_json::from_str(utf8_str).map_err(ChannelError::SerdeError)?;
+        let json_parsed = serde_json::from_str(utf8_str).map_err(ChannelError::Serde)?;
 
         self.front_buf.consume(position + 1);
         Ok(json_parsed)
@@ -370,13 +365,11 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
             self.back_buf.grow(new_length);
         }
 
-        self.back_buf
-            .write(&message)
-            .map_err(ChannelError::WriteError)?;
+        self.back_buf.write(&message).map_err(ChannelError::Write)?;
 
         self.back_buf
             .write(&b"\0"[..])
-            .map_err(ChannelError::WriteError)?;
+            .map_err(ChannelError::Write)?;
 
         self.interest.insert(Ready::WRITABLE);
 
@@ -406,13 +399,11 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
             self.back_buf.grow(new_len);
         }
 
-        self.back_buf
-            .write(&message)
-            .map_err(ChannelError::WriteError)?;
+        self.back_buf.write(&message).map_err(ChannelError::Write)?;
 
         self.back_buf
             .write(&b"\0"[..])
-            .map_err(ChannelError::WriteError)?;
+            .map_err(ChannelError::Write)?;
 
         loop {
             let size = self.back_buf.available_data();
@@ -440,7 +431,7 @@ impl<Tx: Debug + DeserializeOwned + Serialize, Rx: Debug + DeserializeOwned + Se
         buffer_size: usize,
         max_buffer_size: usize,
     ) -> Result<(Channel<Tx, Rx>, Channel<Rx, Tx>), ChannelError> {
-        let (command, proxy) = MioUnixStream::pair().map_err(ChannelError::IoError)?;
+        let (command, proxy) = MioUnixStream::pair().map_err(ChannelError::Read)?;
         let proxy_channel = Channel::new(proxy, buffer_size, max_buffer_size);
         let mut command_channel = Channel::new(command, buffer_size, max_buffer_size);
         command_channel.blocking()?;
@@ -452,7 +443,7 @@ impl<Tx: Debug + DeserializeOwned + Serialize, Rx: Debug + DeserializeOwned + Se
         buffer_size: usize,
         max_buffer_size: usize,
     ) -> Result<(Channel<Tx, Rx>, Channel<Rx, Tx>), ChannelError> {
-        let (command, proxy) = MioUnixStream::pair().map_err(ChannelError::IoError)?;
+        let (command, proxy) = MioUnixStream::pair().map_err(ChannelError::Read)?;
         let proxy_channel = Channel::new(proxy, buffer_size, max_buffer_size);
         let command_channel = Channel::new(command, buffer_size, max_buffer_size);
         Ok((command_channel, proxy_channel))

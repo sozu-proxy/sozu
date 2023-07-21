@@ -22,6 +22,7 @@ use crate::{
         display::format_request_type,
     },
     response::{Backend, HttpFrontend, TcpFrontend},
+    ObjectKind,
 };
 
 /// To use throughout Sōzu
@@ -35,38 +36,24 @@ pub enum StateError {
     NoChange,
     #[error("State can not handle this request")]
     UndispatchableRequest,
-    #[error("Did not find cluster {0}")]
-    ClusterNotFound(String),
-    #[error("Listener exists already on address {0}")]
-    ListenerExistsAlready(String),
+    #[error("Did not find {kind:?} with address or id '{id}'")]
+    NotFound { kind: ObjectKind, id: String },
+    #[error("{kind:?} '{id}' already exists")]
+    Exists { kind: ObjectKind, id: String },
     #[error("Wrong request: {0}")]
     WrongRequest(String),
-    #[error("No listener to remove at address {0}")]
-    NoListenerToRemove(String),
-    #[error("No backend to remove with id {0}")]
-    NoBackendToRemove(String),
-    #[error("No listener to activate at address {0}")]
-    NoListenerToActivate(String),
-    #[error("No listener to deactivate at address {0}")]
-    NoListenerToDeactivate(String),
-    #[error("Can not add the frontend, it is already there: {0}")]
-    FrontendAlreadyThere(String),
-    #[error("Can not remove this frontend, it is not found: {0}")]
-    NoFrontendToRemove(String),
     #[error("Could not add certificate: {0}")]
-    AddCertificateError(String),
+    AddCertificate(String),
     #[error("Could not remove certificate: {0}")]
-    RemoveCertificateError(String),
+    RemoveCertificate(String),
     #[error("Could not replace certificate: {0}")]
-    ReplaceCertificateError(String),
+    ReplaceCertificate(String),
     #[error("The provided socket address '{address}' is wrong: {error}")]
     WrongSocketAddress { address: String, error: String },
-    #[error("Certificate not found")]
-    CertificateNotFound,
     #[error(
         "Could not convert the frontend to an insertable one. Frontend: {frontend} error: {error}"
     )]
-    FrontendConversionError { frontend: String, error: String },
+    FrontendConversion { frontend: String, error: String },
 }
 
 /// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
@@ -176,7 +163,10 @@ impl ConfigState {
     fn remove_cluster(&mut self, cluster_id: &str) -> Result<(), StateError> {
         match self.clusters.remove(cluster_id) {
             Some(_) => Ok(()),
-            None => Err(StateError::ClusterNotFound(cluster_id.to_owned())),
+            None => Err(StateError::NotFound {
+                kind: ObjectKind::Cluster,
+                id: cluster_id.to_owned(),
+            }),
         }
     }
 
@@ -184,7 +174,12 @@ impl ConfigState {
         let address = listener.address.to_string();
         match self.http_listeners.entry(address.clone()) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
-            BTreeMapEntry::Occupied(_) => return Err(StateError::ListenerExistsAlready(address)),
+            BTreeMapEntry::Occupied(_) => {
+                return Err(StateError::Exists {
+                    kind: ObjectKind::HttpListener,
+                    id: address,
+                })
+            }
         };
         Ok(())
     }
@@ -193,7 +188,12 @@ impl ConfigState {
         let address = listener.address.to_string();
         match self.https_listeners.entry(address.clone()) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
-            BTreeMapEntry::Occupied(_) => return Err(StateError::ListenerExistsAlready(address)),
+            BTreeMapEntry::Occupied(_) => {
+                return Err(StateError::Exists {
+                    kind: ObjectKind::HttpsListener,
+                    id: address,
+                })
+            }
         };
         Ok(())
     }
@@ -202,7 +202,12 @@ impl ConfigState {
         let address = listener.address.to_string();
         match self.tcp_listeners.entry(address.clone()) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
-            BTreeMapEntry::Occupied(_) => return Err(StateError::ListenerExistsAlready(address)),
+            BTreeMapEntry::Occupied(_) => {
+                return Err(StateError::Exists {
+                    kind: ObjectKind::TcpListener,
+                    id: address,
+                })
+            }
         };
         Ok(())
     }
@@ -220,117 +225,87 @@ impl ConfigState {
 
     fn remove_http_listener(&mut self, address: &str) -> Result<(), StateError> {
         if self.http_listeners.remove(address).is_none() {
-            return Err(StateError::NoListenerToRemove(address.to_owned()));
+            return Err(StateError::NoChange);
         }
         Ok(())
     }
 
     fn remove_https_listener(&mut self, address: &str) -> Result<(), StateError> {
         if self.https_listeners.remove(address).is_none() {
-            return Err(StateError::NoListenerToRemove(address.to_owned()));
+            return Err(StateError::NoChange);
         }
         Ok(())
     }
 
     fn remove_tcp_listener(&mut self, address: &str) -> Result<(), StateError> {
         if self.tcp_listeners.remove(address).is_none() {
-            return Err(StateError::NoListenerToRemove(address.to_owned()));
+            return Err(StateError::NoChange);
         }
         Ok(())
     }
 
     fn activate_listener(&mut self, activate: &ActivateListener) -> Result<(), StateError> {
         match ListenerType::from_i32(activate.proxy) {
-            Some(ListenerType::Http) => {
-                if self
-                    .http_listeners
-                    .get_mut(&activate.address)
-                    .map(|listener| listener.active = true)
-                    .is_none()
-                {
-                    return Err(StateError::NoListenerToActivate(
-                        activate.address.to_owned(),
-                    ));
-                }
-            }
-            Some(ListenerType::Https) => {
-                if self
-                    .https_listeners
-                    .get_mut(&activate.address)
-                    .map(|listener| listener.active = true)
-                    .is_none()
-                {
-                    return Err(StateError::NoListenerToActivate(
-                        activate.address.to_owned(),
-                    ));
-                }
-            }
-            Some(ListenerType::Tcp) => {
-                if self
-                    .tcp_listeners
-                    .get_mut(&activate.address)
-                    .map(|listener| listener.active = true)
-                    .is_none()
-                {
-                    return Err(StateError::NoListenerToActivate(
-                        activate.address.to_owned(),
-                    ));
-                }
-            }
-            None => {
-                return Err(StateError::WrongRequest(
-                    "Wrong variant for ListenerType on request".to_string(),
-                ))
-            }
+            Some(ListenerType::Http) => self
+                .http_listeners
+                .get_mut(&activate.address)
+                .map(|listener| listener.active = true)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::HttpListener,
+                    id: activate.address.to_owned(),
+                }),
+            Some(ListenerType::Https) => self
+                .https_listeners
+                .get_mut(&activate.address)
+                .map(|listener| listener.active = true)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::HttpsListener,
+                    id: activate.address.to_owned(),
+                }),
+            Some(ListenerType::Tcp) => self
+                .tcp_listeners
+                .get_mut(&activate.address)
+                .map(|listener| listener.active = true)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::TcpListener,
+                    id: activate.address.to_owned(),
+                }),
+            None => Err(StateError::WrongRequest(
+                "Wrong variant for ListenerType on request".to_string(),
+            )),
         }
-        Ok(())
     }
 
     fn deactivate_listener(&mut self, deactivate: &DeactivateListener) -> Result<(), StateError> {
         match ListenerType::from_i32(deactivate.proxy) {
-            Some(ListenerType::Http) => {
-                if self
-                    .http_listeners
-                    .get_mut(&deactivate.address)
-                    .map(|listener| listener.active = false)
-                    .is_none()
-                {
-                    return Err(StateError::NoListenerToDeactivate(
-                        deactivate.address.to_owned(),
-                    ));
-                }
-            }
-            Some(ListenerType::Https) => {
-                if self
-                    .https_listeners
-                    .get_mut(&deactivate.address)
-                    .map(|listener| listener.active = false)
-                    .is_none()
-                {
-                    return Err(StateError::NoListenerToDeactivate(
-                        deactivate.address.to_owned(),
-                    ));
-                }
-            }
-            Some(ListenerType::Tcp) => {
-                if self
-                    .tcp_listeners
-                    .get_mut(&deactivate.address)
-                    .map(|listener| listener.active = false)
-                    .is_none()
-                {
-                    return Err(StateError::NoListenerToDeactivate(
-                        deactivate.address.to_owned(),
-                    ));
-                }
-            }
-            None => {
-                return Err(StateError::WrongRequest(
-                    "Wrong variant for ListenerType on request".to_string(),
-                ))
-            }
+            Some(ListenerType::Http) => self
+                .http_listeners
+                .get_mut(&deactivate.address)
+                .map(|listener| listener.active = false)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::HttpListener,
+                    id: deactivate.address.to_owned(),
+                }),
+            Some(ListenerType::Https) => self
+                .https_listeners
+                .get_mut(&deactivate.address)
+                .map(|listener| listener.active = false)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::HttpsListener,
+                    id: deactivate.address.to_owned(),
+                }),
+            Some(ListenerType::Tcp) => self
+                .tcp_listeners
+                .get_mut(&deactivate.address)
+                .map(|listener| listener.active = false)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::TcpListener,
+                    id: deactivate.address.to_owned(),
+                }),
+            None => Err(StateError::WrongRequest(
+                "Wrong variant for ListenerType on request".to_string(),
+            )),
         }
-        Ok(())
     }
 
     fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
@@ -339,14 +314,17 @@ impl ConfigState {
         match self.http_fronts.entry(front.to_string()) {
             BTreeMapEntry::Vacant(e) => {
                 e.insert(front.clone().to_frontend().map_err(|into_error| {
-                    StateError::FrontendConversionError {
+                    StateError::FrontendConversion {
                         frontend: front_as_key,
                         error: into_error.to_string(),
                     }
                 })?)
             }
             BTreeMapEntry::Occupied(_) => {
-                return Err(StateError::FrontendAlreadyThere(front.to_string()))
+                return Err(StateError::Exists {
+                    kind: ObjectKind::HttpFrontend,
+                    id: front.to_string(),
+                })
             }
         };
         Ok(())
@@ -358,37 +336,46 @@ impl ConfigState {
         match self.https_fronts.entry(front.to_string()) {
             BTreeMapEntry::Vacant(e) => {
                 e.insert(front.clone().to_frontend().map_err(|into_error| {
-                    StateError::FrontendConversionError {
+                    StateError::FrontendConversion {
                         frontend: front_as_key,
                         error: into_error.to_string(),
                     }
                 })?)
             }
             BTreeMapEntry::Occupied(_) => {
-                return Err(StateError::FrontendAlreadyThere(front.to_string()))
+                return Err(StateError::Exists {
+                    kind: ObjectKind::HttpsFrontend,
+                    id: front.to_string(),
+                })
             }
         };
         Ok(())
     }
 
     fn remove_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
-        if self.http_fronts.remove(&front.to_string()).is_none() {
-            return Err(StateError::NoFrontendToRemove(front.to_string()));
-        }
+        self.http_fronts
+            .remove(&front.to_string())
+            .ok_or(StateError::NotFound {
+                kind: ObjectKind::HttpFrontend,
+                id: front.to_string(),
+            })?;
         Ok(())
     }
 
     fn remove_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
-        if self.https_fronts.remove(&front.to_string()).is_none() {
-            return Err(StateError::NoFrontendToRemove(front.to_string()));
-        }
+        self.https_fronts
+            .remove(&front.to_string())
+            .ok_or(StateError::NotFound {
+                kind: ObjectKind::HttpsFrontend,
+                id: front.to_string(),
+            })?;
         Ok(())
     }
 
     fn add_certificate(&mut self, add: &AddCertificate) -> Result<(), StateError> {
         let fingerprint = Fingerprint(
             calculate_fingerprint(add.certificate.certificate.as_bytes()).map_err(
-                |fingerprint_err| StateError::AddCertificateError(format!("{:#}", fingerprint_err)),
+                |fingerprint_err| StateError::AddCertificate(fingerprint_err.to_string()),
             )?,
         );
 
@@ -412,10 +399,10 @@ impl ConfigState {
     }
 
     fn remove_certificate(&mut self, remove: &RemoveCertificate) -> Result<(), StateError> {
-        let fingerprint =
-            Fingerprint(hex::decode(&remove.fingerprint).map_err(|decode_error| {
-                StateError::RemoveCertificateError(decode_error.to_string())
-            })?);
+        let fingerprint = Fingerprint(
+            hex::decode(&remove.fingerprint)
+                .map_err(|decode_error| StateError::RemoveCertificate(decode_error.to_string()))?,
+        );
 
         let address = parse_socket_address(&remove.address)?;
 
@@ -433,20 +420,22 @@ impl ConfigState {
     fn replace_certificate(&mut self, replace: &ReplaceCertificate) -> Result<(), StateError> {
         let address = parse_socket_address(&replace.address)?;
 
-        let old_fingerprint = Fingerprint(hex::decode(&replace.old_fingerprint).map_err(
-            |decode_error| StateError::RemoveCertificateError(decode_error.to_string()),
-        )?);
+        let old_fingerprint = Fingerprint(
+            hex::decode(&replace.old_fingerprint)
+                .map_err(|decode_error| StateError::RemoveCertificate(decode_error.to_string()))?,
+        );
 
         self.certificates
             .get_mut(&address)
-            .ok_or(StateError::CertificateNotFound)?
+            .ok_or(StateError::NotFound {
+                kind: ObjectKind::Certificate,
+                id: address.to_string(),
+            })?
             .remove(&old_fingerprint);
 
         let new_fingerprint = Fingerprint(
             calculate_fingerprint(replace.new_certificate.certificate.as_bytes()).map_err(
-                |fingerprint_err| {
-                    StateError::ReplaceCertificateError(format!("{:#}", fingerprint_err))
-                },
+                |fingerprint_err| StateError::ReplaceCertificate(fingerprint_err.to_string()),
             )?,
         );
 
@@ -457,13 +446,13 @@ impl ConfigState {
         if !self
             .certificates
             .get(&address)
-            .ok_or(StateError::ReplaceCertificateError(
+            .ok_or(StateError::ReplaceCertificate(
                 "Unlikely error. This entry in the certificate hashmap should be present"
                     .to_string(),
             ))?
             .contains_key(&new_fingerprint)
         {
-            return Err(StateError::ReplaceCertificateError(format!(
+            return Err(StateError::ReplaceCertificate(format!(
                 "Failed to insert the new certificate for address {}",
                 replace.address
             )));
@@ -483,10 +472,10 @@ impl ConfigState {
             tags: front.tags.clone(),
         };
         if tcp_frontends.contains(&tcp_frontend) {
-            return Err(StateError::FrontendAlreadyThere(format!(
-                "This tcp frontend is already present: {:?}",
-                tcp_frontend
-            )));
+            return Err(StateError::Exists {
+                kind: ObjectKind::TcpFrontend,
+                id: format!("{:?}", tcp_frontend),
+            });
         }
 
         tcp_frontends.push(tcp_frontend);
@@ -499,9 +488,13 @@ impl ConfigState {
     ) -> Result<(), StateError> {
         let address = parse_socket_address(&front_to_remove.address)?;
 
-        let tcp_frontends = self.tcp_fronts.get_mut(&front_to_remove.cluster_id).ok_or(
-            StateError::NoFrontendToRemove(format!("{:?}", front_to_remove)),
-        )?;
+        let tcp_frontends =
+            self.tcp_fronts
+                .get_mut(&front_to_remove.cluster_id)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::TcpFrontend,
+                    id: format!("{:?}", front_to_remove),
+                })?;
 
         let len = tcp_frontends.len();
         tcp_frontends.retain(|front| front.address != address);
@@ -534,10 +527,13 @@ impl ConfigState {
     }
 
     fn remove_backend(&mut self, backend: &RemoveBackend) -> Result<(), StateError> {
-        let backend_list = self
-            .backends
-            .get_mut(&backend.cluster_id)
-            .ok_or(StateError::NoBackendToRemove(backend.backend_id.to_owned()))?;
+        let backend_list =
+            self.backends
+                .get_mut(&backend.cluster_id)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::Backend,
+                    id: backend.backend_id.to_owned(),
+                })?;
 
         let len = backend_list.len();
         backend_list.retain(|b| {

@@ -20,12 +20,10 @@ use super::load_balancing::*;
 pub enum BackendError {
     #[error("No backend found for cluster {0}")]
     NoBackendForCluster(String),
-    #[error("No more backend is available for cluster {0}")]
-    NoAvailableBackendForCluster(String),
     #[error("Failed to connect to socket with MIO: {0}")]
-    MioConnectionError(String),
+    MioConnection(std::io::Error),
     #[error("This backend is not in a normal status: status={0:?}")]
-    StatusNotNormal(BackendStatus),
+    Status(BackendStatus),
     #[error(
         "could not connect {cluster_id} to {backend_address:?} ({failures} failures): {error}"
     )]
@@ -142,7 +140,7 @@ impl Backend {
 
     pub fn try_connect(&mut self) -> Result<mio::net::TcpStream, BackendError> {
         if self.status != BackendStatus::Normal {
-            return Err(BackendError::StatusNotNormal(self.status.to_owned()));
+            return Err(BackendError::Status(self.status.to_owned()));
         }
 
         match mio::net::TcpStream::connect(self.address) {
@@ -151,14 +149,14 @@ impl Backend {
                 self.inc_connections();
                 Ok(tcp_stream)
             }
-            Err(mio_error) => {
+            Err(io_error) => {
                 self.retry_policy.fail();
                 self.failures += 1;
                 // TODO: handle EINPROGRESS. It is difficult. It is discussed here:
                 // https://docs.rs/mio/latest/mio/net/struct.TcpStream.html#method.connect
                 // with an example code here:
                 // https://github.com/Thomasdezeeuw/heph/blob/0c4f1ab3eaf08bea1d65776528bfd6114c9f8374/src/net/tcp/stream.rs#L560-L622
-                Err(BackendError::MioConnectionError(mio_error.to_string()))
+                Err(BackendError::MioConnection(io_error))
             }
         }
     }
@@ -275,9 +273,7 @@ impl BackendMap {
                         address: None,
                     });
                 }
-                return Err(BackendError::NoAvailableBackendForCluster(
-                    cluster_id.to_owned(),
-                ));
+                return Err(BackendError::NoBackendForCluster(cluster_id.to_owned()));
             }
         };
 

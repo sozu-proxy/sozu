@@ -424,7 +424,7 @@ impl L7ListenerHandler for HttpListener {
             Ok(tuple) => tuple,
             Err(parse_error) => {
                 // parse_error contains a slice of given_host, which should NOT escape this scope
-                return Err(FrontendFromRequestError::HostParsingFailure {
+                return Err(FrontendFromRequestError::HostParse {
                     host: host.to_owned(),
                     error: parse_error.to_string(),
                 });
@@ -487,7 +487,7 @@ impl HttpProxy {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
                 let http_listener = HttpListener::new(config, token)
-                    .map_err(|listener_error| ProxyError::AddListenerError(listener_error))?;
+                    .map_err(|listener_error| ProxyError::AddListener(listener_error))?;
                 entry.insert(Rc::new(RefCell::new(http_listener)));
                 Ok(token)
             }
@@ -524,7 +524,7 @@ impl HttpProxy {
         listener
             .borrow_mut()
             .activate(&self.registry, tcp_listener)
-            .map_err(|listener_error| ProxyError::ListenerActivationFailure {
+            .map_err(|listener_error| ProxyError::ListenerActivation {
                 address: addr.clone(),
                 listener_error,
             })
@@ -605,7 +605,7 @@ impl HttpProxy {
 
         listener
             .add_http_front(front)
-            .map_err(|listener_error| ProxyError::AddFrontendError(listener_error))?;
+            .map_err(|listener_error| ProxyError::AddFrontend(listener_error))?;
         listener.set_tags(hostname, tags);
         Ok(())
     }
@@ -629,7 +629,7 @@ impl HttpProxy {
 
         listener
             .remove_http_front(front)
-            .map_err(|listener_error| ProxyError::RemoveFrontendError(listener_error))?;
+            .map_err(|listener_error| ProxyError::RemoveFrontend(listener_error))?;
 
         listener.set_tags(hostname, None);
         Ok(())
@@ -649,7 +649,7 @@ impl HttpProxy {
         }
 
         if !socket_errors.is_empty() {
-            return Err(ProxyError::SoftStopError {
+            return Err(ProxyError::SoftStop {
                 proxy_protocol: "HTTP".to_string(),
                 error: format!("Error deregistering listen sockets: {:?}", socket_errors),
             });
@@ -672,7 +672,7 @@ impl HttpProxy {
         }
 
         if !socket_errors.is_empty() {
-            return Err(ProxyError::SoftStopError {
+            return Err(ProxyError::HardStop {
                 proxy_protocol: "HTTP".to_string(),
                 error: format!("Error deregistering listen sockets: {:?}", socket_errors),
             });
@@ -695,7 +695,7 @@ impl HttpListener {
         let address = config
             .address
             .parse::<SocketAddr>()
-            .map_err(|parse_error| ListenerError::SocketParseError {
+            .map_err(|parse_error| ListenerError::SocketParse {
                 address: config.address.clone(),
                 error: parse_error.to_string(),
             })?;
@@ -726,7 +726,7 @@ impl HttpListener {
         let mut listener = match tcp_listener {
             Some(tcp_listener) => tcp_listener,
             None => server_bind(self.config.address.clone()).map_err(|server_bind_error| {
-                ListenerError::ActivationError {
+                ListenerError::Activation {
                     address: self.config.address.clone(),
                     error: server_bind_error.to_string(),
                 }
@@ -735,7 +735,7 @@ impl HttpListener {
 
         registry
             .register(&mut listener, self.token, Interest::READABLE)
-            .map_err(|io_error| ListenerError::SocketRegistrationFailure(io_error.to_string()))?;
+            .map_err(|io_error| ListenerError::SocketRegistration(io_error))?;
 
         self.listener = Some(listener);
         self.active = true;
@@ -745,14 +745,14 @@ impl HttpListener {
     pub fn add_http_front(&mut self, http_front: HttpFrontend) -> Result<(), ListenerError> {
         self.fronts
             .add_http_front(&http_front)
-            .map_err(|router_error| ListenerError::AddFrontendError(router_error))
+            .map_err(|router_error| ListenerError::AddFrontend(router_error))
     }
 
     pub fn remove_http_front(&mut self, http_front: HttpFrontend) -> Result<(), ListenerError> {
         debug!("removing http_front {:?}", http_front);
         self.fronts
             .remove_http_front(&http_front)
-            .map_err(|router_error| ListenerError::RemoveFrontendError(router_error))
+            .map_err(|router_error| ListenerError::RemoveFrontend(router_error))
     }
 
     fn accept(&mut self) -> Result<TcpStream, AcceptError> {
@@ -844,8 +844,8 @@ impl ProxyConfiguration for HttpProxy {
                 WorkerResponse::ok(request_id)
             }
             Err(proxy_error) => {
-                debug!("{} unsuccessful: {:#}", request_id, proxy_error);
-                WorkerResponse::error(request_id, format!("{proxy_error}"))
+                debug!("{} unsuccessful: {}", request_id, proxy_error);
+                WorkerResponse::error(request_id, proxy_error)
             }
         }
     }

@@ -10,19 +10,19 @@ use socket2::{Domain, Protocol, Socket, Type};
 #[derive(thiserror::Error, Debug)]
 pub enum ServerBindError {
     #[error("could not set bind to socket: {0}")]
-    BindError(String),
+    BindError(std::io::Error),
     #[error("could not listen on socket: {0}")]
-    Listen(String),
+    Listen(std::io::Error),
     #[error("could not set socket to nonblocking: {0}")]
-    SetNonBlocking(String),
+    SetNonBlocking(std::io::Error),
     #[error("could not set reuse address: {0}")]
-    SetReuseAddress(String),
+    SetReuseAddress(std::io::Error),
     #[error("could not set reuse address: {0}")]
-    SetReusePort(String),
+    SetReusePort(std::io::Error),
     #[error("Could not create socket: {0}")]
-    SocketCreationError(String),
-    #[error("Wrong socket address '{address}': {error}")]
-    WrongAddress { address: String, error: String },
+    SocketCreationError(std::io::Error),
+    #[error("Invalid socket address '{address}': {error}")]
+    InvalidSocketAddress { address: String, error: String },
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -378,41 +378,41 @@ impl SocketHandler for FrontRustls {
 }
 
 pub fn server_bind(addr: String) -> Result<TcpListener, ServerBindError> {
-    let address =
-        addr.parse::<SocketAddr>()
-            .map_err(|parse_error| ServerBindError::WrongAddress {
-                address: addr.clone(),
-                error: parse_error.to_string(),
-            })?;
+    let address = addr.parse::<SocketAddr>().map_err(|parse_error| {
+        ServerBindError::InvalidSocketAddress {
+            address: addr.clone(),
+            error: parse_error.to_string(),
+        }
+    })?;
 
     let sock = Socket::new(
         Domain::for_address(address),
         Type::STREAM,
         Some(Protocol::TCP),
     )
-    .map_err(|io_error| ServerBindError::SocketCreationError(io_error.to_string()))?;
+    .map_err(|io_error| ServerBindError::SocketCreationError(io_error))?;
 
     // set so_reuseaddr, but only on unix (mirrors what libstd does)
     if cfg!(unix) {
         sock.set_reuse_address(true)
-            .map_err(|io_error| ServerBindError::SetReuseAddress(io_error.to_string()))?;
+            .map_err(|io_error| ServerBindError::SetReuseAddress(io_error))?;
     }
 
     sock.set_reuse_port(true)
-        .map_err(|io_error| ServerBindError::SetReusePort(io_error.to_string()))?;
+        .map_err(|io_error| ServerBindError::SetReusePort(io_error))?;
 
     // bind the socket
     let addr = address.into();
     sock.bind(&addr)
-        .map_err(|io_error| ServerBindError::BindError(io_error.to_string()))?;
+        .map_err(|io_error| ServerBindError::BindError(io_error))?;
 
     sock.set_nonblocking(true)
-        .map_err(|io_error| ServerBindError::SetNonBlocking(io_error.to_string()))?;
+        .map_err(|io_error| ServerBindError::SetNonBlocking(io_error))?;
 
     // listen
     // FIXME: make the backlog configurable?
     sock.listen(1024)
-        .map_err(|io_error| ServerBindError::Listen(io_error.to_string()))?;
+        .map_err(|io_error| ServerBindError::Listen(io_error))?;
 
     Ok(TcpListener::from_std(sock.into()))
 }

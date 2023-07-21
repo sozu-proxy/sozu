@@ -949,7 +949,7 @@ impl Server {
                 METRICS.with(|metrics| {
                     match (*metrics.borrow_mut()).query(query_metrics_options) {
                         Ok(c) => push_queue(WorkerResponse::ok_with_content(message.id.clone(), c)),
-                        Err(e) => error!("Error querying metrics: {:#}", e),
+                        Err(e) => error!("Error querying metrics: {}", e),
                     }
                 });
                 return;
@@ -962,7 +962,7 @@ impl Server {
 
     pub fn notify_proxys(&mut self, request: WorkerRequest) {
         if let Err(e) = self.config_state.dispatch(&request.content) {
-            error!("Could not execute order on config state: {:#}", e);
+            error!("Could not execute order on config state: {}", e);
         }
 
         let req_id = request.id.clone();
@@ -1087,7 +1087,7 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Err(e) => {
-                let error = format!("Couldn't add HTTP listener: {e:#}");
+                let error = format!("Couldn't add HTTP listener: {e}");
                 error!("{}", error);
                 WorkerResponse::error(req_id, error)
             }
@@ -1156,7 +1156,7 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Err(e) => {
-                let error = format!("Couldn't add TCP listener: {e:#}");
+                let error = format!("Couldn't add TCP listener: {e}");
                 error!("{}", error);
                 WorkerResponse::error(req_id, error)
             }
@@ -1193,8 +1193,8 @@ impl Server {
                         WorkerResponse::ok(req_id)
                     }
                     Err(activate_error) => {
-                        error!("Could not activate HTTP listener: {:#}", activate_error);
-                        WorkerResponse::error(req_id, format!("{activate_error:#}"))
+                        error!("Could not activate HTTP listener: {}", activate_error);
+                        WorkerResponse::error(req_id, activate_error)
                     }
                 }
             }
@@ -1215,8 +1215,8 @@ impl Server {
                         WorkerResponse::ok(req_id)
                     }
                     Err(activate_error) => {
-                        error!("Could not activate HTTPS listener: {:#}", activate_error);
-                        WorkerResponse::error(req_id, format!("{activate_error:#}"))
+                        error!("Could not activate HTTPS listener: {}", activate_error);
+                        WorkerResponse::error(req_id, activate_error)
                     }
                 }
             }
@@ -1264,11 +1264,10 @@ impl Server {
                 {
                     Some((token, listener)) => (token, listener),
                     None => {
-                        error!("Couldn't deactivate HTTP listener at address {:?}", address);
-                        return WorkerResponse::error(
-                            req_id,
-                            format!("cannot deactivate HTTP listener at address {address:?}"),
-                        );
+                        let error =
+                            format!("Couldn't deactivate HTTP listener at address {address:?}");
+                        error!("{}", error);
+                        return WorkerResponse::error(req_id, error);
                     }
                 };
 
@@ -1309,14 +1308,12 @@ impl Server {
                         Some((token, listener)) => (token, listener),
 
                         None => {
-                            error!(
+                            let error = format!(
                                 "Couldn't deactivate HTTPS listener at address {:?}",
                                 address
                             );
-                            return WorkerResponse::error(
-                                req_id,
-                                format!("cannot deactivate HTTPS listener at address {address:?}"),
-                            );
+                            error!("{}", error);
+                            return WorkerResponse::error(req_id, error);
                         }
                     };
                 if let Err(e) = self.poll.registry().deregister(&mut listener) {
@@ -1351,11 +1348,10 @@ impl Server {
                 {
                     Some((token, listener)) => (token, listener),
                     None => {
-                        error!("Couldn't deactivate TCP listener at address {:?}", address);
-                        return WorkerResponse::error(
-                            req_id,
-                            format!("cannot deactivate TCP listener at address {address:?}"),
-                        );
+                        let error =
+                            format!("Couldn't deactivate TCP listener at address {:?}", address);
+                        error!("{}", error);
+                        return WorkerResponse::error(req_id, error);
                     }
                 };
 

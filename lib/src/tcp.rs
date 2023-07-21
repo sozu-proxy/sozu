@@ -16,7 +16,7 @@ use mio::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::proto::command::request::RequestType;
+use sozu_command::{proto::command::request::RequestType, ObjectKind};
 use time::{Duration, Instant};
 
 use crate::{
@@ -585,7 +585,7 @@ impl TcpSession {
                     }
                     // TODO: should we return CloseSession here?
                     Err(connection_error) => {
-                        error!("Error connecting to backend: {:#}", connection_error)
+                        error!("Error connecting to backend: {}", connection_error);
                     }
                 }
             } else if self.back_readiness().unwrap().event != Ready::EMPTY {
@@ -607,7 +607,7 @@ impl TcpSession {
                     return StateResult::Continue;
                 }
                 Err(connection_error) => {
-                    error!("Error connecting to backend: {:#}", connection_error)
+                    error!("Error connecting to backend: {}", connection_error)
                 }
             }
         }
@@ -669,7 +669,7 @@ impl TcpSession {
                                 return StateResult::Continue;
                             }
                             Err(connection_error) => {
-                                error!("Error connecting to backend: {:#}", connection_error)
+                                error!("Error connecting to backend: {}", connection_error)
                             }
                         }
                     }
@@ -826,17 +826,19 @@ impl TcpSession {
             .borrow()
             .cluster_id
             .clone()
-            .ok_or(BackendConnectionError::FoundNoTcpCluster)?;
+            .ok_or(BackendConnectionError::NotFound(ObjectKind::TcpCluster))?;
 
         self.cluster_id = Some(cluster_id.clone());
 
         if self.connection_attempt >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
-            return Err(BackendConnectionError::TooManyConnections(cluster_id));
+            return Err(BackendConnectionError::MaxConnectionRetries(Some(
+                cluster_id,
+            )));
         }
 
         if self.proxy.borrow().sessions.borrow().at_capacity() {
-            return Err(BackendConnectionError::SessionsMemoryAtCapacity);
+            return Err(BackendConnectionError::MaxSessionsMemory);
         }
 
         let (backend, mut stream) = self
@@ -845,7 +847,7 @@ impl TcpSession {
             .backends
             .borrow_mut()
             .backend_from_cluster_id(&cluster_id)
-            .map_err(|backend_error| BackendConnectionError::BackendError(backend_error))?;
+            .map_err(|backend_error| BackendConnectionError::Backend(backend_error))?;
 
         /*
         this was the old error matching for backend_from_cluster_id.
@@ -1107,7 +1109,7 @@ impl TcpListener {
         let address = config
             .address
             .parse::<SocketAddr>()
-            .map_err(|parse_error| ListenerError::SocketParseError {
+            .map_err(|parse_error| ListenerError::SocketParse {
                 address: config.address.clone(),
                 error: parse_error.to_string(),
             })?;
@@ -1137,10 +1139,7 @@ impl TcpListener {
         let mut listener = tcp_listener.or_else(|| {
             server_bind(self.config.address.clone())
                 .map_err(|e| {
-                    error!(
-                        "could not create listener {:?}: {:#}",
-                        self.config.address, e
-                    );
+                    error!("could not create listener {:?}: {}", self.config.address, e);
                 })
                 .ok()
         });
@@ -1201,7 +1200,7 @@ impl TcpProxy {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
                 let tcp_listener = TcpListener::new(config, pool, token)
-                    .map_err(|listener_error| ProxyError::AddListenerError(listener_error))?;
+                    .map_err(|listener_error| ProxyError::AddListener(listener_error))?;
                 entry.insert(Rc::new(RefCell::new(tcp_listener)));
                 Ok(token)
             }
@@ -1258,12 +1257,14 @@ impl TcpProxy {
     }
 
     pub fn add_tcp_front(&mut self, front: RequestTcpFrontend) -> Result<(), ProxyError> {
-        let address = front.address.parse::<SocketAddr>().map_err(|parse_error| {
-            ProxyError::SocketParseError {
-                address: front.address.clone(),
-                error: parse_error.to_string(),
-            }
-        })?;
+        let address =
+            front
+                .address
+                .parse::<SocketAddr>()
+                .map_err(|parse_error| ProxyError::SocketParse {
+                    address: front.address.clone(),
+                    error: parse_error.to_string(),
+                })?;
 
         let mut listener = self
             .listeners

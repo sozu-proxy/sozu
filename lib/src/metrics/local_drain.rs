@@ -271,7 +271,7 @@ impl LocalDrain {
         let raw_metrics = self
             .cluster_metrics
             .get(cluster_id)
-            .ok_or(MetricError::NoMetricsForCluster(cluster_id.to_owned()))?;
+            .ok_or(MetricError::NoMetrics(cluster_id.to_owned()))?;
 
         let cluster: BTreeMap<String, FilteredMetrics> = raw_metrics
             .iter()
@@ -301,7 +301,7 @@ impl LocalDrain {
         let backend_metrics = self
             .cluster_metrics
             .get(backend_id)
-            .ok_or(MetricError::NoMetricsForBackend(backend_id.to_owned()))?;
+            .ok_or(MetricError::NoMetrics(backend_id.to_owned()))?;
 
         let filtered_backend_metrics = backend_metrics
             .iter()
@@ -354,7 +354,7 @@ impl LocalDrain {
             let cluster_id = self
                 .backend_to_cluster
                 .get(backend_id)
-                .ok_or(MetricError::NoMetricsForBackend(backend_id.to_owned()))?
+                .ok_or(MetricError::NoMetrics(backend_id.to_owned()))?
                 .to_owned();
 
             let backends = vec![self.metrics_of_one_backend(backend_id, metric_names)?];

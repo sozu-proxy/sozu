@@ -68,6 +68,7 @@ use crate::{
         RequestHttpFrontend, RequestTcpFrontend, RulePosition, TcpListenerConfig, TlsVersion,
     },
     request::WorkerRequest,
+    ObjectKind,
 };
 
 /// provides all supported cipher suites exported by Rustls TLS
@@ -154,38 +155,49 @@ pub const DEFAULT_COMMAND_BUFFER_SIZE: usize = 1_000_000;
 /// maximum size of the buffer for the channels, in bytes. (2 MB)
 pub const DEFAULT_MAX_COMMAND_BUFFER_SIZE: usize = 2_000_000;
 
+#[derive(Debug)]
+pub enum IncompatibilityKind {
+    PublicAddress,
+    ProxyProtocol,
+}
+
+#[derive(Debug)]
+pub enum MissingKind {
+    Field(String),
+    Protocol,
+    SavedState,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ConfigError {
     #[error("Could not parse socket address {address}: {error}")]
-    AddressParsingError { address: String, error: String },
+    ParseSocketAddress { address: String, error: String },
     #[error("env path not found: {0}")]
-    EnvError(String),
+    Env(String),
     #[error("Could not open file {path_to_open}: {io_error}")]
-    FileOpenError {
+    FileOpen {
         path_to_open: String,
-        io_error: String,
+        io_error: std::io::Error,
     },
     #[error("Could not read file {path_to_read}: {io_error}")]
-    FileReadError {
+    FileRead {
         path_to_read: String,
-        io_error: String,
+        io_error: std::io::Error,
     },
-    #[error("the listener on {0} has incompatible options: it cannot use the expect proxy protocol and have a public_address field at the same time",)]
-    IncompatiblePublicAddress(String),
-    #[error("all the listeners for cluster {0} should have the same expect_proxy option")]
-    InconsistentExpectProxyOption(String),
+    #[error("the field {kind:?} of {object:?} with id or address {id} is incompatible with the rest of the options")]
+    Incompatible {
+        kind: IncompatibilityKind,
+        object: ObjectKind,
+        id: String,
+    },
     #[error("Invalid '{0}' field for a TCP frontend")]
-    InvalidField(String),
+    InvalidFrontendConfig(String),
     #[error("invalid path {0:?}")]
     InvalidPath(PathBuf),
     #[error("listening address {0} is already used in the configuration")]
     ListenerAddressAlreadyInUse(String),
-    #[error("Invalid '{0}' field to create a frontend")]
-    MissingField(String),
-    #[error("missing field 'protocol' to create a listener")]
-    MissingProtocol,
-    #[error("cannot activate automatic state save if the 'saved_state` option is not set")]
-    MissingSavedState,
+    #[error("missing {0:?}")]
+    Missing(MissingKind),
     #[error("could not get parent directory for file {0}")]
     NoFileParent(String),
     #[error("Could not get the path of the saved state")]
@@ -193,7 +205,7 @@ pub enum ConfigError {
     #[error("Can not determine path to sozu socket: {0}")]
     SocketPathError(String),
     #[error("toml decoding error: {0}")]
-    TomlDeserialization(String),
+    DeserializeToml(String),
     #[error("Can not set this frontend on a {0:?} listener")]
     WrongFrontendProtocol(ListenerProtocol),
     #[error("Can not build a {expected:?} listener from a {found:?} config")]
@@ -586,7 +598,7 @@ impl ListenerBuilder {
 fn parse_socket_address(address: &str) -> Result<SocketAddr, ConfigError> {
     address
         .parse::<SocketAddr>()
-        .map_err(|parse_error| ConfigError::AddressParsingError {
+        .map_err(|parse_error| ConfigError::ParseSocketAddress {
             error: parse_error.to_string(),
             address: address.to_owned(),
         })
@@ -594,15 +606,15 @@ fn parse_socket_address(address: &str) -> Result<SocketAddr, ConfigError> {
 
 fn open_and_read_file(path: &str) -> Result<String, ConfigError> {
     let mut content = String::new();
-    let mut file = File::open(path).map_err(|io_error| ConfigError::FileOpenError {
+    let mut file = File::open(path).map_err(|io_error| ConfigError::FileOpen {
         path_to_open: path.to_owned(),
-        io_error: io_error.to_string(),
+        io_error,
     })?;
 
     file.read_to_string(&mut content)
-        .map_err(|io_error| ConfigError::FileReadError {
+        .map_err(|io_error| ConfigError::FileRead {
             path_to_read: path.to_owned(),
-            io_error: io_error.to_string(),
+            io_error,
         })?;
 
     Ok(content)
@@ -650,19 +662,25 @@ pub struct FileClusterFrontendConfig {
 impl FileClusterFrontendConfig {
     pub fn to_tcp_front(&self) -> Result<TcpFrontendConfig, ConfigError> {
         if self.hostname.is_some() {
-            return Err(ConfigError::InvalidField("hostname".to_string()));
+            return Err(ConfigError::InvalidFrontendConfig("hostname".to_string()));
         }
         if self.path.is_some() {
-            return Err(ConfigError::InvalidField("path_prefix".to_string()));
+            return Err(ConfigError::InvalidFrontendConfig(
+                "path_prefix".to_string(),
+            ));
         }
         if self.certificate.is_some() {
-            return Err(ConfigError::InvalidField("certificate".to_string()));
+            return Err(ConfigError::InvalidFrontendConfig(
+                "certificate".to_string(),
+            ));
         }
         if self.hostname.is_some() {
-            return Err(ConfigError::InvalidField("hostname".to_string()));
+            return Err(ConfigError::InvalidFrontendConfig("hostname".to_string()));
         }
         if self.certificate_chain.is_some() {
-            return Err(ConfigError::InvalidField("certificate_chain".to_string()));
+            return Err(ConfigError::InvalidFrontendConfig(
+                "certificate_chain".to_string(),
+            ));
         }
 
         Ok(TcpFrontendConfig {
@@ -674,7 +692,11 @@ impl FileClusterFrontendConfig {
     pub fn to_http_front(&self, _cluster_id: &str) -> Result<HttpFrontendConfig, ConfigError> {
         let hostname = match &self.hostname {
             Some(hostname) => hostname.to_owned(),
-            None => return Err(ConfigError::MissingField("hostname".to_string())),
+            None => {
+                return Err(ConfigError::Missing(MissingKind::Field(
+                    "hostname".to_string(),
+                )))
+            }
         };
 
         let key_opt = match self.key.as_ref() {
@@ -781,9 +803,11 @@ impl FileClusterConfig {
                         match has_expect_proxy {
                             Some(true) => {}
                             Some(false) => {
-                                return Err(ConfigError::InconsistentExpectProxyOption(
-                                    cluster_id.to_owned(),
-                                ))
+                                return Err(ConfigError::Incompatible {
+                                    object: ObjectKind::Cluster,
+                                    id: cluster_id.to_owned(),
+                                    kind: IncompatibilityKind::ProxyProtocol,
+                                })
                             }
                             None => has_expect_proxy = Some(true),
                         }
@@ -791,9 +815,11 @@ impl FileClusterConfig {
                         match has_expect_proxy {
                             Some(false) => {}
                             Some(true) => {
-                                return Err(ConfigError::InconsistentExpectProxyOption(
-                                    cluster_id.to_owned(),
-                                ))
+                                return Err(ConfigError::Incompatible {
+                                    object: ObjectKind::Cluster,
+                                    id: cluster_id.to_owned(),
+                                    kind: IncompatibilityKind::ProxyProtocol,
+                                })
                             }
                             None => has_expect_proxy = Some(false),
                         }
@@ -1108,7 +1134,7 @@ impl FileConfig {
             Ok(config) => config,
             Err(e) => {
                 display_toml_error(&data, &e);
-                return Err(ConfigError::TomlDeserialization(e.to_string()));
+                return Err(ConfigError::DeserializeToml(e.to_string()));
             }
         };
 
@@ -1257,7 +1283,9 @@ impl ConfigBuilder {
                 ));
             }
 
-            let protocol = listener.protocol.ok_or(ConfigError::MissingProtocol)?;
+            let protocol = listener
+                .protocol
+                .ok_or(ConfigError::Missing(MissingKind::Protocol))?;
 
             self.known_addresses.insert(address, protocol);
             if listener.expect_proxy == Some(true) {
@@ -1265,9 +1293,11 @@ impl ConfigBuilder {
             }
 
             if listener.public_address.is_some() && listener.expect_proxy == Some(true) {
-                return Err(ConfigError::IncompatiblePublicAddress(
-                    listener.address.to_string(),
-                ));
+                return Err(ConfigError::Incompatible {
+                    object: ObjectKind::Listener,
+                    id: listener.address.to_owned(),
+                    kind: IncompatibilityKind::PublicAddress,
+                });
             }
 
             match protocol {
@@ -1390,7 +1420,7 @@ impl ConfigBuilder {
         }
 
         let command_socket_path = self.file.command_socket.clone().unwrap_or({
-            let mut path = env::current_dir().map_err(|e| ConfigError::EnvError(e.to_string()))?;
+            let mut path = env::current_dir().map_err(|e| ConfigError::Env(e.to_string()))?;
             path.push("sozu.sock");
             let verified_path = path
                 .to_str()
@@ -1399,7 +1429,7 @@ impl ConfigBuilder {
         });
 
         if let (None, Some(true)) = (&self.file.saved_state, &self.file.automatic_state_save) {
-            return Err(ConfigError::MissingSavedState);
+            return Err(ConfigError::Missing(MissingKind::SavedState));
         }
 
         Ok(Config {
@@ -1696,17 +1726,17 @@ impl Config {
 
     /// read any file to a string
     pub fn load_file(path: &str) -> Result<String, ConfigError> {
-        std::fs::read_to_string(path).map_err(|io_error| ConfigError::FileReadError {
+        std::fs::read_to_string(path).map_err(|io_error| ConfigError::FileRead {
             path_to_read: path.to_owned(),
-            io_error: io_error.to_string(),
+            io_error,
         })
     }
 
     /// read any file to bytes
     pub fn load_file_bytes(path: &str) -> Result<Vec<u8>, ConfigError> {
-        std::fs::read(path).map_err(|io_error| ConfigError::FileReadError {
+        std::fs::read(path).map_err(|io_error| ConfigError::FileRead {
             path_to_read: path.to_owned(),
-            io_error: io_error.to_string(),
+            io_error,
         })
     }
 }

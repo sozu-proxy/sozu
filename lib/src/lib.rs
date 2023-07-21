@@ -395,7 +395,10 @@ use backends::BackendError;
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
 use router::RouterError;
-use sozu_command::proto::command::{ListenerType, RequestHttpFrontend};
+use sozu_command::{
+    proto::command::{ListenerType, RequestHttpFrontend},
+    ObjectKind,
+};
 use sozu_command_lib::{
     proto::command::Cluster, ready::Ready, request::WorkerRequest, response::WorkerResponse,
     state::ClusterId,
@@ -404,10 +407,6 @@ use time::{Duration, Instant};
 use tls::GenericCertificateResolverError;
 
 use self::{backends::BackendMap, router::Route};
-
-/// returned by proxies when dispatching changes to their state
-#[derive(thiserror::Error, Debug)]
-pub enum NotifyError {}
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -602,7 +601,7 @@ pub trait ListenerHandler {
 #[derive(thiserror::Error, Debug)]
 pub enum FrontendFromRequestError {
     #[error("Could not parse hostname from '{host}': {error}")]
-    HostParsingFailure { host: String, error: String },
+    HostParse { host: String, error: String },
     #[error("invalid remaining chars after hostname. Host: {0}")]
     InvalidCharsAfterHost(String),
     #[error("no cluster found")]
@@ -645,16 +644,14 @@ pub enum BackendConnectAction {
 
 #[derive(thiserror::Error, Debug)]
 pub enum BackendConnectionError {
-    #[error("Found no TCP cluster")]
-    FoundNoTcpCluster,
-    #[error("Too many connections on cluster {0}")]
-    TooManyConnections(String),
+    #[error("Not found: {0:?}")]
+    NotFound(ObjectKind),
+    #[error("Too many connections on cluster {0:?}")]
+    MaxConnectionRetries(Option<String>),
     #[error("the sessions slab has reached maximum capacity")]
-    SessionsMemoryAtCapacity,
+    MaxSessionsMemory,
     #[error("error from the backend: {0}")]
-    BackendError(BackendError),
-    #[error("Reached maximum attempts to connect to this backend")]
-    TooManyAttempts,
+    Backend(BackendError),
     #[error("failed to retrieve the cluster: {0}")]
     RetrieveClusterError(RetrieveClusterError),
 }
@@ -671,7 +668,7 @@ pub enum RetrieveClusterError {
     #[error("unauthorized route")]
     UnauthorizedRoute,
     #[error("failed to retrieve the frontend for the request: {0}")]
-    FrontendFromRequestError(FrontendFromRequestError),
+    RetrieveFrontend(FrontendFromRequestError),
 }
 
 /// Used in sessions
@@ -689,35 +686,35 @@ pub enum AcceptError {
 #[derive(thiserror::Error, Debug)]
 pub enum ListenerError {
     #[error("failed to acquire the lock, {0}")]
-    LockError(String),
+    Lock(String),
     #[error("failed to handle certificate request, got a resolver error, {0}")]
-    ResolverError(GenericCertificateResolverError),
+    Resolver(GenericCertificateResolverError),
     #[error("failed to parse pem, {0}")]
-    PemParseError(String),
+    PemParse(String),
     #[error("failed to build rustls context, {0}")]
-    BuildRustlsError(String),
+    BuildRustls(String),
     #[error("Wrong socket address")]
-    SocketParseError { address: String, error: String },
+    SocketParse { address: String, error: String },
     #[error("could not activate listener with address {address}: {error}")]
-    ActivationError { address: String, error: String },
+    Activation { address: String, error: String },
     #[error("Could not register listener socket: {0}")]
-    SocketRegistrationFailure(String),
+    SocketRegistration(std::io::Error),
     #[error("could not add frontend: {0}")]
-    AddFrontendError(RouterError),
+    AddFrontend(RouterError),
     #[error("could not remove frontend: {0}")]
-    RemoveFrontendError(RouterError),
+    RemoveFrontend(RouterError),
 }
 
 /// Returned by the HTTP, HTTPS and TCP proxies
 #[derive(thiserror::Error, Debug)]
 pub enum ProxyError {
     #[error("error while soft stopping {proxy_protocol} proxy: {error}")]
-    SoftStopError {
+    SoftStop {
         proxy_protocol: String,
         error: String,
     },
     #[error("error while hard stopping {proxy_protocol} proxy: {error}")]
-    HardStopError {
+    HardStop {
         proxy_protocol: String,
         error: String,
     },
@@ -726,9 +723,9 @@ pub enum ProxyError {
     #[error("a listener is already present for this token")]
     ListenerAlreadyPresent,
     #[error("could not create add listener: {0}")]
-    AddListenerError(ListenerError),
+    AddListener(ListenerError),
     #[error("failed to activate listener with address {address:?}: {listener_error}")]
-    ListenerActivationFailure {
+    ListenerActivation {
         address: SocketAddr,
         listener_error: ListenerError,
     },
@@ -738,17 +735,17 @@ pub enum ProxyError {
         error: String,
     },
     #[error("could not add frontend: {0}")]
-    AddFrontendError(ListenerError),
+    AddFrontend(ListenerError),
     #[error("could not remove frontend: {0}")]
-    RemoveFrontendError(ListenerError),
+    RemoveFrontend(ListenerError),
     #[error("could not add certificate: {0}")]
-    AddCertificateError(ListenerError),
+    AddCertificate(ListenerError),
     #[error("could not remove certificate: {0}")]
-    RemoveCertificateError(ListenerError),
+    RemoveCertificate(ListenerError),
     #[error("could not replace certificate: {0}")]
-    ReplaceCertificateError(ListenerError),
+    ReplaceCertificate(ListenerError),
     #[error("Wrong address {address}: {error}")]
-    SocketParseError { address: String, error: String },
+    SocketParse { address: String, error: String },
     #[error("wrong certificate fingerprint: {0}")]
     WrongCertificateFingerprint(String),
     #[error("this request is not supported by the proxy")]

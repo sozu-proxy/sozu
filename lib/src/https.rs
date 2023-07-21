@@ -566,7 +566,7 @@ impl L7ListenerHandler for HttpsListener {
             Ok(tuple) => tuple,
             Err(parse_error) => {
                 // parse_error contains a slice of given_host, which should NOT escape this scope
-                return Err(FrontendFromRequestError::HostParsingFailure {
+                return Err(FrontendFromRequestError::HostParse {
                     host: host.to_owned(),
                     error: parse_error.to_string(),
                 });
@@ -598,7 +598,7 @@ impl CertificateResolver for HttpsListener {
             .resolver
             .0
             .lock()
-            .map_err(|err| ListenerError::LockError(err.to_string()))
+            .map_err(|err| ListenerError::Lock(err.to_string()))
             .ok()?;
 
         resolver.get_certificate(fingerprint)
@@ -609,11 +609,11 @@ impl CertificateResolver for HttpsListener {
             .resolver
             .0
             .lock()
-            .map_err(|err| ListenerError::LockError(err.to_string()))?;
+            .map_err(|err| ListenerError::Lock(err.to_string()))?;
 
         resolver
             .add_certificate(opts)
-            .map_err(ListenerError::ResolverError)
+            .map_err(ListenerError::Resolver)
     }
 
     fn remove_certificate(&mut self, fingerprint: &Fingerprint) -> Result<(), Self::Error> {
@@ -621,11 +621,11 @@ impl CertificateResolver for HttpsListener {
             .resolver
             .0
             .lock()
-            .map_err(|err| ListenerError::LockError(err.to_string()))?;
+            .map_err(|err| ListenerError::Lock(err.to_string()))?;
 
         resolver
             .remove_certificate(fingerprint)
-            .map_err(ListenerError::ResolverError)
+            .map_err(ListenerError::Resolver)
     }
 }
 
@@ -641,7 +641,7 @@ impl HttpsListener {
         let address = config
             .address
             .parse::<StdSocketAddr>()
-            .map_err(|parse_error| ListenerError::SocketParseError {
+            .map_err(|parse_error| ListenerError::SocketParse {
                 address: config.address.clone(),
                 error: parse_error.to_string(),
             })?;
@@ -675,7 +675,7 @@ impl HttpsListener {
         let mut listener = match tcp_listener {
             Some(tcp_listener) => tcp_listener,
             None => server_bind(self.config.address.clone()).map_err(|server_bind_error| {
-                ListenerError::ActivationError {
+                ListenerError::Activation {
                     address: self.config.address.clone(),
                     error: server_bind_error.to_string(),
                 }
@@ -684,7 +684,7 @@ impl HttpsListener {
 
         registry
             .register(&mut listener, self.token, Interest::READABLE)
-            .map_err(|io_error| ListenerError::SocketRegistrationFailure(io_error.to_string()))?;
+            .map_err(|io_error| ListenerError::SocketRegistration(io_error))?;
 
         self.listener = Some(listener);
         self.active = true;
@@ -742,7 +742,7 @@ impl HttpsListener {
             .with_cipher_suites(&ciphers[..])
             .with_safe_default_kx_groups()
             .with_protocol_versions(&versions[..])
-            .map_err(|err| ListenerError::BuildRustlsError(err.to_string()))?
+            .map_err(|err| ListenerError::BuildRustls(err.to_string()))?
             .with_no_client_auth()
             .with_cert_resolver(resolver);
 
@@ -758,14 +758,14 @@ impl HttpsListener {
     pub fn add_https_front(&mut self, tls_front: HttpFrontend) -> Result<(), ListenerError> {
         self.fronts
             .add_http_front(&tls_front)
-            .map_err(|router_error| ListenerError::AddFrontendError(router_error))
+            .map_err(|router_error| ListenerError::AddFrontend(router_error))
     }
 
     pub fn remove_https_front(&mut self, tls_front: HttpFrontend) -> Result<(), ListenerError> {
         debug!("removing tls_front {:?}", tls_front);
         self.fronts
             .remove_http_front(&tls_front)
-            .map_err(|router_error| ListenerError::RemoveFrontendError(router_error))
+            .map_err(|router_error| ListenerError::RemoveFrontend(router_error))
     }
 
     fn accept(&mut self) -> Result<MioTcpStream, AcceptError> {
@@ -856,7 +856,7 @@ impl HttpsProxy {
         }
 
         if !socket_errors.is_empty() {
-            return Err(ProxyError::SoftStopError {
+            return Err(ProxyError::SoftStop {
                 proxy_protocol: "HTTPS".to_string(),
                 error: format!("Error deregistering listen sockets: {:?}", socket_errors),
             });
@@ -879,7 +879,7 @@ impl HttpsProxy {
         }
 
         if !socket_errors.is_empty() {
-            return Err(ProxyError::HardStopError {
+            return Err(ProxyError::HardStop {
                 proxy_protocol: "HTTPS".to_string(),
                 error: format!("Error deregistering listen sockets: {:?}", socket_errors),
             });
@@ -982,7 +982,7 @@ impl HttpsProxy {
         listener
             .borrow_mut()
             .activate(&self.registry, tcp_listener)
-            .map_err(|listener_error| ProxyError::ListenerActivationFailure {
+            .map_err(|listener_error| ProxyError::ListenerActivation {
                 address: addr.clone(),
                 listener_error,
             })
@@ -1074,7 +1074,7 @@ impl HttpsProxy {
         listener.set_tags(front.hostname.to_owned(), front.tags.to_owned());
         listener
             .add_https_front(front)
-            .map_err(|listener_error| ProxyError::AddFrontendError(listener_error))?;
+            .map_err(|listener_error| ProxyError::AddFrontend(listener_error))?;
         Ok(None)
     }
 
@@ -1099,7 +1099,7 @@ impl HttpsProxy {
         listener.set_tags(front.hostname.to_owned(), None);
         listener
             .remove_https_front(front)
-            .map_err(|listener_error| ProxyError::RemoveFrontendError(listener_error))?;
+            .map_err(|listener_error| ProxyError::RemoveFrontend(listener_error))?;
         Ok(None)
     }
 
@@ -1110,7 +1110,7 @@ impl HttpsProxy {
         let address = add_certificate
             .address
             .parse::<StdSocketAddr>()
-            .map_err(|parse_error| ProxyError::SocketParseError {
+            .map_err(|parse_error| ProxyError::SocketParse {
                 address: add_certificate.address.clone(),
                 error: parse_error.to_string(),
             })?;
@@ -1124,7 +1124,7 @@ impl HttpsProxy {
         listener
             .borrow_mut()
             .add_certificate(&add_certificate)
-            .map_err(|listener_error| ProxyError::AddCertificateError(listener_error))?;
+            .map_err(|listener_error| ProxyError::AddCertificate(listener_error))?;
 
         Ok(None)
     }
@@ -1137,7 +1137,7 @@ impl HttpsProxy {
         let address = remove_certificate
             .address
             .parse::<StdSocketAddr>()
-            .map_err(|parse_error| ProxyError::SocketParseError {
+            .map_err(|parse_error| ProxyError::SocketParse {
                 address: remove_certificate.address,
                 error: parse_error.to_string(),
             })?;
@@ -1156,7 +1156,7 @@ impl HttpsProxy {
         listener
             .borrow_mut()
             .remove_certificate(&fingerprint)
-            .map_err(|listener_error| ProxyError::AddCertificateError(listener_error))?;
+            .map_err(|listener_error| ProxyError::AddCertificate(listener_error))?;
 
         Ok(None)
     }
@@ -1169,7 +1169,7 @@ impl HttpsProxy {
         let address = replace_certificate
             .address
             .parse::<StdSocketAddr>()
-            .map_err(|parse_error| ProxyError::SocketParseError {
+            .map_err(|parse_error| ProxyError::SocketParse {
                 address: replace_certificate.address.clone(),
                 error: parse_error.to_string(),
             })?;
@@ -1183,7 +1183,7 @@ impl HttpsProxy {
         listener
             .borrow_mut()
             .replace_certificate(&replace_certificate)
-            .map_err(|listener_error| ProxyError::ReplaceCertificateError(listener_error))?;
+            .map_err(|listener_error| ProxyError::ReplaceCertificate(listener_error))?;
 
         Ok(None)
     }
@@ -1374,8 +1374,8 @@ impl ProxyConfiguration for HttpsProxy {
                 }
             }
             Err(proxy_error) => {
-                debug!("{} unsuccessful: {:#}", request_id, proxy_error);
-                WorkerResponse::error(request_id, format!("{proxy_error}"))
+                debug!("{} unsuccessful: {}", request_id, proxy_error);
+                WorkerResponse::error(request_id, proxy_error)
             }
         }
     }
@@ -1634,7 +1634,7 @@ mod tests {
             .with_safe_default_cipher_suites()
             .with_safe_default_kx_groups()
             .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
-            .map_err(|err| ListenerError::BuildRustlsError(err.to_string()))
+            .map_err(|err| ListenerError::BuildRustls(err.to_string()))
             .expect("could not create Rustls server config")
             .with_no_client_auth()
             .with_cert_resolver(resolver.clone());

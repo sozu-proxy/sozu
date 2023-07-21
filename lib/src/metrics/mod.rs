@@ -27,11 +27,9 @@ pub enum MetricError {
     #[error("Could not parse udp address {address}: {error}")]
     WrongUdpAddress { address: String, error: String },
     #[error("Could not bind to udp address {address}: {error}")]
-    UdpBindError { address: String, error: String },
-    #[error("No metrics found for backend with id {0}")]
-    NoMetricsForBackend(String),
-    #[error("No metrics found for cluster with id {0}")]
-    NoMetricsForCluster(String),
+    UdpBind { address: String, error: String },
+    #[error("No metrics found for object with id {0}")]
+    NoMetrics(String),
     #[error("Could not create histogram for time metric {time_metric:?}: {error}")]
     HistogramCreation {
         time_metric: MetricValue,
@@ -301,7 +299,7 @@ pub fn udp_bind() -> Result<UdpSocket, MetricError> {
                 error: parse_error.to_string(),
             })?;
 
-    UdpSocket::bind(udp_address).map_err(|parse_error| MetricError::UdpBindError {
+    UdpSocket::bind(udp_address).map_err(|parse_error| MetricError::UdpBind {
         address: udp_address.to_string(),
         error: parse_error.to_string(),
     })

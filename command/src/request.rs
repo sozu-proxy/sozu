@@ -15,10 +15,10 @@ use crate::{
 
 #[derive(thiserror::Error, Debug)]
 pub enum RequestError {
-    #[error("Could not parse socket address {address}: {error}")]
-    WrongAddress { address: String, error: String },
-    #[error("wrong value {value} for field '{name}'")]
-    WrongFieldValue { name: String, value: i32 },
+    #[error("Invalid address {address}: {error}")]
+    InvalidSocketAddress { address: String, error: String },
+    #[error("invalid value {value} for field '{name}'")]
+    InvalidValue { name: String, value: i32 },
 }
 
 impl Request {
@@ -135,7 +135,7 @@ impl RequestHttpFrontend {
     pub fn to_frontend(self) -> Result<HttpFrontend, RequestError> {
         Ok(HttpFrontend {
             address: self.address.parse::<SocketAddr>().map_err(|parse_error| {
-                RequestError::WrongAddress {
+                RequestError::InvalidSocketAddress {
                     address: self.address.clone(),
                     error: parse_error.to_string(),
                 }
@@ -144,12 +144,10 @@ impl RequestHttpFrontend {
             hostname: self.hostname,
             path: self.path,
             method: self.method,
-            position: RulePosition::from_i32(self.position).ok_or(
-                RequestError::WrongFieldValue {
-                    name: "position".to_string(),
-                    value: self.position.clone(),
-                },
-            )?,
+            position: RulePosition::from_i32(self.position).ok_or(RequestError::InvalidValue {
+                name: "position".to_string(),
+                value: self.position.clone(),
+            })?,
             tags: Some(self.tags),
         })
     }

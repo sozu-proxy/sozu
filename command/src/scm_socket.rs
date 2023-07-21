@@ -18,15 +18,18 @@ pub const MAX_BYTES_OUT: usize = 4096;
 #[derive(thiserror::Error, Debug)]
 pub enum ScmSocketError {
     #[error("could not set the blocking status of the unix stream to {blocking}: {error}")]
-    SetBlocking { blocking: bool, error: String },
+    SetBlocking {
+        blocking: bool,
+        error: std::io::Error,
+    },
     #[error("could not send message per SCM socket: {0}")]
-    SendError(String),
+    Send(String),
     #[error("could not send message per SCM socket: {0}")]
-    ReceiveError(String),
-    #[error("could not parse utf8 from buffer: {0}")]
-    Utf8Error(String),
+    Receive(String),
+    #[error("invalid char set: {0}")]
+    InvalidCharSet(String),
     #[error("Could not deserialize utf8 string into listeners: {0}")]
-    ListenerParseError(String),
+    ListenerParse(String),
 }
 
 /// A unix socket specialized for file descriptor passing
@@ -43,9 +46,9 @@ impl ScmSocket {
             let stream = StdUnixStream::from_raw_fd(fd);
             stream
                 .set_nonblocking(false)
-                .map_err(|io_error| ScmSocketError::SetBlocking {
+                .map_err(|error| ScmSocketError::SetBlocking {
                     blocking: false,
-                    error: io_error.to_string(),
+                    error,
                 })?;
             let _dropped_fd = stream.into_raw_fd();
         }
@@ -67,10 +70,7 @@ impl ScmSocket {
             let stream = StdUnixStream::from_raw_fd(self.fd);
             stream
                 .set_nonblocking(!blocking)
-                .map_err(|io_error| ScmSocketError::SetBlocking {
-                    blocking,
-                    error: io_error.to_string(),
-                })?;
+                .map_err(|error| ScmSocketError::SetBlocking { blocking, error })?;
             let _dropped_fd = stream.into_raw_fd();
         }
         self.blocking = blocking;
@@ -110,10 +110,10 @@ impl ScmSocket {
         debug!("{} received :{:?}", self.fd, (size, file_descriptor_length));
 
         let raw_listener_list = from_utf8(&buf[..size])
-            .map_err(|utf8_error| ScmSocketError::Utf8Error(utf8_error.to_string()))?;
+            .map_err(|utf8_error| ScmSocketError::InvalidCharSet(utf8_error.to_string()))?;
 
         let mut listeners_count = serde_json::from_str::<ListenersCount>(raw_listener_list)
-            .map_err(|error| ScmSocketError::ListenerParseError(error.to_string()))?;
+            .map_err(|error| ScmSocketError::ListenerParse(error.to_string()))?;
 
         let mut index = 0;
         let len = listeners_count.http.len();
@@ -160,14 +160,14 @@ impl ScmSocket {
         if fds.is_empty() {
             debug!("{} send empty", self.fd);
             socket::sendmsg::<()>(self.fd, &iov, &[], flags, None)
-                .map_err(|error| ScmSocketError::SendError(error.to_string()))?;
+                .map_err(|error| ScmSocketError::Send(error.to_string()))?;
             return Ok(());
         };
 
         let control_message = [socket::ControlMessage::ScmRights(fds)];
         debug!("{} send with data", self.fd);
         socket::sendmsg::<()>(self.fd, &iov, &control_message, flags, None)
-            .map_err(|error| ScmSocketError::SendError(error.to_string()))?;
+            .map_err(|error| ScmSocketError::Send(error.to_string()))?;
         Ok(())
     }
 
@@ -187,7 +187,7 @@ impl ScmSocket {
         };
 
         let msg = socket::recvmsg::<()>(self.fd, &mut iov[..], Some(&mut cmsg), flags)
-            .map_err(|error| ScmSocketError::ReceiveError(error.to_string()))?;
+            .map_err(|error| ScmSocketError::Receive(error.to_string()))?;
 
         let mut fd_count = 0;
         let received_fds = msg

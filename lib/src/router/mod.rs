@@ -16,13 +16,13 @@ use self::pattern_trie::TrieNode;
 #[derive(thiserror::Error, Debug)]
 pub enum RouterError {
     #[error("Could not parse rule from frontend path {0:?}")]
-    UnparsablePathRule(String),
+    InvalidPathRule(String),
     #[error("parsing hostname {hostname} failed")]
-    UnparsableDomain { hostname: String },
+    InvalidDomain { hostname: String },
     #[error("Could not add route {0}")]
-    AddRouteFailure(String),
+    AddRoute(String),
     #[error("Could not remove route {0}")]
-    RemoveRouteFailure(String),
+    RemoveRoute(String),
 }
 
 pub struct Router {
@@ -111,7 +111,7 @@ impl Router {
 
     pub fn add_http_front(&mut self, front: &HttpFrontend) -> Result<(), RouterError> {
         let path_rule = PathRule::from_config(front.path.clone())
-            .ok_or(RouterError::UnparsablePathRule(front.path.to_string()))?;
+            .ok_or(RouterError::InvalidPathRule(front.path.to_string()))?;
 
         let method_rule = MethodRule::new(front.method.clone());
 
@@ -123,7 +123,7 @@ impl Router {
         let success = match front.position {
             RulePosition::Pre => {
                 let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
-                    RouterError::UnparsableDomain {
+                    RouterError::InvalidDomain {
                         hostname: front.hostname.clone(),
                     }
                 })?;
@@ -132,7 +132,7 @@ impl Router {
             }
             RulePosition::Post => {
                 let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
-                    RouterError::UnparsableDomain {
+                    RouterError::InvalidDomain {
                         hostname: front.hostname.clone(),
                     }
                 })?;
@@ -144,21 +144,21 @@ impl Router {
             }
         };
         if !success {
-            return Err(RouterError::AddRouteFailure(format!("{:?}", front)));
+            return Err(RouterError::AddRoute(format!("{:?}", front)));
         }
         Ok(())
     }
 
     pub fn remove_http_front(&mut self, front: &HttpFrontend) -> Result<(), RouterError> {
         let path_rule = PathRule::from_config(front.path.clone())
-            .ok_or(RouterError::UnparsablePathRule(front.path.to_string()))?;
+            .ok_or(RouterError::InvalidPathRule(front.path.to_string()))?;
 
         let method_rule = MethodRule::new(front.method.clone());
 
         let remove_success = match front.position {
             RulePosition::Pre => {
                 let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
-                    RouterError::UnparsableDomain {
+                    RouterError::InvalidDomain {
                         hostname: front.hostname.clone(),
                     }
                 })?;
@@ -167,7 +167,7 @@ impl Router {
             }
             RulePosition::Post => {
                 let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
-                    RouterError::UnparsableDomain {
+                    RouterError::InvalidDomain {
                         hostname: front.hostname.clone(),
                     }
                 })?;
@@ -179,7 +179,7 @@ impl Router {
             }
         };
         if !remove_success {
-            return Err(RouterError::RemoveRouteFailure(format!("{:?}", front)));
+            return Err(RouterError::RemoveRoute(format!("{:?}", front)));
         }
         Ok(())
     }

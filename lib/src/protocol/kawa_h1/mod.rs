@@ -977,7 +977,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         if self.connection_attempts >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
             self.set_answer(DefaultAnswerStatus::Answer503, None);
-            return Err(BackendConnectionError::TooManyAttempts);
+            return Err(BackendConnectionError::MaxConnectionRetries(None));
         }
         Ok(())
     }
@@ -1041,9 +1041,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             Ok(route) => route,
             Err(frontend_error) => {
                 self.set_answer(DefaultAnswerStatus::Answer404, None);
-                return Err(RetrieveClusterError::FrontendFromRequestError(
-                    frontend_error,
-                ));
+                return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
             }
         };
 
@@ -1091,7 +1089,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             )
             .map_err(|backend_error| {
                 self.set_answer(DefaultAnswerStatus::Answer503, None);
-                BackendConnectionError::BackendError(backend_error)
+                BackendConnectionError::Backend(backend_error)
             })?;
 
         if frontend_should_stick {
@@ -1424,7 +1422,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         return SessionResult::Continue;
                     }
                     Err(connection_error) => {
-                        error!("Error connecting to backend: {:#}", connection_error)
+                        error!("Error connecting to backend: {}", connection_error)
                     }
                 }
             } else {
@@ -1479,7 +1477,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                                 return SessionResult::Continue;
                             }
                             Err(connection_error) => {
-                                error!("Error connecting to backend: {:#}", connection_error)
+                                error!("Error connecting to backend: {}", connection_error)
                             }
                         }
                     }
