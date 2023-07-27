@@ -7,12 +7,12 @@ use nom::{
 
 #[derive(Debug)]
 #[allow(dead_code)]
-pub struct CustomError {
+pub struct ParseError {
     kind: ErrorKind,
     serde_json_error: Option<serde_json::Error>,
 }
 
-impl FromExternalError<&[u8], serde_json::Error> for CustomError {
+impl FromExternalError<&[u8], serde_json::Error> for ParseError {
     fn from_external_error(
         _input: &[u8],
         kind: ErrorKind,
@@ -26,7 +26,7 @@ impl FromExternalError<&[u8], serde_json::Error> for CustomError {
     }
 }
 
-impl nom::error::ParseError<&[u8]> for CustomError {
+impl nom::error::ParseError<&[u8]> for ParseError {
     fn from_error_kind(_input: &[u8], kind: ErrorKind) -> Self {
         // println!("input: {:?}, error kind: {:?}", input, kind);
 
@@ -42,7 +42,7 @@ impl nom::error::ParseError<&[u8]> for CustomError {
 }
 
 /// Parse a single Request or WorkerRequest
-pub fn parse_one_request<'a, T>(input: &'a [u8]) -> IResult<&[u8], T, CustomError>
+pub fn parse_one_request<'a, T>(input: &'a [u8]) -> IResult<&[u8], T, ParseError>
 where
     T: serde::de::Deserialize<'a>,
 {
@@ -51,7 +51,7 @@ where
     let command = match serde_json::from_slice::<T>(json_data) {
         Ok(user) => user,
         Err(serde_error) => {
-            return Err(nom::Err::Failure(CustomError::from_external_error(
+            return Err(nom::Err::Failure(ParseError::from_external_error(
                 input,
                 ErrorKind::MapRes,
                 serde_error,
@@ -65,7 +65,7 @@ where
 }
 
 /// Parse a Requests or WorkerRequests using nom
-pub fn parse_several_requests<'a, T>(input: &'a [u8]) -> IResult<&[u8], Vec<T>, CustomError>
+pub fn parse_several_requests<'a, T>(input: &'a [u8]) -> IResult<&[u8], Vec<T>, ParseError>
 where
     T: serde::de::Deserialize<'a>,
 {
