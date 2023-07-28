@@ -1,7 +1,11 @@
 use nom::{
     self,
+    bytes::streaming::is_not,
+    character::complete::char,
+    combinator::map_res,
     error::{ErrorKind, FromExternalError},
     multi::many0,
+    sequence::terminated,
     IResult,
 };
 
@@ -41,35 +45,25 @@ impl nom::error::ParseError<&[u8]> for ParseError {
     }
 }
 
-/// Parse a single Request or WorkerRequest
-pub fn parse_one_request<'a, T>(input: &'a [u8]) -> IResult<&[u8], T, ParseError>
+/// this is to propagate the serde_json error
+pub fn parse_one_request<'a, T>(input: &'a [u8]) -> Result<T, ParseError>
 where
     T: serde::de::Deserialize<'a>,
 {
-    let (next_input, json_data) = nom::bytes::complete::is_not("\0")(input)?;
-
-    let command = match serde_json::from_slice::<T>(json_data) {
-        Ok(user) => user,
-        Err(serde_error) => {
-            return Err(nom::Err::Failure(ParseError::from_external_error(
-                input,
-                ErrorKind::MapRes,
-                serde_error,
-            )))
-        }
-    };
-
-    let (next_input, _) = nom::character::complete::char('\0')(next_input)?;
-
-    Ok((next_input, command))
+    serde_json::from_slice::<T>(input).map_err(|serde_error| {
+        ParseError::from_external_error(input, ErrorKind::MapRes, serde_error)
+    })
 }
 
-/// Parse a Requests or WorkerRequests using nom
-pub fn parse_several_requests<'a, T>(input: &'a [u8]) -> IResult<&[u8], Vec<T>, ParseError>
+pub fn parse_several_requests<'a, T>(input: &'a [u8]) -> IResult<&[u8], Vec<T>>
 where
     T: serde::de::Deserialize<'a>,
 {
-    many0(parse_one_request)(input)
+    // use serde_json::from_slice;
+    many0(nom::combinator::complete(terminated(
+        map_res(is_not("\0"), parse_one_request),
+        char('\0'),
+    )))(input)
 }
 
 #[cfg(test)]
@@ -88,19 +82,15 @@ mod test {
             RequestType::Status(Status {}).into(),
         );
 
-        let mut string = serde_json::ser::to_string(&worker_request).unwrap();
-
-        string.push('\0');
+        let string = serde_json::ser::to_string(&worker_request).unwrap();
 
         println!("string to parse: {string}");
 
         let bytes = &string.as_bytes();
 
-        let empty_vec: Vec<u8> = vec![];
-
         assert_eq!(
-            parse_one_request(bytes).unwrap(),
-            (&empty_vec[..], worker_request)
+            parse_one_request::<WorkerRequest>(bytes).unwrap(),
+            worker_request
         )
     }
 

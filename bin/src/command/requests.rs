@@ -10,7 +10,7 @@ use std::{
 use anyhow::{bail, Context};
 use async_io::Async;
 use futures::{channel::mpsc::*, SinkExt, StreamExt};
-use nom::{Err, HexDisplay, Offset};
+use nom::{HexDisplay, Offset};
 
 use sozu_command_lib::{
     buffer::fixed::Buffer,
@@ -199,13 +199,13 @@ impl CommandServer {
         let (load_state_tx, mut load_state_rx) = futures::channel::mpsc::channel(10000);
         loop {
             let previous = buffer.available_data();
+
             //FIXME: we should read in streaming here
-            match file.read(buffer.space()) {
-                Ok(sz) => buffer.fill(sz),
-                Err(e) => {
-                    bail!("Error reading the saved state file: {}", e);
-                }
-            };
+            let bytes_read = file
+                .read(buffer.space())
+                .with_context(|| "Error reading the saved state file")?;
+
+            buffer.fill(bytes_read);
 
             if buffer.available_data() == 0 {
                 debug!("Empty buffer");
@@ -251,7 +251,7 @@ impl CommandServer {
                         }
                     }
                 }
-                Err(Err::Incomplete(_)) => {
+                Err(nom::Err::Incomplete(_)) => {
                     if buffer.available_data() == buffer.capacity() {
                         error!(
                             "message too big, stopping parsing:\n{}",
