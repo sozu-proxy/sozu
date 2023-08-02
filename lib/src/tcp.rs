@@ -210,6 +210,7 @@ impl TcpSession {
             client_rtt: socket_rtt(self.state.front_socket()),
             server_rtt: None,
             metrics: &self.metrics,
+            user_agent: None,
         }
         .log();
     }

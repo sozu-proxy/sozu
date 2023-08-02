@@ -219,6 +219,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             client_rtt: socket_rtt(self.front_socket()),
             server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
             metrics,
+            user_agent: None,
         }
         .log();
     }

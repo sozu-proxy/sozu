@@ -138,6 +138,7 @@ pub struct RequestRecord<'a> {
     pub client_rtt: Option<Duration>,
     pub server_rtt: Option<Duration>,
     pub metrics: &'a SessionMetrics,
+    pub user_agent: Option<&'a str>,
 }
 
 impl RequestRecord<'_> {
@@ -150,6 +151,7 @@ impl RequestRecord<'_> {
         let session_address = self.session_address;
         let backend_address = self.backend_address;
         let endpoint = &self.endpoint;
+        let user_agent = &self.user_agent;
 
         let metrics = self.metrics;
         // let backend_response_time = metrics.backend_response_time();
@@ -193,7 +195,7 @@ impl RequestRecord<'_> {
         match self.error {
             None => {
                 info_access!(
-                    "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {} {} {}",
+                    "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {} {} {} {}",
                     context,
                     session_address.as_str_or("X"),
                     backend_address.as_str_or("X"),
@@ -205,7 +207,8 @@ impl RequestRecord<'_> {
                     metrics.bout,
                     tags.as_str_or("-"),
                     protocol,
-                    endpoint
+                    endpoint,
+                    user_agent.as_str_or("")
                 );
                 incr!(
                     "access_logs.count",
@@ -214,7 +217,7 @@ impl RequestRecord<'_> {
                 );
             }
             Some(message) => error_access!(
-                "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {} {} {} | {}",
+                "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {} {} {} {} | {}",
                 context,
                 session_address.as_str_or("X"),
                 backend_address.as_str_or("X"),
@@ -227,6 +230,7 @@ impl RequestRecord<'_> {
                 tags.as_str_or("-"),
                 protocol,
                 endpoint,
+                user_agent.as_str_or(""),
                 message
             ),
         }
