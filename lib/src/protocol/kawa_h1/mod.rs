@@ -789,7 +789,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         } else {
             match answer {
                 DefaultAnswerStatus::Answer301 => {
-                    incr!("http.301.redirection")
+                    incr!(
+                        "http.301.redirection",
+                        self.cluster_id.as_deref(),
+                        self.backend_id.as_deref()
+                    )
                 }
                 DefaultAnswerStatus::Answer400 => {
                     incr!("http.400.errors")
