@@ -5,14 +5,14 @@ use mio::*;
 use rusty_ulid::Ulid;
 
 use crate::{
+    backends::Backend,
     logs::{Endpoint, LogContext, RequestRecord},
     pool::Checkout,
     protocol::SessionState,
     socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
-    Backend, L7Proxy, ListenerHandler, Protocol, Readiness, SessionMetrics, SessionResult,
-    StateResult,
+    L7Proxy, ListenerHandler, Protocol, Readiness, SessionMetrics, SessionResult, StateResult,
 };
 
 #[derive(PartialEq, Eq)]

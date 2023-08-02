@@ -9,7 +9,6 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use anyhow::{bail, Context};
 use kawa;
 use mio::{net::TcpStream, *};
 use rusty_ulid::Ulid;
@@ -17,6 +16,7 @@ use sozu_command::proto::command::{Event, EventKind, ListenerType};
 use time::{Duration, Instant};
 
 use crate::{
+    backends::{Backend, BackendError},
     logs::{Endpoint, LogContext, RequestRecord},
     pool::{Checkout, Pool},
     protocol::{
@@ -29,9 +29,9 @@ use crate::{
     socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
     timer::TimeoutContainer,
-    AcceptError, Backend, BackendConnectAction, BackendConnectionStatus, L7ListenerHandler,
-    L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness, SessionIsToBeClosed,
-    SessionMetrics, SessionResult, StateResult,
+    AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus,
+    L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
+    RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
 };
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
@@ -107,6 +107,7 @@ pub struct Http<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     configured_connect_timeout: Duration,
     configured_frontend_timeout: Duration,
     pub cluster_id: Option<String>,
+    /// attempts to connect to the backends during the session
     connection_attempts: u8,
     pub frontend_readiness: Readiness,
     pub frontend_socket: Front,
@@ -1007,11 +1008,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     /// Check the number of connection attempts against authorized connection retries
-    fn check_circuit_breaker(&mut self) -> anyhow::Result<()> {
+    fn check_circuit_breaker(&mut self) -> Result<(), BackendConnectionError> {
         if self.connection_attempts >= CONN_RETRIES {
             error!("{} max connection attempt reached", self.log_context());
             self.set_answer(DefaultAnswerStatus::Answer503, None);
-            bail!("Maximum connection attempt reached");
+            return Err(BackendConnectionError::MaxConnectionRetries(None));
         }
         Ok(())
     }
@@ -1034,22 +1035,22 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     // -> host, path, method
-    pub fn extract_route(&self) -> anyhow::Result<(&str, &str, &Method)> {
+    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
         let given_method = self
             .context
             .method
             .as_ref()
-            .with_context(|| "No method given")?;
+            .ok_or(RetrieveClusterError::NoMethod)?;
         let given_authority = self
             .context
             .authority
             .as_deref()
-            .with_context(|| "No host given")?;
+            .ok_or(RetrieveClusterError::NoHost)?;
         let given_path = self
             .context
             .path
             .as_deref()
-            .with_context(|| "No path given")?;
+            .ok_or(RetrieveClusterError::NoPath)?;
 
         Ok((given_authority, given_path, given_method))
     }
@@ -1057,32 +1058,33 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     fn cluster_id_from_request(
         &mut self,
         proxy: Rc<RefCell<dyn L7Proxy>>,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, RetrieveClusterError> {
         let (host, uri, method) = match self.extract_route() {
             Ok(tuple) => tuple,
-            Err(e) => {
+            Err(cluster_error) => {
                 self.set_answer(DefaultAnswerStatus::Answer400, None);
-                return Err(e).with_context(|| "Could not extract route from request");
+                return Err(cluster_error);
             }
         };
 
-        let cluster_id_res = self
+        let route_result = self
             .listener
             .borrow()
             .frontend_from_request(host, uri, method);
 
-        let cluster_id = match cluster_id_res {
-            Ok(route) => match route {
-                Route::ClusterId(cluster_id) => cluster_id,
-                Route::Deny => {
-                    self.set_answer(DefaultAnswerStatus::Answer401, None);
-                    bail!("Unauthorized route");
-                }
-            },
-            Err(e) => {
-                let no_host_error = format!("Host not found: {host}: {e:#}");
+        let route = match route_result {
+            Ok(route) => route,
+            Err(frontend_error) => {
                 self.set_answer(DefaultAnswerStatus::Answer404, None);
-                bail!(no_host_error);
+                return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
+            }
+        };
+
+        let cluster_id = match route {
+            Route::ClusterId(cluster_id) => cluster_id,
+            Route::Deny => {
+                self.set_answer(DefaultAnswerStatus::Answer401, None);
+                return Err(RetrieveClusterError::UnauthorizedRoute);
             }
         };
 
@@ -1100,7 +1102,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 DefaultAnswerStatus::Answer301,
                 Some(Rc::new(answer.into_bytes())),
             );
-            bail!("Route is unauthorized");
+            return Err(RetrieveClusterError::UnauthorizedRoute);
         }
 
         Ok(cluster_id)
@@ -1112,20 +1114,18 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         frontend_should_stick: bool,
         proxy: Rc<RefCell<dyn L7Proxy>>,
         metrics: &mut SessionMetrics,
-    ) -> anyhow::Result<TcpStream> {
-        let (backend, conn) = match self.get_backend_for_sticky_session(
-            frontend_should_stick,
-            self.context.sticky_session_found.as_deref(),
-            cluster_id,
-            proxy,
-        ) {
-            Ok(tuple) => tuple,
-            Err(e) => {
+    ) -> Result<TcpStream, BackendConnectionError> {
+        let (backend, conn) = self
+            .get_backend_for_sticky_session(
+                frontend_should_stick,
+                self.context.sticky_session_found.as_deref(),
+                cluster_id,
+                proxy,
+            )
+            .map_err(|backend_error| {
                 self.set_answer(DefaultAnswerStatus::Answer503, None);
-                return Err(e)
-                    .with_context(|| format!("Could not find a backend for cluster {cluster_id}"));
-            }
-        };
+                BackendConnectionError::Backend(backend_error)
+            })?;
 
         if frontend_should_stick {
             // update sticky name in case it changed I guess?
@@ -1154,18 +1154,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         sticky_session: Option<&str>,
         cluster_id: &str,
         proxy: Rc<RefCell<dyn L7Proxy>>,
-    ) -> anyhow::Result<(Rc<RefCell<Backend>>, TcpStream)> {
+    ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
         match (frontend_should_stick, sticky_session) {
             (true, Some(sticky_session)) => proxy
                 .borrow()
                 .backends()
                 .borrow_mut()
-                .backend_from_sticky_session(cluster_id, sticky_session)
-                .with_context(|| {
-                    format!(
-                        "Couldn't find a backend corresponding to sticky_session {sticky_session} for cluster {cluster_id}"
-                    )
-                }),
+                .backend_from_sticky_session(cluster_id, sticky_session),
             _ => proxy
                 .borrow()
                 .backends()
@@ -1179,16 +1174,15 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         session_rc: Rc<RefCell<dyn ProxySession>>,
         proxy: Rc<RefCell<dyn L7Proxy>>,
         metrics: &mut SessionMetrics,
-    ) -> anyhow::Result<BackendConnectAction> {
+    ) -> Result<BackendConnectAction, BackendConnectionError> {
         let old_cluster_id = self.cluster_id.clone();
         let old_backend_token = self.backend_token;
 
-        self.check_circuit_breaker()
-            .with_context(|| "Circuit broke")?;
+        self.check_circuit_breaker()?;
 
         let cluster_id = self
             .cluster_id_from_request(proxy.clone())
-            .with_context(|| "Could not get cluster id from request")?;
+            .map_err(|cluster_error| BackendConnectionError::RetrieveClusterError(cluster_error))?;
 
         trace!(
             "connect_to_backend: {:?} {:?} {:?}",
@@ -1463,7 +1457,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         return SessionResult::Continue;
                     }
                     Err(connection_error) => {
-                        error!("Error connecting to backend: {:#}", connection_error)
+                        error!("Error connecting to backend: {}", connection_error)
                     }
                 }
             } else {
@@ -1518,7 +1512,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                                 return SessionResult::Continue;
                             }
                             Err(connection_error) => {
-                                error!("Error connecting to backend: {:#}", connection_error)
+                                error!("Error connecting to backend: {}", connection_error)
                             }
                         }
                     }

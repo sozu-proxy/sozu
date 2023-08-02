@@ -71,3 +71,19 @@ pub mod scm_socket;
 pub mod state;
 /// A writer used for logging
 pub mod writer;
+
+/// Used only when returning errors
+#[derive(Debug)]
+pub enum ObjectKind {
+    Backend,
+    Certificate,
+    Cluster,
+    HttpFrontend,
+    HttpsFrontend,
+    HttpListener,
+    HttpsListener,
+    Listener,
+    TcpCluster,
+    TcpListener,
+    TcpFrontend,
+}

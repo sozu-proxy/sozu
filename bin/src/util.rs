@@ -48,12 +48,12 @@ pub fn setup_logging(config: &Config, tag: &str) {
 
 pub fn setup_metrics(config: &Config) -> anyhow::Result<()> {
     if let Some(metrics) = config.metrics.as_ref() {
-        return metrics::setup(
+        return Ok(metrics::setup(
             &metrics.address,
             "MAIN",
             metrics.tagged_metrics,
             metrics.prefix.clone(),
-        );
+        )?);
     }
     Ok(())
 }
