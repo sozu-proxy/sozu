@@ -207,7 +207,11 @@ impl RequestRecord<'_> {
                     protocol,
                     endpoint
                 );
-                incr!("access_logs.count");
+                incr!(
+                    "access_logs.count",
+                    self.context.cluster_id,
+                    self.context.backend_id
+                );
             }
             Some(message) => error_access!(
                 "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {} {} {} | {}",
