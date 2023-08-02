@@ -420,6 +420,7 @@ impl L7ListenerHandler for HttpListener {
         uri: &str,
         method: &Method,
     ) -> anyhow::Result<Route> {
+        let start = Instant::now();
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
             Err(parse_error) => {
@@ -442,9 +443,26 @@ impl L7ListenerHandler for HttpListener {
         */
         let host = unsafe { from_utf8_unchecked(hostname) };
 
-        self.fronts
+        let res = self
+            .fronts
             .lookup(host.as_bytes(), uri.as_bytes(), method)
-            .with_context(|| "No cluster found")
+            .with_context(|| "No cluster found");
+
+        let now = Instant::now();
+
+        if let Ok(r) = res.as_ref() {
+            if let Route::ClusterId(c) = r {
+                time!(
+                    "frontend_matching_time",
+                    &c,
+                    (now - start).whole_milliseconds()
+                );
+            }
+        } else {
+            incr!("http.failed_backend_matching")
+        }
+
+        res
     }
 }
 
