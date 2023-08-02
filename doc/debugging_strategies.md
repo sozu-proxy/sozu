@@ -131,7 +131,7 @@ unresponsive backend server).
 
 The `sozu.http.errors` counter is the sum of failed requests. It contains the following:
 
-* `sozu.http.front_parse_errors`: sozu received some invalid traffic
+* `sozu.http.frontend_parse_errors`: sozu received some invalid traffic
 * `sozu.http.400.errors`: cannot parse hostname
 * `sozu.http.404.errors`: unknown hostname and/or path
 * `sozu.http.413.errors`: request too large
@@ -139,8 +139,8 @@ The `sozu.http.errors` counter is the sum of failed requests. It contains the fo
 
 Going further, backend connections issues are tracked by the following metrics:
 
-* `sozu.backend.connections.errors`: could not connect to a backend server
-* `sozu.backend.down`: the retry policy triggered and marked the backend server as down
+* `sozu.connections.errors`: could not connect to a backend server
+* `sozu.down`: the retry policy triggered and marked the backend server as down
 
 The `sozu.http.503.errors` metric is incremented after a request sent back a 503 error, and a 503 error is sent
 after the circuit breaker triggered (we wait for 3 failed connections to the backend server).
@@ -180,10 +180,10 @@ active requests (an inactive session can keep a backend connection around).
 
 These metrics are closely linked to resource usage, which is tracked by the following:
 
-* `sozu.slab.count`: number of slots used in the slab allocator. Typically, there's one slot per listener socket,
+* `sozu.slab.entries`: number of slots used in the slab allocator. Typically, there's one slot per listener socket,
 one for the connection to the main process, one for the metrics socket, then one per frontend connection and
 one per backend connection. So the number of connections should always be close to (but lower than) the slab count.
-* `sozu.buffer.count`: number of buffers used in the buffer pool. Inactive sessions and requests for which we send
+* `sozu.buffer.number`: number of buffers used in the buffer pool. Inactive sessions and requests for which we send
 a default answer (400, 404, 413, 503 HTTP errors) do not use buffers. Active HTTP sessions use one buffer (except
 in pipelining mode), WebSocket sessions use two buffers. So the number of buffers should always be lower than the
 slab count, and lower than the number of connections.
@@ -194,7 +194,7 @@ is incremented for each zombie session that gets deleted.
 New connections are put into a queue, and wait until the session is created (if we have available resources),
 or until a configurable timeout has elapsed. The following metrics observe the accept queue usage:
 
-* `sozu.accept_queue.count`: number of sockets in the accept queue
+* `sozu.accept_queue.connections`: number of sockets in the accept queue
 * `sozu.accept_queue.timeout`: incremented every time a socket stayed too long in the queue and is closed
 * `sozu.accept_queue.wait_time`: every time a session is created, this metric records how long the socket had to wait in the accept queue
 
@@ -254,7 +254,7 @@ if the `sozu.zombies` metric triggers, this means there's an event loop or proto
 bug. The logs should contain the internal state of the sessions that were killed. Please copy those
 logs and open an issue to sozu.
 
-It usually comes with the `sozu.slab.count` increasing while the number of connections or active requests stays
+It usually comes with the `sozu.slab.entries` increasing while the number of connections or active requests stays
 the same. The slab count will then drop when the zombie checker activates.
 
 ### Invalid session close
@@ -265,7 +265,7 @@ are increasing, it means sessions are not properly closed by sozu, please open a
 
 ### accept queue filling up
 
-if `sozu.accept_queue.count` is increasing, that means the accept queue is filling up because sozu is under
+if `sozu.accept_queue.connections` is increasing, that means the accept queue is filling up because sozu is under
 heavy load (in a healthy load, this queue is almost always empty). `sozu.accept_queue.wait_time` should increase
 as well. If `sozu.accept_queue.timeout` is higher than zero, sozu cannot accept sessions fast enough and
 is rejecting traffic.
