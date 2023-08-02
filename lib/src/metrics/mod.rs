@@ -292,11 +292,13 @@ macro_rules! count (
 macro_rules! incr (
   ($key:expr) => (count!($key, 1));
   ($key:expr, $cluster_id:expr, $backend_id:expr) => {
-    use $crate::metrics::Subscriber;
+    {
+        use $crate::metrics::Subscriber;
 
-    $crate::metrics::METRICS.with(|metrics| {
-      (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricValue::Count(1));
-    });
+        $crate::metrics::METRICS.with(|metrics| {
+          (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricValue::Count(1));
+        });
+    }
   }
 );
 
@@ -324,12 +326,14 @@ macro_rules! gauge_add (
     });
   });
   ($key:expr, $value:expr, $cluster_id:expr, $backend_id:expr) => {
-    use $crate::metrics::Subscriber;
-    let v = $value;
+    {
+        use $crate::metrics::Subscriber;
+        let v = $value;
 
-    $crate::metrics::METRICS.with(|metrics| {
-      (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricValue::GaugeAdd(v));
-    });
+        $crate::metrics::METRICS.with(|metrics| {
+          (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricValue::GaugeAdd(v));
+        });
+    }
   }
 );
 
