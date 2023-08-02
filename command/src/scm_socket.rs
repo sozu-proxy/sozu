@@ -8,13 +8,29 @@ use std::{
     str::from_utf8,
 };
 
-use anyhow::Context;
 use mio::net::TcpListener;
 use nix::{cmsg_space, sys::socket};
 use serde_json;
 
 pub const MAX_FDS_OUT: usize = 200;
 pub const MAX_BYTES_OUT: usize = 4096;
+
+#[derive(thiserror::Error, Debug)]
+pub enum ScmSocketError {
+    #[error("could not set the blocking status of the unix stream to {blocking}: {error}")]
+    SetBlocking {
+        blocking: bool,
+        error: std::io::Error,
+    },
+    #[error("could not send message per SCM socket: {0}")]
+    Send(String),
+    #[error("could not send message per SCM socket: {0}")]
+    Receive(String),
+    #[error("invalid char set: {0}")]
+    InvalidCharSet(String),
+    #[error("Could not deserialize utf8 string into listeners: {0}")]
+    ListenerParse(String),
+}
 
 /// A unix socket specialized for file descriptor passing
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,12 +41,15 @@ pub struct ScmSocket {
 
 impl ScmSocket {
     /// Create a blocking SCM socket from a raw file descriptor (unsafe)
-    pub fn new(fd: RawFd) -> anyhow::Result<Self> {
+    pub fn new(fd: RawFd) -> Result<Self, ScmSocketError> {
         unsafe {
             let stream = StdUnixStream::from_raw_fd(fd);
             stream
                 .set_nonblocking(false)
-                .with_context(|| "could not change blocking status for stream")?;
+                .map_err(|error| ScmSocketError::SetBlocking {
+                    blocking: false,
+                    error,
+                })?;
             let _dropped_fd = stream.into_raw_fd();
         }
 
@@ -43,7 +62,7 @@ impl ScmSocket {
     }
 
     /// Use the standard library (unsafe) to set the socket to blocking / unblocking
-    pub fn set_blocking(&mut self, blocking: bool) -> anyhow::Result<()> {
+    pub fn set_blocking(&mut self, blocking: bool) -> Result<(), ScmSocketError> {
         if self.blocking == blocking {
             return Ok(());
         }
@@ -51,7 +70,7 @@ impl ScmSocket {
             let stream = StdUnixStream::from_raw_fd(self.fd);
             stream
                 .set_nonblocking(!blocking)
-                .with_context(|| "could not change blocking status for stream")?;
+                .map_err(|error| ScmSocketError::SetBlocking { blocking, error })?;
             let _dropped_fd = stream.into_raw_fd();
         }
         self.blocking = blocking;
@@ -59,7 +78,7 @@ impl ScmSocket {
     }
 
     /// Send listeners (socket addresses and file descriptors) via an scm socket
-    pub fn send_listeners(&self, listeners: &Listeners) -> anyhow::Result<()> {
+    pub fn send_listeners(&self, listeners: &Listeners) -> Result<(), ScmSocketError> {
         let listeners_count = ListenersCount {
             http: listeners.http.iter().map(|t| t.0).collect(),
             tls: listeners.tls.iter().map(|t| t.0).collect(),
@@ -80,22 +99,21 @@ impl ScmSocket {
     }
 
     /// Receive and parse listeners (socket addresses and file descriptors) via an scm socket
-    pub fn receive_listeners(&self) -> anyhow::Result<Listeners> {
+    pub fn receive_listeners(&self) -> Result<Listeners, ScmSocketError> {
         let mut buf = vec![0; MAX_BYTES_OUT];
 
         let mut received_fds: [RawFd; MAX_FDS_OUT] = [0; MAX_FDS_OUT];
 
-        let (size, file_descriptor_length) = self
-            .receive_msg_and_fds(&mut buf, &mut received_fds)
-            .with_context(|| "could not receive listeners")?;
+        let (size, file_descriptor_length) =
+            self.receive_msg_and_fds(&mut buf, &mut received_fds)?;
 
         debug!("{} received :{:?}", self.fd, (size, file_descriptor_length));
 
-        let raw_listener_list =
-            from_utf8(&buf[..size]).with_context(|| "Could not parse utf8 string from buffer")?;
+        let raw_listener_list = from_utf8(&buf[..size])
+            .map_err(|utf8_error| ScmSocketError::InvalidCharSet(utf8_error.to_string()))?;
 
         let mut listeners_count = serde_json::from_str::<ListenersCount>(raw_listener_list)
-            .with_context(|| "Could not deserialize utf8 string into listeners")?;
+            .map_err(|error| ScmSocketError::ListenerParse(error.to_string()))?;
 
         let mut index = 0;
         let len = listeners_count.http.len();
@@ -131,7 +149,7 @@ impl ScmSocket {
 
     /// Sends message and file descriptors separately. The file descriptors are summed up
     /// in a ControlMessage.
-    fn send_msg_and_fds(&self, message: &[u8], fds: &[RawFd]) -> anyhow::Result<()> {
+    fn send_msg_and_fds(&self, message: &[u8], fds: &[RawFd]) -> Result<(), ScmSocketError> {
         let iov = [IoSlice::new(message)];
         let flags = if self.blocking {
             socket::MsgFlags::empty()
@@ -142,14 +160,14 @@ impl ScmSocket {
         if fds.is_empty() {
             debug!("{} send empty", self.fd);
             socket::sendmsg::<()>(self.fd, &iov, &[], flags, None)
-                .with_context(|| "Could not send empty message per socket")?;
+                .map_err(|error| ScmSocketError::Send(error.to_string()))?;
             return Ok(());
         };
 
         let control_message = [socket::ControlMessage::ScmRights(fds)];
         debug!("{} send with data", self.fd);
         socket::sendmsg::<()>(self.fd, &iov, &control_message, flags, None)
-            .with_context(|| "Could not send message per socket")?;
+            .map_err(|error| ScmSocketError::Send(error.to_string()))?;
         Ok(())
     }
 
@@ -158,7 +176,7 @@ impl ScmSocket {
         &self,
         message: &mut [u8],
         fds: &mut [RawFd],
-    ) -> anyhow::Result<(usize, usize)> {
+    ) -> Result<(usize, usize), ScmSocketError> {
         let mut cmsg = cmsg_space!([RawFd; MAX_FDS_OUT]);
         let mut iov = [IoSliceMut::new(message)];
 
@@ -169,7 +187,7 @@ impl ScmSocket {
         };
 
         let msg = socket::recvmsg::<()>(self.fd, &mut iov[..], Some(&mut cmsg), flags)
-            .with_context(|| "Could not receive message per socket")?;
+            .map_err(|error| ScmSocketError::Receive(error.to_string()))?;
 
         let mut fd_count = 0;
         let received_fds = msg

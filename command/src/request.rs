@@ -5,8 +5,6 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::Context;
-
 use crate::{
     proto::command::{
         request::RequestType, LoadBalancingAlgorithms, PathRuleKind, Request, RequestHttpFrontend,
@@ -14,6 +12,14 @@ use crate::{
     },
     response::{HttpFrontend, MessageId},
 };
+
+#[derive(thiserror::Error, Debug)]
+pub enum RequestError {
+    #[error("Invalid address {address}: {error}")]
+    InvalidSocketAddress { address: String, error: String },
+    #[error("invalid value {value} for field '{name}'")]
+    InvalidValue { name: String, value: i32 },
+}
 
 impl Request {
     /// determine to which of the three proxies (HTTP, HTTPS, TCP) a request is destined
@@ -126,18 +132,22 @@ pub struct ProxyDestinations {
 
 impl RequestHttpFrontend {
     /// convert a requested frontend to a usable one by parsing its address
-    pub fn to_frontend(self) -> anyhow::Result<HttpFrontend> {
+    pub fn to_frontend(self) -> Result<HttpFrontend, RequestError> {
         Ok(HttpFrontend {
-            address: self
-                .address
-                .parse::<SocketAddr>()
-                .with_context(|| "wrong socket address")?,
+            address: self.address.parse::<SocketAddr>().map_err(|parse_error| {
+                RequestError::InvalidSocketAddress {
+                    address: self.address.clone(),
+                    error: parse_error.to_string(),
+                }
+            })?,
             cluster_id: self.cluster_id,
             hostname: self.hostname,
             path: self.path,
             method: self.method,
-            position: RulePosition::from_i32(self.position)
-                .with_context(|| "wrong i32 value for RulePosition")?,
+            position: RulePosition::from_i32(self.position).ok_or(RequestError::InvalidValue {
+                name: "position".to_string(),
+                value: self.position.clone(),
+            })?,
             tags: Some(self.tags),
         })
     }

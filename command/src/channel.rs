@@ -12,12 +12,39 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Context};
 use mio::{event::Source, net::UnixStream as MioUnixStream};
 use serde::{de::DeserializeOwned, ser::Serialize};
 use serde_json;
 
 use crate::{buffer::growable::Buffer, ready::Ready};
+
+#[derive(thiserror::Error, Debug)]
+pub enum ChannelError {
+    #[error("io read error")]
+    Read(std::io::Error),
+    #[error("no byte written on the channel")]
+    NoByteWritten,
+    #[error("no byte left to read on the channel")]
+    NoByteToRead,
+    #[error("message too large for the capacity of the back fuffer ({0}. Consider increasing the back buffer size")]
+    MessageTooLarge(usize),
+    #[error("channel could not write on the back buffer")]
+    Write(std::io::Error),
+    #[error("channel buffer is full, cannot grow more")]
+    BufferFull,
+    #[error("Timeout is reached: {0:?}")]
+    TimeoutReached(Duration),
+    #[error("Could not read anything on the channel")]
+    NothingRead,
+    #[error("invalid char set in command message, ignoring: {0}")]
+    InvalidCharSet(String),
+    #[error("Error deserializing message")]
+    Serde(serde_json::error::Error),
+    #[error("Could not change the blocking status ef the unix stream with file descriptor {fd}: {error}")]
+    BlockingStatus { fd: i32, error: String },
+    #[error("Connection error: {0:?}")]
+    Connection(Option<std::io::Error>),
+}
 
 /// A wrapper around unix socket using the mio crate.
 /// Used in pairs to communicate, in a blocking or non-blocking way.
@@ -39,9 +66,9 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         path: &str,
         buffer_size: usize,
         max_buffer_size: usize,
-    ) -> anyhow::Result<Channel<Tx, Rx>> {
+    ) -> Result<Channel<Tx, Rx>, ChannelError> {
         let unix_stream = MioUnixStream::connect(path)
-            .with_context(|| format!("Could not connect to socket with path {path}"))?;
+            .map_err(|io_error| ChannelError::Connection(Some(io_error)))?;
         Ok(Channel::new(unix_stream, buffer_size, max_buffer_size))
     }
 
@@ -77,13 +104,16 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     // Since MioUnixStream does not have a set_nonblocking method, we have to use the standard library.
     // We get the file descriptor of the MioUnixStream socket, create a standard library UnixStream,
     // set it to nonblocking, let go of the file descriptor
-    fn set_nonblocking(&mut self, nonblocking: bool) -> anyhow::Result<()> {
+    fn set_nonblocking(&mut self, nonblocking: bool) -> Result<(), ChannelError> {
         unsafe {
             let fd = self.sock.as_raw_fd();
             let stream = StdUnixStream::from_raw_fd(fd);
-            stream.set_nonblocking(nonblocking).with_context(|| {
-                format!("could not change blocking status of unix stream with file descriptor {fd}")
-            })?;
+            stream
+                .set_nonblocking(nonblocking)
+                .map_err(|error| ChannelError::BlockingStatus {
+                    fd,
+                    error: error.to_string(),
+                })?;
             let _fd = stream.into_raw_fd();
         }
         self.blocking = !nonblocking;
@@ -91,12 +121,12 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     }
 
     /// set the channel to be blocking
-    pub fn blocking(&mut self) -> anyhow::Result<()> {
+    pub fn blocking(&mut self) -> Result<(), ChannelError> {
         self.set_nonblocking(false)
     }
 
     /// set the channel to be nonblocking
-    pub fn nonblocking(&mut self) -> anyhow::Result<()> {
+    pub fn nonblocking(&mut self) -> Result<(), ChannelError> {
         self.set_nonblocking(true)
     }
 
@@ -117,27 +147,23 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     }
 
     /// Checks wether we want and can read or write, and calls the appropriate handler.
-    pub fn run(&mut self) -> anyhow::Result<()> {
+    pub fn run(&mut self) -> Result<(), ChannelError> {
         let interest = self.interest & self.readiness;
 
         if interest.is_readable() {
-            let _ = self
-                .readable()
-                .with_context(|| "error reading from channel")?;
+            let _ = self.readable()?;
         }
 
         if interest.is_writable() {
-            let _ = self
-                .writable()
-                .with_context(|| "error writing to channel")?;
+            let _ = self.writable()?;
         }
         Ok(())
     }
 
     /// Handles readability by filling the front buffer with the socket data.
-    pub fn readable(&mut self) -> anyhow::Result<usize> {
+    pub fn readable(&mut self) -> Result<usize, ChannelError> {
         if !(self.interest & self.readiness).is_readable() {
-            bail!("Connection error, continuing")
+            return Err(ChannelError::Connection(None));
         }
 
         let mut count = 0usize;
@@ -153,17 +179,17 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                     self.interest = Ready::EMPTY;
                     self.readiness.remove(Ready::READABLE);
                     self.readiness.insert(Ready::HUP);
-                    bail!("Error with the socket, reading on it return 0");
+                    return Err(ChannelError::NoByteToRead);
                 }
                 Err(read_error) => match read_error.kind() {
                     ErrorKind::WouldBlock => {
                         self.readiness.remove(Ready::READABLE);
                         break;
                     }
-                    other_error => {
+                    _ => {
                         self.interest = Ready::EMPTY;
                         self.readiness = Ready::EMPTY;
-                        bail!("Error with the socket: {}", other_error);
+                        return Err(ChannelError::Read(read_error));
                     }
                 },
                 Ok(bytes_read) => {
@@ -177,9 +203,9 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     }
 
     /// Handles writability by writing the content of the back buffer onto the socket
-    pub fn writable(&mut self) -> anyhow::Result<usize> {
+    pub fn writable(&mut self) -> Result<usize, ChannelError> {
         if !(self.interest & self.readiness).is_writable() {
-            bail!("Connection error, continuing")
+            return Err(ChannelError::Connection(None));
         }
 
         let mut count = 0usize;
@@ -194,7 +220,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                 Ok(0) => {
                     self.interest = Ready::EMPTY;
                     self.readiness.insert(Ready::HUP);
-                    bail!("The write function returned 0");
+                    return Err(ChannelError::NoByteWritten);
                 }
                 Ok(bytes_written) => {
                     count += bytes_written;
@@ -205,10 +231,10 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                         self.readiness.remove(Ready::WRITABLE);
                         break;
                     }
-                    other_error => {
+                    _ => {
                         self.interest = Ready::EMPTY;
                         self.readiness = Ready::EMPTY;
-                        bail!("channel write error: {:?}", other_error);
+                        return Err(ChannelError::Read(write_error));
                     }
                 },
             }
@@ -223,7 +249,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     ///
     /// Nonblocking: parses a message from the front buffer, without waiting.
     /// Prefer using `channel.readable()` before
-    pub fn read_message(&mut self) -> anyhow::Result<Rx> {
+    pub fn read_message(&mut self) -> Result<Rx, ChannelError> {
         if self.blocking {
             self.read_message_blocking()
         } else {
@@ -232,18 +258,9 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     }
 
     /// Parses a message from the front buffer, without waiting
-    fn read_message_nonblocking(&mut self) -> anyhow::Result<Rx> {
+    fn read_message_nonblocking(&mut self) -> Result<Rx, ChannelError> {
         match self.front_buf.data().iter().position(|&x| x == 0) {
-            Some(position) => {
-                let utf8_str = from_utf8(&self.front_buf.data()[..position])
-                    .with_context(|| "invalid utf-8 encoding in command message, ignoring")?;
-
-                let json_parsed = serde_json::from_str(utf8_str)
-                    .with_context(|| format!("could not parse message {utf8_str}, ignoring"))?;
-
-                self.front_buf.consume(position + 1);
-                Ok(json_parsed)
-            }
+            Some(position) => self.read_and_parse_from_front_buffer(position),
             None => {
                 if self.front_buf.available_space() == 0 {
                     if self.front_buf.capacity() == self.max_buffer_size {
@@ -255,12 +272,12 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                 }
 
                 self.interest.insert(Ready::READABLE);
-                bail!("Could not read anything on the channel");
+                return Err(ChannelError::NothingRead);
             }
         }
     }
 
-    fn read_message_blocking(&mut self) -> anyhow::Result<Rx> {
+    fn read_message_blocking(&mut self) -> Result<Rx, ChannelError> {
         self.read_message_blocking_timeout(None)
     }
 
@@ -268,31 +285,22 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     pub fn read_message_blocking_timeout(
         &mut self,
         timeout: Option<Duration>,
-    ) -> anyhow::Result<Rx> {
+    ) -> Result<Rx, ChannelError> {
         let now = std::time::Instant::now();
 
         loop {
             if let Some(timeout) = timeout {
                 if now.elapsed() >= timeout {
-                    bail!("Timeout is reached: {:?}", timeout);
+                    return Err(ChannelError::TimeoutReached(timeout));
                 }
             }
 
             match self.front_buf.data().iter().position(|&x| x == 0) {
-                Some(position) => {
-                    let utf8_str = from_utf8(&self.front_buf.data()[..position])
-                        .with_context(|| "invalid utf-8 encoding in command message, ignoring")?;
-
-                    let json_parsed = serde_json::from_str(utf8_str)
-                        .with_context(|| format!("could not parse message {utf8_str}, ignoring"))?;
-
-                    self.front_buf.consume(position + 1);
-                    return Ok(json_parsed);
-                }
+                Some(position) => return self.read_and_parse_from_front_buffer(position),
                 None => {
                     if self.front_buf.available_space() == 0 {
                         if self.front_buf.capacity() == self.max_buffer_size {
-                            bail!("command buffer full, cannot grow more, ignoring");
+                            return Err(ChannelError::BufferFull);
                         }
                         let new_size = min(self.front_buf.capacity() + 5000, self.max_buffer_size);
                         self.front_buf.grow(new_size);
@@ -301,9 +309,9 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                     match self
                         .sock
                         .read(self.front_buf.space())
-                        .with_context(|| "Error while reading on the socket")?
+                        .map_err(ChannelError::Read)?
                     {
-                        0 => bail!("No byte letf to read on channel"),
+                        0 => return Err(ChannelError::NoByteToRead),
                         bytes_read => self.front_buf.fill(bytes_read),
                     };
                 }
@@ -311,10 +319,20 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         }
     }
 
+    fn read_and_parse_from_front_buffer(&mut self, position: usize) -> Result<Rx, ChannelError> {
+        let utf8_str = from_utf8(&self.front_buf.data()[..position])
+            .map_err(|from_error| ChannelError::InvalidCharSet(from_error.to_string()))?;
+
+        let json_parsed = serde_json::from_str(utf8_str).map_err(ChannelError::Serde)?;
+
+        self.front_buf.consume(position + 1);
+        Ok(json_parsed)
+    }
+
     /// Checks whether the channel is blocking or nonblocking, writes the message.
     ///
     /// If the channel is nonblocking, you have to flush using `channel.run()` afterwards
-    pub fn write_message(&mut self, message: &Tx) -> anyhow::Result<()> {
+    pub fn write_message(&mut self, message: &Tx) -> Result<(), ChannelError> {
         if self.blocking {
             self.write_message_blocking(message)
         } else {
@@ -324,7 +342,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
 
     /// Writes the message in the buffer, but NOT on the socket.
     /// you have to call channel.run() afterwards
-    fn write_message_nonblocking(&mut self, message: &Tx) -> anyhow::Result<()> {
+    fn write_message_nonblocking(&mut self, message: &Tx) -> Result<(), ChannelError> {
         let message = match serde_json::to_string(message) {
             Ok(string) => string.into_bytes(),
             Err(_) => Vec::new(),
@@ -339,10 +357,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
             if message_len - self.back_buf.available_space() + self.back_buf.capacity()
                 > self.max_buffer_size
             {
-                bail!(format!(
-                    "message is too large to write to back buffer. Consider increasing proxy channel buffer size, current value is {}",
-                    self.back_buf.capacity()
-                ));
+                return Err(ChannelError::MessageTooLarge(self.back_buf.capacity()));
             }
 
             let new_length =
@@ -350,13 +365,11 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
             self.back_buf.grow(new_length);
         }
 
-        self.back_buf
-            .write(&message)
-            .with_context(|| "channel could not write to back buffer")?;
+        self.back_buf.write(&message).map_err(ChannelError::Write)?;
 
         self.back_buf
             .write(&b"\0"[..])
-            .with_context(|| "channel could not write to back buffer")?;
+            .map_err(ChannelError::Write)?;
 
         self.interest.insert(Ready::WRITABLE);
 
@@ -364,7 +377,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     }
 
     /// fills the back buffer with data AND writes on the socket
-    fn write_message_blocking(&mut self, message: &Tx) -> anyhow::Result<()> {
+    fn write_message_blocking(&mut self, message: &Tx) -> Result<(), ChannelError> {
         let message = match serde_json::to_string(message) {
             Ok(string) => string.into_bytes(),
             Err(_) => Vec::new(),
@@ -379,23 +392,18 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
             if msg_len - self.back_buf.available_space() + self.back_buf.capacity()
                 > self.max_buffer_size
             {
-                bail!(format!(
-                    "message is too large to write to back buffer. Consider increasing proxy channel buffer size, current value is {}",
-                    self.back_buf.capacity()
-                ));
+                return Err(ChannelError::MessageTooLarge(self.back_buf.capacity()));
             }
 
             let new_len = msg_len - self.back_buf.available_space() + self.back_buf.capacity();
             self.back_buf.grow(new_len);
         }
 
-        self.back_buf
-            .write(&message)
-            .with_context(|| "channel could not write to back buffer")?;
+        self.back_buf.write(&message).map_err(ChannelError::Write)?;
 
         self.back_buf
             .write(&b"\0"[..])
-            .with_context(|| "channel could not write to back buffer")?;
+            .map_err(ChannelError::Write)?;
 
         loop {
             let size = self.back_buf.available_data();
@@ -404,7 +412,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
             }
 
             match self.sock.write(self.back_buf.data()) {
-                Ok(0) => bail!("No byte written on the channel"),
+                Ok(0) => return Err(ChannelError::NoByteWritten),
                 Ok(bytes_written) => {
                     self.back_buf.consume(bytes_written);
                 }
@@ -422,14 +430,11 @@ impl<Tx: Debug + DeserializeOwned + Serialize, Rx: Debug + DeserializeOwned + Se
     pub fn generate(
         buffer_size: usize,
         max_buffer_size: usize,
-    ) -> anyhow::Result<(Channel<Tx, Rx>, Channel<Rx, Tx>)> {
-        let (command, proxy) =
-            MioUnixStream::pair().with_context(|| "Could not create a pair of unix streams")?;
+    ) -> Result<(Channel<Tx, Rx>, Channel<Rx, Tx>), ChannelError> {
+        let (command, proxy) = MioUnixStream::pair().map_err(ChannelError::Read)?;
         let proxy_channel = Channel::new(proxy, buffer_size, max_buffer_size);
         let mut command_channel = Channel::new(command, buffer_size, max_buffer_size);
-        command_channel
-            .blocking()
-            .with_context(|| "Could not block channel")?;
+        command_channel.blocking()?;
         Ok((command_channel, proxy_channel))
     }
 
@@ -437,8 +442,8 @@ impl<Tx: Debug + DeserializeOwned + Serialize, Rx: Debug + DeserializeOwned + Se
     pub fn generate_nonblocking(
         buffer_size: usize,
         max_buffer_size: usize,
-    ) -> io::Result<(Channel<Tx, Rx>, Channel<Rx, Tx>)> {
-        let (command, proxy) = MioUnixStream::pair()?;
+    ) -> Result<(Channel<Tx, Rx>, Channel<Rx, Tx>), ChannelError> {
+        let (command, proxy) = MioUnixStream::pair().map_err(ChannelError::Read)?;
         let proxy_channel = Channel::new(proxy, buffer_size, max_buffer_size);
         let command_channel = Channel::new(command, buffer_size, max_buffer_size);
         Ok((command_channel, proxy_channel))

@@ -51,13 +51,12 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
     fs::{create_dir_all, metadata, File},
-    io::{self, ErrorKind, Read},
+    io::{ErrorKind, Read},
     net::SocketAddr,
     ops::Range,
     path::PathBuf,
 };
 
-use anyhow::{bail, Context};
 use toml;
 
 use crate::{
@@ -69,6 +68,7 @@ use crate::{
         RequestHttpFrontend, RequestTcpFrontend, RulePosition, TcpListenerConfig, TlsVersion,
     },
     request::WorkerRequest,
+    ObjectKind,
 };
 
 /// provides all supported cipher suites exported by Rustls TLS
@@ -154,6 +154,66 @@ pub const DEFAULT_COMMAND_BUFFER_SIZE: usize = 1_000_000;
 
 /// maximum size of the buffer for the channels, in bytes. (2 MB)
 pub const DEFAULT_MAX_COMMAND_BUFFER_SIZE: usize = 2_000_000;
+
+#[derive(Debug)]
+pub enum IncompatibilityKind {
+    PublicAddress,
+    ProxyProtocol,
+}
+
+#[derive(Debug)]
+pub enum MissingKind {
+    Field(String),
+    Protocol,
+    SavedState,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ConfigError {
+    #[error("Could not parse socket address {address}: {error}")]
+    ParseSocketAddress { address: String, error: String },
+    #[error("env path not found: {0}")]
+    Env(String),
+    #[error("Could not open file {path_to_open}: {io_error}")]
+    FileOpen {
+        path_to_open: String,
+        io_error: std::io::Error,
+    },
+    #[error("Could not read file {path_to_read}: {io_error}")]
+    FileRead {
+        path_to_read: String,
+        io_error: std::io::Error,
+    },
+    #[error("the field {kind:?} of {object:?} with id or address {id} is incompatible with the rest of the options")]
+    Incompatible {
+        kind: IncompatibilityKind,
+        object: ObjectKind,
+        id: String,
+    },
+    #[error("Invalid '{0}' field for a TCP frontend")]
+    InvalidFrontendConfig(String),
+    #[error("invalid path {0:?}")]
+    InvalidPath(PathBuf),
+    #[error("listening address {0} is already used in the configuration")]
+    ListenerAddressAlreadyInUse(String),
+    #[error("missing {0:?}")]
+    Missing(MissingKind),
+    #[error("could not get parent directory for file {0}")]
+    NoFileParent(String),
+    #[error("Could not get the path of the saved state")]
+    SaveStatePath(String),
+    #[error("Can not determine path to sozu socket: {0}")]
+    SocketPathError(String),
+    #[error("toml decoding error: {0}")]
+    DeserializeToml(String),
+    #[error("Can not set this frontend on a {0:?} listener")]
+    WrongFrontendProtocol(ListenerProtocol),
+    #[error("Can not build a {expected:?} listener from a {found:?} config")]
+    WrongListenerProtocol {
+        expected: ListenerProtocol,
+        found: Option<ListenerProtocol>,
+    },
+}
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
@@ -333,18 +393,13 @@ impl ListenerBuilder {
         self
     }
 
-    pub fn parse_address(&self) -> anyhow::Result<SocketAddr> {
-        self.address.parse().with_context(|| "wrong socket address")
+    pub fn parse_address(&self) -> Result<SocketAddr, ConfigError> {
+        parse_socket_address(&self.address)
     }
 
-    pub fn parse_public_address(&self) -> anyhow::Result<Option<SocketAddr>> {
+    pub fn parse_public_address(&self) -> Result<Option<SocketAddr>, ConfigError> {
         match &self.public_address {
-            Some(a) => {
-                let parsed = a
-                    .parse::<SocketAddr>()
-                    .with_context(|| "wrong socket address")?;
-                Ok(Some(parsed))
-            }
+            Some(a) => Ok(Some(parse_socket_address(a)?)),
             None => Ok(None),
         }
     }
@@ -358,29 +413,23 @@ impl ListenerBuilder {
     }
 
     /// build an HTTP listener with config timeouts, using defaults if no config is provided
-    pub fn to_http(&mut self, config: Option<&Config>) -> anyhow::Result<HttpListenerConfig> {
+    pub fn to_http(&mut self, config: Option<&Config>) -> Result<HttpListenerConfig, ConfigError> {
         if self.protocol != Some(ListenerProtocol::Http) {
-            bail!(format!(
-                "Can not build an HTTP listener from a {:?} config",
-                self.protocol
-            ));
+            return Err(ConfigError::WrongListenerProtocol {
+                expected: ListenerProtocol::Http,
+                found: self.protocol.to_owned(),
+            });
         }
 
         if let Some(config) = config {
             self.assign_config_timeouts(config);
         }
 
-        let (answer_404, answer_503) = self
-            .get_404_503_answers()
-            .with_context(|| "Could not get 404 and 503 answers from file system")?;
+        let (answer_404, answer_503) = self.get_404_503_answers()?;
 
-        let _address = self
-            .parse_address()
-            .with_context(|| "wrong socket address")?;
+        let _address = self.parse_address()?;
 
-        let _public_address = self
-            .parse_public_address()
-            .with_context(|| "wrong public address")?;
+        let _public_address = self.parse_public_address()?;
 
         let configuration = HttpListenerConfig {
             address: self.address.clone(),
@@ -400,12 +449,12 @@ impl ListenerBuilder {
     }
 
     /// build an HTTPS listener using defaults if no config or values were provided upstream
-    pub fn to_tls(&mut self, config: Option<&Config>) -> anyhow::Result<HttpsListenerConfig> {
+    pub fn to_tls(&mut self, config: Option<&Config>) -> Result<HttpsListenerConfig, ConfigError> {
         if self.protocol != Some(ListenerProtocol::Https) {
-            bail!(format!(
-                "Can not build an HTTPS listener from a {:?} config",
-                self.protocol
-            ));
+            return Err(ConfigError::WrongListenerProtocol {
+                expected: ListenerProtocol::Https,
+                found: self.protocol.to_owned(),
+            });
         }
 
         let default_cipher_list = DEFAULT_RUSTLS_CIPHER_LIST
@@ -466,15 +515,12 @@ impl ListenerBuilder {
 
         let (answer_404, answer_503) = self
             .get_404_503_answers()
-            .with_context(|| "Could not get 404 and 503 answers from file system")?;
+            //.with_context(|| "Could not get 404 and 503 answers from file system")
+            ?;
 
-        let _address = self
-            .parse_address()
-            .with_context(|| "wrong socket address")?;
+        let _address = self.parse_address()?;
 
-        let _public_address = self
-            .parse_public_address()
-            .with_context(|| "wrong public address")?;
+        let _public_address = self.parse_public_address()?;
 
         if let Some(config) = config {
             self.assign_config_timeouts(config);
@@ -506,21 +552,17 @@ impl ListenerBuilder {
     }
 
     /// build an HTTPS listener using defaults if no config or values were provided upstream
-    pub fn to_tcp(&mut self, config: Option<&Config>) -> anyhow::Result<TcpListenerConfig> {
+    pub fn to_tcp(&mut self, config: Option<&Config>) -> Result<TcpListenerConfig, ConfigError> {
         if self.protocol != Some(ListenerProtocol::Tcp) {
-            bail!(format!(
-                "Can not build a TCP listener from a {:?} config",
-                self.protocol
-            ));
+            return Err(ConfigError::WrongListenerProtocol {
+                expected: ListenerProtocol::Tcp,
+                found: self.protocol.to_owned(),
+            });
         }
 
-        let _address = self
-            .parse_address()
-            .with_context(|| "wrong socket address")?;
+        let _address = self.parse_address()?;
 
-        let _public_address = self
-            .parse_public_address()
-            .with_context(|| "wrong public address")?;
+        let _public_address = self.parse_public_address()?;
 
         if let Some(config) = config {
             self.assign_config_timeouts(config);
@@ -539,46 +581,43 @@ impl ListenerBuilder {
 
     /// Get the 404 and 503 answers from the file system using the provided paths,
     /// if none, defaults to HTML files in the sozu assets
-    fn get_404_503_answers(&self) -> anyhow::Result<(String, String)> {
+    fn get_404_503_answers(&self) -> Result<(String, String), ConfigError> {
         let answer_404 = match &self.answer_404 {
-            Some(a_404_path) => {
-                let mut a_404 = String::new();
-                let mut file = File::open(a_404_path).with_context(|| {
-                    format!(
-                        "Could not open 404 answer file on path {}, current dir {:?}",
-                        a_404_path,
-                        std::env::current_dir().ok()
-                    )
-                })?;
-
-                file.read_to_string(&mut a_404).with_context(|| {
-                    format!(
-                        "Could not read 404 answer file on path {}, current dir {:?}",
-                        a_404_path,
-                        std::env::current_dir().ok()
-                    )
-                })?;
-                a_404
-            }
+            Some(a_404_path) => open_and_read_file(a_404_path)?,
             None => String::from(include_str!("../assets/404.html")),
         };
 
         let answer_503 = match &self.answer_503 {
-            Some(a_503_path) => {
-                let mut a_503 = String::new();
-                let mut file = File::open(a_503_path).with_context(|| {
-                    format!("Could not open 503 answer file on path {a_503_path}")
-                })?;
-
-                file.read_to_string(&mut a_503).with_context(|| {
-                    format!("Could not read 503 answer file on path {a_503_path}")
-                })?;
-                a_503
-            }
+            Some(a_503_path) => open_and_read_file(a_503_path)?,
             None => String::from(include_str!("../assets/503.html")),
         };
         Ok((answer_404, answer_503))
     }
+}
+
+fn parse_socket_address(address: &str) -> Result<SocketAddr, ConfigError> {
+    address
+        .parse::<SocketAddr>()
+        .map_err(|parse_error| ConfigError::ParseSocketAddress {
+            error: parse_error.to_string(),
+            address: address.to_owned(),
+        })
+}
+
+fn open_and_read_file(path: &str) -> Result<String, ConfigError> {
+    let mut content = String::new();
+    let mut file = File::open(path).map_err(|io_error| ConfigError::FileOpen {
+        path_to_open: path.to_owned(),
+        io_error,
+    })?;
+
+    file.read_to_string(&mut content)
+        .map_err(|io_error| ConfigError::FileRead {
+            path_to_read: path.to_owned(),
+            io_error,
+        })?;
+
+    Ok(content)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -621,21 +660,27 @@ pub struct FileClusterFrontendConfig {
 }
 
 impl FileClusterFrontendConfig {
-    pub fn to_tcp_front(&self) -> anyhow::Result<TcpFrontendConfig> {
+    pub fn to_tcp_front(&self) -> Result<TcpFrontendConfig, ConfigError> {
         if self.hostname.is_some() {
-            bail!("invalid 'hostname' field for TCP frontend");
+            return Err(ConfigError::InvalidFrontendConfig("hostname".to_string()));
         }
         if self.path.is_some() {
-            bail!("invalid 'path_prefix' field for TCP frontend");
+            return Err(ConfigError::InvalidFrontendConfig(
+                "path_prefix".to_string(),
+            ));
         }
         if self.certificate.is_some() {
-            bail!("invalid 'certificate' field for TCP frontend");
+            return Err(ConfigError::InvalidFrontendConfig(
+                "certificate".to_string(),
+            ));
         }
         if self.hostname.is_some() {
-            bail!("invalid 'key' field for TCP frontend");
+            return Err(ConfigError::InvalidFrontendConfig("hostname".to_string()));
         }
         if self.certificate_chain.is_some() {
-            bail!("invalid 'certificate_chain' field for TCP frontend",);
+            return Err(ConfigError::InvalidFrontendConfig(
+                "certificate_chain".to_string(),
+            ));
         }
 
         Ok(TcpFrontendConfig {
@@ -644,17 +689,20 @@ impl FileClusterFrontendConfig {
         })
     }
 
-    pub fn to_http_front(&self, _cluster_id: &str) -> anyhow::Result<HttpFrontendConfig> {
+    pub fn to_http_front(&self, _cluster_id: &str) -> Result<HttpFrontendConfig, ConfigError> {
         let hostname = match &self.hostname {
             Some(hostname) => hostname.to_owned(),
-            None => bail!("HTTP frontend should have a 'hostname' field"),
+            None => {
+                return Err(ConfigError::Missing(MissingKind::Field(
+                    "hostname".to_string(),
+                )))
+            }
         };
 
         let key_opt = match self.key.as_ref() {
             None => None,
             Some(path) => {
-                let key = Config::load_file(path)
-                    .with_context(|| format!("cannot load key at path '{path}'"))?;
+                let key = Config::load_file(path)?;
                 Some(key)
             }
         };
@@ -662,8 +710,7 @@ impl FileClusterFrontendConfig {
         let certificate_opt = match self.certificate.as_ref() {
             None => None,
             Some(path) => {
-                let certificate = Config::load_file(path)
-                    .with_context(|| format!("cannot load certificate at path '{path}'"))?;
+                let certificate = Config::load_file(path)?;
                 Some(certificate)
             }
         };
@@ -671,8 +718,7 @@ impl FileClusterFrontendConfig {
         let chain_opt = match self.certificate_chain.as_ref() {
             None => None,
             Some(path) => {
-                let certificate_chain = Config::load_file(path)
-                    .with_context(|| format!("cannot load certificate chain at path {path}"))?;
+                let certificate_chain = Config::load_file(path)?;
                 Some(split_certificate_chain(certificate_chain))
             }
         };
@@ -747,7 +793,7 @@ impl FileClusterConfig {
         self,
         cluster_id: &str,
         expect_proxy: &HashSet<SocketAddr>,
-    ) -> anyhow::Result<ClusterConfig> {
+    ) -> Result<ClusterConfig, ConfigError> {
         match self.protocol {
             FileClusterProtocolConfig::Tcp => {
                 let mut has_expect_proxy = None;
@@ -755,18 +801,26 @@ impl FileClusterConfig {
                 for f in self.frontends {
                     if expect_proxy.contains(&f.address) {
                         match has_expect_proxy {
-                            Some(true) => {},
-                            Some(false) => bail!(format!(
-                                "all the listeners for cluster {cluster_id} should have the same expect_proxy option"
-                            )),
+                            Some(true) => {}
+                            Some(false) => {
+                                return Err(ConfigError::Incompatible {
+                                    object: ObjectKind::Cluster,
+                                    id: cluster_id.to_owned(),
+                                    kind: IncompatibilityKind::ProxyProtocol,
+                                })
+                            }
                             None => has_expect_proxy = Some(true),
                         }
                     } else {
                         match has_expect_proxy {
-                            Some(false) => {},
-                            Some(true) => bail!(format!(
-                                "all the listeners for cluster {cluster_id} should have the same expect_proxy option"
-                            )),
+                            Some(false) => {}
+                            Some(true) => {
+                                return Err(ConfigError::Incompatible {
+                                    object: ObjectKind::Cluster,
+                                    id: cluster_id.to_owned(),
+                                    kind: IncompatibilityKind::ProxyProtocol,
+                                })
+                            }
                             None => has_expect_proxy = Some(false),
                         }
                     }
@@ -795,9 +849,7 @@ impl FileClusterConfig {
             FileClusterProtocolConfig::Http => {
                 let mut frontends = Vec::new();
                 for frontend in self.frontends {
-                    let http_frontend = frontend
-                        .to_http_front(cluster_id)
-                        .with_context(|| "Could not convert frontend config to http frontend")?;
+                    let http_frontend = frontend.to_http_front(cluster_id)?;
                     frontends.push(http_frontend);
                 }
 
@@ -913,7 +965,7 @@ pub struct HttpClusterConfig {
 }
 
 impl HttpClusterConfig {
-    pub fn generate_requests(&self) -> anyhow::Result<Vec<Request>> {
+    pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
         let mut v = vec![RequestType::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: self.sticky_session,
@@ -972,7 +1024,7 @@ pub struct TcpClusterConfig {
 }
 
 impl TcpClusterConfig {
-    pub fn generate_requests(&self) -> anyhow::Result<Vec<Request>> {
+    pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
         let mut v = vec![RequestType::AddCluster(Cluster {
             cluster_id: self.cluster_id.clone(),
             sticky_session: false,
@@ -1026,7 +1078,7 @@ pub enum ClusterConfig {
 }
 
 impl ClusterConfig {
-    pub fn generate_requests(&self) -> anyhow::Result<Vec<Request>> {
+    pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
         match *self {
             ClusterConfig::Http(ref http) => http.generate_requests(),
             ClusterConfig::Tcp(ref tcp) => tcp.generate_requests(),
@@ -1075,14 +1127,14 @@ pub struct FileConfig {
 }
 
 impl FileConfig {
-    pub fn load_from_path(path: &str) -> anyhow::Result<FileConfig> {
+    pub fn load_from_path(path: &str) -> Result<FileConfig, ConfigError> {
         let data = Config::load_file(path)?;
 
         let config: FileConfig = match toml::from_str(&data) {
             Ok(config) => config,
             Err(e) => {
                 display_toml_error(&data, &e);
-                bail!(format!("toml decoding error: {e}"));
+                return Err(ConfigError::DeserializeToml(e.to_string()));
             }
         };
 
@@ -1091,9 +1143,8 @@ impl FileConfig {
         if let Some(listeners) = config.listeners.as_ref() {
             for listener in listeners.iter() {
                 if reserved_address.contains(&listener.parse_address()?) {
-                    bail!(format!(
-                        "listening address {:?} is already used in the configuration",
-                        listener.address
+                    return Err(ConfigError::ListenerAddressAlreadyInUse(
+                        listener.address.to_string(),
                     ));
                 }
                 reserved_address.insert(listener.parse_address()?);
@@ -1205,43 +1256,36 @@ impl ConfigBuilder {
         }
     }
 
-    fn push_tls_listener(&mut self, mut listener: ListenerBuilder) -> anyhow::Result<()> {
-        let listener = listener
-            .to_tls(Some(&self.built))
-            .with_context(|| "Cannot convert listener to TLS")?;
+    fn push_tls_listener(&mut self, mut listener: ListenerBuilder) -> Result<(), ConfigError> {
+        let listener = listener.to_tls(Some(&self.built))?;
         self.built.https_listeners.push(listener);
         Ok(())
     }
 
-    fn push_http_listener(&mut self, mut listener: ListenerBuilder) -> anyhow::Result<()> {
-        let listener = listener
-            .to_http(Some(&self.built))
-            .with_context(|| "Cannot convert listener to HTTP")?;
+    fn push_http_listener(&mut self, mut listener: ListenerBuilder) -> Result<(), ConfigError> {
+        let listener = listener.to_http(Some(&self.built))?;
         self.built.http_listeners.push(listener);
         Ok(())
     }
 
-    fn push_tcp_listener(&mut self, mut listener: ListenerBuilder) -> anyhow::Result<()> {
-        let listener = listener
-            .to_tcp(Some(&self.built))
-            .with_context(|| "Cannot convert listener to TCP")?;
+    fn push_tcp_listener(&mut self, mut listener: ListenerBuilder) -> Result<(), ConfigError> {
+        let listener = listener.to_tcp(Some(&self.built))?;
         self.built.tcp_listeners.push(listener);
         Ok(())
     }
 
-    fn populate_listeners(&mut self, listeners: Vec<ListenerBuilder>) -> anyhow::Result<()> {
+    fn populate_listeners(&mut self, listeners: Vec<ListenerBuilder>) -> Result<(), ConfigError> {
         for listener in listeners.iter() {
             let address = listener.parse_address()?;
             if self.known_addresses.contains_key(&address) {
-                bail!(format!(
-                    "there's already a listener for address {:?}",
-                    listener.address
+                return Err(ConfigError::ListenerAddressAlreadyInUse(
+                    listener.address.to_string(),
                 ));
             }
 
             let protocol = listener
                 .protocol
-                .with_context(|| "No protocol defined for this listener")?;
+                .ok_or(ConfigError::Missing(MissingKind::Protocol))?;
 
             self.known_addresses.insert(address, protocol);
             if listener.expect_proxy == Some(true) {
@@ -1249,10 +1293,11 @@ impl ConfigBuilder {
             }
 
             if listener.public_address.is_some() && listener.expect_proxy == Some(true) {
-                bail!(format!(
-                        "the listener on {} has incompatible options: it cannot use the expect proxy protocol and have a public_address field at the same time",
-                        &listener.address
-                    ));
+                return Err(ConfigError::Incompatible {
+                    object: ObjectKind::Listener,
+                    id: listener.address.to_owned(),
+                    kind: IncompatibilityKind::PublicAddress,
+                });
             }
 
             match protocol {
@@ -1267,22 +1312,26 @@ impl ConfigBuilder {
     fn populate_clusters(
         &mut self,
         mut file_cluster_configs: HashMap<String, FileClusterConfig>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ConfigError> {
         for (id, file_cluster_config) in file_cluster_configs.drain() {
-            let mut cluster_config = file_cluster_config
-                .to_cluster_config(id.as_str(), &self.expect_proxy_addresses)
-                .with_context(|| format!("error parsing cluster configuration for cluster {id}"))?;
+            let mut cluster_config =
+                file_cluster_config.to_cluster_config(id.as_str(), &self.expect_proxy_addresses)?;
+            // .with_context(|| format!("error parsing cluster configuration for cluster {id}"))?;
 
             match cluster_config {
                 ClusterConfig::Http(ref mut http) => {
                     for frontend in http.frontends.iter_mut() {
                         match self.known_addresses.get(&frontend.address) {
                             Some(ListenerProtocol::Tcp) => {
-                                bail!("cannot set up a HTTP or HTTPS frontend on a TCP listener");
+                                return Err(ConfigError::WrongFrontendProtocol(
+                                    ListenerProtocol::Tcp,
+                                ));
                             }
                             Some(ListenerProtocol::Http) => {
                                 if frontend.certificate.is_some() {
-                                    bail!("cannot set up a HTTPS frontend on a HTTP listener");
+                                    return Err(ConfigError::WrongFrontendProtocol(
+                                        ListenerProtocol::Http,
+                                    ));
                                 }
                             }
                             Some(ListenerProtocol::Https) => {
@@ -1302,7 +1351,9 @@ impl ConfigBuilder {
                                     if frontend.certificate.is_none() {
                                         debug!("known addresses: {:#?}", self.known_addresses);
                                         debug!("frontend: {:#?}", frontend);
-                                        bail!("cannot set up a HTTP frontend on a HTTPS listener");
+                                        return Err(ConfigError::WrongFrontendProtocol(
+                                            ListenerProtocol::Https,
+                                        ));
                                     }
                                 }
                             }
@@ -1334,7 +1385,9 @@ impl ConfigBuilder {
                     for frontend in &tcp.frontends {
                         match self.known_addresses.get(&frontend.address) {
                             Some(ListenerProtocol::Http) | Some(ListenerProtocol::Https) => {
-                                bail!("cannot set up a TCP frontend on a HTTP listener");
+                                return Err(ConfigError::WrongFrontendProtocol(
+                                    ListenerProtocol::Http,
+                                ));
                             }
                             Some(ListenerProtocol::Tcp) => {}
                             None => {
@@ -1357,7 +1410,7 @@ impl ConfigBuilder {
     }
 
     /// Builds a [`Config`], populated with listeners and clusters
-    pub fn into_config(&mut self) -> anyhow::Result<Config> {
+    pub fn into_config(&mut self) -> Result<Config, ConfigError> {
         if let Some(listeners) = &self.file.listeners {
             self.populate_listeners(listeners.clone())?;
         }
@@ -1367,16 +1420,16 @@ impl ConfigBuilder {
         }
 
         let command_socket_path = self.file.command_socket.clone().unwrap_or({
-            let mut path = env::current_dir().with_context(|| "env path not found")?;
+            let mut path = env::current_dir().map_err(|e| ConfigError::Env(e.to_string()))?;
             path.push("sozu.sock");
             let verified_path = path
                 .to_str()
-                .with_context(|| "command socket path not valid")?;
+                .ok_or(ConfigError::InvalidPath(path.clone()))?;
             verified_path.to_owned()
         });
 
         if let (None, Some(true)) = (&self.file.saved_state, &self.file.automatic_state_save) {
-            bail!("cannot activate automatic state save if the 'saved_state` option is not set");
+            return Err(ConfigError::Missing(MissingKind::SavedState));
         }
 
         Ok(Config {
@@ -1457,24 +1510,19 @@ fn default_accept_queue_timeout() -> u32 {
 
 impl Config {
     /// Parse a TOML file and build a config out of it
-    pub fn load_from_path(path: &str) -> anyhow::Result<Config> {
-        let file_config =
-            FileConfig::load_from_path(path).with_context(|| "Could not load the config file")?;
+    pub fn load_from_path(path: &str) -> Result<Config, ConfigError> {
+        let file_config = FileConfig::load_from_path(path)?;
 
-        let mut config = ConfigBuilder::new(file_config, path)
-            .into_config()
-            .with_context(|| "Could not build config from file")?;
+        let mut config = ConfigBuilder::new(file_config, path).into_config()?;
 
         // replace saved_state with a verified path
-        config.saved_state = config
-            .saved_state_path()
-            .with_context(|| "Invalid saved_state in the config. Check your config file")?;
+        config.saved_state = config.saved_state_path()?;
 
         Ok(config)
     }
 
     /// yields requests intended to recreate a proxy that match the config
-    pub fn generate_config_messages(&self) -> anyhow::Result<Vec<WorkerRequest>> {
+    pub fn generate_config_messages(&self) -> Result<Vec<WorkerRequest>, ConfigError> {
         let mut v = Vec::new();
         let mut count = 0u8;
 
@@ -1558,63 +1606,86 @@ impl Config {
     }
 
     /// Get the path of the UNIX socket used to communicate with Sōzu
-    pub fn command_socket_path(&self) -> anyhow::Result<String> {
+    pub fn command_socket_path(&self) -> Result<String, ConfigError> {
         let config_path_buf = PathBuf::from(self.config_path.clone());
-        let mut config_folder = match config_path_buf.parent() {
-            Some(path) => path.to_path_buf(),
-            None => bail!("could not get parent folder of configuration file"),
-        };
+        let mut config_dir = config_path_buf
+            .parent()
+            .ok_or(ConfigError::NoFileParent(
+                config_path_buf.to_string_lossy().to_string(),
+            ))?
+            .to_path_buf();
 
         let socket_path = PathBuf::from(self.command_socket.clone());
-        let mut parent = match socket_path.parent() {
-            None => config_folder,
+
+        let mut socket_parent_dir = match socket_path.parent() {
+            // if the socket path is of the form "./sozu.sock",
+            // then the parent is the directory where config.toml is situated
+            None => config_dir,
             Some(path) => {
-                config_folder.push(path);
-                config_folder.canonicalize().with_context(|| {
-                    format!("could not get command socket folder path: {path:?}")
+                // concatenate the config directory and the relative path of the socket
+                config_dir.push(path);
+                // canonicalize to remove double dots like /path/to/config/directory/../../path/to/socket/directory/
+                config_dir.canonicalize().map_err(|io_error| {
+                    ConfigError::SocketPathError(format!(
+                        "Could not canonicalize path {:?}: {}",
+                        config_dir,
+                        io_error.to_string()
+                    ))
                 })?
             }
         };
 
-        let path = match socket_path.file_name() {
-            None => bail!("could not get command socket file name"),
-            Some(f) => {
-                parent.push(f);
-                parent
-            }
-        };
+        let socket_name = socket_path
+            .file_name()
+            .ok_or(ConfigError::SocketPathError(format!(
+                "could not get command socket file name from {:?}",
+                socket_path
+            )))?;
 
-        path.to_str()
-            .map(|s| s.to_string())
-            .with_context(|| "could not parse command socket path")
+        // concatenate parent directory and socket file name
+        socket_parent_dir.push(socket_name);
+
+        let command_socket_path = socket_parent_dir
+            .to_str()
+            .ok_or(ConfigError::SocketPathError(format!(
+                "Invalid socket path {:?}",
+                socket_parent_dir
+            )))?
+            .to_string();
+
+        Ok(command_socket_path)
     }
 
     /// Get the path of where the state will be saved
-    fn saved_state_path(&self) -> anyhow::Result<Option<String>> {
+    fn saved_state_path(&self) -> Result<Option<String>, ConfigError> {
         let path = match self.saved_state.as_ref() {
             Some(path) => path,
             None => return Ok(None),
         };
 
         debug!("saved_stated path in the config: {}", path);
-        let config_path_buf = PathBuf::from(self.config_path.clone());
+        let config_path = PathBuf::from(self.config_path.clone());
 
-        debug!("Config path buffer: {:?}", config_path_buf);
-        let config_folder = config_path_buf
+        debug!("Config path buffer: {:?}", config_path);
+        let config_dir = config_path
             .parent()
-            .with_context(|| "could not get parent folder of configuration file")?;
+            .ok_or(ConfigError::SaveStatePath(format!(
+                "Could get parent directory of config file {:?}",
+                config_path,
+            )))?;
 
-        debug!("Config folder: {:?}", config_folder);
-        if !config_folder.exists() {
-            create_dir_all(config_folder).with_context(|| {
-                format!(
-                    "failed to create state parent directory '{}'",
-                    config_folder.display()
-                )
+        debug!("Config folder: {:?}", config_dir);
+        if !config_dir.exists() {
+            create_dir_all(config_dir).map_err(|io_error| {
+                ConfigError::SaveStatePath(format!(
+                    "failed to create state parent directory '{}': {}",
+                    config_dir.display(),
+                    io_error.to_string()
+                ))
             })?;
         }
 
-        let mut saved_state_path_raw = config_folder.to_path_buf();
+        let mut saved_state_path_raw = config_dir.to_path_buf();
         saved_state_path_raw.push(path);
         debug!(
             "Looking for saved state on the path {:?}",
@@ -1624,32 +1695,49 @@ impl Config {
         match metadata(path) {
             Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
                 info!("Create an empty state file at '{}'", path);
-                File::create(path)
-                    .with_context(|| format!("fail to create state file at '{path}'"))?;
+                File::create(path).map_err(|io_error| {
+                    ConfigError::SaveStatePath(format!(
+                        "failed to create state file '{:?}': {}",
+                        path,
+                        io_error.to_string()
+                    ))
+                })?;
             }
             _ => {}
         }
 
-        saved_state_path_raw.canonicalize().with_context(|| {
-            format!("could not get saved state path from config file input {path:?}")
+        saved_state_path_raw.canonicalize().map_err(|io_error| {
+            ConfigError::SaveStatePath(format!(
+                "could not get saved state path from config file input {path:?}: {}",
+                io_error
+            ))
         })?;
 
         let stringified_path = saved_state_path_raw
             .to_str()
-            .ok_or_else(|| anyhow::Error::msg("Invalid character format, expected UTF8"))?
+            .ok_or(ConfigError::SaveStatePath(format!(
+                "Invalid path {:?}",
+                saved_state_path_raw
+            )))?
             .to_string();
 
         Ok(Some(stringified_path))
     }
 
     /// read any file to a string
-    pub fn load_file(path: &str) -> io::Result<String> {
-        std::fs::read_to_string(path)
+    pub fn load_file(path: &str) -> Result<String, ConfigError> {
+        std::fs::read_to_string(path).map_err(|io_error| ConfigError::FileRead {
+            path_to_read: path.to_owned(),
+            io_error,
+        })
     }
 
     /// read any file to bytes
-    pub fn load_file_bytes(path: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(path)
+    pub fn load_file_bytes(path: &str) -> Result<Vec<u8>, ConfigError> {
+        std::fs::read(path).map_err(|io_error| ConfigError::FileRead {
+            path_to_read: path.to_owned(),
+            io_error,
+        })
     }
 }
 

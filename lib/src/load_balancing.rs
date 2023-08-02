@@ -6,7 +6,7 @@ use rand::{
     thread_rng, Rng,
 };
 
-use crate::{sozu_command::proto::command::LoadMetric, Backend};
+use crate::{backends::Backend, sozu_command::proto::command::LoadMetric};
 
 pub trait LoadBalancingAlgorithm: Debug {
     fn next_available_backend(
@@ -177,7 +177,7 @@ mod test {
     use super::*;
     use crate::retry::{ExponentialBackoffPolicy, RetryPolicyWrapper};
     use crate::sozu_command::proto::command::LoadMetric;
-    use crate::{BackendStatus, PeakEWMA};
+    use crate::{backends::BackendStatus, PeakEWMA};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn create_backend(id: String, connections: Option<usize>) -> Backend {

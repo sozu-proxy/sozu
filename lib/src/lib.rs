@@ -391,20 +391,22 @@ use std::{
     str,
 };
 
-use anyhow::{bail, Context};
+use backends::BackendError;
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
-use sozu_command::proto::command::ListenerType;
+use router::RouterError;
+use sozu_command::{
+    proto::command::{ListenerType, RequestHttpFrontend},
+    ObjectKind,
+};
 use sozu_command_lib::{
-    proto::command::{Cluster, Event, EventKind, LoadBalancingParams},
-    ready::Ready,
-    request::WorkerRequest,
-    response::WorkerResponse,
+    proto::command::Cluster, ready::Ready, request::WorkerRequest, response::WorkerResponse,
     state::ClusterId,
 };
 use time::{Duration, Instant};
+use tls::GenericCertificateResolverError;
 
-use self::{backends::BackendMap, retry::RetryPolicy, router::Route};
+use self::{backends::BackendMap, router::Route};
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -596,17 +598,28 @@ pub trait ListenerHandler {
     fn set_tags(&mut self, key: String, tags: Option<BTreeMap<String, String>>);
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum FrontendFromRequestError {
+    #[error("Could not parse hostname from '{host}': {error}")]
+    HostParse { host: String, error: String },
+    #[error("invalid remaining chars after hostname. Host: {0}")]
+    InvalidCharsAfterHost(String),
+    #[error("no cluster found")]
+    NoClusterFound,
+}
+
 pub trait L7ListenerHandler {
     fn get_sticky_name(&self) -> &str;
 
     fn get_connect_timeout(&self) -> u32;
 
+    /// retrieve a frontend by parsing a request's hostname, uri and method
     fn frontend_from_request(
         &self,
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> anyhow::Result<Route>;
+    ) -> Result<Route, FrontendFromRequestError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -629,6 +642,36 @@ pub enum BackendConnectAction {
     Replace,
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum BackendConnectionError {
+    #[error("Not found: {0:?}")]
+    NotFound(ObjectKind),
+    #[error("Too many connections on cluster {0:?}")]
+    MaxConnectionRetries(Option<String>),
+    #[error("the sessions slab has reached maximum capacity")]
+    MaxSessionsMemory,
+    #[error("error from the backend: {0}")]
+    Backend(BackendError),
+    #[error("failed to retrieve the cluster: {0}")]
+    RetrieveClusterError(RetrieveClusterError),
+}
+
+/// used in kawa_h1 module for the Http session state
+#[derive(thiserror::Error, Debug)]
+pub enum RetrieveClusterError {
+    #[error("No method given")]
+    NoMethod,
+    #[error("No host given")]
+    NoHost,
+    #[error("No path given")]
+    NoPath,
+    #[error("unauthorized route")]
+    UnauthorizedRoute,
+    #[error("failed to retrieve the frontend for the request: {0}")]
+    RetrieveFrontend(FrontendFromRequestError),
+}
+
+/// Used in sessions
 #[derive(Debug, PartialEq, Eq)]
 pub enum AcceptError {
     IoError,
@@ -637,6 +680,76 @@ pub enum AcceptError {
     RegisterError,
     WrongSocketAddress,
     BufferCapacityReached,
+}
+
+/// returned by the HTTP, HTTPS and TCP listeners
+#[derive(thiserror::Error, Debug)]
+pub enum ListenerError {
+    #[error("failed to acquire the lock, {0}")]
+    Lock(String),
+    #[error("failed to handle certificate request, got a resolver error, {0}")]
+    Resolver(GenericCertificateResolverError),
+    #[error("failed to parse pem, {0}")]
+    PemParse(String),
+    #[error("failed to build rustls context, {0}")]
+    BuildRustls(String),
+    #[error("Wrong socket address")]
+    SocketParse { address: String, error: String },
+    #[error("could not activate listener with address {address}: {error}")]
+    Activation { address: String, error: String },
+    #[error("Could not register listener socket: {0}")]
+    SocketRegistration(std::io::Error),
+    #[error("could not add frontend: {0}")]
+    AddFrontend(RouterError),
+    #[error("could not remove frontend: {0}")]
+    RemoveFrontend(RouterError),
+}
+
+/// Returned by the HTTP, HTTPS and TCP proxies
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyError {
+    #[error("error while soft stopping {proxy_protocol} proxy: {error}")]
+    SoftStop {
+        proxy_protocol: String,
+        error: String,
+    },
+    #[error("error while hard stopping {proxy_protocol} proxy: {error}")]
+    HardStop {
+        proxy_protocol: String,
+        error: String,
+    },
+    #[error("found no listener with address {0:?}")]
+    NoListenerFound(SocketAddr),
+    #[error("a listener is already present for this token")]
+    ListenerAlreadyPresent,
+    #[error("could not create add listener: {0}")]
+    AddListener(ListenerError),
+    #[error("failed to activate listener with address {address:?}: {listener_error}")]
+    ListenerActivation {
+        address: SocketAddr,
+        listener_error: ListenerError,
+    },
+    #[error("can not add frontend {front:?}: {error}")]
+    WrongInputFrontend {
+        front: RequestHttpFrontend,
+        error: String,
+    },
+    #[error("could not add frontend: {0}")]
+    AddFrontend(ListenerError),
+    #[error("could not remove frontend: {0}")]
+    RemoveFrontend(ListenerError),
+    #[error("could not add certificate: {0}")]
+    AddCertificate(ListenerError),
+    #[error("could not remove certificate: {0}")]
+    RemoveCertificate(ListenerError),
+    #[error("could not replace certificate: {0}")]
+    ReplaceCertificate(ListenerError),
+    #[error("Wrong address {address}: {error}")]
+    SocketParse { address: String, error: String },
+    #[error("wrong certificate fingerprint: {0}")]
+    WrongCertificateFingerprint(String),
+    #[error("this request is not supported by the proxy")]
+    UnsupportedMessage,
 }
 
 use self::server::ListenToken;
@@ -786,148 +899,7 @@ pub enum SocketType {
     FrontClient,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum BackendStatus {
-    Normal,
-    Closing,
-    Closed,
-}
-
 type SessionIsToBeClosed = bool;
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct Backend {
-    pub sticky_id: Option<String>,
-    pub backend_id: String,
-    pub address: SocketAddr,
-    pub status: BackendStatus,
-    pub retry_policy: retry::RetryPolicyWrapper,
-    pub active_connections: usize,
-    pub active_requests: usize,
-    pub failures: usize,
-    pub load_balancing_parameters: Option<LoadBalancingParams>,
-    pub backup: bool,
-    pub connection_time: PeakEWMA,
-}
-
-impl Backend {
-    pub fn new(
-        backend_id: &str,
-        address: SocketAddr,
-        sticky_id: Option<String>,
-        load_balancing_parameters: Option<LoadBalancingParams>,
-        backup: Option<bool>,
-    ) -> Backend {
-        let desired_policy = retry::ExponentialBackoffPolicy::new(6);
-        Backend {
-            sticky_id,
-            backend_id: backend_id.to_string(),
-            address,
-            status: BackendStatus::Normal,
-            retry_policy: desired_policy.into(),
-            active_connections: 0,
-            active_requests: 0,
-            failures: 0,
-            load_balancing_parameters,
-            backup: backup.unwrap_or(false),
-            connection_time: PeakEWMA::new(),
-        }
-    }
-
-    pub fn set_closing(&mut self) {
-        self.status = BackendStatus::Closing;
-    }
-
-    pub fn retry_policy(&mut self) -> &mut retry::RetryPolicyWrapper {
-        &mut self.retry_policy
-    }
-
-    pub fn can_open(&self) -> bool {
-        if let Some(action) = self.retry_policy.can_try() {
-            self.status == BackendStatus::Normal && action == retry::RetryAction::OKAY
-        } else {
-            false
-        }
-    }
-
-    pub fn inc_connections(&mut self) -> Option<usize> {
-        if self.status == BackendStatus::Normal {
-            self.active_connections += 1;
-            Some(self.active_connections)
-        } else {
-            None
-        }
-    }
-
-    /// TODO: normalize with saturating_sub()
-    pub fn dec_connections(&mut self) -> Option<usize> {
-        match self.status {
-            BackendStatus::Normal => {
-                if self.active_connections > 0 {
-                    self.active_connections -= 1;
-                }
-                Some(self.active_connections)
-            }
-            BackendStatus::Closed => None,
-            BackendStatus::Closing => {
-                if self.active_connections > 0 {
-                    self.active_connections -= 1;
-                }
-                if self.active_connections == 0 {
-                    self.status = BackendStatus::Closed;
-                    None
-                } else {
-                    Some(self.active_connections)
-                }
-            }
-        }
-    }
-
-    pub fn set_connection_time(&mut self, dur: Duration) {
-        self.connection_time.observe(dur.whole_nanoseconds() as f64);
-    }
-
-    pub fn peak_ewma_connection(&mut self) -> f64 {
-        self.connection_time.get(self.active_connections)
-    }
-
-    pub fn try_connect(&mut self) -> anyhow::Result<mio::net::TcpStream> {
-        if self.status != BackendStatus::Normal {
-            bail!("This backend is not in a normal status");
-        }
-
-        match mio::net::TcpStream::connect(self.address) {
-            Ok(tcp_stream) => {
-                //self.retry_policy.succeed();
-                self.inc_connections();
-                Ok(tcp_stream)
-            }
-            Err(mio_error) => {
-                self.retry_policy.fail();
-                self.failures += 1;
-                // TODO: handle EINPROGRESS. It is difficult. It is discussed here:
-                // https://docs.rs/mio/latest/mio/net/struct.TcpStream.html#method.connect
-                // with an example code here:
-                // https://github.com/Thomasdezeeuw/heph/blob/0c4f1ab3eaf08bea1d65776528bfd6114c9f8374/src/net/tcp/stream.rs#L560-L622
-                Err(mio_error).with_context(|| "Failed to connect to socket with MIO")
-            }
-        }
-    }
-}
-
-// when a backend has been removed from configuration and the last connection to
-// it has stopped, it will be dropped, so we can notify that the backend server
-// can be safely stopped
-impl std::ops::Drop for Backend {
-    fn drop(&mut self) {
-        server::push_event(Event {
-            kind: EventKind::RemovedBackendHasNoConnections as i32,
-            backend_id: Some(self.backend_id.clone()),
-            address: Some(self.address.to_string()),
-            cluster_id: None,
-        });
-    }
-}
 
 #[derive(Clone)]
 pub struct Readiness {

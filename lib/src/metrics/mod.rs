@@ -11,7 +11,6 @@ use std::{
     time::Instant,
 };
 
-use anyhow::Context;
 use mio::net::UdpSocket;
 use sozu_command::proto::command::{
     FilteredMetrics, MetricsConfiguration, QueryMetricsOptions, ResponseContent,
@@ -21,6 +20,26 @@ use self::{local_drain::LocalDrain, network_drain::NetworkDrain};
 
 thread_local! {
   pub static METRICS: RefCell<Aggregator> = RefCell::new(Aggregator::new(String::from("sozu")));
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum MetricError {
+    #[error("Could not parse udp address {address}: {error}")]
+    WrongUdpAddress { address: String, error: String },
+    #[error("Could not bind to udp address {address}: {error}")]
+    UdpBind { address: String, error: String },
+    #[error("No metrics found for object with id {0}")]
+    NoMetrics(String),
+    #[error("Could not create histogram for time metric {time_metric:?}: {error}")]
+    HistogramCreation {
+        time_metric: MetricValue,
+        error: String,
+    },
+    #[error("could not record time metric {time_metric:?}: {error}")]
+    TimeMetricRecordingError {
+        time_metric: MetricValue,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +130,7 @@ pub fn setup<O: Into<String>>(
     origin: O,
     use_tagged_metrics: bool,
     prefix: Option<String>,
-) -> anyhow::Result<()> {
+) -> Result<(), MetricError> {
     let metrics_socket = udp_bind()?;
 
     debug!(
@@ -216,7 +235,7 @@ impl Aggregator {
         self.local.dump_proxy_metrics(&Vec::new())
     }
 
-    pub fn query(&mut self, q: &QueryMetricsOptions) -> anyhow::Result<ResponseContent> {
+    pub fn query(&mut self, q: &QueryMetricsOptions) -> Result<ResponseContent, MetricError> {
         self.local.query(q)
     }
 
@@ -269,11 +288,21 @@ impl Write for MetricSocket {
     }
 }
 
-pub fn udp_bind() -> anyhow::Result<UdpSocket> {
-    let address = "0.0.0.0:0"
-        .parse()
-        .with_context(|| "could not parse 0.0.0.0:0")?;
-    UdpSocket::bind(address).with_context(|| "Could not bind to 0.0.0.0:0 udp socket")
+pub fn udp_bind() -> Result<UdpSocket, MetricError> {
+    let address = "0.0.0.0:0";
+
+    let udp_address =
+        address
+            .parse::<SocketAddr>()
+            .map_err(|parse_error| MetricError::WrongUdpAddress {
+                address: address.to_owned(),
+                error: parse_error.to_string(),
+            })?;
+
+    UdpSocket::bind(udp_address).map_err(|parse_error| MetricError::UdpBind {
+        address: udp_address.to_string(),
+        error: parse_error.to_string(),
+    })
 }
 
 /// adds a value to a counter

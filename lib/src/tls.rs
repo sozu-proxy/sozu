@@ -153,15 +153,15 @@ impl Clone for ParsedCertificateAndKey {
 #[derive(thiserror::Error, Clone, Debug)]
 pub enum GenericCertificateResolverError {
     #[error("failed to parse certificate common name, {0}")]
-    CommonNameParseError(String),
+    InvalidCommonName(String),
     #[error("failed to parse pem certificate, {0}")]
-    PemParseError(String),
+    InvalidPem(String),
     #[error("failed to parse der certificate, {0}")]
-    DerParseError(String),
+    InvalidDer(String),
     #[error("certificate, chain or private key is invalid")]
-    InvalidPrivateKeyError,
+    InvalidPrivateKey,
     #[error("certificate is still in use")]
-    IsStillInUseError,
+    IsStillInUse,
 }
 
 // -----------------------------------------------------------------------------
@@ -244,7 +244,7 @@ impl CertificateResolver for GenericCertificateResolver {
             };
 
             if self.is_required_for_domain(&names, fingerprint) {
-                return Err(GenericCertificateResolverError::IsStillInUseError);
+                return Err(GenericCertificateResolverError::IsStillInUse);
             }
 
             for name in &names {
@@ -293,7 +293,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
 
         let x509 = pem
             .parse_x509()
-            .map_err(|err| GenericCertificateResolverError::DerParseError(err.to_string()))?;
+            .map_err(|err| GenericCertificateResolverError::InvalidDer(err.to_string()))?;
 
         let mut names: HashSet<String> = HashSet::new();
         for name in x509.subject().iter_by_oid(&OID_X509_COMMON_NAME) {
@@ -302,7 +302,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
                     .as_str()
                     .map(String::from)
                     .map_err(|err| {
-                        GenericCertificateResolverError::CommonNameParseError(err.to_string())
+                        GenericCertificateResolverError::InvalidCommonName(err.to_string())
                     })?,
             );
         }
@@ -313,7 +313,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
                     .as_str()
                     .map(String::from)
                     .map_err(|err| {
-                        GenericCertificateResolverError::CommonNameParseError(err.to_string())
+                        GenericCertificateResolverError::InvalidCommonName(err.to_string())
                     })?,
             );
         }
@@ -329,12 +329,12 @@ impl CertificateResolverHelper for GenericCertificateResolver {
         certificate_and_key: &CertificateAndKey,
     ) -> Result<ParsedCertificateAndKey, Self::Error> {
         let (_, certificate) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
-            .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
+            .map_err(|err| GenericCertificateResolverError::InvalidPem(err.to_string()))?;
 
         let mut chains = vec![];
         for chain in &certificate_and_key.certificate_chain {
             let (_, chain) = parse_x509_pem(chain.as_bytes())
-                .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
+                .map_err(|err| GenericCertificateResolverError::InvalidPem(err.to_string()))?;
 
             chains.push(chain);
         }
@@ -399,7 +399,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
             }
         }
 
-        Err(GenericCertificateResolverError::InvalidPrivateKeyError)
+        Err(GenericCertificateResolverError::InvalidPrivateKey)
     }
 }
 
@@ -440,7 +440,7 @@ impl GenericCertificateResolver {
         let x509 = parsed_certificate_and_key
             .certificate
             .parse_x509()
-            .map_err(|err| GenericCertificateResolverError::DerParseError(err.to_string()))?;
+            .map_err(|err| GenericCertificateResolverError::InvalidDer(err.to_string()))?;
 
         // We need to know if the new certificate can replace an already existing one.
         let new_names = match self.get_names_override(fingerprint) {
@@ -467,7 +467,7 @@ impl GenericCertificateResolver {
             let certificate = certificate_and_key
                 .certificate
                 .parse_x509()
-                .map_err(|err| GenericCertificateResolverError::DerParseError(err.to_string()))?;
+                .map_err(|err| GenericCertificateResolverError::InvalidDer(err.to_string()))?;
 
             let certificate_names = match self.get_names_override(fingerprint) {
                 Some(names) => names,
@@ -661,7 +661,7 @@ mod tests {
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
-            .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
+            .map_err(|err| GenericCertificateResolverError::InvalidPem(err.to_string()))?;
 
         let fingerprint = resolver.add_certificate(&AddCertificate {
             address: address,
@@ -675,7 +675,7 @@ mod tests {
 
         if let Err(err) = resolver.remove_certificate(&fingerprint) {
             match err {
-                GenericCertificateResolverError::IsStillInUseError => {}
+                GenericCertificateResolverError::IsStillInUse => {}
                 _ => {
                     return Err(format!("the certificate must not been removed, {err}").into());
                 }
@@ -707,7 +707,7 @@ mod tests {
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
-            .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
+            .map_err(|err| GenericCertificateResolverError::InvalidPem(err.to_string()))?;
 
         let fingerprint = resolver.add_certificate(&AddCertificate {
             address: address,
@@ -721,7 +721,7 @@ mod tests {
 
         if let Err(err) = resolver.remove_certificate(&fingerprint) {
             match err {
-                GenericCertificateResolverError::IsStillInUseError => {}
+                GenericCertificateResolverError::IsStillInUse => {}
                 _ => {
                     return Err(format!("the certificate must not been removed, {err}").into());
                 }
@@ -766,7 +766,7 @@ mod tests {
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key_1y.certificate.as_bytes())
-            .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
+            .map_err(|err| GenericCertificateResolverError::InvalidPem(err.to_string()))?;
 
         let names_1y = resolver.certificate_names(&pem)?;
         let fingerprint_1y = resolver.add_certificate(&AddCertificate {
@@ -833,7 +833,7 @@ mod tests {
         };
 
         let (_, pem) = parse_x509_pem(certificate_and_key_1y.certificate.as_bytes())
-            .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
+            .map_err(|err| GenericCertificateResolverError::InvalidPem(err.to_string()))?;
 
         let names_1y = resolver.certificate_names(&pem)?;
         let fingerprint_1y = resolver.add_certificate(&AddCertificate {
@@ -930,7 +930,7 @@ mod tests {
         let mut fingerprints = vec![];
         for certificate in &certificates {
             let (_, pem) = parse_x509_pem(certificate.certificate.as_bytes())
-                .map_err(|err| GenericCertificateResolverError::PemParseError(err.to_string()))?;
+                .map_err(|err| GenericCertificateResolverError::InvalidPem(err.to_string()))?;
 
             fingerprints.push(GenericCertificateResolver::fingerprint(&pem));
         }
