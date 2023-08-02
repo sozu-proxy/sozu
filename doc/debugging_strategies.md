@@ -139,7 +139,7 @@ The `sozu.http.errors` counter is the sum of failed requests. It contains the fo
 
 Going further, backend connections issues are tracked by the following metrics:
 
-* `sozu.connections.errors`: could not connect to a backend server
+* `sozu.backend.connections.error`: could not connect to a backend server
 * `sozu.down`: the retry policy triggered and marked the backend server as down
 
 The `sozu.http.503.errors` metric is incremented after a request sent back a 503 error, and a 503 error is sent
@@ -243,7 +243,7 @@ sozu -c /etc/config.toml query clusters -i cluster_id
 
 ### Backend server unavailable
 
-`sozu.http.503.errors` increases, lots of `sozu.backend.connections.errors` and a
+`sozu.http.503.errors` increases, lots of `sozu.backend.connections.error` and a
 `sozu.backend.down` record: a backend server is down.
 Check the logs for `error connecting to backend, trying again` and `no more available backends for cluster <cluster_id>`
 to find out which cluster is affected

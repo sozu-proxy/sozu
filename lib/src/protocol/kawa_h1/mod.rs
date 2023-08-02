@@ -1350,7 +1350,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             let already_unavailable = backend.retry_policy.is_down();
             backend.retry_policy.fail();
             incr!(
-                "connections.error",
+                "backend.connections.error",
                 self.cluster_id.as_deref(),
                 metrics.backend_id.as_deref()
             );

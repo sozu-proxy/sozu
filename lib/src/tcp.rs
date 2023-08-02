@@ -511,7 +511,7 @@ impl TcpSession {
             let already_unavailable = backend.retry_policy.is_down();
             backend.retry_policy.fail();
             incr!(
-                "connections.error",
+                "backend.connections.error",
                 self.cluster_id.as_deref(),
                 self.metrics.backend_id.as_deref()
             );
