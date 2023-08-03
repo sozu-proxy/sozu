@@ -422,10 +422,10 @@ impl DomainRule {
             DomainRule::Exact(s) => s.as_bytes() == hostname,
             DomainRule::Regex(r) => {
                 let start = Instant::now();
-                let res = r.is_match(hostname);
+                let is_a_match = r.is_match(hostname);
                 let now = Instant::now();
                 time!("regex_matching_time", (now - start).whole_milliseconds());
-                res
+                is_a_match
             }
         }
     }
@@ -502,11 +502,11 @@ impl PathRule {
             }
             PathRule::Regex(r) => {
                 let start = Instant::now();
-                let res = r.is_match(path);
+                let is_a_match = r.is_match(path);
                 let now = Instant::now();
                 time!("regex_matching_time", (now - start).whole_milliseconds());
 
-                if res {
+                if is_a_match {
                     PathRuleResult::Regex
                 } else {
                     PathRuleResult::None
