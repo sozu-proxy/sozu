@@ -789,49 +789,31 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             );
         } else {
             match answer {
-                DefaultAnswerStatus::Answer301 => {
-                    incr!(
-                        "http.301.redirection",
-                        self.cluster_id.as_deref(),
-                        self.backend_id.as_deref()
-                    )
-                }
-                DefaultAnswerStatus::Answer400 => {
-                    incr!("http.400.errors")
-                }
-                DefaultAnswerStatus::Answer401 => {
-                    incr!("http.401.errors")
-                }
-                DefaultAnswerStatus::Answer404 => {
-                    incr!("http.404.errors")
-                }
-                DefaultAnswerStatus::Answer408 => {
-                    incr!("http.408.errors")
-                }
-                DefaultAnswerStatus::Answer413 => {
-                    incr!("http.413.errors")
-                }
-                DefaultAnswerStatus::Answer502 => {
-                    incr!(
-                        "http.502.errors",
-                        self.cluster_id.as_deref(),
-                        self.backend_id.as_deref()
-                    )
-                }
-                DefaultAnswerStatus::Answer503 => {
-                    incr!(
-                        "http.503.errors",
-                        self.cluster_id.as_deref(),
-                        self.backend_id.as_deref()
-                    )
-                }
-                DefaultAnswerStatus::Answer504 => {
-                    incr!(
-                        "http.504.errors",
-                        self.cluster_id.as_deref(),
-                        self.backend_id.as_deref()
-                    )
-                }
+                DefaultAnswerStatus::Answer301 => incr!(
+                    "http.301.redirection",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
+                DefaultAnswerStatus::Answer400 => incr!("http.400.errors"),
+                DefaultAnswerStatus::Answer401 => incr!("http.401.errors"),
+                DefaultAnswerStatus::Answer404 => incr!("http.404.errors"),
+                DefaultAnswerStatus::Answer408 => incr!("http.408.errors"),
+                DefaultAnswerStatus::Answer413 => incr!("http.413.errors"),
+                DefaultAnswerStatus::Answer502 => incr!(
+                    "http.502.errors",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
+                DefaultAnswerStatus::Answer503 => incr!(
+                    "http.503.errors",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
+                DefaultAnswerStatus::Answer504 => incr!(
+                    "http.504.errors",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
             };
         }
 
