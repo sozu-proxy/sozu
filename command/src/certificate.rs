@@ -26,6 +26,8 @@ pub enum CertificateError {
 // -----------------------------------------------------------------------------
 // parse
 
+/// parse a pem file encoded as binary and convert it into the right structure
+/// (a.k.a [`Pem`])
 pub fn parse(certificate: &[u8]) -> Result<Pem, CertificateError> {
     let (_, pem) = parse_x509_pem(certificate)
         .map_err(|err| CertificateError::InvalidCertificate(err.to_string()))?;
@@ -36,6 +38,8 @@ pub fn parse(certificate: &[u8]) -> Result<Pem, CertificateError> {
 // -----------------------------------------------------------------------------
 // get_cn_and_san_attributes
 
+/// Retrieve from the [`Pem`] structure the common name (a.k.a `CN`) and the
+/// subject alternate names (a.k.a `SAN`)
 pub fn get_cn_and_san_attributes(pem: &Pem) -> Result<HashSet<String>, CertificateError> {
     let x509 = pem
         .parse_x509()
@@ -156,10 +160,12 @@ impl<'de> serde::Deserialize<'de> for Fingerprint {
     }
 }
 
+/// Compute fingerprint from decoded pem as binary value
 pub fn calculate_fingerprint_from_der(certificate: &[u8]) -> Vec<u8> {
     Sha256::digest(certificate).iter().cloned().collect()
 }
 
+/// Compute fingerprint from a certificate that is encoded in pem format
 pub fn calculate_fingerprint(certificate: &[u8]) -> Result<Vec<u8>, CertificateError> {
     let parsed_certificate = parse(certificate)
         .map_err(|parse_error| CertificateError::InvalidCertificate(parse_error.to_string()))?;
