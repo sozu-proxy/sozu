@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    certificate::{calculate_fingerprint, Fingerprint},
+    certificate::{self, calculate_fingerprint, Fingerprint},
     proto::{
         command::{
             request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
