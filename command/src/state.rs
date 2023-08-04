@@ -1252,6 +1252,21 @@ impl ConfigState {
             self.certificates
                 .values()
                 .flat_map(|hash_map| hash_map.iter())
+                .flat_map(|(fingerprint, cert)| {
+                    if cert.names.is_empty() {
+                        let pem = certificate::parse(cert.certificate.as_bytes()).ok()?;
+                        let mut c = cert.to_owned();
+
+                        c.names = certificate::get_cn_and_san_attributes(&pem)
+                            .ok()?
+                            .into_iter()
+                            .collect();
+
+                        return Some((fingerprint, c));
+                    }
+
+                    Some((fingerprint, cert.to_owned()))
+                })
                 .filter(|(_, cert)| cert.names.contains(&domain))
                 .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
                 .collect()
@@ -1260,12 +1275,42 @@ impl ConfigState {
                 .values()
                 .flat_map(|hash_map| hash_map.iter())
                 .filter(|(fingerprint, _cert)| fingerprint.to_string() == f)
+                .flat_map(|(fingerprint, cert)| {
+                    if cert.names.is_empty() {
+                        let pem = certificate::parse(cert.certificate.as_bytes()).ok()?;
+                        let mut c = cert.to_owned();
+
+                        c.names = certificate::get_cn_and_san_attributes(&pem)
+                            .ok()?
+                            .into_iter()
+                            .collect();
+
+                        return Some((fingerprint, c));
+                    }
+
+                    Some((fingerprint, cert.to_owned()))
+                })
                 .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
                 .collect()
         } else {
             self.certificates
                 .values()
                 .flat_map(|hash_map| hash_map.iter())
+                .flat_map(|(fingerprint, cert)| {
+                    if cert.names.is_empty() {
+                        let pem = certificate::parse(cert.certificate.as_bytes()).ok()?;
+                        let mut c = cert.to_owned();
+                        
+                        c.names = certificate::get_cn_and_san_attributes(&pem)
+                            .ok()?
+                            .into_iter()
+                            .collect();
+
+                        return Some((fingerprint, c));
+                    }
+
+                    Some((fingerprint, cert.to_owned()))
+                })
                 .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
                 .collect()
         }
