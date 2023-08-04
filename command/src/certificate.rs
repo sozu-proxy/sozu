@@ -21,6 +21,8 @@ pub enum CertificateError {
     InvalidCommonName(String),
     #[error("failed to parse certificate subject alternate names attribute, {0}")]
     InvalidSubjectAlternateNames(String),
+    #[error("failed to parse tls version '{0}'")]
+    InvalidTlsVersion(String),
 }
 
 // -----------------------------------------------------------------------------
@@ -66,29 +68,10 @@ pub fn get_cn_and_san_attributes(pem: &Pem) -> Result<HashSet<String>, Certifica
 }
 
 // -----------------------------------------------------------------------------
-// ParseErrorTlsVersion
-
-#[derive(Debug)]
-pub struct ParseErrorTlsVersion;
-
-impl fmt::Display for ParseErrorTlsVersion {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Cannot find the TLS version")
-    }
-}
-
-impl error::Error for ParseErrorTlsVersion {
-    fn description(&self) -> &str {
-        "Cannot find the TLS version"
-    }
-
-    fn cause(&self) -> Option<&dyn error::Error> {
-        None
-    }
-}
+// TlsVersion
 
 impl FromStr for TlsVersion {
-    type Err = ParseErrorTlsVersion;
+    type Err = CertificateError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -98,7 +81,7 @@ impl FromStr for TlsVersion {
             "TLS_V11" => Ok(TlsVersion::TlsV11),
             "TLS_V12" => Ok(TlsVersion::TlsV12),
             "TLS_V13" => Ok(TlsVersion::TlsV13),
-            _ => Err(ParseErrorTlsVersion {}),
+            _ => Err(CertificateError::InvalidTlsVersion(s.to_string())),
         }
     }
 }
