@@ -46,18 +46,18 @@ pool = "^0.1.4"
 poule = "^0.3.2"
 rand = "^0.8.5"
 regex = "^1.9.1"
-rustls = "^0.21.5"
+rustls = "^0.21.6"
 rustls-pemfile = "^1.0.3"
 rusty_ulid = "^2.0.0"
 serial_test = "^2.0.0"
 sha2 = "^0.10.7"
 slab = "^0.4.8"
 socket2 = { version = "^0.5.3", features = ["all"] }
-thiserror = "^1.0.43"
-time = "^0.3.23"
+thiserror = "^1.0.44"
+time = "^0.3.25"
 url = "^2.4.0"
 webpki = "^0.22.0"
-x509-parser = "^0.15.0"
+x509-parser = "^0.15.1"
 
 sozu-command-lib = { path = "../command", version = "^0.15.2" }
 

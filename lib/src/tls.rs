@@ -16,14 +16,11 @@ use rustls::{
     Certificate, PrivateKey,
 };
 use sha2::{Digest, Sha256};
-use x509_parser::{
-    oid_registry::{OID_X509_COMMON_NAME, OID_X509_EXT_SUBJECT_ALT_NAME},
-    pem::{parse_x509_pem, Pem},
-};
+use x509_parser::pem::{parse_x509_pem, Pem};
 
 use crate::router::trie::*;
 use sozu_command::{
-    certificate::Fingerprint,
+    certificate::{get_cn_and_san_attributes, CertificateError, Fingerprint},
     proto::command::{AddCertificate, CertificateAndKey, ReplaceCertificate, TlsVersion},
 };
 
@@ -152,8 +149,8 @@ impl Clone for ParsedCertificateAndKey {
 
 #[derive(thiserror::Error, Clone, Debug)]
 pub enum GenericCertificateResolverError {
-    #[error("failed to parse certificate common name, {0}")]
-    InvalidCommonName(String),
+    #[error("failed to get common name and subject alternate names from pem, {0}")]
+    InvalidCommonNameAndSubjectAlternateNames(CertificateError),
     #[error("failed to parse pem certificate, {0}")]
     InvalidPem(String),
     #[error("failed to parse der certificate, {0}")]
@@ -291,34 +288,8 @@ impl CertificateResolverHelper for GenericCertificateResolver {
             }
         }
 
-        let x509 = pem
-            .parse_x509()
-            .map_err(|err| GenericCertificateResolverError::InvalidDer(err.to_string()))?;
-
-        let mut names: HashSet<String> = HashSet::new();
-        for name in x509.subject().iter_by_oid(&OID_X509_COMMON_NAME) {
-            names.insert(
-                name.attr_value()
-                    .as_str()
-                    .map(String::from)
-                    .map_err(|err| {
-                        GenericCertificateResolverError::InvalidCommonName(err.to_string())
-                    })?,
-            );
-        }
-
-        for name in x509.subject().iter_by_oid(&OID_X509_EXT_SUBJECT_ALT_NAME) {
-            names.insert(
-                name.attr_value()
-                    .as_str()
-                    .map(String::from)
-                    .map_err(|err| {
-                        GenericCertificateResolverError::InvalidCommonName(err.to_string())
-                    })?,
-            );
-        }
-
-        Ok(names)
+        get_cn_and_san_attributes(pem)
+            .map_err(GenericCertificateResolverError::InvalidCommonNameAndSubjectAlternateNames)
     }
 
     fn fingerprint(pem: &Pem) -> Fingerprint {
@@ -328,8 +299,9 @@ impl CertificateResolverHelper for GenericCertificateResolver {
     fn parse(
         certificate_and_key: &CertificateAndKey,
     ) -> Result<ParsedCertificateAndKey, Self::Error> {
-        let (_, certificate) = parse_x509_pem(certificate_and_key.certificate.as_bytes())
-            .map_err(|err| GenericCertificateResolverError::InvalidPem(err.to_string()))?;
+        let certificate =
+            sozu_command::certificate::parse(certificate_and_key.certificate.as_bytes())
+                .map_err(|err| GenericCertificateResolverError::InvalidPem(err.to_string()))?;
 
         let mut chains = vec![];
         for chain in &certificate_and_key.certificate_chain {
@@ -389,6 +361,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
                         .iter()
                         .filter_map(|v| TlsVersion::from_i32(*v))
                         .collect();
+
                     return Ok(ParsedCertificateAndKey {
                         certificate,
                         chain: chains,

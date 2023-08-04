@@ -1,39 +1,77 @@
-use std::{error, fmt, str::FromStr};
+use std::{collections::HashSet, error, fmt, str::FromStr};
 
 use hex::FromHex;
-use pem::parse;
 use serde::de::{self, Visitor};
 use sha2::{Digest, Sha256};
+use x509_parser::{
+    oid_registry::{OID_X509_COMMON_NAME, OID_X509_EXT_SUBJECT_ALT_NAME},
+    pem::{parse_x509_pem, Pem},
+};
 
 use crate::proto::command::TlsVersion;
 
-#[derive(thiserror::Error, Debug)]
+// -----------------------------------------------------------------------------
+// CertificateError
+
+#[derive(thiserror::Error, Clone, Debug)]
 pub enum CertificateError {
     #[error("Could not parse PEM certificate from bytes: {0}")]
     InvalidCertificate(String),
+    #[error("failed to parse certificate common name attribute, {0}")]
+    InvalidCommonName(String),
+    #[error("failed to parse certificate subject alternate names attribute, {0}")]
+    InvalidSubjectAlternateNames(String),
+    #[error("failed to parse tls version '{0}'")]
+    InvalidTlsVersion(String),
 }
 
-#[derive(Debug)]
-pub struct ParseErrorTlsVersion;
+// -----------------------------------------------------------------------------
+// parse
 
-impl fmt::Display for ParseErrorTlsVersion {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Cannot find the TLS version")
-    }
+/// parse a pem file encoded as binary and convert it into the right structure
+/// (a.k.a [`Pem`])
+pub fn parse(certificate: &[u8]) -> Result<Pem, CertificateError> {
+    let (_, pem) = parse_x509_pem(certificate)
+        .map_err(|err| CertificateError::InvalidCertificate(err.to_string()))?;
+
+    Ok(pem)
 }
 
-impl error::Error for ParseErrorTlsVersion {
-    fn description(&self) -> &str {
-        "Cannot find the TLS version"
+// -----------------------------------------------------------------------------
+// get_cn_and_san_attributes
+
+/// Retrieve from the [`Pem`] structure the common name (a.k.a `CN`) and the
+/// subject alternate names (a.k.a `SAN`)
+pub fn get_cn_and_san_attributes(pem: &Pem) -> Result<HashSet<String>, CertificateError> {
+    let x509 = pem
+        .parse_x509()
+        .map_err(|err| CertificateError::InvalidCertificate(err.to_string()))?;
+
+    let mut names: HashSet<String> = HashSet::new();
+    for name in x509.subject().iter_by_oid(&OID_X509_COMMON_NAME) {
+        names.insert(
+            name.as_str()
+                .map(String::from)
+                .map_err(|err| CertificateError::InvalidCommonName(err.to_string()))?,
+        );
     }
 
-    fn cause(&self) -> Option<&dyn error::Error> {
-        None
+    for name in x509.subject().iter_by_oid(&OID_X509_EXT_SUBJECT_ALT_NAME) {
+        names.insert(
+            name.as_str()
+                .map(String::from)
+                .map_err(|err| CertificateError::InvalidSubjectAlternateNames(err.to_string()))?,
+        );
     }
+
+    Ok(names)
 }
+
+// -----------------------------------------------------------------------------
+// TlsVersion
 
 impl FromStr for TlsVersion {
-    type Err = ParseErrorTlsVersion;
+    type Err = CertificateError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -43,10 +81,13 @@ impl FromStr for TlsVersion {
             "TLS_V11" => Ok(TlsVersion::TlsV11),
             "TLS_V12" => Ok(TlsVersion::TlsV12),
             "TLS_V13" => Ok(TlsVersion::TlsV13),
-            _ => Err(ParseErrorTlsVersion {}),
+            _ => Err(CertificateError::InvalidTlsVersion(s.to_string())),
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// Fingerprint
 
 //FIXME: make fixed size depending on hash algorithm
 /// A TLS certificates, encoded in bytes
@@ -102,18 +143,17 @@ impl<'de> serde::Deserialize<'de> for Fingerprint {
     }
 }
 
+/// Compute fingerprint from decoded pem as binary value
+pub fn calculate_fingerprint_from_der(certificate: &[u8]) -> Vec<u8> {
+    Sha256::digest(certificate).iter().cloned().collect()
+}
+
+/// Compute fingerprint from a certificate that is encoded in pem format
 pub fn calculate_fingerprint(certificate: &[u8]) -> Result<Vec<u8>, CertificateError> {
     let parsed_certificate = parse(certificate)
         .map_err(|parse_error| CertificateError::InvalidCertificate(parse_error.to_string()))?;
-    let fingerprint = Sha256::digest(parsed_certificate.contents())
-        .iter()
-        .cloned()
-        .collect();
-    Ok(fingerprint)
-}
 
-pub fn calculate_fingerprint_from_der(certificate: &[u8]) -> Vec<u8> {
-    Sha256::digest(certificate).iter().cloned().collect()
+    Ok(calculate_fingerprint_from_der(&parsed_certificate.contents))
 }
 
 pub fn split_certificate_chain(mut chain: String) -> Vec<String> {
