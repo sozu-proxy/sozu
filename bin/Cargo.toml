@@ -39,14 +39,14 @@ nix = "^0.26.2"
 nom = "^7.1.3"
 paw = "^1.0.0"
 prettytable-rs = { version = "^0.10.0", default-features = false }
-serde = { version = "^1.0.181", features = ["derive"] }
+serde = { version = "^1.0.183", features = ["derive"] }
 serde_json = "^1.0.104"
 time = "^0.3.25"
 rand = "^0.8.5"
-regex = "^1.9.1"
+regex = "^1.9.3"
 slab = "^0.4.8"
 smol = "^1.3.0"
-tempfile = "^3.7.0"
+tempfile = "^3.7.1"
 termion = "^2.0.1"
 x509-parser = "^0.15.1"
 
