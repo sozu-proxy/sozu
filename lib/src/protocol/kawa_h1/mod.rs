@@ -1147,7 +1147,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         let cluster_id = self
             .cluster_id_from_request(proxy.clone())
-            .map_err(|cluster_error| BackendConnectionError::RetrieveClusterError(cluster_error))?;
+            .map_err(BackendConnectionError::RetrieveClusterError)?;
 
         trace!(
             "connect_to_backend: {:?} {:?} {:?}",

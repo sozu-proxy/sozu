@@ -65,8 +65,8 @@ use crate::{
     tls::{CertificateResolver, MutexWrappedCertificateResolver, ParsedCertificateAndKey},
     util::UnwrapLog,
     AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, Readiness,
-    SessionIsToBeClosed, SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
+    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
 
 // const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
@@ -684,7 +684,7 @@ impl HttpsListener {
 
         registry
             .register(&mut listener, self.token, Interest::READABLE)
-            .map_err(|io_error| ListenerError::SocketRegistration(io_error))?;
+            .map_err(ListenerError::SocketRegistration)?;
 
         self.listener = Some(listener);
         self.active = true;
@@ -758,14 +758,14 @@ impl HttpsListener {
     pub fn add_https_front(&mut self, tls_front: HttpFrontend) -> Result<(), ListenerError> {
         self.fronts
             .add_http_front(&tls_front)
-            .map_err(|router_error| ListenerError::AddFrontend(router_error))
+            .map_err(ListenerError::AddFrontend)
     }
 
     pub fn remove_https_front(&mut self, tls_front: HttpFrontend) -> Result<(), ListenerError> {
         debug!("removing tls_front {:?}", tls_front);
         self.fronts
             .remove_http_front(&tls_front)
-            .map_err(|router_error| ListenerError::RemoveFrontend(router_error))
+            .map_err(ListenerError::RemoveFrontend)
     }
 
     fn accept(&mut self) -> Result<MioTcpStream, AcceptError> {
@@ -983,7 +983,7 @@ impl HttpsProxy {
             .borrow_mut()
             .activate(&self.registry, tcp_listener)
             .map_err(|listener_error| ProxyError::ListenerActivation {
-                address: addr.clone(),
+                address: *addr,
                 listener_error,
             })
     }
@@ -1074,7 +1074,7 @@ impl HttpsProxy {
         listener.set_tags(front.hostname.to_owned(), front.tags.to_owned());
         listener
             .add_https_front(front)
-            .map_err(|listener_error| ProxyError::AddFrontend(listener_error))?;
+            .map_err(ProxyError::AddFrontend)?;
         Ok(None)
     }
 
@@ -1099,7 +1099,7 @@ impl HttpsProxy {
         listener.set_tags(front.hostname.to_owned(), None);
         listener
             .remove_https_front(front)
-            .map_err(|listener_error| ProxyError::RemoveFrontend(listener_error))?;
+            .map_err(ProxyError::RemoveFrontend)?;
         Ok(None)
     }
 
@@ -1124,7 +1124,7 @@ impl HttpsProxy {
         listener
             .borrow_mut()
             .add_certificate(&add_certificate)
-            .map_err(|listener_error| ProxyError::AddCertificate(listener_error))?;
+            .map_err(ProxyError::AddCertificate)?;
 
         Ok(None)
     }
@@ -1156,7 +1156,7 @@ impl HttpsProxy {
         listener
             .borrow_mut()
             .remove_certificate(&fingerprint)
-            .map_err(|listener_error| ProxyError::AddCertificate(listener_error))?;
+            .map_err(ProxyError::AddCertificate)?;
 
         Ok(None)
     }
@@ -1183,7 +1183,7 @@ impl HttpsProxy {
         listener
             .borrow_mut()
             .replace_certificate(&replace_certificate)
-            .map_err(|listener_error| ProxyError::ReplaceCertificate(listener_error))?;
+            .map_err(ProxyError::ReplaceCertificate)?;
 
         Ok(None)
     }
@@ -1280,7 +1280,7 @@ impl ProxyConfiguration for HttpsProxy {
         let content_result = match request_type {
             RequestType::AddCluster(cluster) => {
                 debug!("{} add cluster {:?}", request_id, cluster);
-                self.add_cluster(cluster.clone())
+                self.add_cluster(cluster)
             }
             RequestType::RemoveCluster(cluster_id) => {
                 debug!("{} remove cluster {:?}", request_id, cluster_id);
@@ -1314,7 +1314,7 @@ impl ProxyConfiguration for HttpsProxy {
             }
             RequestType::RemoveListener(remove) => {
                 debug!("removing HTTPS listener at address {:?}", remove.address);
-                self.remove_listener(remove.clone())
+                self.remove_listener(remove)
             }
             RequestType::SoftStop(_) => {
                 debug!("{} processing soft shutdown", request_id);
@@ -1345,12 +1345,12 @@ impl ProxyConfiguration for HttpsProxy {
                     "{} changing logging filter to {}",
                     request_id, logging_filter
                 );
-                self.logging(logging_filter.clone())
+                self.logging(logging_filter)
             }
             RequestType::QueryCertificatesFromWorkers(filters) => {
                 if let Some(domain) = filters.domain {
                     debug!("{} query certificate for domain {}", request_id, domain);
-                    self.query_certificate_for_domain(domain.clone())
+                    self.query_certificate_for_domain(domain)
                 } else {
                     debug!("{} query all certificates", request_id);
                     self.query_all_certificates()

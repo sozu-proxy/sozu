@@ -172,14 +172,6 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
         self.backend_token = Some(token);
     }
 
-    pub fn front_readiness(&mut self) -> &mut Readiness {
-        &mut self.frontend_readiness
-    }
-
-    pub fn back_readiness(&mut self) -> &mut Readiness {
-        &mut self.backend_readiness
-    }
-
     pub fn into_pipe(
         mut self,
         back_buf: Checkout,

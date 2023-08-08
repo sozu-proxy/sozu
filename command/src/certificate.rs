@@ -1,4 +1,4 @@
-use std::{collections::HashSet, error, fmt, str::FromStr};
+use std::{collections::HashSet, fmt, str::FromStr};
 
 use hex::FromHex;
 use serde::de::{self, Visitor};

@@ -47,8 +47,7 @@ use super::{
     router::Route,
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager},
     socket::server_bind,
-    AcceptError, Protocol, ProxyConfiguration, ProxySession, Readiness, SessionMetrics,
-    StateResult,
+    AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionMetrics, StateResult,
 };
 
 #[derive(PartialEq, Eq)]
@@ -486,8 +485,8 @@ impl HttpProxy {
     ) -> Result<Token, ProxyError> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                let http_listener = HttpListener::new(config, token)
-                    .map_err(|listener_error| ProxyError::AddListener(listener_error))?;
+                let http_listener =
+                    HttpListener::new(config, token).map_err(ProxyError::AddListener)?;
                 entry.insert(Rc::new(RefCell::new(http_listener)));
                 Ok(token)
             }
@@ -525,7 +524,7 @@ impl HttpProxy {
             .borrow_mut()
             .activate(&self.registry, tcp_listener)
             .map_err(|listener_error| ProxyError::ListenerActivation {
-                address: addr.clone(),
+                address: *addr,
                 listener_error,
             })
     }
@@ -605,7 +604,7 @@ impl HttpProxy {
 
         listener
             .add_http_front(front)
-            .map_err(|listener_error| ProxyError::AddFrontend(listener_error))?;
+            .map_err(ProxyError::AddFrontend)?;
         listener.set_tags(hostname, tags);
         Ok(())
     }
@@ -629,7 +628,7 @@ impl HttpProxy {
 
         listener
             .remove_http_front(front)
-            .map_err(|listener_error| ProxyError::RemoveFrontend(listener_error))?;
+            .map_err(ProxyError::RemoveFrontend)?;
 
         listener.set_tags(hostname, None);
         Ok(())
@@ -735,7 +734,7 @@ impl HttpListener {
 
         registry
             .register(&mut listener, self.token, Interest::READABLE)
-            .map_err(|io_error| ListenerError::SocketRegistration(io_error))?;
+            .map_err(ListenerError::SocketRegistration)?;
 
         self.listener = Some(listener);
         self.active = true;
@@ -745,14 +744,14 @@ impl HttpListener {
     pub fn add_http_front(&mut self, http_front: HttpFrontend) -> Result<(), ListenerError> {
         self.fronts
             .add_http_front(&http_front)
-            .map_err(|router_error| ListenerError::AddFrontend(router_error))
+            .map_err(ListenerError::AddFrontend)
     }
 
     pub fn remove_http_front(&mut self, http_front: HttpFrontend) -> Result<(), ListenerError> {
         debug!("removing http_front {:?}", http_front);
         self.fronts
             .remove_http_front(&http_front)
-            .map_err(|router_error| ListenerError::RemoveFrontend(router_error))
+            .map_err(ListenerError::RemoveFrontend)
     }
 
     fn accept(&mut self) -> Result<TcpStream, AcceptError> {
@@ -780,7 +779,7 @@ impl ProxyConfiguration for HttpProxy {
         let result = match request.content.request_type {
             Some(RequestType::AddCluster(cluster)) => {
                 debug!("{} add cluster {:?}", request.id, cluster);
-                self.add_cluster(cluster.clone())
+                self.add_cluster(cluster)
             }
             Some(RequestType::RemoveCluster(cluster_id)) => {
                 debug!("{} remove cluster {:?}", request_id, cluster_id);
@@ -796,7 +795,7 @@ impl ProxyConfiguration for HttpProxy {
             }
             Some(RequestType::RemoveListener(remove)) => {
                 debug!("removing HTTP listener at address {:?}", remove.address);
-                self.remove_listener(remove.clone())
+                self.remove_listener(remove)
             }
             Some(RequestType::SoftStop(_)) => {
                 debug!("{} processing soft shutdown", request_id);
@@ -827,7 +826,7 @@ impl ProxyConfiguration for HttpProxy {
                     "{} changing logging filter to {}",
                     request_id, logging_filter
                 );
-                self.logging(logging_filter.clone())
+                self.logging(logging_filter)
             }
             other_command => {
                 debug!(

@@ -543,12 +543,6 @@ macro_rules! StateMachineBuilder {
                 std::mem::swap(&mut owned_state, self);
                 owned_state
             }
-            fn front_readiness(&mut self) -> &mut Readiness {
-                match self {
-                    $($state_name::$variant_name(_state, ..) => $crate::fallback!({$($override)?} &mut _state.frontend_readiness),)+
-                    $state_name::FailedUpgrade(_) => unreachable!(),
-                }
-            }
             _fn_impl!{front_socket(&, self) -> &mio::net::TcpStream}
         }
 
