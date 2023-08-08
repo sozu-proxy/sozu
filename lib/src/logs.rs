@@ -195,7 +195,7 @@ impl RequestRecord<'_> {
         match self.error {
             None => {
                 info_access!(
-                    "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {} {} {} {}",
+                    "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {}{} {} {}",
                     context,
                     session_address.as_str_or("X"),
                     backend_address.as_str_or("X"),
@@ -205,10 +205,16 @@ impl RequestRecord<'_> {
                     LogDuration(server_rtt),
                     metrics.bin,
                     metrics.bout,
-                    tags.as_str_or("-"),
+                    match user_agent {
+                        Some(_) => tags.as_str_or(""),
+                        None => tags.as_str_or("-"),
+                    },
+                    match tags {
+                        Some(tags) if !tags.is_empty() => user_agent.map(|ua| format!(", user-agent={ua}")).unwrap_or_default(),
+                        Some(_) | None => user_agent.map(|ua| format!("user-agent={ua}")).unwrap_or_default(),
+                    },
                     protocol,
-                    endpoint,
-                    user_agent.as_str_or("")
+                    endpoint
                 );
                 incr!(
                     "access_logs.count",
@@ -217,7 +223,7 @@ impl RequestRecord<'_> {
                 );
             }
             Some(message) => error_access!(
-                "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {} {} {} {} | {}",
+                "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {}{} {} {} | {}",
                 context,
                 session_address.as_str_or("X"),
                 backend_address.as_str_or("X"),
@@ -227,10 +233,16 @@ impl RequestRecord<'_> {
                 LogDuration(server_rtt),
                 metrics.bin,
                 metrics.bout,
-                tags.as_str_or("-"),
+                match user_agent {
+                    Some(_) => tags.as_str_or(""),
+                    None => tags.as_str_or("-"),
+                },
+                match tags {
+                    Some(tags) if !tags.is_empty() => user_agent.map(|ua| format!(", user-agent={ua}")).unwrap_or_default(),
+                    Some(_) | None => user_agent.map(|ua| format!("user-agent={ua}")).unwrap_or_default(),
+                },
                 protocol,
                 endpoint,
-                user_agent.as_str_or(""),
                 message
             ),
         }
