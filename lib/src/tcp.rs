@@ -469,7 +469,7 @@ impl TcpSession {
 
                 if backend.retry_policy.is_down() {
                     incr!(
-                        "up",
+                        "backend.up",
                         self.cluster_id.as_deref(),
                         self.metrics.backend_id.as_deref()
                     );
@@ -522,7 +522,7 @@ impl TcpSession {
                     backend.backend_id, backend.address
                 );
                 incr!(
-                    "down",
+                    "backend.down",
                     self.cluster_id.as_deref(),
                     self.metrics.backend_id.as_deref()
                 );

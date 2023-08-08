@@ -1292,7 +1292,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
                 if backend.retry_policy.is_down() {
                     incr!(
-                        "up",
+                        "backend.up",
                         self.cluster_id.as_deref(),
                         metrics.backend_id.as_deref()
                     );
@@ -1340,7 +1340,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     backend.backend_id, backend.address
                 );
                 incr!(
-                    "down",
+                    "backend.down",
                     self.cluster_id.as_deref(),
                     metrics.backend_id.as_deref()
                 );

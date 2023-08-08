@@ -140,7 +140,7 @@ The `sozu.http.errors` counter is the sum of failed requests. It contains the fo
 Going further, backend connections issues are tracked by the following metrics:
 
 * `sozu.backend.connections.error`: could not connect to a backend server
-* `sozu.down`: the retry policy triggered and marked the backend server as down
+* `sozu.backend.down`: the retry policy triggered and marked the backend server as down
 
 The `sozu.http.503.errors` metric is incremented after a request sent back a 503 error, and a 503 error is sent
 after the circuit breaker triggered (we wait for 3 failed connections to the backend server).
