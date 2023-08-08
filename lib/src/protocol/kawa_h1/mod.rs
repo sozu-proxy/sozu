@@ -424,7 +424,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         if self.response_stream.is_terminated() && self.response_stream.is_completed() {
-            save_http_status_metric(self.context.status);
+            save_http_status_metric(self.context.status, self.log_context());
 
             self.log_request_success(metrics);
             metrics.reset();
@@ -765,6 +765,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             client_rtt: socket_rtt(self.front_socket()),
             server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
             metrics,
+            user_agent: self.context.user_agent.as_deref(),
         }
         .log();
     }
@@ -788,15 +789,43 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             );
         } else {
             match answer {
-                DefaultAnswerStatus::Answer301 => incr!("http.301.redirection"),
+                DefaultAnswerStatus::Answer301 => incr!(
+                    "http.301.redirection",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
                 DefaultAnswerStatus::Answer400 => incr!("http.400.errors"),
-                DefaultAnswerStatus::Answer401 => incr!("http.401.errors"),
+                DefaultAnswerStatus::Answer401 => incr!(
+                    "http.401.errors",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
                 DefaultAnswerStatus::Answer404 => incr!("http.404.errors"),
-                DefaultAnswerStatus::Answer408 => incr!("http.408.errors"),
-                DefaultAnswerStatus::Answer413 => incr!("http.413.errors"),
-                DefaultAnswerStatus::Answer502 => incr!("http.502.errors"),
-                DefaultAnswerStatus::Answer503 => incr!("http.503.errors"),
-                DefaultAnswerStatus::Answer504 => incr!("http.504.errors"),
+                DefaultAnswerStatus::Answer408 => incr!(
+                    "http.408.errors",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
+                DefaultAnswerStatus::Answer413 => incr!(
+                    "http.413.errors",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
+                DefaultAnswerStatus::Answer502 => incr!(
+                    "http.502.errors",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
+                DefaultAnswerStatus::Answer503 => incr!(
+                    "http.503.errors",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
+                DefaultAnswerStatus::Answer504 => incr!(
+                    "http.504.errors",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
             };
         }
 
@@ -1275,7 +1304,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
                 if backend.retry_policy.is_down() {
                     incr!(
-                        "up",
+                        "backend.up",
                         self.cluster_id.as_deref(),
                         metrics.backend_id.as_deref()
                     );
@@ -1313,7 +1342,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             let already_unavailable = backend.retry_policy.is_down();
             backend.retry_policy.fail();
             incr!(
-                "connections.error",
+                "backend.connections.error",
                 self.cluster_id.as_deref(),
                 metrics.backend_id.as_deref()
             );
@@ -1323,7 +1352,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     backend.backend_id, backend.address
                 );
                 incr!(
-                    "down",
+                    "backend.down",
                     self.cluster_id.as_deref(),
                     metrics.backend_id.as_deref()
                 );
@@ -1698,23 +1727,23 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
 }
 
 /// Save the HTTP status code of the backend response
-fn save_http_status_metric(status: Option<u16>) {
+fn save_http_status_metric(status: Option<u16>, context: LogContext) {
     if let Some(status) = status {
         match status {
             100..=199 => {
-                incr!("http.status.1xx");
+                incr!("http.status.1xx", context.cluster_id, context.backend_id);
             }
             200..=299 => {
-                incr!("http.status.2xx");
+                incr!("http.status.2xx", context.cluster_id, context.backend_id);
             }
             300..=399 => {
-                incr!("http.status.3xx");
+                incr!("http.status.3xx", context.cluster_id, context.backend_id);
             }
             400..=499 => {
-                incr!("http.status.4xx");
+                incr!("http.status.4xx", context.cluster_id, context.backend_id);
             }
             500..=599 => {
-                incr!("http.status.5xx");
+                incr!("http.status.5xx", context.cluster_id, context.backend_id);
             }
             _ => {
                 // http responses with other codes (protocol error)

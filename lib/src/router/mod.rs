@@ -3,6 +3,7 @@ pub mod trie;
 
 use regex::bytes::Regex;
 use std::str::from_utf8;
+use time::Instant;
 
 use crate::protocol::http::parser::Method;
 use sozu_command::{
@@ -419,7 +420,13 @@ impl DomainRule {
                     && !&hostname[..len_without_suffix].contains(&b'.')
             }
             DomainRule::Exact(s) => s.as_bytes() == hostname,
-            DomainRule::Regex(r) => r.is_match(hostname),
+            DomainRule::Regex(r) => {
+                let start = Instant::now();
+                let is_a_match = r.is_match(hostname);
+                let now = Instant::now();
+                time!("regex_matching_time", (now - start).whole_milliseconds());
+                is_a_match
+            }
         }
     }
 }
@@ -494,7 +501,12 @@ impl PathRule {
                 }
             }
             PathRule::Regex(r) => {
-                if r.is_match(path) {
+                let start = Instant::now();
+                let is_a_match = r.is_match(path);
+                let now = Instant::now();
+                time!("regex_matching_time", (now - start).whole_milliseconds());
+
+                if is_a_match {
                     PathRuleResult::Regex
                 } else {
                     PathRuleResult::None

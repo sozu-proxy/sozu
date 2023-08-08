@@ -604,7 +604,7 @@ impl Server {
             }
 
             gauge!("client.connections", self.sessions.borrow().nb_connections);
-            gauge!("slab.count", self.sessions.borrow().slab.len());
+            gauge!("slab.entries", self.sessions.borrow().slab.len());
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).send_data();
             });
@@ -1522,7 +1522,7 @@ impl Server {
             _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
         }
 
-        gauge!("accept_queue.count", self.accept_queue.len());
+        gauge!("accept_queue.connections", self.accept_queue.len());
     }
 
     pub fn create_sessions(&mut self) {
@@ -1579,7 +1579,7 @@ impl Server {
             self.sessions.borrow_mut().incr();
         }
 
-        gauge!("accept_queue.count", self.accept_queue.len());
+        gauge!("accept_queue.connections", self.accept_queue.len());
     }
 
     pub fn ready(&mut self, token: Token, events: Ready) {

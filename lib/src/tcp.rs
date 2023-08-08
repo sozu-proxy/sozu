@@ -211,6 +211,7 @@ impl TcpSession {
             client_rtt: socket_rtt(self.state.front_socket()),
             server_rtt: None,
             metrics: &self.metrics,
+            user_agent: None,
         }
         .log();
     }
@@ -474,7 +475,7 @@ impl TcpSession {
 
                 if backend.retry_policy.is_down() {
                     incr!(
-                        "up",
+                        "backend.up",
                         self.cluster_id.as_deref(),
                         self.metrics.backend_id.as_deref()
                     );
@@ -517,7 +518,7 @@ impl TcpSession {
             let already_unavailable = backend.retry_policy.is_down();
             backend.retry_policy.fail();
             incr!(
-                "connections.error",
+                "backend.connections.error",
                 self.cluster_id.as_deref(),
                 self.metrics.backend_id.as_deref()
             );
@@ -527,7 +528,7 @@ impl TcpSession {
                     backend.backend_id, backend.address
                 );
                 incr!(
-                    "down",
+                    "backend.down",
                     self.cluster_id.as_deref(),
                     self.metrics.backend_id.as_deref()
                 );
