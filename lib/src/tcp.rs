@@ -399,16 +399,22 @@ impl TcpSession {
     }
 
     fn front_readiness(&mut self) -> &mut Readiness {
-        self.state.front_readiness()
+        match &mut self.state {
+            TcpStateMachine::Pipe(pipe) => &mut pipe.frontend_readiness,
+            TcpStateMachine::SendProxyProtocol(pp) => &mut pp.frontend_readiness,
+            TcpStateMachine::RelayProxyProtocol(pp) => &mut pp.frontend_readiness,
+            TcpStateMachine::ExpectProxyProtocol(pp) => &mut pp.frontend_readiness,
+            TcpStateMachine::FailedUpgrade(_) => unreachable!(),
+        }
     }
 
     fn back_readiness(&mut self) -> Option<&mut Readiness> {
         match &mut self.state {
-            TcpStateMachine::Pipe(pipe) => Some(pipe.back_readiness()),
-            TcpStateMachine::SendProxyProtocol(pp) => Some(pp.back_readiness()),
-            TcpStateMachine::RelayProxyProtocol(pp) => Some(pp.back_readiness()),
+            TcpStateMachine::Pipe(pipe) => Some(&mut pipe.backend_readiness),
+            TcpStateMachine::SendProxyProtocol(pp) => Some(&mut pp.backend_readiness),
+            TcpStateMachine::RelayProxyProtocol(pp) => Some(&mut pp.backend_readiness),
             TcpStateMachine::ExpectProxyProtocol(_) => None,
-            TcpStateMachine::FailedUpgrade(_) => todo!(),
+            TcpStateMachine::FailedUpgrade(_) => unreachable!(),
         }
     }
 
@@ -847,7 +853,7 @@ impl TcpSession {
             .backends
             .borrow_mut()
             .backend_from_cluster_id(&cluster_id)
-            .map_err(|backend_error| BackendConnectionError::Backend(backend_error))?;
+            .map_err(BackendConnectionError::Backend)?;
 
         /*
         this was the old error matching for backend_from_cluster_id.
@@ -1199,8 +1205,8 @@ impl TcpProxy {
     ) -> Result<Token, ProxyError> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                let tcp_listener = TcpListener::new(config, pool, token)
-                    .map_err(|listener_error| ProxyError::AddListener(listener_error))?;
+                let tcp_listener =
+                    TcpListener::new(config, pool, token).map_err(ProxyError::AddListener)?;
                 entry.insert(Rc::new(RefCell::new(tcp_listener)));
                 Ok(token)
             }

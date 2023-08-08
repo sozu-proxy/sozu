@@ -151,14 +151,6 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
         }
     }
 
-    pub fn front_readiness(&mut self) -> &mut Readiness {
-        &mut self.frontend_readiness
-    }
-
-    pub fn back_readiness(&mut self) -> &mut Readiness {
-        &mut self.backend_readiness
-    }
-
     pub fn into_pipe(
         mut self,
         front_buf: Checkout,

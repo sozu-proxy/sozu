@@ -1627,9 +1627,7 @@ impl Config {
                 // canonicalize to remove double dots like /path/to/config/directory/../../path/to/socket/directory/
                 config_dir.canonicalize().map_err(|io_error| {
                     ConfigError::SocketPathError(format!(
-                        "Could not canonicalize path {:?}: {}",
-                        config_dir,
-                        io_error.to_string()
+                        "Could not canonicalize path {config_dir:?}: {io_error}"
                     ))
                 })?
             }
@@ -1638,8 +1636,7 @@ impl Config {
         let socket_name = socket_path
             .file_name()
             .ok_or(ConfigError::SocketPathError(format!(
-                "could not get command socket file name from {:?}",
-                socket_path
+                "could not get command socket file name from {socket_path:?}"
             )))?;
 
         // concatenate parent directory and socket file name
@@ -1648,8 +1645,7 @@ impl Config {
         let command_socket_path = socket_parent_dir
             .to_str()
             .ok_or(ConfigError::SocketPathError(format!(
-                "Invalid socket path {:?}",
-                socket_parent_dir
+                "Invalid socket path {socket_parent_dir:?}"
             )))?
             .to_string();
 
@@ -1670,17 +1666,14 @@ impl Config {
         let config_dir = config_path
             .parent()
             .ok_or(ConfigError::SaveStatePath(format!(
-                "Could get parent directory of config file {:?}",
-                config_path,
+                "Could get parent directory of config file {config_path:?}"
             )))?;
 
         debug!("Config folder: {:?}", config_dir);
         if !config_dir.exists() {
             create_dir_all(config_dir).map_err(|io_error| {
                 ConfigError::SaveStatePath(format!(
-                    "failed to create state parent directory '{}': {}",
-                    config_dir.display(),
-                    io_error.to_string()
+                    "failed to create state parent directory '{config_dir:?}': {io_error}"
                 ))
             })?;
         }
@@ -1697,9 +1690,7 @@ impl Config {
                 info!("Create an empty state file at '{}'", path);
                 File::create(path).map_err(|io_error| {
                     ConfigError::SaveStatePath(format!(
-                        "failed to create state file '{:?}': {}",
-                        path,
-                        io_error.to_string()
+                        "failed to create state file '{path:?}': {io_error}"
                     ))
                 })?;
             }
@@ -1708,16 +1699,14 @@ impl Config {
 
         saved_state_path_raw.canonicalize().map_err(|io_error| {
             ConfigError::SaveStatePath(format!(
-                "could not get saved state path from config file input {path:?}: {}",
-                io_error
+                "could not get saved state path from config file input {path:?}: {io_error}"
             ))
         })?;
 
         let stringified_path = saved_state_path_raw
             .to_str()
             .ok_or(ConfigError::SaveStatePath(format!(
-                "Invalid path {:?}",
-                saved_state_path_raw
+                "Invalid path {saved_state_path_raw:?}"
             )))?
             .to_string();
 

@@ -133,7 +133,7 @@ impl ConfigState {
             | &RequestType::ReturnListenSockets(_)
             | &RequestType::HardStop(_) => Ok(()),
 
-            _other_request => return Err(StateError::UndispatchableRequest),
+            _other_request => Err(StateError::UndispatchableRequest),
         }
     }
 
@@ -142,7 +142,7 @@ impl ConfigState {
         if let Some(request_type) = &request.request_type {
             let count = self
                 .request_counts
-                .entry(format_request_type(&request_type))
+                .entry(format_request_type(request_type))
                 .or_insert(1);
             *count += 1;
         }
@@ -1268,7 +1268,7 @@ impl ConfigState {
                     Some((fingerprint, cert.to_owned()))
                 })
                 .filter(|(_, cert)| cert.names.contains(&domain))
-                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
+                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert))
                 .collect()
         } else if let Some(f) = filters.fingerprint {
             self.certificates
@@ -1290,7 +1290,7 @@ impl ConfigState {
 
                     Some((fingerprint, cert.to_owned()))
                 })
-                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
+                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert))
                 .collect()
         } else {
             self.certificates
@@ -1300,7 +1300,7 @@ impl ConfigState {
                     if cert.names.is_empty() {
                         let pem = certificate::parse(cert.certificate.as_bytes()).ok()?;
                         let mut c = cert.to_owned();
-                        
+
                         c.names = certificate::get_cn_and_san_attributes(&pem)
                             .ok()?
                             .into_iter()
@@ -1311,7 +1311,7 @@ impl ConfigState {
 
                     Some((fingerprint, cert.to_owned()))
                 })
-                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.clone()))
+                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert))
                 .collect()
         }
     }

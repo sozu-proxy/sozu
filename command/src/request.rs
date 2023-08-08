@@ -146,7 +146,7 @@ impl RequestHttpFrontend {
             method: self.method,
             position: RulePosition::from_i32(self.position).ok_or(RequestError::InvalidValue {
                 name: "position".to_string(),
-                value: self.position.clone(),
+                value: self.position,
             })?,
             tags: Some(self.tags),
         })

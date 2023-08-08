@@ -168,14 +168,6 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.backend_token = Some(token);
     }
 
-    pub fn front_readiness(&mut self) -> &mut Readiness {
-        &mut self.frontend_readiness
-    }
-
-    pub fn back_readiness(&mut self) -> &mut Readiness {
-        &mut self.backend_readiness
-    }
-
     pub fn get_session_address(&self) -> Option<SocketAddr> {
         self.session_address
             .or_else(|| self.frontend.socket_ref().peer_addr().ok())
@@ -293,7 +285,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.backend_status = ConnectionStatus::Closed;
         if self.backend_buffer.available_data() == 0 {
             if self.backend_readiness.event.is_readable() {
-                self.back_readiness().interest.insert(Ready::READABLE);
+                self.backend_readiness.interest.insert(Ready::READABLE);
                 error!("Pipe::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?} -> {:?}", self.frontend_readiness, self.backend_readiness);
                 StateResult::Continue
             } else {
@@ -301,7 +293,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 StateResult::CloseSession
             }
         } else {
-            self.front_readiness().interest.insert(Ready::WRITABLE);
+            self.frontend_readiness.interest.insert(Ready::WRITABLE);
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
             }

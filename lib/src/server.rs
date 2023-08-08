@@ -926,7 +926,7 @@ impl Server {
             Some(RequestType::QueryCertificatesFromWorkers(filters)) => {
                 if filters.fingerprint.is_some() {
                     let certs = self.config_state.get_certificates(filters.clone());
-                    let response = if certs.len() >= 1 {
+                    let response = if !certs.is_empty() {
                         WorkerResponse::ok_with_content(
                             message.id.clone(),
                             ContentType::CertificatesWithFingerprints(
@@ -937,7 +937,7 @@ impl Server {
                     } else {
                         WorkerResponse::error(
                             message.id.clone(),
-                            format!("Could not find certificate for this fingerprint"),
+                            "Could not find certificate for this fingerprint",
                         )
                     };
                     push_queue(response);

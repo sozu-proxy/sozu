@@ -272,7 +272,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                 }
 
                 self.interest.insert(Ready::READABLE);
-                return Err(ChannelError::NothingRead);
+                Err(ChannelError::NothingRead)
             }
         }
     }
@@ -423,14 +423,13 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     }
 }
 
+type ChannelResult<Tx, Rx> = Result<(Channel<Tx, Rx>, Channel<Rx, Tx>), ChannelError>;
+
 impl<Tx: Debug + DeserializeOwned + Serialize, Rx: Debug + DeserializeOwned + Serialize>
     Channel<Tx, Rx>
 {
     /// creates a channel pair: `(blocking_channel, nonblocking_channel)`
-    pub fn generate(
-        buffer_size: usize,
-        max_buffer_size: usize,
-    ) -> Result<(Channel<Tx, Rx>, Channel<Rx, Tx>), ChannelError> {
+    pub fn generate(buffer_size: usize, max_buffer_size: usize) -> ChannelResult<Tx, Rx> {
         let (command, proxy) = MioUnixStream::pair().map_err(ChannelError::Read)?;
         let proxy_channel = Channel::new(proxy, buffer_size, max_buffer_size);
         let mut command_channel = Channel::new(command, buffer_size, max_buffer_size);
@@ -442,7 +441,7 @@ impl<Tx: Debug + DeserializeOwned + Serialize, Rx: Debug + DeserializeOwned + Se
     pub fn generate_nonblocking(
         buffer_size: usize,
         max_buffer_size: usize,
-    ) -> Result<(Channel<Tx, Rx>, Channel<Rx, Tx>), ChannelError> {
+    ) -> ChannelResult<Tx, Rx> {
         let (command, proxy) = MioUnixStream::pair().map_err(ChannelError::Read)?;
         let proxy_channel = Channel::new(proxy, buffer_size, max_buffer_size);
         let command_channel = Channel::new(command, buffer_size, max_buffer_size);

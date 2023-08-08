@@ -390,29 +390,27 @@ pub fn server_bind(addr: String) -> Result<TcpListener, ServerBindError> {
         Type::STREAM,
         Some(Protocol::TCP),
     )
-    .map_err(|io_error| ServerBindError::SocketCreationError(io_error))?;
+    .map_err(ServerBindError::SocketCreationError)?;
 
     // set so_reuseaddr, but only on unix (mirrors what libstd does)
     if cfg!(unix) {
         sock.set_reuse_address(true)
-            .map_err(|io_error| ServerBindError::SetReuseAddress(io_error))?;
+            .map_err(ServerBindError::SetReuseAddress)?;
     }
 
     sock.set_reuse_port(true)
-        .map_err(|io_error| ServerBindError::SetReusePort(io_error))?;
+        .map_err(ServerBindError::SetReusePort)?;
 
     // bind the socket
     let addr = address.into();
-    sock.bind(&addr)
-        .map_err(|io_error| ServerBindError::BindError(io_error))?;
+    sock.bind(&addr).map_err(ServerBindError::BindError)?;
 
     sock.set_nonblocking(true)
-        .map_err(|io_error| ServerBindError::SetNonBlocking(io_error))?;
+        .map_err(ServerBindError::SetNonBlocking)?;
 
     // listen
     // FIXME: make the backlog configurable?
-    sock.listen(1024)
-        .map_err(|io_error| ServerBindError::Listen(io_error))?;
+    sock.listen(1024).map_err(ServerBindError::Listen)?;
 
     Ok(TcpListener::from_std(sock.into()))
 }

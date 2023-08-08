@@ -157,10 +157,6 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
         self.frontend.socket_ref()
     }
 
-    pub fn readiness(&mut self) -> &mut Readiness {
-        &mut self.frontend_readiness
-    }
-
     pub fn into_pipe(
         self,
         front_buf: Checkout,

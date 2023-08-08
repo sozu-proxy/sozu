@@ -116,14 +116,6 @@ impl<Front: SocketHandler> Http2<Front> {
         self.backend_token = Some(token);
     }
 
-    pub fn front_readiness(&mut self) -> &mut Readiness {
-        &mut self.frontend.readiness
-    }
-
-    pub fn back_readiness(&mut self) -> &mut Readiness {
-        &mut self.back_readiness
-    }
-
     pub fn front_hup(&mut self) -> StateResult {
         StateResult::CloseSession
     }

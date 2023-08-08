@@ -42,17 +42,8 @@ impl Display for QueryCertificatesFilters {
     }
 }
 
-pub fn concatenate_vector(vec: &Vec<String>) -> String {
-    let mut vec = vec.clone();
-    let mut concatenated = match vec.pop() {
-        Some(s) => s,
-        None => return String::from("empty"),
-    };
-    for s in vec {
-        concatenated.push_str(&s);
-        concatenated.push_str(", ");
-    }
-    concatenated
+pub fn concatenate_vector(vec: &[String]) -> String {
+    vec.join(", ")
 }
 
 pub fn format_request_type(request_type: &RequestType) -> String {
