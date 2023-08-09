@@ -5,7 +5,7 @@ repository = "https://github.com/sozu-proxy/sozu"
 readme = "README.md"
 documentation = "https://docs.rs/sozu-lib"
 homepage = "https://sozu.io"
-version = "0.15.2"
+version = "0.15.3"
 license = "AGPL-3.0"
 authors = [
   "Clément Delafargue <clement@delafargue.name>",
@@ -16,7 +16,7 @@ authors = [
 ]
 categories = ["network-programming"]
 edition = "2021"
-rust-version = "1.66.1"
+rust-version = "1.67.0"
 include = [
   "./README.md",
   "Cargo.toml",
@@ -59,7 +59,7 @@ url = "^2.4.0"
 webpki = "^0.22.0"
 x509-parser = "^0.15.1"
 
-sozu-command-lib = { path = "../command", version = "^0.15.2" }
+sozu-command-lib = { path = "../command", version = "^0.15.3" }
 
 [dev-dependencies]
 quickcheck = "^1.0.3"
