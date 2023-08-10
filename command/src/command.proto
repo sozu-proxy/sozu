@@ -162,6 +162,7 @@ message HttpsListenerConfig {
     // agains session tracking. Defaults to 4.
     required uint64 send_tls13_tickets = 20;
     optional CustomHttpAnswers http_answers = 21;
+    repeated AlpnProtocol alpn = 22;
 }
 
 // details of an TCP listener
@@ -364,6 +365,11 @@ enum TlsVersion {
     TLS_V1_1 = 3;
     TLS_V1_2 = 4;
     TLS_V1_3 = 5;
+}
+
+enum AlpnProtocol {
+    Http11 = 0;
+    H2 = 1;
 }
 
 // A cluster is what binds a frontend to backends with routing rules

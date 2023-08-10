@@ -61,7 +61,7 @@ use crate::{
     certificate::split_certificate_chain,
     logging::AccessLogFormat,
     proto::command::{
-        request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
+        request::RequestType, ActivateListener, AddBackend, AddCertificate, AlpnProtocol, CertificateAndKey,
         Cluster, CustomHttpAnswers, HttpListenerConfig, HttpsListenerConfig, ListenerType,
         LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule,
         ProtobufAccessLogFormat, ProxyProtocolConfig, Request, RequestHttpFrontend,
@@ -71,8 +71,10 @@ use crate::{
     ObjectKind,
 };
 
+pub const DEFAULT_ALPN: [AlpnProtocol; 1] = [AlpnProtocol::Http11];
+
 /// provides all supported cipher suites exported by Rustls TLS
-/// provider as it support only strongly secure ones.
+/// provider as it supports only strongly secure ones.
 ///
 /// See the [documentation](https://docs.rs/rustls/latest/rustls/static.ALL_CIPHER_SUITES.html)
 pub const DEFAULT_RUSTLS_CIPHER_LIST: [&str; 9] = [
@@ -240,6 +242,7 @@ pub struct ListenerBuilder {
     pub address: SocketAddr,
     pub protocol: Option<ListenerProtocol>,
     pub public_address: Option<SocketAddr>,
+    pub alpn: Option<Vec<AlpnProtocol>>,
     pub answer_301: Option<String>,
     pub answer_400: Option<String>,
     pub answer_401: Option<String>,
@@ -302,6 +305,7 @@ impl ListenerBuilder {
     fn new(address: SocketAddress, protocol: ListenerProtocol) -> ListenerBuilder {
         ListenerBuilder {
             address: address.into(),
+            alpn: None,
             answer_301: None,
             answer_401: None,
             answer_400: None,
@@ -331,14 +335,14 @@ impl ListenerBuilder {
         }
     }
 
-    pub fn with_public_address(&mut self, public_address: Option<SocketAddr>) -> &mut Self {
+    pub fn with_public_address(mut self, public_address: Option<SocketAddr>) -> Self {
         if let Some(address) = public_address {
             self.public_address = Some(address);
         }
         self
     }
 
-    pub fn with_answer_404_path<S>(&mut self, answer_404_path: Option<S>) -> &mut Self
+    pub fn with_answer_404_path<S>(mut self, answer_404_path: Option<S>) -> Self
     where
         S: ToString,
     {
@@ -348,7 +352,7 @@ impl ListenerBuilder {
         self
     }
 
-    pub fn with_answer_503_path<S>(&mut self, answer_503_path: Option<S>) -> &mut Self
+    pub fn with_answer_503_path<S>(mut self, answer_503_path: Option<S>) -> Self
     where
         S: ToString,
     {
@@ -358,27 +362,27 @@ impl ListenerBuilder {
         self
     }
 
-    pub fn with_tls_versions(&mut self, tls_versions: Vec<TlsVersion>) -> &mut Self {
+    pub fn with_tls_versions(mut self, tls_versions: Vec<TlsVersion>) -> Self {
         self.tls_versions = Some(tls_versions);
         self
     }
 
-    pub fn with_cipher_list(&mut self, cipher_list: Option<Vec<String>>) -> &mut Self {
+    pub fn with_cipher_list(mut self, cipher_list: Option<Vec<String>>) -> Self {
         self.cipher_list = cipher_list;
         self
     }
 
-    pub fn with_cipher_suites(&mut self, cipher_suites: Option<Vec<String>>) -> &mut Self {
+    pub fn with_cipher_suites(mut self, cipher_suites: Option<Vec<String>>) -> Self {
         self.cipher_suites = cipher_suites;
         self
     }
 
-    pub fn with_expect_proxy(&mut self, expect_proxy: bool) -> &mut Self {
+    pub fn with_expect_proxy(mut self, expect_proxy: bool) -> Self {
         self.expect_proxy = Some(expect_proxy);
         self
     }
 
-    pub fn with_sticky_name<S>(&mut self, sticky_name: Option<S>) -> &mut Self
+    pub fn with_sticky_name<S>(mut self, sticky_name: Option<S>) -> Self
     where
         S: ToString,
     {
@@ -388,7 +392,7 @@ impl ListenerBuilder {
         self
     }
 
-    pub fn with_certificate<S>(&mut self, certificate: S) -> &mut Self
+    pub fn with_certificate<S>(mut self, certificate: S) -> Self
     where
         S: ToString,
     {
@@ -396,12 +400,12 @@ impl ListenerBuilder {
         self
     }
 
-    pub fn with_certificate_chain(&mut self, certificate_chain: String) -> &mut Self {
+    pub fn with_certificate_chain(mut self, certificate_chain: String) -> Self {
         self.certificate = Some(certificate_chain);
         self
     }
 
-    pub fn with_key<S>(&mut self, key: String) -> &mut Self
+    pub fn with_key<S>(mut self, key: String) -> Self
     where
         S: ToString,
     {
@@ -409,22 +413,22 @@ impl ListenerBuilder {
         self
     }
 
-    pub fn with_front_timeout(&mut self, front_timeout: Option<u32>) -> &mut Self {
+    pub fn with_front_timeout(mut self, front_timeout: Option<u32>) -> Self {
         self.front_timeout = front_timeout;
         self
     }
 
-    pub fn with_back_timeout(&mut self, back_timeout: Option<u32>) -> &mut Self {
+    pub fn with_back_timeout(mut self, back_timeout: Option<u32>) -> Self {
         self.back_timeout = back_timeout;
         self
     }
 
-    pub fn with_connect_timeout(&mut self, connect_timeout: Option<u32>) -> &mut Self {
+    pub fn with_connect_timeout(mut self, connect_timeout: Option<u32>) -> Self {
         self.connect_timeout = connect_timeout;
         self
     }
 
-    pub fn with_request_timeout(&mut self, request_timeout: Option<u32>) -> &mut Self {
+    pub fn with_request_timeout(mut self, request_timeout: Option<u32>) -> Self {
         self.request_timeout = request_timeout;
         self
     }
@@ -455,11 +459,11 @@ impl ListenerBuilder {
     }
 
     /// build an HTTP listener with config timeouts, using defaults if no config is provided
-    pub fn to_http(&mut self, config: Option<&Config>) -> Result<HttpListenerConfig, ConfigError> {
+    pub fn to_http(mut self, config: Option<&Config>) -> Result<HttpListenerConfig, ConfigError> {
         if self.protocol != Some(ListenerProtocol::Http) {
             return Err(ConfigError::WrongListenerProtocol {
                 expected: ListenerProtocol::Http,
-                found: self.protocol.to_owned(),
+                found: self.protocol,
             });
         }
 
@@ -473,7 +477,7 @@ impl ListenerBuilder {
             address: self.address.into(),
             public_address: self.public_address.map(|a| a.into()),
             expect_proxy: self.expect_proxy.unwrap_or(false),
-            sticky_name: self.sticky_name.clone(),
+            sticky_name: self.sticky_name,
             front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
             back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
@@ -486,34 +490,47 @@ impl ListenerBuilder {
     }
 
     /// build an HTTPS listener using defaults if no config or values were provided upstream
-    pub fn to_tls(&mut self, config: Option<&Config>) -> Result<HttpsListenerConfig, ConfigError> {
+    pub fn to_tls(mut self, config: Option<&Config>) -> Result<HttpsListenerConfig, ConfigError> {
         if self.protocol != Some(ListenerProtocol::Https) {
             return Err(ConfigError::WrongListenerProtocol {
                 expected: ListenerProtocol::Https,
-                found: self.protocol.to_owned(),
+                found: self.protocol,
             });
         }
+
+        if let Some(config) = config {
+            self.assign_config_timeouts(config);
+        }
+
+        let http_answers = self.get_http_answers()?;
+        let default_alpn = DEFAULT_ALPN.into_iter().map(|p| p as i32).collect();
+
+        let alpn = self
+            .alpn
+            .as_ref()
+            .map(|alpn| alpn.iter().map(|p| *p as i32).collect())
+            .unwrap_or(default_alpn);
 
         let default_cipher_list = DEFAULT_RUSTLS_CIPHER_LIST
             .into_iter()
             .map(String::from)
             .collect();
 
-        let cipher_list = self.cipher_list.clone().unwrap_or(default_cipher_list);
+        let cipher_list = self.cipher_list.unwrap_or(default_cipher_list);
 
         let default_cipher_suites = DEFAULT_CIPHER_SUITES
             .into_iter()
             .map(String::from)
             .collect();
 
-        let cipher_suites = self.cipher_suites.clone().unwrap_or(default_cipher_suites);
+        let cipher_suites = self.cipher_suites.unwrap_or(default_cipher_suites);
 
-        let signature_algorithms: Vec<String> = DEFAULT_SIGNATURE_ALGORITHMS
+        let signature_algorithms = DEFAULT_SIGNATURE_ALGORITHMS
             .into_iter()
             .map(String::from)
             .collect();
 
-        let groups_list: Vec<String> = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
+        let groups_list = DEFAULT_GROUPS_LIST.into_iter().map(String::from).collect();
 
         let versions = match self.tls_versions {
             None => vec![TlsVersion::TlsV12 as i32, TlsVersion::TlsV13 as i32],
@@ -550,15 +567,10 @@ impl ListenerBuilder {
             .map(split_certificate_chain)
             .unwrap_or_default();
 
-        let http_answers = self.get_http_answers()?;
-
-        if let Some(config) = config {
-            self.assign_config_timeouts(config);
-        }
-
         let https_listener_config = HttpsListenerConfig {
+            alpn,
             address: self.address.into(),
-            sticky_name: self.sticky_name.clone(),
+            sticky_name: self.sticky_name,
             public_address: self.public_address.map(|a| a.into()),
             cipher_list,
             versions,
@@ -584,11 +596,11 @@ impl ListenerBuilder {
     }
 
     /// build an HTTPS listener using defaults if no config or values were provided upstream
-    pub fn to_tcp(&mut self, config: Option<&Config>) -> Result<TcpListenerConfig, ConfigError> {
+    pub fn to_tcp(mut self, config: Option<&Config>) -> Result<TcpListenerConfig, ConfigError> {
         if self.protocol != Some(ListenerProtocol::Tcp) {
             return Err(ConfigError::WrongListenerProtocol {
                 expected: ListenerProtocol::Tcp,
-                found: self.protocol.to_owned(),
+                found: self.protocol,
             });
         }
 
@@ -1281,7 +1293,7 @@ impl ConfigBuilder {
         }
     }
 
-    fn push_tls_listener(&mut self, mut listener: ListenerBuilder) -> Result<(), ConfigError> {
+    fn push_tls_listener(&mut self, listener: ListenerBuilder) -> Result<(), ConfigError> {
         let listener = listener.to_tls(Some(&self.built))?;
         self.built.https_listeners.push(listener);
         Ok(())
