@@ -33,10 +33,10 @@ use sozu_command::{
     config::DEFAULT_CIPHER_SUITES,
     logging,
     proto::command::{
-        request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
-        CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
-        ListenerType, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        ResponseContent, TlsVersion,
+        request::RequestType, response_content::ContentType, AddCertificate, AlpnProtocol,
+        CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
+        ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
     },
     ready::Ready,
     request::WorkerRequest,
@@ -69,9 +69,6 @@ use crate::{
     SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
 
-// const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
-const SERVER_PROTOS: &[&str] = &["http/1.1"];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsCluster {
     cluster_id: String,
@@ -93,11 +90,6 @@ StateMachineBuilder! {
         WebSocket(Pipe<FrontRustls, HttpsListener>),
         Http2(Http2<FrontRustls>) -> todo!("H2"),
     }
-}
-
-pub enum AlpnProtocols {
-    H2,
-    Http11,
 }
 
 pub struct HttpsSession {
@@ -265,14 +257,14 @@ impl HttpsSession {
         );
 
         let alpn = match alpn {
-            Some("http/1.1") => AlpnProtocols::Http11,
-            Some("h2") => AlpnProtocols::H2,
+            Some("http/1.1") => AlpnProtocol::Http11,
+            Some("h2") => AlpnProtocol::H2,
             Some(other) => {
                 error!("Unsupported ALPN protocol: {}", other);
                 return None;
             }
             // Some client don't fill in the ALPN protocol, in this case we default to Http/1.1
-            None => AlpnProtocols::Http11,
+            None => AlpnProtocol::Http11,
         };
 
         if let Some(version) = handshake.session.protocol_version() {
@@ -289,7 +281,7 @@ impl HttpsSession {
 
         gauge_add!("protocol.tls.handshake", -1);
         match alpn {
-            AlpnProtocols::Http11 => {
+            AlpnProtocol::Http11 => {
                 let mut http = Http::new(
                     self.answers.clone(),
                     self.configured_backend_timeout,
@@ -330,7 +322,7 @@ impl HttpsSession {
                 gauge_add!("protocol.https", 1);
                 Some(HttpsStateMachine::Http(http))
             }
-            AlpnProtocols::H2 => {
+            AlpnProtocol::H2 => {
                 let mut http = Http2::new(
                     front_stream,
                     self.frontend_token,
@@ -748,8 +740,8 @@ impl HttpsListener {
             .filter_map(|version| match TlsVersion::from_i32(*version) {
                 Some(TlsVersion::TlsV12) => Some(&rustls::version::TLS12),
                 Some(TlsVersion::TlsV13) => Some(&rustls::version::TLS13),
-                _other_version => {
-                    error!("unsupported TLS version: {:?}", _other_version);
+                other_version => {
+                    error!("unsupported TLS version: {:?}", other_version);
                     None
                 }
             })
@@ -763,11 +755,20 @@ impl HttpsListener {
             .with_no_client_auth()
             .with_cert_resolver(resolver);
 
-        let mut protocols = SERVER_PROTOS
+        let protocols = config
+            .alpn
             .iter()
-            .map(|proto| proto.as_bytes().to_vec())
+            .filter_map(|protocol| match AlpnProtocol::from_i32(*protocol) {
+                Some(AlpnProtocol::Http11) => Some("http/1.1"),
+                Some(AlpnProtocol::H2) => Some("h2"),
+                other_protocol => {
+                    error!("unsupported ALPN protocol: {:?}", other_protocol);
+                    None
+                }
+            })
+            .map(|protocol| protocol.as_bytes().to_vec())
             .collect::<Vec<_>>();
-        server_config.alpn_protocols.append(&mut protocols);
+        server_config.alpn_protocols = protocols;
 
         Ok(server_config)
     }
