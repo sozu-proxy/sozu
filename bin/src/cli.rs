@@ -425,6 +425,8 @@ pub enum HttpFrontendCmd {
         method: Option<String>,
         #[clap(long = "tags", help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')", value_parser = parse_tags)]
         tags: Option<BTreeMap<String, String>>,
+        #[clap(help = "the frontend uses http2 with prio-knowledge")]
+        h2: Option<bool>,
     },
     #[clap(name = "remove")]
     Remove {

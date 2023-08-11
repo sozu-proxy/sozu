@@ -173,6 +173,7 @@ impl RequestHttpFrontend {
                 }
             })?,
             tags: Some(self.tags),
+            h2: self.h2,
         })
     }
 }
