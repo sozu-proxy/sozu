@@ -39,6 +39,7 @@ pub struct HttpFrontend {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    pub h2: bool,
 }
 
 impl From<HttpFrontend> for RequestHttpFrontend {
@@ -54,6 +55,7 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             path: val.path,
             method: val.method,
             position: val.position.into(),
+            h2: val.h2,
             tags,
         }
     }
