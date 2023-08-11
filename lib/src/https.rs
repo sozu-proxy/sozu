@@ -599,7 +599,7 @@ impl L7ListenerHandler for HttpsListener {
 
         let now = Instant::now();
 
-        if let Route::ClusterId(cluster) = &route {
+        if let Route::Cluster { id: cluster, .. } = &route {
             time!("frontend_matching_time", cluster, (now - start).as_millis());
         }
 
@@ -848,7 +848,7 @@ impl HttpsProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::SoftStop {
                 proxy_protocol: "HTTPS".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -871,7 +871,7 @@ impl HttpsProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::HardStop {
                 proxy_protocol: "HTTPS".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -1550,25 +1550,37 @@ mod tests {
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri1),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id1.clone())
+            &Route::Cluster {
+                id: cluster_id1.clone(),
+                h2: false
+            }
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri2),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id2)
+            &Route::Cluster {
+                id: cluster_id2,
+                h2: false
+            }
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri3),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id3)
+            &Route::Cluster {
+                id: cluster_id3,
+                h2: false
+            }
         ));
         assert!(fronts.add_tree_rule(
             "other.domain".as_bytes(),
             &PathRule::Prefix("test".to_string()),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id1)
+            &Route::Cluster {
+                id: cluster_id1,
+                h2: false
+            }
         ));
 
         let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
@@ -1609,25 +1621,37 @@ mod tests {
         let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);
         assert_eq!(
             frontend1.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            Route::Cluster {
+                id: "cluster_1".to_string(),
+                h2: false
+            }
         );
         println!("TEST {}", line!());
         let frontend2 = listener.frontend_from_request("lolcatho.st", "/test", &Method::Get);
         assert_eq!(
             frontend2.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            Route::Cluster {
+                id: "cluster_1".to_string(),
+                h2: false
+            }
         );
         println!("TEST {}", line!());
         let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test", &Method::Get);
         assert_eq!(
             frontend3.expect("should find a frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            Route::Cluster {
+                id: "cluster_2".to_string(),
+                h2: false
+            }
         );
         println!("TEST {}", line!());
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         assert_eq!(
             frontend4.expect("should find a frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            Route::Cluster {
+                id: "cluster_3".to_string(),
+                h2: false
+            }
         );
         println!("TEST {}", line!());
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);

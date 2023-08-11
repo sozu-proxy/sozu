@@ -238,6 +238,7 @@ impl CommandManager {
                 method,
                 cluster_id: route,
                 tags,
+                h2,
             } => self.send_request(
                 RequestType::AddHttpFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
@@ -250,6 +251,7 @@ impl CommandManager {
                         Some(tags) => tags,
                         None => BTreeMap::new(),
                     },
+                    h2: h2.unwrap_or(false),
                 })
                 .into(),
             ),
@@ -286,6 +288,7 @@ impl CommandManager {
                 method,
                 cluster_id: route,
                 tags,
+                h2,
             } => self.send_request(
                 RequestType::AddHttpsFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
@@ -298,6 +301,7 @@ impl CommandManager {
                         Some(tags) => tags,
                         None => BTreeMap::new(),
                     },
+                    h2: h2.unwrap_or(false),
                 })
                 .into(),
             ),

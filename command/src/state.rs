@@ -471,7 +471,7 @@ impl ConfigState {
         if tcp_frontends.contains(&tcp_frontend) {
             return Err(StateError::Exists {
                 kind: ObjectKind::TcpFrontend,
-                id: format!("{:?}", tcp_frontend),
+                id: format!("{tcp_frontend:?}"),
             });
         }
 
@@ -488,7 +488,7 @@ impl ConfigState {
                 .get_mut(&front_to_remove.cluster_id)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpFrontend,
-                    id: format!("{:?}", front_to_remove),
+                    id: format!("{front_to_remove:?}"),
                 })?;
 
         let len = tcp_frontends.len();
