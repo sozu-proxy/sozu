@@ -667,7 +667,7 @@ impl HttpProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::SoftStop {
                 proxy_protocol: "HTTP".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -690,7 +690,7 @@ impl HttpProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::HardStop {
                 proxy_protocol: "HTTP".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -1463,6 +1463,7 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id1),
                 tags: None,
+                h2: false,
             })
             .expect("Could not add http frontend");
         fronts
@@ -1474,6 +1475,7 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id2),
                 tags: None,
+                h2: false,
             })
             .expect("Could not add http frontend");
         fronts
@@ -1485,6 +1487,7 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some(cluster_id3),
                 tags: None,
+                h2: false,
             })
             .expect("Could not add http frontend");
         fronts
@@ -1496,6 +1499,7 @@ mod tests {
                 position: RulePosition::Tree,
                 cluster_id: Some("cluster_1".to_owned()),
                 tags: None,
+                h2: false,
             })
             .expect("Could not add http frontend");
 
@@ -1527,19 +1531,31 @@ mod tests {
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
         assert_eq!(
             frontend1.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            Route::Cluster {
+                id: "cluster_1".to_string(),
+                h2: false
+            }
         );
         assert_eq!(
             frontend2.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            Route::Cluster {
+                id: "cluster_1".to_string(),
+                h2: false
+            }
         );
         assert_eq!(
             frontend3.expect("should find frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            Route::Cluster {
+                id: "cluster_2".to_string(),
+                h2: false
+            }
         );
         assert_eq!(
             frontend4.expect("should find frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            Route::Cluster {
+                id: "cluster_3".to_string(),
+                h2: false
+            }
         );
         assert!(frontend5.is_err());
     }

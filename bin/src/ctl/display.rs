@@ -609,7 +609,7 @@ pub fn print_cluster_responses(
     clusters_table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
     let mut header = vec![cell!("cluster id")];
     for worker_id in worker_responses.map.keys() {
-        header.push(cell!(format!("worker {}", worker_id)));
+        header.push(cell!(format!("worker {worker_id}")));
     }
     header.push(cell!("desynchronized"));
     clusters_table.add_row(Row::new(header));
@@ -657,14 +657,14 @@ pub fn print_certificates_by_worker(
     }
 
     for (worker_id, response_content) in response_contents.iter() {
-        println!("Worker {}", worker_id);
+        println!("Worker {worker_id}");
         match &response_content.content_type {
             Some(ContentType::CertificatesByAddress(list)) => {
                 for certs in list.certificates.iter() {
                     println!("\t{}:", certs.address);
 
                     for summary in certs.certificate_summaries.iter() {
-                        println!("\t\t{}", summary);
+                        println!("\t\t{summary}");
                     }
 
                     println!();

@@ -117,7 +117,10 @@ impl Router {
         let method_rule = MethodRule::new(front.method.clone());
 
         let route = match &front.cluster_id {
-            Some(cluster_id) => Route::ClusterId(cluster_id.clone()),
+            Some(cluster_id) => Route::Cluster {
+                id: cluster_id.clone(),
+                h2: front.h2,
+            },
             None => Route::Deny,
         };
 
@@ -145,7 +148,7 @@ impl Router {
             }
         };
         if !success {
-            return Err(RouterError::AddRoute(format!("{:?}", front)));
+            return Err(RouterError::AddRoute(format!("{front:?}")));
         }
         Ok(())
     }
@@ -180,7 +183,7 @@ impl Router {
             }
         };
         if !remove_success {
-            return Err(RouterError::RemoveRoute(format!("{:?}", front)));
+            return Err(RouterError::RemoveRoute(format!("{front:?}")));
         }
         Ok(())
     }
@@ -581,7 +584,7 @@ pub enum Route {
     /// send a 401 default answer
     Deny,
     /// the cluster to which the frontend belongs
-    ClusterId(ClusterId),
+    Cluster { id: ClusterId, h2: bool },
 }
 
 #[cfg(test)]
@@ -693,25 +696,37 @@ mod tests {
             &"*".parse::<DomainRule>().unwrap(),
             &PathRule::Prefix("/.well-known/acme-challenge".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("acme".to_string())
+            &Route::Cluster {
+                id: "acme".to_string(),
+                h2: false
+            }
         ));
         assert!(router.add_tree_rule(
             "www.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("example".to_string())
+            &Route::Cluster {
+                id: "example".to_string(),
+                h2: false
+            }
         ));
         assert!(router.add_tree_rule(
             "*.test.example.com".as_bytes(),
             &PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("examplewildcard".to_string())
+            &Route::Cluster {
+                id: "examplewildcard".to_string(),
+                h2: false
+            }
         ));
         assert!(router.add_tree_rule(
             "/test[0-9]/.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("exampleregex".to_string())
+            &Route::Cluster {
+                id: "exampleregex".to_string(),
+                h2: false
+            }
         ));
 
         assert_eq!(
@@ -720,7 +735,10 @@ mod tests {
                 "/helloA".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("example".to_string()))
+            Some(Route::Cluster {
+                id: "example".to_string(),
+                h2: false
+            })
         );
         assert_eq!(
             router.lookup(
@@ -728,7 +746,10 @@ mod tests {
                 "/.well-known/acme-challenge".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("acme".to_string()))
+            Some(Route::Cluster {
+                id: "acme".to_string(),
+                h2: false
+            })
         );
         assert_eq!(
             router.lookup(
@@ -744,7 +765,10 @@ mod tests {
                 "/helloAB/".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("examplewildcard".to_string()))
+            Some(Route::Cluster {
+                id: "examplewildcard".to_string(),
+                h2: false
+            })
         );
         assert_eq!(
             router.lookup(
@@ -752,7 +776,10 @@ mod tests {
                 "/helloAB/".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("exampleregex".to_string()))
+            Some(Route::Cluster {
+                id: "exampleregex".to_string(),
+                h2: false
+            })
         );
     }
 }

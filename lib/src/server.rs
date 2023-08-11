@@ -1309,8 +1309,7 @@ impl Server {
 
                         None => {
                             let error = format!(
-                                "Couldn't deactivate HTTPS listener at address {:?}",
-                                address
+                                "Couldn't deactivate HTTPS listener at address {address:?}",
                             );
                             error!("{}", error);
                             return WorkerResponse::error(req_id, error);
@@ -1349,7 +1348,7 @@ impl Server {
                     Some((token, listener)) => (token, listener),
                     None => {
                         let error =
-                            format!("Couldn't deactivate TCP listener at address {:?}", address);
+                            format!("Couldn't deactivate TCP listener at address {address:?}");
                         error!("{}", error);
                         return WorkerResponse::error(req_id, error);
                     }

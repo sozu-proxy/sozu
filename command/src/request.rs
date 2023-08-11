@@ -149,6 +149,7 @@ impl RequestHttpFrontend {
                 value: self.position,
             })?,
             tags: Some(self.tags),
+            h2: self.h2,
         })
     }
 }

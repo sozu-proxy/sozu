@@ -33,9 +33,9 @@ impl Display for CertificateSummary {
 impl Display for QueryCertificatesFilters {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         if let Some(d) = self.domain.clone() {
-            write!(f, "domain:{}", d)
+            write!(f, "domain:{d}")
         } else if let Some(fp) = self.fingerprint.clone() {
-            write!(f, "domain:{}", fp)
+            write!(f, "domain:{fp}")
         } else {
             write!(f, "all certificates")
         }
