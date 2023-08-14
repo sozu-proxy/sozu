@@ -54,6 +54,7 @@ use crate::{
             answers::HttpAnswers,
             parser::{hostname_and_port, Method},
         },
+        mux::Mux,
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
         Http, Pipe, SessionState,
@@ -65,8 +66,8 @@ use crate::{
     tls::{CertificateResolver, MutexWrappedCertificateResolver, ParsedCertificateAndKey},
     util::UnwrapLog,
     AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
-    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, Readiness,
+    SessionIsToBeClosed, SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +87,7 @@ StateMachineBuilder! {
     enum HttpsStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
+        Mux(Mux),
         Http(Http<FrontRustls, HttpsListener>),
         WebSocket(Pipe<FrontRustls, HttpsListener>),
         Http2(Http2<FrontRustls>) -> todo!("H2"),
@@ -183,6 +185,7 @@ impl HttpsSession {
             HttpsStateMachine::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
             HttpsStateMachine::Handshake(handshake) => self.upgrade_handshake(handshake),
             HttpsStateMachine::Http(http) => self.upgrade_http(http),
+            HttpsStateMachine::Mux(mux) => unimplemented!(),
             HttpsStateMachine::Http2(_) => self.upgrade_http2(),
             HttpsStateMachine::WebSocket(wss) => self.upgrade_websocket(wss),
             HttpsStateMachine::FailedUpgrade(_) => unreachable!(),
@@ -266,6 +269,7 @@ impl HttpsSession {
             // Some client don't fill in the ALPN protocol, in this case we default to Http/1.1
             None => AlpnProtocol::Http11,
         };
+        println!("ALPN: {alpn:?}");
 
         if let Some(version) = handshake.session.protocol_version() {
             incr!(rustls_version_str(version));
@@ -280,6 +284,50 @@ impl HttpsSession {
         };
 
         gauge_add!("protocol.tls.handshake", -1);
+        // return Some(HttpsStateMachine::Mux(Mux::new(
+        //     self.frontend_token,
+        //     handshake.request_id,
+        //     self.listener.clone(),
+        //     self.pool.clone(),
+        //     self.public_address,
+        //     self.peer_address,
+        //     self.sticky_name.clone(),
+        // )));
+        use crate::protocol::mux;
+        let frontend = match alpn {
+            AlpnProtocol::Http11 => mux::Connection::H1(mux::ConnectionH1 {
+                socket: front_stream,
+                position: mux::Position::Server,
+                readiness: Readiness {
+                    interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
+                    event: handshake.frontend_readiness.event,
+                },
+                stream: 0,
+            }),
+            AlpnProtocol::H2 => mux::Connection::H2(mux::ConnectionH2 {
+                socket: front_stream,
+                position: mux::Position::Server,
+                readiness: Readiness {
+                    interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
+                    event: handshake.frontend_readiness.event,
+                },
+                streams: HashMap::new(),
+                state: mux::H2State::ClientPreface,
+            }),
+        };
+        let mut mux = Mux {
+            frontend_token: self.frontend_token,
+            frontend,
+            backends: HashMap::new(),
+            streams: Vec::new(),
+            listener: self.listener.clone(),
+            pool: self.pool.clone(),
+            public_address: self.public_address,
+            peer_address: self.peer_address,
+            sticky_name: self.sticky_name.clone(),
+        };
+        mux.create_stream(handshake.request_id).ok()?;
+        return Some(HttpsStateMachine::Mux(mux));
         match alpn {
             AlpnProtocol::Http11 => {
                 let mut http = Http::new(
@@ -408,6 +456,7 @@ impl ProxySession for HttpsSession {
             StateMarker::Expect => gauge_add!("protocol.proxy.expect", -1),
             StateMarker::Handshake => gauge_add!("protocol.tls.handshake", -1),
             StateMarker::Http => gauge_add!("protocol.https", -1),
+            StateMarker::Mux => gauge_add!("protocol.https", -1),
             StateMarker::WebSocket => {
                 gauge_add!("protocol.wss", -1);
                 gauge_add!("websocket.active_requests", -1);
@@ -469,6 +518,7 @@ impl ProxySession for HttpsSession {
     }
 
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+        println!("READY");
         self.metrics.service_start();
 
         let session_result =
