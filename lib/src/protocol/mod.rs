@@ -1,5 +1,6 @@
 pub mod h2;
 pub mod kawa_h1;
+pub mod mux;
 pub mod pipe;
 pub mod proxy_protocol;
 pub mod rustls;
