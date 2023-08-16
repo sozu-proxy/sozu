@@ -250,7 +250,7 @@ pub fn frame<'a>(input: &'a [u8], max_frame_size: u32) -> IResult<&'a [u8], Fram
             if header.payload_len % 6 != 0 {
                 return Err(Err::Failure(Error::new(input, InnerError::FrameSizeError)));
             }
-            settings_frame(i, &header)?
+            settings_frame(i, header.payload_len as usize)?
         }
         FrameType::Ping => {
             if header.payload_len != 8 {
@@ -408,9 +408,9 @@ pub struct Setting {
 
 pub fn settings_frame<'a, 'b>(
     input: &'a [u8],
-    header: &'b FrameHeader,
+    payload_len: usize,
 ) -> IResult<&'a [u8], Frame<'a>, Error<'a>> {
-    let (i, data) = take(header.payload_len)(input)?;
+    let (i, data) = take(payload_len)(input)?;
 
     let (_, settings) = many0(map(
         complete(tuple((be_u16, be_u32))),
