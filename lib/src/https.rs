@@ -313,6 +313,7 @@ impl HttpsSession {
                 },
                 streams: HashMap::new(),
                 state: mux::H2State::ClientPreface,
+                expect: Some((0, 24 + 9)),
             }),
         };
         let mut mux = Mux {
@@ -637,7 +638,7 @@ impl L7ListenerHandler for HttpsListener {
 
         let now = Instant::now();
 
-        if let Route::ClusterId(cluster) = &route {
+        if let Route::Cluster { id: cluster, h2 } = &route {
             time!(
                 "frontend_matching_time",
                 cluster,
