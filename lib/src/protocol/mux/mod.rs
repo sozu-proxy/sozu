@@ -1,7 +1,6 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    io::Write,
     net::SocketAddr,
     rc::{Rc, Weak},
 };
@@ -26,6 +25,7 @@ type GenericHttpStream = kawa::Kawa<Checkout>;
 type StreamId = usize;
 type GlobalStreamId = usize;
 
+#[derive(Debug, Clone, Copy)]
 pub enum Position {
     Client,
     Server,
@@ -38,10 +38,13 @@ pub struct ConnectionH1<Front: SocketHandler> {
     pub stream: GlobalStreamId,
 }
 
+#[derive(Debug)]
 pub enum H2State {
     ClientPreface,
-    ServerPreface,
-    Connected,
+    ClientSettings,
+    ServerSettings,
+    Header,
+    Frame,
     Error,
 }
 pub struct ConnectionH2<Front: SocketHandler> {
@@ -50,6 +53,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub readiness: Readiness,
     pub state: H2State,
     pub streams: HashMap<StreamId, GlobalStreamId>,
+    pub expect: Option<(GlobalStreamId, usize)>,
     // context_hpack: HpackContext,
     // settings: SettiongsH2,
 }
@@ -57,6 +61,21 @@ pub struct Stream {
     pub request_id: Ulid,
     pub front: GenericHttpStream,
     pub back: GenericHttpStream,
+}
+
+impl Stream {
+    pub fn front(&mut self, position: Position) -> &mut GenericHttpStream {
+        match position {
+            Position::Client => &mut self.back,
+            Position::Server => &mut self.front,
+        }
+    }
+    pub fn back(&mut self, position: Position) -> &mut GenericHttpStream {
+        match position {
+            Position::Client => &mut self.front,
+            Position::Server => &mut self.back,
+        }
+    }
 }
 
 pub enum Connection<Front: SocketHandler> {
@@ -205,22 +224,6 @@ impl SessionState for Mux {
 }
 
 impl Mux {
-    // pub fn new(
-    //     frontend_token: Token,
-    //     request_id: Ulid,
-    //     listener: Rc<RefCell<HttpsListener>>,
-    //     pool: Weak<RefCell<Pool>>,
-    //     public_address: SocketAddr,
-    //     peer_address: Option<SocketAddr>,
-    //     sticky_name: String,
-    // ) -> Self {
-    //     Self {
-    //         frontend_token,
-    //         frontend: todo!(),
-    //         backends: todo!(),
-    //         streams: todo!(),
-    //     }
-    // }
     pub fn front_socket(&self) -> &TcpStream {
         match &self.frontend {
             Connection::H1(c) => &c.socket.stream,
@@ -251,50 +254,63 @@ impl Mux {
 impl<Front: SocketHandler> ConnectionH2<Front> {
     fn readable(&mut self, streams: &mut [Stream]) {
         println!("======= MUX H2 READABLE");
+        let kawa = if let Some((stream_id, amount)) = self.expect {
+            let kawa = streams[stream_id].front(self.position);
+            let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
+            println!("{:?}({stream_id}, {amount}) {size} {status:?}", self.state);
+            if size > 0 {
+                kawa.storage.fill(size);
+                if size == amount {
+                    self.expect = None;
+                } else {
+                    self.expect = Some((stream_id, amount - size));
+                    return;
+                }
+            } else {
+                self.readiness.event.remove(Ready::READABLE);
+                return;
+            }
+            kawa
+        } else {
+            self.readiness.event.remove(Ready::READABLE);
+            return;
+        };
         match (&self.state, &self.position) {
             (H2State::ClientPreface, Position::Client) => {
                 error!("Waiting for ClientPreface to finish writing")
             }
             (H2State::ClientPreface, Position::Server) => {
-                let stream = &mut streams[0];
-                let kawa = &mut stream.front;
-                let mut i = [0; 33];
-
-                // let (size, status) = self.socket.socket_read(kawa.storage.space());
-                // println!("{:02x?}", &kawa.storage.buffer()[..size]);
-                // unreachable!();
-
-                let (size, status) = self.socket.socket_read(&mut i);
-
-                println!("{size} {status:?} {i:02x?}");
-                let i = match parser::preface(&i) {
+                let i = kawa.storage.data();
+                let i = match parser::preface(i) {
                     Ok((i, _)) => i,
-                    Err(_) => todo!(),
+                    Err(e) => panic!("{e:?}"),
                 };
-                let header = match parser::frame_header(&i) {
+                match parser::frame_header(i) {
                     Ok((
                         _,
-                        header @ parser::FrameHeader {
-                            payload_len: _,
+                        parser::FrameHeader {
+                            payload_len,
                             frame_type: parser::FrameType::Settings,
                             flags: 0,
                             stream_id: 0,
                         },
-                    )) => header,
+                    )) => {
+                        kawa.storage.clear();
+                        self.state = H2State::ClientSettings;
+                        self.expect = Some((0, payload_len as usize));
+                    }
                     _ => todo!(),
                 };
-                let (size, status) = self
-                    .socket
-                    .socket_read(&mut kawa.storage.space()[..header.payload_len as usize]);
-                kawa.storage.fill(size);
+            }
+            (H2State::ClientSettings, Position::Server) => {
                 let i = kawa.storage.data();
-                println!("  {size} {status:?} {i:02x?}");
-                match parser::settings_frame(i, &header) {
+                match parser::settings_frame(i, i.len()) {
                     Ok((_, settings)) => println!("{settings:?}"),
-                    Err(_) => todo!(),
+                    Err(e) => panic!("{e:?}"),
                 }
-                let kawa = &mut stream.back;
-                self.state = H2State::ServerPreface;
+                kawa.storage.clear();
+                let kawa = &mut streams[0].back;
+                self.state = H2State::ServerSettings;
                 match serializer::gen_frame_header(
                     kawa.storage.space(),
                     &parser::FrameHeader {
@@ -325,46 +341,42 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.readiness.interest.insert(Ready::WRITABLE);
                 self.readiness.interest.remove(Ready::READABLE);
             }
-            (H2State::ServerPreface, Position::Client) => todo!("Receive server Settings"),
-            (H2State::ServerPreface, Position::Server) => {
+            (H2State::ServerSettings, Position::Client) => todo!("Receive server Settings"),
+            (H2State::ServerSettings, Position::Server) => {
                 error!("waiting for ServerPreface to finish writing")
             }
-            (H2State::Connected, Position::Server) => {
-                let mut header = [0; 9];
-                let (size, status) = self.socket.socket_read(&mut header);
-                println!("  size: {size}, status: {status:?}");
-                if size == 0 {
-                    self.readiness.event.remove(Ready::READABLE);
-                    return;
-                }
-                println!("{:?}", &header[..size]);
-                let len = match parser::frame_header(&header) {
-                    Ok((_, h)) => {
-                        println!("{h:?}");
-                        h.payload_len as usize
-                    }
-                    Err(_) => {
-                        self.state = H2State::Error;
-                        return;
-                    }
-                };
-                let kawa = &mut streams[0].front;
-                kawa.storage.clear();
-                let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..len]);
-                kawa.storage.fill(size);
+            (H2State::Header, Position::Server) => {
                 let i = kawa.storage.data();
-                println!("  {size} {status:?} {i:?}");
+                println!("  header: {i:?}");
+                match parser::frame_header(i) {
+                    Ok((_, header)) => {
+                        println!("{header:?}");
+                        kawa.storage.clear();
+                        self.state = H2State::Frame;
+                        self.expect =
+                            Some((header.stream_id as usize, header.payload_len as usize));
+                    }
+                    Err(e) => panic!("{e:?}"),
+                };
+            }
+            (H2State::Frame, Position::Server) => {
+                let i = kawa.storage.data();
+                println!("  data: {i:?}");
+                kawa.storage.clear();
+                self.state = H2State::Header;
+                self.expect = Some((0, 9));
             }
             _ => unreachable!(),
         }
     }
+
     fn writable(&mut self, streams: &mut [Stream]) {
         println!("======= MUX H2 WRITABLE");
         match (&self.state, &self.position) {
             (H2State::ClientPreface, Position::Client) => todo!("Send PRI + client Settings"),
             (H2State::ClientPreface, Position::Server) => unreachable!(),
-            (H2State::ServerPreface, Position::Client) => unreachable!(),
-            (H2State::Connected, Position::Server) | (H2State::ServerPreface, Position::Server) => {
+            (H2State::ServerSettings, Position::Client) => unreachable!(),
+            (H2State::ServerSettings, Position::Server) => {
                 let stream = &mut streams[0];
                 let kawa = &mut stream.back;
                 println!("{:?}", kawa.storage.data());
@@ -375,7 +387,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if kawa.storage.is_empty() {
                     self.readiness.interest.remove(Ready::WRITABLE);
                     self.readiness.interest.insert(Ready::READABLE);
-                    self.state = H2State::Connected;
+                    self.state = H2State::Header;
+                    self.expect = Some((0, 9));
                 }
             }
             _ => unreachable!(),

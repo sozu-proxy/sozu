@@ -323,6 +323,7 @@ impl HttpsSession {
                 },
                 streams: HashMap::new(),
                 state: mux::H2State::ClientPreface,
+                expect: Some((0, 24 + 9)),
             }),
         };
         let mut mux = Mux {
@@ -479,6 +480,7 @@ impl ProxySession for HttpsSession {
                 StateMarker::Http => incr!("https.upgrade.http.failed"),
                 StateMarker::WebSocket => incr!("https.upgrade.wss.failed"),
                 StateMarker::Http2 => incr!("https.upgrade.http2.failed"),
+                StateMarker::Mux => incr!("https.upgrade.mux.failed"),
             }
             return;
         }
