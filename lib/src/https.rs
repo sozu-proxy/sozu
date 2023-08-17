@@ -304,40 +304,27 @@ impl HttpsSession {
         //     self.sticky_name.clone(),
         // )));
         use crate::protocol::mux;
-        let frontend = match alpn {
-            AlpnProtocol::Http11 => mux::Connection::H1(mux::ConnectionH1 {
-                socket: front_stream,
-                position: mux::Position::Server,
-                readiness: Readiness {
-                    interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
-                    event: handshake.frontend_readiness.event,
-                },
-                stream: 0,
-            }),
-            AlpnProtocol::H2 => mux::Connection::H2(mux::ConnectionH2 {
-                socket: front_stream,
-                position: mux::Position::Server,
-                readiness: Readiness {
-                    interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
-                    event: handshake.frontend_readiness.event,
-                },
-                streams: HashMap::new(),
-                state: mux::H2State::ClientPreface,
-                expect: Some((0, 24 + 9)),
-            }),
+        let mut frontend = match alpn {
+            AlpnProtocol::Http11 => mux::Connection::new_h1_server(front_stream),
+            AlpnProtocol::H2 => mux::Connection::new_h2_server(front_stream),
         };
+        frontend.readiness_mut().event = handshake.frontend_readiness.event;
         let mut mux = Mux {
             frontend_token: self.frontend_token,
             frontend,
             backends: HashMap::new(),
-            streams: Vec::new(),
+            streams: mux::Streams {
+                streams: Vec::new(),
+                pool: self.pool.clone(),
+            },
             listener: self.listener.clone(),
-            pool: self.pool.clone(),
             public_address: self.public_address,
             peer_address: self.peer_address,
             sticky_name: self.sticky_name.clone(),
         };
-        mux.create_stream(handshake.request_id).ok()?;
+        mux.streams
+            .create_stream(handshake.request_id, 1 << 16)
+            .ok()?;
         return Some(HttpsStateMachine::Mux(mux));
         match alpn {
             AlpnProtocol::Http11 => {
