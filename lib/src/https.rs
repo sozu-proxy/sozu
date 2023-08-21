@@ -71,8 +71,8 @@ use crate::{
     tls::MutexCertificateResolver,
     util::UnwrapLog,
     AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
-    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, Readiness,
-    SessionIsToBeClosed, SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
+    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,7 +191,7 @@ impl HttpsSession {
             HttpsStateMachine::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
             HttpsStateMachine::Handshake(handshake) => self.upgrade_handshake(handshake),
             HttpsStateMachine::Http(http) => self.upgrade_http(http),
-            HttpsStateMachine::Mux(mux) => unimplemented!(),
+            HttpsStateMachine::Mux(_) => unimplemented!(),
             HttpsStateMachine::Http2(_) => self.upgrade_http2(),
             HttpsStateMachine::WebSocket(wss) => self.upgrade_websocket(wss),
             HttpsStateMachine::FailedUpgrade(_) => unreachable!(),
@@ -255,12 +255,6 @@ impl HttpsSession {
     }
 
     fn upgrade_handshake(&mut self, handshake: TlsHandshake) -> Option<HttpsStateMachine> {
-        // Add 1st routing phase
-        // - get SNI
-        // - get ALPN
-        // - find corresponding listener
-        // - determine next protocol (tcps, https ,http2)
-
         let sni = handshake.session.server_name();
         let alpn = handshake.session.alpn_protocol();
         let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
@@ -294,79 +288,25 @@ impl HttpsSession {
         };
 
         gauge_add!("protocol.tls.handshake", -1);
-        // return Some(HttpsStateMachine::Mux(Mux::new(
-        //     self.frontend_token,
-        //     handshake.request_id,
-        //     self.listener.clone(),
-        //     self.pool.clone(),
-        //     self.public_address,
-        //     self.peer_address,
-        //     self.sticky_name.clone(),
-        // )));
+
         use crate::protocol::mux;
         let mut frontend = match alpn {
             AlpnProtocol::Http11 => mux::Connection::new_h1_server(front_stream),
             AlpnProtocol::H2 => mux::Connection::new_h2_server(front_stream),
         };
         frontend.readiness_mut().event = handshake.frontend_readiness.event;
-        let mut mux = Mux {
+        let mux = Mux {
             frontend_token: self.frontend_token,
             frontend,
             backends: HashMap::new(),
-            streams: mux::Streams {
-                streams: Vec::new(),
-                pool: self.pool.clone(),
-            },
+            context: mux::Context::new(self.pool.clone(), handshake.request_id, 1 << 16).ok()?,
             listener: self.listener.clone(),
             public_address: self.public_address,
             peer_address: self.peer_address,
             sticky_name: self.sticky_name.clone(),
         };
-        mux.streams
-            .create_stream(handshake.request_id, 1 << 16)
-            .ok()?;
+        gauge_add!("protocol.https", 1);
         return Some(HttpsStateMachine::Mux(mux));
-        match alpn {
-            AlpnProtocol::Http11 => {
-                let mut http = Http::new(
-                    self.answers.clone(),
-                    self.configured_backend_timeout,
-                    self.configured_connect_timeout,
-                    self.configured_frontend_timeout,
-                    handshake.container_frontend_timeout,
-                    front_stream,
-                    self.frontend_token,
-                    self.listener.clone(),
-                    self.pool.clone(),
-                    Protocol::HTTPS,
-                    self.public_address,
-                    handshake.request_id,
-                    self.peer_address,
-                    self.sticky_name.clone(),
-                )
-                .ok()?;
-
-                http.frontend_readiness.event = handshake.frontend_readiness.event;
-
-                gauge_add!("protocol.https", 1);
-                Some(HttpsStateMachine::Http(http))
-            }
-            AlpnProtocol::H2 => {
-                let mut http = Http2::new(
-                    front_stream,
-                    self.frontend_token,
-                    self.pool.clone(),
-                    Some(self.public_address),
-                    None,
-                    self.sticky_name.clone(),
-                );
-
-                http.frontend.readiness.event = handshake.frontend_readiness.event;
-
-                gauge_add!("protocol.http2", 1);
-                Some(HttpsStateMachine::Http2(http))
-            }
-        }
     }
 
     fn upgrade_http(&self, http: Http<FrontRustls, HttpsListener>) -> Option<HttpsStateMachine> {
