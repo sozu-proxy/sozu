@@ -457,7 +457,7 @@ impl L7ListenerHandler for HttpListener {
 
         let now = Instant::now();
 
-        if let Route::Cluster { id: cluster, h2 } = &route {
+        if let Route::Cluster { id: cluster, .. } = &route {
             time!(
                 "frontend_matching_time",
                 cluster,
