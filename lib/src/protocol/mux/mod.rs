@@ -1,9 +1,9 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
+    io::Write,
     net::SocketAddr,
     rc::{Rc, Weak},
-    str::from_utf8_unchecked,
 };
 
 use mio::{net::TcpStream, Token};
@@ -36,6 +36,7 @@ pub struct ConnectionH1<Front: SocketHandler> {
     pub position: Position,
     pub readiness: Readiness,
     pub socket: Front,
+    /// note: a Server H1 will always reference stream 0, but a client can reference any stream
     pub stream: GlobalStreamId,
 }
 
@@ -73,7 +74,7 @@ impl Default for H2Settings {
 }
 
 pub struct ConnectionH2<Front: SocketHandler> {
-    pub decoder: hpack::Decoder<'static>,
+    // pub decoder: hpack::Decoder<'static>,
     pub expect: Option<(GlobalStreamId, usize)>,
     pub position: Position,
     pub readiness: Readiness,
@@ -146,7 +147,6 @@ impl<Front: SocketHandler> Connection<Front> {
             state: H2State::ClientPreface,
             expect: Some((0, 24 + 9)),
             settings: H2Settings::default(),
-            decoder: hpack::Decoder::new(),
         })
     }
     pub fn new_h2_client(front_stream: Front) -> Connection<Front> {
@@ -161,7 +161,6 @@ impl<Front: SocketHandler> Connection<Front> {
             state: H2State::ClientPreface,
             expect: None,
             settings: H2Settings::default(),
-            decoder: hpack::Decoder::new(),
         })
     }
 
@@ -177,23 +176,29 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => &mut c.readiness,
         }
     }
-    fn readable(&mut self, streams: &mut Streams) {
+    fn readable(&mut self, context: &mut Context) {
         match self {
-            Connection::H1(c) => c.readable(streams),
-            Connection::H2(c) => c.readable(streams),
+            Connection::H1(c) => c.readable(context),
+            Connection::H2(c) => c.readable(context),
         }
     }
-    fn writable(&mut self, streams: &mut Streams) {
+    fn writable(&mut self, context: &mut Context) {
         match self {
-            Connection::H1(c) => c.writable(streams),
-            Connection::H2(c) => c.writable(streams),
+            Connection::H1(c) => c.writable(context),
+            Connection::H2(c) => c.writable(context),
         }
     }
 }
 
 pub struct Streams {
-    pub streams: Vec<Stream>,
+    zero: Stream,
+    others: Vec<Stream>,
+}
+
+pub struct Context {
+    pub streams: Streams,
     pub pool: Weak<RefCell<Pool>>,
+    pub decoder: hpack::Decoder<'static>,
 }
 
 pub struct Mux {
@@ -204,16 +209,16 @@ pub struct Mux {
     pub public_address: SocketAddr,
     pub peer_address: Option<SocketAddr>,
     pub sticky_name: String,
-    pub streams: Streams,
+    pub context: Context,
 }
 
-impl Streams {
-    pub fn create_stream(
-        &mut self,
+impl Context {
+    pub fn new_stream(
+        pool: Weak<RefCell<Pool>>,
         request_id: Ulid,
         window: u32,
-    ) -> Result<GlobalStreamId, AcceptError> {
-        let (front_buffer, back_buffer) = match self.pool.upgrade() {
+    ) -> Result<Stream, AcceptError> {
+        let (front_buffer, back_buffer) = match pool.upgrade() {
             Some(pool) => {
                 let mut pool = pool.borrow_mut();
                 match (pool.checkout(), pool.checkout()) {
@@ -223,25 +228,48 @@ impl Streams {
             }
             None => return Err(AcceptError::BufferCapacityReached),
         };
-        self.streams.push(Stream {
+        Ok(Stream {
             request_id,
             window: window as i32,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
-        });
-        Ok(self.streams.len() - 1)
+        })
+    }
+
+    pub fn create_stream(
+        &mut self,
+        request_id: Ulid,
+        window: u32,
+    ) -> Result<GlobalStreamId, AcceptError> {
+        self.streams
+            .others
+            .push(Self::new_stream(self.pool.clone(), request_id, window)?);
+        Ok(self.streams.others.len())
+    }
+
+    pub fn new(
+        pool: Weak<RefCell<Pool>>,
+        request_id: Ulid,
+        window: u32,
+    ) -> Result<Context, AcceptError> {
+        Ok(Self {
+            streams: Streams {
+                zero: Context::new_stream(pool.clone(), request_id, window)?,
+                others: Vec::new(),
+            },
+            pool,
+            decoder: hpack::Decoder::new(),
+        })
     }
 }
 
-impl std::ops::Deref for Streams {
-    type Target = [Stream];
-    fn deref(&self) -> &Self::Target {
-        &self.streams
-    }
-}
-impl std::ops::DerefMut for Streams {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.streams
+impl Streams {
+    pub fn get(&mut self, stream_id: GlobalStreamId) -> &mut Stream {
+        if stream_id == 0 {
+            &mut self.zero
+        } else {
+            &mut self.others[stream_id - 1]
+        }
     }
 }
 
@@ -257,9 +285,9 @@ impl Mux {
 impl SessionState for Mux {
     fn ready(
         &mut self,
-        session: Rc<RefCell<dyn ProxySession>>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
-        metrics: &mut SessionMetrics,
+        _session: Rc<RefCell<dyn ProxySession>>,
+        _proxy: Rc<RefCell<dyn L7Proxy>>,
+        _metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
         let max_loop_iterations = 100000;
@@ -268,29 +296,29 @@ impl SessionState for Mux {
             return SessionResult::Close;
         }
 
-        let streams = &mut self.streams;
+        let context = &mut self.context;
         while counter < max_loop_iterations {
             let mut dirty = false;
 
             if self.frontend.readiness().filter_interest().is_readable() {
-                self.frontend.readable(streams);
+                self.frontend.readable(context);
                 dirty = true;
             }
 
             for (_, backend) in self.backends.iter_mut() {
                 if backend.readiness().filter_interest().is_writable() {
-                    backend.writable(streams);
+                    backend.writable(context);
                     dirty = true;
                 }
 
                 if backend.readiness().filter_interest().is_readable() {
-                    backend.readable(streams);
+                    backend.readable(context);
                     dirty = true;
                 }
             }
 
             if self.frontend.readiness().filter_interest().is_writable() {
-                self.frontend.writable(streams);
+                self.frontend.writable(context);
                 dirty = true;
             }
 
@@ -325,7 +353,7 @@ impl SessionState for Mux {
         }
     }
 
-    fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> StateResult {
+    fn timeout(&mut self, token: Token, _metrics: &mut SessionMetrics) -> StateResult {
         println!("MuxState::timeout({token:?})");
         StateResult::CloseSession
     }
@@ -353,14 +381,17 @@ impl SessionState for Mux {
         let mut b = [0; 1024];
         let (size, status) = s.socket_read(&mut b);
         println!("{size} {status:?} {:?}", &b[..size]);
+        for stream in &self.context.streams.others {
+            kawa::debug_kawa(&stream.front);
+        }
     }
 }
 
 impl<Front: SocketHandler> ConnectionH2<Front> {
-    fn readable(&mut self, streams: &mut Streams) {
+    fn readable(&mut self, context: &mut Context) {
         println!("======= MUX H2 READABLE");
         let kawa = if let Some((stream_id, amount)) = self.expect {
-            let kawa = streams[stream_id].front(self.position);
+            let kawa = context.streams.get(stream_id).front(self.position);
             let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
             println!("{:?}({stream_id}, {amount}) {size} {status:?}", self.state);
             if size > 0 {
@@ -412,11 +443,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 match parser::settings_frame(i, i.len()) {
                     Ok((_, settings)) => {
                         kawa.storage.clear();
-                        self.handle(settings, streams);
+                        self.handle(settings, context);
                     }
                     Err(e) => panic!("{e:?}"),
                 }
-                let kawa = &mut streams[0].back;
+                let kawa = &mut context.streams.zero.back;
                 self.state = H2State::ServerSettings;
                 match serializer::gen_frame_header(
                     kawa.storage.space(),
@@ -463,7 +494,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         {
                             *stream_id
                         } else {
-                            self.create_stream(header.stream_id, streams)
+                            self.create_stream(header.stream_id, context)
                         };
                         let stream_id = if header.frame_type == parser::FrameType::Headers {
                             0
@@ -483,7 +514,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 match parser::frame_body(i, header, self.settings.settings_max_frame_size) {
                     Ok((_, frame)) => {
                         kawa.storage.clear();
-                        self.handle(frame, streams);
+                        self.handle(frame, context);
                     }
                     Err(e) => panic!("{e:?}"),
                 }
@@ -494,15 +525,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    fn writable(&mut self, streams: &mut Streams) {
+    fn writable(&mut self, context: &mut Context) {
         println!("======= MUX H2 WRITABLE");
         match (&self.state, &self.position) {
             (H2State::ClientPreface, Position::Client) => todo!("Send PRI + client Settings"),
             (H2State::ClientPreface, Position::Server) => unreachable!(),
             (H2State::ServerSettings, Position::Client) => unreachable!(),
             (H2State::ServerSettings, Position::Server) => {
-                let stream = &mut streams[0];
-                let kawa = &mut stream.back;
+                let kawa = &mut context.streams.zero.back;
                 println!("{:?}", kawa.storage.data());
                 let (size, status) = self.socket.socket_write(kawa.storage.data());
                 println!("  size: {size}, status: {status:?}");
@@ -519,8 +549,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    pub fn create_stream(&mut self, stream_id: StreamId, streams: &mut Streams) -> GlobalStreamId {
-        match streams.create_stream(Ulid::generate(), self.settings.settings_initial_window_size) {
+    pub fn create_stream(&mut self, stream_id: StreamId, context: &mut Context) -> GlobalStreamId {
+        match context.create_stream(Ulid::generate(), self.settings.settings_initial_window_size) {
             Ok(global_stream_id) => {
                 self.streams.insert(stream_id, global_stream_id);
                 global_stream_id
@@ -529,18 +559,45 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    fn handle(&mut self, frame: parser::Frame, streams: &mut Streams) {
+    fn handle(&mut self, frame: parser::Frame, context: &mut Context) {
         println!("{frame:?}");
         match frame {
             parser::Frame::Data(_) => todo!(),
             parser::Frame::Headers(headers) => {
-                let kawa = streams[0].front(self.position);
+                // if !headers.end_headers {
+                //     self.state = H2State::Continuation
+                // }
+                let global_stream_id = self.streams.get(&headers.stream_id).unwrap();
+                let kawa = context.streams.zero.front(self.position);
                 let buffer = headers.header_block_fragment.data(kawa.storage.buffer());
+                // this is Kawa's Territory, it may be rewritten in Kawa and called as:
+                // kawa::h2::handle_header(buffer, kawa, EditorCallBacks)
+                let kawa = context.streams.others[*global_stream_id - 1].front(self.position);
                 println!("{buffer:?}");
-                let result = self.decoder.decode(buffer).unwrap();
-                for (k, v) in result {
-                    unsafe { println!("{} {}", from_utf8_unchecked(&k), from_utf8_unchecked(&v)) };
-                }
+                context
+                    .decoder
+                    .decode_with_cb(buffer, |k, v| {
+                        // Proof of concept that we can decompress stream 0 fragments into another stream
+                        // this is incomplete as pseudo headers should be sorted out and stored as a kawa::StatusLine
+                        let start = kawa.storage.end as u32;
+                        kawa.storage.write(&k).unwrap();
+                        kawa.storage.write(&v).unwrap();
+                        let len_key = k.len() as u32;
+                        let len_val = v.len() as u32;
+                        kawa.push_block(kawa::Block::Header(kawa::Pair {
+                            key: kawa::Store::Slice(kawa::repr::Slice {
+                                start,
+                                len: len_key,
+                            }),
+                            val: kawa::Store::Slice(kawa::repr::Slice {
+                                start: start + len_key,
+                                len: len_val,
+                            }),
+                        }));
+                    })
+                    .unwrap();
+                // everything has been parsed
+                kawa.storage.head = kawa.storage.end;
             }
             parser::Frame::Priority => todo!(),
             parser::Frame::RstStream(_) => todo!(),
@@ -562,7 +619,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             parser::Frame::Ping(_) => todo!(),
             parser::Frame::GoAway => todo!(),
             parser::Frame::WindowUpdate(update) => {
-                streams[update.stream_id as usize].window += update.increment as i32;
+                let global_stream_id = *self.streams.get(&update.stream_id).unwrap();
+                context.streams.get(global_stream_id).window += update.increment as i32;
             }
             parser::Frame::Continuation => todo!(),
         }
@@ -570,9 +628,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 }
 
 impl<Front: SocketHandler> ConnectionH1<Front> {
-    fn readable(&mut self, streams: &mut Streams) {
+    fn readable(&mut self, context: &mut Context) {
         println!("======= MUX H1 READABLE");
-        let stream = &mut streams[self.stream];
+        let stream = &mut context.streams.get(self.stream);
         let kawa = match self.position {
             Position::Client => &mut stream.front,
             Position::Server => &mut stream.back,
@@ -596,9 +654,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             self.readiness.interest.remove(Ready::READABLE);
         }
     }
-    fn writable(&mut self, streams: &mut Streams) {
+    fn writable(&mut self, context: &mut Context) {
         println!("======= MUX H1 WRITABLE");
-        let stream = &mut streams[self.stream];
+        let stream = &mut context.streams.get(self.stream);
         let kawa = match self.position {
             Position::Client => &mut stream.back,
             Position::Server => &mut stream.front,
