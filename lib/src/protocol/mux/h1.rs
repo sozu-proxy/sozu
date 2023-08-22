@@ -1,7 +1,7 @@
 use sozu_command::ready::Ready;
 
 use crate::{
-    protocol::mux::{Context, GlobalStreamId, Position},
+    protocol::mux::{Context, GlobalStreamId, MuxResult, Position},
     socket::{SocketHandler, SocketResult},
     Readiness,
 };
@@ -15,7 +15,7 @@ pub struct ConnectionH1<Front: SocketHandler> {
 }
 
 impl<Front: SocketHandler> ConnectionH1<Front> {
-    pub fn readable(&mut self, context: &mut Context) {
+    pub fn readable(&mut self, context: &mut Context) -> MuxResult {
         println!("======= MUX H1 READABLE");
         let stream = &mut context.streams.get(self.stream);
         let kawa = match self.position {
@@ -40,8 +40,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if kawa.is_terminated() {
             self.readiness.interest.remove(Ready::READABLE);
         }
+        MuxResult::Continue
     }
-    pub fn writable(&mut self, context: &mut Context) {
+    pub fn writable(&mut self, context: &mut Context) -> MuxResult {
         println!("======= MUX H1 WRITABLE");
         let stream = &mut context.streams.get(self.stream);
         let kawa = match self.position {
@@ -52,7 +53,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let bufs = kawa.as_io_slice();
         if bufs.is_empty() {
             self.readiness.interest.remove(Ready::WRITABLE);
-            return;
+            return MuxResult::Continue;
         }
         let (size, status) = self.socket.socket_write_vectored(&bufs);
         println!("  size: {size}, status: {status:?}");
@@ -62,5 +63,6 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         } else {
             self.readiness.event.remove(Ready::WRITABLE);
         }
+        MuxResult::Continue
     }
 }
