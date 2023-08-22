@@ -28,7 +28,7 @@ use crate::{
     AcceptError, L7Proxy, ProxySession, Readiness, SessionMetrics, SessionResult, StateResult,
 };
 
-use self::h2::{H2State, H2Settings};
+use self::h2::{H2Settings, H2State};
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
 type GenericHttpStream = kawa::Kawa<Checkout>;
@@ -39,6 +39,13 @@ type GlobalStreamId = usize;
 pub enum Position {
     Client,
     Server,
+}
+
+pub enum MuxResult {
+    Continue,
+    CloseSession,
+    Close(GlobalStreamId),
+    Connect(GlobalStreamId),
 }
 
 pub enum Connection<Front: SocketHandler> {
@@ -111,13 +118,13 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => &mut c.readiness,
         }
     }
-    fn readable(&mut self, context: &mut Context) {
+    fn readable(&mut self, context: &mut Context) -> MuxResult {
         match self {
             Connection::H1(c) => c.readable(context),
             Connection::H2(c) => c.readable(context),
         }
     }
-    fn writable(&mut self, context: &mut Context) {
+    fn writable(&mut self, context: &mut Context) -> MuxResult {
         match self {
             Connection::H1(c) => c.writable(context),
             Connection::H2(c) => c.writable(context),
@@ -128,8 +135,8 @@ impl<Front: SocketHandler> Connection<Front> {
 pub struct Stream {
     // pub request_id: Ulid,
     pub window: i32,
-    pub front: GenericHttpStream,
-    pub back: GenericHttpStream,
+    front: GenericHttpStream,
+    back: GenericHttpStream,
     pub context: HttpContext,
 }
 
@@ -276,24 +283,44 @@ impl SessionState for Mux {
             let mut dirty = false;
 
             if self.frontend.readiness().filter_interest().is_readable() {
-                self.frontend.readable(context);
+                match self.frontend.readable(context) {
+                    MuxResult::Continue => (),
+                    MuxResult::CloseSession => return SessionResult::Close,
+                    MuxResult::Close(_) => todo!(),
+                    MuxResult::Connect(_) => todo!(),
+                }
                 dirty = true;
             }
 
             for (_, backend) in self.backends.iter_mut() {
                 if backend.readiness().filter_interest().is_writable() {
-                    backend.writable(context);
+                    match backend.writable(context) {
+                        MuxResult::Continue => (),
+                        MuxResult::CloseSession => return SessionResult::Close,
+                        MuxResult::Close(_) => todo!(),
+                        MuxResult::Connect(_) => unreachable!(),
+                        }
                     dirty = true;
                 }
 
                 if backend.readiness().filter_interest().is_readable() {
-                    backend.readable(context);
+                    match backend.readable(context) {
+                        MuxResult::Continue => (),
+                        MuxResult::CloseSession => return SessionResult::Close,
+                        MuxResult::Close(_) => todo!(),
+                        MuxResult::Connect(_) => unreachable!(),
+                        }
                     dirty = true;
                 }
             }
 
             if self.frontend.readiness().filter_interest().is_writable() {
-                self.frontend.writable(context);
+                match self.frontend.writable(context) {
+                    MuxResult::Continue => (),
+                    MuxResult::CloseSession => return SessionResult::Close,
+                    MuxResult::Close(_) => todo!(),
+                    MuxResult::Connect(_) => unreachable!(),
+                }
                 dirty = true;
             }
 
