@@ -8,7 +8,7 @@ use nom::{
     multi::many0,
     number::streaming::{be_u16, be_u24, be_u32, be_u8},
     sequence::tuple,
-    Err, HexDisplay, IResult, Offset,
+    Err, IResult,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,7 +33,6 @@ pub enum FrameType {
     Continuation,
 }
 
-/*
 const NO_ERROR: u32 = 0x0;
 const PROTOCOL_ERROR: u32 = 0x1;
 const INTERNAL_ERROR: u32 = 0x2;
@@ -48,7 +47,26 @@ const CONNECT_ERROR: u32 = 0xa;
 const ENHANCE_YOUR_CALM: u32 = 0xb;
 const INADEQUATE_SECURITY: u32 = 0xc;
 const HTTP_1_1_REQUIRED: u32 = 0xd;
-*/
+
+pub fn error_code_to_str(error_code: u32) -> &'static str {
+    match error_code {
+        NO_ERROR => "NO_ERROR",
+        PROTOCOL_ERROR => "PROTOCOL_ERROR",
+        INTERNAL_ERROR => "INTERNAL_ERROR",
+        FLOW_CONTROL_ERROR => "FLOW_CONTROL_ERROR",
+        SETTINGS_TIMEOUT => "SETTINGS_TIMEOUT",
+        STREAM_CLOSED => "STREAM_CLOSED",
+        FRAME_SIZE_ERROR => "FRAME_SIZE_ERROR",
+        REFUSED_STREAM => "REFUSED_STREAM",
+        CANCEL => "CANCEL",
+        COMPRESSION_ERROR => "COMPRESSION_ERROR",
+        CONNECT_ERROR => "CONNECT_ERROR",
+        ENHANCE_YOUR_CALM => "ENHANCE_YOUR_CALM",
+        INADEQUATE_SECURITY => "INADEQUATE_SECURITY",
+        HTTP_1_1_REQUIRED => "HTTP_1_1_REQUIRED",
+        _ => "UNKNOWN_ERROR",
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Error<'a> {
@@ -127,13 +145,13 @@ pub fn preface(i: &[u8]) -> IResult<&[u8], &[u8]> {
   */
 
 pub fn frame_header(input: &[u8]) -> IResult<&[u8], FrameHeader, Error> {
-    let (i1, payload_len) = be_u24(input)?;
-    let (i2, frame_type) = map_opt(be_u8, convert_frame_type)(i1)?;
-    let (i3, flags) = be_u8(i2)?;
-    let (i4, stream_id) = be_u32(i3)?;
+    let (i, payload_len) = be_u24(input)?;
+    let (i, frame_type) = map_opt(be_u8, convert_frame_type)(i)?;
+    let (i, flags) = be_u8(i)?;
+    let (i, stream_id) = be_u32(i)?;
 
     Ok((
-        i4,
+        i,
         FrameHeader {
             payload_len,
             frame_type,
@@ -164,14 +182,14 @@ fn convert_frame_type(t: u8) -> Option<FrameType> {
 pub enum Frame {
     Data(Data),
     Headers(Headers),
-    Priority,
+    Priority(Priority),
     RstStream(RstStream),
     Settings(Settings),
-    PushPromise,
+    PushPromise(PushPromise),
     Ping(Ping),
-    GoAway,
+    GoAway(GoAway),
     WindowUpdate(WindowUpdate),
-    Continuation,
+    Continuation(Continuation),
 }
 
 impl Frame {
@@ -179,11 +197,11 @@ impl Frame {
         match self {
             Frame::Data(_)
             | Frame::Headers(_)
-            | Frame::Priority
+            | Frame::Priority(_)
             | Frame::RstStream(_)
-            | Frame::PushPromise
-            | Frame::Continuation => true,
-            Frame::Settings(_) | Frame::Ping(_) | Frame::GoAway => false,
+            | Frame::PushPromise(_)
+            | Frame::Continuation(_) => true,
+            Frame::Settings(_) | Frame::Ping(_) | Frame::GoAway(_) => false,
             Frame::WindowUpdate(w) => w.stream_id != 0,
         }
     }
@@ -192,11 +210,11 @@ impl Frame {
         match self {
             Frame::Data(d) => d.stream_id,
             Frame::Headers(h) => h.stream_id,
-            Frame::Priority => unimplemented!(),
+            Frame::Priority(p) => p.stream_id,
             Frame::RstStream(r) => r.stream_id,
-            Frame::PushPromise => unimplemented!(),
-            Frame::Continuation => unimplemented!(),
-            Frame::Settings(_) | Frame::Ping(_) | Frame::GoAway => 0,
+            Frame::PushPromise(p) => p.stream_id,
+            Frame::Continuation(c) => c.stream_id,
+            Frame::Settings(_) | Frame::Ping(_) | Frame::GoAway(_) => 0,
             Frame::WindowUpdate(w) => w.stream_id,
         }
     }
@@ -233,7 +251,7 @@ pub fn frame_body<'a>(
             if header.payload_len != 5 {
                 return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
             }
-            unimplemented!();
+            priority_frame(i, header)?
         }
         FrameType::RstStream => {
             if header.payload_len != 4 {
@@ -241,9 +259,7 @@ pub fn frame_body<'a>(
             }
             rst_stream_frame(i, &header)?
         }
-        FrameType::PushPromise => {
-            unimplemented!();
-        }
+        FrameType::PushPromise => push_promise_frame(i, &header)?,
         FrameType::Continuation => {
             unimplemented!();
         }
@@ -259,9 +275,7 @@ pub fn frame_body<'a>(
             }
             ping_frame(i, &header)?
         }
-        FrameType::GoAway => {
-            unimplemented!();
-        }
+        FrameType::GoAway => goaway_frame(i, &header)?,
         FrameType::WindowUpdate => {
             if header.payload_len != 4 {
                 return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
@@ -280,24 +294,24 @@ pub struct Data {
     pub end_stream: bool,
 }
 
-pub fn data_frame<'a, 'b>(
+pub fn data_frame<'a>(
     input: &'a [u8],
-    header: &'b FrameHeader,
+    header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, Error<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
 
-    let (i1, pad_length) = if header.flags & 0x8 != 0 {
+    let (i, pad_length) = if header.flags & 0x8 != 0 {
         let (i, pad_length) = be_u8(i)?;
         (i, Some(pad_length))
     } else {
         (i, None)
     };
 
-    if pad_length.is_some() && i1.len() <= pad_length.unwrap() as usize {
+    if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
         return Err(Err::Failure(Error::new(input, InnerError::ProtocolError)));
     }
 
-    let (_, payload) = take(i1.len() - pad_length.unwrap_or(0) as usize)(i1)?;
+    let (_, payload) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
 
     Ok((
         remaining,
@@ -327,41 +341,46 @@ pub struct StreamDependency {
     pub stream_id: u32,
 }
 
-pub fn headers_frame<'a, 'b>(
+fn stream_dependency<'a>(i: &'a [u8]) -> IResult<&'a [u8], StreamDependency, Error<'a>> {
+    let (i, stream) = map(be_u32, |i| StreamDependency {
+        exclusive: i & 0x8000 != 0,
+        stream_id: i & 0x7FFFFFFF,
+    })(i)?;
+    Ok((i, stream))
+}
+
+pub fn headers_frame<'a>(
     input: &'a [u8],
-    header: &'b FrameHeader,
+    header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, Error<'a>> {
     let (remaining, i) = take(header.payload_len)(input)?;
 
-    let (i1, pad_length) = if header.flags & 0x8 != 0 {
+    let (i, pad_length) = if header.flags & 0x8 != 0 {
         let (i, pad_length) = be_u8(i)?;
         (i, Some(pad_length))
     } else {
         (i, None)
     };
 
-    let (i2, stream_dependency) = if header.flags & 0x20 != 0 {
-        let (i, stream) = map(be_u32, |i| StreamDependency {
-            exclusive: i & 0x8000 != 0,
-            stream_id: i & 0x7FFFFFFF,
-        })(i1)?;
-        (i, Some(stream))
+    let (i, stream_dependency) = if header.flags & 0x20 != 0 {
+        let (i, dep) = stream_dependency(i)?;
+        (i, Some(dep))
     } else {
-        (i1, None)
+        (i, None)
     };
 
-    let (i3, weight) = if header.flags & 0x20 != 0 {
-        let (i, weight) = be_u8(i2)?;
+    let (i, weight) = if header.flags & 0x20 != 0 {
+        let (i, weight) = be_u8(i)?;
         (i, Some(weight))
     } else {
-        (i2, None)
+        (i, None)
     };
 
-    if pad_length.is_some() && i3.len() <= pad_length.unwrap() as usize {
+    if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
         return Err(Err::Failure(Error::new(input, InnerError::ProtocolError)));
     }
 
-    let (_, header_block_fragment) = take(i3.len() - pad_length.unwrap_or(0) as usize)(i3)?;
+    let (_, header_block_fragment) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
 
     Ok((
         remaining,
@@ -379,14 +398,37 @@ pub fn headers_frame<'a, 'b>(
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Priority {
+    pub stream_id: u32,
+    pub stream_dependency: StreamDependency,
+    pub weight: u8,
+}
+
+pub fn priority_frame<'a>(
+    input: &'a [u8],
+    header: &FrameHeader,
+) -> IResult<&'a [u8], Frame, Error<'a>> {
+    let (i, stream_dependency) = stream_dependency(input)?;
+    let (i, weight) = be_u8(i)?;
+    Ok((
+        i,
+        Frame::Priority(Priority {
+            stream_dependency,
+            stream_id: header.stream_id,
+            weight,
+        }),
+    ))
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RstStream {
     pub stream_id: u32,
     pub error_code: u32,
 }
 
-pub fn rst_stream_frame<'a, 'b>(
+pub fn rst_stream_frame<'a>(
     input: &'a [u8],
-    header: &'b FrameHeader,
+    header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, Error<'a>> {
     let (i, error_code) = be_u32(input)?;
     Ok((
@@ -409,7 +451,7 @@ pub struct Setting {
     pub value: u32,
 }
 
-pub fn settings_frame<'a, 'b>(
+pub fn settings_frame<'a>(
     input: &'a [u8],
     payload_len: usize,
 ) -> IResult<&'a [u8], Frame, Error<'a>> {
@@ -423,14 +465,53 @@ pub fn settings_frame<'a, 'b>(
     Ok((i, Frame::Settings(Settings { settings })))
 }
 
+#[derive(Clone, Debug)]
+pub struct PushPromise {
+    pub stream_id: u32,
+    pub promised_stream_id: u32,
+    pub header_block_fragment: Slice,
+    pub end_headers: bool,
+}
+
+pub fn push_promise_frame<'a>(
+    input: &'a [u8],
+    header: &FrameHeader,
+) -> IResult<&'a [u8], Frame, Error<'a>> {
+    let (remaining, i) = take(header.payload_len)(input)?;
+
+    let (i, pad_length) = if header.flags & 0x8 != 0 {
+        let (i, pad_length) = be_u8(i)?;
+        (i, Some(pad_length))
+    } else {
+        (i, None)
+    };
+
+    if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
+        return Err(Err::Failure(Error::new(input, InnerError::ProtocolError)));
+    }
+
+    let (i, promised_stream_id) = be_u32(i)?;
+    let (_, header_block_fragment) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
+
+    Ok((
+        remaining,
+        Frame::PushPromise(PushPromise {
+            stream_id: header.stream_id,
+            promised_stream_id,
+            header_block_fragment: Slice::new(input, header_block_fragment),
+            end_headers: header.flags & 0x4 != 0,
+        }),
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ping {
     pub payload: [u8; 8],
 }
 
-pub fn ping_frame<'a, 'b>(
+pub fn ping_frame<'a>(
     input: &'a [u8],
-    header: &'b FrameHeader,
+    header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, Error<'a>> {
     let (i, data) = take(8usize)(input)?;
 
@@ -443,15 +524,39 @@ pub fn ping_frame<'a, 'b>(
     Ok((i, Frame::Ping(p)))
 }
 
+#[derive(Clone, Debug)]
+pub struct GoAway {
+    pub last_stream_id: u32,
+    pub error_code: u32,
+    pub additional_debug_data: Slice,
+}
+
+pub fn goaway_frame<'a>(
+    input: &'a [u8],
+    header: &FrameHeader,
+) -> IResult<&'a [u8], Frame, Error<'a>> {
+    let (remaining, i) = take(header.payload_len)(input)?;
+    let (i, last_stream_id) = be_u32(i)?;
+    let (additional_debug_data, error_code) = be_u32(i)?;
+    Ok((
+        remaining,
+        Frame::GoAway(GoAway {
+            last_stream_id,
+            error_code,
+            additional_debug_data: Slice::new(input, additional_debug_data),
+        }),
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowUpdate {
     pub stream_id: u32,
     pub increment: u32,
 }
 
-pub fn window_update_frame<'a, 'b>(
+pub fn window_update_frame<'a>(
     input: &'a [u8],
-    header: &'b FrameHeader,
+    header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, Error<'a>> {
     let (i, increment) = be_u32(input)?;
     let increment = increment & 0x7FFFFFFF;
@@ -466,6 +571,28 @@ pub fn window_update_frame<'a, 'b>(
         Frame::WindowUpdate(WindowUpdate {
             stream_id: header.stream_id,
             increment,
+        }),
+    ))
+}
+
+#[derive(Clone, Debug)]
+pub struct Continuation {
+    pub stream_id: u32,
+    pub header_block_fragment: Slice,
+    pub end_headers: bool,
+}
+
+pub fn continuation_frame<'a>(
+    input: &'a [u8],
+    header: &FrameHeader,
+) -> IResult<&'a [u8], Frame, Error<'a>> {
+    let (i, header_block_fragment) = take(header.payload_len)(input)?;
+    Ok((
+        i,
+        Frame::Continuation(Continuation {
+            stream_id: header.stream_id,
+            header_block_fragment: Slice::new(input, header_block_fragment),
+            end_headers: header.flags & 0x4 != 0,
         }),
     ))
 }
