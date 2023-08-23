@@ -1040,7 +1040,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             self.context.id.to_string(),
             self.context.cluster_id.as_deref(),
             self.context.backend_id.as_deref(),
-            self.get_route(),
+            self.context.get_route(),
         );
         kawa.prepare(&mut kawa::h1::BlockConverter);
         self.context.status = Some(status);
@@ -1214,45 +1214,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         true
     }
 
-    // -> host, path, method
-    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
-        let given_method = self
-            .context
-            .method
-            .as_ref()
-            .ok_or(RetrieveClusterError::NoMethod)?;
-        let given_authority = self
-            .context
-            .authority
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoHost)?;
-        let given_path = self
-            .context
-            .path
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoPath)?;
-
-        Ok((given_authority, given_path, given_method))
-    }
-
-    pub fn get_route(&self) -> String {
-        if let Some(method) = &self.context.method {
-            if let Some(authority) = &self.context.authority {
-                if let Some(path) = &self.context.path {
-                    return format!("{method} {authority}{path}");
-                }
-                return format!("{method} {authority}");
-            }
-            return format!("{method}");
-        }
-        String::new()
-    }
-
     fn cluster_id_from_request(
         &mut self,
         proxy: Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
-        let (host, uri, method) = match self.extract_route() {
+        let (host, uri, method) = match self.context.extract_route() {
             Ok(tuple) => tuple,
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswer::Answer400 {
