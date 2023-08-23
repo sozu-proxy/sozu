@@ -298,9 +298,11 @@ impl HttpsSession {
         let mux = Mux {
             frontend_token: self.frontend_token,
             frontend,
-            backends: HashMap::new(),
             context: mux::Context::new(self.pool.clone(), handshake.request_id, 1 << 16).ok()?,
-            listener: self.listener.clone(),
+            router: mux::Router {
+                listener: self.listener.clone(),
+                backends: HashMap::new(),
+            },
             public_address: self.public_address,
             peer_address: self.peer_address,
             sticky_name: self.sticky_name.clone(),
@@ -552,7 +554,6 @@ impl L7ListenerHandler for HttpsListener {
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
             Err(parse_error) => {
-                // parse_error contains a slice of given_host, which should NOT escape this scope
                 return Err(FrontendFromRequestError::HostParse {
                     host: host.to_owned(),
                     error: parse_error.to_string(),
