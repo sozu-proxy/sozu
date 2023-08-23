@@ -1028,32 +1028,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         true
     }
 
-    // -> host, path, method
-    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
-        let given_method = self
-            .context
-            .method
-            .as_ref()
-            .ok_or(RetrieveClusterError::NoMethod)?;
-        let given_authority = self
-            .context
-            .authority
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoHost)?;
-        let given_path = self
-            .context
-            .path
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoPath)?;
-
-        Ok((given_authority, given_path, given_method))
-    }
-
     fn cluster_id_from_request(
         &mut self,
         proxy: Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
-        let (host, uri, method) = match self.extract_route() {
+        let (host, uri, method) = match self.context.extract_route() {
             Ok(tuple) => tuple,
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswerStatus::Answer400, None);
