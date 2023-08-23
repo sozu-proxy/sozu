@@ -8,7 +8,7 @@ use rusty_ulid::Ulid;
 use crate::{
     pool::Checkout,
     protocol::http::{parser::compare_no_case, GenericHttpStream, Method},
-    Protocol,
+    Protocol, RetrieveClusterError,
 };
 
 use sozu_command_lib::logging::LogContext;
@@ -364,5 +364,30 @@ impl HttpContext {
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
         }
+    }
+
+    // -> host, path, method
+    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
+        let given_method = self.method.as_ref().ok_or(RetrieveClusterError::NoMethod)?;
+        let given_authority = self
+            .authority
+            .as_deref()
+            .ok_or(RetrieveClusterError::NoHost)?;
+        let given_path = self.path.as_deref().ok_or(RetrieveClusterError::NoPath)?;
+
+        Ok((given_authority, given_path, given_method))
+    }
+
+    pub fn get_route(&self) -> String {
+        if let Some(method) = &self.method {
+            if let Some(authority) = &self.authority {
+                if let Some(path) = &self.path {
+                    return format!("{method} {authority}{path}");
+                }
+                return format!("{method} {authority}");
+            }
+            return format!("{method}");
+        }
+        String::new()
     }
 }
