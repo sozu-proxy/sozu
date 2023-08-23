@@ -1,10 +1,20 @@
 use std::{io::Write, str::from_utf8_unchecked};
 
-use crate::protocol::http::parser::compare_no_case;
+use kawa::h1::ParserCallbacks;
+
+use crate::{pool::Checkout, protocol::http::parser::compare_no_case};
 
 use super::GenericHttpStream;
 
-pub fn handle_header(kawa: &mut GenericHttpStream, input: &[u8], decoder: &mut hpack::Decoder) {
+pub fn handle_header<C>(
+    kawa: &mut GenericHttpStream,
+    input: &[u8],
+    end_stream: bool,
+    decoder: &mut hpack::Decoder,
+    callbacks: &mut C,
+) where
+    C: ParserCallbacks<Checkout>,
+{
     println!("{input:?}");
     kawa.push_block(kawa::Block::StatusLine);
     kawa.detached.status_line = match kawa.kind {
@@ -16,16 +26,11 @@ pub fn handle_header(kawa: &mut GenericHttpStream, input: &[u8], decoder: &mut h
             decoder
                 .decode_with_cb(input, |k, v| {
                     let start = kawa.storage.end as u32;
-                    kawa.storage.write(&k).unwrap();
                     kawa.storage.write(&v).unwrap();
                     let len_key = k.len() as u32;
                     let len_val = v.len() as u32;
-                    let key = kawa::Store::Slice(kawa::repr::Slice {
-                        start,
-                        len: len_key,
-                    });
                     let val = kawa::Store::Slice(kawa::repr::Slice {
-                        start: start + len_key,
+                        start,
                         len: len_val,
                     });
 
@@ -38,6 +43,16 @@ pub fn handle_header(kawa: &mut GenericHttpStream, input: &[u8], decoder: &mut h
                     } else if compare_no_case(&k, b":scheme") {
                         scheme = val;
                     } else {
+                        if compare_no_case(&k, b"content-length") {
+                            let length =
+                                unsafe { from_utf8_unchecked(&v).parse::<usize>().unwrap() };
+                            kawa.body_size = kawa::BodySize::Length(length);
+                        }
+                        kawa.storage.write(&k).unwrap();
+                        let key = kawa::Store::Slice(kawa::repr::Slice {
+                            start: start + len_val,
+                            len: len_key,
+                        });
                         kawa.push_block(kawa::Block::Header(kawa::Pair { key, val }));
                     }
                 })
@@ -103,5 +118,32 @@ pub fn handle_header(kawa: &mut GenericHttpStream, input: &[u8], decoder: &mut h
 
     // everything has been parsed
     kawa.storage.head = kawa.storage.end;
-    kawa.parsing_phase = kawa::ParsingPhase::Chunks { first: true };
+
+    callbacks.on_headers(kawa);
+
+    kawa.push_block(kawa::Block::Flags(kawa::Flags {
+        end_body: false,
+        end_chunk: false,
+        end_header: true,
+        end_stream: false,
+    }));
+
+    if end_stream {
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: true,
+            end_chunk: false,
+            end_header: false,
+            end_stream: true,
+        }));
+        kawa.body_size = kawa::BodySize::Length(0);
+    }
+    kawa.parsing_phase = match kawa.body_size {
+        kawa::BodySize::Chunked => kawa::ParsingPhase::Chunks { first: true },
+        kawa::BodySize::Length(0) => kawa::ParsingPhase::Terminated,
+        kawa::BodySize::Length(_) => kawa::ParsingPhase::Body,
+        kawa::BodySize::Empty => {
+            println!("HTTP is just the worst...");
+            kawa::ParsingPhase::Body
+        },
+    };
 }

@@ -6,7 +6,7 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use mio::{net::TcpStream, Token};
+use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use sozu_command::ready::Ready;
 
@@ -17,6 +17,7 @@ mod pkawa;
 mod serializer;
 
 use crate::{
+    backends::{Backend, BackendError},
     https::HttpsListener,
     pool::{Checkout, Pool},
     protocol::{
@@ -24,8 +25,10 @@ use crate::{
         mux::{h1::ConnectionH1, h2::ConnectionH2},
         SessionState,
     },
+    router::Route,
     socket::{FrontRustls, SocketHandler},
-    AcceptError, L7Proxy, ProxySession, Readiness, SessionMetrics, SessionResult, StateResult,
+    AcceptError, BackendConnectionError, L7ListenerHandler, L7Proxy, ProxySession, Readiness,
+    RetrieveClusterError, SessionMetrics, SessionResult, StateResult,
 };
 
 use self::h2::{H2Settings, H2State};
@@ -65,7 +68,7 @@ impl<Front: SocketHandler> Connection<Front> {
             stream: 0,
         })
     }
-    pub fn new_h1_client(front_stream: Front) -> Connection<Front> {
+    pub fn new_h1_client(front_stream: Front, stream_id: GlobalStreamId) -> Connection<Front> {
         Connection::H1(ConnectionH1 {
             socket: front_stream,
             position: Position::Client,
@@ -73,7 +76,7 @@ impl<Front: SocketHandler> Connection<Front> {
                 interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
-            stream: 0,
+            stream: stream_id,
         })
     }
 
@@ -118,6 +121,12 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => &mut c.readiness,
         }
     }
+    pub fn socket(&self) -> &TcpStream {
+        match self {
+            Connection::H1(c) => &c.socket.socket_ref(),
+            Connection::H2(c) => &c.socket.socket_ref(),
+        }
+    }
     fn readable(&mut self, context: &mut Context) -> MuxResult {
         match self {
             Connection::H1(c) => c.readable(context),
@@ -141,13 +150,13 @@ pub struct Stream {
 }
 
 impl Stream {
-    pub fn front(&mut self, position: Position) -> &mut GenericHttpStream {
+    pub fn rbuffer(&mut self, position: Position) -> &mut GenericHttpStream {
         match position {
             Position::Client => &mut self.back,
             Position::Server => &mut self.front,
         }
     }
-    pub fn back(&mut self, position: Position) -> &mut GenericHttpStream {
+    pub fn wbuffer(&mut self, position: Position) -> &mut GenericHttpStream {
         match position {
             Position::Client => &mut self.front,
             Position::Server => &mut self.back,
@@ -244,11 +253,175 @@ impl Context {
     }
 }
 
+pub struct Router {
+    pub listener: Rc<RefCell<HttpsListener>>,
+    pub backends: HashMap<Token, Connection<TcpStream>>,
+}
+
+impl Router {
+    fn connect(
+        &mut self,
+        stream_id: GlobalStreamId,
+        context: &mut Context,
+        session: Rc<RefCell<dyn ProxySession>>,
+        proxy: Rc<RefCell<dyn L7Proxy>>,
+        metrics: &mut SessionMetrics,
+    ) -> Result<(), BackendConnectionError> {
+        let context = &mut context.streams.others[stream_id - 1].context;
+        // we should get if the route is H2 or not here
+        // for now we assume it's H1
+        let cluster_id = self
+            .cluster_id_from_request(context, proxy.clone())
+            .map_err(BackendConnectionError::RetrieveClusterError)?;
+        println!("{cluster_id}!!!!!");
+
+        let frontend_should_stick = proxy
+            .borrow()
+            .clusters()
+            .get(&cluster_id)
+            .map(|cluster| cluster.sticky_session)
+            .unwrap_or(false);
+
+        let mut socket = self.backend_from_request(
+            &cluster_id,
+            frontend_should_stick,
+            context,
+            proxy.clone(),
+            metrics,
+        )?;
+
+        if let Err(e) = socket.set_nodelay(true) {
+            error!(
+                "error setting nodelay on back socket({:?}): {:?}",
+                socket, e
+            );
+        }
+        // self.backend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
+        // self.backend_connection_status = BackendConnectionStatus::Connecting(Instant::now());
+
+        let backend_token = proxy.borrow().add_session(session);
+
+        if let Err(e) = proxy.borrow().register_socket(
+            &mut socket,
+            backend_token,
+            Interest::READABLE | Interest::WRITABLE,
+        ) {
+            error!("error registering back socket({:?}): {:?}", socket, e);
+        }
+
+        self.backends
+            .insert(backend_token, Connection::new_h1_client(socket, stream_id));
+        Ok(())
+    }
+
+    fn cluster_id_from_request(
+        &mut self,
+        context: &mut HttpContext,
+        proxy: Rc<RefCell<dyn L7Proxy>>,
+    ) -> Result<String, RetrieveClusterError> {
+        let (host, uri, method) = match context.extract_route() {
+            Ok(tuple) => tuple,
+            Err(cluster_error) => {
+                panic!("{}", cluster_error);
+                // self.set_answer(DefaultAnswerStatus::Answer400, None);
+                // return Err(cluster_error);
+            }
+        };
+
+        let route_result = self
+            .listener
+            .borrow()
+            .frontend_from_request(host, uri, method);
+
+        let route = match route_result {
+            Ok(route) => route,
+            Err(frontend_error) => {
+                panic!("{}", frontend_error);
+                // self.set_answer(DefaultAnswerStatus::Answer404, None);
+                // return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
+            }
+        };
+
+        let cluster_id = match route {
+            Route::Cluster { id, .. } => id,
+            Route::Deny => {
+                panic!("Route::Deny");
+                // self.set_answer(DefaultAnswerStatus::Answer401, None);
+                // return Err(RetrieveClusterError::UnauthorizedRoute);
+            }
+        };
+
+        Ok(cluster_id)
+    }
+
+    pub fn backend_from_request(
+        &mut self,
+        cluster_id: &str,
+        frontend_should_stick: bool,
+        context: &mut HttpContext,
+        proxy: Rc<RefCell<dyn L7Proxy>>,
+        metrics: &mut SessionMetrics,
+    ) -> Result<TcpStream, BackendConnectionError> {
+        let (backend, conn) = self
+            .get_backend_for_sticky_session(
+                cluster_id,
+                frontend_should_stick,
+                context.sticky_session_found.as_deref(),
+                proxy,
+            )
+            .map_err(|backend_error| {
+                panic!("{backend_error}")
+                // self.set_answer(DefaultAnswerStatus::Answer503, None);
+                // BackendConnectionError::Backend(backend_error)
+            })?;
+
+        if frontend_should_stick {
+            // update sticky name in case it changed I guess?
+            context.sticky_name = self.listener.borrow().get_sticky_name().to_string();
+
+            context.sticky_session = Some(
+                backend
+                    .borrow()
+                    .sticky_id
+                    .clone()
+                    .unwrap_or_else(|| backend.borrow().backend_id.clone()),
+            );
+        }
+
+        // metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        // metrics.backend_start();
+        // self.set_backend_id(backend.borrow().backend_id.clone());
+        // self.backend = Some(backend);
+
+        Ok(conn)
+    }
+
+    fn get_backend_for_sticky_session(
+        &self,
+        cluster_id: &str,
+        frontend_should_stick: bool,
+        sticky_session: Option<&str>,
+        proxy: Rc<RefCell<dyn L7Proxy>>,
+    ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
+        match (frontend_should_stick, sticky_session) {
+            (true, Some(sticky_session)) => proxy
+                .borrow()
+                .backends()
+                .borrow_mut()
+                .backend_from_sticky_session(cluster_id, sticky_session),
+            _ => proxy
+                .borrow()
+                .backends()
+                .borrow_mut()
+                .backend_from_cluster_id(cluster_id),
+        }
+    }
+}
+
 pub struct Mux {
     pub frontend_token: Token,
     pub frontend: Connection<FrontRustls>,
-    pub backends: HashMap<Token, Connection<TcpStream>>,
-    pub listener: Rc<RefCell<HttpsListener>>,
+    pub router: Router,
     pub public_address: SocketAddr,
     pub peer_address: Option<SocketAddr>,
     pub sticky_name: String,
@@ -257,19 +430,16 @@ pub struct Mux {
 
 impl Mux {
     pub fn front_socket(&self) -> &TcpStream {
-        match &self.frontend {
-            Connection::H1(c) => &c.socket.stream,
-            Connection::H2(c) => &c.socket.stream,
-        }
+        self.frontend.socket()
     }
 }
 
 impl SessionState for Mux {
     fn ready(
         &mut self,
-        _session: Rc<RefCell<dyn ProxySession>>,
-        _proxy: Rc<RefCell<dyn L7Proxy>>,
-        _metrics: &mut SessionMetrics,
+        session: Rc<RefCell<dyn ProxySession>>,
+        proxy: Rc<RefCell<dyn L7Proxy>>,
+        metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
         let max_loop_iterations = 100000;
@@ -287,19 +457,32 @@ impl SessionState for Mux {
                     MuxResult::Continue => (),
                     MuxResult::CloseSession => return SessionResult::Close,
                     MuxResult::Close(_) => todo!(),
-                    MuxResult::Connect(_) => todo!(),
+                    MuxResult::Connect(stream_id) => {
+                        match self.router.connect(
+                            stream_id,
+                            context,
+                            session.clone(),
+                            proxy.clone(),
+                            metrics,
+                        ) {
+                            Ok(_) => (),
+                            Err(error) => {
+                                println!("{error}");
+                            }
+                        }
+                    }
                 }
                 dirty = true;
             }
 
-            for (_, backend) in self.backends.iter_mut() {
+            for (_, backend) in self.router.backends.iter_mut() {
                 if backend.readiness().filter_interest().is_writable() {
                     match backend.writable(context) {
                         MuxResult::Continue => (),
                         MuxResult::CloseSession => return SessionResult::Close,
                         MuxResult::Close(_) => todo!(),
                         MuxResult::Connect(_) => unreachable!(),
-                        }
+                    }
                     dirty = true;
                 }
 
@@ -309,7 +492,7 @@ impl SessionState for Mux {
                         MuxResult::CloseSession => return SessionResult::Close,
                         MuxResult::Close(_) => todo!(),
                         MuxResult::Connect(_) => unreachable!(),
-                        }
+                    }
                     dirty = true;
                 }
             }
@@ -324,10 +507,11 @@ impl SessionState for Mux {
                 dirty = true;
             }
 
-            for backend in self.backends.values() {
+            for backend in self.router.backends.values() {
                 if backend.readiness().filter_interest().is_hup()
                     || backend.readiness().filter_interest().is_error()
                 {
+                    println!("{:?} {:?}", backend.readiness(), backend.socket());
                     return SessionResult::Close;
                 }
             }
@@ -350,7 +534,7 @@ impl SessionState for Mux {
     fn update_readiness(&mut self, token: Token, events: sozu_command::ready::Ready) {
         if token == self.frontend_token {
             self.frontend.readiness_mut().event |= events;
-        } else if let Some(c) = self.backends.get_mut(&token) {
+        } else if let Some(c) = self.router.backends.get_mut(&token) {
             c.readiness_mut().event |= events;
         }
     }
@@ -384,15 +568,16 @@ impl SessionState for Mux {
         let (size, status) = s.socket_read(&mut b);
         println!("{size} {status:?} {:?}", &b[..size]);
         for stream in &mut self.context.streams.others {
-            let kawa = &mut stream.front;
-            kawa::debug_kawa(kawa);
-            kawa.prepare(&mut kawa::h1::BlockConverter);
-            let out = kawa.as_io_slice();
-            let mut writer = std::io::BufWriter::new(Vec::new());
-            let amount = writer.write_vectored(&out).unwrap();
-            println!("amount: {amount}\n{}", unsafe {
-                std::str::from_utf8_unchecked(writer.buffer())
-            });
+            for kawa in [&mut stream.front, &mut stream.back] {
+                kawa::debug_kawa(kawa);
+                kawa.prepare(&mut kawa::h1::BlockConverter);
+                let out = kawa.as_io_slice();
+                let mut writer = std::io::BufWriter::new(Vec::new());
+                let amount = writer.write_vectored(&out).unwrap();
+                println!("amount: {amount}\n{}", unsafe {
+                    std::str::from_utf8_unchecked(writer.buffer())
+                });
+            }
         }
     }
 }

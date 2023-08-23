@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, str::from_utf8_unchecked};
 
 use kawa::h1::ParserCallbacks;
 use rusty_ulid::Ulid;
@@ -60,23 +60,25 @@ pub struct ConnectionH2<Front: SocketHandler> {
 impl<Front: SocketHandler> ConnectionH2<Front> {
     pub fn readable(&mut self, context: &mut Context) -> MuxResult {
         println!("======= MUX H2 READABLE");
-        let kawa = if let Some((stream_id, amount)) = self.expect {
-            let kawa = context.streams.get(stream_id).front(self.position);
-            let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
-            println!("{:?}({stream_id}, {amount}) {size} {status:?}", self.state);
-            if size > 0 {
-                kawa.storage.fill(size);
-                if size == amount {
-                    self.expect = None;
+        let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect {
+            let kawa = context.streams.get(stream_id).rbuffer(self.position);
+            if amount > 0 {
+                let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
+                println!("{:?}({stream_id}, {amount}) {size} {status:?}", self.state);
+                if size > 0 {
+                    kawa.storage.fill(size);
+                    if size == amount {
+                        self.expect = None;
+                    } else {
+                        self.expect = Some((stream_id, amount - size));
+                        return MuxResult::Continue;
+                    }
                 } else {
-                    self.expect = Some((stream_id, amount - size));
+                    self.readiness.event.remove(Ready::READABLE);
                     return MuxResult::Continue;
                 }
-            } else {
-                self.readiness.event.remove(Ready::READABLE);
-                return MuxResult::Continue;
             }
-            kawa
+            (stream_id, kawa)
         } else {
             self.readiness.event.remove(Ready::READABLE);
             return MuxResult::Continue;
@@ -186,7 +188,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         Ok((_, frame)) => frame,
                         Err(e) => panic!("{e:?}"),
                     };
-                kawa.storage.clear();
+                if stream_id == 0 {
+                    kawa.storage.clear();
+                }
                 let state_result = self.handle(frame, context);
                 self.state = H2State::Header;
                 self.expect = Some((0, 9));
@@ -235,19 +239,47 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     fn handle(&mut self, frame: Frame, context: &mut Context) -> MuxResult {
         println!("{frame:?}");
         match frame {
-            Frame::Data(_) => todo!(),
+            Frame::Data(data) => {
+                let mut slice = data.payload;
+                let global_stream_id = *self.streams.get(&data.stream_id).unwrap();
+                let stream = &mut context.streams.others[global_stream_id - 1];
+                let kawa = stream.rbuffer(self.position);
+                slice.start += kawa.storage.head as u32;
+                kawa.storage.head += slice.len();
+                let buffer = kawa.storage.buffer();
+                let payload = slice.data(buffer);
+                println!("{:?}", unsafe { from_utf8_unchecked(payload) });
+                kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
+                    data: kawa::Store::Slice(slice),
+                }));
+                if data.end_stream {
+                    kawa.push_block(kawa::Block::Flags(kawa::Flags {
+                        end_body: true,
+                        end_chunk: false,
+                        end_header: false,
+                        end_stream: true,
+                    }));
+                    kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+                }
+            }
             Frame::Headers(headers) => {
                 if !headers.end_headers {
                     todo!();
                     // self.state = H2State::Continuation
                 }
                 let global_stream_id = *self.streams.get(&headers.stream_id).unwrap();
-                let kawa = context.streams.zero.front(self.position);
+                let kawa = context.streams.zero.rbuffer(self.position);
                 let buffer = headers.header_block_fragment.data(kawa.storage.buffer());
                 let stream = &mut context.streams.others[global_stream_id - 1];
                 let kawa = &mut stream.front;
-                pkawa::handle_header(kawa, buffer, &mut context.decoder);
-                stream.context.on_headers(kawa);
+                pkawa::handle_header(
+                    kawa,
+                    buffer,
+                    headers.end_stream,
+                    &mut context.decoder,
+                    &mut stream.context,
+                );
+                kawa::debug_kawa(kawa);
                 return MuxResult::Connect(global_stream_id);
             }
             Frame::PushPromise(push_promise) => match self.position {

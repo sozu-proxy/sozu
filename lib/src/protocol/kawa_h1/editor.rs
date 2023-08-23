@@ -8,7 +8,7 @@ use rusty_ulid::Ulid;
 use crate::{
     pool::Checkout,
     protocol::http::{parser::compare_no_case, GenericHttpStream, Method},
-    Protocol,
+    Protocol, RetrieveClusterError,
 };
 
 /// This is the container used to store and use information about the session from within a Kawa parser callback
@@ -336,5 +336,17 @@ impl HttpContext {
             key: kawa::Store::Static(b"Sozu-Id"),
             val: kawa::Store::from_string(self.id.to_string()),
         }));
+    }
+
+    // -> host, path, method
+    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
+        let given_method = self.method.as_ref().ok_or(RetrieveClusterError::NoMethod)?;
+        let given_authority = self
+            .authority
+            .as_deref()
+            .ok_or(RetrieveClusterError::NoHost)?;
+        let given_path = self.path.as_deref().ok_or(RetrieveClusterError::NoPath)?;
+
+        Ok((given_authority, given_path, given_method))
     }
 }
