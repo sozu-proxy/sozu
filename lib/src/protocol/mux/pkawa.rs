@@ -15,7 +15,6 @@ pub fn handle_header<C>(
 ) where
     C: ParserCallbacks<Checkout>,
 {
-    println!("{input:?}");
     kawa.push_block(kawa::Block::StatusLine);
     kawa.detached.status_line = match kawa.kind {
         kawa::Kind::Request => {
@@ -26,7 +25,7 @@ pub fn handle_header<C>(
             decoder
                 .decode_with_cb(input, |k, v| {
                     let start = kawa.storage.end as u32;
-                    kawa.storage.write(&v).unwrap();
+                    kawa.storage.write_all(&v).unwrap();
                     let len_key = k.len() as u32;
                     let len_val = v.len() as u32;
                     let val = kawa::Store::Slice(kawa::repr::Slice {
@@ -48,7 +47,7 @@ pub fn handle_header<C>(
                                 unsafe { from_utf8_unchecked(&v).parse::<usize>().unwrap() };
                             kawa.body_size = kawa::BodySize::Length(length);
                         }
-                        kawa.storage.write(&k).unwrap();
+                        kawa.storage.write_all(&k).unwrap();
                         let key = kawa::Store::Slice(kawa::repr::Slice {
                             start: start + len_val,
                             len: len_key,
@@ -81,16 +80,11 @@ pub fn handle_header<C>(
             decoder
                 .decode_with_cb(input, |k, v| {
                     let start = kawa.storage.end as u32;
-                    kawa.storage.write(&k).unwrap();
-                    kawa.storage.write(&v).unwrap();
+                    kawa.storage.write_all(&v).unwrap();
                     let len_key = k.len() as u32;
                     let len_val = v.len() as u32;
-                    let key = kawa::Store::Slice(kawa::repr::Slice {
-                        start,
-                        len: len_key,
-                    });
                     let val = kawa::Store::Slice(kawa::repr::Slice {
-                        start: start + len_key,
+                        start,
                         len: len_val,
                     });
 
@@ -103,6 +97,11 @@ pub fn handle_header<C>(
                                 .unwrap()
                         }
                     } else {
+                        kawa.storage.write_all(&k).unwrap();
+                        let key = kawa::Store::Slice(kawa::repr::Slice {
+                            start: start + len_val,
+                            len: len_key,
+                        });
                         kawa.push_block(kawa::Block::Header(kawa::Pair { key, val }));
                     }
                 })
@@ -144,6 +143,6 @@ pub fn handle_header<C>(
         kawa::BodySize::Empty => {
             println!("HTTP is just the worst...");
             kawa::ParsingPhase::Body
-        },
+        }
     };
 }
