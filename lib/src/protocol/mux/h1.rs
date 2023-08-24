@@ -6,6 +6,8 @@ use crate::{
     Readiness,
 };
 
+use super::UpdateReadiness;
+
 pub struct ConnectionH1<Front: SocketHandler> {
     pub position: Position,
     pub readiness: Readiness,
@@ -15,7 +17,10 @@ pub struct ConnectionH1<Front: SocketHandler> {
 }
 
 impl<Front: SocketHandler> ConnectionH1<Front> {
-    pub fn readable(&mut self, context: &mut Context) -> MuxResult {
+    pub fn readable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
+    where
+        E: UpdateReadiness,
+    {
         println!("======= MUX H1 READABLE");
         let stream = &mut context.streams[self.stream];
         let kawa = stream.rbuffer(self.position);
@@ -42,7 +47,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
         MuxResult::Continue
     }
-    pub fn writable(&mut self, context: &mut Context) -> MuxResult {
+    pub fn writable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
+    where
+        E: UpdateReadiness,
+    {
         println!("======= MUX H1 WRITABLE");
         let stream = &mut context.streams[self.stream];
         let kawa = stream.wbuffer(self.position);
