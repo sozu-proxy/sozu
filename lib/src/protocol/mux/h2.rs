@@ -12,7 +12,7 @@ use crate::{
     Readiness,
 };
 
-use super::GenericHttpStream;
+use super::{GenericHttpStream, UpdateReadiness};
 
 #[derive(Debug)]
 pub enum H2State {
@@ -66,7 +66,10 @@ pub enum H2StreamId {
 }
 
 impl<Front: SocketHandler> ConnectionH2<Front> {
-    pub fn readable(&mut self, context: &mut Context) -> MuxResult {
+    pub fn readable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
+    where
+        E: UpdateReadiness,
+    {
         println!("======= MUX H2 READABLE");
         let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect {
             let kawa = match stream_id {
@@ -230,7 +233,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    pub fn writable(&mut self, context: &mut Context) -> MuxResult {
+    pub fn writable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
+    where
+        E: UpdateReadiness,
+    {
         println!("======= MUX H2 WRITABLE");
         match (&self.state, &self.position) {
             (H2State::ClientPreface, Position::Client) => todo!("Send PRI + client Settings"),

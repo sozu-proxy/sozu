@@ -56,6 +56,11 @@ pub enum Connection<Front: SocketHandler> {
     H2(ConnectionH2<Front>),
 }
 
+pub trait UpdateReadiness {
+    fn readiness(&self, token: Token) -> &Readiness;
+    fn readiness_mut(&mut self, token: Token) -> &mut Readiness;
+}
+
 impl<Front: SocketHandler> Connection<Front> {
     pub fn new_h1_server(front_stream: Front) -> Connection<Front> {
         Connection::H1(ConnectionH1 {
@@ -143,17 +148,43 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => c.socket.socket_ref(),
         }
     }
-    fn readable(&mut self, context: &mut Context) -> MuxResult {
+    fn readable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
+    where
+        E: UpdateReadiness,
+    {
         match self {
-            Connection::H1(c) => c.readable(context),
-            Connection::H2(c) => c.readable(context),
+            Connection::H1(c) => c.readable(context, endpoint),
+            Connection::H2(c) => c.readable(context, endpoint),
         }
     }
-    fn writable(&mut self, context: &mut Context) -> MuxResult {
+    fn writable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
+    where
+        E: UpdateReadiness,
+    {
         match self {
-            Connection::H1(c) => c.writable(context),
-            Connection::H2(c) => c.writable(context),
+            Connection::H1(c) => c.writable(context, endpoint),
+            Connection::H2(c) => c.writable(context, endpoint),
         }
+    }
+}
+
+struct EndpointServer<'a>(&'a mut Connection<FrontRustls>);
+struct EndpointClient<'a>(&'a mut Router);
+
+impl<'a> UpdateReadiness for EndpointServer<'a> {
+    fn readiness(&self, _token: Token) -> &Readiness {
+        self.0.readiness()
+    }
+    fn readiness_mut(&mut self, _token: Token) -> &mut Readiness {
+        self.0.readiness_mut()
+    }
+}
+impl<'a> UpdateReadiness for EndpointClient<'a> {
+    fn readiness(&self, token: Token) -> &Readiness {
+        self.0.backends.get(&token).unwrap().readiness()
+    }
+    fn readiness_mut(&mut self, token: Token) -> &mut Readiness {
+        self.0.backends.get_mut(&token).unwrap().readiness_mut()
     }
 }
 
@@ -459,7 +490,7 @@ impl SessionState for Mux {
             let mut dirty = false;
 
             if self.frontend.readiness().filter_interest().is_readable() {
-                match self.frontend.readable(context) {
+                match self.frontend.readable(context, EndpointClient(&mut self.router)) {
                     MuxResult::Continue => (),
                     MuxResult::CloseSession => return SessionResult::Close,
                     MuxResult::Close(_) => todo!(),
@@ -483,7 +514,7 @@ impl SessionState for Mux {
 
             for (_, backend) in self.router.backends.iter_mut() {
                 if backend.readiness().filter_interest().is_writable() {
-                    match backend.writable(context) {
+                    match backend.writable(context, EndpointServer(&mut self.frontend)) {
                         MuxResult::Continue => (),
                         MuxResult::CloseSession => return SessionResult::Close,
                         MuxResult::Close(_) => todo!(),
@@ -493,7 +524,7 @@ impl SessionState for Mux {
                 }
 
                 if backend.readiness().filter_interest().is_readable() {
-                    match backend.readable(context) {
+                    match backend.readable(context, EndpointServer(&mut self.frontend)) {
                         MuxResult::Continue => (),
                         MuxResult::CloseSession => return SessionResult::Close,
                         MuxResult::Close(_) => todo!(),
@@ -504,7 +535,7 @@ impl SessionState for Mux {
             }
 
             if self.frontend.readiness().filter_interest().is_writable() {
-                match self.frontend.writable(context) {
+                match self.frontend.writable(context, EndpointClient(&mut self.router)) {
                     MuxResult::Continue => (),
                     MuxResult::CloseSession => return SessionResult::Close,
                     MuxResult::Close(_) => todo!(),
