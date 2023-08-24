@@ -91,18 +91,4 @@ The repository provides a unit file [here][unit-file]. You can copy it to `/etc/
 
 This will make systemd take notice of it, and now you can start the service with `systemctl start sozu.service`. Furthermore, you can enable it, so that it is activated by default on future boots with `systemctl enable sozu.service`.
 
-You can use a `bash` script and call `sed` to automate this part. e.g.: [generate.sh][gen].
-
-This script will generate `sozu.service`, `sozu.conf` and `config.toml` files into a `generated` folder at the root of `os-build` directory. You will have to set your own `__BINDIR__`, `__SYSCONFDIR__`, `__DATADIR__` and `__RUNDIR__` variables.
-
-Here is an example of those variables:
-
-| variable | value |
-| :--- | :--- |
-| `__BINDIR__` | `/usr/local/bin` |
-| `__SYSCONFDIR__` | `/etc` |
-| `__DATADIR__` | `/var/lib/sozu` |
-| `__RUNDIR__` | `/run` |
-
 [unit-file]: ../os-build/systemd/sozu.service
-[gen]: ../os-build/exherbo/generate.sh
