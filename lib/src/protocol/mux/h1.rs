@@ -17,7 +17,7 @@ pub struct ConnectionH1<Front: SocketHandler> {
 impl<Front: SocketHandler> ConnectionH1<Front> {
     pub fn readable(&mut self, context: &mut Context) -> MuxResult {
         println!("======= MUX H1 READABLE");
-        let stream = &mut context.streams.get(self.stream);
+        let stream = &mut context.streams[self.stream];
         let kawa = stream.rbuffer(self.position);
         let (size, status) = self.socket.socket_read(kawa.storage.space());
         println!("  size: {size}, status: {status:?}");
@@ -44,7 +44,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     }
     pub fn writable(&mut self, context: &mut Context) -> MuxResult {
         println!("======= MUX H1 WRITABLE");
-        let stream = &mut context.streams.get(self.stream);
+        let stream = &mut context.streams[self.stream];
         let kawa = stream.wbuffer(self.position);
         kawa.prepare(&mut kawa::h1::BlockConverter);
         kawa::debug_kawa(kawa);

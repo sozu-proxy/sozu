@@ -27,11 +27,11 @@ use crate::{
     },
     router::Route,
     socket::{FrontRustls, SocketHandler},
-    AcceptError, BackendConnectionError, L7ListenerHandler, L7Proxy, ProxySession, Readiness,
+    BackendConnectionError, L7ListenerHandler, L7Proxy, ProxySession, Readiness,
     RetrieveClusterError, SessionMetrics, SessionResult, StateResult,
 };
 
-use self::h2::{H2Settings, H2State};
+use self::h2::{H2Settings, H2State, H2StreamId};
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
 type GenericHttpStream = kawa::Kawa<Checkout>;
@@ -80,33 +80,49 @@ impl<Front: SocketHandler> Connection<Front> {
         })
     }
 
-    pub fn new_h2_server(front_stream: Front) -> Connection<Front> {
-        Connection::H2(ConnectionH2 {
+    pub fn new_h2_server(
+        front_stream: Front,
+        pool: Weak<RefCell<Pool>>,
+    ) -> Option<Connection<Front>> {
+        let buffer = pool
+            .upgrade()
+            .and_then(|pool| pool.borrow_mut().checkout())?;
+        Some(Connection::H2(ConnectionH2 {
             socket: front_stream,
             position: Position::Server,
             readiness: Readiness {
                 interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
-            streams: HashMap::from([(0, 0)]),
+            streams: HashMap::new(),
             state: H2State::ClientPreface,
-            expect: Some((0, 24 + 9)),
+            expect: Some((H2StreamId::Zero, 24 + 9)),
             settings: H2Settings::default(),
-        })
+            zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
+            window: 1 << 16,
+        }))
     }
-    pub fn new_h2_client(front_stream: Front) -> Connection<Front> {
-        Connection::H2(ConnectionH2 {
+    pub fn new_h2_client(
+        front_stream: Front,
+        pool: Weak<RefCell<Pool>>,
+    ) -> Option<Connection<Front>> {
+        let buffer = pool
+            .upgrade()
+            .and_then(|pool| pool.borrow_mut().checkout())?;
+        Some(Connection::H2(ConnectionH2 {
             socket: front_stream,
             position: Position::Client,
             readiness: Readiness {
                 interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
-            streams: HashMap::from([(0, 0)]),
+            streams: HashMap::new(),
             state: H2State::ClientPreface,
             expect: None,
             settings: H2Settings::default(),
-        })
+            zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
+            window: 1 << 16,
+        }))
     }
 
     pub fn readiness(&self) -> &Readiness {
@@ -123,8 +139,8 @@ impl<Front: SocketHandler> Connection<Front> {
     }
     pub fn socket(&self) -> &TcpStream {
         match self {
-            Connection::H1(c) => &c.socket.socket_ref(),
-            Connection::H2(c) => &c.socket.socket_ref(),
+            Connection::H1(c) => c.socket.socket_ref(),
+            Connection::H2(c) => c.socket.socket_ref(),
         }
     }
     fn readable(&mut self, context: &mut Context) -> MuxResult {
@@ -149,59 +165,27 @@ pub struct Stream {
     pub context: HttpContext,
 }
 
+/// This struct allows to mutably borrow the read and write buffers (dependant on the position)
+/// as well as the context of a Stream at the same time
+pub struct StreamParts<'a> {
+    pub rbuffer: &'a mut GenericHttpStream,
+    pub wbuffer: &'a mut GenericHttpStream,
+    pub context: &'a mut HttpContext,
+}
+
 impl Stream {
-    pub fn rbuffer(&mut self, position: Position) -> &mut GenericHttpStream {
-        match position {
-            Position::Client => &mut self.back,
-            Position::Server => &mut self.front,
-        }
-    }
-    pub fn wbuffer(&mut self, position: Position) -> &mut GenericHttpStream {
-        match position {
-            Position::Client => &mut self.front,
-            Position::Server => &mut self.back,
-        }
-    }
-}
-
-pub struct Streams {
-    zero: Stream,
-    others: Vec<Stream>,
-}
-
-impl Streams {
-    pub fn get(&mut self, stream_id: GlobalStreamId) -> &mut Stream {
-        if stream_id == 0 {
-            &mut self.zero
-        } else {
-            &mut self.others[stream_id - 1]
-        }
-    }
-}
-
-pub struct Context {
-    pub streams: Streams,
-    pub pool: Weak<RefCell<Pool>>,
-    pub decoder: hpack::Decoder<'static>,
-}
-
-impl Context {
-    pub fn new_stream(
-        pool: Weak<RefCell<Pool>>,
-        request_id: Ulid,
-        window: u32,
-    ) -> Result<Stream, AcceptError> {
+    pub fn new(pool: Weak<RefCell<Pool>>, request_id: Ulid, window: u32) -> Option<Self> {
         let (front_buffer, back_buffer) = match pool.upgrade() {
             Some(pool) => {
                 let mut pool = pool.borrow_mut();
                 match (pool.checkout(), pool.checkout()) {
                     (Some(front_buffer), Some(back_buffer)) => (front_buffer, back_buffer),
-                    _ => return Err(AcceptError::BufferCapacityReached),
+                    _ => return None,
                 }
             }
-            None => return Err(AcceptError::BufferCapacityReached),
+            None => return None,
         };
-        Ok(Stream {
+        Some(Self {
             window: window as i32,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
@@ -225,31 +209,53 @@ impl Context {
             },
         })
     }
+    pub fn split(&mut self, position: Position) -> StreamParts<'_> {
+        match position {
+            Position::Client => StreamParts {
+                rbuffer: &mut self.back,
+                wbuffer: &mut self.front,
+                context: &mut self.context,
+            },
+            Position::Server => StreamParts {
+                rbuffer: &mut self.front,
+                wbuffer: &mut self.back,
+                context: &mut self.context,
+            },
+        }
+    }
+    pub fn rbuffer(&mut self, position: Position) -> &mut GenericHttpStream {
+        match position {
+            Position::Client => &mut self.back,
+            Position::Server => &mut self.front,
+        }
+    }
+    pub fn wbuffer(&mut self, position: Position) -> &mut GenericHttpStream {
+        match position {
+            Position::Client => &mut self.front,
+            Position::Server => &mut self.back,
+        }
+    }
+}
 
-    pub fn create_stream(
-        &mut self,
-        request_id: Ulid,
-        window: u32,
-    ) -> Result<GlobalStreamId, AcceptError> {
+pub struct Context {
+    pub streams: Vec<Stream>,
+    pub pool: Weak<RefCell<Pool>>,
+    pub decoder: hpack::Decoder<'static>,
+}
+
+impl Context {
+    pub fn create_stream(&mut self, request_id: Ulid, window: u32) -> Option<GlobalStreamId> {
         self.streams
-            .others
-            .push(Self::new_stream(self.pool.clone(), request_id, window)?);
-        Ok(self.streams.others.len())
+            .push(Stream::new(self.pool.clone(), request_id, window)?);
+        Some(self.streams.len() - 1)
     }
 
-    pub fn new(
-        pool: Weak<RefCell<Pool>>,
-        request_id: Ulid,
-        window: u32,
-    ) -> Result<Context, AcceptError> {
-        Ok(Self {
-            streams: Streams {
-                zero: Context::new_stream(pool.clone(), request_id, window)?,
-                others: Vec::new(),
-            },
+    pub fn new(pool: Weak<RefCell<Pool>>) -> Context {
+        Self {
+            streams: Vec::new(),
             pool,
             decoder: hpack::Decoder::new(),
-        })
+        }
     }
 }
 
@@ -267,7 +273,7 @@ impl Router {
         proxy: Rc<RefCell<dyn L7Proxy>>,
         metrics: &mut SessionMetrics,
     ) -> Result<(), BackendConnectionError> {
-        let context = &mut context.streams.others[stream_id - 1].context;
+        let context = &mut context.streams[stream_id].context;
         // we should get if the route is H2 or not here
         // for now we assume it's H1
         let cluster_id = self
@@ -317,7 +323,7 @@ impl Router {
     fn cluster_id_from_request(
         &mut self,
         context: &mut HttpContext,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
+        _proxy: Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
         let (host, uri, method) = match context.extract_route() {
             Ok(tuple) => tuple,
@@ -360,7 +366,7 @@ impl Router {
         frontend_should_stick: bool,
         context: &mut HttpContext,
         proxy: Rc<RefCell<dyn L7Proxy>>,
-        metrics: &mut SessionMetrics,
+        _metrics: &mut SessionMetrics,
     ) -> Result<TcpStream, BackendConnectionError> {
         let (backend, conn) = self
             .get_backend_for_sticky_session(
@@ -567,7 +573,7 @@ impl SessionState for Mux {
         let mut b = [0; 1024];
         let (size, status) = s.socket_read(&mut b);
         println!("{size} {status:?} {:?}", &b[..size]);
-        for stream in &mut self.context.streams.others {
+        for stream in &mut self.context.streams {
             for kawa in [&mut stream.front, &mut stream.back] {
                 kawa::debug_kawa(kawa);
                 kawa.prepare(&mut kawa::h1::BlockConverter);
