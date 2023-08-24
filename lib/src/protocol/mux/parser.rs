@@ -245,8 +245,8 @@ pub fn frame_body<'a>(
     }
 
     let f = match header.frame_type {
-        FrameType::Data => data_frame(i, &header)?,
-        FrameType::Headers => headers_frame(i, &header)?,
+        FrameType::Data => data_frame(i, header)?,
+        FrameType::Headers => headers_frame(i, header)?,
         FrameType::Priority => {
             if header.payload_len != 5 {
                 return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
@@ -257,30 +257,28 @@ pub fn frame_body<'a>(
             if header.payload_len != 4 {
                 return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
             }
-            rst_stream_frame(i, &header)?
+            rst_stream_frame(i, header)?
         }
-        FrameType::PushPromise => push_promise_frame(i, &header)?,
-        FrameType::Continuation => {
-            unimplemented!();
-        }
+        FrameType::PushPromise => push_promise_frame(i, header)?,
+        FrameType::Continuation => continuation_frame(i, header)?,
         FrameType::Settings => {
             if header.payload_len % 6 != 0 {
                 return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
             }
-            settings_frame(i, header.payload_len as usize)?
+            settings_frame(i, header)?
         }
         FrameType::Ping => {
             if header.payload_len != 8 {
                 return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
             }
-            ping_frame(i, &header)?
+            ping_frame(i, header)?
         }
-        FrameType::GoAway => goaway_frame(i, &header)?,
+        FrameType::GoAway => goaway_frame(i, header)?,
         FrameType::WindowUpdate => {
             if header.payload_len != 4 {
                 return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
             }
-            window_update_frame(i, &header)?
+            window_update_frame(i, header)?
         }
     };
 
@@ -341,7 +339,7 @@ pub struct StreamDependency {
     pub stream_id: u32,
 }
 
-fn stream_dependency<'a>(i: &'a [u8]) -> IResult<&'a [u8], StreamDependency, Error<'a>> {
+fn stream_dependency(i: &[u8]) -> IResult<&[u8], StreamDependency, Error<'_>> {
     let (i, stream) = map(be_u32, |i| StreamDependency {
         exclusive: i & 0x8000 != 0,
         stream_id: i & 0x7FFFFFFF,
@@ -443,6 +441,7 @@ pub fn rst_stream_frame<'a>(
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub settings: Vec<Setting>,
+    pub ack: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -453,16 +452,22 @@ pub struct Setting {
 
 pub fn settings_frame<'a>(
     input: &'a [u8],
-    payload_len: usize,
+    header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, Error<'a>> {
-    let (i, data) = take(payload_len)(input)?;
+    let (i, data) = take(header.payload_len)(input)?;
 
     let (_, settings) = many0(map(
         complete(tuple((be_u16, be_u32))),
         |(identifier, value)| Setting { identifier, value },
     ))(data)?;
 
-    Ok((i, Frame::Settings(Settings { settings })))
+    Ok((
+        i,
+        Frame::Settings(Settings {
+            settings,
+            ack: header.flags & 0x1 != 0,
+        }),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -511,7 +516,7 @@ pub struct Ping {
 
 pub fn ping_frame<'a>(
     input: &'a [u8],
-    header: &FrameHeader,
+    _header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, Error<'a>> {
     let (i, data) = take(8usize)(input)?;
 
