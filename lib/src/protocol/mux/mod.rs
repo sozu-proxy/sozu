@@ -171,6 +171,8 @@ impl<Front: SocketHandler> Connection<Front> {
 struct EndpointServer<'a>(&'a mut Connection<FrontRustls>);
 struct EndpointClient<'a>(&'a mut Router);
 
+// note: EndpointServer are used by client Connection, they do not know the frontend Token
+// they will use the Stream's Token which is their backend token
 impl<'a> UpdateReadiness for EndpointServer<'a> {
     fn readiness(&self, _token: Token) -> &Readiness {
         self.0.readiness()
@@ -188,9 +190,38 @@ impl<'a> UpdateReadiness for EndpointClient<'a> {
     }
 }
 
+// enum Stream {
+//     Idle {
+//         window: i32,
+//     },
+//     Open {
+//         window: i32,
+//         token: Token,
+//         front: GenericHttpStream,
+//         back: GenericHttpStream,
+//         context: HttpContext,
+//     },
+//     Reserved {
+//         window: i32,
+//         token: Token,
+//         position: Position,
+//         buffer: GenericHttpStream,
+//         context: HttpContext,
+//     },
+//     HalfClosed {
+//         window: i32,
+//         token: Token,
+//         position: Position,
+//         buffer: GenericHttpStream,
+//         context: HttpContext,
+//     },
+//     Closed,
+// }
+
 pub struct Stream {
     // pub request_id: Ulid,
     pub window: i32,
+    pub token: Option<Token>,
     front: GenericHttpStream,
     back: GenericHttpStream,
     pub context: HttpContext,
@@ -218,6 +249,7 @@ impl Stream {
         };
         Some(Self {
             window: window as i32,
+            token: None,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
             context: HttpContext {
@@ -306,7 +338,8 @@ impl Router {
         proxy: Rc<RefCell<dyn L7Proxy>>,
         metrics: &mut SessionMetrics,
     ) -> Result<(), BackendConnectionError> {
-        let context = &mut context.streams[stream_id].context;
+        let stream = &mut context.streams[stream_id];
+        let context = &mut stream.context;
         // we should get if the route is H2 or not here
         // for now we assume it's H1
         let cluster_id = self
@@ -348,6 +381,7 @@ impl Router {
             error!("error registering back socket({:?}): {:?}", socket, e);
         }
 
+        stream.token.insert(backend_token);
         self.backends
             .insert(backend_token, Connection::new_h1_client(socket, stream_id));
         Ok(())
@@ -492,7 +526,10 @@ impl SessionState for Mux {
             let mut dirty = false;
 
             if self.frontend.readiness().filter_interest().is_readable() {
-                match self.frontend.readable(context, EndpointClient(&mut self.router)) {
+                match self
+                    .frontend
+                    .readable(context, EndpointClient(&mut self.router))
+                {
                     MuxResult::Continue => (),
                     MuxResult::CloseSession => return SessionResult::Close,
                     MuxResult::Close(_) => todo!(),
@@ -537,7 +574,10 @@ impl SessionState for Mux {
             }
 
             if self.frontend.readiness().filter_interest().is_writable() {
-                match self.frontend.writable(context, EndpointClient(&mut self.router)) {
+                match self
+                    .frontend
+                    .writable(context, EndpointClient(&mut self.router))
+                {
                     MuxResult::Continue => (),
                     MuxResult::CloseSession => return SessionResult::Close,
                     MuxResult::Close(_) => todo!(),
