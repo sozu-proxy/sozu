@@ -17,7 +17,7 @@ pub struct ConnectionH1<Front: SocketHandler> {
 }
 
 impl<Front: SocketHandler> ConnectionH1<Front> {
-    pub fn readable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
+    pub fn readable<E>(&mut self, context: &mut Context, mut endpoint: E) -> MuxResult
     where
         E: UpdateReadiness,
     {
@@ -44,6 +44,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
         if kawa.is_terminated() {
             self.readiness.interest.remove(Ready::READABLE);
+        }
+        if kawa.is_main_phase() {
+            endpoint
+                .readiness_mut(stream.token.unwrap())
+                .interest
+                .insert(Ready::WRITABLE)
         }
         MuxResult::Continue
     }

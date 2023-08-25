@@ -143,7 +143,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 ) {
                     Ok((_, settings)) => {
                         kawa.storage.clear();
-                        self.handle(settings, context);
+                        self.handle(settings, context, endpoint);
                     }
                     Err(e) => panic!("{e:?}"),
                 }
@@ -223,7 +223,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if let H2StreamId::Zero = stream_id {
                     kawa.storage.clear();
                 }
-                let state_result = self.handle(frame, context);
+                let state_result = self.handle(frame, context, endpoint);
                 self.state = H2State::Header;
                 self.expect = Some((H2StreamId::Zero, 9));
                 return state_result;
@@ -239,8 +239,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         println!("======= MUX H2 WRITABLE");
         match (&self.state, &self.position) {
-            (H2State::ClientPreface, Position::Client) => todo!("Send PRI + client Settings"),
+            (H2State::ClientPreface, Position::Client) => todo!("Send PRI"),
             (H2State::ClientPreface, Position::Server) => unreachable!(),
+            (H2State::ClientSettings, Position::Client) => todo!("Send Settings"),
+            (H2State::ClientSettings, Position::Server) => unreachable!(),
             (H2State::ServerSettings, Position::Client) => unreachable!(),
             (H2State::ServerSettings, Position::Server) => {
                 let kawa = &mut self.zero;
@@ -257,7 +259,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 MuxResult::Continue
             }
-            _ => unreachable!(),
+            (H2State::Error, _) => unreachable!(),
+            // Proxying states (Header/Frame)
+            (_, _) => {
+                for stream_id in self.streams.values() {
+                    let kawa = context.streams[*stream_id].wbuffer(self.position);
+                    if kawa.is_main_phase() {
+                        kawa.prepare(&mut kawa::h2::BlockConverter);
+                        kawa::debug_kawa(kawa);
+                    }
+                }
+                self.readiness.interest.remove(Ready::WRITABLE);
+                MuxResult::Continue
+            }
         }
     }
 
@@ -269,7 +283,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         global_stream_id
     }
 
-    fn handle(&mut self, frame: Frame, context: &mut Context) -> MuxResult {
+    fn handle<E>(&mut self, frame: Frame, context: &mut Context, mut endpoint: E) -> MuxResult
+    where
+        E: UpdateReadiness,
+    {
         println!("{frame:?}");
         match frame {
             Frame::Data(data) => {
@@ -313,7 +330,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     parts.context,
                 );
                 kawa::debug_kawa(parts.rbuffer);
-                return MuxResult::Connect(global_stream_id);
+                match self.position {
+                    Position::Client => endpoint
+                        .readiness_mut(stream.token.unwrap())
+                        .interest
+                        .insert(Ready::WRITABLE),
+                    Position::Server => return MuxResult::Connect(global_stream_id),
+                };
             }
             Frame::PushPromise(push_promise) => match self.position {
                 Position::Client => {
