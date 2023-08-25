@@ -360,18 +360,12 @@ pub fn headers_frame<'a>(
         (i, None)
     };
 
-    let (i, stream_dependency) = if header.flags & 0x20 != 0 {
-        let (i, dep) = stream_dependency(i)?;
-        (i, Some(dep))
-    } else {
-        (i, None)
-    };
-
-    let (i, weight) = if header.flags & 0x20 != 0 {
+    let (i, stream_dependency, weight) = if header.flags & 0x20 != 0 {
+        let (i, stream_dependency) = stream_dependency(i)?;
         let (i, weight) = be_u8(i)?;
-        (i, Some(weight))
+        (i, Some(stream_dependency), Some(weight))
     } else {
-        (i, None)
+        (i, None, None)
     };
 
     if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
@@ -521,10 +515,7 @@ pub fn ping_frame<'a>(
     let (i, data) = take(8usize)(input)?;
 
     let mut p = Ping { payload: [0; 8] };
-
-    for i in 0..8 {
-        p.payload[i] = data[i];
-    }
+    p.payload[..8].copy_from_slice(&data[..8]);
 
     Ok((i, Frame::Ping(p)))
 }

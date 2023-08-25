@@ -56,20 +56,22 @@ pub fn handle_header<C>(
                     }
                 })
                 .unwrap();
-            let buffer = kawa.storage.data();
-            let uri = unsafe {
-                format!(
-                    "{}://{}{}",
-                    from_utf8_unchecked(scheme.data(buffer)),
-                    from_utf8_unchecked(authority.data(buffer)),
-                    from_utf8_unchecked(path.data(buffer))
-                )
-            };
-            println!("Reconstructed URI: {uri}");
+            // uri is only used by H1 statusline, in most cases it only consists of the path
+            // a better algorithm should be used though
+            // let buffer = kawa.storage.data();
+            // let uri = unsafe {
+            //     format!(
+            //         "{}://{}{}",
+            //         from_utf8_unchecked(scheme.data(buffer)),
+            //         from_utf8_unchecked(authority.data(buffer)),
+            //         from_utf8_unchecked(path.data(buffer))
+            //     )
+            // };
+            // println!("Reconstructed URI: {uri}");
             kawa::StatusLine::Request {
                 version: kawa::Version::V20,
                 method,
-                uri: kawa::Store::from_string(uri),
+                uri: path.clone(), //kawa::Store::from_string(uri),
                 authority,
                 path,
             }

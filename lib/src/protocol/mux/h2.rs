@@ -5,6 +5,7 @@ use sozu_command::ready::Ready;
 
 use crate::{
     protocol::mux::{
+        converter,
         parser::{self, error_code_to_str, Frame, FrameHeader, FrameType},
         pkawa, serializer, Context, GlobalStreamId, MuxResult, Position, StreamId,
     },
@@ -48,6 +49,7 @@ impl Default for H2Settings {
 }
 
 pub struct ConnectionH2<Front: SocketHandler> {
+    pub decoder: hpack::Decoder<'static>,
     pub expect: Option<(H2StreamId, usize)>,
     pub position: Position,
     pub readiness: Readiness,
@@ -262,14 +264,37 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (H2State::Error, _) => unreachable!(),
             // Proxying states (Header/Frame)
             (_, _) => {
-                for stream_id in self.streams.values() {
-                    let kawa = context.streams[*stream_id].wbuffer(self.position);
+                let mut converter = converter::H2BlockConverter {
+                    stream_id: 0,
+                    encoder: unsafe { std::mem::transmute(&mut self.decoder) },
+                    out: Vec::new(),
+                };
+                let mut want_write = false;
+                for (stream_id, global_stream_id) in &self.streams {
+                    let kawa = context.streams[*global_stream_id].wbuffer(self.position);
                     if kawa.is_main_phase() {
-                        kawa.prepare(&mut kawa::h2::BlockConverter);
+                        converter.stream_id = *stream_id;
+                        kawa.prepare(&mut converter);
                         kawa::debug_kawa(kawa);
+                        while !kawa.out.is_empty() {
+                            let bufs = kawa.as_io_slice();
+                            let (size, status) = self.socket.socket_write_vectored(&bufs);
+                            println!("  size: {size}, status: {status:?}");
+                            if size > 0 {
+                                kawa.consume(size);
+                            } else {
+                                want_write = true;
+                                break;
+                            }
+                        }
+                        if kawa.is_terminated() && kawa.is_completed() {
+                            // close stream
+                        }
                     }
                 }
-                self.readiness.interest.remove(Ready::WRITABLE);
+                if !want_write {
+                    self.readiness.interest.remove(Ready::WRITABLE);
+                }
                 MuxResult::Continue
             }
         }
@@ -326,7 +351,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     parts.rbuffer,
                     buffer,
                     headers.end_stream,
-                    &mut context.decoder,
+                    &mut self.decoder,
                     parts.context,
                 );
                 kawa::debug_kawa(parts.rbuffer);
