@@ -10,6 +10,7 @@ use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use sozu_command::ready::Ready;
 
+mod converter;
 mod h1;
 mod h2;
 mod parser;
@@ -105,6 +106,7 @@ impl<Front: SocketHandler> Connection<Front> {
             settings: H2Settings::default(),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             window: 1 << 16,
+            decoder: hpack::Decoder::new(),
         }))
     }
     pub fn new_h2_client(
@@ -127,6 +129,7 @@ impl<Front: SocketHandler> Connection<Front> {
             settings: H2Settings::default(),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             window: 1 << 16,
+            decoder: hpack::Decoder::new(),
         }))
     }
 
@@ -303,7 +306,6 @@ impl Stream {
 pub struct Context {
     pub streams: Vec<Stream>,
     pub pool: Weak<RefCell<Pool>>,
-    pub decoder: hpack::Decoder<'static>,
 }
 
 impl Context {
@@ -317,7 +319,6 @@ impl Context {
         Self {
             streams: Vec::new(),
             pool,
-            decoder: hpack::Decoder::new(),
         }
     }
 }
@@ -379,7 +380,7 @@ impl Router {
             error!("error registering back socket({:?}): {:?}", socket, e);
         }
 
-        stream.token.insert(backend_token);
+        stream.token = Some(backend_token);
         self.backends
             .insert(backend_token, Connection::new_h1_client(socket, stream_id));
         Ok(())
@@ -608,7 +609,7 @@ impl SessionState for Mux {
         SessionResult::Continue
     }
 
-    fn update_readiness(&mut self, token: Token, events: sozu_command::ready::Ready) {
+    fn update_readiness(&mut self, token: Token, events: Ready) {
         if token == self.frontend_token {
             self.frontend.readiness_mut().event |= events;
         } else if let Some(c) = self.router.backends.get_mut(&token) {
