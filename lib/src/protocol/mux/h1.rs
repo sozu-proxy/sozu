@@ -1,12 +1,10 @@
 use sozu_command::ready::Ready;
 
 use crate::{
-    protocol::mux::{Context, GlobalStreamId, MuxResult, Position},
-    socket::{SocketHandler, SocketResult},
+    protocol::mux::{Context, GlobalStreamId, MuxResult, Position, UpdateReadiness},
+    socket::SocketHandler,
     Readiness,
 };
-
-use super::UpdateReadiness;
 
 pub struct ConnectionH1<Front: SocketHandler> {
     pub position: Position,
@@ -23,21 +21,24 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     {
         println!("======= MUX H1 READABLE");
         let stream = &mut context.streams[self.stream];
-        let kawa = stream.rbuffer(self.position);
+        let parts = stream.split(self.position);
+        let kawa = parts.rbuffer;
         let (size, status) = self.socket.socket_read(kawa.storage.space());
         println!("  size: {size}, status: {status:?}");
         if size > 0 {
             kawa.storage.fill(size);
         } else {
             self.readiness.event.remove(Ready::READABLE);
+            return MuxResult::Continue;
         }
-        match status {
-            SocketResult::Continue => {}
-            SocketResult::Closed => todo!(),
-            SocketResult::Error => todo!(),
-            SocketResult::WouldBlock => self.readiness.event.remove(Ready::READABLE),
-        }
-        kawa::h1::parse(kawa, &mut kawa::h1::NoCallbacks);
+        // match status {
+        //     SocketResult::Continue => {}
+        //     SocketResult::Closed => todo!(),
+        //     SocketResult::Error => todo!(),
+        //     SocketResult::WouldBlock => self.readiness.event.remove(Ready::READABLE),
+        // }
+        let was_initial = kawa.is_initial();
+        kawa::h1::parse(kawa, parts.context);
         kawa::debug_kawa(kawa);
         if kawa.is_error() {
             return MuxResult::Close(self.stream);
@@ -45,11 +46,14 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if kawa.is_terminated() {
             self.readiness.interest.remove(Ready::READABLE);
         }
-        if kawa.is_main_phase() {
-            endpoint
-                .readiness_mut(stream.token.unwrap())
-                .interest
-                .insert(Ready::WRITABLE)
+        if was_initial && kawa.is_main_phase() {
+            match self.position {
+                Position::Client => endpoint
+                    .readiness_mut(stream.token.unwrap())
+                    .interest
+                    .insert(Ready::WRITABLE),
+                Position::Server => return MuxResult::Connect(self.stream),
+            };
         }
         MuxResult::Continue
     }
