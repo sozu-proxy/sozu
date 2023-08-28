@@ -79,7 +79,7 @@ impl<Front: SocketHandler> Connection<Front> {
             socket: front_stream,
             position: Position::Client,
             readiness: Readiness {
-                interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+                interest: Ready::WRITABLE | Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
             stream: stream_id,
@@ -120,7 +120,7 @@ impl<Front: SocketHandler> Connection<Front> {
             socket: front_stream,
             position: Position::Client,
             readiness: Readiness {
-                interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+                interest: Ready::WRITABLE | Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
             streams: HashMap::new(),
