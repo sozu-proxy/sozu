@@ -50,6 +50,7 @@ impl Default for H2Settings {
 
 pub struct ConnectionH2<Front: SocketHandler> {
     pub decoder: hpack::Decoder<'static>,
+    pub encoder: hpack::Encoder<'static>,
     pub expect: Option<(H2StreamId, usize)>,
     pub position: Position,
     pub readiness: Readiness,
@@ -263,7 +264,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (_, _) => {
                 let mut converter = converter::H2BlockConverter {
                     stream_id: 0,
-                    encoder: unsafe { std::mem::transmute(&mut self.decoder) },
+                    encoder: &mut self.encoder,
                     out: Vec::new(),
                 };
                 let mut want_write = false;
