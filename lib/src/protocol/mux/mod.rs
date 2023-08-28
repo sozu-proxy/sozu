@@ -107,6 +107,7 @@ impl<Front: SocketHandler> Connection<Front> {
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             window: 1 << 16,
             decoder: hpack::Decoder::new(),
+            encoder: hpack::Encoder::new(),
         }))
     }
     pub fn new_h2_client(
@@ -130,6 +131,7 @@ impl<Front: SocketHandler> Connection<Front> {
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             window: 1 << 16,
             decoder: hpack::Decoder::new(),
+            encoder: hpack::Encoder::new(),
         }))
     }
 
@@ -590,7 +592,7 @@ impl SessionState for Mux {
                     || backend.readiness().filter_interest().is_error()
                 {
                     println!("{:?} {:?}", backend.readiness(), backend.socket());
-                    return SessionResult::Close;
+                    // return SessionResult::Close;
                 }
             }
 

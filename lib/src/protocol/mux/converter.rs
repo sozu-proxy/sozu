@@ -1,4 +1,8 @@
+use std::str::from_utf8_unchecked;
+
 use kawa::{AsBuffer, Block, BlockConverter, Chunk, Flags, Kawa, Pair, StatusLine, Store};
+
+use crate::protocol::http::parser::compare_no_case;
 
 use super::{
     parser::{FrameHeader, FrameType},
@@ -14,7 +18,7 @@ pub struct H2BlockConverter<'a> {
 
 impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
     fn call(&mut self, block: Block, kawa: &mut Kawa<T>) {
-        let buffer = kawa.storage.mut_buffer();
+        let buffer = kawa.storage.buffer();
         match block {
             Block::StatusLine => match kawa.detached.status_line.pop() {
                 StatusLine::Request {
@@ -66,20 +70,21 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
             }
             Block::Header(Pair { key, val }) => {
                 {
-                    // let key = key.data(kawa.storage.buffer());
-                    // let val = val.data(kawa.storage.buffer());
-                    // if compare_no_case(key, b"connection")
-                    //     || compare_no_case(key, b"host")
-                    //     || compare_no_case(key, b"http2-settings")
-                    //     || compare_no_case(key, b"keep-alive")
-                    //     || compare_no_case(key, b"proxy-connection")
-                    //     || compare_no_case(key, b"te") && !compare_no_case(val, b"trailers")
-                    //     || compare_no_case(key, b"trailer")
-                    //     || compare_no_case(key, b"transfer-encoding")
-                    //     || compare_no_case(key, b"upgrade")
-                    // {
-                    //     return;
-                    // }
+                    let key = key.data(buffer);
+                    let val = val.data(buffer);
+                    if compare_no_case(key, b"connection")
+                        || compare_no_case(key, b"host")
+                        || compare_no_case(key, b"http2-settings")
+                        || compare_no_case(key, b"keep-alive")
+                        || compare_no_case(key, b"proxy-connection")
+                        || compare_no_case(key, b"te") && !compare_no_case(val, b"trailers")
+                        || compare_no_case(key, b"trailer")
+                        || compare_no_case(key, b"transfer-encoding")
+                        || compare_no_case(key, b"upgrade")
+                    {
+                        println!("Elided H2 header: {}", unsafe { from_utf8_unchecked(key) });
+                        return;
+                    }
                 }
                 self.encoder
                     .encode_header_into(
