@@ -82,7 +82,10 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                     // }
                 }
                 self.encoder
-                    .encode_header_into((key.data(buffer), val.data(buffer)), &mut self.out)
+                    .encode_header_into(
+                        (&key.data(buffer).to_ascii_lowercase(), val.data(buffer)),
+                        &mut self.out,
+                    )
                     .unwrap();
             }
             Block::ChunkHeader(_) => {

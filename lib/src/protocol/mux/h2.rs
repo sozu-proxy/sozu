@@ -251,14 +251,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 println!("{:?}", kawa.storage.data());
                 let (size, status) = self.socket.socket_write(kawa.storage.data());
                 println!("  size: {size}, status: {status:?}");
-                let size = kawa.storage.available_data();
-                kawa.storage.consume(size);
-                if kawa.storage.is_empty() {
-                    self.readiness.interest.remove(Ready::WRITABLE);
-                    self.readiness.interest.insert(Ready::READABLE);
-                    self.state = H2State::Header;
-                    self.expect = Some((H2StreamId::Zero, 9));
-                }
+                kawa.storage.clear();
+                self.readiness.interest.remove(Ready::WRITABLE);
+                self.readiness.interest.insert(Ready::READABLE);
+                self.state = H2State::Header;
+                self.expect = Some((H2StreamId::Zero, 9));
                 MuxResult::Continue
             }
             (H2State::Error, _) => unreachable!(),
