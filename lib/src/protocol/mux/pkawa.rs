@@ -1,6 +1,9 @@
 use std::{io::Write, str::from_utf8_unchecked};
 
-use kawa::h1::ParserCallbacks;
+use kawa::{
+    h1::ParserCallbacks, repr::Slice, Block, BodySize, Flags, Kind, Pair, ParsingPhase, StatusLine,
+    Store, Version,
+};
 
 use crate::{pool::Checkout, protocol::http::parser::compare_no_case};
 
@@ -15,20 +18,20 @@ pub fn handle_header<C>(
 ) where
     C: ParserCallbacks<Checkout>,
 {
-    kawa.push_block(kawa::Block::StatusLine);
+    kawa.push_block(Block::StatusLine);
     kawa.detached.status_line = match kawa.kind {
-        kawa::Kind::Request => {
-            let mut method = kawa::Store::Empty;
-            let mut authority = kawa::Store::Empty;
-            let mut path = kawa::Store::Empty;
-            let mut scheme = kawa::Store::Empty;
+        Kind::Request => {
+            let mut method = Store::Empty;
+            let mut authority = Store::Empty;
+            let mut path = Store::Empty;
+            let mut scheme = Store::Empty;
             decoder
                 .decode_with_cb(input, |k, v| {
                     let start = kawa.storage.end as u32;
                     kawa.storage.write_all(&v).unwrap();
                     let len_key = k.len() as u32;
                     let len_val = v.len() as u32;
-                    let val = kawa::Store::Slice(kawa::repr::Slice {
+                    let val = Store::Slice(Slice {
                         start,
                         len: len_val,
                     });
@@ -45,14 +48,14 @@ pub fn handle_header<C>(
                         if compare_no_case(&k, b"content-length") {
                             let length =
                                 unsafe { from_utf8_unchecked(&v).parse::<usize>().unwrap() };
-                            kawa.body_size = kawa::BodySize::Length(length);
+                            kawa.body_size = BodySize::Length(length);
                         }
                         kawa.storage.write_all(&k).unwrap();
-                        let key = kawa::Store::Slice(kawa::repr::Slice {
+                        let key = Store::Slice(Slice {
                             start: start + len_val,
                             len: len_key,
                         });
-                        kawa.push_block(kawa::Block::Header(kawa::Pair { key, val }));
+                        kawa.push_block(Block::Header(Pair { key, val }));
                     }
                 })
                 .unwrap();
@@ -68,24 +71,24 @@ pub fn handle_header<C>(
             //     )
             // };
             // println!("Reconstructed URI: {uri}");
-            kawa::StatusLine::Request {
-                version: kawa::Version::V20,
+            StatusLine::Request {
+                version: Version::V20,
                 method,
-                uri: path.clone(), //kawa::Store::from_string(uri),
+                uri: path.clone(), //Store::from_string(uri),
                 authority,
                 path,
             }
         }
-        kawa::Kind::Response => {
+        Kind::Response => {
             let mut code = 0;
-            let mut status = kawa::Store::Empty;
+            let mut status = Store::Empty;
             decoder
                 .decode_with_cb(input, |k, v| {
                     let start = kawa.storage.end as u32;
                     kawa.storage.write_all(&v).unwrap();
                     let len_key = k.len() as u32;
                     let len_val = v.len() as u32;
-                    let val = kawa::Store::Slice(kawa::repr::Slice {
+                    let val = Store::Slice(Slice {
                         start,
                         len: len_val,
                     });
@@ -100,19 +103,19 @@ pub fn handle_header<C>(
                         }
                     } else {
                         kawa.storage.write_all(&k).unwrap();
-                        let key = kawa::Store::Slice(kawa::repr::Slice {
+                        let key = Store::Slice(Slice {
                             start: start + len_val,
                             len: len_key,
                         });
-                        kawa.push_block(kawa::Block::Header(kawa::Pair { key, val }));
+                        kawa.push_block(Block::Header(Pair { key, val }));
                     }
                 })
                 .unwrap();
-            kawa::StatusLine::Response {
-                version: kawa::Version::V20,
+            StatusLine::Response {
+                version: Version::V20,
                 code,
                 status,
-                reason: kawa::Store::Empty,
+                reason: Store::Empty,
             }
         }
     };
@@ -122,7 +125,7 @@ pub fn handle_header<C>(
 
     callbacks.on_headers(kawa);
 
-    kawa.push_block(kawa::Block::Flags(kawa::Flags {
+    kawa.push_block(Block::Flags(Flags {
         end_body: false,
         end_chunk: false,
         end_header: true,
@@ -130,21 +133,21 @@ pub fn handle_header<C>(
     }));
 
     if end_stream {
-        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+        kawa.push_block(Block::Flags(Flags {
             end_body: true,
             end_chunk: false,
             end_header: false,
             end_stream: true,
         }));
-        kawa.body_size = kawa::BodySize::Length(0);
+        kawa.body_size = BodySize::Length(0);
     }
     kawa.parsing_phase = match kawa.body_size {
-        kawa::BodySize::Chunked => kawa::ParsingPhase::Chunks { first: true },
-        kawa::BodySize::Length(0) => kawa::ParsingPhase::Terminated,
-        kawa::BodySize::Length(_) => kawa::ParsingPhase::Body,
-        kawa::BodySize::Empty => {
+        BodySize::Chunked => ParsingPhase::Chunks { first: true },
+        BodySize::Length(0) => ParsingPhase::Terminated,
+        BodySize::Length(_) => ParsingPhase::Body,
+        BodySize::Empty => {
             println!("HTTP is just the worst...");
-            kawa::ParsingPhase::Body
+            ParsingPhase::Body
         }
     };
 }
