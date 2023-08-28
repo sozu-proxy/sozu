@@ -27,12 +27,12 @@ pub enum H2State {
 
 #[derive(Debug)]
 pub struct H2Settings {
-    settings_header_table_size: u32,
-    settings_enable_push: bool,
-    settings_max_concurrent_streams: u32,
-    settings_initial_window_size: u32,
-    settings_max_frame_size: u32,
-    settings_max_header_list_size: u32,
+    pub settings_header_table_size: u32,
+    pub settings_enable_push: bool,
+    pub settings_max_concurrent_streams: u32,
+    pub settings_initial_window_size: u32,
+    pub settings_max_frame_size: u32,
+    pub settings_max_header_list_size: u32,
 }
 
 impl Default for H2Settings {
@@ -135,7 +135,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             (H2State::ClientSettings, Position::Server) => {
                 let i = kawa.storage.data();
-                match parser::settings_frame(
+                let settings = match parser::settings_frame(
                     i,
                     &FrameHeader {
                         payload_len: i.len() as u32,
@@ -146,10 +146,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 ) {
                     Ok((_, settings)) => {
                         kawa.storage.clear();
-                        self.handle(settings, context, endpoint);
+                        settings
                     }
                     Err(e) => panic!("{e:?}"),
-                }
+                };
                 self.state = H2State::ServerSettings;
                 let kawa = &mut self.zero;
                 match serializer::gen_frame_header(
@@ -164,25 +164,34 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, size)) => kawa.storage.fill(size),
                     Err(e) => panic!("could not serialize HeaderFrame: {e:?}"),
                 };
-                // kawa.storage
-                //     .write(&[1, 3, 0, 0, 0, 100, 0, 4, 0, 1, 0, 0])
-                //     .unwrap();
-                match serializer::gen_frame_header(
-                    kawa.storage.space(),
-                    &FrameHeader {
-                        payload_len: 0,
-                        frame_type: FrameType::Settings,
-                        flags: 1,
-                        stream_id: 0,
-                    },
-                ) {
-                    Ok((_, size)) => kawa.storage.fill(size),
-                    Err(e) => panic!("could not serialize HeaderFrame: {e:?}"),
-                };
-                self.readiness.interest.insert(Ready::WRITABLE);
-                self.readiness.interest.remove(Ready::READABLE);
+
+                self.handle(settings, context, endpoint);
             }
-            (H2State::ServerSettings, Position::Client) => todo!("Receive server Settings"),
+            (H2State::ServerSettings, Position::Client) => {
+                let i = kawa.storage.data();
+
+                match parser::frame_header(i) {
+                    Ok((
+                        _,
+                        FrameHeader {
+                            payload_len,
+                            frame_type: FrameType::Settings,
+                            flags: 0,
+                            stream_id: 0,
+                        },
+                    )) => {
+                        kawa.storage.clear();
+                        self.expect = Some((H2StreamId::Zero, payload_len as usize));
+                        self.state = H2State::Frame(FrameHeader {
+                            payload_len,
+                            frame_type: FrameType::Settings,
+                            flags: 0,
+                            stream_id: 0,
+                        })
+                    }
+                    _ => todo!(),
+                };
+            }
             (H2State::ServerSettings, Position::Server) => {
                 error!("waiting for ServerPreface to finish writing")
             }
@@ -215,7 +224,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Err(e) => panic!("{e:?}"),
                 };
             }
-            (H2State::Frame(header), Position::Server) => {
+            (H2State::Frame(header), _) => {
                 let i = kawa.storage.data();
                 println!("  data: {i:?}");
                 let frame =
@@ -242,9 +251,32 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         println!("======= MUX H2 WRITABLE");
         match (&self.state, &self.position) {
-            (H2State::ClientPreface, Position::Client) => todo!("Send PRI"),
+            (H2State::ClientPreface, Position::Client) => {
+                let pri = serializer::H2_PRI.as_bytes();
+                let kawa = &mut self.zero;
+
+                kawa.storage.space()[0..pri.len()].copy_from_slice(pri);
+                kawa.storage.fill(pri.len());
+
+                self.state = H2State::ClientSettings;
+                MuxResult::Continue
+            }
             (H2State::ClientPreface, Position::Server) => unreachable!(),
-            (H2State::ClientSettings, Position::Client) => todo!("Send Settings"),
+            (H2State::ClientSettings, Position::Client) => {
+                let kawa = &mut self.zero;
+                match serializer::gen_settings(kawa.storage.space(), &self.settings) {
+                    Ok((_, size)) => kawa.storage.fill(size),
+                    Err(e) => panic!("{e:?}"),
+                };
+                let (size, status) = self.socket.socket_write(kawa.storage.data());
+                self.state = H2State::ServerSettings;
+                self.readiness.interest.remove(Ready::WRITABLE);
+                self.readiness.interest.insert(Ready::READABLE);
+                kawa.storage.clear();
+
+                self.expect = Some((H2StreamId::Zero, 9));
+                MuxResult::Continue
+            }
             (H2State::ClientSettings, Position::Server) => unreachable!(),
             (H2State::ServerSettings, Position::Client) => unreachable!(),
             (H2State::ServerSettings, Position::Server) => {
@@ -290,6 +322,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         }
                     }
                 }
+
+                let kawa = &mut self.zero;
+                self.socket.socket_write(kawa.storage.data());
+                kawa.storage.clear();
+
                 if !want_write {
                     self.readiness.interest.remove(Ready::WRITABLE);
                 }
@@ -395,6 +432,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
                 println!("{:#?}", self.settings);
+
+                let kawa = &mut self.zero;
+                kawa.storage.space()[0..serializer::SETTINGS_ACKNOWLEDGEMENT.len()]
+                    .copy_from_slice(&serializer::SETTINGS_ACKNOWLEDGEMENT);
+                kawa.storage
+                    .fill(serializer::SETTINGS_ACKNOWLEDGEMENT.len());
+
+                self.readiness.interest.insert(Ready::WRITABLE);
+                self.readiness.interest.remove(Ready::READABLE);
             }
             Frame::Ping(_) => todo!(),
             Frame::GoAway(goaway) => {
