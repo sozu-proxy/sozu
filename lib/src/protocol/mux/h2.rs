@@ -13,7 +13,7 @@ use crate::{
     Readiness,
 };
 
-use super::{GenericHttpStream, UpdateReadiness};
+use super::{Endpoint, GenericHttpStream, BackendStatus};
 
 #[derive(Debug)]
 pub enum H2State {
@@ -61,6 +61,21 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub zero: GenericHttpStream,
     pub window: u32,
 }
+impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionH2")
+            .field("expect", &self.expect)
+            .field("position", &self.position)
+            .field("readiness", &self.readiness)
+            .field("settings", &self.settings)
+            .field("socket", &self.socket.socket_ref())
+            .field("state", &self.state)
+            .field("streams", &self.streams)
+            .field("zero", &self.zero.storage.meter(20))
+            .field("window", &self.window)
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum H2StreamId {
@@ -71,13 +86,13 @@ pub enum H2StreamId {
 impl<Front: SocketHandler> ConnectionH2<Front> {
     pub fn readable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
     where
-        E: UpdateReadiness,
+        E: Endpoint,
     {
         println!("======= MUX H2 READABLE");
         let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect {
             let kawa = match stream_id {
                 H2StreamId::Zero => &mut self.zero,
-                H2StreamId::Global(stream_id) => context.streams[stream_id].rbuffer(self.position),
+                H2StreamId::Global(stream_id) => context.streams[stream_id].rbuffer(&self.position),
             };
             if amount > 0 {
                 let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
@@ -107,7 +122,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return MuxResult::Continue;
         };
         match (&self.state, &self.position) {
-            (H2State::ClientPreface, Position::Client) => {
+            (H2State::ClientPreface, Position::Client(_)) => {
                 error!("Waiting for ClientPreface to finish writing")
             }
             (H2State::ClientPreface, Position::Server) => {
@@ -167,7 +182,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
                 self.handle(settings, context, endpoint);
             }
-            (H2State::ServerSettings, Position::Client) => {
+            (H2State::ServerSettings, Position::Client(_)) => {
                 let i = kawa.storage.data();
 
                 match parser::frame_header(i) {
@@ -200,7 +215,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 println!("  header: {i:?}");
                 match parser::frame_header(i) {
                     Ok((_, header)) => {
-                        println!("{header:?}");
+                        println!("{header:#?}");
                         kawa.storage.clear();
                         let stream_id = if header.stream_id == 0 {
                             H2StreamId::Zero
@@ -245,13 +260,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    pub fn writable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
+    pub fn writable<E>(&mut self, context: &mut Context, mut endpoint: E) -> MuxResult
     where
-        E: UpdateReadiness,
+        E: Endpoint,
     {
         println!("======= MUX H2 WRITABLE");
         match (&self.state, &self.position) {
-            (H2State::ClientPreface, Position::Client) => {
+            (H2State::ClientPreface, Position::Client(_)) => {
                 let pri = serializer::H2_PRI.as_bytes();
                 let kawa = &mut self.zero;
 
@@ -262,7 +277,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             (H2State::ClientPreface, Position::Server) => unreachable!(),
-            (H2State::ClientSettings, Position::Client) => {
+            (H2State::ClientSettings, Position::Client(_)) => {
                 let kawa = &mut self.zero;
                 match serializer::gen_settings(kawa.storage.space(), &self.settings) {
                     Ok((_, size)) => kawa.storage.fill(size),
@@ -278,7 +293,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             (H2State::ClientSettings, Position::Server) => unreachable!(),
-            (H2State::ServerSettings, Position::Client) => unreachable!(),
+            (H2State::ServerSettings, Position::Client(_)) => unreachable!(),
             (H2State::ServerSettings, Position::Server) => {
                 let kawa = &mut self.zero;
                 println!("{:?}", kawa.storage.data());
@@ -300,8 +315,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     out: Vec::new(),
                 };
                 let mut want_write = false;
+                let mut dead_streams = Vec::new();
                 for (stream_id, global_stream_id) in &self.streams {
-                    let kawa = context.streams[*global_stream_id].wbuffer(self.position);
+                    let stream = &mut context.streams[*global_stream_id];
+                    let kawa = stream.wbuffer(&self.position);
                     if kawa.is_main_phase() {
                         converter.stream_id = *stream_id;
                         kawa.prepare(&mut converter);
@@ -318,9 +335,22 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             }
                         }
                         if kawa.is_terminated() && kawa.is_completed() {
-                            // close stream
+                            match self.position {
+                                Position::Client(_) => {}
+                                Position::Server => {
+                                    endpoint.end_stream(
+                                        stream.token.unwrap(),
+                                        *global_stream_id,
+                                        context,
+                                    );
+                                    dead_streams.push(*stream_id);
+                                }
+                            }
                         }
                     }
+                }
+                for stream_id in dead_streams {
+                    self.streams.remove(&stream_id).unwrap();
                 }
 
                 let kawa = &mut self.zero;
@@ -345,15 +375,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     fn handle<E>(&mut self, frame: Frame, context: &mut Context, mut endpoint: E) -> MuxResult
     where
-        E: UpdateReadiness,
+        E: Endpoint,
     {
-        println!("{frame:?}");
+        println!("{frame:#?}");
         match frame {
             Frame::Data(data) => {
                 let mut slice = data.payload;
                 let global_stream_id = *self.streams.get(&data.stream_id).unwrap();
                 let stream = &mut context.streams[global_stream_id];
-                let kawa = stream.rbuffer(self.position);
+                let kawa = stream.rbuffer(&self.position);
                 slice.start += kawa.storage.head as u32;
                 kawa.storage.head += slice.len();
                 let buffer = kawa.storage.buffer();
@@ -381,7 +411,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let kawa = &mut self.zero;
                 let buffer = headers.header_block_fragment.data(kawa.storage.buffer());
                 let stream = &mut context.streams[global_stream_id];
-                let parts = &mut stream.split(self.position);
+                let parts = &mut stream.split(&self.position);
                 pkawa::handle_header(
                     parts.rbuffer,
                     buffer,
@@ -391,7 +421,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 kawa::debug_kawa(parts.rbuffer);
                 match self.position {
-                    Position::Client => endpoint
+                    Position::Client(_) => endpoint
                         .readiness_mut(stream.token.unwrap())
                         .interest
                         .insert(Ready::WRITABLE),
@@ -399,7 +429,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 };
             }
             Frame::PushPromise(push_promise) => match self.position {
-                Position::Client => {
+                Position::Client(_) => {
                     todo!("if enabled forward the push")
                 }
                 Position::Server => {
@@ -462,5 +492,41 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Frame::Continuation(_) => todo!(),
         }
         MuxResult::Continue
+    }
+
+    pub fn close<E>(&mut self, context: &mut Context, mut endpoint: E)
+    where
+        E: Endpoint,
+    {
+        match self.position {
+            Position::Client(BackendStatus::Connecting(_)) => todo!("reconnect"),
+            Position::Client(_) => {}
+            Position::Server => unreachable!(),
+        }
+        for global_stream_id in self.streams.values() {
+            endpoint.end_stream(
+                context.streams[*global_stream_id].token.unwrap(),
+                *global_stream_id,
+                context,
+            )
+        }
+    }
+
+    pub fn end_stream(&mut self, stream: usize, context: &mut Context) {
+        let stream_context = &mut context.streams[stream].context;
+        println!("end H2 stream {stream}: {stream_context:#?}");
+        for (stream_id, global_stream_id) in &self.streams {
+            if *global_stream_id == stream {
+                let id = *stream_id;
+                self.streams.remove(&id);
+                break;
+            }
+        }
+        todo!()
+    }
+
+    pub fn start_stream(&mut self, stream: usize, context: &mut Context) {
+        println!("start new H2 stream {stream}");
+        todo!()
     }
 }

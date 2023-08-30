@@ -165,6 +165,12 @@ pub struct FrontRustls {
     pub session: ServerConnection,
 }
 
+impl std::fmt::Debug for FrontRustls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FrontRustls")
+    }
+}
+
 impl SocketHandler for FrontRustls {
     fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
         let mut size = 0usize;

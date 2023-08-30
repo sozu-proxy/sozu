@@ -36,7 +36,7 @@ pub struct HttpContext {
     pub user_agent: Option<String>,
 
     // ========== Read only
-    /// signals wether Kawa should write a "Connection" header with a "close" value (request and response)
+    /// signals whether Kawa should write a "Connection" header with a "close" value (request and response)
     pub closing: bool,
     /// the value of the custom header, named "Sozu-Id", that Kawa should write (request and response)
     pub id: Ulid,
@@ -258,6 +258,10 @@ impl HttpContext {
                 .data_opt(buf)
                 .and_then(|data| from_utf8(data).ok())
                 .map(ToOwned::to_owned);
+        }
+
+        if self.method == Some(Method::Head) {
+            response.body_size = kawa::BodySize::Length(0);
         }
 
         // If found:
