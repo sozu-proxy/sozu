@@ -1,5 +1,3 @@
-use core::slice;
-
 use cookie_factory::{
     bytes::{be_u16, be_u24, be_u32, be_u8},
     combinator::slice,
