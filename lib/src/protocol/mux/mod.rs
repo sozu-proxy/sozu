@@ -39,10 +39,18 @@ type GenericHttpStream = kawa::Kawa<Checkout>;
 type StreamId = u32;
 type GlobalStreamId = usize;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum Position {
-    Client,
+    Client(BackendStatus),
     Server,
+}
+
+#[derive(Debug)]
+pub enum BackendStatus {
+    Connecting(String),
+    Connected(String),
+    KeepAlive(String),
+    Disconnecting,
 }
 
 pub enum MuxResult {
@@ -52,14 +60,17 @@ pub enum MuxResult {
     Connect(GlobalStreamId),
 }
 
+#[derive(Debug)]
 pub enum Connection<Front: SocketHandler> {
     H1(ConnectionH1<Front>),
     H2(ConnectionH2<Front>),
 }
 
-pub trait UpdateReadiness {
+pub trait Endpoint {
     fn readiness(&self, token: Token) -> &Readiness;
     fn readiness_mut(&mut self, token: Token) -> &mut Readiness;
+    fn end_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context);
+    fn start_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context);
 }
 
 impl<Front: SocketHandler> Connection<Front> {
@@ -74,15 +85,15 @@ impl<Front: SocketHandler> Connection<Front> {
             stream: 0,
         })
     }
-    pub fn new_h1_client(front_stream: Front, stream_id: GlobalStreamId) -> Connection<Front> {
+    pub fn new_h1_client(front_stream: Front, cluster_id: String) -> Connection<Front> {
         Connection::H1(ConnectionH1 {
             socket: front_stream,
-            position: Position::Client,
+            position: Position::Client(BackendStatus::Connecting(cluster_id)),
             readiness: Readiness {
                 interest: Ready::WRITABLE | Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
-            stream: stream_id,
+            stream: 0,
         })
     }
 
@@ -112,6 +123,7 @@ impl<Front: SocketHandler> Connection<Front> {
     }
     pub fn new_h2_client(
         front_stream: Front,
+        cluster_id: String,
         pool: Weak<RefCell<Pool>>,
     ) -> Option<Connection<Front>> {
         let buffer = pool
@@ -119,7 +131,7 @@ impl<Front: SocketHandler> Connection<Front> {
             .and_then(|pool| pool.borrow_mut().checkout())?;
         Some(Connection::H2(ConnectionH2 {
             socket: front_stream,
-            position: Position::Client,
+            position: Position::Client(BackendStatus::Connecting(cluster_id)),
             readiness: Readiness {
                 interest: Ready::WRITABLE | Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
@@ -147,6 +159,18 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => &mut c.readiness,
         }
     }
+    fn position(&self) -> &Position {
+        match self {
+            Connection::H1(c) => &c.position,
+            Connection::H2(c) => &c.position,
+        }
+    }
+    fn position_mut(&mut self) -> &mut Position {
+        match self {
+            Connection::H1(c) => &mut c.position,
+            Connection::H2(c) => &mut c.position,
+        }
+    }
     pub fn socket(&self) -> &TcpStream {
         match self {
             Connection::H1(c) => c.socket.socket_ref(),
@@ -155,7 +179,7 @@ impl<Front: SocketHandler> Connection<Front> {
     }
     fn readable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
     where
-        E: UpdateReadiness,
+        E: Endpoint,
     {
         match self {
             Connection::H1(c) => c.readable(context, endpoint),
@@ -164,11 +188,35 @@ impl<Front: SocketHandler> Connection<Front> {
     }
     fn writable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
     where
-        E: UpdateReadiness,
+        E: Endpoint,
     {
         match self {
             Connection::H1(c) => c.writable(context, endpoint),
             Connection::H2(c) => c.writable(context, endpoint),
+        }
+    }
+
+    fn close<E>(&mut self, context: &mut Context, endpoint: E)
+    where
+        E: Endpoint,
+    {
+        match self {
+            Connection::H1(c) => c.close(context, endpoint),
+            Connection::H2(c) => c.close(context, endpoint),
+        }
+    }
+
+    fn end_stream(&mut self, stream: usize, context: &mut Context) {
+        match self {
+            Connection::H1(c) => c.end_stream(stream, context),
+            Connection::H2(c) => c.end_stream(stream, context),
+        }
+    }
+
+    fn start_stream(&mut self, stream: usize, context: &mut Context) {
+        match self {
+            Connection::H1(c) => c.start_stream(stream, context),
+            Connection::H2(c) => c.start_stream(stream, context),
         }
     }
 }
@@ -178,20 +226,47 @@ struct EndpointClient<'a>(&'a mut Router);
 
 // note: EndpointServer are used by client Connection, they do not know the frontend Token
 // they will use the Stream's Token which is their backend token
-impl<'a> UpdateReadiness for EndpointServer<'a> {
+impl<'a> Endpoint for EndpointServer<'a> {
     fn readiness(&self, _token: Token) -> &Readiness {
         self.0.readiness()
     }
     fn readiness_mut(&mut self, _token: Token) -> &mut Readiness {
         self.0.readiness_mut()
     }
+
+    fn end_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context) {
+        // this may be used to forward H2<->H2 RstStream
+        // or to handle backend hup
+        self.0.end_stream(stream, context);
+    }
+
+    fn start_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context) {
+        // this may be used to forward H2<->H2 PushPromise
+        todo!()
+    }
 }
-impl<'a> UpdateReadiness for EndpointClient<'a> {
+impl<'a> Endpoint for EndpointClient<'a> {
     fn readiness(&self, token: Token) -> &Readiness {
         self.0.backends.get(&token).unwrap().readiness()
     }
     fn readiness_mut(&mut self, token: Token) -> &mut Readiness {
         self.0.backends.get_mut(&token).unwrap().readiness_mut()
+    }
+
+    fn end_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context) {
+        self.0
+            .backends
+            .get_mut(&token)
+            .unwrap()
+            .end_stream(stream, context);
+    }
+
+    fn start_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context) {
+        self.0
+            .backends
+            .get_mut(&token)
+            .unwrap()
+            .start_stream(stream, context);
     }
 }
 
@@ -260,8 +335,8 @@ impl Stream {
             context: HttpContext {
                 backend_id: None,
                 cluster_id: None,
-                keep_alive_backend: false,
-                keep_alive_frontend: false,
+                keep_alive_backend: true,
+                keep_alive_frontend: true,
                 sticky_session_found: None,
                 method: None,
                 authority: None,
@@ -279,9 +354,9 @@ impl Stream {
             },
         })
     }
-    pub fn split(&mut self, position: Position) -> StreamParts<'_> {
+    pub fn split(&mut self, position: &Position) -> StreamParts<'_> {
         match position {
-            Position::Client => StreamParts {
+            Position::Client(_) => StreamParts {
                 rbuffer: &mut self.back,
                 wbuffer: &mut self.front,
                 context: &mut self.context,
@@ -293,15 +368,15 @@ impl Stream {
             },
         }
     }
-    pub fn rbuffer(&mut self, position: Position) -> &mut GenericHttpStream {
+    pub fn rbuffer(&mut self, position: &Position) -> &mut GenericHttpStream {
         match position {
-            Position::Client => &mut self.back,
+            Position::Client(_) => &mut self.back,
             Position::Server => &mut self.front,
         }
     }
-    pub fn wbuffer(&mut self, position: Position) -> &mut GenericHttpStream {
+    pub fn wbuffer(&mut self, position: &Position) -> &mut GenericHttpStream {
         match position {
-            Position::Client => &mut self.front,
+            Position::Client(_) => &mut self.front,
             Position::Server => &mut self.back,
         }
     }
@@ -342,13 +417,13 @@ impl Router {
         metrics: &mut SessionMetrics,
     ) -> Result<(), BackendConnectionError> {
         let stream = &mut context.streams[stream_id];
-        let context = &mut stream.context;
-        // we should get if the route is H2 or not here
-        // for now we assume it's H1
-        let cluster_id = self
-            .cluster_id_from_request(context, proxy.clone())
+        // when reused, a stream should be detached from its old connection, if not we could end
+        // with concurrent connections on a single endpoint
+        assert!(stream.token.is_none());
+        let stream_context = &mut stream.context;
+        let (cluster_id, h2) = self
+            .route_from_request(stream_context, proxy.clone())
             .map_err(BackendConnectionError::RetrieveClusterError)?;
-        println!("{cluster_id}!!!!!");
 
         let frontend_should_stick = proxy
             .borrow()
@@ -357,44 +432,95 @@ impl Router {
             .map(|cluster| cluster.sticky_session)
             .unwrap_or(false);
 
-        let mut socket = self.backend_from_request(
-            &cluster_id,
-            frontend_should_stick,
-            context,
-            proxy.clone(),
-            metrics,
-        )?;
+        let mut reuse_token = None;
+        // let mut priority = 0;
+        let mut reuse_connecting = true;
+        for (token, backend) in &self.backends {
+            match (h2, reuse_connecting, backend.position()) {
+                (_, _, Position::Server) => panic!("Backend connection behaves like a server"),
+                (_, _, Position::Client(BackendStatus::Disconnecting)) => {}
 
-        if let Err(e) = socket.set_nodelay(true) {
-            error!(
-                "error setting nodelay on back socket({:?}): {:?}",
-                socket, e
-            );
+                (true, _, Position::Client(BackendStatus::Connected(old_cluster_id))) => {
+                    if *old_cluster_id == cluster_id {
+                        reuse_token = Some(*token);
+                        reuse_connecting = false;
+                        break;
+                    }
+                }
+                (true, true, Position::Client(BackendStatus::Connecting(old_cluster_id))) => {
+                    if *old_cluster_id == cluster_id {
+                        reuse_token = Some(*token)
+                    }
+                }
+                (true, false, Position::Client(BackendStatus::Connecting(_))) => {}
+                (true, _, Position::Client(BackendStatus::KeepAlive(_))) => {
+                    panic!("ConnectionH2 behaves like H1")
+                }
+
+                (false, _, Position::Client(BackendStatus::KeepAlive(old_cluster_id))) => {
+                    if *old_cluster_id == cluster_id {
+                        reuse_token = Some(*token);
+                        reuse_connecting = false;
+                        break;
+                    }
+                }
+                // can't bundle H1 streams together
+                (false, _, Position::Client(BackendStatus::Connected(_)))
+                | (false, _, Position::Client(BackendStatus::Connecting(_))) => {}
+            }
         }
-        // self.backend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
-        // self.backend_connection_status = BackendConnectionStatus::Connecting(Instant::now());
+        println!("connect: {cluster_id} (stick={frontend_should_stick}, h2={h2}) -> (reuse={reuse_token:?})");
 
-        let backend_token = proxy.borrow().add_session(session);
+        let token = if let Some(token) = reuse_token {
+            token
+        } else {
+            let mut socket = self.backend_from_request(
+                &cluster_id,
+                frontend_should_stick,
+                stream_context,
+                proxy.clone(),
+                metrics,
+            )?;
 
-        if let Err(e) = proxy.borrow().register_socket(
-            &mut socket,
-            backend_token,
-            Interest::READABLE | Interest::WRITABLE,
-        ) {
-            error!("error registering back socket({:?}): {:?}", socket, e);
-        }
+            if let Err(e) = socket.set_nodelay(true) {
+                error!(
+                    "error setting nodelay on back socket({:?}): {:?}",
+                    socket, e
+                );
+            }
+            // self.backend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
+            // self.backend_connection_status = BackendConnectionStatus::Connecting(Instant::now());
 
-        stream.token = Some(backend_token);
+            let token = proxy.borrow().add_session(session);
+
+            if let Err(e) = proxy.borrow().register_socket(
+                &mut socket,
+                token,
+                Interest::READABLE | Interest::WRITABLE,
+            ) {
+                error!("error registering back socket({:?}): {:?}", socket, e);
+            }
+
+            let connection = Connection::new_h1_client(socket, cluster_id);
+            self.backends.insert(token, connection);
+            token
+        };
+
+        // link stream to backend
+        stream.token = Some(token);
+        // link backend to stream
         self.backends
-            .insert(backend_token, Connection::new_h1_client(socket, stream_id));
+            .get_mut(&token)
+            .unwrap()
+            .start_stream(stream_id, context);
         Ok(())
     }
 
-    fn cluster_id_from_request(
+    fn route_from_request(
         &mut self,
         context: &mut HttpContext,
         _proxy: Rc<RefCell<dyn L7Proxy>>,
-    ) -> Result<String, RetrieveClusterError> {
+    ) -> Result<(String, bool), RetrieveClusterError> {
         let (host, uri, method) = match context.extract_route() {
             Ok(tuple) => tuple,
             Err(cluster_error) => {
@@ -419,7 +545,7 @@ impl Router {
         };
 
         let cluster_id = match route {
-            Route::Cluster { id, .. } => id,
+            Route::Cluster { id, h2 } => (id, h2),
             Route::Deny => {
                 panic!("Route::Deny");
                 // self.set_answer(DefaultAnswerStatus::Answer401, None);
@@ -554,8 +680,28 @@ impl SessionState for Mux {
                 dirty = true;
             }
 
-            for (_, backend) in self.router.backends.iter_mut() {
-                if backend.readiness().filter_interest().is_writable() {
+            let mut dead_backends = Vec::new();
+            for (token, backend) in self.router.backends.iter_mut() {
+                let readiness = backend.readiness().filter_interest();
+                if readiness.is_hup() || readiness.is_error() {
+                    println!(
+                        "{token:?} -> {:?} {:?}",
+                        backend.readiness(),
+                        backend.socket()
+                    );
+                    backend.close(context, EndpointServer(&mut self.frontend));
+                    dead_backends.push(*token);
+                }
+                if readiness.is_writable() {
+                    let mut owned_position = Position::Server;
+                    let position = backend.position_mut();
+                    std::mem::swap(&mut owned_position, position);
+                    match owned_position {
+                        Position::Client(BackendStatus::Connecting(cluster_id)) => {
+                            *position = Position::Client(BackendStatus::Connected(cluster_id));
+                        }
+                        _ => *position = owned_position,
+                    }
                     match backend.writable(context, EndpointServer(&mut self.frontend)) {
                         MuxResult::Continue => (),
                         MuxResult::CloseSession => return SessionResult::Close,
@@ -565,7 +711,7 @@ impl SessionState for Mux {
                     dirty = true;
                 }
 
-                if backend.readiness().filter_interest().is_readable() {
+                if readiness.is_readable() {
                     match backend.readable(context, EndpointServer(&mut self.frontend)) {
                         MuxResult::Continue => (),
                         MuxResult::CloseSession => return SessionResult::Close,
@@ -574,6 +720,13 @@ impl SessionState for Mux {
                     }
                     dirty = true;
                 }
+            }
+            if !dead_backends.is_empty() {
+                for token in &dead_backends {
+                    self.router.backends.remove(token);
+                }
+                println!("FRONTEND: {:#?}", &self.frontend);
+                println!("BACKENDS: {:#?}", self.router.backends);
             }
 
             if self.frontend.readiness().filter_interest().is_writable() {
@@ -587,15 +740,6 @@ impl SessionState for Mux {
                     MuxResult::Connect(_) => unreachable!(),
                 }
                 dirty = true;
-            }
-
-            for backend in self.router.backends.values() {
-                if backend.readiness().filter_interest().is_hup()
-                    || backend.readiness().filter_interest().is_error()
-                {
-                    println!("{:?} {:?}", backend.readiness(), backend.socket());
-                    // return SessionResult::Close;
-                }
             }
 
             if !dirty {
