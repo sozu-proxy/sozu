@@ -87,7 +87,7 @@ StateMachineBuilder! {
     enum HttpsStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
-        Mux(Mux),
+        Mux(Mux<FrontRustls>),
         Http(Http<FrontRustls, HttpsListener>),
         WebSocket(Pipe<FrontRustls, HttpsListener>),
         Http2(Http2<FrontRustls>) -> todo!("H2"),
@@ -307,7 +307,7 @@ impl HttpsSession {
         debug!("https switching to wss");
         let front_token = self.frontend_token;
         let back_token = unwrap_msg!(http.backend_token);
-        let ws_context = http.websocket_context();
+        let (ws_context, _) = http.upgrade_context();
 
         let mut container_frontend_timeout = http.container_frontend_timeout;
         let mut container_backend_timeout = http.container_backend_timeout;

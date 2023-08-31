@@ -209,6 +209,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 status: None,
                 reason: None,
                 user_agent: None,
+                upgrade: None,
             },
         })
     }
@@ -721,16 +722,19 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     /// Format the context of the websocket into a loggable String
-    pub fn websocket_context(&self) -> String {
-        format!(
-            "{}",
-            Endpoint::Http {
-                method: self.context.method.as_ref(),
-                authority: self.context.authority.as_deref(),
-                path: self.context.path.as_deref(),
-                status: self.context.status,
-                reason: self.context.reason.as_deref(),
-            }
+    pub fn upgrade_context(&self) -> (String, String) {
+        (
+            format!(
+                "{}",
+                Endpoint::Http {
+                    method: self.context.method.as_ref(),
+                    authority: self.context.authority.as_deref(),
+                    path: self.context.path.as_deref(),
+                    status: self.context.status,
+                    reason: self.context.reason.as_deref(),
+                }
+            ),
+            self.context.upgrade.to_owned().expect("protocol error"),
         )
     }
 

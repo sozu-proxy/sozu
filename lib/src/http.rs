@@ -28,9 +28,15 @@ use sozu_command::{
 };
 
 use crate::{
-    protocol::SessionState, router::Router, timer::TimeoutContainer, util::UnwrapLog, CachedTags,
-    FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError, ListenerHandler,
-    ProxyError, SessionIsToBeClosed, SessionResult, StateMachineBuilder,
+    protocol::{
+        mux::{self, Mux},
+        SessionState,
+    },
+    router::Router,
+    timer::TimeoutContainer,
+    util::UnwrapLog,
+    CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
+    ListenerHandler, ProxyError, SessionIsToBeClosed, SessionResult, StateMachineBuilder,
 };
 
 use super::{
@@ -66,6 +72,7 @@ StateMachineBuilder! {
         Expect(ExpectProxyProtocol<TcpStream>),
         Http(Http<TcpStream, HttpListener>),
         WebSocket(Pipe<TcpStream, HttpListener>),
+        Mux(Mux<TcpStream>),
     }
 }
 
@@ -165,6 +172,7 @@ impl HttpSession {
             HttpStateMachine::Http(http) => self.upgrade_http(http),
             HttpStateMachine::Expect(expect) => self.upgrade_expect(expect),
             HttpStateMachine::WebSocket(ws) => self.upgrade_websocket(ws),
+            HttpStateMachine::Mux(_) => unreachable!(),
             HttpStateMachine::FailedUpgrade(_) => unreachable!(),
         };
 
@@ -216,11 +224,35 @@ impl HttpSession {
         }
     }
 
+    fn upgrade_to_http2(
+        &mut self,
+        http: Http<TcpStream, HttpListener>,
+    ) -> Option<HttpStateMachine> {
+        let mux = Mux {
+            frontend_token: self.frontend_token,
+            frontend: mux::Connection::new_h2_server(http.frontend_socket, self.pool.clone())?,
+            router: mux::Router {
+                listener: self.listener.clone() as Rc<RefCell<dyn L7ListenerHandler>>,
+                backends: HashMap::new(),
+            },
+            public_address: http.context.public_address,
+            peer_address: http.context.session_address,
+            sticky_name: self.sticky_name.clone(),
+            context: mux::Context::new(self.pool.clone()),
+        };
+
+        Some(HttpStateMachine::Mux(mux))
+    }
+
     fn upgrade_http(&mut self, http: Http<TcpStream, HttpListener>) -> Option<HttpStateMachine> {
         debug!("http switching to ws");
         let front_token = self.frontend_token;
         let back_token = unwrap_msg!(http.backend_token);
-        let ws_context = http.websocket_context();
+        let context = http.upgrade_context();
+
+        if context.1.as_str() == "h2c" {
+            return self.upgrade_to_http2(http);
+        }
 
         let mut container_frontend_timeout = http.container_frontend_timeout;
         let mut container_backend_timeout = http.container_backend_timeout;
@@ -242,7 +274,7 @@ impl HttpSession {
             Protocol::HTTP,
             http.context.id,
             http.context.session_address,
-            Some(ws_context),
+            Some(context.0),
         );
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
@@ -280,6 +312,8 @@ impl ProxySession for HttpSession {
                 gauge_add!("protocol.ws", -1);
                 gauge_add!("websocket.active_requests", -1);
             }
+            // TODO
+            StateMarker::Mux => {}
         }
 
         if self.state.failed() {

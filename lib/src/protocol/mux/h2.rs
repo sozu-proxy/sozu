@@ -13,7 +13,7 @@ use crate::{
     Readiness,
 };
 
-use super::{Endpoint, GenericHttpStream, BackendStatus};
+use super::{BackendStatus, Endpoint, GenericHttpStream};
 
 #[derive(Debug)]
 pub enum H2State {

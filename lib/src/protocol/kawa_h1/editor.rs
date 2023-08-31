@@ -51,6 +51,8 @@ pub struct HttpContext {
     /// the sticky session that should be used
     /// used to create a "Set-Cookie" header in the response in case it differs from sticky_session_found
     pub sticky_session: Option<String>,
+    /// the value of the upgrade header
+    pub upgrade: Option<String>,
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -147,6 +149,12 @@ impl HttpContext {
                         forwarded = Some(header);
                     } else if compare_no_case(key, b"User-Agent") {
                         self.user_agent = header
+                            .val
+                            .data_opt(buf)
+                            .and_then(|data| from_utf8(data).ok())
+                            .map(ToOwned::to_owned);
+                    } else if compare_no_case(key, b"Upgrade") {
+                        self.upgrade = header
                             .val
                             .data_opt(buf)
                             .and_then(|data| from_utf8(data).ok())

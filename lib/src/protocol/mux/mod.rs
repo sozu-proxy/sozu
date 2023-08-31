@@ -19,7 +19,6 @@ mod serializer;
 
 use crate::{
     backends::{Backend, BackendError},
-    https::HttpsListener,
     pool::{Checkout, Pool},
     protocol::{
         http::editor::HttpContext,
@@ -221,12 +220,12 @@ impl<Front: SocketHandler> Connection<Front> {
     }
 }
 
-struct EndpointServer<'a>(&'a mut Connection<FrontRustls>);
+struct EndpointServer<'a, Front: SocketHandler>(&'a mut Connection<Front>);
 struct EndpointClient<'a>(&'a mut Router);
 
 // note: EndpointServer are used by client Connection, they do not know the frontend Token
 // they will use the Stream's Token which is their backend token
-impl<'a> Endpoint for EndpointServer<'a> {
+impl<'a, Front: SocketHandler> Endpoint for EndpointServer<'a, Front> {
     fn readiness(&self, _token: Token) -> &Readiness {
         self.0.readiness()
     }
@@ -349,6 +348,7 @@ impl Stream {
                 session_address: None,
                 sticky_name: "SOZUBALANCEID".to_owned(),
                 sticky_session: None,
+                upgrade: None,
             },
         })
     }
@@ -401,7 +401,7 @@ impl Context {
 }
 
 pub struct Router {
-    pub listener: Rc<RefCell<HttpsListener>>,
+    pub listener: Rc<RefCell<dyn L7ListenerHandler>>,
     pub backends: HashMap<Token, Connection<TcpStream>>,
 }
 
@@ -618,9 +618,9 @@ impl Router {
     }
 }
 
-pub struct Mux {
+pub struct Mux<Front: SocketHandler> {
     pub frontend_token: Token,
-    pub frontend: Connection<FrontRustls>,
+    pub frontend: Connection<Front>,
     pub router: Router,
     pub public_address: SocketAddr,
     pub peer_address: Option<SocketAddr>,
@@ -628,13 +628,13 @@ pub struct Mux {
     pub context: Context,
 }
 
-impl Mux {
+impl<Front: SocketHandler> Mux<Front> {
     pub fn front_socket(&self) -> &TcpStream {
         self.frontend.socket()
     }
 }
 
-impl SessionState for Mux {
+impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
     fn ready(
         &mut self,
         session: Rc<RefCell<dyn ProxySession>>,
