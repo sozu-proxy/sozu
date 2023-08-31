@@ -30,7 +30,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     where
         E: Endpoint,
     {
-        println!("======= MUX H1 READABLE");
+        println!("======= MUX H1 READABLE {:?}", self.position);
         let stream = &mut context.streams[self.stream];
         let parts = stream.split(&self.position);
         let kawa = parts.rbuffer;
@@ -72,7 +72,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     where
         E: Endpoint,
     {
-        println!("======= MUX H1 WRITABLE");
+        println!("======= MUX H1 WRITABLE {:?}", self.position);
         let stream = &mut context.streams[self.stream];
         let kawa = stream.wbuffer(&self.position);
         kawa.prepare(&mut kawa::h1::BlockConverter);
@@ -122,7 +122,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         )
     }
 
-    pub fn end_stream(&mut self, stream: usize, context: &mut Context) {
+    pub fn end_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
         assert_eq!(stream, self.stream);
         let stream_context = &mut context.streams[stream].context;
         println!("end H1 stream {stream}: {stream_context:#?}");
@@ -144,8 +144,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
     }
 
-    pub fn start_stream(&mut self, stream: usize, context: &mut Context) {
-        println!("start H1 stream {stream}");
+    pub fn start_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
+        println!("start H1 stream {stream} {:?}", self.readiness);
         self.stream = stream;
         let mut owned_position = Position::Server;
         std::mem::swap(&mut owned_position, &mut self.position);
