@@ -119,6 +119,7 @@ impl<Front: SocketHandler> Connection<Front> {
             window: 1 << 16,
             decoder: hpack::Decoder::new(),
             encoder: hpack::Encoder::new(),
+            last_stream_id: 0,
         }))
     }
     pub fn new_h2_client(
@@ -133,7 +134,7 @@ impl<Front: SocketHandler> Connection<Front> {
             socket: front_stream,
             position: Position::Client(BackendStatus::Connecting(cluster_id)),
             readiness: Readiness {
-                interest: Ready::WRITABLE | Ready::READABLE | Ready::HUP | Ready::ERROR,
+                interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
             streams: HashMap::new(),
@@ -144,6 +145,7 @@ impl<Front: SocketHandler> Connection<Front> {
             window: 1 << 16,
             decoder: hpack::Decoder::new(),
             encoder: hpack::Encoder::new(),
+            last_stream_id: 0,
         }))
     }
 
@@ -206,14 +208,14 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
-    fn end_stream(&mut self, stream: usize, context: &mut Context) {
+    fn end_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
         match self {
             Connection::H1(c) => c.end_stream(stream, context),
             Connection::H2(c) => c.end_stream(stream, context),
         }
     }
 
-    fn start_stream(&mut self, stream: usize, context: &mut Context) {
+    fn start_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
         match self {
             Connection::H1(c) => c.start_stream(stream, context),
             Connection::H2(c) => c.start_stream(stream, context),
@@ -300,6 +302,7 @@ impl<'a> Endpoint for EndpointClient<'a> {
 
 pub struct Stream {
     // pub request_id: Ulid,
+    pub active: bool,
     pub window: i32,
     pub token: Option<Token>,
     front: GenericHttpStream,
@@ -315,6 +318,29 @@ pub struct StreamParts<'a> {
     pub context: &'a mut HttpContext,
 }
 
+fn temporary_http_context(request_id: Ulid) -> HttpContext {
+    HttpContext {
+        backend_id: None,
+        cluster_id: None,
+        keep_alive_backend: true,
+        keep_alive_frontend: true,
+        sticky_session_found: None,
+        method: None,
+        authority: None,
+        path: None,
+        status: None,
+        reason: None,
+        user_agent: None,
+        closing: false,
+        id: request_id,
+        protocol: crate::Protocol::HTTPS,
+        public_address: "0.0.0.0:80".parse().unwrap(),
+        session_address: None,
+        sticky_name: "SOZUBALANCEID".to_owned(),
+        sticky_session: None,
+    }
+}
+
 impl Stream {
     pub fn new(pool: Weak<RefCell<Pool>>, request_id: Ulid, window: u32) -> Option<Self> {
         let (front_buffer, back_buffer) = match pool.upgrade() {
@@ -328,30 +354,12 @@ impl Stream {
             None => return None,
         };
         Some(Self {
+            active: true,
             window: window as i32,
             token: None,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
-            context: HttpContext {
-                backend_id: None,
-                cluster_id: None,
-                keep_alive_backend: true,
-                keep_alive_frontend: true,
-                sticky_session_found: None,
-                method: None,
-                authority: None,
-                path: None,
-                status: None,
-                reason: None,
-                user_agent: None,
-                closing: false,
-                id: request_id,
-                protocol: crate::Protocol::HTTPS,
-                public_address: "0.0.0.0:80".parse().unwrap(),
-                session_address: None,
-                sticky_name: "SOZUBALANCEID".to_owned(),
-                sticky_session: None,
-            },
+            context: temporary_http_context(request_id),
         })
     }
     pub fn split(&mut self, position: &Position) -> StreamParts<'_> {
@@ -389,6 +397,20 @@ pub struct Context {
 
 impl Context {
     pub fn create_stream(&mut self, request_id: Ulid, window: u32) -> Option<GlobalStreamId> {
+        for (stream_id, stream) in self.streams.iter_mut().enumerate() {
+            if !stream.active {
+                println!("Reuse stream: {stream_id}");
+                stream.window = window as i32;
+                stream.context = temporary_http_context(request_id);
+                stream.back.clear();
+                stream.back.storage.clear();
+                stream.front.clear();
+                stream.front.storage.clear();
+                stream.token = None;
+                stream.active = true;
+                return Some(stream_id);
+            }
+        }
         self.streams
             .push(Stream::new(self.pool.clone(), request_id, window)?);
         Some(self.streams.len() - 1)
@@ -472,6 +494,7 @@ impl Router {
         println!("connect: {cluster_id} (stick={frontend_should_stick}, h2={h2}) -> (reuse={reuse_token:?})");
 
         let token = if let Some(token) = reuse_token {
+            println!("reused backend: {:#?}", self.backends.get(&token).unwrap());
             token
         } else {
             let mut socket = self.backend_from_request(
@@ -501,7 +524,11 @@ impl Router {
                 error!("error registering back socket({:?}): {:?}", socket, e);
             }
 
-            let connection = Connection::new_h1_client(socket, cluster_id);
+            let connection = if h2 {
+                Connection::new_h2_client(socket, cluster_id, context.pool.clone()).unwrap()
+            } else {
+                Connection::new_h1_client(socket, cluster_id)
+            };
             self.backends.insert(token, connection);
             token
         };

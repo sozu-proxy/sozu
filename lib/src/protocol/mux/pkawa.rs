@@ -95,12 +95,7 @@ pub fn handle_header<C>(
 
                     if compare_no_case(&k, b":status") {
                         status = val;
-                        code = unsafe {
-                            std::str::from_utf8_unchecked(&k)
-                                .parse::<u16>()
-                                .ok()
-                                .unwrap()
-                        }
+                        code = unsafe { from_utf8_unchecked(&v).parse::<u16>().ok().unwrap() }
                     } else {
                         kawa.storage.write_all(&k).unwrap();
                         let key = Store::Slice(Slice {
@@ -115,7 +110,7 @@ pub fn handle_header<C>(
                 version: Version::V20,
                 code,
                 status,
-                reason: Store::Empty,
+                reason: Store::Static(b"Default"),
             }
         }
     };
@@ -124,6 +119,15 @@ pub fn handle_header<C>(
     kawa.storage.head = kawa.storage.end;
 
     callbacks.on_headers(kawa);
+
+    if end_stream {
+        if let BodySize::Empty = kawa.body_size {
+            kawa.push_block(Block::Header(Pair {
+                key: Store::Static(b"Content-Length"),
+                val: Store::Static(b"0"),
+            }));
+        }
+    }
 
     kawa.push_block(Block::Flags(Flags {
         end_body: false,
