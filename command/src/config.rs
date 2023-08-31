@@ -667,6 +667,11 @@ pub enum PathRuleType {
     Equals,
 }
 
+/// Congruent with command.proto
+fn default_rule_position() -> RulePosition {
+    RulePosition::Tree
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileClusterFrontendConfig {
@@ -682,7 +687,7 @@ pub struct FileClusterFrontendConfig {
     pub certificate_chain: Option<String>,
     #[serde(default)]
     pub tls_versions: Vec<TlsVersion>,
-    #[serde(default)]
+    #[serde(default = "default_rule_position")]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
     pub h2: Option<bool>,
