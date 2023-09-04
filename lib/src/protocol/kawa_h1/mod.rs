@@ -268,7 +268,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             _ => return,
         };
 
-        self.context.id = Ulid::generate();
         self.context.reset();
 
         self.request_stream.clear();
