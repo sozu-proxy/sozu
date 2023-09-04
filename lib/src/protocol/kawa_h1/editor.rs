@@ -356,6 +356,7 @@ impl HttpContext {
         self.status = None;
         self.reason = None;
         self.user_agent = None;
+        self.id = Ulid::generate();
     }
 
     pub fn log_context(&self) -> LogContext {

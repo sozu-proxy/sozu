@@ -44,6 +44,8 @@ pub fn handle_header<C>(
                         path = val;
                     } else if compare_no_case(&k, b":scheme") {
                         scheme = val;
+                    } else if compare_no_case(&k, b"cookie") {
+                        panic!("cookies should be split in pairs");
                     } else {
                         if compare_no_case(&k, b"content-length") {
                             let length =
@@ -145,6 +147,11 @@ pub fn handle_header<C>(
         }));
         kawa.body_size = BodySize::Length(0);
     }
+
+    if kawa.parsing_phase == ParsingPhase::Terminated {
+        return;
+    }
+
     kawa.parsing_phase = match kawa.body_size {
         BodySize::Chunked => ParsingPhase::Chunks { first: true },
         BodySize::Length(0) => ParsingPhase::Terminated,
