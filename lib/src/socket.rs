@@ -196,7 +196,7 @@ impl SocketHandler for FrontRustls {
                 break;
             }
 
-            if !can_read | is_error | is_closed {
+            if !can_read || is_error || is_closed {
                 break;
             }
 

@@ -1,7 +1,10 @@
 use sozu_command::ready::Ready;
 
 use crate::{
-    protocol::mux::{BackendStatus, Context, Endpoint, GlobalStreamId, MuxResult, Position},
+    protocol::mux::{
+        update_readiness_after_read, update_readiness_after_write, BackendStatus, Context,
+        Endpoint, GlobalStreamId, MuxResult, Position,
+    },
     socket::SocketHandler,
     Readiness,
 };
@@ -12,6 +15,7 @@ pub struct ConnectionH1<Front: SocketHandler> {
     pub socket: Front,
     /// note: a Server H1 will always reference stream 0, but a client can reference any stream
     pub stream: GlobalStreamId,
+    pub requests: usize,
 }
 
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
@@ -35,19 +39,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let parts = stream.split(&self.position);
         let kawa = parts.rbuffer;
         let (size, status) = self.socket.socket_read(kawa.storage.space());
-        println!("  size: {size}, status: {status:?}");
-        if size > 0 {
-            kawa.storage.fill(size);
-        } else {
-            self.readiness.event.remove(Ready::READABLE);
+        kawa.storage.fill(size);
+        if update_readiness_after_read(size, status, &mut self.readiness) {
             return MuxResult::Continue;
         }
-        // match status {
-        //     SocketResult::Continue => {}
-        //     SocketResult::Closed => todo!(),
-        //     SocketResult::Error => todo!(),
-        //     SocketResult::WouldBlock => self.readiness.event.remove(Ready::READABLE),
-        // }
+
         let was_initial = kawa.is_initial();
         kawa::h1::parse(kawa, parts.context);
         kawa::debug_kawa(kawa);
@@ -58,6 +54,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             self.readiness.interest.remove(Ready::READABLE);
         }
         if was_initial && kawa.is_main_phase() {
+            self.requests += 1;
+            println!("REQUESTS: {}", self.requests);
             match self.position {
                 Position::Client(_) => endpoint
                     .readiness_mut(stream.token.unwrap())
@@ -83,18 +81,22 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             return MuxResult::Continue;
         }
         let (size, status) = self.socket.socket_write_vectored(&bufs);
-        println!("  size: {size}, status: {status:?}");
-        if size > 0 {
-            kawa.consume(size);
-            // self.backend_readiness.interest.insert(Ready::READABLE);
-        } else {
-            self.readiness.event.remove(Ready::WRITABLE);
+        kawa.consume(size);
+        if update_readiness_after_write(size, status, &mut self.readiness) {
+            return MuxResult::Continue;
         }
+
         if kawa.is_terminated() && kawa.is_completed() {
             match self.position {
                 Position::Client(_) => self.readiness.interest.insert(Ready::READABLE),
                 Position::Server => {
-                    endpoint.end_stream(stream.token.unwrap(), self.stream, context)
+                    stream.context.reset();
+                    stream.back.clear();
+                    stream.back.storage.clear();
+                    stream.front.clear();
+                    // do not clear stream.front because of H1 pipelining
+                    let token = stream.token.take().unwrap();
+                    endpoint.end_stream(token, self.stream, context);
                 }
             }
         }
@@ -112,7 +114,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 return;
             }
             Position::Client(BackendStatus::Connecting(_)) => todo!("reconnect"),
-            Position::Client(_) => {}
+            Position::Client(BackendStatus::Connected(_)) => {}
             Position::Server => unreachable!(),
         }
         endpoint.end_stream(

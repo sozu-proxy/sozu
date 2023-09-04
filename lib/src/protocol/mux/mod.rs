@@ -27,7 +27,7 @@ use crate::{
         SessionState,
     },
     router::Route,
-    socket::{FrontRustls, SocketHandler},
+    socket::{FrontRustls, SocketHandler, SocketResult},
     BackendConnectionError, L7ListenerHandler, L7Proxy, ProxySession, Readiness,
     RetrieveClusterError, SessionMetrics, SessionResult, StateResult,
 };
@@ -83,6 +83,7 @@ impl<Front: SocketHandler> Connection<Front> {
                 event: Ready::EMPTY,
             },
             stream: 0,
+            requests: 0,
         })
     }
     pub fn new_h1_client(front_stream: Front, cluster_id: String) -> Connection<Front> {
@@ -94,6 +95,7 @@ impl<Front: SocketHandler> Connection<Front> {
                 event: Ready::EMPTY,
             },
             stream: 0,
+            requests: 0,
         })
     }
 
@@ -113,7 +115,8 @@ impl<Front: SocketHandler> Connection<Front> {
             },
             streams: HashMap::new(),
             state: H2State::ClientPreface,
-            expect: Some((H2StreamId::Zero, 24 + 9)),
+            expect_read: Some((H2StreamId::Zero, 24 + 9)),
+            expect_write: None,
             settings: H2Settings::default(),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             window: 1 << 16,
@@ -139,7 +142,8 @@ impl<Front: SocketHandler> Connection<Front> {
             },
             streams: HashMap::new(),
             state: H2State::ClientPreface,
-            expect: None,
+            expect_read: None,
+            expect_write: None,
             settings: H2Settings::default(),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             window: 1 << 16,
@@ -269,6 +273,52 @@ impl<'a> Endpoint for EndpointClient<'a> {
             .get_mut(&token)
             .unwrap()
             .start_stream(stream, context);
+    }
+}
+
+fn update_readiness_after_read(
+    size: usize,
+    status: SocketResult,
+    readiness: &mut Readiness,
+) -> bool {
+    println!("  size={size}, status={status:?}");
+    match status {
+        SocketResult::Continue => {}
+        SocketResult::Closed | SocketResult::Error => {
+            readiness.event.remove(Ready::ALL);
+        }
+        SocketResult::WouldBlock => {
+            readiness.event.remove(Ready::READABLE);
+        }
+    }
+    if size > 0 {
+        false
+    } else {
+        readiness.event.remove(Ready::READABLE);
+        true
+    }
+}
+fn update_readiness_after_write(
+    size: usize,
+    status: SocketResult,
+    readiness: &mut Readiness,
+) -> bool {
+    println!("  size={size}, status={status:?}");
+    match status {
+        SocketResult::Continue => {}
+        SocketResult::Closed | SocketResult::Error => {
+            // even if the socket closed there might be something left to read
+            readiness.event.remove(Ready::WRITABLE);
+        }
+        SocketResult::WouldBlock => {
+            readiness.event.remove(Ready::WRITABLE);
+        }
+    }
+    if size > 0 {
+        false
+    } else {
+        readiness.event.remove(Ready::WRITABLE);
+        true
     }
 }
 
@@ -709,11 +759,7 @@ impl SessionState for Mux {
             for (token, backend) in self.router.backends.iter_mut() {
                 let readiness = backend.readiness().filter_interest();
                 if readiness.is_hup() || readiness.is_error() {
-                    println!(
-                        "{token:?} -> {:?} {:?}",
-                        backend.readiness(),
-                        backend.socket()
-                    );
+                    println!("{token:?} -> {:?}", backend);
                     backend.close(context, EndpointServer(&mut self.frontend));
                     dead_backends.push(*token);
                 }
@@ -776,6 +822,7 @@ impl SessionState for Mux {
 
         if counter == max_loop_iterations {
             incr!("http.infinite_loop.error");
+            panic!();
             return SessionResult::Close;
         }
 

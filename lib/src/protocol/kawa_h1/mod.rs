@@ -219,10 +219,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     /// Reset the connection in case of keep-alive to be ready for the next request
     pub fn reset(&mut self) {
         trace!("==============reset");
-        self.context.keep_alive_frontend = true;
-        self.context.keep_alive_backend = true;
-        self.context.sticky_session_found = None;
-        self.context.id = Ulid::generate();
+        self.context.reset();
 
         self.request_stream.clear();
         self.response_stream.clear();

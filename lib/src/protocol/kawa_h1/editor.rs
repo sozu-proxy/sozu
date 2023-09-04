@@ -349,4 +349,16 @@ impl HttpContext {
 
         Ok((given_authority, given_path, given_method))
     }
+
+    pub fn reset(&mut self) {
+        self.keep_alive_backend = true;
+        self.sticky_session_found = None;
+        self.method = None;
+        self.authority = None;
+        self.path = None;
+        self.status = None;
+        self.reason = None;
+        self.user_agent = None;
+        self.id = Ulid::generate();
+    }
 }
