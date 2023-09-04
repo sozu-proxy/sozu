@@ -7,7 +7,8 @@ use crate::{
     protocol::mux::{
         converter,
         parser::{self, error_code_to_str, Frame, FrameHeader, FrameType},
-        pkawa, serializer, Context, GlobalStreamId, MuxResult, Position, StreamId,
+        pkawa, serializer, update_readiness_after_read, update_readiness_after_write, Context,
+        GlobalStreamId, MuxResult, Position, StreamId,
     },
     socket::SocketHandler,
     Readiness,
@@ -51,7 +52,8 @@ impl Default for H2Settings {
 pub struct ConnectionH2<Front: SocketHandler> {
     pub decoder: hpack::Decoder<'static>,
     pub encoder: hpack::Encoder<'static>,
-    pub expect: Option<(H2StreamId, usize)>,
+    pub expect_read: Option<(H2StreamId, usize)>,
+    pub expect_write: Option<H2StreamId>,
     pub position: Position,
     pub readiness: Readiness,
     pub settings: H2Settings,
@@ -65,7 +67,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionH2")
-            .field("expect", &self.expect)
+            .field("expect", &self.expect_read)
             .field("position", &self.position)
             .field("readiness", &self.readiness)
             .field("settings", &self.settings)
@@ -81,7 +83,7 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
 #[derive(Debug, Clone, Copy)]
 pub enum H2StreamId {
     Zero,
-    Global(GlobalStreamId),
+    Other(StreamId, GlobalStreamId),
 }
 
 impl<Front: SocketHandler> ConnectionH2<Front> {
@@ -90,32 +92,29 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
     {
         println!("======= MUX H2 READABLE {:?}", self.position);
-        let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect {
+        let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect_read {
             let kawa = match stream_id {
                 H2StreamId::Zero => &mut self.zero,
-                H2StreamId::Global(stream_id) => context.streams[stream_id].rbuffer(&self.position),
+                H2StreamId::Other(stream_id, global_stream_id) => {
+                    context.streams[global_stream_id].rbuffer(&self.position)
+                }
             };
+            println!("{:?}({stream_id:?}, {amount})", self.state);
             if amount > 0 {
                 let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
-                println!(
-                    "{:?}({stream_id:?}, {amount}) {size} {status:?}",
-                    self.state
-                );
-                if size > 0 {
-                    kawa.storage.fill(size);
+                kawa.storage.fill(size);
+                if update_readiness_after_read(size, status, &mut self.readiness) {
+                    return MuxResult::Continue;
+                } else {
                     if size == amount {
-                        self.expect = None;
+                        self.expect_read = None;
                     } else {
-                        self.expect = Some((stream_id, amount - size));
+                        self.expect_read = Some((stream_id, amount - size));
                         return MuxResult::Continue;
                     }
-                } else {
-                    // We wanted to read (amount > 0) but there is nothing yet (size == 0)
-                    self.readiness.event.remove(Ready::READABLE);
-                    return MuxResult::Continue;
                 }
             } else {
-                self.expect = None;
+                self.expect_read = None;
             }
             (stream_id, kawa)
         } else {
@@ -148,7 +147,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     )) => {
                         kawa.storage.clear();
                         self.state = H2State::ClientSettings;
-                        self.expect = Some((H2StreamId::Zero, payload_len as usize));
+                        self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
                     }
                     _ => todo!(),
                 };
@@ -170,7 +169,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                     Err(e) => panic!("{e:?}"),
                 };
-                self.state = H2State::ServerSettings;
                 let kawa = &mut self.zero;
                 match serializer::gen_frame_header(
                     kawa.storage.space(),
@@ -185,11 +183,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Err(e) => panic!("could not serialize HeaderFrame: {e:?}"),
                 };
 
+                self.state = H2State::ServerSettings;
+                self.expect_write = Some(H2StreamId::Zero);
                 self.handle(settings, context, endpoint);
             }
             (H2State::ServerSettings, Position::Client(_)) => {
                 let i = kawa.storage.data();
-
                 match parser::frame_header(i) {
                     Ok((
                         _,
@@ -201,7 +200,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         },
                     )) => {
                         kawa.storage.clear();
-                        self.expect = Some((H2StreamId::Zero, payload_len as usize));
+                        self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
                         self.state = H2State::Frame(FrameHeader {
                             payload_len,
                             frame_type: FrameType::Settings,
@@ -219,23 +218,25 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, header)) => {
                         println!("{header:#?}");
                         kawa.storage.clear();
-                        let stream_id = if header.stream_id == 0 {
-                            H2StreamId::Zero
-                        } else {
-                            let stream_id =
-                                if let Some(stream_id) = self.streams.get(&header.stream_id) {
-                                    *stream_id
-                                } else {
-                                    self.create_stream(header.stream_id, context)
-                                };
-                            if header.frame_type == FrameType::Data {
-                                H2StreamId::Global(stream_id)
-                            } else {
+                        let stream_id = header.stream_id;
+                        let stream_id =
+                            if stream_id == 0 || header.frame_type == FrameType::RstStream {
                                 H2StreamId::Zero
-                            }
-                        };
+                            } else {
+                                let global_stream_id =
+                                    if let Some(global_stream_id) = self.streams.get(&stream_id) {
+                                        *global_stream_id
+                                    } else {
+                                        self.create_stream(stream_id, context)
+                                    };
+                                if header.frame_type == FrameType::Data {
+                                    H2StreamId::Other(stream_id, global_stream_id)
+                                } else {
+                                    H2StreamId::Zero
+                                }
+                            };
                         println!("{} {stream_id:?} {:#?}", header.stream_id, self.streams);
-                        self.expect = Some((stream_id, header.payload_len as usize));
+                        self.expect_read = Some((stream_id, header.payload_len as usize));
                         self.state = H2State::Frame(header);
                     }
                     Err(e) => panic!("{e:?}"),
@@ -254,7 +255,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 let state_result = self.handle(frame, context, endpoint);
                 self.state = H2State::Header;
-                self.expect = Some((H2StreamId::Zero, 9));
+                self.expect_read = Some((H2StreamId::Zero, 9));
                 return state_result;
             }
         }
@@ -266,6 +267,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
     {
         println!("======= MUX H2 WRITABLE {:?}", self.position);
+        if let Some(H2StreamId::Zero) = self.expect_write {
+            let kawa = &mut self.zero;
+            println!("{:?}", kawa.storage.data());
+            while !kawa.storage.is_empty() {
+                let (size, status) = self.socket.socket_write(kawa.storage.data());
+                kawa.storage.consume(size);
+                if update_readiness_after_write(size, status, &mut self.readiness) {
+                    return MuxResult::Continue;
+                }
+            }
+            // when H2StreamId::Zero is used to write READABLE is disabled
+            // so when we finish the write we enable READABLE again
+            self.readiness.interest.insert(Ready::READABLE);
+            self.expect_write = None;
+        }
         match (&self.state, &self.position) {
             (H2State::Error, _)
             | (H2State::ClientPreface, Position::Server)
@@ -275,68 +291,80 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.state, self.position
             ),
             (H2State::ClientPreface, Position::Client(_)) => {
-                println!("Ppreparing preface");
+                println!("Preparing preface and settings");
                 let pri = serializer::H2_PRI.as_bytes();
                 let kawa = &mut self.zero;
 
                 kawa.storage.space()[0..pri.len()].copy_from_slice(pri);
                 kawa.storage.fill(pri.len());
-
-                self.state = H2State::ClientSettings;
-                MuxResult::Continue
-            }
-            (H2State::ClientSettings, Position::Client(_)) => {
-                println!("Sending preface and settings");
-                let kawa = &mut self.zero;
                 match serializer::gen_settings(kawa.storage.space(), &self.settings) {
                     Ok((_, size)) => kawa.storage.fill(size),
                     Err(e) => panic!("{e:?}"),
                 };
-                let (size, status) = self.socket.socket_write(kawa.storage.data());
-                println!("  size: {size}, status: {status:?}");
+
+                self.state = H2State::ClientSettings;
+                self.expect_write = Some(H2StreamId::Zero);
+                MuxResult::Continue
+            }
+            (H2State::ClientSettings, Position::Client(_)) => {
+                println!("Sent preface and settings");
                 self.state = H2State::ServerSettings;
                 self.readiness.interest.remove(Ready::WRITABLE);
-                self.readiness.interest.insert(Ready::READABLE);
-                kawa.storage.clear();
-
-                self.expect = Some((H2StreamId::Zero, 9));
+                self.expect_read = Some((H2StreamId::Zero, 9));
                 MuxResult::Continue
             }
             (H2State::ServerSettings, Position::Server) => {
-                let kawa = &mut self.zero;
-                println!("{:?}", kawa.storage.data());
-                let (size, status) = self.socket.socket_write(kawa.storage.data());
-                println!("  size: {size}, status: {status:?}");
-                kawa.storage.clear();
-                self.readiness.interest.remove(Ready::WRITABLE);
-                self.readiness.interest.insert(Ready::READABLE);
                 self.state = H2State::Header;
-                self.expect = Some((H2StreamId::Zero, 9));
+                self.readiness.interest.remove(Ready::WRITABLE);
+                self.expect_read = Some((H2StreamId::Zero, 9));
                 MuxResult::Continue
             }
             // Proxying states (Header/Frame)
             (_, _) => {
-                let kawa = &mut self.zero;
-                while !kawa.storage.is_empty() {
-                    let (size, status) = self.socket.socket_write(kawa.storage.data());
-                    println!("  size: {size}, status: {status:?}");
-                    if size > 0 {
-                        kawa.storage.consume(size);
-                    } else {
-                        return MuxResult::Continue;
+                let mut dead_streams = Vec::new();
+
+                if let Some(H2StreamId::Other(stream_id, global_stream_id)) = self.expect_write {
+                    let stream = &mut context.streams[global_stream_id];
+                    let kawa = stream.wbuffer(&self.position);
+                    while !kawa.out.is_empty() {
+                        let bufs = kawa.as_io_slice();
+                        let (size, status) = self.socket.socket_write_vectored(&bufs);
+                        kawa.consume(size);
+                        if update_readiness_after_write(size, status, &mut self.readiness) {
+                            return MuxResult::Continue;
+                        }
+                    }
+                    self.expect_write = None;
+                    if kawa.is_terminated() && kawa.is_completed() {
+                        match self.position {
+                            Position::Client(_) => {}
+                            Position::Server => {
+                                // mark stream as reusable
+                                stream.active = false;
+                                println!("Recycle stream: {global_stream_id}");
+                                endpoint.end_stream(
+                                    stream.token.unwrap(),
+                                    global_stream_id,
+                                    context,
+                                );
+                                dead_streams.push(stream_id);
+                            }
+                        }
                     }
                 }
-                self.readiness.interest.insert(Ready::READABLE);
 
                 let mut converter = converter::H2BlockConverter {
                     stream_id: 0,
                     encoder: &mut self.encoder,
                     out: Vec::new(),
                 };
-                let mut want_write = false;
-                let mut dead_streams = Vec::new();
-                for (stream_id, global_stream_id) in &self.streams {
-                    let stream = &mut context.streams[*global_stream_id];
+                let mut priorities = self.streams.keys().collect::<Vec<_>>();
+                priorities.sort();
+
+                println!("PRIORITIES: {priorities:?}");
+                'outer: for stream_id in priorities {
+                    let global_stream_id = *self.streams.get(stream_id).unwrap();
+                    let stream = &mut context.streams[global_stream_id];
                     let kawa = stream.wbuffer(&self.position);
                     if kawa.is_main_phase() {
                         converter.stream_id = *stream_id;
@@ -345,12 +373,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         while !kawa.out.is_empty() {
                             let bufs = kawa.as_io_slice();
                             let (size, status) = self.socket.socket_write_vectored(&bufs);
-                            println!("  size: {size}, status: {status:?}");
-                            if size > 0 {
-                                kawa.consume(size);
-                            } else {
-                                want_write = true;
-                                break;
+                            kawa.consume(size);
+                            if update_readiness_after_write(size, status, &mut self.readiness) {
+                                self.expect_write =
+                                    Some(H2StreamId::Other(*stream_id, global_stream_id));
+                                break 'outer;
                             }
                         }
                         if kawa.is_terminated() && kawa.is_completed() {
@@ -362,7 +389,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     println!("Recycle stream: {global_stream_id}");
                                     endpoint.end_stream(
                                         stream.token.unwrap(),
-                                        *global_stream_id,
+                                        global_stream_id,
                                         context,
                                     );
                                     dead_streams.push(*stream_id);
@@ -375,7 +402,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.streams.remove(&stream_id).unwrap();
                 }
 
-                if !want_write {
+                if self.expect_write.is_none() {
+                    // We wrote everything
                     self.readiness.interest.remove(Ready::WRITABLE);
                 }
                 MuxResult::Continue
@@ -500,8 +528,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
                 self.readiness.interest.insert(Ready::WRITABLE);
                 self.readiness.interest.remove(Ready::READABLE);
+                self.expect_write = Some(H2StreamId::Zero);
             }
-            Frame::Ping(_) => todo!(),
+            Frame::Ping(ping) => {
+                let kawa = &mut self.zero;
+                match serializer::gen_ping_acknolegment(kawa.storage.space(), &ping.payload) {
+                    Ok((_, size)) => kawa.storage.fill(size),
+                    Err(e) => panic!("could not serialize PingFrame: {e:?}"),
+                };
+                self.readiness.interest.insert(Ready::WRITABLE);
+                self.readiness.interest.remove(Ready::READABLE);
+                self.expect_write = Some(H2StreamId::Zero);
+            }
             Frame::GoAway(goaway) => {
                 println!(
                     "GoAway({} -> {})",
@@ -533,6 +571,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Position::Server => unreachable!(),
         }
         for global_stream_id in self.streams.values() {
+            println!("end stream: {global_stream_id}");
             endpoint.end_stream(
                 context.streams[*global_stream_id].token.unwrap(),
                 *global_stream_id,
@@ -548,10 +587,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             if *global_stream_id == stream {
                 let id = *stream_id;
                 self.streams.remove(&id);
-                break;
+                return;
             }
         }
-        // todo!()
+        panic!();
     }
 
     pub fn start_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
