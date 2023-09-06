@@ -585,6 +585,8 @@ pub enum BackendConnectionError {
     MaxConnectionRetries(Option<String>),
     #[error("the sessions slab has reached maximum capacity")]
     MaxSessionsMemory,
+    #[error("the checkout pool has reached maximum capacity")]
+    MaxBuffers,
     #[error("error from the backend: {0}")]
     Backend(BackendError),
     #[error("failed to retrieve the cluster: {0}")]
