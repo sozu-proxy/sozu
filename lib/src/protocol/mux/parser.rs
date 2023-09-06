@@ -2,11 +2,11 @@ use std::convert::From;
 
 use kawa::repr::Slice;
 use nom::{
-    bytes::streaming::{tag, take},
+    bytes::complete::{tag, take},
     combinator::{complete, map, map_opt},
     error::{ErrorKind, ParseError},
     multi::many0,
-    number::streaming::{be_u16, be_u24, be_u32, be_u8},
+    number::complete::{be_u16, be_u24, be_u32, be_u8},
     sequence::tuple,
     Err, IResult,
 };
@@ -77,6 +77,11 @@ pub struct Error<'a> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum InnerError {
     Nom(ErrorKind),
+    H2(H2Error),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum H2Error {
     NoError,
     ProtocolError,
     InternalError,
@@ -96,6 +101,9 @@ pub enum InnerError {
 impl<'a> Error<'a> {
     pub fn new(input: &'a [u8], error: InnerError) -> Error<'a> {
         Error { input, error }
+    }
+    pub fn new_h2(input: &'a [u8], error: H2Error) -> Error<'a> {
+        Error { input, error: InnerError::H2(error) }
     }
 }
 
@@ -226,7 +234,7 @@ pub fn frame_body<'a>(
     max_frame_size: u32,
 ) -> IResult<&'a [u8], Frame, Error<'a>> {
     if header.payload_len > max_frame_size {
-        return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
+        return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
     }
 
     let valid_stream_id = match header.frame_type {
@@ -241,7 +249,7 @@ pub fn frame_body<'a>(
     };
 
     if !valid_stream_id {
-        return Err(Err::Failure(Error::new(i, InnerError::ProtocolError)));
+        return Err(Err::Failure(Error::new_h2(i, H2Error::ProtocolError)));
     }
 
     let f = match header.frame_type {
@@ -249,13 +257,13 @@ pub fn frame_body<'a>(
         FrameType::Headers => headers_frame(i, header)?,
         FrameType::Priority => {
             if header.payload_len != 5 {
-                return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
+                return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
             }
             priority_frame(i, header)?
         }
         FrameType::RstStream => {
             if header.payload_len != 4 {
-                return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
+                return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
             }
             rst_stream_frame(i, header)?
         }
@@ -263,20 +271,20 @@ pub fn frame_body<'a>(
         FrameType::Continuation => continuation_frame(i, header)?,
         FrameType::Settings => {
             if header.payload_len % 6 != 0 {
-                return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
+                return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
             }
             settings_frame(i, header)?
         }
         FrameType::Ping => {
             if header.payload_len != 8 {
-                return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
+                return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
             }
             ping_frame(i, header)?
         }
         FrameType::GoAway => goaway_frame(i, header)?,
         FrameType::WindowUpdate => {
             if header.payload_len != 4 {
-                return Err(Err::Failure(Error::new(i, InnerError::FrameSizeError)));
+                return Err(Err::Failure(Error::new_h2(i, H2Error::FrameSizeError)));
             }
             window_update_frame(i, header)?
         }
@@ -306,7 +314,7 @@ pub fn data_frame<'a>(
     };
 
     if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
-        return Err(Err::Failure(Error::new(input, InnerError::ProtocolError)));
+        return Err(Err::Failure(Error::new_h2(input, H2Error::ProtocolError)));
     }
 
     let (_, payload) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
@@ -369,7 +377,7 @@ pub fn headers_frame<'a>(
     };
 
     if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
-        return Err(Err::Failure(Error::new(input, InnerError::ProtocolError)));
+        return Err(Err::Failure(Error::new_h2(input, H2Error::ProtocolError)));
     }
 
     let (_, header_block_fragment) = take(i.len() - pad_length.unwrap_or(0) as usize)(i)?;
@@ -486,7 +494,7 @@ pub fn push_promise_frame<'a>(
     };
 
     if pad_length.is_some() && i.len() <= pad_length.unwrap() as usize {
-        return Err(Err::Failure(Error::new(input, InnerError::ProtocolError)));
+        return Err(Err::Failure(Error::new_h2(input, H2Error::ProtocolError)));
     }
 
     let (i, promised_stream_id) = be_u32(i)?;
@@ -559,7 +567,7 @@ pub fn window_update_frame<'a>(
 
     //FIXME: if stream id is 0, trat it as connection error?
     if increment == 0 {
-        return Err(Err::Failure(Error::new(input, InnerError::ProtocolError)));
+        return Err(Err::Failure(Error::new_h2(input, H2Error::ProtocolError)));
     }
 
     Ok((
