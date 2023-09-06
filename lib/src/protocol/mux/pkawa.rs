@@ -45,7 +45,7 @@ pub fn handle_header<C>(
                     } else if compare_no_case(&k, b":scheme") {
                         scheme = val;
                     } else if compare_no_case(&k, b"cookie") {
-                        panic!("cookies should be split in pairs");
+                        todo!("cookies should be split in pairs");
                     } else {
                         if compare_no_case(&k, b"content-length") {
                             let length =

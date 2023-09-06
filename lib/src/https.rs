@@ -442,18 +442,23 @@ impl ProxySession for HttpsSession {
             token,
             super::ready_to_string(events)
         );
+        println!("EVENT: {token:?}->{events:?}");
         self.last_event = Instant::now();
         self.metrics.wait_start();
         self.state.update_readiness(token, events);
     }
 
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
-        println!("READY");
+        let start = std::time::Instant::now();
+        println!("READY {start:?}");
         self.metrics.service_start();
 
         let session_result =
             self.state
                 .ready(session.clone(), self.proxy.clone(), &mut self.metrics);
+
+        let end = std::time::Instant::now();
+        println!("READY END {end:?} -> {:?}", end.duration_since(start));
 
         let to_be_closed = match session_result {
             SessionResult::Close => true,
