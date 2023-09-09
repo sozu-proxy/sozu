@@ -3,8 +3,8 @@ use sozu_command::ready::Ready;
 use crate::{
     println_,
     protocol::mux::{
-        debug_kawa, update_readiness_after_read, update_readiness_after_write, BackendStatus,
-        Context, Endpoint, GlobalStreamId, MuxResult, Position,
+        debug_kawa, set_default_answer, update_readiness_after_read, update_readiness_after_write,
+        BackendStatus, Context, Endpoint, GlobalStreamId, MuxResult, Position, StreamState, forcefully_terminate_answer,
     },
     socket::SocketHandler,
     Readiness,
@@ -49,24 +49,43 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         kawa::h1::parse(kawa, parts.context);
         debug_kawa(kawa);
         if kawa.is_error() {
-            return MuxResult::Close(self.stream);
+            match self.position {
+                Position::Client(_) => {
+                    let StreamState::Linked(token) = stream.state else { unreachable!() };
+                    let global_stream_id = self.stream;
+                    self.readiness.interest.remove(Ready::ALL);
+                    self.end_stream(global_stream_id, context);
+                    endpoint.end_stream(token, global_stream_id, context);
+                }
+                Position::Server => {
+                    set_default_answer(&mut stream.back, &mut self.readiness, 400);
+                    stream.state = StreamState::Unlinked;
+                }
+            }
+            return MuxResult::Continue;
         }
         if kawa.is_terminated() {
             self.readiness.interest.remove(Ready::READABLE);
         }
         if was_initial && kawa.is_main_phase() {
-            self.requests += 1;
-            println_!("REQUESTS: {}", self.requests);
             match self.position {
-                Position::Client(_) => endpoint
-                    .readiness_mut(stream.token.unwrap())
-                    .interest
-                    .insert(Ready::WRITABLE),
-                Position::Server => return MuxResult::Connect(self.stream),
+                Position::Client(_) => {
+                    let StreamState::Linked(token) = stream.state else { unreachable!() };
+                    endpoint
+                        .readiness_mut(token)
+                        .interest
+                        .insert(Ready::WRITABLE)
+                }
+                Position::Server => {
+                    self.requests += 1;
+                    println_!("REQUESTS: {}", self.requests);
+                    stream.state = StreamState::Link
+                }
             };
         }
         MuxResult::Continue
     }
+
     pub fn writable<E>(&mut self, context: &mut Context, mut endpoint: E) -> MuxResult
     where
         E: Endpoint,
@@ -95,9 +114,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     stream.back.clear();
                     stream.back.storage.clear();
                     stream.front.clear();
-                    // do not clear stream.front because of H1 pipelining
-                    let token = stream.token.take().unwrap();
-                    endpoint.end_stream(token, self.stream, context);
+                    // do not clear stream.front.storage because of H1 pipelining
+                    if let StreamState::Linked(token) = stream.state {
+                        endpoint.end_stream(token, self.stream, context);
+                    }
                 }
             }
         }
@@ -114,21 +134,20 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 println_!("close detached client ConnectionH1");
                 return;
             }
-            Position::Client(BackendStatus::Connecting(_)) => todo!("reconnect"),
-            Position::Client(BackendStatus::Connected(_)) => {}
+            Position::Client(BackendStatus::Connecting(_))
+            | Position::Client(BackendStatus::Connected(_)) => {}
             Position::Server => unreachable!(),
         }
-        endpoint.end_stream(
-            context.streams[self.stream].token.unwrap(),
-            self.stream,
-            context,
-        )
+        // reconnection is handled by the server
+        let StreamState::Linked(token) = context.streams[self.stream].state else {unreachable!()};
+        endpoint.end_stream(token, self.stream, context)
     }
 
     pub fn end_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
         assert_eq!(stream, self.stream);
-        let stream_context = &mut context.streams[stream].context;
-        println_!("end H1 stream {stream}: {stream_context:#?}");
+        let stream = &mut context.streams[stream];
+        let stream_context = &mut stream.context;
+        println_!("end H1 stream {}: {stream_context:#?}", self.stream);
         self.stream = usize::MAX;
         let mut owned_position = Position::Server;
         std::mem::swap(&mut owned_position, &mut self.position);
@@ -143,7 +162,27 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             Position::Client(BackendStatus::KeepAlive(_))
             | Position::Client(BackendStatus::Disconnecting) => unreachable!(),
-            Position::Server => todo!(),
+            Position::Server => match (stream.front.consumed, stream.back.is_main_phase()) {
+                (true, true) => {
+                    // we have a "forwardable" answer from the back
+                    // if the answer is not terminated we send an RstStream to properly clean the stream
+                    // if it is terminated, we finish the transfer, the backend is not necessary anymore
+                    if !stream.back.is_terminated() {
+                        forcefully_terminate_answer(&mut stream.back, &mut self.readiness);
+                    }
+                    stream.state = StreamState::Unlinked;
+                }
+                (true, false) => {
+                    set_default_answer(&mut stream.back, &mut self.readiness, 502);
+                    stream.state = StreamState::Unlinked;
+                }
+                (false, false) => {
+                    // we do not have an answer, but the request is untouched so we can retry
+                    println!("H1 RECONNECT");
+                    stream.state = StreamState::Link;
+                }
+                (false, true) => unreachable!(),
+            },
         }
     }
 
