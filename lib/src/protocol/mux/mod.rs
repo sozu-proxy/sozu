@@ -31,6 +31,7 @@ use crate::{
         SessionState,
     },
     router::Route,
+    server::CONN_RETRIES,
     socket::{FrontRustls, SocketHandler, SocketResult},
     BackendConnectionError, L7ListenerHandler, L7Proxy, ProxySession, Readiness,
     RetrieveClusterError, SessionMetrics, SessionResult, StateResult,
@@ -39,18 +40,64 @@ use crate::{
 #[macro_export]
 macro_rules! println_ {
     ($($t:expr),*) => {
+        // print!("{}:{} ", file!(), line!());
         println!($($t),*)
         // $(let _ = &$t;)*
     };
 }
 fn debug_kawa(_kawa: &GenericHttpStream) {
-    // kawa::debug_kawa(_kawa);
+    kawa::debug_kawa(_kawa);
 }
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
 type GenericHttpStream = kawa::Kawa<Checkout>;
 type StreamId = u32;
 type GlobalStreamId = usize;
+
+/// Replace the content of the kawa buffer with a default Sozu answer for a given status code
+fn set_default_answer(kawa: &mut GenericHttpStream, readiness: &mut Readiness, code: u16) {
+    kawa.clear();
+    kawa.storage.clear();
+    kawa.detached.status_line = kawa::StatusLine::Response {
+        version: kawa::Version::V20,
+        code,
+        status: kawa::Store::from_string(code.to_string()),
+        reason: kawa::Store::Static(b"Sozu Default Answer"),
+    };
+    kawa.push_block(kawa::Block::StatusLine);
+    kawa.push_block(kawa::Block::Header(kawa::Pair {
+        key: kawa::Store::Static(b"Cache-Control"),
+        val: kawa::Store::Static(b"no-cache"),
+    }));
+    kawa.push_block(kawa::Block::Header(kawa::Pair {
+        key: kawa::Store::Static(b"Connection"),
+        val: kawa::Store::Static(b"close"),
+    }));
+    kawa.push_block(kawa::Block::Header(kawa::Pair {
+        key: kawa::Store::Static(b"Content-Length"),
+        val: kawa::Store::Static(b"0"),
+    }));
+    kawa.push_block(kawa::Block::Flags(kawa::Flags {
+        end_body: false,
+        end_chunk: false,
+        end_header: true,
+        end_stream: true,
+    }));
+    kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+    readiness.interest.insert(Ready::WRITABLE);
+}
+
+fn forcefully_terminate_answer(kawa: &mut GenericHttpStream, readiness: &mut Readiness) {
+    kawa.push_block(kawa::Block::Flags(kawa::Flags {
+        end_body: false,
+        end_chunk: false,
+        end_header: false,
+        end_stream: true,
+    }));
+    kawa.parsing_phase = kawa::ParsingPhase::Error;
+    debug_kawa(kawa);
+    readiness.interest.insert(Ready::WRITABLE);
+}
 
 #[derive(Debug)]
 pub enum Position {
@@ -69,8 +116,6 @@ pub enum BackendStatus {
 pub enum MuxResult {
     Continue,
     CloseSession(H2Error),
-    Close(GlobalStreamId),
-    Connect(GlobalStreamId),
 }
 
 #[derive(Debug)]
@@ -82,7 +127,15 @@ pub enum Connection<Front: SocketHandler> {
 pub trait Endpoint {
     fn readiness(&self, token: Token) -> &Readiness;
     fn readiness_mut(&mut self, token: Token) -> &mut Readiness;
+    /// If end_stream is called on a client it means the stream has PROPERLY finished,
+    /// the server has completed serving the response and informs the endpoint that this stream won't be used anymore.
+    /// If end_stream is called on a server it means the stream was BROKEN, the client was most likely disconnected or encountered an error
+    /// it is for the server to decide if the stream can be retried or an error should be sent. It should be GUARANTEED that all bytes from
+    /// the backend were read. However it is almost certain that all bytes were not already sent to the client.
     fn end_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context);
+    /// If start_stream is called on a client it means the stream should be attached to this endpoint,
+    /// the stream might be recovering from a disconnection, in any case at this point its response MUST be empty.
+    /// If the start_stream is called on a H2 server it means the stream is a server push and its request MUST be empty.
     fn start_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context);
 }
 
@@ -365,11 +418,25 @@ fn update_readiness_after_write(
 //     Closed,
 // }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamState {
+    Idle,
+    /// the Stream is asking for connection, this will trigger a call to connect
+    Link,
+    /// the Stream is linked to a Client (note that the client might not be connected)
+    Linked(Token),
+    /// the Stream was linked to a Client, but the connection closed, the client was removed
+    /// and this Stream could not be retried (it should be terminated)
+    Unlinked,
+    /// the Stream is unlinked and can be reused
+    Recycle,
+}
+
 pub struct Stream {
     // pub request_id: Ulid,
-    pub active: bool,
     pub window: i32,
-    pub token: Option<Token>,
+    pub attempts: u8,
+    pub state: StreamState,
     front: GenericHttpStream,
     back: GenericHttpStream,
     pub context: HttpContext,
@@ -417,9 +484,9 @@ impl Stream {
             None => return None,
         };
         Some(Self {
-            active: true,
+            state: StreamState::Idle,
+            attempts: 0,
             window: window as i32,
-            token: None,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
             context: temporary_http_context(request_id),
@@ -461,16 +528,16 @@ pub struct Context {
 impl Context {
     pub fn create_stream(&mut self, request_id: Ulid, window: u32) -> Option<GlobalStreamId> {
         for (stream_id, stream) in self.streams.iter_mut().enumerate() {
-            if !stream.active {
+            if stream.state == StreamState::Recycle {
                 println_!("Reuse stream: {stream_id}");
+                stream.state = StreamState::Idle;
+                stream.attempts = 0;
                 stream.window = window as i32;
                 stream.context = temporary_http_context(request_id);
                 stream.back.clear();
                 stream.back.storage.clear();
                 stream.front.clear();
                 stream.front.storage.clear();
-                stream.token = None;
-                stream.active = true;
                 return Some(stream_id);
             }
         }
@@ -504,7 +571,12 @@ impl Router {
         let stream = &mut context.streams[stream_id];
         // when reused, a stream should be detached from its old connection, if not we could end
         // with concurrent connections on a single endpoint
-        assert!(stream.token.is_none());
+        assert!(matches!(stream.state, StreamState::Link));
+        if stream.attempts >= CONN_RETRIES {
+            return Err(BackendConnectionError::MaxConnectionRetries(None));
+        }
+        stream.attempts += 1;
+
         let stream_context = &mut stream.context;
         let (cluster_id, h2) = self
             .route_from_request(stream_context, proxy.clone())
@@ -604,7 +676,7 @@ impl Router {
         };
 
         // link stream to backend
-        stream.token = Some(token);
+        stream.state = StreamState::Linked(token);
         // link backend to stream
         self.backends
             .get_mut(&token)
@@ -624,8 +696,6 @@ impl Router {
                 // we are past kawa parsing if it succeeded this can't fail
                 // if the request was malformed it was caught by kawa and we sent a 400
                 panic!("{cluster_error}");
-                // self.set_answer(DefaultAnswerStatus::Answer400, None);
-                // return Err(cluster_error);
             }
         };
 
@@ -755,112 +825,149 @@ impl SessionState for Mux {
 
         let start = std::time::Instant::now();
         println_!("{start:?}");
-        while counter < max_loop_iterations {
-            let mut dirty = false;
+        loop {
+            loop {
+                let context = &mut self.context;
+                if self.frontend.readiness().filter_interest().is_readable() {
+                    match self
+                        .frontend
+                        .readable(context, EndpointClient(&mut self.router))
+                    {
+                        MuxResult::Continue => (),
+                        MuxResult::CloseSession(e) => self.goaway(e),
+                    }
+                }
+
+                let mut all_backends_readiness_are_empty = true;
+                let context = &mut self.context;
+                let mut dead_backends = Vec::new();
+                for (token, backend) in self.router.backends.iter_mut() {
+                    let readiness = backend.readiness_mut();
+                    let dead = readiness.filter_interest().is_hup()
+                        || readiness.filter_interest().is_error();
+                    if dead {
+                        println_!("Backend({token:?}) -> {readiness:?}");
+                        readiness.event.remove(Ready::WRITABLE);
+                    }
+
+                    if backend.readiness().filter_interest().is_writable() {
+                        let mut owned_position = Position::Server;
+                        let position = backend.position_mut();
+                        std::mem::swap(&mut owned_position, position);
+                        match owned_position {
+                            Position::Client(BackendStatus::Connecting(cluster_id)) => {
+                                *position = Position::Client(BackendStatus::Connected(cluster_id));
+                            }
+                            _ => *position = owned_position,
+                        }
+                        match backend.writable(context, EndpointServer(&mut self.frontend)) {
+                            MuxResult::Continue => (),
+                            MuxResult::CloseSession(e) => {
+                                self.goaway(e);
+                                break;
+                            }
+                        }
+                    }
+
+                    if backend.readiness().filter_interest().is_readable() {
+                        match backend.readable(context, EndpointServer(&mut self.frontend)) {
+                            MuxResult::Continue => (),
+                            MuxResult::CloseSession(e) => {
+                                self.goaway(e);
+                                break;
+                            }
+                        }
+                    }
+
+                    if dead && !backend.readiness().filter_interest().is_readable() {
+                        println_!("Closing {:#?}", backend);
+                        backend.close(context, EndpointServer(&mut self.frontend));
+                        dead_backends.push(*token);
+                    }
+
+                    if !backend.readiness().filter_interest().is_empty() {
+                        all_backends_readiness_are_empty = false;
+                    }
+                }
+                if !dead_backends.is_empty() {
+                    for token in &dead_backends {
+                        self.router.backends.remove(token);
+                    }
+                    println_!("FRONTEND: {:#?}", &self.frontend);
+                    println_!("BACKENDS: {:#?}", self.router.backends);
+                }
+
+                let context = &mut self.context;
+                if self.frontend.readiness().filter_interest().is_writable() {
+                    match self
+                        .frontend
+                        .writable(context, EndpointClient(&mut self.router))
+                    {
+                        MuxResult::Continue => (),
+                        MuxResult::CloseSession(e) => self.goaway(e),
+                    }
+                }
+
+                if self.frontend.readiness().filter_interest().is_empty()
+                    && all_backends_readiness_are_empty
+                {
+                    break;
+                }
+
+                counter += 1;
+                if counter >= max_loop_iterations {
+                    incr!("http.infinite_loop.error");
+                    return SessionResult::Close;
+                }
+            }
 
             let context = &mut self.context;
-            if self.frontend.readiness().filter_interest().is_readable() {
-                match self
-                    .frontend
-                    .readable(context, EndpointClient(&mut self.router))
-                {
-                    MuxResult::Continue => (),
-                    MuxResult::CloseSession(e) => self.goaway(e),
-                    MuxResult::Close(_) => todo!(),
-                    MuxResult::Connect(stream_id) => {
-                        match self.router.connect(
-                            stream_id,
-                            context,
-                            session.clone(),
-                            proxy.clone(),
-                            metrics,
-                        ) {
-                            Ok(_) => (),
-                            Err(error) => {
-                                println_!("{error}");
+            let front_readiness = self.frontend.readiness_mut();
+            let mut dirty = false;
+            for stream_id in 0..context.streams.len() {
+                if context.streams[stream_id].state == StreamState::Link {
+                    dirty = true;
+                    match self.router.connect(
+                        stream_id,
+                        context,
+                        session.clone(),
+                        proxy.clone(),
+                        metrics,
+                    ) {
+                        Ok(_) => {}
+                        Err(error) => {
+                            println_!("Connection error: {error}");
+                            let kawa = &mut context.streams[stream_id].back;
+                            use BackendConnectionError as BE;
+                            match error {
+                                BE::Backend(BackendError::NoBackendForCluster(_))
+                                | BE::MaxConnectionRetries(_)
+                                | BE::MaxSessionsMemory
+                                | BE::MaxBuffers => {
+                                    set_default_answer(kawa, front_readiness, 503);
+                                }
+                                BE::RetrieveClusterError(
+                                    RetrieveClusterError::RetrieveFrontend(_),
+                                ) => {
+                                    set_default_answer(kawa, front_readiness, 404);
+                                }
+                                BE::RetrieveClusterError(
+                                    RetrieveClusterError::UnauthorizedRoute,
+                                ) => {
+                                    set_default_answer(kawa, front_readiness, 401);
+                                }
+
+                                BE::Backend(_) => {}
+                                BE::RetrieveClusterError(_) => unreachable!(),
+                                BE::NotFound(_) => unreachable!(),
                             }
                         }
                     }
                 }
-                dirty = true;
             }
-
-            let context = &mut self.context;
-            let mut dead_backends = Vec::new();
-            for (token, backend) in self.router.backends.iter_mut() {
-                let readiness = backend.readiness().filter_interest();
-                if readiness.is_hup() || readiness.is_error() {
-                    println_!("{token:?} -> {:?}", backend);
-                    backend.close(context, EndpointServer(&mut self.frontend));
-                    dead_backends.push(*token);
-                }
-                if readiness.is_writable() {
-                    let mut owned_position = Position::Server;
-                    let position = backend.position_mut();
-                    std::mem::swap(&mut owned_position, position);
-                    match owned_position {
-                        Position::Client(BackendStatus::Connecting(cluster_id)) => {
-                            *position = Position::Client(BackendStatus::Connected(cluster_id));
-                        }
-                        _ => *position = owned_position,
-                    }
-                    match backend.writable(context, EndpointServer(&mut self.frontend)) {
-                        MuxResult::Continue => (),
-                        MuxResult::CloseSession(e) => {
-                            self.goaway(e);
-                            break;
-                        }
-                        MuxResult::Close(_) => todo!(),
-                        MuxResult::Connect(_) => unreachable!(),
-                    }
-                    dirty = true;
-                }
-
-                if readiness.is_readable() {
-                    match backend.readable(context, EndpointServer(&mut self.frontend)) {
-                        MuxResult::Continue => (),
-                        MuxResult::CloseSession(e) => {
-                            self.goaway(e);
-                            break;
-                        }
-                        MuxResult::Close(_) => todo!(),
-                        MuxResult::Connect(_) => unreachable!(),
-                    }
-                    dirty = true;
-                }
-            }
-            if !dead_backends.is_empty() {
-                for token in &dead_backends {
-                    self.router.backends.remove(token);
-                }
-                println_!("FRONTEND: {:#?}", &self.frontend);
-                println_!("BACKENDS: {:#?}", self.router.backends);
-            }
-
-            let context = &mut self.context;
-            if self.frontend.readiness().filter_interest().is_writable() {
-                match self
-                    .frontend
-                    .writable(context, EndpointClient(&mut self.router))
-                {
-                    MuxResult::Continue => (),
-                    MuxResult::CloseSession(e) => self.goaway(e),
-                    MuxResult::Close(_) => todo!(),
-                    MuxResult::Connect(_) => unreachable!(),
-                }
-                dirty = true;
-            }
-
             if !dirty {
                 break;
             }
-
-            counter += 1;
-        }
-
-        if counter == max_loop_iterations {
-            incr!("http.infinite_loop.error");
-            return SessionResult::Close;
         }
 
         SessionResult::Continue

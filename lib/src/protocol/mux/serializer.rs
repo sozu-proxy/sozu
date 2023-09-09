@@ -8,7 +8,7 @@ use cookie_factory::{
 
 use super::{
     h2::H2Settings,
-    parser::{FrameHeader, FrameType},
+    parser::{FrameHeader, FrameType, H2Error},
 };
 
 pub const H2_PRI: &str = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -93,5 +93,24 @@ pub fn gen_settings<'a>(
             buf,
         )
         .map(|(buf, size)| (buf, (old_size + size as usize)))
+    })
+}
+
+pub fn gen_rst_stream<'a>(
+    buf: &'a mut [u8],
+    stream_id: u32,
+    error_code: H2Error,
+) -> Result<(&'a mut [u8], usize), GenError> {
+    gen_frame_header(
+        buf,
+        &FrameHeader {
+            payload_len: 4,
+            frame_type: FrameType::RstStream,
+            flags: 0,
+            stream_id,
+        },
+    )
+    .and_then(|(buf, old_size)| {
+        gen(be_u32(error_code as u32), buf).map(|(buf, size)| (buf, (old_size + size as usize)))
     })
 }
