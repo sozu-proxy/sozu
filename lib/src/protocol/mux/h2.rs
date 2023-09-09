@@ -10,7 +10,7 @@ use crate::{
         parser::{self, error_code_to_str, Frame, FrameHeader, FrameType, H2Error},
         pkawa, serializer, update_readiness_after_read, update_readiness_after_write,
         BackendStatus, Context, Endpoint, GenericHttpStream, GlobalStreamId, MuxResult, Position,
-        StreamId,
+        StreamId, StreamState, set_default_answer, forcefully_terminate_answer,
     },
     socket::SocketHandler,
     Readiness,
@@ -359,18 +359,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         }
                     }
                     self.expect_write = None;
-                    if kawa.is_terminated() && kawa.is_completed() {
+                    if (kawa.is_terminated() || kawa.is_error()) && kawa.is_completed() {
                         match self.position {
                             Position::Client(_) => {}
                             Position::Server => {
                                 // mark stream as reusable
-                                stream.active = false;
                                 println_!("Recycle stream: {global_stream_id}");
-                                endpoint.end_stream(
-                                    stream.token.unwrap(),
-                                    global_stream_id,
-                                    context,
-                                );
+                                let mut state = StreamState::Recycle;
+                                std::mem::swap(&mut stream.state, &mut state);
+                                if let StreamState::Linked(token) = state {
+                                    endpoint.end_stream(token, global_stream_id, context);
+                                }
                                 dead_streams.push(stream_id);
                             }
                         }
@@ -379,6 +378,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
                 let mut converter = converter::H2BlockConverter {
                     stream_id: 0,
+                    state: StreamState::Idle,
                     encoder: &mut self.encoder,
                     out: Vec::new(),
                 };
@@ -389,35 +389,35 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 'outer: for stream_id in priorities {
                     let global_stream_id = *self.streams.get(stream_id).unwrap();
                     let stream = &mut context.streams[global_stream_id];
+                    converter.state = stream.state;
                     let kawa = stream.wbuffer(&self.position);
-                    if kawa.is_main_phase() {
+                    if kawa.is_main_phase() || kawa.is_error() {
                         converter.stream_id = *stream_id;
                         kawa.prepare(&mut converter);
                         debug_kawa(kawa);
-                        while !kawa.out.is_empty() {
-                            let bufs = kawa.as_io_slice();
-                            let (size, status) = self.socket.socket_write_vectored(&bufs);
-                            kawa.consume(size);
-                            if update_readiness_after_write(size, status, &mut self.readiness) {
-                                self.expect_write =
-                                    Some(H2StreamId::Other(*stream_id, global_stream_id));
-                                break 'outer;
-                            }
+                    }
+                    while !kawa.out.is_empty() {
+                        let bufs = kawa.as_io_slice();
+                        let (size, status) = self.socket.socket_write_vectored(&bufs);
+                        kawa.consume(size);
+                        if update_readiness_after_write(size, status, &mut self.readiness) {
+                            self.expect_write =
+                                Some(H2StreamId::Other(*stream_id, global_stream_id));
+                            break 'outer;
                         }
-                        if kawa.is_terminated() && kawa.is_completed() {
-                            match self.position {
-                                Position::Client(_) => {}
-                                Position::Server => {
-                                    // mark stream as reusable
-                                    stream.active = false;
-                                    println_!("Recycle stream: {global_stream_id}");
-                                    endpoint.end_stream(
-                                        stream.token.unwrap(),
-                                        global_stream_id,
-                                        context,
-                                    );
-                                    dead_streams.push(*stream_id);
+                    }
+                    if (kawa.is_terminated() || kawa.is_error()) && kawa.is_completed() {
+                        match self.position {
+                            Position::Client(_) => {}
+                            Position::Server => {
+                                // mark stream as reusable
+                                println_!("Recycle stream: {global_stream_id}");
+                                let mut state = StreamState::Recycle;
+                                std::mem::swap(&mut stream.state, &mut state);
+                                if let StreamState::Linked(token) = state {
+                                    endpoint.end_stream(token, global_stream_id, context);
                                 }
+                                dead_streams.push(*stream_id);
                             }
                         }
                     }
@@ -511,11 +511,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 debug_kawa(parts.rbuffer);
                 match self.position {
-                    Position::Client(_) => endpoint
-                        .readiness_mut(stream.token.unwrap())
-                        .interest
-                        .insert(Ready::WRITABLE),
-                    Position::Server => return MuxResult::Connect(global_stream_id),
+                    Position::Client(_) => {
+                        let StreamState::Linked(token) = stream.state else { unreachable!() };
+                        endpoint
+                            .readiness_mut(token)
+                            .interest
+                            .insert(Ready::WRITABLE)
+                    }
+                    Position::Server => stream.state = StreamState::Link,
                 };
             }
             Frame::PushPromise(push_promise) => match self.position {
@@ -609,38 +612,61 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
     {
         match self.position {
-            Position::Client(BackendStatus::Connecting(_)) => todo!("reconnect"),
-            Position::Client(_) => {}
+            Position::Client(BackendStatus::Connected(_))
+            | Position::Client(BackendStatus::Connecting(_)) => {}
+            Position::Client(BackendStatus::Disconnecting)
+            | Position::Client(BackendStatus::KeepAlive(_)) => unreachable!(),
             Position::Server => unreachable!(),
         }
+        // reconnection is handled by the server for each stream separately
         for global_stream_id in self.streams.values() {
             println_!("end stream: {global_stream_id}");
-            endpoint.end_stream(
-                context.streams[*global_stream_id].token.unwrap(),
-                *global_stream_id,
-                context,
-            )
+            let StreamState::Linked(token) = context.streams[*global_stream_id].state else { unreachable!() };
+            endpoint.end_stream(token, *global_stream_id, context)
         }
     }
 
     pub fn end_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
         let stream_context = &mut context.streams[stream].context;
         println_!("end H2 stream {stream}: {stream_context:#?}");
-        let mut found = false;
-        for (stream_id, global_stream_id) in &self.streams {
-            if *global_stream_id == stream {
-                let id = *stream_id;
-                self.streams.remove(&id);
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            panic!();
-        }
         match self.position {
-            Position::Client(_) => {}
-            Position::Server => todo!(),
+            Position::Client(_) => {
+                for (stream_id, global_stream_id) in &self.streams {
+                    if *global_stream_id == stream {
+                        let id = *stream_id;
+                        self.streams.remove(&id);
+                        return;
+                    }
+                }
+                unreachable!()
+            }
+            Position::Server => {
+                let stream = &mut context.streams[stream];
+                match (stream.front.consumed, stream.back.is_main_phase()) {
+                    (_, true) => {
+                        // front might not have been consumed (in case of PushPromise)
+                        // we have a "forwardable" answer from the back
+                        // if the answer is not terminated we send an RstStream to properly clean the stream
+                        // if it is terminated, we finish the transfer, the backend is not necessary anymore
+                        if !stream.back.is_terminated() {
+                            forcefully_terminate_answer(&mut stream.back, &mut self.readiness);
+                        }
+                        stream.state = StreamState::Unlinked
+                    }
+                    (true, false) => {
+                        // we do not have an answer, but the request has already been partially consumed
+                        // so we can't retry, send a 502 bad gateway instead
+                        // note: it might be possible to send a RstStream with an adequate error code
+                        set_default_answer(&mut stream.back, &mut self.readiness, 502);
+                        stream.state = StreamState::Unlinked;
+                        }
+                    (false, false) => {
+                        // we do not have an answer, but the request is untouched so we can retry
+                        println!("H2 RECONNECT");
+                        stream.state = StreamState::Link
+                    }
+                }
+            }
         }
     }
 

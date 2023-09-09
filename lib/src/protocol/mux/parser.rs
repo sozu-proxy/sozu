@@ -103,7 +103,10 @@ impl<'a> Error<'a> {
         Error { input, error }
     }
     pub fn new_h2(input: &'a [u8], error: H2Error) -> Error<'a> {
-        Error { input, error: InnerError::H2(error) }
+        Error {
+            input,
+            error: InnerError::H2(error),
+        }
     }
 }
 

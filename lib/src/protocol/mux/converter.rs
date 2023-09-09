@@ -5,13 +5,14 @@ use kawa::{AsBuffer, Block, BlockConverter, Chunk, Flags, Kawa, Pair, StatusLine
 use crate::protocol::http::parser::compare_no_case;
 
 use super::{
-    parser::{FrameHeader, FrameType},
-    serializer::gen_frame_header,
-    StreamId,
+    parser::{FrameHeader, FrameType, H2Error},
+    serializer::{gen_frame_header, gen_rst_stream},
+    StreamId, StreamState,
 };
 
 pub struct H2BlockConverter<'a> {
     pub stream_id: StreamId,
+    pub state: StreamState,
     pub encoder: &'a mut hpack::Encoder<'static>,
     pub out: Vec<u8>,
 }
@@ -140,20 +141,25 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                     .unwrap();
                     kawa.push_out(Store::from_slice(&header));
                     kawa.push_out(Store::Alloc(payload.into_boxed_slice(), 0));
-                }
-                if end_stream {
-                    let mut header = [0; 9];
-                    gen_frame_header(
-                        &mut header,
-                        &FrameHeader {
-                            payload_len: 0,
-                            frame_type: FrameType::Data,
-                            flags: 1,
-                            stream_id: self.stream_id,
-                        },
-                    )
-                    .unwrap();
-                    kawa.push_out(Store::from_slice(&header));
+                } else if end_stream {
+                    if kawa.is_error() {
+                        let mut frame = [0; 13];
+                        gen_rst_stream(&mut frame, self.stream_id, H2Error::InternalError).unwrap();
+                        kawa.push_out(Store::from_slice(&frame));
+                    } else {
+                        let mut header = [0; 9];
+                        gen_frame_header(
+                            &mut header,
+                            &FrameHeader {
+                                payload_len: 0,
+                                frame_type: FrameType::Data,
+                                flags: 1,
+                                stream_id: self.stream_id,
+                            },
+                        )
+                        .unwrap();
+                        kawa.push_out(Store::from_slice(&header));
+                    }
                 }
                 if end_header || end_stream {
                     kawa.push_delimiter()
