@@ -28,13 +28,19 @@ use crate::{
         sync_backend::Backend as SyncBackend,
     },
     sozu::worker::Worker,
-    tests::{repeat_until_error_or, setup_async_test, setup_sync_test, State},
+    tests::{provide_port, repeat_until_error_or, setup_async_test, setup_sync_test, State},
 };
 
-pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> State {
-    let front_address = "127.0.0.1:2001"
+fn create_local_address() -> SocketAddr {
+    let address: SocketAddr = format!("127.0.0.1:{}", provide_port())
         .parse()
         .expect("could not parse front address");
+    println!("created local address {}", address);
+    address
+}
+
+pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> State {
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) = setup_async_test(
@@ -95,9 +101,7 @@ pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> S
 }
 
 pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
@@ -166,9 +170,7 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
 }
 
 pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let config = Worker::into_config(FileConfig {
         zombie_check_interval: zombie,
@@ -237,9 +239,7 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
 }
 
 pub fn try_issue_810_timeout() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) = setup_sync_test(
@@ -289,12 +289,9 @@ pub fn try_issue_810_timeout() -> State {
 }
 
 pub fn try_issue_810_panic(part2: bool) -> State {
-    let front_address: SocketAddr = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
-    let back_address = "127.0.0.1:2002"
-        .parse::<std::net::SocketAddr>()
-        .expect("could not parse back address");
+    let front_address = create_local_address();
+
+    let back_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("810-PANIC", config, &listeners, state);
@@ -360,12 +357,11 @@ pub fn try_issue_810_panic(part2: bool) -> State {
 }
 
 pub fn try_tls_endpoint() -> State {
-    let front_address: SocketAddr = "127.0.0.1:2001"
+    let front_port = provide_port();
+    let front_address: SocketAddr = format!("127.0.0.1:{}", front_port)
         .parse()
         .expect("could not parse front address");
-    let back_address = "127.0.0.1:2002"
-        .parse::<std::net::SocketAddr>()
-        .expect("could not parse back address");
+    let back_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
@@ -423,7 +419,11 @@ pub fn try_tls_endpoint() -> State {
     );
 
     let client = build_https_client();
-    let request = client.get(format!("https://{hostname}:2001/api").parse().unwrap());
+    let request = client.get(
+        format!("https://{hostname}:{front_port}/api")
+            .parse()
+            .unwrap(),
+    );
     if let Some((status, body)) = resolve_request(request) {
         println!("response status: {status:?}");
         println!("response body: {body}");
@@ -450,9 +450,7 @@ pub fn try_tls_endpoint() -> State {
 }
 
 pub fn test_upgrade() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
@@ -569,9 +567,7 @@ pub fn test_http(nb_requests: usize) {
 */
 
 pub fn try_hard_or_soft_stop(soft: bool) -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
@@ -649,9 +645,7 @@ fn try_http_behaviors() -> State {
 
     info!("starting up");
 
-    let front_address: SocketAddr = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address: SocketAddr = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("BEHAVE-WORKER", config, &listeners, state);
@@ -698,9 +692,8 @@ fn try_http_behaviors() -> State {
     assert_eq!(response, Some(default_503_answer()));
     assert_eq!(client.receive(), None);
 
-    let back_address = "127.0.0.1:2002"
-        .parse::<std::net::SocketAddr>()
-        .expect("could not parse back address");
+    let back_address = create_local_address();
+
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
@@ -949,9 +942,7 @@ fn try_http_behaviors() -> State {
 }
 
 fn try_msg_close() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) = setup_sync_test(
@@ -991,9 +982,7 @@ fn try_msg_close() -> State {
 }
 
 pub fn try_blue_geen() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, _) = setup_async_test("BG", config, listeners, state, front_address, 0, false);
@@ -1003,12 +992,9 @@ pub fn try_blue_geen() -> State {
         responses_sent: 0,
     };
 
-    let primary_address = "127.0.0.1:2002"
-        .parse()
-        .expect("could not parse back address");
-    let secondary_address = "127.0.0.1:2003"
-        .parse()
-        .expect("could not parse back address");
+    let primary_address = create_local_address();
+
+    let secondary_address = create_local_address();
 
     let mut primary = AsyncBackend::spawn_detached_backend(
         "PRIMARY",
@@ -1093,9 +1079,7 @@ pub fn try_keep_alive() -> State {
         None,
     );
 
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) = setup_sync_test(
@@ -1183,9 +1167,7 @@ pub fn try_keep_alive() -> State {
 }
 
 pub fn try_stick() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
@@ -1259,9 +1241,7 @@ pub fn try_stick() -> State {
 }
 
 fn try_max_connections() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (mut config, listeners, state) = Worker::empty_config();
     config.max_connections = 15;

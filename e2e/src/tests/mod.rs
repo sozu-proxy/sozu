@@ -1,6 +1,11 @@
 mod tests;
 
-use std::{io::stdin, net::SocketAddr};
+use std::{
+    cell::RefCell,
+    io::stdin,
+    net::SocketAddr,
+    sync::atomic::{AtomicU16, Ordering},
+};
 
 use sozu_command_lib::{
     config::{Config, ListenerBuilder},
@@ -23,6 +28,12 @@ pub enum State {
     Success,
     Fail,
     Undecided,
+}
+
+static PORT_PROVIDER: AtomicU16 = AtomicU16::new(2000);
+
+fn provide_port() -> u16 {
+    PORT_PROVIDER.fetch_add(1, Ordering::SeqCst)
 }
 
 /// Setup a Sozu worker with
@@ -72,7 +83,7 @@ pub fn setup_test<S: Into<String>>(
 
     let mut backends = Vec::new();
     for i in 0..nb_backends {
-        let back_address: SocketAddr = format!("127.0.0.1:{}", 2002 + i)
+        let back_address: SocketAddr = format!("127.0.0.1:{}", provide_port())
             .parse()
             .expect("could not parse back address");
         worker.send_proxy_request(Request {
