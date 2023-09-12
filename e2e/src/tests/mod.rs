@@ -1,7 +1,6 @@
 mod tests;
 
 use std::{
-    cell::RefCell,
     io::stdin,
     net::SocketAddr,
     sync::atomic::{AtomicU16, Ordering},

@@ -5,8 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serial_test::serial;
-
 use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
     info,
@@ -1364,19 +1362,16 @@ fn try_max_connections() -> State {
     State::Success
 }
 
-#[serial]
 #[test]
 fn test_sync() {
     assert_eq!(try_sync(10, 100), State::Success);
 }
 
-#[serial]
 #[test]
 fn test_async() {
     assert_eq!(try_async(3, 10, 100), State::Success);
 }
 
-#[serial]
 #[test]
 fn test_hard_stop() {
     assert_eq!(
@@ -1389,7 +1384,6 @@ fn test_hard_stop() {
     );
 }
 
-#[serial]
 #[test]
 fn test_soft_stop() {
     assert_eq!(
@@ -1404,7 +1398,7 @@ fn test_soft_stop() {
 
 // https://github.com/sozu-proxy/sozu/issues/806
 // This should actually be a success
-#[serial]
+
 #[test]
 fn test_issue_806() {
     assert!(
@@ -1417,7 +1411,7 @@ fn test_issue_806() {
 }
 
 // https://github.com/sozu-proxy/sozu/issues/808
-#[serial]
+
 #[test]
 fn test_issue_808() {
     // this test is not relevant anymore, at least not like this
@@ -1434,7 +1428,7 @@ fn test_issue_808() {
 }
 
 // https://github.com/sozu-proxy/sozu/issues/810
-#[serial]
+
 #[test]
 fn test_issue_810_timeout() {
     assert_eq!(
@@ -1447,7 +1441,6 @@ fn test_issue_810_timeout() {
     );
 }
 
-#[serial]
 #[test]
 fn test_issue_810_panic_on_session_close() {
     assert_eq!(
@@ -1460,7 +1453,6 @@ fn test_issue_810_panic_on_session_close() {
     );
 }
 
-#[serial]
 #[test]
 fn test_issue_810_panic_on_missing_listener() {
     assert_eq!(
@@ -1473,7 +1465,6 @@ fn test_issue_810_panic_on_missing_listener() {
         );
 }
 
-#[serial]
 #[test]
 fn test_tls_endpoint() {
     assert_eq!(
@@ -1486,7 +1477,6 @@ fn test_tls_endpoint() {
     );
 }
 
-#[serial]
 #[test]
 fn test_http_behaviors() {
     assert_eq!(
@@ -1495,7 +1485,6 @@ fn test_http_behaviors() {
     );
 }
 
-#[serial]
 #[test]
 fn test_msg_close() {
     assert_eq!(
@@ -1504,7 +1493,6 @@ fn test_msg_close() {
     );
 }
 
-#[serial]
 #[test]
 fn test_blue_green() {
     assert_eq!(
@@ -1513,7 +1501,6 @@ fn test_blue_green() {
     );
 }
 
-#[serial]
 #[test]
 fn test_keep_alive() {
     assert_eq!(
@@ -1522,7 +1509,6 @@ fn test_keep_alive() {
     );
 }
 
-#[serial]
 #[test]
 fn test_stick() {
     assert_eq!(
@@ -1531,7 +1517,6 @@ fn test_stick() {
     );
 }
 
-#[serial]
 #[test]
 fn test_max_connections() {
     assert_eq!(

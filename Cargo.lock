@@ -1927,7 +1927,6 @@ dependencies = [
  "libc",
  "mio",
  "rustls",
- "serial_test",
  "slab",
  "sozu-command-lib",
  "sozu-lib",

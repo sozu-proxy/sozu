@@ -28,7 +28,7 @@ The tests are flagged with the usual macros, so they will run with all other tes
 
     cargo test
 
-All tests are run one at a time with the `#[serial]` macro. You can run just one using
+You can run just one test using
 
     cargo test test_issue_810_timeout
 
