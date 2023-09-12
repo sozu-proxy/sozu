@@ -905,7 +905,9 @@ fn try_http_behaviors() -> State {
     );
 
     info!("expecting 103");
-    backend.set_response("HTTP/1.1 103 Early Hint\r\nLink: </style.css>; rel=preload; as=style\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong");
+    backend.set_response(
+        "HTTP/1.1 103 Early Hint\r\nLink: </style.css>; rel=preload; as=style\r\n\r\n",
+    );
     client.set_request("GET /103 HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\nping");
     client.connect();
     client.send();
@@ -922,6 +924,9 @@ fn try_http_behaviors() -> State {
         response.starts_with(&expected_response_start)
             && response.ends_with(&expected_response_end)
     );
+
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong");
+    backend.send(1);
 
     let expected_response_start = String::from("HTTP/1.1 200 OK\r\n");
     let expected_response_end = String::from("\r\n\r\npong");
