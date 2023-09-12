@@ -26,7 +26,6 @@ use crate::{
         mux::{
             h1::ConnectionH1,
             h2::{ConnectionH2, H2Settings, H2State, H2StreamId},
-            parser::H2Error,
         },
         SessionState,
     },
@@ -54,8 +53,9 @@ type GenericHttpStream = kawa::Kawa<Checkout>;
 type StreamId = u32;
 type GlobalStreamId = usize;
 
-/// Replace the content of the kawa buffer with a default Sozu answer for a given status code
-fn set_default_answer(kawa: &mut GenericHttpStream, readiness: &mut Readiness, code: u16) {
+/// Replace the content of the kawa message with a default Sozu answer for a given status code
+fn set_default_answer(stream: &mut Stream, readiness: &mut Readiness, code: u16) {
+    let kawa = &mut stream.back;
     kawa.clear();
     kawa.storage.clear();
     kawa.detached.status_line = kawa::StatusLine::Response {
@@ -84,10 +84,14 @@ fn set_default_answer(kawa: &mut GenericHttpStream, readiness: &mut Readiness, c
         end_stream: true,
     }));
     kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+    stream.state = StreamState::Unlinked;
     readiness.interest.insert(Ready::WRITABLE);
 }
 
-fn forcefully_terminate_answer(kawa: &mut GenericHttpStream, readiness: &mut Readiness) {
+/// Forcefully terminates a kawa message by setting the "end_stream" flag and setting the parsing_phase to Error.
+/// An H2 converter will produce an RstStream frame.
+fn forcefully_terminate_answer(stream: &mut Stream, readiness: &mut Readiness) {
+    let kawa = &mut stream.back;
     kawa.push_block(kawa::Block::Flags(kawa::Flags {
         end_body: false,
         end_chunk: false,
@@ -96,6 +100,7 @@ fn forcefully_terminate_answer(kawa: &mut GenericHttpStream, readiness: &mut Rea
     }));
     kawa.parsing_phase = kawa::ParsingPhase::Terminated;
     debug_kawa(kawa);
+    stream.state = StreamState::Unlinked;
     readiness.interest.insert(Ready::WRITABLE);
 }
 
@@ -115,13 +120,7 @@ pub enum BackendStatus {
 
 pub enum MuxResult {
     Continue,
-    CloseSession(H2Error),
-}
-
-#[derive(Debug)]
-pub enum Connection<Front: SocketHandler> {
-    H1(ConnectionH1<Front>),
-    H2(ConnectionH2<Front>),
+    CloseSession,
 }
 
 pub trait Endpoint {
@@ -137,6 +136,12 @@ pub trait Endpoint {
     /// the stream might be recovering from a disconnection, in any case at this point its response MUST be empty.
     /// If the start_stream is called on a H2 server it means the stream is a server push and its request MUST be empty.
     fn start_stream(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context);
+}
+
+#[derive(Debug)]
+pub enum Connection<Front: SocketHandler> {
+    H1(ConnectionH1<Front>),
+    H2(ConnectionH2<Front>),
 }
 
 impl<Front: SocketHandler> Connection<Front> {
@@ -805,10 +810,6 @@ impl Mux {
     pub fn front_socket(&self) -> &TcpStream {
         self.frontend.socket()
     }
-
-    fn goaway(&mut self, e: H2Error) {
-        todo!()
-    }
 }
 
 impl SessionState for Mux {
@@ -835,8 +836,8 @@ impl SessionState for Mux {
                         .frontend
                         .readable(context, EndpointClient(&mut self.router))
                     {
-                        MuxResult::Continue => (),
-                        MuxResult::CloseSession(e) => self.goaway(e),
+                        MuxResult::Continue => {}
+                        MuxResult::CloseSession => return SessionResult::Close,
                     }
                 }
 
@@ -853,31 +854,25 @@ impl SessionState for Mux {
                     }
 
                     if backend.readiness().filter_interest().is_writable() {
-                        let mut owned_position = Position::Server;
                         let position = backend.position_mut();
-                        std::mem::swap(&mut owned_position, position);
-                        match owned_position {
+                        match position {
                             Position::Client(BackendStatus::Connecting(cluster_id)) => {
-                                *position = Position::Client(BackendStatus::Connected(cluster_id));
+                                *position = Position::Client(BackendStatus::Connected(
+                                    std::mem::take(cluster_id),
+                                ));
                             }
-                            _ => *position = owned_position,
+                            _ => {}
                         }
                         match backend.writable(context, EndpointServer(&mut self.frontend)) {
-                            MuxResult::Continue => (),
-                            MuxResult::CloseSession(e) => {
-                                self.goaway(e);
-                                break;
-                            }
+                            MuxResult::Continue => {}
+                            MuxResult::CloseSession => return SessionResult::Close,
                         }
                     }
 
                     if backend.readiness().filter_interest().is_readable() {
                         match backend.readable(context, EndpointServer(&mut self.frontend)) {
-                            MuxResult::Continue => (),
-                            MuxResult::CloseSession(e) => {
-                                self.goaway(e);
-                                break;
-                            }
+                            MuxResult::Continue => {}
+                            MuxResult::CloseSession => return SessionResult::Close,
                         }
                     }
 
@@ -905,8 +900,8 @@ impl SessionState for Mux {
                         .frontend
                         .writable(context, EndpointClient(&mut self.router))
                     {
-                        MuxResult::Continue => (),
-                        MuxResult::CloseSession(e) => self.goaway(e),
+                        MuxResult::Continue => {}
+                        MuxResult::CloseSession => return SessionResult::Close,
                     }
                 }
 
@@ -939,24 +934,24 @@ impl SessionState for Mux {
                         Ok(_) => {}
                         Err(error) => {
                             println_!("Connection error: {error}");
-                            let kawa = &mut context.streams[stream_id].back;
+                            let stream = &mut context.streams[stream_id];
                             use BackendConnectionError as BE;
                             match error {
                                 BE::Backend(BackendError::NoBackendForCluster(_))
                                 | BE::MaxConnectionRetries(_)
                                 | BE::MaxSessionsMemory
                                 | BE::MaxBuffers => {
-                                    set_default_answer(kawa, front_readiness, 503);
+                                    set_default_answer(stream, front_readiness, 503);
                                 }
                                 BE::RetrieveClusterError(
                                     RetrieveClusterError::RetrieveFrontend(_),
                                 ) => {
-                                    set_default_answer(kawa, front_readiness, 404);
+                                    set_default_answer(stream, front_readiness, 404);
                                 }
                                 BE::RetrieveClusterError(
                                     RetrieveClusterError::UnauthorizedRoute,
                                 ) => {
-                                    set_default_answer(kawa, front_readiness, 401);
+                                    set_default_answer(stream, front_readiness, 401);
                                 }
 
                                 BE::Backend(_) => {}

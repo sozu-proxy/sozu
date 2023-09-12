@@ -6,24 +6,24 @@ use sozu_command::ready::Ready;
 use crate::{
     println_,
     protocol::mux::{
-        converter, debug_kawa,
+        converter, debug_kawa, forcefully_terminate_answer,
         parser::{self, error_code_to_str, Frame, FrameHeader, FrameType, H2Error},
-        pkawa, serializer, update_readiness_after_read, update_readiness_after_write,
-        BackendStatus, Context, Endpoint, GenericHttpStream, GlobalStreamId, MuxResult, Position,
-        StreamId, StreamState, set_default_answer, forcefully_terminate_answer,
+        pkawa, serializer, set_default_answer, update_readiness_after_read,
+        update_readiness_after_write, BackendStatus, Context, Endpoint, GenericHttpStream,
+        GlobalStreamId, MuxResult, Position, StreamId, StreamState,
     },
     socket::SocketHandler,
     Readiness,
 };
 
 #[inline(always)]
-fn error_nom_to_h2(error: nom::Err<parser::Error>) -> MuxResult {
+fn error_nom_to_h2(error: nom::Err<parser::Error>) -> H2Error {
     match error {
         nom::Err::Error(parser::Error {
             error: parser::InnerError::H2(e),
             ..
-        }) => return MuxResult::CloseSession(e),
-        _ => return MuxResult::CloseSession(H2Error::ProtocolError),
+        }) => return e,
+        _ => return H2Error::ProtocolError,
     }
 }
 
@@ -34,6 +34,7 @@ pub enum H2State {
     ServerSettings,
     Header,
     Frame(FrameHeader),
+    GoAway,
     Error,
 }
 
@@ -138,6 +139,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         };
         match (&self.state, &self.position) {
             (H2State::Error, _)
+            | (H2State::GoAway, _)
             | (H2State::ServerSettings, Position::Server)
             | (H2State::ClientPreface, Position::Client(_))
             | (H2State::ClientSettings, Position::Client(_)) => unreachable!(
@@ -148,7 +150,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let i = kawa.storage.data();
                 let i = match parser::preface(i) {
                     Ok((i, _)) => i,
-                    Err(_) => return MuxResult::CloseSession(H2Error::ProtocolError),
+                    Err(_) => return self.force_disconnect(),
                 };
                 match parser::frame_header(i) {
                     Ok((
@@ -164,7 +166,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         self.state = H2State::ClientSettings;
                         self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
                     }
-                    _ => return MuxResult::CloseSession(H2Error::ProtocolError),
+                    _ => return self.force_disconnect(),
                 };
             }
             (H2State::ClientSettings, Position::Server) => {
@@ -182,7 +184,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         kawa.storage.clear();
                         settings
                     }
-                    Err(_) => return MuxResult::CloseSession(H2Error::ProtocolError),
+                    Err(_) => return self.force_disconnect(),
                 };
                 let kawa = &mut self.zero;
                 match serializer::gen_frame_header(
@@ -197,13 +199,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, size)) => kawa.storage.fill(size),
                     Err(e) => {
                         println!("could not serialize HeaderFrame: {e:?}");
-                        return MuxResult::CloseSession(H2Error::InternalError);
+                        return self.force_disconnect();
                     }
                 };
 
                 self.state = H2State::ServerSettings;
                 self.expect_write = Some(H2StreamId::Zero);
-                self.handle(settings, context, endpoint);
+                self.handle_frame(settings, context, endpoint);
             }
             (H2State::ServerSettings, Position::Client(_)) => {
                 let i = kawa.storage.data();
@@ -221,7 +223,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
                         self.state = H2State::Frame(header)
                     }
-                    _ => return MuxResult::CloseSession(H2Error::ProtocolError),
+                    _ => return self.force_disconnect(),
                 };
             }
             (H2State::Header, _) => {
@@ -232,32 +234,30 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         println_!("{header:#?}");
                         kawa.storage.clear();
                         let stream_id = header.stream_id;
-                        let stream_id = if stream_id == 0
-                            || header.frame_type == FrameType::RstStream
-                        {
-                            H2StreamId::Zero
-                        } else {
-                            let global_stream_id = if let Some(global_stream_id) =
-                                self.streams.get(&stream_id)
-                            {
-                                *global_stream_id
+                        let stream_id =
+                            if stream_id == 0 || header.frame_type == FrameType::RstStream {
+                                H2StreamId::Zero
                             } else {
-                                match self.create_stream(stream_id, context) {
-                                    Some(global_stream_id) => global_stream_id,
-                                    None => return MuxResult::CloseSession(H2Error::InternalError),
+                                let global_stream_id =
+                                    if let Some(global_stream_id) = self.streams.get(&stream_id) {
+                                        *global_stream_id
+                                    } else {
+                                        match self.create_stream(stream_id, context) {
+                                            Some(global_stream_id) => global_stream_id,
+                                            None => return self.goaway(H2Error::InternalError),
+                                        }
+                                    };
+                                if header.frame_type == FrameType::Data {
+                                    H2StreamId::Other(stream_id, global_stream_id)
+                                } else {
+                                    H2StreamId::Zero
                                 }
                             };
-                            if header.frame_type == FrameType::Data {
-                                H2StreamId::Other(stream_id, global_stream_id)
-                            } else {
-                                H2StreamId::Zero
-                            }
-                        };
                         println_!("{} {stream_id:?} {:#?}", header.stream_id, self.streams);
                         self.expect_read = Some((stream_id, header.payload_len as usize));
                         self.state = H2State::Frame(header);
                     }
-                    Err(e) => return error_nom_to_h2(e),
+                    Err(e) => panic!("stream error: {:?}", error_nom_to_h2(e)),
                 };
             }
             (H2State::Frame(header), _) => {
@@ -269,12 +269,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.local_settings.settings_max_frame_size,
                 ) {
                     Ok((_, frame)) => frame,
-                    Err(e) => return error_nom_to_h2(e),
+                    Err(e) => panic!("stream error: {:?}", error_nom_to_h2(e)),
                 };
                 if let H2StreamId::Zero = stream_id {
                     kawa.storage.clear();
                 }
-                let state_result = self.handle(frame, context, endpoint);
+                let state_result = self.handle_frame(frame, context, endpoint);
                 self.state = H2State::Header;
                 self.expect_read = Some((H2StreamId::Zero, 9));
                 return state_result;
@@ -311,6 +311,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 "Unexpected combination: (Readable, {:?}, {:?})",
                 self.state, self.position
             ),
+            (H2State::GoAway, _) => self.force_disconnect(),
             (H2State::ClientPreface, Position::Client(_)) => {
                 println_!("Preparing preface and settings");
                 let pri = serializer::H2_PRI.as_bytes();
@@ -322,7 +323,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, size)) => kawa.storage.fill(size),
                     Err(e) => {
                         println!("could not serialize SettingsFrame: {e:?}");
-                        return MuxResult::CloseSession(H2Error::InternalError);
+                        return self.force_disconnect();
                     }
                 };
 
@@ -343,8 +344,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.expect_read = Some((H2StreamId::Zero, 9));
                 MuxResult::Continue
             }
-            // Proxying states (Header/Frame)
-            (_, _) => {
+            // Proxying states
+            (H2State::Header, _) | (H2State::Frame(_), _) => {
                 let mut dead_streams = Vec::new();
 
                 if let Some(H2StreamId::Other(stream_id, global_stream_id)) = self.expect_write {
@@ -365,8 +366,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             Position::Server => {
                                 // mark stream as reusable
                                 println_!("Recycle stream: {global_stream_id}");
-                                let mut state = StreamState::Recycle;
-                                std::mem::swap(&mut stream.state, &mut state);
+                                let state =
+                                    std::mem::replace(&mut stream.state, StreamState::Recycle);
                                 if let StreamState::Linked(token) = state {
                                     endpoint.end_stream(token, global_stream_id, context);
                                 }
@@ -412,8 +413,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             Position::Server => {
                                 // mark stream as reusable
                                 println_!("Recycle stream: {global_stream_id}");
-                                let mut state = StreamState::Recycle;
-                                std::mem::swap(&mut stream.state, &mut state);
+                                let state =
+                                    std::mem::replace(&mut stream.state, StreamState::Recycle);
                                 if let StreamState::Linked(token) = state {
                                     endpoint.end_stream(token, global_stream_id, context);
                                 }
@@ -435,6 +436,27 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
+    pub fn goaway(&mut self, error: H2Error) -> MuxResult {
+        self.state = H2State::Error;
+        self.expect_read = None;
+        self.expect_write = Some(H2StreamId::Zero);
+        let kawa = &mut self.zero;
+
+        match serializer::gen_goaway(kawa.storage.space(), self.last_stream_id, error) {
+            Ok((_, size)) => {
+                kawa.storage.fill(size);
+                self.state = H2State::GoAway;
+                self.expect_write = Some(H2StreamId::Zero);
+                self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
+                MuxResult::Continue
+            }
+            Err(e) => {
+                println!("could not serialize GoAwayFrame: {e:?}");
+                self.force_disconnect()
+            }
+        }
+    }
+
     pub fn create_stream(
         &mut self,
         stream_id: StreamId,
@@ -444,8 +466,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             Ulid::generate(),
             self.peer_settings.settings_initial_window_size,
         )?;
-        if (stream_id >> 1) > self.last_stream_id {
-            self.last_stream_id = stream_id >> 1;
+        if stream_id > self.last_stream_id {
+            self.last_stream_id = stream_id & !1;
         }
         self.streams.insert(stream_id, global_stream_id);
         Some(global_stream_id)
@@ -459,7 +481,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    fn handle<E>(&mut self, frame: Frame, context: &mut Context, mut endpoint: E) -> MuxResult
+    fn handle_frame<E>(&mut self, frame: Frame, context: &mut Context, mut endpoint: E) -> MuxResult
     where
         E: Endpoint,
     {
@@ -469,7 +491,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let mut slice = data.payload;
                 let global_stream_id = match self.streams.get(&data.stream_id) {
                     Some(global_stream_id) => *global_stream_id,
-                    None => return MuxResult::CloseSession(H2Error::ProtocolError),
+                    None => panic!("stream error"),
                 };
                 let stream = &mut context.streams[global_stream_id];
                 let kawa = stream.rbuffer(&self.position);
@@ -490,6 +512,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }));
                     kawa.parsing_phase = kawa::ParsingPhase::Terminated;
                 }
+                match self.position {
+                    Position::Client(_) => {
+                        let StreamState::Linked(token) = stream.state else { unreachable!() };
+                        endpoint
+                            .readiness_mut(token)
+                            .interest
+                            .insert(Ready::WRITABLE)
+                    }
+                    Position::Server => {}
+                };
             }
             Frame::Headers(headers) => {
                 if !headers.end_headers {
@@ -526,12 +558,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     if self.local_settings.settings_enable_push {
                         todo!("forward the push")
                     } else {
-                        return MuxResult::CloseSession(H2Error::ProtocolError);
+                        return self.goaway(H2Error::ProtocolError);
                     }
                 }
                 Position::Server => {
                     println_!("A client should not push promises");
-                    return MuxResult::CloseSession(H2Error::ProtocolError);
+                    return self.goaway(H2Error::ProtocolError);
                 }
             },
             Frame::Priority(priority) => (),
@@ -576,7 +608,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Ok((_, size)) => kawa.storage.fill(size),
                     Err(e) => {
                         println!("could not serialize PingFrame: {e:?}");
-                        return MuxResult::CloseSession(H2Error::InternalError);
+                        return self.force_disconnect();
                     }
                 };
                 self.readiness.interest.insert(Ready::WRITABLE);
@@ -589,22 +621,32 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     goaway.error_code,
                     error_code_to_str(goaway.error_code)
                 );
-                todo!();
+                return self.goaway(H2Error::NoError);
             }
             Frame::WindowUpdate(update) => {
                 if update.stream_id == 0 {
                     self.window += update.increment;
                 } else {
-                    let global_stream_id = match self.streams.get(&update.stream_id) {
-                        Some(global_stream_id) => *global_stream_id,
-                        None => return MuxResult::CloseSession(H2Error::ProtocolError),
-                    };
-                    context.streams[global_stream_id].window += update.increment as i32;
+                    if let Some(global_stream_id) = self.streams.get(&update.stream_id) {
+                        context.streams[*global_stream_id].window += update.increment as i32;
+                    }
                 }
             }
             Frame::Continuation(_) => todo!(),
         }
         MuxResult::Continue
+    }
+
+    fn force_disconnect(&mut self) -> MuxResult {
+        self.state = H2State::Error;
+        match self.position {
+            Position::Client(_) => {
+                self.position = Position::Client(BackendStatus::Disconnecting);
+                self.readiness.event = Ready::HUP;
+                MuxResult::Continue
+            }
+            Position::Server => MuxResult::CloseSession,
+        }
     }
 
     pub fn close<E>(&mut self, context: &mut Context, mut endpoint: E)
@@ -613,9 +655,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         match self.position {
             Position::Client(BackendStatus::Connected(_))
-            | Position::Client(BackendStatus::Connecting(_)) => {}
-            Position::Client(BackendStatus::Disconnecting)
-            | Position::Client(BackendStatus::KeepAlive(_)) => unreachable!(),
+            | Position::Client(BackendStatus::Connecting(_))
+            | Position::Client(BackendStatus::Disconnecting) => {}
+            Position::Client(BackendStatus::KeepAlive(_)) => unreachable!(),
             Position::Server => unreachable!(),
         }
         // reconnection is handled by the server for each stream separately
@@ -649,17 +691,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         // if the answer is not terminated we send an RstStream to properly clean the stream
                         // if it is terminated, we finish the transfer, the backend is not necessary anymore
                         if !stream.back.is_terminated() {
-                            forcefully_terminate_answer(&mut stream.back, &mut self.readiness);
+                            forcefully_terminate_answer(stream, &mut self.readiness);
+                        } else {
+                            stream.state = StreamState::Unlinked;
+                            self.readiness.interest.insert(Ready::WRITABLE);
                         }
-                        stream.state = StreamState::Unlinked
                     }
                     (true, false) => {
                         // we do not have an answer, but the request has already been partially consumed
                         // so we can't retry, send a 502 bad gateway instead
                         // note: it might be possible to send a RstStream with an adequate error code
-                        set_default_answer(&mut stream.back, &mut self.readiness, 502);
-                        stream.state = StreamState::Unlinked;
-                        }
+                        set_default_answer(stream, &mut self.readiness, 502);
+                    }
                     (false, false) => {
                         // we do not have an answer, but the request is untouched so we can retry
                         println!("H2 RECONNECT");

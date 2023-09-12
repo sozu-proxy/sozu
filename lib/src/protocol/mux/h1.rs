@@ -3,8 +3,9 @@ use sozu_command::ready::Ready;
 use crate::{
     println_,
     protocol::mux::{
-        debug_kawa, set_default_answer, update_readiness_after_read, update_readiness_after_write,
-        BackendStatus, Context, Endpoint, GlobalStreamId, MuxResult, Position, StreamState, forcefully_terminate_answer,
+        debug_kawa, forcefully_terminate_answer, set_default_answer, update_readiness_after_read,
+        update_readiness_after_write, BackendStatus, Context, Endpoint, GlobalStreamId, MuxResult,
+        Position, StreamState,
     },
     socket::SocketHandler,
     Readiness,
@@ -58,8 +59,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     endpoint.end_stream(token, global_stream_id, context);
                 }
                 Position::Server => {
-                    set_default_answer(&mut stream.back, &mut self.readiness, 400);
-                    stream.state = StreamState::Unlinked;
+                    set_default_answer(stream, &mut self.readiness, 400);
                 }
             }
             return MuxResult::Continue;
@@ -67,7 +67,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if kawa.is_terminated() {
             self.readiness.interest.remove(Ready::READABLE);
         }
-        if was_initial && kawa.is_main_phase() {
+        if kawa.is_main_phase() {
             match self.position {
                 Position::Client(_) => {
                     let StreamState::Linked(token) = stream.state else { unreachable!() };
@@ -77,12 +77,14 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         .insert(Ready::WRITABLE)
                 }
                 Position::Server => {
-                    self.requests += 1;
-                    println_!("REQUESTS: {}", self.requests);
-                    stream.state = StreamState::Link
+                    if was_initial {
+                        self.requests += 1;
+                        println_!("REQUESTS: {}", self.requests);
+                        stream.state = StreamState::Link
+                    }
                 }
-            };
-        }
+            }
+        };
         MuxResult::Continue
     }
 
@@ -115,7 +117,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     stream.back.storage.clear();
                     stream.front.clear();
                     // do not clear stream.front.storage because of H1 pipelining
-                    if let StreamState::Linked(token) = stream.state {
+                    stream.attempts = 0;
+                    let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
+                    if let StreamState::Linked(token) = old_state {
                         endpoint.end_stream(token, self.stream, context);
                     }
                 }
@@ -148,14 +152,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let stream = &mut context.streams[stream];
         let stream_context = &mut stream.context;
         println_!("end H1 stream {}: {stream_context:#?}", self.stream);
-        self.stream = usize::MAX;
-        let mut owned_position = Position::Server;
-        std::mem::swap(&mut owned_position, &mut self.position);
-        match owned_position {
+        match &mut self.position {
             Position::Client(BackendStatus::Connected(cluster_id))
             | Position::Client(BackendStatus::Connecting(cluster_id)) => {
+                self.stream = usize::MAX;
                 self.position = if stream_context.keep_alive_backend {
-                    Position::Client(BackendStatus::KeepAlive(cluster_id))
+                    Position::Client(BackendStatus::KeepAlive(std::mem::take(cluster_id)))
                 } else {
                     Position::Client(BackendStatus::Disconnecting)
                 }
@@ -168,13 +170,14 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     // if the answer is not terminated we send an RstStream to properly clean the stream
                     // if it is terminated, we finish the transfer, the backend is not necessary anymore
                     if !stream.back.is_terminated() {
-                        forcefully_terminate_answer(&mut stream.back, &mut self.readiness);
+                        forcefully_terminate_answer(stream, &mut self.readiness);
+                    } else {
+                        stream.state = StreamState::Unlinked;
+                        self.readiness.interest.insert(Ready::WRITABLE);
                     }
-                    stream.state = StreamState::Unlinked;
                 }
                 (true, false) => {
-                    set_default_answer(&mut stream.back, &mut self.readiness, 502);
-                    stream.state = StreamState::Unlinked;
+                    set_default_answer(stream, &mut self.readiness, 502);
                 }
                 (false, false) => {
                     // we do not have an answer, but the request is untouched so we can retry
@@ -189,16 +192,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     pub fn start_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
         println_!("start H1 stream {stream} {:?}", self.readiness);
         self.stream = stream;
-        let mut owned_position = Position::Server;
-        std::mem::swap(&mut owned_position, &mut self.position);
-        match owned_position {
+        match &mut self.position {
             Position::Client(BackendStatus::KeepAlive(cluster_id)) => {
-                self.position = Position::Client(BackendStatus::Connecting(cluster_id))
+                self.position =
+                    Position::Client(BackendStatus::Connecting(std::mem::take(cluster_id)))
             }
+            Position::Client(_) => {}
             Position::Server => unreachable!(),
-            _ => {
-                self.position = owned_position;
-            }
         }
     }
 }
