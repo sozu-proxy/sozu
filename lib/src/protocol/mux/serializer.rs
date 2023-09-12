@@ -114,3 +114,26 @@ pub fn gen_rst_stream<'a>(
         gen(be_u32(error_code as u32), buf).map(|(buf, size)| (buf, (old_size + size as usize)))
     })
 }
+
+pub fn gen_goaway<'a>(
+    buf: &'a mut [u8],
+    last_stream_id: u32,
+    error_code: H2Error,
+) -> Result<(&'a mut [u8], usize), GenError> {
+    gen_frame_header(
+        buf,
+        &FrameHeader {
+            payload_len: 4,
+            frame_type: FrameType::GoAway,
+            flags: 0,
+            stream_id: 0,
+        },
+    )
+    .and_then(|(buf, old_size)| {
+        gen(
+            tuple((be_u32(last_stream_id), be_u32(error_code as u32))),
+            buf,
+        )
+        .map(|(buf, size)| (buf, (old_size + size as usize)))
+    })
+}

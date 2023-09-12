@@ -515,9 +515,7 @@ macro_rules! StateMachineBuilder {
             /// leaving a FailedUpgrade in its place.
             /// The FailedUpgrade retains the marker of the previous State.
             fn take(&mut self) -> $state_name {
-                let mut owned_state = $state_name::FailedUpgrade(self.marker());
-                std::mem::swap(&mut owned_state, self);
-                owned_state
+                std::mem::replace(self, $state_name::FailedUpgrade(self.marker()))
             }
             _fn_impl!{front_socket(&, self) -> &mio::net::TcpStream}
         }

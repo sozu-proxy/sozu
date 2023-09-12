@@ -125,8 +125,7 @@ impl<'a, T: AsBuffer> BlockConverter<T> for H2BlockConverter<'a> {
                 ..
             }) => {
                 if end_header {
-                    let mut payload = Vec::new();
-                    std::mem::swap(&mut self.out, &mut payload);
+                    let payload = std::mem::replace(&mut self.out, Vec::new());
                     let mut header = [0; 9];
                     let flags = if end_stream { 1 } else { 0 } | if end_header { 4 } else { 0 };
                     gen_frame_header(
