@@ -191,11 +191,6 @@ impl CertificateResolver for GenericCertificateResolver {
             self.overrides.remove(&fingerprint);
         }
 
-        // We do not need to update the entry, if the certificate is already registered
-        if self.get_certificate(&fingerprint).is_some() {
-            return Ok(fingerprint);
-        }
-
         let (ok, certificates_to_remove) =
             self.should_insert(&fingerprint, &parsed_certificate_and_key)?;
         if !ok {
