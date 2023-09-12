@@ -5,8 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serial_test::serial;
-
 use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
     info,
@@ -28,13 +26,19 @@ use crate::{
         sync_backend::Backend as SyncBackend,
     },
     sozu::worker::Worker,
-    tests::{repeat_until_error_or, setup_async_test, setup_sync_test, State},
+    tests::{provide_port, repeat_until_error_or, setup_async_test, setup_sync_test, State},
 };
 
-pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> State {
-    let front_address = "127.0.0.1:2001"
+fn create_local_address() -> SocketAddr {
+    let address: SocketAddr = format!("127.0.0.1:{}", provide_port())
         .parse()
         .expect("could not parse front address");
+    println!("created local address {}", address);
+    address
+}
+
+pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> State {
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) = setup_async_test(
@@ -95,9 +99,7 @@ pub fn try_async(nb_backends: usize, nb_clients: usize, nb_requests: usize) -> S
 }
 
 pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
@@ -166,9 +168,7 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
 }
 
 pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let config = Worker::into_config(FileConfig {
         zombie_check_interval: zombie,
@@ -237,9 +237,7 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
 }
 
 pub fn try_issue_810_timeout() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) = setup_sync_test(
@@ -289,12 +287,9 @@ pub fn try_issue_810_timeout() -> State {
 }
 
 pub fn try_issue_810_panic(part2: bool) -> State {
-    let front_address: SocketAddr = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
-    let back_address = "127.0.0.1:2002"
-        .parse::<std::net::SocketAddr>()
-        .expect("could not parse back address");
+    let front_address = create_local_address();
+
+    let back_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("810-PANIC", config, &listeners, state);
@@ -360,12 +355,11 @@ pub fn try_issue_810_panic(part2: bool) -> State {
 }
 
 pub fn try_tls_endpoint() -> State {
-    let front_address: SocketAddr = "127.0.0.1:2001"
+    let front_port = provide_port();
+    let front_address: SocketAddr = format!("127.0.0.1:{}", front_port)
         .parse()
         .expect("could not parse front address");
-    let back_address = "127.0.0.1:2002"
-        .parse::<std::net::SocketAddr>()
-        .expect("could not parse back address");
+    let back_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
@@ -423,7 +417,11 @@ pub fn try_tls_endpoint() -> State {
     );
 
     let client = build_https_client();
-    let request = client.get(format!("https://{hostname}:2001/api").parse().unwrap());
+    let request = client.get(
+        format!("https://{hostname}:{front_port}/api")
+            .parse()
+            .unwrap(),
+    );
     if let Some((status, body)) = resolve_request(request) {
         println!("response status: {status:?}");
         println!("response body: {body}");
@@ -450,9 +448,7 @@ pub fn try_tls_endpoint() -> State {
 }
 
 pub fn test_upgrade() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
@@ -569,9 +565,7 @@ pub fn test_http(nb_requests: usize) {
 */
 
 pub fn try_hard_or_soft_stop(soft: bool) -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
@@ -649,9 +643,7 @@ fn try_http_behaviors() -> State {
 
     info!("starting up");
 
-    let front_address: SocketAddr = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address: SocketAddr = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("BEHAVE-WORKER", config, &listeners, state);
@@ -698,9 +690,8 @@ fn try_http_behaviors() -> State {
     assert_eq!(response, Some(default_503_answer()));
     assert_eq!(client.receive(), None);
 
-    let back_address = "127.0.0.1:2002"
-        .parse::<std::net::SocketAddr>()
-        .expect("could not parse back address");
+    let back_address = create_local_address();
+
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
@@ -914,7 +905,9 @@ fn try_http_behaviors() -> State {
     );
 
     info!("expecting 103");
-    backend.set_response("HTTP/1.1 103 Early Hint\r\nLink: </style.css>; rel=preload; as=style\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong");
+    backend.set_response(
+        "HTTP/1.1 103 Early Hint\r\nLink: </style.css>; rel=preload; as=style\r\n\r\n",
+    );
     client.set_request("GET /103 HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\nping");
     client.connect();
     client.send();
@@ -931,6 +924,9 @@ fn try_http_behaviors() -> State {
         response.starts_with(&expected_response_start)
             && response.ends_with(&expected_response_end)
     );
+
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong");
+    backend.send(1);
 
     let expected_response_start = String::from("HTTP/1.1 200 OK\r\n");
     let expected_response_end = String::from("\r\n\r\npong");
@@ -949,9 +945,7 @@ fn try_http_behaviors() -> State {
 }
 
 fn try_msg_close() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) = setup_sync_test(
@@ -991,9 +985,7 @@ fn try_msg_close() -> State {
 }
 
 pub fn try_blue_geen() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, _) = setup_async_test("BG", config, listeners, state, front_address, 0, false);
@@ -1003,12 +995,9 @@ pub fn try_blue_geen() -> State {
         responses_sent: 0,
     };
 
-    let primary_address = "127.0.0.1:2002"
-        .parse()
-        .expect("could not parse back address");
-    let secondary_address = "127.0.0.1:2003"
-        .parse()
-        .expect("could not parse back address");
+    let primary_address = create_local_address();
+
+    let secondary_address = create_local_address();
 
     let mut primary = AsyncBackend::spawn_detached_backend(
         "PRIMARY",
@@ -1093,9 +1082,7 @@ pub fn try_keep_alive() -> State {
         None,
     );
 
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) = setup_sync_test(
@@ -1183,9 +1170,7 @@ pub fn try_keep_alive() -> State {
 }
 
 pub fn try_stick() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let (mut worker, mut backends) =
@@ -1259,9 +1244,7 @@ pub fn try_stick() -> State {
 }
 
 fn try_max_connections() -> State {
-    let front_address = "127.0.0.1:2001"
-        .parse()
-        .expect("could not parse front address");
+    let front_address = create_local_address();
 
     let (mut config, listeners, state) = Worker::empty_config();
     config.max_connections = 15;
@@ -1384,19 +1367,16 @@ fn try_max_connections() -> State {
     State::Success
 }
 
-#[serial]
 #[test]
 fn test_sync() {
     assert_eq!(try_sync(10, 100), State::Success);
 }
 
-#[serial]
 #[test]
 fn test_async() {
     assert_eq!(try_async(3, 10, 100), State::Success);
 }
 
-#[serial]
 #[test]
 fn test_hard_stop() {
     assert_eq!(
@@ -1409,7 +1389,6 @@ fn test_hard_stop() {
     );
 }
 
-#[serial]
 #[test]
 fn test_soft_stop() {
     assert_eq!(
@@ -1424,7 +1403,7 @@ fn test_soft_stop() {
 
 // https://github.com/sozu-proxy/sozu/issues/806
 // This should actually be a success
-#[serial]
+
 #[test]
 fn test_issue_806() {
     assert!(
@@ -1437,7 +1416,7 @@ fn test_issue_806() {
 }
 
 // https://github.com/sozu-proxy/sozu/issues/808
-#[serial]
+
 #[test]
 fn test_issue_808() {
     // this test is not relevant anymore, at least not like this
@@ -1454,7 +1433,7 @@ fn test_issue_808() {
 }
 
 // https://github.com/sozu-proxy/sozu/issues/810
-#[serial]
+
 #[test]
 fn test_issue_810_timeout() {
     assert_eq!(
@@ -1467,7 +1446,6 @@ fn test_issue_810_timeout() {
     );
 }
 
-#[serial]
 #[test]
 fn test_issue_810_panic_on_session_close() {
     assert_eq!(
@@ -1480,7 +1458,6 @@ fn test_issue_810_panic_on_session_close() {
     );
 }
 
-#[serial]
 #[test]
 fn test_issue_810_panic_on_missing_listener() {
     assert_eq!(
@@ -1493,7 +1470,6 @@ fn test_issue_810_panic_on_missing_listener() {
         );
 }
 
-#[serial]
 #[test]
 fn test_tls_endpoint() {
     assert_eq!(
@@ -1506,7 +1482,6 @@ fn test_tls_endpoint() {
     );
 }
 
-#[serial]
 #[test]
 fn test_http_behaviors() {
     assert_eq!(
@@ -1515,7 +1490,6 @@ fn test_http_behaviors() {
     );
 }
 
-#[serial]
 #[test]
 fn test_msg_close() {
     assert_eq!(
@@ -1524,7 +1498,6 @@ fn test_msg_close() {
     );
 }
 
-#[serial]
 #[test]
 fn test_blue_green() {
     assert_eq!(
@@ -1533,7 +1506,6 @@ fn test_blue_green() {
     );
 }
 
-#[serial]
 #[test]
 fn test_keep_alive() {
     assert_eq!(
@@ -1542,7 +1514,6 @@ fn test_keep_alive() {
     );
 }
 
-#[serial]
 #[test]
 fn test_stick() {
     assert_eq!(
@@ -1551,7 +1522,6 @@ fn test_stick() {
     );
 }
 
-#[serial]
 #[test]
 fn test_max_connections() {
     assert_eq!(
