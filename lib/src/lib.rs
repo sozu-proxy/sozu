@@ -337,7 +337,6 @@ pub mod metrics;
 mod logs;
 
 pub mod backends;
-pub mod buffer_queue;
 pub mod features;
 pub mod http;
 pub mod load_balancing;
