@@ -6,7 +6,6 @@ edition = "2021"
 
 [dependencies]
 futures = "^0.3.28"
-futures-lite = "^1.13.0"
 hyper = { version = "^0.14.27", features = ["client", "http1"] }
 hyper-rustls = { version = "^0.24.1", default-features = false, features = ["webpki-tokio", "http1", "tls12", "logging"] }
 libc = "^0.2.147"

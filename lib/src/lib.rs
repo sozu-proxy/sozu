@@ -324,32 +324,11 @@
 //! }
 //! ```
 
-extern crate hdrhistogram;
-extern crate libc;
-extern crate log;
-extern crate mio;
-extern crate nom;
-extern crate pool as pool_crate;
-extern crate rand;
-extern crate rustls;
-extern crate rusty_ulid;
-extern crate slab;
-extern crate socket2;
-extern crate time;
-extern crate url;
 #[macro_use]
 extern crate sozu_command_lib as sozu_command;
-extern crate cookie_factory;
-extern crate hpack;
-extern crate idna;
-extern crate lazycell;
-extern crate poule;
-extern crate regex;
-extern crate webpki;
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
-extern crate foreign_types_shared;
 
 #[macro_use]
 pub mod util;
@@ -358,7 +337,6 @@ pub mod metrics;
 mod logs;
 
 pub mod backends;
-pub mod buffer_queue;
 pub mod features;
 pub mod http;
 pub mod load_balancing;
@@ -392,18 +370,19 @@ use backends::BackendError;
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
 use router::RouterError;
-use sozu_command::{
-    proto::command::{ListenerType, RequestHttpFrontend},
-    ObjectKind,
-};
-use sozu_command_lib::{
-    proto::command::Cluster, ready::Ready, request::WorkerRequest, response::WorkerResponse,
-    state::ClusterId,
-};
 use time::{Duration, Instant};
 use tls::GenericCertificateResolverError;
 
-use self::{backends::BackendMap, router::Route};
+use sozu_command::{
+    proto::command::{Cluster, ListenerType, RequestHttpFrontend},
+    ready::Ready,
+    request::WorkerRequest,
+    response::WorkerResponse,
+    state::ClusterId,
+    ObjectKind,
+};
+
+use crate::{backends::BackendMap, router::Route};
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

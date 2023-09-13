@@ -10,7 +10,7 @@ use anyhow::{bail, Context};
 use futures_lite::future;
 use libc::{self, pid_t};
 use mio::net::UnixStream;
-use nix::unistd::*;
+use nix::unistd::{fork, ForkResult};
 use serde::{Deserialize, Serialize};
 
 use tempfile::tempfile;

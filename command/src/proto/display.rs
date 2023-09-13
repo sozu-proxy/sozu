@@ -1,9 +1,8 @@
 use std::fmt::{Display, Formatter};
 
-use crate::proto::command::TlsVersion;
-
-use super::command::{
+use crate::proto::command::{
     request::RequestType, CertificateAndKey, CertificateSummary, QueryCertificatesFilters,
+    TlsVersion,
 };
 
 impl Display for CertificateAndKey {

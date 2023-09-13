@@ -2,13 +2,14 @@
 use std::{collections::BTreeMap, str, time::Instant};
 
 use hdrhistogram::Histogram;
+
 use sozu_command::proto::command::{
     filtered_metrics, response_content::ContentType, AvailableMetrics, BackendMetrics,
     ClusterMetrics, FilteredMetrics, MetricsConfiguration, Percentiles, QueryMetricsOptions,
     ResponseContent, WorkerMetrics,
 };
 
-use super::{MetricError, MetricValue, Subscriber};
+use crate::metrics::{MetricError, MetricValue, Subscriber};
 
 /// This is how the metrics are stored in the local drain
 #[derive(Debug, Clone)]

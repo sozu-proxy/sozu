@@ -814,7 +814,7 @@ fn try_http_behaviors() -> State {
     let mut backend = SyncBackend::new(
         "backend",
         back_address,
-        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\nTransfer-Encoding: Chunked\r\n\r\nearly",
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\nTransfer-Encoding: Chunked\r\n\r\n",
     );
 
     info!("expecting upgrade (101 switching protocols)");
@@ -832,6 +832,9 @@ fn try_http_behaviors() -> State {
     println!("request: {request:?}");
     println!("response: {response:?}");
     assert!(response.starts_with(&expected_response_start));
+
+    backend.set_response("early");
+    backend.send(0);
     let expected_response = String::from("early");
     let response = client.receive();
     assert_eq!(response, Some(expected_response));

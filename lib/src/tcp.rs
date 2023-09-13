@@ -16,8 +16,9 @@ use mio::{
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
-use sozu_command::{proto::command::request::RequestType, ObjectKind};
 use time::{Duration, Instant};
+
+use sozu_command::{proto::command::request::RequestType, ObjectKind};
 
 use crate::{
     backends::{Backend, BackendMap},

@@ -1,18 +1,18 @@
 pub mod pattern_trie;
 pub mod trie;
 
-use regex::bytes::Regex;
 use std::str::from_utf8;
+
+use regex::bytes::Regex;
 use time::Instant;
 
-use crate::protocol::http::parser::Method;
 use sozu_command::{
     proto::command::{PathRule as CommandPathRule, PathRuleKind, RulePosition},
     response::HttpFrontend,
     state::ClusterId,
 };
 
-use self::pattern_trie::TrieNode;
+use crate::{protocol::http::parser::Method, router::pattern_trie::TrieNode};
 
 #[derive(thiserror::Error, Debug)]
 pub enum RouterError {
