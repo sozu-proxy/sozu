@@ -13,6 +13,8 @@ use mio::{
     Events, Interest, Poll, Token,
 };
 use slab::Slab;
+use time::{Duration, Instant};
+
 use sozu_command::{
     channel::Channel,
     config::Config,
@@ -29,7 +31,6 @@ use sozu_command::{
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
-use time::{Duration, Instant};
 
 use crate::{
     backends::{Backend, BackendMap},

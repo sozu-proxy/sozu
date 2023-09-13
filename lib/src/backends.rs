@@ -1,20 +1,19 @@
 use std::{cell::RefCell, collections::HashMap, net::SocketAddr, rc::Rc};
 
 use mio::net::TcpStream;
+use time::Duration;
 
 use sozu_command::{
     proto::command::{Event, EventKind, LoadBalancingAlgorithms, LoadBalancingParams, LoadMetric},
     state::ClusterId,
 };
-use time::Duration;
 
 use crate::{
+    load_balancing::{LeastLoaded, LoadBalancingAlgorithm, PowerOfTwo, Random, RoundRobin},
     retry::{self, RetryPolicy},
     server::{self, push_event},
     PeakEWMA,
 };
-
-use super::load_balancing::*;
 
 #[derive(thiserror::Error, Debug)]
 pub enum BackendError {

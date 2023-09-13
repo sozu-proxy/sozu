@@ -9,7 +9,11 @@ use std::{
 };
 
 use anyhow::Context;
-use mio::{net::*, unix::SourceFd, *};
+use mio::{
+    net::{TcpListener, TcpStream, UnixStream},
+    unix::SourceFd,
+    Interest, Poll, Registry, Token,
+};
 use rusty_ulid::Ulid;
 use slab::Slab;
 use time::{Duration, Instant};
@@ -28,12 +32,6 @@ use sozu_command::{
 };
 
 use crate::{
-    protocol::SessionState, router::Router, timer::TimeoutContainer, util::UnwrapLog, CachedTags,
-    FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError, ListenerHandler,
-    ProxyError, SessionIsToBeClosed, SessionResult, StateMachineBuilder,
-};
-
-use super::{
     backends::BackendMap,
     pool::Pool,
     protocol::{
@@ -42,12 +40,16 @@ use super::{
             parser::{hostname_and_port, Method},
         },
         proxy_protocol::expect::ExpectProxyProtocol,
-        {Http, Pipe},
+        Http, Pipe, SessionState,
     },
-    router::Route,
+    router::{Route, Router},
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager},
     socket::server_bind,
-    AcceptError, Protocol, ProxyConfiguration, ProxySession, SessionMetrics, StateResult,
+    timer::TimeoutContainer,
+    util::UnwrapLog,
+    AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
+    ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
+    SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
 
 #[derive(PartialEq, Eq)]

@@ -13,10 +13,16 @@ use anyhow::{bail, Context};
 use async_dup::Arc;
 use async_io::Async;
 use futures::{
-    channel::{mpsc::*, oneshot},
+    channel::{
+        mpsc::{channel, Receiver, Sender},
+        oneshot,
+    },
     {SinkExt, StreamExt},
 };
-use futures_lite::{future, io::*};
+use futures_lite::{
+    future,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+};
 use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,

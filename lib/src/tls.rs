@@ -18,11 +18,12 @@ use rustls::{
 use sha2::{Digest, Sha256};
 use x509_parser::pem::{parse_x509_pem, Pem};
 
-use crate::router::trie::*;
 use sozu_command::{
     certificate::{get_cn_and_san_attributes, CertificateError, Fingerprint},
     proto::command::{AddCertificate, CertificateAndKey, ReplaceCertificate, TlsVersion},
 };
+
+use crate::router::trie::{Key, KeyValue, TrieNode};
 
 // -----------------------------------------------------------------------------
 // CertificateResolver trait

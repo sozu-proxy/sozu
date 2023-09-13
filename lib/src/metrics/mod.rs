@@ -12,11 +12,12 @@ use std::{
 };
 
 use mio::net::UdpSocket;
+
 use sozu_command::proto::command::{
     FilteredMetrics, MetricsConfiguration, QueryMetricsOptions, ResponseContent,
 };
 
-use self::{local_drain::LocalDrain, network_drain::NetworkDrain};
+use crate::metrics::{local_drain::LocalDrain, network_drain::NetworkDrain};
 
 thread_local! {
   pub static METRICS: RefCell<Aggregator> = RefCell::new(Aggregator::new(String::from("sozu")));

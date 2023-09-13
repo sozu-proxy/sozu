@@ -10,10 +10,11 @@ use std::{
 };
 
 use kawa;
-use mio::{net::TcpStream, *};
+use mio::{net::TcpStream, Token, Interest};
 use rusty_ulid::Ulid;
-use sozu_command::proto::command::{Event, EventKind, ListenerType};
 use time::{Duration, Instant};
+
+use sozu_command::proto::command::{Event, EventKind, ListenerType};
 
 use crate::{
     backends::{Backend, BackendError},

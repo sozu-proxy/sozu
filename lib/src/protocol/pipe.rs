@@ -1,7 +1,6 @@
 use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 
-use mio::net::*;
-use mio::*;
+use mio::{net::TcpStream, Token};
 use rusty_ulid::Ulid;
 
 use crate::{

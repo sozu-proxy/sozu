@@ -5,10 +5,7 @@ use std::{
     str,
 };
 
-use crate::{
-    pool::{Checkout, Pool},
-    pool_crate::Reset,
-};
+use crate::pool::{Checkout, Pool};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum InputElement {
@@ -480,17 +477,6 @@ impl Write for BufferQueue {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
-    }
-}
-
-impl Reset for BufferQueue {
-    fn reset(&mut self) {
-        self.parsed_position = 0;
-        self.buffer_position = 0;
-        self.start_parsing_position = 0;
-        self.buffer.reset();
-        self.input_queue.clear();
-        self.output_queue.clear();
     }
 }
 

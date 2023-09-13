@@ -1,6 +1,6 @@
 use std::{cell::RefCell, io::ErrorKind, rc::Rc};
 
-use mio::{net::*, Token};
+use mio::{net::TcpStream, Token};
 use rustls::ServerConnection;
 use rusty_ulid::Ulid;
 

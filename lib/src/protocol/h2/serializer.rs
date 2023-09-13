@@ -5,7 +5,7 @@ use cookie_factory::{
     GenError,
 };
 
-use super::parser::{FrameHeader, FrameType};
+use crate::protocol::h2::parser::{FrameHeader, FrameType};
 
 pub fn gen_frame_header<'a, 'b>(
     x: (&'a mut [u8], usize),

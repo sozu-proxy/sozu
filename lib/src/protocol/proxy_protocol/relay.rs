@@ -1,20 +1,17 @@
 use std::{cell::RefCell, io::Write, rc::Rc};
 
-use mio::net::TcpStream;
-use mio::*;
+use mio::{net::TcpStream, Token};
 use nom::{Err, Offset};
 use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::{pipe::Pipe, SessionResult},
+    protocol::{pipe::Pipe, proxy_protocol::parser::parse_v2_header, SessionResult},
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
     tcp::TcpListener,
     Protocol, Readiness, SessionMetrics, StateResult,
 };
-
-use super::parser::parse_v2_header;
 
 pub struct RelayProxyProtocol<Front: SocketHandler> {
     cursor_header: usize,
