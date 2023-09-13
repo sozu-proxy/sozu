@@ -1,8 +1,6 @@
 use std::{collections::HashMap, rc::Rc};
 
-use crate::sozu_command::state::ClusterId;
-
-use crate::protocol::http::DefaultAnswerStatus;
+use crate::{protocol::http::DefaultAnswerStatus, sozu_command::state::ClusterId};
 
 #[allow(non_snake_case)]
 pub struct DefaultAnswers {
