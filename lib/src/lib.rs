@@ -324,10 +324,6 @@
 //! }
 //! ```
 
-#![cfg_attr(feature = "unstable", feature(test))]
-#[cfg(all(feature = "unstable", test))]
-extern crate test;
-
 extern crate hdrhistogram;
 extern crate libc;
 extern crate log;
