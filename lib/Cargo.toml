@@ -35,7 +35,7 @@ hdrhistogram = "^7.5.2"
 hex = "^0.4.3"
 hpack = "^0.3.0"
 idna = "^0.4.0"
-kawa = "^0.6.3"
+kawa = { version = "^0.6.3", default-features = false }
 lazycell = "^1.3.0"
 libc = "^0.2.147"
 log = "^0.4.19"
@@ -68,12 +68,13 @@ tiny_http = "^0.12.0"
 ureq = "^2.7.1"
 
 [features]
-default = []
-splice = []
-unstable = []
+default = ["simd"]
 logs-debug = []
 logs-trace = []
+simd = ["kawa/simd"]
+splice = []
 tolerant-http1-parser = []
+unstable = []
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }
