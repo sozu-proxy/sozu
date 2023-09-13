@@ -10,7 +10,7 @@ use std::{
 };
 
 use kawa;
-use mio::{net::TcpStream, Token, Interest};
+use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
