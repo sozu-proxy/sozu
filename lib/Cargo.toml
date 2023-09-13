@@ -5,7 +5,7 @@ repository = "https://github.com/sozu-proxy/sozu"
 readme = "README.md"
 documentation = "https://docs.rs/sozu-lib"
 homepage = "https://sozu.io"
-version = "0.15.3"
+version = "0.15.4"
 license = "AGPL-3.0"
 authors = [
   "Clément Delafargue <clement@delafargue.name>",
@@ -52,7 +52,7 @@ thiserror = "^1.0.44"
 time = "^0.3.25"
 x509-parser = "^0.15.1"
 
-sozu-command-lib = { path = "../command", version = "^0.15.3" }
+sozu-command-lib = { path = "../command", version = "^0.15.4" }
 
 [dev-dependencies]
 quickcheck = "^1.0.3"
