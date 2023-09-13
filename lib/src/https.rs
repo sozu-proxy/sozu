@@ -748,7 +748,11 @@ impl HttpsListener {
             .filter_map(|version| match TlsVersion::try_from(*version) {
                 Ok(TlsVersion::TlsV12) => Some(&rustls::version::TLS12),
                 Ok(TlsVersion::TlsV13) => Some(&rustls::version::TLS13),
-                Ok(_) | Err(_) => {
+                Ok(other_version) => {
+                    error!("unsupported TLS version {:?}", other_version);
+                    None
+                }
+                Err(_) => {
                     error!("unsupported TLS version");
                     None
                 }
