@@ -4,6 +4,65 @@
 
 See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av0.16.0)
 
+## 0.15.4 - 2023-09-13
+
+### Changelog
+
+### 🌟 Features
+
+- Expose SIMD as a feature flag and enable it by default, see [`9df3f1d`](https://github.com/sozu-proxy/sozu/commit/9df3f1d718e269585aae133fa746362c6cec6a1b).
+- Improve documentation, see [`d2f1621`](https://github.com/sozu-proxy/sozu/commit/d2f1621e67c214707174ecfb1d03b1c1adbe8455), [`e9c185e`](https://github.com/sozu-proxy/sozu/commit/e9c185e6139b7123206513d3a4fee2087977ec2a), [`bd5703a`](https://github.com/sozu-proxy/sozu/commit/bd5703ae313a8ab270eba4b1ebe3d9ad911b2793).
+- We did some cleaning on unused source code, see [`31c26b4`](https://github.com/sozu-proxy/sozu/commit/31c26b46d544259cfb9d8a219ed2cd5fbb9b2875), [`c25d483`](https://github.com/sozu-proxy/sozu/commit/c25d483fe6d1065e8e98c9c45379e05205d94ff0), [`4aceb86`](https://github.com/sozu-proxy/sozu/commit/4aceb866529979ac113cf17580e04d3637ab362b), [`001aa89`](https://github.com/sozu-proxy/sozu/commit/001aa897ee001b30859fa07a414f360f0004edb8).
+- We update the minimum supported rust version to `1.70.0`, see [`02892b8`](https://github.com/sozu-proxy/sozu/commit/02892b83ccc1aa165cd5dc58637fc4ca6282917b).
+
+### ⛑️ Fixed
+
+- Fix unit and end-to-end (e2e) tests, see [`2b84a4b`](https://github.com/sozu-proxy/sozu/commit/2b84a4bf88da6077f3371871634bce4ae6204be0), [`4aceb86`](https://github.com/sozu-proxy/sozu/commit/4aceb866529979ac113cf17580e04d3637ab362b), [`818bc48`](https://github.com/sozu-proxy/sozu/commit/818bc4822517499e4ae9dc728bb5e15198c4da93), [`56dce47`](https://github.com/sozu-proxy/sozu/commit/56dce47e364f2a36d7fb8d1c82bc6d2852eec25d).
+- Fix certificate issue at loading, see [`daaeb19`](https://github.com/sozu-proxy/sozu/commit/daaeb19f3b87a164dbdd3317444e437ccfc459fc).
+
+#### 🌟 Features
+
+- [ [`9df3f1d`](https://github.com/sozu-proxy/sozu/commit/9df3f1d718e269585aae133fa746362c6cec6a1b) ] introduce SIMD as default feature [`Emmanuel Bosquet`] (`2023-09-13`)
+
+#### ➕ Added
+
+- [ [`2b84a4b`](https://github.com/sozu-proxy/sozu/commit/2b84a4bf88da6077f3371871634bce4ae6204be0) ] create PortProvider in e2e tests [`Emmanuel Bosquet`] (`2023-09-12`)
+
+#### ✍️ Changed
+
+- [ [`31c26b4`](https://github.com/sozu-proxy/sozu/commit/31c26b46d544259cfb9d8a219ed2cd5fbb9b2875) ] remove buffer_queue, useless since introduction of kawa [`Emmanuel Bosquet`] (`2023-09-13`)
+- [ [`c25d483`](https://github.com/sozu-proxy/sozu/commit/c25d483fe6d1065e8e98c9c45379e05205d94ff0) ] remove unused dependencies [`Emmanuel Bosquet`] (`2023-09-13`)
+- [ [`f9c4ddb`](https://github.com/sozu-proxy/sozu/commit/f9c4ddb703ec943ed94297d4837163d5d88fa9d8) ] update dependencies [`Emmanuel Bosquet`] (`2023-09-13`)
+- [ [`90e3bc7`](https://github.com/sozu-proxy/sozu/commit/90e3bc7f7838c9a5cdaa3e2b8df3f171f55fd127) ] cargo fmt [`Emmanuel Bosquet`] (`2023-09-13`)
+- [ [`4aceb86`](https://github.com/sozu-proxy/sozu/commit/4aceb866529979ac113cf17580e04d3637ab362b) ] remove serial aspect of e2e tests [`Emmanuel Bosquet`] (`2023-09-12`)
+- [ [`f0661a5`](https://github.com/sozu-proxy/sozu/commit/f0661a54bc56b1e4e2b41935e4d0dd6834cde1b1) ] update dependencies [`Emmanuel Bosquet`] (`2023-09-11`)
+- [ [`02892b8`](https://github.com/sozu-proxy/sozu/commit/02892b83ccc1aa165cd5dc58637fc4ca6282917b) ] set rust-toolchain and rust-version to 1.70.0 [`Emmanuel Bosquet`] (`2023-09-11`)
+
+#### 🚀 Refactored
+
+- [ [`5b14713`](https://github.com/sozu-proxy/sozu/commit/5b1471314d63e0f64bd184f673426664f0e23bda) ] merge use statements in kawa_h1::answers [`Emmanuel Bosquet`] (`2023-09-13`)
+- [ [`001aa89`](https://github.com/sozu-proxy/sozu/commit/001aa897ee001b30859fa07a414f360f0004edb8) ] remove useless test crate import [`Emmanuel Bosquet`] (`2023-09-13`)
+- [ [`8c164f9`](https://github.com/sozu-proxy/sozu/commit/8c164f9a91b001305d910333eac2ab742feca017) ] use TryFrom in prost::Decode [`Emmanuel Bosquet`] (`2023-09-13`)
+
+#### ⛑️ Fixed
+
+- [ [`818bc48`](https://github.com/sozu-proxy/sozu/commit/818bc4822517499e4ae9dc728bb5e15198c4da93) ] fix test for 101 HTTP behavior [`Emmanuel Bosquet`] (`2023-09-13`)
+- [ [`daaeb19`](https://github.com/sozu-proxy/sozu/commit/daaeb19f3b87a164dbdd3317444e437ccfc459fc) ] remove skipping of certificate update in GenericCertificateResolver [`Emmanuel Bosquet`] (`2023-09-12`)
+- [ [`56dce47`](https://github.com/sozu-proxy/sozu/commit/56dce47e364f2a36d7fb8d1c82bc6d2852eec25d) ] fix 103 early hint e2e test [`Emmanuel Bosquet`] (`2023-09-12`)
+
+#### 📚 Documentation
+
+- [ [`d2f1621`](https://github.com/sozu-proxy/sozu/commit/d2f1621e67c214707174ecfb1d03b1c1adbe8455) ] fix(readme): Define covered work interpretation #764 [`Steven LE ROUX`] (`2023-08-30`)
+- [ [`e9c185e`](https://github.com/sozu-proxy/sozu/commit/e9c185e6139b7123206513d3a4fee2087977ec2a) ] remove doc lines about a removed systemd script [`Emmanuel Bosquet`] (`2023-08-24`)
+- [ [`bd5703a`](https://github.com/sozu-proxy/sozu/commit/bd5703ae313a8ab270eba4b1ebe3d9ad911b2793) ] fix doc link to systemd unit file [`Emmanuel Bosquet`] (`2023-08-24`)
+
+### 🥹 Contributors
+* @keksoj
+* @Wonshtrum
+* @FlorentinDUBOIS
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.3...0.15.4
+
 ## 0.15.3 - 2023-08-09
 
 ### 🌟 Features
