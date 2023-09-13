@@ -127,16 +127,16 @@ impl PathRule {
 }
 
 pub fn is_default_path_rule(p: &PathRule) -> bool {
-    PathRuleKind::from_i32(p.kind) == Some(PathRuleKind::Prefix) && p.value.is_empty()
+    PathRuleKind::try_from(p.kind) == Ok(PathRuleKind::Prefix) && p.value.is_empty()
 }
 
 impl std::fmt::Display for PathRule {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match PathRuleKind::from_i32(self.kind) {
-            Some(PathRuleKind::Prefix) => write!(f, "prefix '{}'", self.value),
-            Some(PathRuleKind::Regex) => write!(f, "regexp '{}'", self.value),
-            Some(PathRuleKind::Equals) => write!(f, "equals '{}'", self.value),
-            None => write!(f, ""),
+        match PathRuleKind::try_from(self.kind) {
+            Ok(PathRuleKind::Prefix) => write!(f, "prefix '{}'", self.value),
+            Ok(PathRuleKind::Regex) => write!(f, "regexp '{}'", self.value),
+            Ok(PathRuleKind::Equals) => write!(f, "equals '{}'", self.value),
+            Err(_) => write!(f, ""),
         }
     }
 }

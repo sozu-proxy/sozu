@@ -523,11 +523,11 @@ impl PathRule {
     }
 
     pub fn from_config(rule: CommandPathRule) -> Option<Self> {
-        match PathRuleKind::from_i32(rule.kind) {
-            Some(PathRuleKind::Prefix) => Some(PathRule::Prefix(rule.value)),
-            Some(PathRuleKind::Regex) => Regex::new(&rule.value).ok().map(PathRule::Regex),
-            Some(PathRuleKind::Equals) => Some(PathRule::Equals(rule.value)),
-            _ => None,
+        match PathRuleKind::try_from(rule.kind) {
+            Ok(PathRuleKind::Prefix) => Some(PathRule::Prefix(rule.value)),
+            Ok(PathRuleKind::Regex) => Regex::new(&rule.value).ok().map(PathRule::Regex),
+            Ok(PathRuleKind::Equals) => Some(PathRule::Equals(rule.value)),
+            Err(_) => None,
         }
     }
 }

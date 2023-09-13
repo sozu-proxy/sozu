@@ -210,8 +210,12 @@ impl RequestRecord<'_> {
                         None => tags.as_str_or("-"),
                     },
                     match tags {
-                        Some(tags) if !tags.is_empty() => user_agent.map(|ua| format!(", user-agent={ua}")).unwrap_or_default(),
-                        Some(_) | None => user_agent.map(|ua| format!("user-agent={ua}")).unwrap_or_default(),
+                        Some(tags) if !tags.is_empty() => user_agent
+                            .map(|ua| format!(", user-agent={ua}"))
+                            .unwrap_or_default(),
+                        Some(_) | None => user_agent
+                            .map(|ua| format!("user-agent={ua}"))
+                            .unwrap_or_default(),
                     },
                     protocol,
                     endpoint
@@ -238,8 +242,12 @@ impl RequestRecord<'_> {
                     None => tags.as_str_or("-"),
                 },
                 match tags {
-                    Some(tags) if !tags.is_empty() => user_agent.map(|ua| format!(", user-agent={ua}")).unwrap_or_default(),
-                    Some(_) | None => user_agent.map(|ua| format!("user-agent={ua}")).unwrap_or_default(),
+                    Some(tags) if !tags.is_empty() => user_agent
+                        .map(|ua| format!(", user-agent={ua}"))
+                        .unwrap_or_default(),
+                    Some(_) | None => user_agent
+                        .map(|ua| format!("user-agent={ua}"))
+                        .unwrap_or_default(),
                 },
                 protocol,
                 endpoint,
