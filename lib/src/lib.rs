@@ -370,6 +370,7 @@ pub mod socket;
 pub mod timer;
 pub mod tls;
 
+/// unused for now but may be usefull for bypassing sozu on a low level
 #[cfg(feature = "splice")]
 mod splice;
 
