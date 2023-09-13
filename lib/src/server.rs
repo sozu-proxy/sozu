@@ -878,7 +878,7 @@ impl Server {
 
     fn notify(&mut self, message: WorkerRequest) {
         if let Some(RequestType::ConfigureMetrics(configuration)) = &message.content.request_type {
-            if let Some(metrics_config) = MetricsConfiguration::from_i32(*configuration) {
+            if let Ok(metrics_config) = MetricsConfiguration::try_from(*configuration) {
                 METRICS.with(|metrics| {
                     (*metrics.borrow_mut()).configure(&metrics_config);
 
@@ -1008,11 +1008,11 @@ impl Server {
             Some(RequestType::RemoveListener(ref remove)) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
-                let response = match ListenerType::from_i32(remove.proxy) {
-                    Some(ListenerType::Http) => self.http.borrow_mut().notify(request.clone()),
-                    Some(ListenerType::Https) => self.https.borrow_mut().notify(request.clone()),
-                    Some(ListenerType::Tcp) => self.tcp.borrow_mut().notify(request.clone()),
-                    None => WorkerResponse::error(req_id, "Wrong variant ListenerType"),
+                let response = match ListenerType::try_from(remove.proxy) {
+                    Ok(ListenerType::Http) => self.http.borrow_mut().notify(request.clone()),
+                    Ok(ListenerType::Https) => self.https.borrow_mut().notify(request.clone()),
+                    Ok(ListenerType::Tcp) => self.tcp.borrow_mut().notify(request.clone()),
+                    Err(_) => WorkerResponse::error(req_id, "Wrong variant ListenerType"),
                 };
                 push_queue(response);
             }
@@ -1031,8 +1031,10 @@ impl Server {
             .borrow_mut()
             .set_load_balancing_policy_for_cluster(
                 &cluster.cluster_id,
-                LoadBalancingAlgorithms::from_i32(cluster.load_balancing).unwrap_or_default(),
-                cluster.load_metric.and_then(LoadMetric::from_i32),
+                LoadBalancingAlgorithms::try_from(cluster.load_balancing).unwrap_or_default(),
+                cluster
+                    .load_metric
+                    .and_then(|n| LoadMetric::try_from(n).ok()),
             );
     }
 
@@ -1178,8 +1180,8 @@ impl Server {
             Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {e}")),
         };
 
-        match ListenerType::from_i32(activate.proxy) {
-            Some(ListenerType::Http) => {
+        match ListenerType::try_from(activate.proxy) {
+            Ok(ListenerType::Http) => {
                 let listener = self
                     .scm_listeners
                     .as_mut()
@@ -1198,7 +1200,7 @@ impl Server {
                     }
                 }
             }
-            Some(ListenerType::Https) => {
+            Ok(ListenerType::Https) => {
                 let listener = self
                     .scm_listeners
                     .as_mut()
@@ -1220,7 +1222,7 @@ impl Server {
                     }
                 }
             }
-            Some(ListenerType::Tcp) => {
+            Ok(ListenerType::Tcp) => {
                 let listener = self
                     .scm_listeners
                     .as_mut()
@@ -1239,7 +1241,7 @@ impl Server {
                     }
                 }
             }
-            None => WorkerResponse::error(req_id, "Wrong variant for ListenerType on request"),
+            Err(_) => WorkerResponse::error(req_id, "Wrong variant for ListenerType on request"),
         }
     }
 
@@ -1258,8 +1260,8 @@ impl Server {
             Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {e}")),
         };
 
-        match ListenerType::from_i32(deactivate.proxy) {
-            Some(ListenerType::Http) => {
+        match ListenerType::try_from(deactivate.proxy) {
+            Ok(ListenerType::Http) => {
                 let (token, mut listener) = match self.http.borrow_mut().give_back_listener(address)
                 {
                     Some((token, listener)) => (token, listener),
@@ -1302,7 +1304,7 @@ impl Server {
                 }
                 WorkerResponse::ok(req_id)
             }
-            Some(ListenerType::Https) => {
+            Ok(ListenerType::Https) => {
                 let (token, mut listener) =
                     match self.https.borrow_mut().give_back_listener(address) {
                         Some((token, listener)) => (token, listener),
@@ -1343,7 +1345,7 @@ impl Server {
                 }
                 WorkerResponse::ok(req_id)
             }
-            Some(ListenerType::Tcp) => {
+            Ok(ListenerType::Tcp) => {
                 let (token, mut listener) = match self.tcp.borrow_mut().give_back_listener(address)
                 {
                     Some((token, listener)) => (token, listener),
@@ -1382,7 +1384,7 @@ impl Server {
                 }
                 WorkerResponse::ok(req_id)
             }
-            None => WorkerResponse::error(req_id, "Wrong variant for ListenerType on request"),
+            Err(_) => WorkerResponse::error(req_id, "Wrong variant for ListenerType on request"),
         }
     }
 

@@ -59,9 +59,9 @@ impl CommandServer {
                 self.upgrade_worker(client_id, worker_id).await
             }
             Some(RequestType::ConfigureMetrics(config)) => {
-                match MetricsConfiguration::from_i32(config) {
-                    Some(config) => self.configure_metrics(client_id, config).await,
-                    None => Err(anyhow::Error::msg("wrong i32 for metrics configuration")),
+                match MetricsConfiguration::try_from(config) {
+                    Ok(config) => self.configure_metrics(client_id, config).await,
+                    Err(_) => Err(anyhow::Error::msg("wrong i32 for metrics configuration")),
                 }
             }
             Some(RequestType::Logging(logging_filter)) => self.set_logging_level(logging_filter),

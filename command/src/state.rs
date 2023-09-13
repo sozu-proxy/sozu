@@ -8,6 +8,8 @@ use std::{
     net::SocketAddr,
 };
 
+use prost::DecodeError;
+
 use crate::{
     certificate::{self, calculate_fingerprint, Fingerprint},
     proto::{
@@ -54,6 +56,12 @@ pub enum StateError {
         "Could not convert the frontend to an insertable one. Frontend: {frontend} error: {error}"
     )]
     FrontendConversion { frontend: String, error: String },
+}
+
+impl From<DecodeError> for StateError {
+    fn from(decode_error: DecodeError) -> Self {
+        Self::WrongRequest(format!("Wrong field value: {decode_error}"))
+    }
 }
 
 /// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
@@ -213,13 +221,10 @@ impl ConfigState {
     }
 
     fn remove_listener(&mut self, remove: &RemoveListener) -> Result<(), StateError> {
-        match ListenerType::from_i32(remove.proxy) {
-            Some(ListenerType::Http) => self.remove_http_listener(&remove.address),
-            Some(ListenerType::Https) => self.remove_https_listener(&remove.address),
-            Some(ListenerType::Tcp) => self.remove_tcp_listener(&remove.address),
-            None => Err(StateError::WrongRequest(
-                "Wrong ListenerType on RemoveListener request".to_string(),
-            )),
+        match ListenerType::try_from(remove.proxy)? {
+            ListenerType::Http => self.remove_http_listener(&remove.address),
+            ListenerType::Https => self.remove_https_listener(&remove.address),
+            ListenerType::Tcp => self.remove_tcp_listener(&remove.address),
         }
     }
 
@@ -245,8 +250,8 @@ impl ConfigState {
     }
 
     fn activate_listener(&mut self, activate: &ActivateListener) -> Result<(), StateError> {
-        match ListenerType::from_i32(activate.proxy) {
-            Some(ListenerType::Http) => self
+        match ListenerType::try_from(activate.proxy)? {
+            ListenerType::Http => self
                 .http_listeners
                 .get_mut(&activate.address)
                 .map(|listener| listener.active = true)
@@ -254,7 +259,7 @@ impl ConfigState {
                     kind: ObjectKind::HttpListener,
                     id: activate.address.to_owned(),
                 }),
-            Some(ListenerType::Https) => self
+            ListenerType::Https => self
                 .https_listeners
                 .get_mut(&activate.address)
                 .map(|listener| listener.active = true)
@@ -262,7 +267,7 @@ impl ConfigState {
                     kind: ObjectKind::HttpsListener,
                     id: activate.address.to_owned(),
                 }),
-            Some(ListenerType::Tcp) => self
+            ListenerType::Tcp => self
                 .tcp_listeners
                 .get_mut(&activate.address)
                 .map(|listener| listener.active = true)
@@ -270,15 +275,12 @@ impl ConfigState {
                     kind: ObjectKind::TcpListener,
                     id: activate.address.to_owned(),
                 }),
-            None => Err(StateError::WrongRequest(
-                "Wrong variant for ListenerType on request".to_string(),
-            )),
         }
     }
 
     fn deactivate_listener(&mut self, deactivate: &DeactivateListener) -> Result<(), StateError> {
-        match ListenerType::from_i32(deactivate.proxy) {
-            Some(ListenerType::Http) => self
+        match ListenerType::try_from(deactivate.proxy)? {
+            ListenerType::Http => self
                 .http_listeners
                 .get_mut(&deactivate.address)
                 .map(|listener| listener.active = false)
@@ -286,7 +288,7 @@ impl ConfigState {
                     kind: ObjectKind::HttpListener,
                     id: deactivate.address.to_owned(),
                 }),
-            Some(ListenerType::Https) => self
+            ListenerType::Https => self
                 .https_listeners
                 .get_mut(&deactivate.address)
                 .map(|listener| listener.active = false)
@@ -294,7 +296,7 @@ impl ConfigState {
                     kind: ObjectKind::HttpsListener,
                     id: deactivate.address.to_owned(),
                 }),
-            Some(ListenerType::Tcp) => self
+            ListenerType::Tcp => self
                 .tcp_listeners
                 .get_mut(&deactivate.address)
                 .map(|listener| listener.active = false)
@@ -302,9 +304,6 @@ impl ConfigState {
                     kind: ObjectKind::TcpListener,
                     id: deactivate.address.to_owned(),
                 }),
-            None => Err(StateError::WrongRequest(
-                "Wrong variant for ListenerType on request".to_string(),
-            )),
         }
     }
 

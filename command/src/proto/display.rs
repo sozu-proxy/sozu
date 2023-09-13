@@ -10,9 +10,9 @@ impl Display for CertificateAndKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let versions = self.versions.iter().fold(String::new(), |acc, tls_v| {
             acc + " "
-                + match TlsVersion::from_i32(*tls_v) {
-                    Some(v) => v.as_str_name(),
-                    None => "",
+                + match TlsVersion::try_from(*tls_v) {
+                    Ok(v) => v.as_str_name(),
+                    Err(_) => "",
                 }
         });
         write!(

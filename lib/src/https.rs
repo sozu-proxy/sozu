@@ -745,11 +745,11 @@ impl HttpsListener {
         let versions = config
             .versions
             .iter()
-            .filter_map(|version| match TlsVersion::from_i32(*version) {
-                Some(TlsVersion::TlsV12) => Some(&rustls::version::TLS12),
-                Some(TlsVersion::TlsV13) => Some(&rustls::version::TLS13),
-                _other_version => {
-                    error!("unsupported TLS version: {:?}", _other_version);
+            .filter_map(|version| match TlsVersion::try_from(*version) {
+                Ok(TlsVersion::TlsV12) => Some(&rustls::version::TLS12),
+                Ok(TlsVersion::TlsV13) => Some(&rustls::version::TLS13),
+                Ok(_) | Err(_) => {
+                    error!("unsupported TLS version");
                     None
                 }
             })

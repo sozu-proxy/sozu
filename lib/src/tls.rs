@@ -315,7 +315,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
                     let versions = certificate_and_key
                         .versions
                         .iter()
-                        .filter_map(|v| TlsVersion::from_i32(*v))
+                        .filter_map(|v| TlsVersion::try_from(*v).ok())
                         .collect();
                     return Ok(ParsedCertificateAndKey {
                         certificate,
@@ -339,7 +339,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
                     let versions = certificate_and_key
                         .versions
                         .iter()
-                        .filter_map(|v| TlsVersion::from_i32(*v))
+                        .filter_map(|v| TlsVersion::try_from(*v).ok())
                         .collect();
                     return Ok(ParsedCertificateAndKey {
                         certificate,
@@ -354,7 +354,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
                     let versions = certificate_and_key
                         .versions
                         .iter()
-                        .filter_map(|v| TlsVersion::from_i32(*v))
+                        .filter_map(|v| TlsVersion::try_from(*v).ok())
                         .collect();
 
                     return Ok(ParsedCertificateAndKey {

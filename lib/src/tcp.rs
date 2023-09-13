@@ -1372,7 +1372,7 @@ impl ProxyConfiguration for TcpProxy {
                 let config = ClusterConfiguration {
                     proxy_protocol: cluster
                         .proxy_protocol
-                        .and_then(ProxyProtocolConfig::from_i32),
+                        .and_then(|n| ProxyProtocolConfig::try_from(n).ok()),
                     //load_balancing: cluster.load_balancing,
                 };
                 self.configs.insert(cluster.cluster_id, config);

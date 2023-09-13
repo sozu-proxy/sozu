@@ -144,9 +144,11 @@ impl RequestHttpFrontend {
             hostname: self.hostname,
             path: self.path,
             method: self.method,
-            position: RulePosition::from_i32(self.position).ok_or(RequestError::InvalidValue {
-                name: "position".to_string(),
-                value: self.position,
+            position: RulePosition::try_from(self.position).map_err(|_| {
+                RequestError::InvalidValue {
+                    name: "position".to_string(),
+                    value: self.position,
+                }
             })?,
             tags: Some(self.tags),
         })
@@ -156,17 +158,17 @@ impl RequestHttpFrontend {
 impl Display for RequestHttpFrontend {
     /// Used to create a unique summary of the frontend, used as a key in maps
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match &PathRuleKind::from_i32(self.path.kind) {
-            Some(PathRuleKind::Prefix) => {
+        let s = match &PathRuleKind::try_from(self.path.kind) {
+            Ok(PathRuleKind::Prefix) => {
                 format!("{};{};P{}", self.address, self.hostname, self.path.value)
             }
-            Some(PathRuleKind::Regex) => {
+            Ok(PathRuleKind::Regex) => {
                 format!("{};{};R{}", self.address, self.hostname, self.path.value)
             }
-            Some(PathRuleKind::Equals) => {
+            Ok(PathRuleKind::Equals) => {
                 format!("{};{};={}", self.address, self.hostname, self.path.value)
             }
-            None => String::from("Wrong variant of PathRuleKind"),
+            Err(e) => format!("Wrong variant of PathRuleKind: {e}"),
         };
 
         match &self.method {
