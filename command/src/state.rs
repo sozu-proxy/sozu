@@ -1129,39 +1129,39 @@ impl ConfigState {
 
     // FIXME: what about deny rules?
     pub fn hash_state(&self) -> BTreeMap<ClusterId, u64> {
-        let mut h: HashMap<_, _> = self
+        let mut hm: HashMap<String, DefaultHasher> = self
             .clusters
             .keys()
             .map(|cluster_id| {
-                let mut s = DefaultHasher::new();
-                self.clusters.get(cluster_id).hash(&mut s);
-                if let Some(v) = self.backends.get(cluster_id) {
-                    v.iter().collect::<BTreeSet<_>>().hash(&mut s)
+                let mut hasher = DefaultHasher::new();
+                self.clusters.get(cluster_id).hash(&mut hasher);
+                if let Some(backends) = self.backends.get(cluster_id) {
+                    backends.iter().collect::<BTreeSet<_>>().hash(&mut hasher)
                 }
-                if let Some(v) = self.tcp_fronts.get(cluster_id) {
-                    v.iter().collect::<BTreeSet<_>>().hash(&mut s)
+                if let Some(tcp_fronts) = self.tcp_fronts.get(cluster_id) {
+                    tcp_fronts.iter().collect::<BTreeSet<_>>().hash(&mut hasher)
                 }
-                (cluster_id.to_string(), s)
+                (cluster_id.to_string(), hasher)
             })
             .collect();
 
         for front in self.http_fronts.values() {
             if let Some(cluster_id) = &front.cluster_id {
-                if let Some(s) = h.get_mut(cluster_id) {
-                    front.hash(s);
+                if let Some(hasher) = hm.get_mut(cluster_id) {
+                    front.hash(hasher);
                 }
             }
         }
 
         for front in self.https_fronts.values() {
             if let Some(cluster_id) = &front.cluster_id {
-                if let Some(s) = h.get_mut(cluster_id) {
-                    front.hash(s);
+                if let Some(hasher) = hm.get_mut(cluster_id) {
+                    front.hash(hasher);
                 }
             }
         }
 
-        h.drain()
+        hm.drain()
             .map(|(cluster_id, hasher)| (cluster_id, hasher.finish()))
             .collect()
     }
