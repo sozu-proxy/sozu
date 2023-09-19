@@ -7,7 +7,10 @@ use rusty_ulid::Ulid;
 
 use crate::{
     pool::Checkout,
-    protocol::http::{parser::compare_no_case, GenericHttpStream, Method},
+    protocol::{
+        http::{parser::compare_no_case, GenericHttpStream, Method},
+        pipe::WebSocketContext,
+    },
     Protocol, RetrieveClusterError,
 };
 
@@ -390,5 +393,15 @@ impl HttpContext {
             return format!("{method}");
         }
         String::new()
+    }
+
+    pub fn websocket_context(&self) -> WebSocketContext {
+        WebSocketContext::Http {
+            method: self.method.clone(),
+            authority: self.authority.clone(),
+            path: self.path.clone(),
+            reason: self.reason.clone(),
+            status: self.status,
+        }
     }
 }

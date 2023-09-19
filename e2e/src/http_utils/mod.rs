@@ -33,3 +33,21 @@ pub fn immutable_answer(status: u16) -> String {
         _ => unimplemented!()
     }
 }
+
+// use std::io::Write;
+// use kawa;
+
+// /// the default kawa answer for the error code provided, converted to HTTP/1.1
+// pub fn default_answer(code: u16) -> String {
+//     let mut kawa_answer = kawa::Kawa::new(
+//         kawa::Kind::Response,
+//         kawa::Buffer::new(kawa::SliceBuffer(&mut [])),
+//     );
+//     sozu_lib::protocol::mux::fill_default_answer(&mut kawa_answer, code);
+//     kawa_answer.prepare(&mut kawa::h1::converter::H1BlockConverter);
+//     let out = kawa_answer.as_io_slice();
+//     let mut writer = std::io::BufWriter::new(Vec::new());
+//     writer.write_vectored(&out).expect("WRITE");
+//     let result = unsafe { std::str::from_utf8_unchecked(writer.buffer()) };
+//     result.to_string()
+// }

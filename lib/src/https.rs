@@ -59,7 +59,7 @@ use crate::{
             parser::{hostname_and_port, Method},
             ResponseStream,
         },
-        mux::Mux,
+        mux::{self, Mux},
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
         Http, Pipe, SessionState,
@@ -92,7 +92,7 @@ StateMachineBuilder! {
     enum HttpsStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
-        Mux(Mux),
+        Mux(Mux<FrontRustls>),
         Http(Http<FrontRustls, HttpsListener>),
         WebSocket(Pipe<FrontRustls, HttpsListener>),
         Http2(Http2<FrontRustls>) -> todo!("H2"),
@@ -289,7 +289,6 @@ impl HttpsSession {
 
         gauge_add!("protocol.tls.handshake", -1);
 
-        use crate::protocol::mux;
         let mut context = mux::Context::new(self.pool.clone());
         let mut frontend = match alpn {
             AlpnProtocol::Http11 => {
@@ -305,10 +304,7 @@ impl HttpsSession {
             frontend_token: self.frontend_token,
             frontend,
             context,
-            router: mux::Router {
-                listener: self.listener.clone(),
-                backends: HashMap::new(),
-            },
+            router: mux::Router::new(self.listener.clone()),
             public_address: self.public_address,
             peer_address: self.peer_address,
             sticky_name: self.sticky_name.clone(),
@@ -328,8 +324,8 @@ impl HttpsSession {
                 return None;
             }
         };
+        let ws_context = http.context.websocket_context();
 
-        let ws_context = http.websocket_context();
         let mut container_frontend_timeout = http.container_frontend_timeout;
         let mut container_backend_timeout = http.container_backend_timeout;
         container_frontend_timeout.reset();
