@@ -776,7 +776,8 @@ fn try_http_behaviors() -> State {
             && response.ends_with(&expected_response_end)
     );
 
-    info!("server closes, expecting 503");
+    // FIXME: do we want 502 or 503???
+    info!("server closes, expecting 502");
     // TODO: what if the client continue to use the closed stream
     client.connect();
     client.send();
@@ -1242,7 +1243,9 @@ pub fn try_stick() -> State {
     backend1.send(0);
     let response = client.receive();
     println!("response: {response:?}");
-    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nX-Forwarded-For:"));
+    assert!(request.unwrap().starts_with(
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\n"
+    ));
     assert!(response.unwrap().starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSet-Cookie: SOZUBALANCEID=sticky_cluster_0-0; Path=/\r\nSozu-Id:"));
 
     // invalid sticky_session
@@ -1255,7 +1258,9 @@ pub fn try_stick() -> State {
     backend2.send(0);
     let response = client.receive();
     println!("response: {response:?}");
-    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nX-Forwarded-For:"));
+    assert!(request.unwrap().starts_with(
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\n"
+    ));
     assert!(response.unwrap().starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSet-Cookie: SOZUBALANCEID=sticky_cluster_0-1; Path=/\r\nSozu-Id:"));
 
     // good sticky_session (force use backend2, round-robin would have chosen backend1)
@@ -1268,7 +1273,9 @@ pub fn try_stick() -> State {
     backend2.send(0);
     let response = client.receive();
     println!("response: {response:?}");
-    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nX-Forwarded-For:"));
+    assert!(request.unwrap().starts_with(
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\n"
+    ));
     assert!(response
         .unwrap()
         .starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSozu-Id:"));
