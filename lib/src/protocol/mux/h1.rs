@@ -77,6 +77,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         .insert(Ready::WRITABLE)
                 }
                 Position::Server => {
+                    if let StreamState::Linked(token) = stream.state {
+                        endpoint
+                            .readiness_mut(token)
+                            .interest
+                            .insert(Ready::WRITABLE)
+                    }
                     if was_initial {
                         self.requests += 1;
                         println_!("REQUESTS: {}", self.requests);
@@ -112,20 +118,72 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             match self.position {
                 Position::Client(_) => self.readiness.interest.insert(Ready::READABLE),
                 Position::Server => {
-                    stream.context.reset();
-                    stream.back.clear();
-                    stream.back.storage.clear();
-                    stream.front.clear();
-                    // do not clear stream.front.storage because of H1 pipelining
-                    stream.attempts = 0;
+                    if stream.context.closing {
+                        return MuxResult::CloseSession;
+                    }
+                    let kawa = &mut stream.back;
+                    match kawa.detached.status_line {
+                        kawa::StatusLine::Response { code: 101, .. } => {
+                            println!("============== HANDLE UPGRADE!");
+                            // unimplemented!();
+                            return MuxResult::Upgrade;
+                        }
+                        kawa::StatusLine::Response { code: 100, .. } => {
+                            println!("============== HANDLE CONTINUE!");
+                            // after a 100 continue, we expect the client to continue with its request
+                            self.readiness.interest.insert(Ready::READABLE);
+                            kawa.clear();
+                            return MuxResult::Continue;
+                        }
+                        kawa::StatusLine::Response { code: 103, .. } => {
+                            println!("============== HANDLE EARLY HINT!");
+                            if let StreamState::Linked(token) = stream.state {
+                                // after a 103 early hints, we expect the server to send its response
+                                endpoint
+                                    .readiness_mut(token)
+                                    .interest
+                                    .insert(Ready::READABLE);
+                                kawa.clear();
+                                return MuxResult::Continue;
+                            } else {
+                                return MuxResult::CloseSession;
+                            }
+                        }
+                        _ => {}
+                    }
                     let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
-                    if let StreamState::Linked(token) = old_state {
-                        endpoint.end_stream(token, self.stream, context);
+                    if stream.context.keep_alive_frontend {
+                        println!("{old_state:?} {:?}", self.readiness);
+                        if let StreamState::Linked(token) = old_state {
+                            println!("{:?}", endpoint.readiness(token));
+                            endpoint.end_stream(token, self.stream, context);
+                        }
+                        self.readiness.interest.insert(Ready::READABLE);
+                        let stream = &mut context.streams[self.stream];
+                        stream.context.reset();
+                        stream.back.clear();
+                        stream.back.storage.clear();
+                        stream.front.clear();
+                        // do not clear stream.front.storage because of H1 pipelining
+                        stream.attempts = 0;
+                    } else {
+                        return MuxResult::CloseSession;
                     }
                 }
             }
         }
         MuxResult::Continue
+    }
+
+    fn force_disconnect(&mut self) -> MuxResult {
+        match self.position {
+            Position::Client(_) => {
+                self.position = Position::Client(BackendStatus::Disconnecting);
+                self.readiness.event = Ready::HUP;
+                MuxResult::Continue
+            }
+            Position::Server => MuxResult::CloseSession,
+        }
     }
 
     pub fn close<E>(&mut self, context: &mut Context, mut endpoint: E)
@@ -156,10 +214,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             Position::Client(BackendStatus::Connected(cluster_id))
             | Position::Client(BackendStatus::Connecting(cluster_id)) => {
                 self.stream = usize::MAX;
-                self.position = if stream_context.keep_alive_backend {
-                    Position::Client(BackendStatus::KeepAlive(std::mem::take(cluster_id)))
+                if stream_context.keep_alive_backend {
+                    self.position =
+                        Position::Client(BackendStatus::KeepAlive(std::mem::take(cluster_id)))
                 } else {
-                    Position::Client(BackendStatus::Disconnecting)
+                    self.force_disconnect();
                 }
             }
             Position::Client(BackendStatus::KeepAlive(_))
@@ -177,6 +236,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     }
                 }
                 (true, false) => {
+                    // we do not have an answer, but the request has already been partially consumed
+                    // so we can't retry, send a 502 bad gateway instead
                     set_default_answer(stream, &mut self.readiness, 502);
                 }
                 (false, false) => {
@@ -191,6 +252,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
 
     pub fn start_stream(&mut self, stream: GlobalStreamId, context: &mut Context) {
         println_!("start H1 stream {stream} {:?}", self.readiness);
+        self.readiness.interest.insert(Ready::ALL);
         self.stream = stream;
         match &mut self.position {
             Position::Client(BackendStatus::KeepAlive(cluster_id)) => {

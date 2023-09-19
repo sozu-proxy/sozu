@@ -755,20 +755,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    /// Format the context of the websocket into a loggable String
-    pub fn websocket_context(&self) -> String {
-        format!(
-            "{}",
-            Endpoint::Http {
-                method: self.context.method.as_ref(),
-                authority: self.context.authority.as_deref(),
-                path: self.context.path.as_deref(),
-                status: self.context.status,
-                reason: self.context.reason.as_deref(),
-            }
-        )
-    }
-
     pub fn log_request(&self, metrics: &SessionMetrics, message: Option<&str>) {
         let listener = self.listener.borrow();
         let tags = self.context.authority.as_ref().and_then(|host| {

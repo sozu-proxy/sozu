@@ -6,6 +6,7 @@ use std::{
 use rusty_ulid::Ulid;
 
 use crate::{
+    logs::Endpoint,
     pool::Checkout,
     protocol::http::{parser::compare_no_case, GenericHttpStream, Method},
     Protocol, RetrieveClusterError,
@@ -348,6 +349,18 @@ impl HttpContext {
         let given_path = self.path.as_deref().ok_or(RetrieveClusterError::NoPath)?;
 
         Ok((given_authority, given_path, given_method))
+    }
+
+    /// Format the context of the websocket into a loggable String
+    pub fn websocket_context(&self) -> String {
+        Endpoint::Http {
+            method: self.method.as_ref(),
+            authority: self.authority.as_deref(),
+            path: self.path.as_deref(),
+            status: self.status,
+            reason: self.reason.as_deref(),
+        }
+        .to_string()
     }
 
     pub fn reset(&mut self) {

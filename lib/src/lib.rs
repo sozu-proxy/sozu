@@ -639,6 +639,8 @@ pub enum RetrieveClusterError {
     UnauthorizedRoute,
     #[error("{0}")]
     RetrieveFrontend(FrontendFromRequestError),
+    #[error("https redirect")]
+    HttpsRedirect,
 }
 
 /// Used in sessions

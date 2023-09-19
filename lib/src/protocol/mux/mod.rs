@@ -8,7 +8,7 @@ use std::{
 
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
-use sozu_command::ready::Ready;
+use sozu_command::{proto::command::ListenerType, ready::Ready};
 
 mod converter;
 mod h1;
@@ -19,22 +19,20 @@ mod serializer;
 
 use crate::{
     backends::{Backend, BackendError},
-    https::HttpsListener,
     pool::{Checkout, Pool},
     protocol::{
         http::editor::HttpContext,
-        mux::{
-            h1::ConnectionH1,
-            h2::{ConnectionH2, H2Settings, H2State, H2StreamId},
-        },
+        mux::h2::{H2Settings, H2State, H2StreamId},
         SessionState,
     },
     router::Route,
     server::CONN_RETRIES,
-    socket::{FrontRustls, SocketHandler, SocketResult},
+    socket::{SocketHandler, SocketResult},
     BackendConnectionError, L7ListenerHandler, L7Proxy, ProxySession, Readiness,
-    RetrieveClusterError, SessionMetrics, SessionResult, StateResult,
+    RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
 };
+
+pub use crate::protocol::mux::{h1::ConnectionH1, h2::ConnectionH2};
 
 #[macro_export]
 macro_rules! println_ {
@@ -53,11 +51,22 @@ type GenericHttpStream = kawa::Kawa<Checkout>;
 type StreamId = u32;
 type GlobalStreamId = usize;
 
-/// Replace the content of the kawa message with a default Sozu answer for a given status code
-fn set_default_answer(stream: &mut Stream, readiness: &mut Readiness, code: u16) {
-    let kawa = &mut stream.back;
-    kawa.clear();
-    kawa.storage.clear();
+pub fn fill_default_301_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, host: &str, uri: &str) {
+    kawa.detached.status_line = kawa::StatusLine::Response {
+        version: kawa::Version::V20,
+        code: 301,
+        status: kawa::Store::Static(b"301"),
+        reason: kawa::Store::Static(b"Moved Permanently"),
+    };
+    kawa.push_block(kawa::Block::StatusLine);
+    kawa.push_block(kawa::Block::Header(kawa::Pair {
+        key: kawa::Store::Static(b"Location"),
+        val: kawa::Store::from_string(format!("https://{host}{uri}")),
+    }));
+    terminate_default_answer(kawa, false);
+}
+
+pub fn fill_default_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, code: u16) {
     kawa.detached.status_line = kawa::StatusLine::Response {
         version: kawa::Version::V20,
         code,
@@ -65,14 +74,20 @@ fn set_default_answer(stream: &mut Stream, readiness: &mut Readiness, code: u16)
         reason: kawa::Store::Static(b"Sozu Default Answer"),
     };
     kawa.push_block(kawa::Block::StatusLine);
-    kawa.push_block(kawa::Block::Header(kawa::Pair {
-        key: kawa::Store::Static(b"Cache-Control"),
-        val: kawa::Store::Static(b"no-cache"),
-    }));
-    kawa.push_block(kawa::Block::Header(kawa::Pair {
-        key: kawa::Store::Static(b"Connection"),
-        val: kawa::Store::Static(b"close"),
-    }));
+    terminate_default_answer(kawa, true);
+}
+
+pub fn terminate_default_answer<T: kawa::AsBuffer>(kawa: &mut kawa::Kawa<T>, close: bool) {
+    if close {
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Static(b"Cache-Control"),
+            val: kawa::Store::Static(b"no-cache"),
+        }));
+        kawa.push_block(kawa::Block::Header(kawa::Pair {
+            key: kawa::Store::Static(b"Connection"),
+            val: kawa::Store::Static(b"close"),
+        }));
+    }
     kawa.push_block(kawa::Block::Header(kawa::Pair {
         key: kawa::Store::Static(b"Content-Length"),
         val: kawa::Store::Static(b"0"),
@@ -84,6 +99,20 @@ fn set_default_answer(stream: &mut Stream, readiness: &mut Readiness, code: u16)
         end_stream: true,
     }));
     kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+}
+
+/// Replace the content of the kawa message with a default Sozu answer for a given status code
+fn set_default_answer(stream: &mut Stream, readiness: &mut Readiness, code: u16) {
+    let kawa = &mut stream.back;
+    kawa.clear();
+    kawa.storage.clear();
+    if code == 301 {
+        let host = stream.context.authority.as_deref().unwrap();
+        let uri = stream.context.path.as_deref().unwrap();
+        fill_default_301_answer(kawa, host, uri);
+    } else {
+        fill_default_answer(kawa, code);
+    }
     stream.state = StreamState::Unlinked;
     readiness.interest.insert(Ready::WRITABLE);
 }
@@ -98,7 +127,7 @@ fn forcefully_terminate_answer(stream: &mut Stream, readiness: &mut Readiness) {
         end_header: false,
         end_stream: true,
     }));
-    kawa.parsing_phase = kawa::ParsingPhase::Error;
+    kawa.parsing_phase.error("Termination".into());
     debug_kawa(kawa);
     stream.state = StreamState::Unlinked;
     readiness.interest.insert(Ready::WRITABLE);
@@ -120,6 +149,7 @@ pub enum BackendStatus {
 
 pub enum MuxResult {
     Continue,
+    Upgrade,
     CloseSession,
 }
 
@@ -238,13 +268,13 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => &mut c.readiness,
         }
     }
-    fn position(&self) -> &Position {
+    pub fn position(&self) -> &Position {
         match self {
             Connection::H1(c) => &c.position,
             Connection::H2(c) => &c.position,
         }
     }
-    fn position_mut(&mut self) -> &mut Position {
+    pub fn position_mut(&mut self) -> &mut Position {
         match self {
             Connection::H1(c) => &mut c.position,
             Connection::H2(c) => &mut c.position,
@@ -300,12 +330,12 @@ impl<Front: SocketHandler> Connection<Front> {
     }
 }
 
-struct EndpointServer<'a>(&'a mut Connection<FrontRustls>);
+struct EndpointServer<'a, Front: SocketHandler>(&'a mut Connection<Front>);
 struct EndpointClient<'a>(&'a mut Router);
 
 // note: EndpointServer are used by client Connection, they do not know the frontend Token
 // they will use the Stream's Token which is their backend token
-impl<'a> Endpoint for EndpointServer<'a> {
+impl<'a, Front: SocketHandler> Endpoint for EndpointServer<'a, Front> {
     fn readiness(&self, _token: Token) -> &Readiness {
         self.0.readiness()
     }
@@ -442,8 +472,8 @@ pub struct Stream {
     pub window: i32,
     pub attempts: u8,
     pub state: StreamState,
-    front: GenericHttpStream,
-    back: GenericHttpStream,
+    pub front: GenericHttpStream,
+    pub back: GenericHttpStream,
     pub context: HttpContext,
 }
 
@@ -560,11 +590,18 @@ impl Context {
 }
 
 pub struct Router {
-    pub listener: Rc<RefCell<HttpsListener>>,
+    pub listener: Rc<RefCell<dyn L7ListenerHandler>>,
     pub backends: HashMap<Token, Connection<TcpStream>>,
 }
 
 impl Router {
+    pub fn new(listener: Rc<RefCell<dyn L7ListenerHandler>>) -> Self {
+        Self {
+            listener,
+            backends: HashMap::new(),
+        }
+    }
+
     fn connect(
         &mut self,
         stream_id: GlobalStreamId,
@@ -587,12 +624,18 @@ impl Router {
             .route_from_request(stream_context, proxy.clone())
             .map_err(BackendConnectionError::RetrieveClusterError)?;
 
-        let frontend_should_stick = proxy
+        let (frontend_should_stick, frontend_should_redirect_https) = proxy
             .borrow()
             .clusters()
             .get(&cluster_id)
-            .map(|cluster| cluster.sticky_session)
-            .unwrap_or(false);
+            .map(|cluster| (cluster.sticky_session, cluster.https_redirect))
+            .unwrap_or((false, false));
+
+        if frontend_should_redirect_https && matches!(proxy.borrow().kind(), ListenerType::Http) {
+            return Err(BackendConnectionError::RetrieveClusterError(
+                RetrieveClusterError::HttpsRedirect,
+            ));
+        }
 
         let mut reuse_token = None;
         // let mut priority = 0;
@@ -794,9 +837,9 @@ impl Router {
     }
 }
 
-pub struct Mux {
+pub struct Mux<Front: SocketHandler> {
     pub frontend_token: Token,
-    pub frontend: Connection<FrontRustls>,
+    pub frontend: Connection<Front>,
     pub router: Router,
     pub public_address: SocketAddr,
     pub peer_address: Option<SocketAddr>,
@@ -804,13 +847,13 @@ pub struct Mux {
     pub context: Context,
 }
 
-impl Mux {
+impl<Front: SocketHandler> Mux<Front> {
     pub fn front_socket(&self) -> &TcpStream {
         self.frontend.socket()
     }
 }
 
-impl SessionState for Mux {
+impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
     fn ready(
         &mut self,
         session: Rc<RefCell<dyn ProxySession>>,
@@ -836,6 +879,7 @@ impl SessionState for Mux {
                     {
                         MuxResult::Continue => {}
                         MuxResult::CloseSession => return SessionResult::Close,
+                        MuxResult::Upgrade => return SessionResult::Upgrade,
                     }
                 }
 
@@ -844,6 +888,7 @@ impl SessionState for Mux {
                 let mut dead_backends = Vec::new();
                 for (token, backend) in self.router.backends.iter_mut() {
                     let readiness = backend.readiness_mut();
+                    println!("{token:?} -> {readiness:?}");
                     let dead = readiness.filter_interest().is_hup()
                         || readiness.filter_interest().is_error();
                     if dead {
@@ -863,6 +908,7 @@ impl SessionState for Mux {
                         }
                         match backend.writable(context, EndpointServer(&mut self.frontend)) {
                             MuxResult::Continue => {}
+                            MuxResult::Upgrade => unreachable!(), // only frontend can upgrade
                             MuxResult::CloseSession => return SessionResult::Close,
                         }
                     }
@@ -870,6 +916,7 @@ impl SessionState for Mux {
                     if backend.readiness().filter_interest().is_readable() {
                         match backend.readable(context, EndpointServer(&mut self.frontend)) {
                             MuxResult::Continue => {}
+                            MuxResult::Upgrade => unreachable!(), // only frontend can upgrade
                             MuxResult::CloseSession => return SessionResult::Close,
                         }
                     }
@@ -888,7 +935,7 @@ impl SessionState for Mux {
                     for token in &dead_backends {
                         self.router.backends.remove(token);
                     }
-                    println_!("FRONTEND: {:#?}", &self.frontend);
+                    println_!("FRONTEND: {:#?}", self.frontend);
                     println_!("BACKENDS: {:#?}", self.router.backends);
                 }
 
@@ -900,6 +947,7 @@ impl SessionState for Mux {
                     {
                         MuxResult::Continue => {}
                         MuxResult::CloseSession => return SessionResult::Close,
+                        MuxResult::Upgrade => return SessionResult::Upgrade,
                     }
                 }
 
@@ -951,6 +999,9 @@ impl SessionState for Mux {
                                 ) => {
                                     set_default_answer(stream, front_readiness, 401);
                                 }
+                                BE::RetrieveClusterError(RetrieveClusterError::HttpsRedirect) => {
+                                    set_default_answer(stream, front_readiness, 301);
+                                }
 
                                 BE::Backend(_) => {}
                                 BE::RetrieveClusterError(_) => unreachable!(),
@@ -996,6 +1047,7 @@ impl SessionState for Mux {
             self.frontend.readiness()
         );
     }
+
     fn close(&mut self, _proxy: Rc<RefCell<dyn L7Proxy>>, _metrics: &mut SessionMetrics) {
         let s = match &mut self.frontend {
             Connection::H1(c) => &mut c.socket,
@@ -1016,5 +1068,33 @@ impl SessionState for Mux {
                 });
             }
         }
+    }
+
+    fn shutting_down(&mut self) -> SessionIsToBeClosed {
+        let mut can_stop = true;
+        for stream in &mut self.context.streams {
+            match stream.state {
+                StreamState::Linked(_) => {
+                    can_stop = false;
+                }
+                StreamState::Unlinked => {
+                    let front = &stream.front;
+                    let back = &stream.back;
+                    kawa::debug_kawa(front);
+                    kawa::debug_kawa(back);
+                    if front.is_initial()
+                        && front.storage.is_empty()
+                        && back.is_initial()
+                        && back.storage.is_empty()
+                    {
+                        continue;
+                    }
+                    stream.context.closing = true;
+                    can_stop = false;
+                }
+                _ => {}
+            }
+        }
+        can_stop
     }
 }
