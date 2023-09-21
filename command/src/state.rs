@@ -1129,7 +1129,7 @@ impl ConfigState {
 
     // FIXME: what about deny rules?
     pub fn hash_state(&self) -> BTreeMap<ClusterId, u64> {
-        let mut hm: HashMap<String, DefaultHasher> = self
+        let mut hm: HashMap<ClusterId, DefaultHasher> = self
             .clusters
             .keys()
             .map(|cluster_id| {
@@ -1141,10 +1141,11 @@ impl ConfigState {
                 if let Some(tcp_fronts) = self.tcp_fronts.get(cluster_id) {
                     tcp_fronts.iter().collect::<BTreeSet<_>>().hash(&mut hasher)
                 }
-                (cluster_id.to_string(), hasher)
+                (cluster_id.to_owned(), hasher)
             })
             .collect();
 
+            
         for front in self.http_fronts.values() {
             if let Some(cluster_id) = &front.cluster_id {
                 if let Some(hasher) = hm.get_mut(cluster_id) {
