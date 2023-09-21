@@ -44,9 +44,9 @@ command_socket = "./sozu.sock"
 # buffer will grow up to max_command_buffer_size. If the buffer is still not large
 # enough sozu will close the connection
 # defaults to 1000000
-command_buffer_size = 16384
+command_buffer_size = 1_000_000
 # defaults to command_buffer_size * 2
-max_command_buffer_size = 163840
+max_command_buffer_size = 2_000_000
 
 # the number of worker processes that will handle traffic
 # defaults to 2 workers
@@ -89,7 +89,7 @@ buffer_size = 16393
 
 # how much time (in milliseconds) sozu command line will wait for a command to complete.
 # Defaults to 1000 milliseconds
-# ctl_command_timeout = 1000
+ctl_command_timeout = 60_000
 
 # PID file is a file containing the PID of the main process of sozu.
 # It can be helpful to help systemd or any other service system to keep track
