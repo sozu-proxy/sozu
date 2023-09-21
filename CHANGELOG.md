@@ -4,9 +4,29 @@
 
 See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av0.16.0)
 
-## 0.15.4 - 2023-09-13
+## 0.15.5 - 2023-09-21
+
+### ⛑️ Fixed
+
+We fix a bug that can occurs with pki using T.61 charset, see [`a5412b9`](https://github.com/sozu-proxy/sozu/commit/a5412b9764e860eedc2a206b16e81144946a8d7f).
 
 ### Changelog
+
+#### ⛑️ Fixed
+
+- [[`a5412b9`](https://github.com/sozu-proxy/sozu/commit/a5412b9764e860eedc2a206b16e81144946a8d7f) ] fix(command): retrieve name and san from slice [`Florentin Dubois`] (`2023-09-21`)
+
+#### ✍️ Changed
+
+- [ [`24c4407`](https://github.com/sozu-proxy/sozu/commit/24c4407d654dfbcd7c490e3a23c46fe8289bce4e) ] chore: update changelog to add 0.15.4 [`Florentin Dubois`] (`2023-09-13`)
+- [ [`6de9cf5`](https://github.com/sozu-proxy/sozu/commit/6de9cf541368fca3d874b14df7e068a856d4d183) ] chore: update dependencies [`Florentin Dubois`] (`2023-09-21`)
+
+### 🥹 Contributors
+* @FlorentinDUBOIS
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.4...0.15.5
+
+## 0.15.4 - 2023-09-13
 
 ### 🌟 Features
 
@@ -19,6 +39,8 @@ See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_fil
 
 - Fix unit and end-to-end (e2e) tests, see [`2b84a4b`](https://github.com/sozu-proxy/sozu/commit/2b84a4bf88da6077f3371871634bce4ae6204be0), [`4aceb86`](https://github.com/sozu-proxy/sozu/commit/4aceb866529979ac113cf17580e04d3637ab362b), [`818bc48`](https://github.com/sozu-proxy/sozu/commit/818bc4822517499e4ae9dc728bb5e15198c4da93), [`56dce47`](https://github.com/sozu-proxy/sozu/commit/56dce47e364f2a36d7fb8d1c82bc6d2852eec25d).
 - Fix certificate issue at loading, see [`daaeb19`](https://github.com/sozu-proxy/sozu/commit/daaeb19f3b87a164dbdd3317444e437ccfc459fc).
+
+### Changelog
 
 #### 🌟 Features
 
