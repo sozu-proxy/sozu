@@ -17,10 +17,6 @@ use crate::proto::command::TlsVersion;
 pub enum CertificateError {
     #[error("Could not parse PEM certificate from bytes: {0}")]
     InvalidCertificate(String),
-    #[error("failed to parse certificate common name attribute, {0}")]
-    InvalidCommonName(String),
-    #[error("failed to parse certificate subject alternate names attribute, {0}")]
-    InvalidSubjectAlternateNames(String),
     #[error("failed to parse tls version '{0}'")]
     InvalidTlsVersion(String),
 }
@@ -52,7 +48,7 @@ pub fn get_cn_and_san_attributes(pem: &Pem) -> Result<HashSet<String>, Certifica
         names.insert(
             name.as_str()
                 .map(String::from)
-                .map_err(|err| CertificateError::InvalidCommonName(err.to_string()))?,
+                .unwrap_or_else(|_| String::from_utf8_lossy(name.as_slice()).to_string()),
         );
     }
 
@@ -60,7 +56,7 @@ pub fn get_cn_and_san_attributes(pem: &Pem) -> Result<HashSet<String>, Certifica
         names.insert(
             name.as_str()
                 .map(String::from)
-                .map_err(|err| CertificateError::InvalidSubjectAlternateNames(err.to_string()))?,
+                .unwrap_or_else(|_| String::from_utf8_lossy(name.as_slice()).to_string()),
         );
     }
 
