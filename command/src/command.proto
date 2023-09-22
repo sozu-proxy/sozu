@@ -209,7 +209,7 @@ message ListenersList {
 
 // An HTTP or HTTPS frontend, as order to, or received from, Sōzu
 message RequestHttpFrontend {
-    optional string cluster_id = 1;
+    required string cluster_id = 1;
     required string address = 2;
     required string hostname = 3;
     required PathRule path = 4;

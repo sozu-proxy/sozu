@@ -25,7 +25,6 @@ use crate::{
         SessionState,
     },
     retry::RetryPolicy,
-    router::Route,
     server::{push_event, CONN_RETRIES},
     socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
     sozu_command::ready::Ready,
@@ -1062,24 +1061,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
         };
 
-        let route_result = self
+        let cluster_result = self
             .listener
             .borrow()
             .frontend_from_request(host, uri, method);
 
-        let route = match route_result {
+        let cluster_id = match cluster_result {
             Ok(route) => route,
             Err(frontend_error) => {
                 self.set_answer(DefaultAnswerStatus::Answer404, None);
                 return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
-            }
-        };
-
-        let cluster_id = match route {
-            Route::ClusterId(cluster_id) => cluster_id,
-            Route::Deny => {
-                self.set_answer(DefaultAnswerStatus::Answer401, None);
-                return Err(RetrieveClusterError::UnauthorizedRoute);
             }
         };
 

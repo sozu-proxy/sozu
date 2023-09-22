@@ -921,7 +921,7 @@ impl HttpFrontendConfig {
 
             v.push(
                 RequestType::AddHttpsFrontend(RequestHttpFrontend {
-                    cluster_id: Some(cluster_id.to_string()),
+                    cluster_id: cluster_id.to_string(),
                     address: self.address.to_string(),
                     hostname: self.hostname.clone(),
                     path: self.path.clone(),
@@ -935,7 +935,7 @@ impl HttpFrontendConfig {
             //create the front both for HTTP and HTTPS if possible
             v.push(
                 RequestType::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: Some(cluster_id.to_string()),
+                    cluster_id: cluster_id.to_string(),
                     address: self.address.to_string(),
                     hostname: self.hostname.clone(),
                     path: self.path.clone(),

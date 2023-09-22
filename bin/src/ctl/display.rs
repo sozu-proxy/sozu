@@ -150,10 +150,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
         ]);
         for http_frontend in frontends.http_frontends.iter() {
             table.add_row(row!(
-                http_frontend
-                    .cluster_id
-                    .clone()
-                    .unwrap_or("Deny".to_owned()),
+                http_frontend.cluster_id,
                 http_frontend.address.to_string(),
                 http_frontend.hostname.to_string(),
                 format!("{:?}", http_frontend.path),
@@ -181,10 +178,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
         ]);
         for https_frontend in frontends.https_frontends.iter() {
             table.add_row(row!(
-                https_frontend
-                    .cluster_id
-                    .clone()
-                    .unwrap_or("Deny".to_owned()),
+                https_frontend.cluster_id,
                 https_frontend.address.to_string(),
                 https_frontend.hostname.to_string(),
                 format!("{:?}", https_frontend.path),
@@ -514,10 +508,7 @@ pub fn print_cluster_responses(
 
         for (key, values) in http_frontends.iter() {
             let mut row = Vec::new();
-            match &key.cluster_id {
-                Some(cluster_id) => row.push(cell!(cluster_id)),
-                None => row.push(cell!("-")),
-            }
+            row.push(cell!(key.cluster_id));
             row.push(cell!(key.hostname));
             row.push(cell!(key.path));
 
@@ -538,10 +529,7 @@ pub fn print_cluster_responses(
 
         for (key, values) in https_frontends.iter() {
             let mut row = Vec::new();
-            match &key.cluster_id {
-                Some(cluster_id) => row.push(cell!(cluster_id)),
-                None => row.push(cell!("-")),
-            }
+            row.push(cell!(key.cluster_id));
             row.push(cell!(key.hostname));
             row.push(cell!(key.path));
 

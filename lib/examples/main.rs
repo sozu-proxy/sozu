@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let http_front = RequestHttpFrontend {
-        cluster_id: Some(String::from("cluster_1")),
+        cluster_id: String::from("cluster_1"),
         address: "127.0.0.1:8080".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
@@ -122,7 +122,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let tls_front = RequestHttpFrontend {
-        cluster_id: Some(String::from("cluster_1")),
+        cluster_id: String::from("cluster_1"),
         address: "127.0.0.1:8443".to_string(),
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
@@ -171,7 +171,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     let tls_front2 = RequestHttpFrontend {
-        cluster_id: Some(String::from("cluster_2")),
+        cluster_id: String::from("cluster_2"),
         address: "127.0.0.1:8443".to_string(),
         hostname: String::from("test.local"),
         path: PathRule::prefix(String::from("/")),

@@ -27,9 +27,9 @@ pub enum RouterError {
 }
 
 pub struct Router {
-    pre: Vec<(DomainRule, PathRule, MethodRule, Route)>,
-    pub tree: TrieNode<Vec<(PathRule, MethodRule, Route)>>,
-    post: Vec<(DomainRule, PathRule, MethodRule, Route)>,
+    pre: Vec<(DomainRule, PathRule, MethodRule, ClusterId)>,
+    pub tree: TrieNode<Vec<(PathRule, MethodRule, ClusterId)>>,
+    post: Vec<(DomainRule, PathRule, MethodRule, ClusterId)>,
 }
 
 impl Default for Router {
@@ -47,7 +47,7 @@ impl Router {
         }
     }
 
-    pub fn lookup(&self, hostname: &[u8], path: &[u8], method: &Method) -> Option<Route> {
+    pub fn lookup(&self, hostname: &[u8], path: &[u8], method: &Method) -> Option<ClusterId> {
         for (domain_rule, path_rule, method_rule, cluster_id) in &self.pre {
             if domain_rule.matches(hostname)
                 && path_rule.matches(path) != PathRuleResult::None
@@ -116,11 +116,6 @@ impl Router {
 
         let method_rule = MethodRule::new(front.method.clone());
 
-        let route = match &front.cluster_id {
-            Some(cluster_id) => Route::ClusterId(cluster_id.clone()),
-            None => Route::Deny,
-        };
-
         let success = match front.position {
             RulePosition::Pre => {
                 let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
@@ -129,7 +124,7 @@ impl Router {
                     }
                 })?;
 
-                self.add_pre_rule(&domain, &path_rule, &method_rule, &route)
+                self.add_pre_rule(&domain, &path_rule, &method_rule, &front.cluster_id)
             }
             RulePosition::Post => {
                 let domain = front.hostname.parse::<DomainRule>().map_err(|_| {
@@ -138,11 +133,14 @@ impl Router {
                     }
                 })?;
 
-                self.add_post_rule(&domain, &path_rule, &method_rule, &route)
+                self.add_post_rule(&domain, &path_rule, &method_rule, &front.cluster_id)
             }
-            RulePosition::Tree => {
-                self.add_tree_rule(front.hostname.as_bytes(), &path_rule, &method_rule, &route)
-            }
+            RulePosition::Tree => self.add_tree_rule(
+                front.hostname.as_bytes(),
+                &path_rule,
+                &method_rule,
+                &front.cluster_id,
+            ),
         };
         if !success {
             return Err(RouterError::AddRoute(format!("{:?}", front)));
@@ -190,7 +188,7 @@ impl Router {
         hostname: &[u8],
         path: &PathRule,
         method: &MethodRule,
-        cluster: &Route,
+        cluster: &ClusterId,
     ) -> bool {
         let hostname = match from_utf8(hostname) {
             Err(_) => return false,
@@ -267,7 +265,7 @@ impl Router {
         domain: &DomainRule,
         path: &PathRule,
         method: &MethodRule,
-        cluster_id: &Route,
+        cluster_id: &ClusterId,
     ) -> bool {
         if !self
             .pre
@@ -291,7 +289,7 @@ impl Router {
         domain: &DomainRule,
         path: &PathRule,
         method: &MethodRule,
-        cluster_id: &Route,
+        cluster_id: &ClusterId,
     ) -> bool {
         if !self
             .post
@@ -575,15 +573,6 @@ impl MethodRule {
     }
 }
 
-/// The cluster to which the traffic will be redirected
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Route {
-    /// send a 401 default answer
-    Deny,
-    /// the cluster to which the frontend belongs
-    ClusterId(ClusterId),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,25 +682,25 @@ mod tests {
             &"*".parse::<DomainRule>().unwrap(),
             &PathRule::Prefix("/.well-known/acme-challenge".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("acme".to_string())
+            &"acme".to_string()
         ));
         assert!(router.add_tree_rule(
             "www.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("example".to_string())
+            &"example".to_string()
         ));
         assert!(router.add_tree_rule(
             "*.test.example.com".as_bytes(),
             &PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("examplewildcard".to_string())
+            &"examplewildcard".to_string()
         ));
         assert!(router.add_tree_rule(
             "/test[0-9]/.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("exampleregex".to_string())
+            &"exampleregex".to_string()
         ));
 
         assert_eq!(
@@ -720,7 +709,7 @@ mod tests {
                 "/helloA".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("example".to_string()))
+            Some("example".to_string())
         );
         assert_eq!(
             router.lookup(
@@ -728,7 +717,7 @@ mod tests {
                 "/.well-known/acme-challenge".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("acme".to_string()))
+            Some("acme".to_string())
         );
         assert_eq!(
             router.lookup(
@@ -744,7 +733,7 @@ mod tests {
                 "/helloAB/".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("examplewildcard".to_string()))
+            Some("examplewildcard".to_string())
         );
         assert_eq!(
             router.lookup(
@@ -752,7 +741,7 @@ mod tests {
                 "/helloAB/".as_bytes(),
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("exampleregex".to_string()))
+            Some("exampleregex".to_string())
         );
     }
 }

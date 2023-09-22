@@ -42,7 +42,7 @@ use crate::{
         proxy_protocol::expect::ExpectProxyProtocol,
         Http, Pipe, SessionState,
     },
-    router::{Route, Router},
+    router::Router,
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
@@ -420,7 +420,7 @@ impl L7ListenerHandler for HttpListener {
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError> {
+    ) -> Result<ClusterId, FrontendFromRequestError> {
         let start = Instant::now();
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
@@ -449,7 +449,7 @@ impl L7ListenerHandler for HttpListener {
         */
         let host = unsafe { from_utf8_unchecked(hostname) };
 
-        let route = self
+        let cluster_id = self
             .fronts
             .lookup(host.as_bytes(), uri.as_bytes(), method)
             .ok_or_else(|| {
@@ -459,15 +459,13 @@ impl L7ListenerHandler for HttpListener {
 
         let now = Instant::now();
 
-        if let Route::ClusterId(cluster) = &route {
-            time!(
-                "frontend_matching_time",
-                cluster,
-                (now - start).whole_milliseconds()
-            );
-        }
+        time!(
+            "frontend_matching_time",
+            &cluster_id,
+            (now - start).whole_milliseconds()
+        );
 
-        Ok(route)
+        Ok(cluster_id)
     }
 }
 
@@ -1148,7 +1146,7 @@ mod tests {
         });
 
         let front = RequestHttpFrontend {
-            cluster_id: Some(String::from("cluster_1")),
+            cluster_id: String::from("cluster_1"),
             address: "127.0.0.1:1024".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
@@ -1234,7 +1232,7 @@ mod tests {
             address: "127.0.0.1:1031".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
-            cluster_id: Some(String::from("cluster_1")),
+            cluster_id: String::from("cluster_1"),
             ..Default::default()
         };
         command
@@ -1356,7 +1354,7 @@ mod tests {
             address: "127.0.0.1:1041".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
-            cluster_id: Some(String::from("cluster_1")),
+            cluster_id: String::from("cluster_1"),
             ..Default::default()
         };
         command
@@ -1463,7 +1461,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri1),
                 position: RulePosition::Tree,
-                cluster_id: Some(cluster_id1),
+                cluster_id: cluster_id1,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1474,7 +1472,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri2),
                 position: RulePosition::Tree,
-                cluster_id: Some(cluster_id2),
+                cluster_id: cluster_id2,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1485,7 +1483,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri3),
                 position: RulePosition::Tree,
-                cluster_id: Some(cluster_id3),
+                cluster_id: cluster_id3,
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1496,7 +1494,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix("/test".to_owned()),
                 position: RulePosition::Tree,
-                cluster_id: Some("cluster_1".to_owned()),
+                cluster_id: "cluster_1".to_owned(),
                 tags: None,
             })
             .expect("Could not add http frontend");
@@ -1529,19 +1527,19 @@ mod tests {
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
         assert_eq!(
             frontend1.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            "cluster_1".to_string()
         );
         assert_eq!(
             frontend2.expect("should find frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            "cluster_1".to_string()
         );
         assert_eq!(
             frontend3.expect("should find frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            "cluster_2".to_string()
         );
         assert_eq!(
             frontend4.expect("should find frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            "cluster_3".to_string()
         );
         assert!(frontend5.is_err());
     }

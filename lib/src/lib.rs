@@ -123,7 +123,7 @@
 //!  use sozu_command_lib::proto::command::{PathRule, RequestHttpFrontend, RulePosition};
 //!
 //! let http_front = RequestHttpFrontend {
-//!     cluster_id: Some("my-cluster".to_string()),
+//!     cluster_id: "my-cluster".to_string(),
 //!     address: "127.0.0.1:8080".to_string(),
 //!     hostname: "example.com".to_string(),
 //!     path: PathRule::prefix(String::from("/")),
@@ -274,7 +274,7 @@
 //!     };
 //!
 //!     let http_front = RequestHttpFrontend {
-//!         cluster_id: Some("my-cluster".to_string()),
+//!         cluster_id: "my-cluster".to_string(),
 //!         address: "127.0.0.1:8080".to_string(),
 //!         hostname: "example.com".to_string(),
 //!         path: PathRule::prefix(String::from("/")),
@@ -382,7 +382,7 @@ use sozu_command::{
     ObjectKind,
 };
 
-use crate::{backends::BackendMap, router::Route};
+use crate::backends::BackendMap;
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,13 +583,14 @@ pub trait L7ListenerHandler {
 
     fn get_connect_timeout(&self) -> u32;
 
+    // TODO: rename this, since it returns a ClusterId, maybe… cluster_id_from_request()
     /// retrieve a frontend by parsing a request's hostname, uri and method
     fn frontend_from_request(
         &self,
         host: &str,
         uri: &str,
         method: &Method,
-    ) -> Result<Route, FrontendFromRequestError>;
+    ) -> Result<ClusterId, FrontendFromRequestError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

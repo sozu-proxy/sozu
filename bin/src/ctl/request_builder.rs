@@ -200,11 +200,11 @@ impl CommandManager {
                 path_equals,
                 address,
                 method,
-                cluster_id: route,
+                cluster_id,
                 tags,
             } => self.send_request(
                 RequestType::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: route.into(),
+                    cluster_id,
                     address: address.to_string(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
@@ -224,10 +224,10 @@ impl CommandManager {
                 path_equals,
                 address,
                 method,
-                cluster_id: route,
+                cluster_id,
             } => self.send_request(
                 RequestType::RemoveHttpFrontend(RequestHttpFrontend {
-                    cluster_id: route.into(),
+                    cluster_id,
                     address: address.to_string(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
@@ -248,11 +248,11 @@ impl CommandManager {
                 path_equals,
                 address,
                 method,
-                cluster_id: route,
+                cluster_id,
                 tags,
             } => self.send_request(
                 RequestType::AddHttpsFrontend(RequestHttpFrontend {
-                    cluster_id: route.into(),
+                    cluster_id,
                     address: address.to_string(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
@@ -272,10 +272,10 @@ impl CommandManager {
                 path_equals,
                 address,
                 method,
-                cluster_id: route,
+                cluster_id,
             } => self.send_request(
                 RequestType::RemoveHttpsFrontend(RequestHttpFrontend {
-                    cluster_id: route.into(),
+                    cluster_id,
                     address: address.to_string(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),

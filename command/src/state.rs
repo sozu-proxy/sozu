@@ -1146,18 +1146,14 @@ impl ConfigState {
             .collect();
 
         for front in self.http_fronts.values() {
-            if let Some(cluster_id) = &front.cluster_id {
-                if let Some(s) = h.get_mut(cluster_id) {
-                    front.hash(s);
-                }
+            if let Some(s) = h.get_mut(&front.cluster_id) {
+                front.hash(s);
             }
         }
 
         for front in self.https_fronts.values() {
-            if let Some(cluster_id) = &front.cluster_id {
-                if let Some(s) = h.get_mut(cluster_id) {
-                    front.hash(s);
-                }
+            if let Some(s) = h.get_mut(&front.cluster_id) {
+                front.hash(s);
             }
         }
 
@@ -1175,18 +1171,14 @@ impl ConfigState {
         let mut backends = Vec::new();
 
         for http_frontend in self.http_fronts.values() {
-            if let Some(id) = &http_frontend.cluster_id {
-                if id == cluster_id {
-                    http_frontends.push(http_frontend.clone().into());
-                }
+            if http_frontend.cluster_id == cluster_id {
+                http_frontends.push(http_frontend.clone().into());
             }
         }
 
         for https_frontend in self.https_fronts.values() {
-            if let Some(id) = &https_frontend.cluster_id {
-                if id == cluster_id {
-                    https_frontends.push(https_frontend.clone().into());
-                }
+            if https_frontend.cluster_id == cluster_id {
+                https_frontends.push(https_frontend.clone().into());
             }
         }
 
@@ -1226,17 +1218,13 @@ impl ConfigState {
 
         self.http_fronts.values().for_each(|front| {
             if domain_check(&front.hostname, &front.path, &hostname, &path) {
-                if let Some(id) = &front.cluster_id {
-                    cluster_ids.insert(id.to_string());
-                }
+                cluster_ids.insert(front.cluster_id.clone());
             }
         });
 
         self.https_fronts.values().for_each(|front| {
             if domain_check(&front.hostname, &front.path, &hostname, &path) {
-                if let Some(id) = &front.cluster_id {
-                    cluster_ids.insert(id.to_string());
-                }
+                cluster_ids.insert(front.cluster_id.clone());
             }
         });
 
@@ -1488,7 +1476,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: Some(String::from("cluster_1")),
+                    cluster_id: String::from("cluster_1"),
                     hostname: String::from("lolcatho.st:8080"),
                     path: PathRule::prefix(String::from("/")),
                     address: "0.0.0.0:8080".to_string(),
@@ -1501,7 +1489,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: Some(String::from("cluster_2")),
+                    cluster_id: String::from("cluster_2"),
                     hostname: String::from("test.local"),
                     path: PathRule::prefix(String::from("/abc")),
                     address: "0.0.0.0:8080".to_string(),
@@ -1583,7 +1571,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: Some(String::from("cluster_1")),
+                    cluster_id: String::from("cluster_1"),
                     hostname: String::from("lolcatho.st:8080"),
                     path: PathRule::prefix(String::from("/")),
                     address: "0.0.0.0:8080".to_string(),
@@ -1596,7 +1584,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: Some(String::from("cluster_2")),
+                    cluster_id: String::from("cluster_2"),
                     hostname: String::from("test.local"),
                     path: PathRule::prefix(String::from("/abc")),
                     address: "0.0.0.0:8080".to_string(),
@@ -1657,7 +1645,7 @@ mod tests {
         state2
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: Some(String::from("cluster_1")),
+                    cluster_id: String::from("cluster_1"),
                     hostname: String::from("lolcatho.st:8080"),
                     path: PathRule::prefix(String::from("/")),
                     address: "0.0.0.0:8080".to_string(),
@@ -1717,7 +1705,7 @@ mod tests {
 
         let e: Vec<Request> = vec![
             RequestType::RemoveHttpFrontend(RequestHttpFrontend {
-                cluster_id: Some(String::from("cluster_2")),
+                cluster_id: String::from("cluster_2"),
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
                 address: "0.0.0.0:8080".to_string(),
@@ -1781,7 +1769,7 @@ mod tests {
     fn cluster_ids_by_domain() {
         let mut config = ConfigState::new();
         let http_front_cluster1 = RequestHttpFrontend {
-            cluster_id: Some(String::from("MyCluster_1")),
+            cluster_id: String::from("MyCluster_1"),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("")),
             address: "0.0.0.0:8080".to_string(),
@@ -1789,7 +1777,7 @@ mod tests {
         };
 
         let https_front_cluster1 = RequestHttpFrontend {
-            cluster_id: Some(String::from("MyCluster_1")),
+            cluster_id: String::from("MyCluster_1"),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("")),
             address: "0.0.0.0:8443".to_string(),
@@ -1797,7 +1785,7 @@ mod tests {
         };
 
         let http_front_cluster2 = RequestHttpFrontend {
-            cluster_id: Some(String::from("MyCluster_2")),
+            cluster_id: String::from("MyCluster_2"),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("/api")),
             address: "0.0.0.0:8080".to_string(),
@@ -1805,7 +1793,7 @@ mod tests {
         };
 
         let https_front_cluster2 = RequestHttpFrontend {
-            cluster_id: Some(String::from("MyCluster_2")),
+            cluster_id: String::from("MyCluster_2"),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("/api")),
             address: "0.0.0.0:8443".to_string(),

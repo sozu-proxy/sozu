@@ -26,8 +26,7 @@ impl Response {
 /// An HTTP or HTTPS frontend, as used *within* Sōzu
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpFrontend {
-    /// Send a 401, DENY, if cluster_id is None
-    pub cluster_id: Option<ClusterId>,
+    pub cluster_id: ClusterId,
     pub address: SocketAddr,
     pub hostname: String,
     #[serde(default)]
