@@ -226,27 +226,35 @@ impl CommandServer {
                     for request in requests {
                         message_counter += 1;
 
-                        if self.state.dispatch(&request.content).is_ok() {
-                            diff_counter += 1;
+                        match self.state.dispatch(&request.content) {
+                            Ok(()) => {
+                                diff_counter += 1;
 
-                            let mut found = false;
-                            let id = format!("LOAD-STATE-{}-{diff_counter}", request.id);
+                                let mut found = false;
+                                let id = format!("LOAD-STATE-{}-{diff_counter}", request.id);
 
-                            for worker in
-                                self.workers.iter_mut().filter(|worker| worker.is_active())
-                            {
-                                let worker_message_id = format!("{}-{}", id, worker.id);
-                                worker
-                                    .send(worker_message_id.clone(), request.content.clone())
-                                    .await;
-                                self.in_flight
-                                    .insert(worker_message_id, (load_state_tx.clone(), 1));
+                                for worker in
+                                    self.workers.iter_mut().filter(|worker| worker.is_active())
+                                {
+                                    let worker_message_id = format!("{}-{}", id, worker.id);
+                                    worker
+                                        .send(worker_message_id.clone(), request.content.clone())
+                                        .await;
+                                    self.in_flight
+                                        .insert(worker_message_id, (load_state_tx.clone(), 1));
 
-                                found = true;
+                                    found = true;
+                                }
+
+                                if !found {
+                                    bail!("no worker found");
+                                }
                             }
-
-                            if !found {
-                                bail!("no worker found");
+                            Err(e) => {
+                                warn!(
+                                    "Request {} could not be dispatched on the state: {}",
+                                    request, e
+                                );
                             }
                         }
                     }
