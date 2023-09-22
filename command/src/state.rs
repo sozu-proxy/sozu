@@ -170,7 +170,18 @@ impl ConfigState {
         Ok(())
     }
 
+    /// Remove a cluster and all its children (frontends and backends)
     fn remove_cluster(&mut self, cluster_id: &str) -> Result<(), StateError> {
+        self.http_fronts
+            .retain(|_, front| front.cluster_id != cluster_id);
+
+        self.https_fronts
+            .retain(|_, front| front.cluster_id != cluster_id);
+
+        self.tcp_fronts.retain(|id, _| id != cluster_id);
+
+        self.backends.retain(|id, _| id != cluster_id);
+
         match self.clusters.remove(cluster_id) {
             Some(_) => Ok(()),
             None => Err(StateError::NotFound {
