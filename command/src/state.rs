@@ -56,6 +56,8 @@ pub enum StateError {
         "Could not convert the frontend to an insertable one. Frontend: {frontend} error: {error}"
     )]
     FrontendConversion { frontend: String, error: String },
+    #[error("Found no matching cluster for the id {0}")]
+    HasNoMatchingCluster(ClusterId),
 }
 
 impl From<DecodeError> for StateError {
@@ -307,7 +309,16 @@ impl ConfigState {
         }
     }
 
+    fn check_for_cluster_presence(&self, cluster_id: &ClusterId) -> Result<(), StateError> {
+        if !self.clusters.contains_key(cluster_id) {
+            return Err(StateError::HasNoMatchingCluster(cluster_id.clone()));
+        }
+        Ok(())
+    }
+
     fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+        self.check_for_cluster_presence(&front.cluster_id)?;
+
         let front_as_key = front.to_string();
 
         match self.http_fronts.entry(front.to_string()) {
@@ -330,6 +341,8 @@ impl ConfigState {
     }
 
     fn add_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+        self.check_for_cluster_presence(&front.cluster_id)?;
+
         let front_as_key = front.to_string();
 
         match self.https_fronts.entry(front.to_string()) {
@@ -460,6 +473,8 @@ impl ConfigState {
     }
 
     fn add_tcp_frontend(&mut self, front: &RequestTcpFrontend) -> Result<(), StateError> {
+        self.check_for_cluster_presence(&front.cluster_id)?;
+
         let tcp_frontends = self
             .tcp_fronts
             .entry(front.cluster_id.clone())
@@ -1473,6 +1488,25 @@ mod tests {
     #[test]
     fn serialize() {
         let mut state: ConfigState = Default::default();
+
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: "cluster_1".to_string(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: "cluster_2".to_string(),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
         state
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -1570,6 +1604,27 @@ mod tests {
         let mut state: ConfigState = Default::default();
         state
             .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_1"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_2"),
+                    sticky_session: true,
+                    https_redirect: true,
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+
+        state
+            .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
                     cluster_id: String::from("cluster_1"),
                     hostname: String::from("lolcatho.st:8080"),
@@ -1629,19 +1684,17 @@ mod tests {
                 .into(),
             )
             .expect("Could not execute request");
-        state
+
+        let mut state2: ConfigState = Default::default();
+        state2
             .dispatch(
                 &RequestType::AddCluster(Cluster {
-                    cluster_id: String::from("cluster_2"),
-                    sticky_session: true,
-                    https_redirect: true,
+                    cluster_id: String::from("cluster_1"),
                     ..Default::default()
                 })
                 .into(),
             )
             .expect("Could not execute request");
-
-        let mut state2: ConfigState = Default::default();
         state2
             .dispatch(
                 &RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -1768,6 +1821,20 @@ mod tests {
     #[test]
     fn cluster_ids_by_domain() {
         let mut config = ConfigState::new();
+
+        let mut cluster_1 = Cluster::default();
+        cluster_1.cluster_id = String::from("MyCluster_1");
+        let mut cluster_2 = Cluster::default();
+        cluster_2.cluster_id = String::from("MyCluster_2");
+
+        config
+            .dispatch(&RequestType::AddCluster(cluster_1).into())
+            .expect("Could not execute request");
+
+        config
+            .dispatch(&RequestType::AddCluster(cluster_2).into())
+            .expect("Could not execute request");
+
         let http_front_cluster1 = RequestHttpFrontend {
             cluster_id: String::from("MyCluster_1"),
             hostname: String::from("lolcatho.st"),
