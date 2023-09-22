@@ -519,6 +519,8 @@ impl ConfigState {
     }
 
     fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
+        self.check_for_cluster_presence(&add_backend.cluster_id)?;
+
         let backend = Backend {
             address: parse_socket_address(&add_backend.address)?,
             cluster_id: add_backend.cluster_id.clone(),
@@ -1911,6 +1913,16 @@ mod tests {
     #[test]
     fn duplicate_backends() {
         let mut state: ConfigState = Default::default();
+
+        let cluster_1 = Cluster {
+            cluster_id: "cluster_1".to_string(),
+            ..Default::default()
+        };
+
+        state
+            .dispatch(&RequestType::AddCluster(cluster_1).into())
+            .expect("Could not execute request");
+
         state
             .dispatch(
                 &RequestType::AddBackend(AddBackend {
