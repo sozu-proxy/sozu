@@ -7,7 +7,7 @@ use crate::{
     println_,
     protocol::mux::{
         converter, debug_kawa, forcefully_terminate_answer,
-        parser::{self, error_code_to_str, Frame, FrameHeader, FrameType, H2Error},
+        parser::{self, error_code_to_str, Frame, FrameHeader, FrameType, H2Error, Headers},
         pkawa, serializer, set_default_answer, update_readiness_after_read,
         update_readiness_after_write, BackendStatus, Context, Endpoint, GenericHttpStream,
         GlobalStreamId, MuxResult, Position, StreamId, StreamState,
@@ -34,6 +34,8 @@ pub enum H2State {
     ServerSettings,
     Header,
     Frame(FrameHeader),
+    ContinuationHeader(Headers),
+    ContinuationFrame(Headers),
     GoAway,
     Error,
 }
@@ -68,16 +70,16 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub encoder: hpack::Encoder<'static>,
     pub expect_read: Option<(H2StreamId, usize)>,
     pub expect_write: Option<H2StreamId>,
-    pub position: Position,
-    pub readiness: Readiness,
+    pub last_stream_id: StreamId,
     pub local_settings: H2Settings,
     pub peer_settings: H2Settings,
+    pub position: Position,
+    pub readiness: Readiness,
     pub socket: Front,
     pub state: H2State,
-    pub last_stream_id: StreamId,
     pub streams: HashMap<StreamId, GlobalStreamId>,
-    pub zero: GenericHttpStream,
     pub window: u32,
+    pub zero: GenericHttpStream,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -205,7 +207,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
                 self.state = H2State::ServerSettings;
                 self.expect_write = Some(H2StreamId::Zero);
-                self.handle_frame(settings, context, endpoint);
+                return self.handle_frame(settings, context, endpoint);
             }
             (H2State::ServerSettings, Position::Client(_)) => {
                 let i = kawa.storage.data();
@@ -260,6 +262,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Err(e) => panic!("stream error: {:?}", error_nom_to_h2(e)),
                 };
             }
+            (H2State::ContinuationHeader(headers), _) => {
+                let i = kawa.storage.data();
+                println_!("  continuation header: {i:?}");
+                match parser::frame_header(i) {
+                    Ok((_, header)) => {
+                        println_!("{header:#?}");
+                        kawa.storage.end -= 9;
+                        let stream_id = header.stream_id;
+                        assert_eq!(stream_id, headers.stream_id);
+                        self.expect_read = Some((H2StreamId::Zero, header.payload_len as usize));
+                        let mut headers = headers.clone();
+                        headers.end_headers = header.flags & 0x4 != 0;
+                        headers.header_block_fragment.len += header.payload_len;
+                        self.state = H2State::ContinuationFrame(headers);
+                    }
+                    Err(e) => panic!("stream error: {:?}", error_nom_to_h2(e)),
+                };
+            }
             (H2State::Frame(header), _) => {
                 let i = kawa.storage.data();
                 println_!("  data: {i:?}");
@@ -274,10 +294,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if let H2StreamId::Zero = stream_id {
                     kawa.storage.clear();
                 }
-                let state_result = self.handle_frame(frame, context, endpoint);
                 self.state = H2State::Header;
                 self.expect_read = Some((H2StreamId::Zero, 9));
-                return state_result;
+                return self.handle_frame(frame, context, endpoint);
+            }
+            (H2State::ContinuationFrame(headers), _) => {
+                let i = kawa.storage.data();
+                println_!("  data: {i:?}");
+                let headers = headers.clone();
+                self.state = H2State::Header;
+                self.expect_read = Some((H2StreamId::Zero, 9));
+                return self.handle_frame(Frame::Headers(headers), context, endpoint);
             }
         }
         MuxResult::Continue
@@ -345,7 +372,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             // Proxying states
-            (H2State::Header, _) | (H2State::Frame(_), _) => {
+            (H2State::Header, _)
+            | (H2State::Frame(_), _)
+            | (H2State::ContinuationFrame(_), _)
+            | (H2State::ContinuationHeader(_), _) => {
                 let mut dead_streams = Vec::new();
 
                 if let Some(H2StreamId::Other(stream_id, global_stream_id)) = self.expect_write {
@@ -379,7 +409,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
                 let mut converter = converter::H2BlockConverter {
                     stream_id: 0,
-                    state: StreamState::Idle,
                     encoder: &mut self.encoder,
                     out: Vec::new(),
                 };
@@ -390,7 +419,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 'outer: for stream_id in priorities {
                     let global_stream_id = *self.streams.get(stream_id).unwrap();
                     let stream = &mut context.streams[global_stream_id];
-                    converter.state = stream.state;
                     let kawa = stream.wbuffer(&self.position);
                     if kawa.is_main_phase() || kawa.is_error() {
                         converter.stream_id = *stream_id;
@@ -525,8 +553,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Frame::Headers(headers) => {
                 if !headers.end_headers {
-                    todo!();
-                    // self.state = H2State::Continuation
+                    self.state = H2State::ContinuationHeader(headers);
+                    return MuxResult::Continue;
                 }
                 // can this fail?
                 let global_stream_id = *self.streams.get(&headers.stream_id).unwrap();
