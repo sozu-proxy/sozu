@@ -7,12 +7,11 @@ use crate::protocol::http::parser::compare_no_case;
 use super::{
     parser::{FrameHeader, FrameType, H2Error},
     serializer::{gen_frame_header, gen_rst_stream},
-    StreamId, StreamState,
+    StreamId,
 };
 
 pub struct H2BlockConverter<'a> {
     pub stream_id: StreamId,
-    pub state: StreamState,
     pub encoder: &'a mut hpack::Encoder<'static>,
     pub out: Vec<u8>,
 }
