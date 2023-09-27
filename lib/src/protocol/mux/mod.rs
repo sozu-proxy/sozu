@@ -34,6 +34,8 @@ use crate::{
 
 pub use crate::protocol::mux::{h1::ConnectionH1, h2::ConnectionH2};
 
+use self::h2::Prioriser;
+
 #[macro_export]
 macro_rules! println_ {
     ($($t:expr),*) => {
@@ -208,23 +210,24 @@ impl<Front: SocketHandler> Connection<Front> {
             .upgrade()
             .and_then(|pool| pool.borrow_mut().checkout())?;
         Some(Connection::H2(ConnectionH2 {
-            socket: front_stream,
+            decoder: hpack::Decoder::new(),
+            encoder: hpack::Encoder::new(),
+            expect_read: Some((H2StreamId::Zero, 24 + 9)),
+            expect_write: None,
+            last_stream_id: 0,
+            local_settings: H2Settings::default(),
+            peer_settings: H2Settings::default(),
             position: Position::Server,
+            prioriser: Prioriser::new(),
             readiness: Readiness {
                 interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
-            streams: HashMap::new(),
+            socket: front_stream,
             state: H2State::ClientPreface,
-            expect_read: Some((H2StreamId::Zero, 24 + 9)),
-            expect_write: None,
-            local_settings: H2Settings::default(),
-            peer_settings: H2Settings::default(),
-            zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
+            streams: HashMap::new(),
             window: 1 << 16,
-            decoder: hpack::Decoder::new(),
-            encoder: hpack::Encoder::new(),
-            last_stream_id: 0,
+            zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
         }))
     }
     pub fn new_h2_client(
@@ -236,23 +239,24 @@ impl<Front: SocketHandler> Connection<Front> {
             .upgrade()
             .and_then(|pool| pool.borrow_mut().checkout())?;
         Some(Connection::H2(ConnectionH2 {
-            socket: front_stream,
+            decoder: hpack::Decoder::new(),
+            encoder: hpack::Encoder::new(),
+            expect_read: None,
+            expect_write: None,
+            last_stream_id: 0,
+            local_settings: H2Settings::default(),
+            peer_settings: H2Settings::default(),
             position: Position::Client(BackendStatus::Connecting(cluster_id)),
+            prioriser: Prioriser::new(),
             readiness: Readiness {
                 interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
-            streams: HashMap::new(),
+            socket: front_stream,
             state: H2State::ClientPreface,
-            expect_read: None,
-            expect_write: None,
-            local_settings: H2Settings::default(),
-            peer_settings: H2Settings::default(),
-            zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
+            streams: HashMap::new(),
             window: 1 << 16,
-            decoder: hpack::Decoder::new(),
-            encoder: hpack::Encoder::new(),
-            last_stream_id: 0,
+            zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
         }))
     }
 
