@@ -391,7 +391,6 @@ pub fn headers_frame<'a>(
             stream_id: header.stream_id,
             stream_dependency,
             weight,
-            // header_block_fragment,
             header_block_fragment: Slice::new(input, header_block_fragment),
             end_stream: header.flags & 0x1 != 0,
             end_headers: header.flags & 0x4 != 0,

@@ -48,6 +48,10 @@ pub struct H2Settings {
     pub settings_initial_window_size: u32,
     pub settings_max_frame_size: u32,
     pub settings_max_header_list_size: u32,
+    /// RFC 8441
+    pub settings_enable_connect_protocol: bool,
+    /// RFC 9218
+    pub settings_no_rfc7540_priorities: bool,
 }
 
 impl Default for H2Settings {
@@ -55,15 +59,26 @@ impl Default for H2Settings {
         Self {
             settings_header_table_size: 4096,
             settings_enable_push: true,
-            settings_max_concurrent_streams: u32::MAX,
+            settings_max_concurrent_streams: 256,
             settings_initial_window_size: (1 << 16) - 1,
             settings_max_frame_size: 1 << 14,
             settings_max_header_list_size: u32::MAX,
+            settings_enable_connect_protocol: false,
+            settings_no_rfc7540_priorities: true,
         }
     }
 }
 
-struct Prioriser {}
+pub struct Prioriser {}
+
+impl Prioriser {
+    pub fn new() -> Self {
+        Self {}
+    }
+    pub fn push_priority(&mut self, priority: parser::Priority) {
+        println!("DEPRECATED: {priority:?}");
+    }
+}
 
 pub struct ConnectionH2<Front: SocketHandler> {
     pub decoder: hpack::Decoder<'static>,
@@ -74,6 +89,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub local_settings: H2Settings,
     pub peer_settings: H2Settings,
     pub position: Position,
+    pub prioriser: Prioriser,
     pub readiness: Readiness,
     pub socket: Front,
     pub state: H2State,
@@ -189,18 +205,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     Err(_) => return self.force_disconnect(),
                 };
                 let kawa = &mut self.zero;
-                match serializer::gen_frame_header(
-                    kawa.storage.space(),
-                    &FrameHeader {
-                        payload_len: 0,
-                        frame_type: FrameType::Settings,
-                        flags: 0,
-                        stream_id: 0,
-                    },
-                ) {
+                match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
                     Ok((_, size)) => kawa.storage.fill(size),
                     Err(e) => {
-                        println!("could not serialize HeaderFrame: {e:?}");
+                        println!("could not serialize SettingsFrame: {e:?}");
                         return self.force_disconnect();
                     }
                 };
@@ -594,7 +602,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     return self.goaway(H2Error::ProtocolError);
                 }
             },
-            Frame::Priority(priority) => (),
+            Frame::Priority(priority) => self.prioriser.push_priority(priority),
             Frame::RstStream(rst_stream) => {
                 println_!(
                     "RstStream({} -> {})",
@@ -608,15 +616,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     return MuxResult::Continue;
                 }
                 for setting in settings.settings {
-                    match setting.identifier {
+                    #[rustfmt::skip]
+                    let _ = match setting.identifier {
                         1 => self.peer_settings.settings_header_table_size = setting.value,
                         2 => self.peer_settings.settings_enable_push = setting.value == 1,
                         3 => self.peer_settings.settings_max_concurrent_streams = setting.value,
                         4 => self.peer_settings.settings_initial_window_size = setting.value,
                         5 => self.peer_settings.settings_max_frame_size = setting.value,
                         6 => self.peer_settings.settings_max_header_list_size = setting.value,
+                        8 => self.peer_settings.settings_enable_connect_protocol = setting.value == 1,
+                        9 => self.peer_settings.settings_no_rfc7540_priorities = setting.value == 1,
                         other => println!("unknown setting_id: {other}, we MUST ignore this"),
-                    }
+                    };
                 }
                 println_!("{:#?}", self.peer_settings);
 

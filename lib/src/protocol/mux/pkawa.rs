@@ -46,6 +46,8 @@ pub fn handle_header<C>(
                         scheme = val;
                     } else if compare_no_case(&k, b"cookie") {
                         todo!("cookies should be split in pairs");
+                    } else if compare_no_case(&k, b"priority") {
+                        unimplemented!();
                     } else {
                         if compare_no_case(&k, b"content-length") {
                             let length =
