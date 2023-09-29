@@ -8,16 +8,18 @@ use crate::{
         Position, StreamState,
     },
     socket::SocketHandler,
+    timer::TimeoutContainer,
     Readiness,
 };
 
 pub struct ConnectionH1<Front: SocketHandler> {
     pub position: Position,
     pub readiness: Readiness,
+    pub requests: usize,
     pub socket: Front,
     /// note: a Server H1 will always reference stream 0, but a client can reference any stream
     pub stream: GlobalStreamId,
-    pub requests: usize,
+    pub timeout_container: TimeoutContainer,
 }
 
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {

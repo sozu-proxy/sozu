@@ -9,6 +9,7 @@ use std::{
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use sozu_command::{proto::command::ListenerType, ready::Ready};
+use time::Duration;
 
 mod converter;
 mod h1;
@@ -28,6 +29,7 @@ use crate::{
     router::Route,
     server::CONN_RETRIES,
     socket::{SocketHandler, SocketResult},
+    timer::TimeoutContainer,
     BackendConnectionError, L7ListenerHandler, L7Proxy, ProxySession, Readiness,
     RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
 };
@@ -177,19 +179,27 @@ pub enum Connection<Front: SocketHandler> {
 }
 
 impl<Front: SocketHandler> Connection<Front> {
-    pub fn new_h1_server(front_stream: Front) -> Connection<Front> {
+    pub fn new_h1_server(
+        front_stream: Front,
+        timeout_container: TimeoutContainer,
+    ) -> Connection<Front> {
         Connection::H1(ConnectionH1 {
-            socket: front_stream,
             position: Position::Server,
             readiness: Readiness {
                 interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
-            stream: 0,
             requests: 0,
+            socket: front_stream,
+            stream: 0,
+            timeout_container,
         })
     }
-    pub fn new_h1_client(front_stream: Front, cluster_id: String) -> Connection<Front> {
+    pub fn new_h1_client(
+        front_stream: Front,
+        cluster_id: String,
+        timeout_container: TimeoutContainer,
+    ) -> Connection<Front> {
         Connection::H1(ConnectionH1 {
             socket: front_stream,
             position: Position::Client(BackendStatus::Connecting(cluster_id)),
@@ -199,12 +209,14 @@ impl<Front: SocketHandler> Connection<Front> {
             },
             stream: 0,
             requests: 0,
+            timeout_container,
         })
     }
 
     pub fn new_h2_server(
         front_stream: Front,
         pool: Weak<RefCell<Pool>>,
+        timeout_container: TimeoutContainer,
     ) -> Option<Connection<Front>> {
         let buffer = pool
             .upgrade()
@@ -226,6 +238,7 @@ impl<Front: SocketHandler> Connection<Front> {
             socket: front_stream,
             state: H2State::ClientPreface,
             streams: HashMap::new(),
+            timeout_container,
             window: 1 << 16,
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
         }))
@@ -234,6 +247,7 @@ impl<Front: SocketHandler> Connection<Front> {
         front_stream: Front,
         cluster_id: String,
         pool: Weak<RefCell<Pool>>,
+        timeout_container: TimeoutContainer,
     ) -> Option<Connection<Front>> {
         let buffer = pool
             .upgrade()
@@ -255,6 +269,7 @@ impl<Front: SocketHandler> Connection<Front> {
             socket: front_stream,
             state: H2State::ClientPreface,
             streams: HashMap::new(),
+            timeout_container,
             window: 1 << 16,
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
         }))
@@ -282,6 +297,12 @@ impl<Front: SocketHandler> Connection<Front> {
         match self {
             Connection::H1(c) => &mut c.position,
             Connection::H2(c) => &mut c.position,
+        }
+    }
+    pub fn timeout_container(&mut self) -> &mut TimeoutContainer {
+        match self {
+            Connection::H1(c) => &mut c.timeout_container,
+            Connection::H2(c) => &mut c.timeout_container,
         }
     }
     pub fn socket(&self) -> &TcpStream {
@@ -594,15 +615,23 @@ impl Context {
 }
 
 pub struct Router {
-    pub listener: Rc<RefCell<dyn L7ListenerHandler>>,
     pub backends: HashMap<Token, Connection<TcpStream>>,
+    pub configured_backend_timeout: Duration,
+    pub configured_connect_timeout: Duration,
+    pub listener: Rc<RefCell<dyn L7ListenerHandler>>,
 }
 
 impl Router {
-    pub fn new(listener: Rc<RefCell<dyn L7ListenerHandler>>) -> Self {
+    pub fn new(
+        configured_backend_timeout: Duration,
+        configured_connect_timeout: Duration,
+        listener: Rc<RefCell<dyn L7ListenerHandler>>,
+    ) -> Self {
         Self {
-            listener,
             backends: HashMap::new(),
+            configured_backend_timeout,
+            configured_connect_timeout,
+            listener,
         }
     }
 
@@ -715,13 +744,19 @@ impl Router {
                 error!("error registering back socket({:?}): {:?}", socket, e);
             }
 
+            let timeout_container = TimeoutContainer::new(self.configured_connect_timeout, token);
             let connection = if h2 {
-                match Connection::new_h2_client(socket, cluster_id, context.pool.clone()) {
+                match Connection::new_h2_client(
+                    socket,
+                    cluster_id,
+                    context.pool.clone(),
+                    timeout_container,
+                ) {
                     Some(connection) => connection,
                     None => return Err(BackendConnectionError::MaxBuffers),
                 }
             } else {
-                Connection::new_h1_client(socket, cluster_id)
+                Connection::new_h1_client(socket, cluster_id, timeout_container)
             };
             self.backends.insert(token, connection);
             token
@@ -842,6 +877,7 @@ impl Router {
 }
 
 pub struct Mux<Front: SocketHandler> {
+    pub configured_frontend_timeout: Duration,
     pub frontend_token: Token,
     pub frontend: Connection<Front>,
     pub router: Router,
@@ -1033,11 +1069,90 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
 
     fn timeout(&mut self, token: Token, _metrics: &mut SessionMetrics) -> StateResult {
         println_!("MuxState::timeout({token:?})");
-        StateResult::CloseSession
+        let front_is_h2 = match self.frontend {
+            Connection::H1(_) => false,
+            Connection::H2(_) => true,
+        };
+        let mut is_to_be_closed = true;
+        if self.frontend_token == token {
+            self.frontend.timeout_container().triggered();
+            let front_readiness = self.frontend.readiness_mut();
+            for stream in &mut self.context.streams {
+                match stream.state {
+                    StreamState::Idle => {
+                        // In h1 an Idle stream is always the first request, so we can send a 408
+                        // In h2 an Idle stream doesn't necessarily hold a request yet,
+                        // in most cases it was just reserved, so we can just ignore them.
+                        if !front_is_h2 {
+                            set_default_answer(stream, front_readiness, 408);
+                            is_to_be_closed = false;
+                        }
+                    }
+                    StreamState::Link => {
+                        // This is an unusual case, as we have both a complete request and no
+                        // available backend yet. For now, we answer with 503
+                        set_default_answer(stream, front_readiness, 503);
+                        is_to_be_closed = false;
+                    }
+                    StreamState::Linked(_) => {
+                        // A stream Linked to a backend is waiting for the response, not the answer.
+                        // For streaming or malformed requests, it is possible that the request is not
+                        // terminated at this point. For now, we do nothing and
+                        is_to_be_closed = false;
+                    }
+                    StreamState::Unlinked => {
+                        // A stream Unlinked already has a response and its backend closed.
+                        // In case it hasn't finished proxying we wait. Otherwise it is a stream
+                        // kept alive for a new request, which can be killed.
+                        if !stream.back.is_completed() {
+                            is_to_be_closed = false;
+                        }
+                    }
+                    StreamState::Recycle => {
+                        // A recycled stream is an h2 stream which doesn't hold a request anymore.
+                        // We can ignore it.
+                    }
+                }
+            }
+        } else if let Some(backend) = self.router.backends.get_mut(&token) {
+            backend.timeout_container().triggered();
+            let front_readiness = self.frontend.readiness_mut();
+            for stream_id in 0..self.context.streams.len() {
+                let stream = &mut self.context.streams[stream_id];
+                if let StreamState::Linked(back_token) = stream.state {
+                    if token == back_token {
+                        // This stream is linked to the backend that timedout.
+                        if stream.back.is_terminated() || stream.back.is_error() {
+                            // Nothing to do, simply wait for the remaining bytes to be proxied
+                            if !stream.back.is_completed() {
+                                is_to_be_closed = false;
+                            }
+                        } else if stream.back.is_initial() {
+                            // The response has not started yet
+                            set_default_answer(stream, front_readiness, 504);
+                            is_to_be_closed = false;
+                        } else {
+                            forcefully_terminate_answer(stream, front_readiness);
+                            is_to_be_closed = false;
+                        }
+                        backend.end_stream(0, &mut self.context);
+                    }
+                }
+            }
+        }
+        if is_to_be_closed {
+            StateResult::CloseSession
+        } else {
+            StateResult::Continue
+        }
     }
 
     fn cancel_timeouts(&mut self) {
         println_!("MuxState::cancel_timeouts");
+        self.frontend.timeout_container().cancel();
+        for backend in self.router.backends.values_mut() {
+            backend.timeout_container().cancel();
+        }
     }
 
     fn print_state(&self, context: &str) {

@@ -13,6 +13,7 @@ use crate::{
         GlobalStreamId, MuxResult, Position, StreamId, StreamState,
     },
     socket::SocketHandler,
+    timer::TimeoutContainer,
     Readiness,
 };
 
@@ -94,6 +95,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub socket: Front,
     pub state: H2State,
     pub streams: HashMap<StreamId, GlobalStreamId>,
+    pub timeout_container: TimeoutContainer,
     pub window: u32,
     pub zero: GenericHttpStream,
 }
