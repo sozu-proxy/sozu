@@ -70,27 +70,21 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             self.readiness.interest.remove(Ready::READABLE);
         }
         if kawa.is_main_phase() {
+            if let StreamState::Linked(token) = stream.state {
+                endpoint
+                    .readiness_mut(token)
+                    .interest
+                    .insert(Ready::WRITABLE)
+            }
             match self.position {
-                Position::Client(_) => {
-                    let StreamState::Linked(token) = stream.state else { unreachable!() };
-                    endpoint
-                        .readiness_mut(token)
-                        .interest
-                        .insert(Ready::WRITABLE)
-                }
                 Position::Server => {
-                    if let StreamState::Linked(token) = stream.state {
-                        endpoint
-                            .readiness_mut(token)
-                            .interest
-                            .insert(Ready::WRITABLE)
-                    }
                     if was_initial {
                         self.requests += 1;
                         println_!("REQUESTS: {}", self.requests);
                         stream.state = StreamState::Link
                     }
                 }
+                Position::Client(_) => {}
             }
         };
         MuxResult::Continue
@@ -177,7 +171,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         MuxResult::Continue
     }
 
-    fn force_disconnect(&mut self) -> MuxResult {
+    pub fn force_disconnect(&mut self) -> MuxResult {
         match self.position {
             Position::Client(_) => {
                 self.position = Position::Client(BackendStatus::Disconnecting);

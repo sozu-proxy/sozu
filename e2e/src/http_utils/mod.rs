@@ -24,8 +24,8 @@ pub fn http_request<S1: Into<String>, S2: Into<String>, S3: Into<String>, S4: In
     )
 }
 
-use std::io::Write;
 use kawa;
+use std::io::Write;
 
 /// the default kawa answer for the error code provided, converted to HTTP/1.1
 pub fn default_answer(code: u16) -> String {
