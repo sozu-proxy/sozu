@@ -535,9 +535,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let kawa = stream.rbuffer(&self.position);
                 slice.start += kawa.storage.head as u32;
                 kawa.storage.head += slice.len();
-                let buffer = kawa.storage.buffer();
-                let payload = slice.data(buffer);
-                println_!("{:?}", unsafe { from_utf8_unchecked(payload) });
                 kawa.push_block(kawa::Block::Chunk(kawa::Chunk {
                     data: kawa::Store::Slice(slice),
                 }));
@@ -550,16 +547,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }));
                     kawa.parsing_phase = kawa::ParsingPhase::Terminated;
                 }
-                match self.position {
-                    Position::Client(_) => {
-                        let StreamState::Linked(token) = stream.state else { unreachable!() };
-                        endpoint
-                            .readiness_mut(token)
-                            .interest
-                            .insert(Ready::WRITABLE)
-                    }
-                    Position::Server => {}
-                };
+                if let StreamState::Linked(token) = stream.state {
+                    endpoint
+                        .readiness_mut(token)
+                        .interest
+                        .insert(Ready::WRITABLE)
+                }
             }
             Frame::Headers(headers) => {
                 if !headers.end_headers {
@@ -572,6 +565,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let buffer = headers.header_block_fragment.data(kawa.storage.buffer());
                 let stream = &mut context.streams[global_stream_id];
                 let parts = &mut stream.split(&self.position);
+                let was_initial = parts.rbuffer.is_initial();
                 pkawa::handle_header(
                     parts.rbuffer,
                     buffer,
@@ -580,16 +574,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     parts.context,
                 );
                 debug_kawa(parts.rbuffer);
-                match self.position {
-                    Position::Client(_) => {
-                        let StreamState::Linked(token) = stream.state else { unreachable!() };
-                        endpoint
-                            .readiness_mut(token)
-                            .interest
-                            .insert(Ready::WRITABLE)
-                    }
-                    Position::Server => stream.state = StreamState::Link,
-                };
+                if let StreamState::Linked(token) = stream.state {
+                    endpoint
+                        .readiness_mut(token)
+                        .interest
+                        .insert(Ready::WRITABLE)
+                }
+                if was_initial {
+                    match self.position {
+                        Position::Server => stream.state = StreamState::Link,
+                        Position::Client(_) => {}
+                    };
+                }
             }
             Frame::PushPromise(push_promise) => match self.position {
                 Position::Client(_) => {
@@ -673,12 +669,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 }
             }
-            Frame::Continuation(_) => todo!(),
+            Frame::Continuation(_) => unreachable!(),
         }
         MuxResult::Continue
     }
 
-    fn force_disconnect(&mut self) -> MuxResult {
+    pub fn force_disconnect(&mut self) -> MuxResult {
         self.state = H2State::Error;
         match self.position {
             Position::Client(_) => {

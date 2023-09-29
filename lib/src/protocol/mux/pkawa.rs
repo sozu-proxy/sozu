@@ -18,6 +18,9 @@ pub fn handle_header<C>(
 ) where
     C: ParserCallbacks<Checkout>,
 {
+    if !kawa.is_initial() {
+        return handle_trailer(kawa, input, end_stream, decoder);
+    }
     kawa.push_block(Block::StatusLine);
     kawa.detached.status_line = match kawa.kind {
         Kind::Request => {
@@ -126,6 +129,7 @@ pub fn handle_header<C>(
 
     if end_stream {
         if let BodySize::Empty = kawa.body_size {
+            kawa.body_size = BodySize::Length(0);
             kawa.push_block(Block::Header(Pair {
                 key: Store::Static(b"Content-Length"),
                 val: Store::Static(b"0"),
@@ -134,21 +138,11 @@ pub fn handle_header<C>(
     }
 
     kawa.push_block(Block::Flags(Flags {
-        end_body: false,
+        end_body: end_stream,
         end_chunk: false,
         end_header: true,
-        end_stream: false,
+        end_stream,
     }));
-
-    if end_stream {
-        kawa.push_block(Block::Flags(Flags {
-            end_body: true,
-            end_chunk: false,
-            end_header: false,
-            end_stream: true,
-        }));
-        kawa.body_size = BodySize::Length(0);
-    }
 
     if kawa.parsing_phase == ParsingPhase::Terminated {
         return;
@@ -158,9 +152,41 @@ pub fn handle_header<C>(
         BodySize::Chunked => ParsingPhase::Chunks { first: true },
         BodySize::Length(0) => ParsingPhase::Terminated,
         BodySize::Length(_) => ParsingPhase::Body,
-        BodySize::Empty => {
-            println!("HTTP is just the worst...");
-            ParsingPhase::Body
-        }
+        BodySize::Empty => ParsingPhase::Chunks { first: true },
     };
+}
+
+pub fn handle_trailer(
+    kawa: &mut GenericHttpStream,
+    input: &[u8],
+    end_stream: bool,
+    decoder: &mut hpack::Decoder,
+) {
+    decoder
+        .decode_with_cb(input, |k, v| {
+            let start = kawa.storage.end as u32;
+            kawa.storage.write_all(&k).unwrap();
+            kawa.storage.write_all(&v).unwrap();
+            let len_key = k.len() as u32;
+            let len_val = v.len() as u32;
+            let key = Store::Slice(Slice {
+                start,
+                len: len_key,
+            });
+            let val = Store::Slice(Slice {
+                start: start + len_key,
+                len: len_val,
+            });
+            kawa.push_block(Block::Header(Pair { key, val }));
+        })
+        .unwrap();
+
+    assert!(end_stream);
+    kawa.push_block(Block::Flags(Flags {
+        end_body: end_stream,
+        end_chunk: false,
+        end_header: true,
+        end_stream,
+    }));
+    kawa.parsing_phase = ParsingPhase::Terminated;
 }
