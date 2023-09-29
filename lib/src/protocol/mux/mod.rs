@@ -207,7 +207,7 @@ impl<Front: SocketHandler> Connection<Front> {
                 interest: Ready::WRITABLE | Ready::READABLE | Ready::HUP | Ready::ERROR,
                 event: Ready::EMPTY,
             },
-            stream: 0,
+            stream: usize::MAX - 1,
             requests: 0,
             timeout_container,
         })
@@ -309,6 +309,12 @@ impl<Front: SocketHandler> Connection<Front> {
         match self {
             Connection::H1(c) => c.socket.socket_ref(),
             Connection::H2(c) => c.socket.socket_ref(),
+        }
+    }
+    fn force_disconnect(&mut self) -> MuxResult {
+        match self {
+            Connection::H1(c) => c.force_disconnect(),
+            Connection::H2(c) => c.force_disconnect(),
         }
     }
     fn readable<E>(&mut self, context: &mut Context, endpoint: E) -> MuxResult
@@ -1075,8 +1081,10 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
             Connection::H1(_) => false,
             Connection::H2(_) => true,
         };
-        let mut is_to_be_closed = true;
+        let mut should_close = true;
+        let mut should_write = false;
         if self.frontend_token == token {
+            println_!("MuxState::timeout_frontend({:#?})", self.frontend);
             self.frontend.timeout_container().triggered();
             let front_readiness = self.frontend.readiness_mut();
             for stream in &mut self.context.streams {
@@ -1087,27 +1095,27 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                         // in most cases it was just reserved, so we can just ignore them.
                         if !front_is_h2 {
                             set_default_answer(stream, front_readiness, 408);
-                            is_to_be_closed = false;
+                            should_write = true;
                         }
                     }
                     StreamState::Link => {
                         // This is an unusual case, as we have both a complete request and no
                         // available backend yet. For now, we answer with 503
                         set_default_answer(stream, front_readiness, 503);
-                        is_to_be_closed = false;
+                        should_write = true;
                     }
                     StreamState::Linked(_) => {
                         // A stream Linked to a backend is waiting for the response, not the answer.
                         // For streaming or malformed requests, it is possible that the request is not
                         // terminated at this point. For now, we do nothing and
-                        is_to_be_closed = false;
+                        should_close = false;
                     }
                     StreamState::Unlinked => {
                         // A stream Unlinked already has a response and its backend closed.
                         // In case it hasn't finished proxying we wait. Otherwise it is a stream
                         // kept alive for a new request, which can be killed.
                         if !stream.back.is_completed() {
-                            is_to_be_closed = false;
+                            should_close = false;
                         }
                     }
                     StreamState::Recycle => {
@@ -1117,6 +1125,7 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                 }
             }
         } else if let Some(backend) = self.router.backends.get_mut(&token) {
+            println_!("MuxState::timeout_backend({:#?})", backend);
             backend.timeout_container().triggered();
             let front_readiness = self.frontend.readiness_mut();
             for stream_id in 0..self.context.streams.len() {
@@ -1125,24 +1134,40 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                     if token == back_token {
                         // This stream is linked to the backend that timedout.
                         if stream.back.is_terminated() || stream.back.is_error() {
+                            println!(
+                                "Stream terminated or in error, do nothing, just wait a bit more"
+                            );
                             // Nothing to do, simply wait for the remaining bytes to be proxied
                             if !stream.back.is_completed() {
-                                is_to_be_closed = false;
+                                should_close = false;
                             }
                         } else if stream.back.is_initial() {
                             // The response has not started yet
+                            println!("Stream still waiting for response, send 504");
                             set_default_answer(stream, front_readiness, 504);
-                            is_to_be_closed = false;
+                            should_write = true;
                         } else {
+                            println!("Stream waiting for end of response, forcefully terminate it");
                             forcefully_terminate_answer(stream, front_readiness);
-                            is_to_be_closed = false;
+                            should_write = true;
                         }
-                        backend.end_stream(0, &mut self.context);
+                        backend.end_stream(stream_id, &mut self.context);
+                        backend.force_disconnect();
                     }
                 }
             }
         }
-        if is_to_be_closed {
+        if should_write {
+            return match self
+                .frontend
+                .writable(&mut self.context, EndpointClient(&mut self.router))
+            {
+                MuxResult::Continue => StateResult::Continue,
+                MuxResult::Upgrade => StateResult::Upgrade,
+                MuxResult::CloseSession => StateResult::CloseSession,
+            };
+        }
+        if should_close {
             StateResult::CloseSession
         } else {
             StateResult::Continue
@@ -1162,11 +1187,19 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
             "\
 {} Session(Mux)
 \tFrontend:
-\t\ttoken: {:?}\treadiness: {:?}",
+\t\ttoken: {:?}\treadiness: {:?}
+\tBackend(s):",
             context,
             self.frontend_token,
             self.frontend.readiness()
         );
+        for (backend_token, backend) in &self.router.backends {
+            error!(
+                "\t\ttoken: {:?}\treadiness: {:?}",
+                backend_token,
+                backend.readiness()
+            )
+        }
     }
 
     fn close(&mut self, _proxy: Rc<RefCell<dyn L7Proxy>>, _metrics: &mut SessionMetrics) {
@@ -1184,9 +1217,10 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                 let out = kawa.as_io_slice();
                 let mut writer = std::io::BufWriter::new(Vec::new());
                 let amount = writer.write_vectored(&out).unwrap();
-                println_!("amount: {amount}\n{}", unsafe {
-                    std::str::from_utf8_unchecked(writer.buffer())
-                });
+                println_!(
+                    "amount: {amount}\n{}",
+                    String::from_utf8_lossy(writer.buffer())
+                );
             }
         }
     }
