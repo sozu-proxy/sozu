@@ -53,7 +53,6 @@ use crate::{
     backends::BackendMap,
     pool::Pool,
     protocol::{
-        h2::Http2,
         http::{
             answers::HttpAnswers,
             parser::{hostname_and_port, Method},
@@ -62,7 +61,7 @@ use crate::{
         mux::{self, Mux},
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
-        Http, Pipe, SessionState,
+        Pipe, SessionState,
     },
     router::{Route, Router},
     server::{ListenToken, SessionManager},
@@ -93,9 +92,9 @@ StateMachineBuilder! {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
         Mux(Mux<FrontRustls>),
-        Http(Http<FrontRustls, HttpsListener>),
+        // Http(Http<FrontRustls, HttpsListener>),
         WebSocket(Pipe<FrontRustls, HttpsListener>),
-        Http2(Http2<FrontRustls>) -> todo!("H2"),
+        // Http2(Http2<FrontRustls>) -> todo!("H2"),
     }
 }
 
@@ -190,9 +189,9 @@ impl HttpsSession {
         let new_state = match self.state.take() {
             HttpsStateMachine::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
             HttpsStateMachine::Handshake(handshake) => self.upgrade_handshake(handshake),
-            HttpsStateMachine::Http(http) => self.upgrade_http(http),
-            HttpsStateMachine::Mux(_) => unimplemented!(),
-            HttpsStateMachine::Http2(_) => self.upgrade_http2(),
+            // HttpsStateMachine::Http(http) => self.upgrade_http(http),
+            HttpsStateMachine::Mux(mux) => self.upgrade_mux(mux),
+            // HttpsStateMachine::Http2(_) => self.upgrade_http2(),
             HttpsStateMachine::WebSocket(wss) => self.upgrade_websocket(wss),
             HttpsStateMachine::FailedUpgrade(_) => unreachable!(),
         };
@@ -289,74 +288,105 @@ impl HttpsSession {
 
         gauge_add!("protocol.tls.handshake", -1);
 
+        let router = mux::Router::new(
+            self.configured_backend_timeout,
+            self.configured_connect_timeout,
+            self.listener.clone(),
+        );
         let mut context = mux::Context::new(self.pool.clone());
         let mut frontend = match alpn {
             AlpnProtocol::Http11 => {
                 context.create_stream(handshake.request_id, 1 << 16)?;
-                mux::Connection::new_h1_server(front_stream)
+                mux::Connection::new_h1_server(front_stream, handshake.container_frontend_timeout)
             }
-            AlpnProtocol::H2 => mux::Connection::new_h2_server(front_stream, self.pool.clone())?,
+            AlpnProtocol::H2 => mux::Connection::new_h2_server(
+                front_stream,
+                self.pool.clone(),
+                handshake.container_frontend_timeout,
+            )?,
         };
         frontend.readiness_mut().event = handshake.frontend_readiness.event;
 
         gauge_add!("protocol.https", 1);
         Some(HttpsStateMachine::Mux(Mux {
+            configured_frontend_timeout: self.configured_frontend_timeout,
             frontend_token: self.frontend_token,
             frontend,
             context,
-            router: mux::Router::new(self.listener.clone()),
+            router,
             public_address: self.public_address,
             peer_address: self.peer_address,
             sticky_name: self.sticky_name.clone(),
         }))
     }
 
-    fn upgrade_http(&self, http: Http<FrontRustls, HttpsListener>) -> Option<HttpsStateMachine> {
-        debug!("https switching to wss");
-        let front_token = self.frontend_token;
-        let back_token = match http.backend_token {
-            Some(back_token) => back_token,
-            None => {
-                warn!(
-                    "Could not upgrade https request on cluster '{:?}' ({:?}) using backend '{:?}' into secure websocket for request '{}'",
-                    http.context.cluster_id, self.frontend_token, http.context.backend_id, http.context.id
-                );
-                return None;
-            }
-        };
-        let ws_context = http.context.websocket_context();
+    fn upgrade_mux(&self, mut mux: Mux<FrontRustls>) -> Option<HttpsStateMachine> {
+        debug!("mux switching to wss");
+        let stream = mux.context.streams.pop().unwrap();
 
-        let mut container_frontend_timeout = http.container_frontend_timeout;
-        let mut container_backend_timeout = http.container_backend_timeout;
+        let (frontend_readiness, frontend_socket, mut container_frontend_timeout) =
+            match mux.frontend {
+                mux::Connection::H1(mux::ConnectionH1 {
+                    readiness,
+                    socket,
+                    timeout_container,
+                    ..
+                }) => (readiness, socket, timeout_container),
+                mux::Connection::H2(_) => {
+                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    return None;
+                }
+            };
+
+        let mux::StreamState::Linked(back_token) = stream.state else {
+            error!("Upgrading stream should be linked to a backend");
+            return None;
+        };
+        let backend = mux.router.backends.remove(&back_token).unwrap();
+        let (cluster_id, backend_readiness, backend_socket, mut container_backend_timeout) =
+            match backend {
+                mux::Connection::H1(mux::ConnectionH1 {
+                    position: mux::Position::Client(mux::BackendStatus::Connected(cluster_id)),
+                    readiness,
+                    socket,
+                    timeout_container,
+                    ..
+                }) => (cluster_id, readiness, socket, timeout_container),
+                mux::Connection::H1(_) => {
+                    error!("The backend disconnected just after upgrade, abort");
+                    return None;
+                }
+                mux::Connection::H2(_) => {
+                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    return None;
+                }
+            };
+
+        let ws_context = stream.context.websocket_context();
+
         container_frontend_timeout.reset();
         container_backend_timeout.reset();
 
-        let backend_buffer = if let ResponseStream::BackendAnswer(kawa) = http.response_stream {
-            kawa.storage.buffer
-        } else {
-            return None;
-        };
-
         let mut pipe = Pipe::new(
-            backend_buffer,
-            http.context.backend_id,
-            http.backend_socket,
-            http.backend,
+            stream.back.storage.buffer,
+            None,
+            Some(backend_socket),
+            None,
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
-            http.context.cluster_id,
-            http.request_stream.storage.buffer,
-            front_token,
-            http.frontend_socket,
+            Some(cluster_id),
+            stream.front.storage.buffer,
+            self.frontend_token,
+            frontend_socket,
             self.listener.clone(),
-            Protocol::HTTP,
-            http.context.id,
-            http.context.session_address,
+            Protocol::HTTPS,
+            stream.context.id,
+            stream.context.session_address,
             ws_context,
         );
 
-        pipe.frontend_readiness.event = http.frontend_readiness.event;
-        pipe.backend_readiness.event = http.backend_readiness.event;
+        pipe.frontend_readiness.event = frontend_readiness.event;
+        pipe.backend_readiness.event = backend_readiness.event;
         pipe.set_back_token(back_token);
 
         gauge_add!("protocol.https", -1);
@@ -364,10 +394,6 @@ impl HttpsSession {
         gauge_add!("http.active_requests", -1);
         gauge_add!("websocket.active_requests", 1);
         Some(HttpsStateMachine::WebSocket(pipe))
-    }
-
-    fn upgrade_http2(&self) -> Option<HttpsStateMachine> {
-        todo!()
     }
 
     fn upgrade_websocket(
@@ -393,23 +419,19 @@ impl ProxySession for HttpsSession {
         match self.state.marker() {
             StateMarker::Expect => gauge_add!("protocol.proxy.expect", -1),
             StateMarker::Handshake => gauge_add!("protocol.tls.handshake", -1),
-            StateMarker::Http => gauge_add!("protocol.https", -1),
             StateMarker::Mux => gauge_add!("protocol.https", -1),
             StateMarker::WebSocket => {
                 gauge_add!("protocol.wss", -1);
                 gauge_add!("websocket.active_requests", -1);
             }
-            StateMarker::Http2 => gauge_add!("protocol.http2", -1),
         }
 
         if self.state.failed() {
             match self.state.marker() {
                 StateMarker::Expect => incr!("https.upgrade.expect.failed"),
                 StateMarker::Handshake => incr!("https.upgrade.handshake.failed"),
-                StateMarker::Http => incr!("https.upgrade.http.failed"),
-                StateMarker::WebSocket => incr!("https.upgrade.wss.failed"),
-                StateMarker::Http2 => incr!("https.upgrade.http2.failed"),
                 StateMarker::Mux => incr!("https.upgrade.mux.failed"),
+                StateMarker::WebSocket => incr!("https.upgrade.wss.failed"),
             }
             return;
         }
