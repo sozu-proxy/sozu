@@ -53,8 +53,7 @@
 //! ```ignore
 //! use sozu_command_lib::{
 //!     channel::Channel,
-//!     request::WorkerRequest,
-//!     response::WorkerResponse,
+//!     proto::command::{WorkerRequest, WorkerResponse},
 //! };
 //!
 //! let (mut command_channel, proxy_channel): (
@@ -167,8 +166,7 @@
 //!
 //! ```ignore
 //! use sozu_command_lib::{
-//!     proto::command::{Request, request::RequestType},
-//!     request::WorkerRequest,
+//!     proto::command::{Request, request::RequestType, WorkerRequest},
 //! };
 //!
 //! command_channel
@@ -227,9 +225,8 @@
 //!     logging::setup_logging,
 //!     proto::command::{
 //!         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
-//!         PathRule, Request, RequestHttpFrontend, RulePosition, SocketAddress,
+//!         PathRule, Request, RequestHttpFrontend, RulePosition, SocketAddress,WorkerRequest,
 //!     },
-//!     request::WorkerRequest,
 //! };
 //!
 //! fn main() -> anyhow::Result<()> {
@@ -361,10 +358,8 @@ use time::{Duration, Instant};
 use tls::CertificateResolverError;
 
 use sozu_command::{
-    proto::command::{Cluster, ListenerType, RequestHttpFrontend},
+    proto::command::{Cluster, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse},
     ready::Ready,
-    request::WorkerRequest,
-    response::WorkerResponse,
     state::ClusterId,
     ObjectKind,
 };

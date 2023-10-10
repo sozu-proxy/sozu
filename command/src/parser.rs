@@ -70,10 +70,7 @@ where
 mod test {
     use super::*;
 
-    use crate::{
-        proto::command::{request::RequestType, Status, SubscribeEvents},
-        request::WorkerRequest,
-    };
+    use crate::proto::command::{request::RequestType, Status, SubscribeEvents, WorkerRequest};
 
     #[test]
     fn parse_one_worker_request() {

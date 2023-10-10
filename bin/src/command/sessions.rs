@@ -6,10 +6,11 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use sozu_command_lib::{
     channel::Channel,
-    proto::command::{Request, Response, ResponseContent, ResponseStatus, RunState, WorkerInfo},
+    proto::command::{
+        Request, Response, ResponseContent, ResponseStatus, RunState, WorkerInfo, WorkerRequest,
+        WorkerResponse,
+    },
     ready::Ready,
-    request::WorkerRequest,
-    response::WorkerResponse,
     scm_socket::ScmSocket,
 };
 

@@ -14,10 +14,8 @@ use sozu_command_lib::{
     logging::setup_logging,
     proto::command::{
         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, RequestHttpFrontend, RulePosition, SocketAddress,
+        PathRule, RequestHttpFrontend, RulePosition, SocketAddress, WorkerRequest, WorkerResponse,
     },
-    request::WorkerRequest,
-    response::WorkerResponse,
 };
 
 fn main() -> anyhow::Result<()> {

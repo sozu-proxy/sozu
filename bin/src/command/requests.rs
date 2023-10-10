@@ -16,9 +16,9 @@ use sozu_command_lib::{
         request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
         CertificatesWithFingerprints, ClusterHashes, ClusterInformations, FrontendFilters,
         HardStop, QueryCertificatesFilters, QueryMetricsOptions, Request, ResponseContent,
-        ResponseStatus, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerResponses,
+        ResponseStatus, RunState, SoftStop, Status, WorkerInfo, WorkerInfos, WorkerRequest,
+        WorkerResponses,
     },
-    request::WorkerRequest,
 };
 use sozu_lib::metrics::METRICS;
 
@@ -388,7 +388,7 @@ impl GatheringTask for LoadStaticConfigTask {
     ) {
         let mut messages = vec![];
         for (worker_id, response) in self.gatherer.responses {
-            match response.status {
+            match ResponseStatus::try_from(response.status).unwrap() {
                 ResponseStatus::Ok => {}
                 ResponseStatus::Failure => {
                     messages.push(format!("worker {worker_id}: {}", response.message))
@@ -468,7 +468,7 @@ impl GatheringTask for WorkerTask {
         let mut messages = vec![];
 
         for (worker_id, response) in self.gatherer.responses {
-            match response.status {
+            match ResponseStatus::try_from(response.status).unwrap() {
                 ResponseStatus::Ok => messages.push(format!("{worker_id}: OK")),
                 ResponseStatus::Failure => {
                     messages.push(format!("{worker_id}: {}", response.message))
@@ -750,7 +750,7 @@ impl GatheringTask for StatusTask {
         _timed_out: bool,
     ) {
         for (worker_id, response) in self.gatherer.responses {
-            let new_run_state = match response.status {
+            let new_run_state = match ResponseStatus::try_from(response.status).unwrap() {
                 ResponseStatus::Ok => RunState::Running,
                 ResponseStatus::Processing => continue,
                 ResponseStatus::Failure => RunState::NotAnswering,

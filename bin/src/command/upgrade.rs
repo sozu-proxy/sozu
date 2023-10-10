@@ -8,8 +8,8 @@ use sozu_command_lib::{
     config::Config,
     proto::command::{
         request::RequestType, ResponseStatus, ReturnListenSockets, RunState, SoftStop,
+        WorkerResponse,
     },
-    response::WorkerResponse,
     state::ConfigState,
 };
 
@@ -236,7 +236,8 @@ impl Gatherer for UpgradeWorkerTask {
         worker_id: WorkerId,
         message: WorkerResponse,
     ) {
-        match message.status {
+        // TODO: there's gotta be a better way than unwrapping here
+        match ResponseStatus::try_from(message.status).unwrap() {
             ResponseStatus::Ok => {
                 self.ok += 1;
                 match self.progress {

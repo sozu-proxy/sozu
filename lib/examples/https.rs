@@ -15,9 +15,8 @@ use sozu_command_lib::{
     logging::setup_logging,
     proto::command::{
         request::RequestType, AddBackend, AddCertificate, CertificateAndKey, LoadBalancingParams,
-        PathRule, RequestHttpFrontend, SocketAddress,
+        PathRule, RequestHttpFrontend, SocketAddress, WorkerRequest,
     },
-    request::WorkerRequest,
 };
 
 fn main() -> anyhow::Result<()> {

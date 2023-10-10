@@ -12,9 +12,8 @@ use sozu_command_lib::{
     logging::setup_logging,
     proto::command::{
         request::RequestType, AddBackend, LoadBalancingParams, RequestTcpFrontend, SocketAddress,
-        TcpListenerConfig,
+        TcpListenerConfig, WorkerRequest,
     },
-    request::WorkerRequest,
 };
 
 fn main() -> anyhow::Result<()> {

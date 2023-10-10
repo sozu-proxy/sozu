@@ -26,12 +26,13 @@ use sozu_command_lib::{
     channel::{Channel, ChannelError},
     config::Config,
     logging::setup_logging_with_config,
+    proto::command::{WorkerRequest, WorkerResponse},
     ready::Ready,
-    request::{read_requests_from_file, RequestError, WorkerRequest},
-    response::WorkerResponse,
+    request::{read_requests_from_file, RequestError},
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
     state::{ConfigState, StateError},
 };
+
 use sozu_lib::{
     metrics::{self, MetricError},
     server::{Server, ServerError as LibServerError},

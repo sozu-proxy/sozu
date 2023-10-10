@@ -22,11 +22,9 @@ use sozu_command_lib::{
     config::Config,
     proto::command::{
         request::RequestType, response_content::ContentType, Request, ResponseContent,
-        ResponseStatus, RunState, Status,
+        ResponseStatus, RunState, Status, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
-    request::WorkerRequest,
-    response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
     state::ConfigState,
 };
@@ -155,7 +153,7 @@ impl Gatherer for DefaultGatherer {
         worker_id: WorkerId,
         message: WorkerResponse,
     ) {
-        match message.status {
+        match ResponseStatus::try_from(message.status).unwrap() {
             ResponseStatus::Ok => self.ok += 1,
             ResponseStatus::Failure => self.errors += 1,
             ResponseStatus::Processing => client.return_processing(format!(

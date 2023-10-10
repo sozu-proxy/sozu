@@ -15,11 +15,11 @@ use crate::{
     proto::{
         command::{
             ip_address, request::RequestType, IpAddress, LoadBalancingAlgorithms, PathRuleKind,
-            Request, RequestHttpFrontend, RulePosition, SocketAddress, Uint128,
+            Request, RequestHttpFrontend, RulePosition, SocketAddress, Uint128, WorkerRequest,
         },
         display::format_request_type,
     },
-    response::{HttpFrontend, MessageId},
+    response::HttpFrontend,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -122,12 +122,14 @@ impl Request {
     }
 }
 
+/*
 /// This is sent only from Sōzu to Sōzu
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Deserialize)]
 pub struct WorkerRequest {
     pub id: MessageId,
     pub content: Request,
 }
+*/
 
 impl WorkerRequest {
     pub fn new(id: String, content: Request) -> Self {

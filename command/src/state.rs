@@ -21,11 +21,10 @@ use crate::{
             HttpsListenerConfig, ListedFrontends, ListenerType, ListenersList, PathRule,
             QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
             ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend, RequestTcpFrontend,
-            SocketAddress, TcpListenerConfig,
+            SocketAddress, TcpListenerConfig, WorkerRequest,
         },
         display::format_request_type,
     },
-    request::WorkerRequest,
     response::{Backend, HttpFrontend, TcpFrontend},
     ObjectKind,
 };
