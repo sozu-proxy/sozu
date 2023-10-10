@@ -40,10 +40,9 @@ use crate::{
         logging,
         proto::command::{
             Event, EventKind, ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig,
+            WorkerRequest, WorkerResponse,
         },
         ready::Ready,
-        request::WorkerRequest,
-        response::WorkerResponse,
         scm_socket::ScmSocket,
         state::ClusterId,
     },

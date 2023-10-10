@@ -22,11 +22,10 @@ use sozu_command::{
     logging,
     proto::command::{
         request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,
-        RequestHttpFrontend,
+        RequestHttpFrontend, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
-    request::WorkerRequest,
-    response::{HttpFrontend, WorkerResponse},
+    response::HttpFrontend,
     scm_socket::{Listeners, ScmSocket},
     state::ClusterId,
 };
@@ -1101,8 +1100,9 @@ mod tests {
     use crate::sozu_command::{
         channel::Channel,
         config::ListenerBuilder,
-        proto::command::{LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RulePosition},
-        request::WorkerRequest,
+        proto::command::{
+            LoadBalancingAlgorithms, LoadBalancingParams, PathRule, RulePosition, WorkerRequest,
+        },
         response::{Backend, HttpFrontend},
     };
 

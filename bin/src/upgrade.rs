@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use tempfile::tempfile;
 
 use sozu_command_lib::{
-    channel::Channel, config::Config, proto::command::RunState, request::WorkerRequest,
+    channel::Channel,
+    config::Config,
+    proto::command::{RunState, WorkerRequest},
     state::ConfigState,
 };
 

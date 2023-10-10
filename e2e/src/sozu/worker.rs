@@ -19,10 +19,8 @@ use sozu_command::{
     proto::command::{
         request::RequestType, AddBackend, Cluster, HardStop, LoadBalancingParams, PathRule,
         Request, RequestHttpFrontend, RequestTcpFrontend, ReturnListenSockets, RulePosition,
-        SoftStop,
+        SoftStop, WorkerRequest, WorkerResponse,
     },
-    request::WorkerRequest,
-    response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };

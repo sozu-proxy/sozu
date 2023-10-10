@@ -593,8 +593,24 @@ message Percentiles {
     required uint64 p_99_99 = 6;
     required uint64 p_99_999 = 7;
     required uint64 p_100 = 8;
+    required uint64 sum = 9;
 }
 
 message RequestCounts {
     map<string, int32> map = 1;
+}
+
+// This is sent only from Sōzu to Sōzu
+message WorkerRequest {
+    required string id = 1;
+    required Request content = 2;
+}
+
+// A response as sent by a worker
+message WorkerResponse {
+    required string id = 1;
+    required ResponseStatus status = 2;
+    // an associated message to detail failure, success or processing
+    required string message = 3;
+    optional ResponseContent content = 4;
 }

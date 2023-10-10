@@ -1817,6 +1817,7 @@ dependencies = [
  "num_cpus",
  "paw",
  "prettytable-rs",
+ "prost",
  "rand",
  "regex",
  "serde",

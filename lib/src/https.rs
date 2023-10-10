@@ -36,11 +36,10 @@ use sozu_command::{
         request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
         CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
         ListenerType, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        ResponseContent, TlsVersion,
+        ResponseContent, TlsVersion, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
-    request::WorkerRequest,
-    response::{HttpFrontend, WorkerResponse},
+    response::HttpFrontend,
     scm_socket::ScmSocket,
     state::ClusterId,
 };

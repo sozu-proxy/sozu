@@ -85,6 +85,7 @@ impl AggregatedMetric {
 }
 
 pub fn histogram_to_percentiles(hist: &Histogram<u32>) -> Percentiles {
+    let sum = hist.len() as f64 * hist.mean();
     Percentiles {
         samples: hist.len(),
         p_50: hist.value_at_percentile(50.0),
@@ -94,6 +95,7 @@ pub fn histogram_to_percentiles(hist: &Histogram<u32>) -> Percentiles {
         p_99_99: hist.value_at_percentile(99.99),
         p_99_999: hist.value_at_percentile(99.999),
         p_100: hist.value_at_percentile(100.0),
+        sum: sum as u64,
     }
 }
 

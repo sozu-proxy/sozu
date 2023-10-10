@@ -23,11 +23,9 @@ use sozu_command::{
         CertificatesWithFingerprints, Cluster, ClusterHashes, ClusterInformations,
         DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, ListenerType,
         LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, ResponseStatus,
-        TcpListenerConfig as CommandTcpListener,
+        TcpListenerConfig as CommandTcpListener, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
-    request::WorkerRequest,
-    response::{MessageId, WorkerResponse},
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
@@ -67,7 +65,7 @@ pub fn push_event(event: Event) {
         (*queue.borrow_mut()).push_back(WorkerResponse {
             id: "EVENT".to_string(),
             message: String::new(),
-            status: ResponseStatus::Processing,
+            status: ResponseStatus::Processing.into(),
             content: Some(ContentType::Event(event).into()),
         });
     });
@@ -259,7 +257,7 @@ pub struct Server {
     scm: ScmSocket,
     sessions: Rc<RefCell<SessionManager>>,
     should_poll_at: Option<Instant>,
-    shutting_down: Option<MessageId>,
+    shutting_down: Option<String>,
     tcp: Rc<RefCell<tcp::TcpProxy>>,
     zombie_check_interval: Duration,
 }
@@ -904,7 +902,7 @@ impl Server {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
                     ContentType::Clusters(ClusterInformations {
-                        vec: vec![self.config_state.cluster_state(cluster_id)],
+                        vec: vec![self.config_state.cluster_state(&cluster_id)],
                     })
                     .into(),
                 ));

@@ -33,10 +33,8 @@ use sozu_command_lib::{
     config::Config,
     proto::command::{
         request::RequestType, response_content::ContentType, MetricsConfiguration, Request,
-        Response, ResponseContent, ResponseStatus, RunState, Status,
+        Response, ResponseContent, ResponseStatus, RunState, Status, WorkerRequest, WorkerResponse,
     },
-    request::WorkerRequest,
-    response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
@@ -554,15 +552,15 @@ impl CommandServer {
 
             let mut i = 0;
             while let Some((proxy_response, _)) = rx.next().await {
-                match proxy_response.status {
-                    ResponseStatus::Ok => {
+                match ResponseStatus::try_from(proxy_response.status) {
+                    Ok(ResponseStatus::Ok) => {
                         ok += 1;
                     }
-                    ResponseStatus::Processing => {
+                    Ok(ResponseStatus::Processing) => {
                         //info!("metrics processing");
                         continue;
                     }
-                    ResponseStatus::Failure => {
+                    Ok(ResponseStatus::Failure) | Err(_) => {
                         error!(
                             "error handling configuration message {}: {}",
                             proxy_response.id, proxy_response.message
@@ -760,8 +758,8 @@ impl CommandServer {
 
                 // if a worker returned Ok or Error, we're not expecting any more
                 // messages with this id from it
-                match response.status {
-                    ResponseStatus::Ok | ResponseStatus::Failure => {
+                match ResponseStatus::try_from(response.status) {
+                    Ok(ResponseStatus::Ok) | Ok(ResponseStatus::Failure) => {
                         expected_responses -= 1;
                     }
                     _ => {}
@@ -947,6 +945,8 @@ async fn client_loop(
     smol::spawn(async move {
         while let Some(response) = client_rx.next().await {
             trace!("sending back message to client: {:?}", response);
+
+            // let mut message: Vec<u8> = response.encode_to_vec();
             let mut message: Vec<u8> = serde_json::to_string(&response)
                 .map(|string| string.into_bytes())
                 .unwrap_or_else(|_| Vec::new());
@@ -971,6 +971,7 @@ async fn client_loop(
             Ok(msg) => msg,
         };
 
+        // match Message::decode::<&[u8]>(&message) {
         match serde_json::from_slice::<Request>(&message) {
             Err(e) => {
                 error!("could not decode client message: {:?}", e);
@@ -1019,6 +1020,7 @@ async fn worker_loop(
         debug!("will start sending messages to worker {}", worker_id);
         while let Some(worker_request) = worker_rx.next().await {
             debug!("sending to worker {}: {:?}", worker_id, worker_request);
+            // let mut message: Vec<u8> = worker_request.encode_to_vec();
             let mut message: Vec<u8> = serde_json::to_string(&worker_request)
                 .map(|string| string.into_bytes())
                 .unwrap_or_else(|_| Vec::new());
@@ -1043,6 +1045,7 @@ async fn worker_loop(
             Ok(msg) => msg,
         };
 
+        // match Message::decode::<&[u8]>(&message) {
         match serde_json::from_slice::<WorkerResponse>(&message) {
             Err(e) => {
                 error!("could not decode worker message: {:?}", e);

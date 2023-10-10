@@ -4,7 +4,7 @@ use crate::{
     proto::command::{
         AddBackend, FilteredTimeSerie, LoadBalancingParams, PathRule, PathRuleKind,
         RequestHttpFrontend, RequestTcpFrontend, Response, ResponseContent, ResponseStatus,
-        RulePosition, RunState,
+        RulePosition, RunState, WorkerResponse,
     },
     state::ClusterId,
 };
@@ -224,15 +224,6 @@ struct StatePath {
 
 pub type MessageId = String;
 
-/// A response as sent by a worker
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerResponse {
-    pub id: MessageId,
-    pub status: ResponseStatus,
-    pub message: String,
-    pub content: Option<ResponseContent>,
-}
-
 impl WorkerResponse {
     pub fn ok<T>(id: T) -> Self
     where
@@ -241,7 +232,7 @@ impl WorkerResponse {
         Self {
             id: id.to_string(),
             message: String::new(),
-            status: ResponseStatus::Ok,
+            status: ResponseStatus::Ok.into(),
             content: None,
         }
     }
@@ -252,7 +243,7 @@ impl WorkerResponse {
     {
         Self {
             id: id.to_string(),
-            status: ResponseStatus::Ok,
+            status: ResponseStatus::Ok.into(),
             message: String::new(),
             content: Some(content),
         }
@@ -266,7 +257,7 @@ impl WorkerResponse {
         Self {
             id: id.to_string(),
             message: error.to_string(),
-            status: ResponseStatus::Failure,
+            status: ResponseStatus::Failure.into(),
             content: None,
         }
     }
@@ -278,19 +269,19 @@ impl WorkerResponse {
         Self {
             id: id.to_string(),
             message: String::new(),
-            status: ResponseStatus::Processing,
+            status: ResponseStatus::Processing.into(),
             content: None,
         }
     }
 
-    pub fn status<T>(id: T, status: ResponseStatus) -> Self
+    pub fn with_status<T>(id: T, status: ResponseStatus) -> Self
     where
         T: ToString,
     {
         Self {
             id: id.to_string(),
             message: String::new(),
-            status,
+            status: status.into(),
             content: None,
         }
     }

@@ -66,8 +66,8 @@ use crate::{
         Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
         LoadBalancingParams, LoadMetric, PathRule, ProxyProtocolConfig, Request,
         RequestHttpFrontend, RequestTcpFrontend, RulePosition, TcpListenerConfig, TlsVersion,
+        WorkerRequest,
     },
-    request::WorkerRequest,
     ObjectKind,
 };
 
@@ -715,7 +715,7 @@ impl FileClusterFrontendConfig {
             }
         };
 
-        let chain_opt = match self.certificate_chain.as_ref() {
+        let certificate_chain = match self.certificate_chain.as_ref() {
             None => None,
             Some(path) => {
                 let certificate_chain = Config::load_file(path)?;
@@ -736,7 +736,7 @@ impl FileClusterFrontendConfig {
             hostname,
             certificate: certificate_opt,
             key: key_opt,
-            certificate_chain: chain_opt,
+            certificate_chain,
             tls_versions: self.tls_versions.clone(),
             position: self.position,
             path,

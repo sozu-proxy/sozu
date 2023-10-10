@@ -8,9 +8,9 @@ use std::{
 use crate::{
     proto::command::{
         request::RequestType, LoadBalancingAlgorithms, PathRuleKind, Request, RequestHttpFrontend,
-        RulePosition,
+        RulePosition, WorkerRequest,
     },
-    response::{HttpFrontend, MessageId},
+    response::HttpFrontend,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -104,12 +104,14 @@ impl Request {
     }
 }
 
+/*
 /// This is sent only from Sōzu to Sōzu
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Deserialize)]
 pub struct WorkerRequest {
     pub id: MessageId,
     pub content: Request,
 }
+*/
 
 impl WorkerRequest {
     pub fn new(id: String, content: Request) -> Self {

@@ -30,10 +30,10 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     logging::target_to_backend,
-    proto::command::{request::RequestType, Request, RunState, Status, WorkerInfo},
+    proto::command::{
+        request::RequestType, Request, RunState, Status, WorkerInfo, WorkerRequest, WorkerResponse,
+    },
     ready::Ready,
-    request::WorkerRequest,
-    response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
 };
