@@ -1370,6 +1370,46 @@ fn try_max_connections() -> State {
     State::Success
 }
 
+pub fn try_head() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test("SYNC", config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+
+    let head_response = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n";
+    backend.connect();
+    backend.set_response(head_response);
+
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request("HEAD", "/api", format!("ping"), "localhost"),
+    );
+
+    client.connect();
+    for i in 0..2 {
+        client.send();
+        if i == 0 {
+            backend.accept(0);
+        }
+        let request = backend.receive(0);
+        println!("request: {request:?}");
+        assert!(request.is_some());
+        backend.send(0);
+        let response = client.receive();
+        println!("response: {response:?}");
+        assert!(response.is_some());
+        assert!(response.unwrap().ends_with("\r\n\r\n"))
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+
 #[test]
 fn test_sync() {
     assert_eq!(try_sync(10, 100), State::Success);
@@ -1529,6 +1569,14 @@ fn test_stick() {
 fn test_max_connections() {
     assert_eq!(
         repeat_until_error_or(2, "Max connections reached", try_max_connections),
+        State::Success
+    );
+}
+
+#[test]
+fn test_head() {
+    assert_eq!(
+        repeat_until_error_or(10, "Head request", try_head),
         State::Success
     );
 }

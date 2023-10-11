@@ -276,6 +276,10 @@ impl HttpContext {
                 .map(ToOwned::to_owned);
         }
 
+        if self.method == Some(Method::Head) {
+            response.parsing_phase = kawa::ParsingPhase::Terminated;
+        }
+
         // If found:
         // - set Connection to "close" if closing is set
         // - set keep_alive_backend to false if Connection is "close"
