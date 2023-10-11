@@ -124,6 +124,8 @@ impl HttpContext {
         // - store User-Agent
         let mut x_for = None;
         let mut forwarded = None;
+        let mut has_x_port = false;
+        let mut has_x_proto = false;
         let mut has_connection = false;
         for block in &mut request.blocks {
             match block {
@@ -138,8 +140,10 @@ impl HttpContext {
                             self.keep_alive_frontend &= !compare_no_case(val, b"close");
                         }
                     } else if compare_no_case(key, b"X-Forwarded-Proto") {
+                        has_x_proto = true;
                         header.val = kawa::Store::Static(proto.as_bytes());
                     } else if compare_no_case(key, b"X-Forwarded-Port") {
+                        has_x_port = true;
                         header.val = kawa::Store::from_string(public_port.to_string());
                     } else if compare_no_case(key, b"X-Forwarded-For") {
                         x_for = Some(header);
@@ -204,6 +208,12 @@ impl HttpContext {
                     val: kawa::Store::from_string(peer_ip.to_string()),
                 }));
             }
+            if !has_x_port {
+                request.push_block(kawa::Block::Header(kawa::Pair {
+                    key: kawa::Store::Static(b"X-Forwarded-Port"),
+                    val: kawa::Store::from_string(peer_port.to_string()),
+                }));
+            }
             if !has_forwarded {
                 let value = match (peer_ip, public_ip) {
                     (IpAddr::V4(_), IpAddr::V4(_)) => {
@@ -224,6 +234,12 @@ impl HttpContext {
                     val: kawa::Store::from_string(value),
                 }));
             }
+        }
+        if !has_x_proto {
+            request.push_block(kawa::Block::Header(kawa::Pair {
+                key: kawa::Store::Static(b"X-Forwarded-Proto"),
+                val: kawa::Store::Static(proto.as_bytes()),
+            }));
         }
 
         // Create a "Connection" header in case it was not found and closing it set
@@ -258,6 +274,10 @@ impl HttpContext {
                 .data_opt(buf)
                 .and_then(|data| from_utf8(data).ok())
                 .map(ToOwned::to_owned);
+        }
+
+        if self.method == Some(Method::Head) {
+            response.parsing_phase = kawa::ParsingPhase::Terminated;
         }
 
         // If found:
