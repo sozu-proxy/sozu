@@ -1116,8 +1116,9 @@ pub mod testing {
     pub use mio::{net::UnixStream, Poll, Registry, Token};
     pub use slab::Slab;
     pub use sozu_command::{
-        config::ServerConfig,
-        proto::command::{HttpListenerConfig, HttpsListenerConfig, TcpListenerConfig},
+        proto::command::{
+            HttpListenerConfig, HttpsListenerConfig, ServerConfig, TcpListenerConfig,
+        },
         scm_socket::{Listeners, ScmSocket},
     };
 
@@ -1153,7 +1154,7 @@ pub mod testing {
         let event_loop = Poll::new().with_context(|| "Failed at creating event loop")?;
         let backends = Rc::new(RefCell::new(BackendMap::new()));
         let server_config = ServerConfig {
-            max_connections: max_buffers,
+            max_connections: max_buffers as u64,
             ..Default::default()
         };
 

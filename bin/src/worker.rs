@@ -25,9 +25,9 @@ use tempfile::tempfile;
 
 use sozu_command_lib::{
     channel::{Channel, ChannelError},
-    config::{Config, ServerConfig},
-    logging::{setup_logging, setup_logging_with_config},
-    proto::command::{WorkerRequest, WorkerResponse},
+    config::Config,
+    logging::setup_logging,
+    proto::command::{ServerConfig, WorkerRequest, WorkerResponse},
     ready::Ready,
     request::{read_requests_from_file, RequestError},
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -232,8 +232,8 @@ pub fn fork_main_into_worker(
 
     let mut main_to_worker_channel: Channel<ServerConfig, WorkerResponse> = Channel::new(
         main_to_worker,
-        worker_config.command_buffer_size,
-        worker_config.max_command_buffer_size,
+        worker_config.command_buffer_size as usize,
+        worker_config.max_command_buffer_size as usize,
     );
 
     // DISCUSS: should we really block the channel just to write on it?

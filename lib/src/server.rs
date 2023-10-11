@@ -17,13 +17,13 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     channel::Channel,
-    config::ServerConfig,
     proto::command::{
         request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
         CertificatesWithFingerprints, Cluster, ClusterHashes, ClusterInformations,
         DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, ListenerType,
         LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, Request,
-        ResponseStatus, TcpListenerConfig as CommandTcpListener, WorkerRequest, WorkerResponse,
+        ResponseStatus, ServerConfig, TcpListenerConfig as CommandTcpListener, WorkerRequest,
+        WorkerResponse,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -248,17 +248,17 @@ impl Server {
     ) -> Result<Self, ServerError> {
         let event_loop = Poll::new().map_err(ServerError::CreatePoll)?;
         let pool = Rc::new(RefCell::new(Pool::with_capacity(
-            config.min_buffers,
-            config.max_buffers,
-            config.buffer_size,
+            config.min_buffers as usize,
+            config.max_buffers as usize,
+            config.buffer_size as usize,
         )));
         let backends = Rc::new(RefCell::new(BackendMap::new()));
 
         //FIXME: we will use a few entries for the channel, metrics socket and the listeners
         //FIXME: for HTTP/2, we will have more than 2 entries per session
         let sessions: Rc<RefCell<SessionManager>> = SessionManager::new(
-            Slab::with_capacity(config.slab_capacity()),
-            config.max_connections,
+            Slab::with_capacity(config.slab_capacity() as usize),
+            config.max_connections as usize,
         );
         {
             let mut s = sessions.borrow_mut();
