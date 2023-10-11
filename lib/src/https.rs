@@ -31,13 +31,13 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     certificate::Fingerprint,
-    config::{ServerConfig, DEFAULT_CIPHER_SUITES},
+    config::DEFAULT_CIPHER_SUITES,
     logging,
     proto::command::{
         request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
         CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
         ListenerType, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        ResponseContent, TlsVersion, WorkerRequest, WorkerResponse,
+        ResponseContent, ServerConfig, TlsVersion, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
     response::HttpFrontend,
@@ -1557,7 +1557,7 @@ pub fn start_https_worker(
         let (scm_server, _scm_client) =
             UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
         let server_config = ServerConfig {
-            max_connections: max_buffers,
+            max_connections: max_buffers as u64,
             ..Default::default()
         };
         let mut server = Server::new(

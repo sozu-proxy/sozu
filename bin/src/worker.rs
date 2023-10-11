@@ -29,10 +29,11 @@ use tempfile::tempfile;
 use sozu::{metrics, server::Server};
 use sozu_command_lib::{
     channel::Channel,
-    config::{Config, ServerConfig},
+    config::Config,
     logging::target_to_backend,
     proto::command::{
-        request::RequestType, Request, RunState, Status, WorkerInfo, WorkerRequest, WorkerResponse,
+        request::RequestType, Request, RunState, ServerConfig, Status, WorkerInfo, WorkerRequest,
+        WorkerResponse,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket},
@@ -328,8 +329,8 @@ pub fn fork_main_into_worker(
 
     let mut main_to_worker_channel: Channel<ServerConfig, WorkerResponse> = Channel::new(
         main_to_worker,
-        worker_config.command_buffer_size,
-        worker_config.max_command_buffer_size,
+        worker_config.command_buffer_size as usize,
+        worker_config.max_command_buffer_size as usize,
     );
 
     // DISCUSS: should we really block the channel just to write on it?

@@ -7,8 +7,8 @@ use std::{
 };
 
 use sozu_command_lib::{
-    config::{ListenerBuilder, ServerConfig},
-    proto::command::{request::RequestType, ActivateListener, ListenerType, Request},
+    config::ListenerBuilder,
+    proto::command::{request::RequestType, ActivateListener, ListenerType, Request, ServerConfig},
     scm_socket::Listeners,
     state::ConfigState,
 };

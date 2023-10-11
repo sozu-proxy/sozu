@@ -18,7 +18,10 @@ use rusty_ulid::Ulid;
 use slab::Slab;
 use time::{Duration, Instant};
 
-use sozu_command::{config::ServerConfig, proto::command::request::RequestType, ObjectKind};
+use sozu_command::{
+    proto::command::{request::RequestType, ServerConfig},
+    ObjectKind,
+};
 
 use crate::{
     backends::{Backend, BackendMap},
@@ -1584,7 +1587,7 @@ pub fn start_tcp_worker(
     let scm_socket =
         ScmSocket::new(scm_server.as_raw_fd()).with_context(|| "Could not create scm socket")?;
     let server_config = ServerConfig {
-        max_connections: max_buffers,
+        max_connections: max_buffers as u64,
         ..Default::default()
     };
 
@@ -1819,7 +1822,7 @@ mod tests {
                 .unwrap();
 
             let server_config = ServerConfig {
-                max_connections,
+                max_connections: max_connections as u64,
                 ..Default::default()
             };
             let mut server = Server::new(

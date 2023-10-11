@@ -65,8 +65,8 @@ use crate::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
         Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
         LoadBalancingParams, LoadMetric, PathRule, ProxyProtocolConfig, Request,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, TcpListenerConfig, TlsVersion,
-        WorkerRequest,
+        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
+        TcpListenerConfig, TlsVersion, WorkerRequest,
     },
     ObjectKind,
 };
@@ -1740,33 +1740,6 @@ fn display_toml_error(file: &str, error: &toml::de::Error) {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerMetricsConfig {
-    pub address: String,
-    pub tagged_metrics: bool,
-    pub prefix: Option<String>,
-}
-
-/// Used by a worker to start its server loop
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerConfig {
-    pub max_connections: usize,
-    pub front_timeout: u32,
-    pub back_timeout: u32,
-    pub connect_timeout: u32,
-    pub zombie_check_interval: u32,
-    pub accept_queue_timeout: u32,
-    pub min_buffers: usize,
-    pub max_buffers: usize,
-    pub buffer_size: usize,
-    pub log_level: String,
-    pub log_target: String,
-    pub log_access_target: Option<String>,
-    pub command_buffer_size: usize,
-    pub max_command_buffer_size: usize,
-    pub metrics: Option<ServerMetricsConfig>,
-}
-
 impl ServerConfig {
     /// reduce the config to the bare minimum needed by a worker
     pub fn from_config(config: &Config) -> ServerConfig {
@@ -1778,49 +1751,27 @@ impl ServerConfig {
             })
         });
         ServerConfig {
-            max_connections: config.max_connections,
+            max_connections: config.max_connections as u64,
             front_timeout: config.front_timeout,
             back_timeout: config.back_timeout,
             connect_timeout: config.connect_timeout,
             zombie_check_interval: config.zombie_check_interval,
             accept_queue_timeout: config.accept_queue_timeout,
-            min_buffers: config.min_buffers,
-            max_buffers: config.max_buffers,
-            buffer_size: config.buffer_size,
+            min_buffers: config.min_buffers as u64,
+            max_buffers: config.max_buffers as u64,
+            buffer_size: config.buffer_size as u64,
             log_level: config.log_level.clone(),
             log_target: config.log_target.clone(),
             log_access_target: config.log_access_target.clone(),
-            command_buffer_size: config.command_buffer_size,
-            max_command_buffer_size: config.max_command_buffer_size,
+            command_buffer_size: config.command_buffer_size as u64,
+            max_command_buffer_size: config.max_command_buffer_size as u64,
             metrics,
         }
     }
 
     /// size of the slab for the Session manager
-    pub fn slab_capacity(&self) -> usize {
+    pub fn slab_capacity(&self) -> u64 {
         10 + 2 * self.max_connections
-    }
-}
-
-impl Default for ServerConfig {
-    fn default() -> ServerConfig {
-        ServerConfig {
-            max_connections: DEFAULT_MAX_CONNECTIONS,
-            front_timeout: DEFAULT_FRONT_TIMEOUT,
-            back_timeout: DEFAULT_BACK_TIMEOUT,
-            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            zombie_check_interval: DEFAULT_ZOMBIE_CHECK_INTERVAL,
-            accept_queue_timeout: DEFAULT_ACCEPT_QUEUE_TIMEOUT,
-            min_buffers: DEFAULT_MIN_BUFFERS,
-            max_buffers: DEFAULT_MAX_BUFFERS,
-            buffer_size: DEFAULT_BUFFER_SIZE,
-            log_level: "info".to_string(),
-            log_target: "stdout".to_string(),
-            log_access_target: None,
-            command_buffer_size: DEFAULT_COMMAND_BUFFER_SIZE,
-            max_command_buffer_size: DEFAULT_MAX_COMMAND_BUFFER_SIZE,
-            metrics: None,
-        }
     }
 }
 

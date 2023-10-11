@@ -19,11 +19,10 @@ use slab::Slab;
 use time::{Duration, Instant};
 
 use sozu_command::{
-    config::ServerConfig,
     logging,
     proto::command::{
         request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,
-        RequestHttpFrontend, WorkerRequest, WorkerResponse,
+        RequestHttpFrontend, ServerConfig, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
     response::HttpFrontend,
@@ -1065,7 +1064,7 @@ pub fn start_http_worker(
     }
 
     let server_config = ServerConfig {
-        max_connections: max_buffers,
+        max_connections: max_buffers as u64,
         ..Default::default()
     };
 

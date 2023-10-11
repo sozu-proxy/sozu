@@ -614,3 +614,30 @@ message WorkerResponse {
     required string message = 3;
     optional ResponseContent content = 4;
 }
+
+// intended to workers
+message ServerMetricsConfig {
+    required string address = 1;
+    required bool tagged_metrics = 2;
+    optional string prefix = 3;
+}
+
+// Used by a worker to start its server loop.
+// The defaults should match those of the config module
+message ServerConfig {
+    required uint64 max_connections = 1 [default = 10000];
+    required uint32 front_timeout = 2 [default = 60];
+    required uint32 back_timeout = 3 [default = 30];
+    required uint32 connect_timeout = 4 [default = 3];
+    required uint32 zombie_check_interval = 5 [default = 1800];
+    required uint32 accept_queue_timeout = 6 [default = 60];
+    required uint64 min_buffers = 7 [default = 1];
+    required uint64 max_buffers = 8 [default = 1000];
+    required uint64 buffer_size = 9 [default = 16393];
+    required string log_level = 10 [default = "info"];
+    required string log_target = 11 [default = "stdout"];
+    optional string log_access_target = 12;
+    required uint64 command_buffer_size = 13 [default = 1000000];
+    required uint64 max_command_buffer_size = 14 [default = 2000000];
+    optional ServerMetricsConfig metrics = 15;
+}
