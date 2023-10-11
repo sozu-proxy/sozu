@@ -74,12 +74,12 @@ pub enum SubCmd {
             help = "Worker's channel buffer size",
             default_value = "1000000"
         )]
-        command_buffer_size: usize,
+        command_buffer_size: u64,
         #[clap(
             long = "max-command-buffer-size",
             help = "Worker's channel max buffer size"
         )]
-        max_command_buffer_size: Option<usize>,
+        max_command_buffer_size: Option<u64>,
     },
     #[clap(
         name = "main",
@@ -95,12 +95,12 @@ pub enum SubCmd {
             help = "Main process channel buffer size",
             default_value = "1000000"
         )]
-        command_buffer_size: usize,
+        command_buffer_size: u64,
         #[clap(
             long = "max-command-buffer-size",
             help = "Main process channel max buffer size"
         )]
-        max_command_buffer_size: Option<usize>,
+        max_command_buffer_size: Option<u64>,
     },
 
     // sozu command line

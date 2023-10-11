@@ -144,22 +144,22 @@ pub const DEFAULT_WORKER_AUTOMATIC_RESTART: bool = true;
 pub const DEFAULT_AUTOMATIC_STATE_SAVE: bool = false;
 
 /// minimum number of buffers (1)
-pub const DEFAULT_MIN_BUFFERS: usize = 1;
+pub const DEFAULT_MIN_BUFFERS: u64 = 1;
 
 /// maximum number of buffers (1 000)
-pub const DEFAULT_MAX_BUFFERS: usize = 1_000;
+pub const DEFAULT_MAX_BUFFERS: u64 = 1_000;
 
 /// size of the buffers, in bytes (16 KB)
-pub const DEFAULT_BUFFER_SIZE: usize = 16_393;
+pub const DEFAULT_BUFFER_SIZE: u64 = 16_393;
 
 /// maximum number of simultaneous connections (10 000)
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
 /// size of the buffer for the channels, in bytes. Must be bigger than the size of the data received. (1 MB)
-pub const DEFAULT_COMMAND_BUFFER_SIZE: usize = 1_000_000;
+pub const DEFAULT_COMMAND_BUFFER_SIZE: u64 = 1_000_000;
 
 /// maximum size of the buffer for the channels, in bytes. (2 MB)
-pub const DEFAULT_MAX_COMMAND_BUFFER_SIZE: usize = 2_000_000;
+pub const DEFAULT_MAX_COMMAND_BUFFER_SIZE: u64 = 2_000_000;
 
 /// wether to avoid register cluster metrics in the local drain
 pub const DEFAULT_DISABLE_CLUSTER_METRICS: bool = false;
@@ -1077,12 +1077,12 @@ impl ClusterConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct FileConfig {
     pub command_socket: Option<String>,
-    pub command_buffer_size: Option<usize>,
-    pub max_command_buffer_size: Option<usize>,
+    pub command_buffer_size: Option<u64>,
+    pub max_command_buffer_size: Option<u64>,
     pub max_connections: Option<usize>,
-    pub min_buffers: Option<usize>,
-    pub max_buffers: Option<usize>,
-    pub buffer_size: Option<usize>,
+    pub min_buffers: Option<u64>,
+    pub max_buffers: Option<u64>,
+    pub buffer_size: Option<u64>,
     pub saved_state: Option<String>,
     #[serde(default)]
     pub automatic_state_save: Option<bool>,
@@ -1434,12 +1434,12 @@ impl ConfigBuilder {
 pub struct Config {
     pub config_path: String,
     pub command_socket: String,
-    pub command_buffer_size: usize,
-    pub max_command_buffer_size: usize,
+    pub command_buffer_size: u64,
+    pub max_command_buffer_size: u64,
     pub max_connections: usize,
-    pub min_buffers: usize,
-    pub max_buffers: usize,
-    pub buffer_size: usize,
+    pub min_buffers: u64,
+    pub max_buffers: u64,
+    pub buffer_size: u64,
     pub saved_state: Option<String>,
     #[serde(default)]
     pub automatic_state_save: bool,
@@ -1763,14 +1763,14 @@ impl ServerConfig {
             connect_timeout: config.connect_timeout,
             zombie_check_interval: config.zombie_check_interval,
             accept_queue_timeout: config.accept_queue_timeout,
-            min_buffers: config.min_buffers as u64,
-            max_buffers: config.max_buffers as u64,
-            buffer_size: config.buffer_size as u64,
+            min_buffers: config.min_buffers,
+            max_buffers: config.max_buffers,
+            buffer_size: config.buffer_size,
             log_level: config.log_level.clone(),
             log_target: config.log_target.clone(),
             log_access_target: config.log_access_target.clone(),
-            command_buffer_size: config.command_buffer_size as u64,
-            max_command_buffer_size: config.max_command_buffer_size as u64,
+            command_buffer_size: config.command_buffer_size,
+            max_command_buffer_size: config.max_command_buffer_size,
             metrics,
         }
     }

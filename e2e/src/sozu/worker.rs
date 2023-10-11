@@ -72,11 +72,9 @@ impl Worker {
     ) -> (ScmSocket, Channel<WorkerRequest, WorkerResponse>, Server) {
         let (scm_main_to_worker, scm_worker_to_main) =
             UnixStream::pair().expect("could not create unix stream pair");
-        let (cmd_main_to_worker, cmd_worker_to_main) = Channel::generate(
-            config.command_buffer_size as usize,
-            config.max_command_buffer_size as usize,
-        )
-        .expect("could not create a channel");
+        let (cmd_main_to_worker, cmd_worker_to_main) =
+            Channel::generate(config.command_buffer_size, config.max_command_buffer_size)
+                .expect("could not create a channel");
 
         set_no_close_exec(scm_main_to_worker.as_raw_fd());
         set_no_close_exec(scm_worker_to_main.as_raw_fd());
@@ -119,11 +117,9 @@ impl Worker {
         let name = name.into();
         let (scm_main_to_worker, scm_worker_to_main) =
             UnixStream::pair().expect("could not create unix stream pair");
-        let (cmd_main_to_worker, cmd_worker_to_main) = Channel::generate(
-            config.command_buffer_size as usize,
-            config.max_command_buffer_size as usize,
-        )
-        .expect("could not create a channel");
+        let (cmd_main_to_worker, cmd_worker_to_main) =
+            Channel::generate(config.command_buffer_size, config.max_command_buffer_size)
+                .expect("could not create a channel");
 
         set_no_close_exec(scm_main_to_worker.as_raw_fd());
         set_no_close_exec(scm_worker_to_main.as_raw_fd());

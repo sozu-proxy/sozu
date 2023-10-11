@@ -54,7 +54,7 @@ pub struct Channel<Tx, Rx> {
     pub sock: MioUnixStream,
     pub front_buf: Buffer,
     pub back_buf: Buffer,
-    max_buffer_size: usize,
+    max_buffer_size: u64,
     pub readiness: Ready,
     pub interest: Ready,
     blocking: bool,
@@ -84,8 +84,8 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     /// Creates a nonblocking channel on a given socket path
     pub fn from_path(
         path: &str,
-        buffer_size: usize,
-        max_buffer_size: usize,
+        buffer_size: u64,
+        max_buffer_size: u64,
     ) -> Result<Channel<Tx, Rx>, ChannelError> {
         let unix_stream = MioUnixStream::connect(path)
             .map_err(|io_error| ChannelError::Connection(Some(io_error)))?;
@@ -93,11 +93,11 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     }
 
     /// Creates a nonblocking channel, using a unix stream
-    pub fn new(sock: MioUnixStream, buffer_size: usize, max_buffer_size: usize) -> Channel<Tx, Rx> {
+    pub fn new(sock: MioUnixStream, buffer_size: u64, max_buffer_size: u64) -> Channel<Tx, Rx> {
         Channel {
             sock,
-            front_buf: Buffer::with_capacity(buffer_size),
-            back_buf: Buffer::with_capacity(buffer_size),
+            front_buf: Buffer::with_capacity(buffer_size as usize),
+            back_buf: Buffer::with_capacity(buffer_size as usize),
             max_buffer_size,
             readiness: Ready::EMPTY,
             interest: Ready::READABLE,
@@ -300,11 +300,14 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
             Some(position) => self.read_and_parse_from_front_buffer(position),
             None => {
                 if self.front_buf.available_space() == 0 {
-                    if self.front_buf.capacity() == self.max_buffer_size {
+                    if (self.front_buf.capacity() as u64) == self.max_buffer_size {
                         error!("command buffer full, cannot grow more, ignoring");
                     } else {
                         println!("growing channel");
-                        let new_size = min(self.front_buf.capacity() + 5000, self.max_buffer_size);
+                        let new_size = min(
+                            self.front_buf.capacity() + 5000,
+                            self.max_buffer_size as usize,
+                        );
                         self.front_buf.grow(new_size);
                     }
                 }
@@ -340,10 +343,13 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                 Some(position) => break self.read_and_parse_from_front_buffer(position),
                 None => {
                     if self.front_buf.available_space() == 0 {
-                        if self.front_buf.capacity() == self.max_buffer_size {
-                            break Err(ChannelError::BufferFull);
+                        if (self.front_buf.capacity() as u64) == self.max_buffer_size {
+                            return Err(ChannelError::BufferFull);
                         }
-                        let new_size = min(self.front_buf.capacity() + 5000, self.max_buffer_size);
+                        let new_size = min(
+                            self.front_buf.capacity() + 5000,
+                            self.max_buffer_size as usize,
+                        );
                         self.front_buf.grow(new_size);
                     }
                     match self.sock.read(self.front_buf.space()) {
@@ -399,7 +405,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
 
         if message_len > self.back_buf.available_space() {
             if message_len - self.back_buf.available_space() + self.back_buf.capacity()
-                > self.max_buffer_size
+                > (self.max_buffer_size as usize)
             {
                 return Err(ChannelError::MessageTooLarge(self.back_buf.capacity()));
             }
@@ -434,7 +440,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
 
         if msg_len > self.back_buf.available_space() {
             if msg_len - self.back_buf.available_space() + self.back_buf.capacity()
-                > self.max_buffer_size
+                > (self.max_buffer_size as usize)
             {
                 return Err(ChannelError::MessageTooLarge(self.back_buf.capacity()));
             }
@@ -473,7 +479,7 @@ impl<Tx: Debug + DeserializeOwned + Serialize, Rx: Debug + DeserializeOwned + Se
     Channel<Tx, Rx>
 {
     /// creates a channel pair: `(blocking_channel, nonblocking_channel)`
-    pub fn generate(buffer_size: usize, max_buffer_size: usize) -> ChannelResult<Tx, Rx> {
+    pub fn generate(buffer_size: u64, max_buffer_size: u64) -> ChannelResult<Tx, Rx> {
         let (command, proxy) = MioUnixStream::pair().map_err(ChannelError::Read)?;
         let proxy_channel = Channel::new(proxy, buffer_size, max_buffer_size);
         let mut command_channel = Channel::new(command, buffer_size, max_buffer_size);
@@ -482,10 +488,7 @@ impl<Tx: Debug + DeserializeOwned + Serialize, Rx: Debug + DeserializeOwned + Se
     }
 
     /// creates a pair of nonblocking channels
-    pub fn generate_nonblocking(
-        buffer_size: usize,
-        max_buffer_size: usize,
-    ) -> ChannelResult<Tx, Rx> {
+    pub fn generate_nonblocking(buffer_size: u64, max_buffer_size: u64) -> ChannelResult<Tx, Rx> {
         let (command, proxy) = MioUnixStream::pair().map_err(ChannelError::Read)?;
         let proxy_channel = Channel::new(proxy, buffer_size, max_buffer_size);
         let command_channel = Channel::new(command, buffer_size, max_buffer_size);

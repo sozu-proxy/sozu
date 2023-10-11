@@ -219,7 +219,7 @@ impl CommandHub {
         if let Err(err) = self.register(token, &mut stream) {
             error!("Could not register client: {}", err);
         }
-        let channel = Channel::new(stream, 4096, usize::MAX);
+        let channel = Channel::new(stream, 4096, u64::MAX);
         let id = self.next_client_id();
         let session = ClientSession::new(channel, id, token);
         info!("register new client: {}", id);
