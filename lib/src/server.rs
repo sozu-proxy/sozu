@@ -231,14 +231,14 @@ impl Server {
         config_state: ConfigState,
         expects_initial_status: bool,
     ) -> anyhow::Result<Self> {
+        let server_config = ServerConfig::from_config(&config);
         let event_loop = Poll::new().with_context(|| "could not create event loop")?;
         let pool = Rc::new(RefCell::new(Pool::with_capacity(
-            config.min_buffers,
-            config.max_buffers,
-            config.buffer_size,
+            server_config.min_buffers,
+            server_config.max_buffers,
+            server_config.buffer_size,
         )));
         let backends = Rc::new(RefCell::new(BackendMap::new()));
-        let server_config = ServerConfig::from_config(&config);
 
         //FIXME: we will use a few entries for the channel, metrics socket and the listeners
         //FIXME: for HTTP/2, we will have more than 2 entries per session
