@@ -12,7 +12,7 @@ use sozu_lib as sozu;
 use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
-    config::{Config, ConfigBuilder, FileConfig},
+    config::{ConfigBuilder, FileConfig, ServerConfig},
     logging::setup_logging,
     proto::command::{
         request::RequestType, AddBackend, Cluster, HardStop, LoadBalancingParams, PathRule,
@@ -28,7 +28,7 @@ use crate::sozu::command_id::CommandID;
 /// Handle to a detached thread where a Sozu worker runs
 pub struct Worker {
     pub name: String,
-    pub config: Config,
+    pub config: ServerConfig,
     pub state: ConfigState,
     pub scm_main_to_worker: ScmSocket,
     pub scm_worker_to_main: ScmSocket,
@@ -49,13 +49,14 @@ pub fn set_no_close_exec(fd: i32) {
 }
 
 impl Worker {
-    pub fn into_config(file_config: FileConfig) -> Config {
-        ConfigBuilder::new(file_config, "")
+    pub fn into_config(file_config: FileConfig) -> ServerConfig {
+        let config = ConfigBuilder::new(file_config, "")
             .into_config()
-            .expect("could not create Config")
+            .expect("could not create Config");
+        ServerConfig::from_config(&config)
     }
 
-    pub fn empty_config() -> (Config, Listeners, ConfigState) {
+    pub fn empty_config() -> (ServerConfig, Listeners, ConfigState) {
         let listeners = Listeners::default();
         let config = FileConfig::default();
         let config = Worker::into_config(config);
@@ -63,8 +64,9 @@ impl Worker {
         (config, listeners, state)
     }
 
+    // TODO: this seems to be used nowhere. We may want to delete it.
     pub fn create_server(
-        config: Config,
+        config: ServerConfig,
         listeners: Listeners,
         state: ConfigState,
     ) -> (ScmSocket, Channel<WorkerRequest, WorkerResponse>, Server) {
@@ -108,7 +110,7 @@ impl Worker {
 
     pub fn start_new_worker<S: Into<String>>(
         name: S,
-        config: Config,
+        config: ServerConfig,
         listeners: &Listeners,
         state: ConfigState,
     ) -> Self {

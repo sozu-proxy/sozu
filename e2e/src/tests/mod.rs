@@ -7,7 +7,7 @@ use std::{
 };
 
 use sozu_command_lib::{
-    config::{Config, ListenerBuilder},
+    config::{ListenerBuilder, ServerConfig},
     proto::command::{request::RequestType, ActivateListener, ListenerType, Request},
     scm_socket::Listeners,
     state::ConfigState,
@@ -46,7 +46,7 @@ fn provide_port() -> u16 {
 /// - n backends ("cluster_0-{0..n}")
 pub fn setup_test<S: Into<String>>(
     name: S,
-    config: Config,
+    config: ServerConfig,
     listeners: Listeners,
     state: ConfigState,
     front_address: SocketAddr,
@@ -108,7 +108,7 @@ pub fn setup_test<S: Into<String>>(
 
 pub fn setup_async_test<S: Into<String>>(
     name: S,
-    config: Config,
+    config: ServerConfig,
     listeners: Listeners,
     state: ConfigState,
     front_address: SocketAddr,
@@ -145,7 +145,7 @@ pub fn setup_async_test<S: Into<String>>(
 
 pub fn setup_sync_test<S: Into<String>>(
     name: S,
-    config: Config,
+    config: ServerConfig,
     listeners: Listeners,
     state: ConfigState,
     front_address: SocketAddr,

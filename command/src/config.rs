@@ -1746,7 +1746,15 @@ fn display_toml_error(file: &str, error: &toml::de::Error) {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerMetricsConfig {
+    pub address: String,
+    pub tagged_metrics: bool,
+    pub prefix: Option<String>,
+}
+
 /// Used by a worker to start its server loop
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub max_connections: usize,
     pub front_timeout: u32,
@@ -1757,10 +1765,24 @@ pub struct ServerConfig {
     pub min_buffers: usize,
     pub max_buffers: usize,
     pub buffer_size: usize,
+    pub log_level: String,
+    pub log_target: String,
+    pub log_access_target: Option<String>,
+    pub command_buffer_size: usize,
+    pub max_command_buffer_size: usize,
+    pub metrics: Option<ServerMetricsConfig>,
 }
 
 impl ServerConfig {
+    /// reduce the config to the bare minimum needed by a worker
     pub fn from_config(config: &Config) -> ServerConfig {
+        let metrics = config.metrics.clone().and_then(|m| {
+            Some(ServerMetricsConfig {
+                address: m.address.to_string(),
+                tagged_metrics: m.tagged_metrics,
+                prefix: m.prefix,
+            })
+        });
         ServerConfig {
             max_connections: config.max_connections,
             front_timeout: config.front_timeout,
@@ -1771,6 +1793,12 @@ impl ServerConfig {
             min_buffers: config.min_buffers,
             max_buffers: config.max_buffers,
             buffer_size: config.buffer_size,
+            log_level: config.log_level.clone(),
+            log_target: config.log_target.clone(),
+            log_access_target: config.log_access_target.clone(),
+            command_buffer_size: config.command_buffer_size,
+            max_command_buffer_size: config.max_command_buffer_size,
+            metrics,
         }
     }
 
@@ -1792,6 +1820,12 @@ impl Default for ServerConfig {
             min_buffers: DEFAULT_MIN_BUFFERS,
             max_buffers: DEFAULT_MAX_BUFFERS,
             buffer_size: DEFAULT_BUFFER_SIZE,
+            log_level: "info".to_string(),
+            log_target: "stdout".to_string(),
+            log_access_target: None,
+            command_buffer_size: DEFAULT_COMMAND_BUFFER_SIZE,
+            max_command_buffer_size: DEFAULT_MAX_COMMAND_BUFFER_SIZE,
+            metrics: None,
         }
     }
 }

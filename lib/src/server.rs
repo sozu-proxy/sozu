@@ -17,7 +17,7 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     channel::Channel,
-    config::{Config, ServerConfig},
+    config::ServerConfig,
     proto::command::{
         request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
         CertificatesWithFingerprints, Cluster, ClusterHashes, ClusterInformations,
@@ -242,24 +242,23 @@ impl Server {
     pub fn try_new_from_config(
         worker_to_main_channel: ProxyChannel,
         worker_to_main_scm: ScmSocket,
-        config: Config,
+        config: ServerConfig,
         initial_state: Vec<WorkerRequest>,
         expects_initial_status: bool,
     ) -> Result<Self, ServerError> {
         let event_loop = Poll::new().map_err(ServerError::CreatePoll)?;
-        let server_config = ServerConfig::from_config(&config);
         let pool = Rc::new(RefCell::new(Pool::with_capacity(
-            server_config.min_buffers,
-            server_config.max_buffers,
-            server_config.buffer_size,
+            config.min_buffers,
+            config.max_buffers,
+            config.buffer_size,
         )));
         let backends = Rc::new(RefCell::new(BackendMap::new()));
 
         //FIXME: we will use a few entries for the channel, metrics socket and the listeners
         //FIXME: for HTTP/2, we will have more than 2 entries per session
         let sessions: Rc<RefCell<SessionManager>> = SessionManager::new(
-            Slab::with_capacity(server_config.slab_capacity()),
-            server_config.max_connections,
+            Slab::with_capacity(config.slab_capacity()),
+            config.max_connections,
         );
         {
             let mut s = sessions.borrow_mut();
@@ -304,7 +303,7 @@ impl Server {
             None,
             Some(https),
             None,
-            server_config,
+            config,
             Some(initial_state),
             expects_initial_status,
         )
