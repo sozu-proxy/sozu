@@ -17,7 +17,7 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     channel::Channel,
-    config::Config,
+    config::{Config, ServerConfig},
     proto::command::{
         request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
         CertificatesWithFingerprints, Cluster, ClusterHashes, ClusterInformations,
@@ -97,45 +97,6 @@ impl From<usize> for SessionToken {
 impl From<SessionToken> for usize {
     fn from(val: SessionToken) -> usize {
         val.0
-    }
-}
-
-pub struct ServerConfig {
-    pub max_connections: usize,
-    pub front_timeout: u32,
-    pub back_timeout: u32,
-    pub connect_timeout: u32,
-    pub zombie_check_interval: u32,
-    pub accept_queue_timeout: u32,
-}
-
-impl ServerConfig {
-    pub fn from_config(config: &Config) -> ServerConfig {
-        ServerConfig {
-            max_connections: config.max_connections,
-            front_timeout: config.front_timeout,
-            back_timeout: config.back_timeout,
-            connect_timeout: config.connect_timeout,
-            zombie_check_interval: config.zombie_check_interval,
-            accept_queue_timeout: config.accept_queue_timeout,
-        }
-    }
-
-    fn slab_capacity(&self) -> usize {
-        10 + 2 * self.max_connections
-    }
-}
-
-impl Default for ServerConfig {
-    fn default() -> ServerConfig {
-        ServerConfig {
-            max_connections: 10000,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-            zombie_check_interval: 30 * 60,
-            accept_queue_timeout: 60,
-        }
     }
 }
 

@@ -17,6 +17,7 @@ use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
 use sozu_command::{
+    config::ServerConfig,
     logging,
     proto::command::{
         request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,

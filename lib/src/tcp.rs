@@ -14,7 +14,10 @@ use mio::{
 use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
-use sozu_command::{config::MAX_LOOP_ITERATIONS, proto::command::request::RequestType, ObjectKind};
+use sozu_command::{
+    config::ServerConfig, config::MAX_LOOP_ITERATIONS, proto::command::request::RequestType,
+    ObjectKind,
+};
 
 use crate::{
     backends::{Backend, BackendMap},

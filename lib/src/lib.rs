@@ -1116,6 +1116,7 @@ pub mod testing {
     pub use mio::{net::UnixStream, Poll, Registry, Token};
     pub use slab::Slab;
     pub use sozu_command::{
+        config::ServerConfig,
         proto::command::{HttpListenerConfig, HttpsListenerConfig, TcpListenerConfig},
         scm_socket::{Listeners, ScmSocket},
     };
@@ -1126,7 +1127,7 @@ pub mod testing {
         https::HttpsProxy,
         pool::Pool,
         server::Server,
-        server::{ListenSession, ProxyChannel, ServerConfig, SessionManager},
+        server::{ListenSession, ProxyChannel, SessionManager},
         tcp::TcpProxy,
         Protocol, ProxySession,
     };
