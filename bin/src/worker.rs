@@ -203,8 +203,8 @@ pub fn begin_worker_process(
     worker_to_main_scm_fd: i32,
     configuration_state_fd: i32,
     id: i32,
-    command_buffer_size: usize,
-    max_command_buffer_size: usize,
+    command_buffer_size: u64,
+    max_command_buffer_size: u64,
 ) -> Result<(), anyhow::Error> {
     let mut worker_to_main_channel: Channel<WorkerResponse, ServerConfig> = Channel::new(
         unsafe { UnixStream::from_raw_fd(worker_to_main_channel_fd) },
@@ -329,8 +329,8 @@ pub fn fork_main_into_worker(
 
     let mut main_to_worker_channel: Channel<ServerConfig, WorkerResponse> = Channel::new(
         main_to_worker,
-        worker_config.command_buffer_size as usize,
-        worker_config.max_command_buffer_size as usize,
+        worker_config.command_buffer_size,
+        worker_config.max_command_buffer_size,
     );
 
     // DISCUSS: should we really block the channel just to write on it?
