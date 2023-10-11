@@ -143,6 +143,9 @@ pub const DEFAULT_WORKER_AUTOMATIC_RESTART: bool = true;
 /// wether to save the state automatically (false)
 pub const DEFAULT_AUTOMATIC_STATE_SAVE: bool = false;
 
+/// minimum number of buffers (1)
+pub const DEFAULT_MIN_BUFFERS: usize = 1;
+
 /// maximum number of buffers (1 000)
 pub const DEFAULT_MAX_BUFFERS: usize = 1_000;
 
@@ -1218,8 +1221,8 @@ impl ConfigBuilder {
                 .disable_cluster_metrics
                 .unwrap_or(DEFAULT_DISABLE_CLUSTER_METRICS),
             min_buffers: std::cmp::min(
-                file_config.min_buffers.unwrap_or(1),
-                file_config.max_buffers.unwrap_or(1000),
+                file_config.min_buffers.unwrap_or(DEFAULT_MIN_BUFFERS),
+                file_config.max_buffers.unwrap_or(DEFAULT_MAX_BUFFERS),
             ),
             pid_file_path: file_config.pid_file_path.clone(),
             request_timeout: file_config
@@ -1751,6 +1754,9 @@ pub struct ServerConfig {
     pub connect_timeout: u32,
     pub zombie_check_interval: u32,
     pub accept_queue_timeout: u32,
+    pub min_buffers: usize,
+    pub max_buffers: usize,
+    pub buffer_size: usize,
 }
 
 impl ServerConfig {
@@ -1762,6 +1768,9 @@ impl ServerConfig {
             connect_timeout: config.connect_timeout,
             zombie_check_interval: config.zombie_check_interval,
             accept_queue_timeout: config.accept_queue_timeout,
+            min_buffers: config.min_buffers,
+            max_buffers: config.max_buffers,
+            buffer_size: config.buffer_size,
         }
     }
 
@@ -1774,12 +1783,15 @@ impl ServerConfig {
 impl Default for ServerConfig {
     fn default() -> ServerConfig {
         ServerConfig {
-            max_connections: 10000,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-            zombie_check_interval: 30 * 60,
-            accept_queue_timeout: 60,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            front_timeout: DEFAULT_FRONT_TIMEOUT,
+            back_timeout: DEFAULT_BACK_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            zombie_check_interval: DEFAULT_ZOMBIE_CHECK_INTERVAL,
+            accept_queue_timeout: DEFAULT_ACCEPT_QUEUE_TIMEOUT,
+            min_buffers: DEFAULT_MIN_BUFFERS,
+            max_buffers: DEFAULT_MAX_BUFFERS,
+            buffer_size: DEFAULT_BUFFER_SIZE,
         }
     }
 }
