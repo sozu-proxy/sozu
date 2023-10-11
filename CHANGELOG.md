@@ -4,6 +4,32 @@
 
 See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av0.16.0)
 
+## 0.15.6 - 2023-10-11
+
+### ⛑️ Fixed
+
+- Fix behaviour on missing `X-Forwarded-Proto` and `X-Forwarded-Port`, we add them in that case, see [`c09e17a`](https://github.com/sozu-proxy/sozu/commit/c09e17a4bc5d8ff45694402dd7521e50320cb262).
+- Fix behaviour on kawa parser when we detect a header `Content-Length` on `HEAD` requests, see [`7d89372`](https://github.com/sozu-proxy/sozu/commit/7d8937267462be3dea343fba76ec2c6ac1671da3).
+
+### Changelog
+
+#### ⛑️ Fixed
+
+- [ [`c09e17a`](https://github.com/sozu-proxy/sozu/commit/c09e17a4bc5d8ff45694402dd7521e50320cb262) ] Fix X-Forwarded-Proto and X-Forwarded-Port (add them when not present) [`Eloi DEMOLIS`] (`2023-10-11`)
+- [ [`7d89372`](https://github.com/sozu-proxy/sozu/commit/7d8937267462be3dea343fba76ec2c6ac1671da3) ] Fix responses to head requests (ignore body length) [`Eloi DEMOLIS`] (`2023-10-11`)
+
+#### ✍️ Changed
+
+- [ [`a52e750`](https://github.com/sozu-proxy/sozu/commit/a52e750e3f5e1a95a2d29f13edbb27908a28e3ad) ] doc(changelog): add 0.15.5 entry [`Florentin Dubois`] (`2023-09-21`)
+- [ [`4ffaf2b`](https://github.com/sozu-proxy/sozu/commit/4ffaf2b1feea57f2557722a7de9f63e58c673915) ] chore: update dependencies [`Florentin Dubois`] (`2023-10-11`)
+- [ [`6de9cf5`](https://github.com/sozu-proxy/sozu/commit/6de9cf541368fca3d874b14df7e068a856d4d183) ] chore: update dependencies [`Florentin Dubois`] (`2023-09-21`)
+
+### 🥹 Contributors
+* @FlorentinDUBOIS
+* @Wonshtrum
+
+**Full Changelog**: https://github.com/sozu-proxy/sozu/compare/0.15.5...0.15.6
+
 ## 0.15.5 - 2023-09-21
 
 ### ⛑️ Fixed
@@ -16,7 +42,7 @@ We fix a bug that can occurs with pki using T.61 charset, see [`a5412b9`](https:
 
 - [[`a5412b9`](https://github.com/sozu-proxy/sozu/commit/a5412b9764e860eedc2a206b16e81144946a8d7f) ] fix(command): retrieve name and san from slice [`Florentin Dubois`] (`2023-09-21`)
 
-#### ✍️ Changed
+
 
 - [ [`24c4407`](https://github.com/sozu-proxy/sozu/commit/24c4407d654dfbcd7c490e3a23c46fe8289bce4e) ] chore: update changelog to add 0.15.4 [`Florentin Dubois`] (`2023-09-13`)
 - [ [`6de9cf5`](https://github.com/sozu-proxy/sozu/commit/6de9cf541368fca3d874b14df7e068a856d4d183) ] chore: update dependencies [`Florentin Dubois`] (`2023-09-21`)
