@@ -22,7 +22,8 @@ use rustls::{
         TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
         TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
     },
-    CipherSuite, ProtocolVersion, ServerConfig, ServerConnection, SupportedCipherSuite,
+    CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
+    SupportedCipherSuite,
 };
 use rusty_ulid::Ulid;
 use slab::Slab;
@@ -30,7 +31,7 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     certificate::Fingerprint,
-    config::DEFAULT_CIPHER_SUITES,
+    config::{ServerConfig, DEFAULT_CIPHER_SUITES},
     logging,
     proto::command::{
         request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
@@ -524,7 +525,7 @@ pub struct HttpsListener {
     fronts: Router,
     listener: Option<MioTcpListener>,
     resolver: Arc<MutexWrappedCertificateResolver>,
-    rustls_details: Arc<ServerConfig>,
+    rustls_details: Arc<RustlsServerConfig>,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
@@ -710,7 +711,7 @@ impl HttpsListener {
     pub fn create_rustls_context(
         config: &HttpsListenerConfig,
         resolver: Arc<MutexWrappedCertificateResolver>,
-    ) -> Result<ServerConfig, ListenerError> {
+    ) -> Result<RustlsServerConfig, ListenerError> {
         let cipher_names = if config.cipher_list.is_empty() {
             DEFAULT_CIPHER_SUITES.to_vec()
         } else {
@@ -758,7 +759,7 @@ impl HttpsListener {
             })
             .collect::<Vec<_>>();
 
-        let mut server_config = ServerConfig::builder()
+        let mut server_config = RustlsServerConfig::builder()
             .with_cipher_suites(&ciphers[..])
             .with_safe_default_kx_groups()
             .with_protocol_versions(&versions[..])
@@ -1495,8 +1496,6 @@ pub fn start_https_worker(
     max_buffers: usize,
     buffer_size: usize,
 ) -> anyhow::Result<()> {
-    use crate::server;
-
     let event_loop = Poll::new().with_context(|| "could not create event loop")?;
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
@@ -1557,7 +1556,7 @@ pub fn start_https_worker(
     {
         let (scm_server, _scm_client) =
             UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
-        let server_config = server::ServerConfig {
+        let server_config = ServerConfig {
             max_connections: max_buffers,
             ..Default::default()
         };
@@ -1650,7 +1649,7 @@ mod tests {
             .expect("test address 127.0.0.1:1032 should be parsed");
         let resolver = Arc::new(MutexWrappedCertificateResolver::new());
 
-        let server_config = ServerConfig::builder()
+        let server_config = RustlsServerConfig::builder()
             .with_safe_default_cipher_suites()
             .with_safe_default_kx_groups()
             .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])

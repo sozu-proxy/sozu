@@ -18,7 +18,7 @@ use rusty_ulid::Ulid;
 use slab::Slab;
 use time::{Duration, Instant};
 
-use sozu_command::{proto::command::request::RequestType, ObjectKind};
+use sozu_command::{config::ServerConfig, proto::command::request::RequestType, ObjectKind};
 
 use crate::{
     backends::{Backend, BackendMap},
@@ -1530,8 +1530,6 @@ pub fn start_tcp_worker(
     buffer_size: usize,
     channel: ProxyChannel,
 ) -> anyhow::Result<()> {
-    use crate::server;
-
     let poll = Poll::new().with_context(|| "could not create event loop")?;
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
         1,
@@ -1585,7 +1583,7 @@ pub fn start_tcp_worker(
         UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
     let scm_socket =
         ScmSocket::new(scm_server.as_raw_fd()).with_context(|| "Could not create scm socket")?;
-    let server_config = server::ServerConfig {
+    let server_config = ServerConfig {
         max_connections: max_buffers,
         ..Default::default()
     };
@@ -1744,8 +1742,6 @@ mod tests {
 
     /// used in tests only
     pub fn start_proxy() -> anyhow::Result<Channel<WorkerRequest, WorkerResponse>> {
-        use crate::server;
-
         info!("listen for connections");
         let (mut command, channel) =
             Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
@@ -1822,7 +1818,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let server_config = server::ServerConfig {
+            let server_config = ServerConfig {
                 max_connections,
                 ..Default::default()
             };

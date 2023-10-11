@@ -19,6 +19,7 @@ use slab::Slab;
 use time::{Duration, Instant};
 
 use sozu_command::{
+    config::ServerConfig,
     logging,
     proto::command::{
         request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,
@@ -994,8 +995,6 @@ pub fn start_http_worker(
     max_buffers: usize,
     buffer_size: usize,
 ) -> anyhow::Result<()> {
-    use crate::server;
-
     let event_loop = Poll::new().with_context(|| "could not create event loop")?;
 
     let pool = Rc::new(RefCell::new(Pool::with_capacity(
@@ -1065,7 +1064,7 @@ pub fn start_http_worker(
         error!("error sending empty listeners: {:?}", e);
     }
 
-    let server_config = server::ServerConfig {
+    let server_config = ServerConfig {
         max_connections: max_buffers,
         ..Default::default()
     };
