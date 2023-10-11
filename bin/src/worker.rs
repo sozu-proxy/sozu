@@ -3,6 +3,7 @@ use std::{
     fmt,
     fs::File,
     io::Seek,
+    net::SocketAddr,
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
     os::unix::process::CommandExt,
     process::Command,
@@ -28,7 +29,7 @@ use tempfile::tempfile;
 use sozu::{metrics, server::Server};
 use sozu_command_lib::{
     channel::Channel,
-    config::Config,
+    config::{Config, ServerConfig},
     logging::target_to_backend,
     proto::command::{
         request::RequestType, Request, RunState, Status, WorkerInfo, WorkerRequest, WorkerResponse,
@@ -62,7 +63,6 @@ impl Worker {
         pid: pid_t,
         command_channel: Channel<WorkerRequest, WorkerResponse>,
         scm_socket: ScmSocket,
-        _: &Config,
     ) -> Worker {
         Worker {
             id,
@@ -150,7 +150,7 @@ pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result
             &state,
             listeners,
         )?;
-        let mut worker = Worker::new(index as u32, pid, command_channel, scm_socket, config);
+        let mut worker = Worker::new(index as u32, pid, command_channel, scm_socket);
 
         // the new worker expects a status message at startup
         if let Some(worker_channel) = worker.worker_channel.as_mut() {
@@ -193,7 +193,6 @@ pub fn start_worker(
         worker_pid,
         main_to_worker_channel,
         main_to_worker_scm,
-        config,
     ))
 }
 
@@ -206,7 +205,7 @@ pub fn begin_worker_process(
     command_buffer_size: usize,
     max_command_buffer_size: usize,
 ) -> Result<(), anyhow::Error> {
-    let mut worker_to_main_channel: Channel<WorkerResponse, Config> = Channel::new(
+    let mut worker_to_main_channel: Channel<WorkerResponse, ServerConfig> = Channel::new(
         unsafe { UnixStream::from_raw_fd(worker_to_main_channel_fd) },
         command_buffer_size,
         max_command_buffer_size,
@@ -260,8 +259,12 @@ pub fn begin_worker_process(
     worker_to_main_channel.readiness.insert(Ready::READABLE);
 
     if let Some(metrics) = worker_config.metrics.as_ref() {
+        let address = metrics
+            .address
+            .parse::<SocketAddr>()
+            .with_context(|| format!("Could not parse metrics address {}", metrics.address))?;
         metrics::setup(
-            &metrics.address,
+            &address,
             worker_id,
             metrics.tagged_metrics,
             metrics.prefix.clone(),
@@ -321,10 +324,12 @@ pub fn fork_main_into_worker(
     util::disable_close_on_exec(worker_to_main.as_raw_fd())?;
     util::disable_close_on_exec(worker_to_main_scm.as_raw_fd())?;
 
-    let mut main_to_worker_channel: Channel<Config, WorkerResponse> = Channel::new(
+    let worker_config = ServerConfig::from_config(config);
+
+    let mut main_to_worker_channel: Channel<ServerConfig, WorkerResponse> = Channel::new(
         main_to_worker,
-        config.command_buffer_size,
-        config.max_command_buffer_size,
+        worker_config.command_buffer_size,
+        worker_config.max_command_buffer_size,
     );
 
     // DISCUSS: should we really block the channel just to write on it?
@@ -338,7 +343,7 @@ pub fn fork_main_into_worker(
         Ok(ForkResult::Parent { child: worker_pid }) => {
             info!("{} worker launched: {}", worker_id, worker_pid);
             main_to_worker_channel
-                .write_message(config)
+                .write_message(&worker_config)
                 .with_context(|| "Could not send config to the new worker using the channel")?;
 
             if let Err(e) = main_to_worker_channel.nonblocking() {
