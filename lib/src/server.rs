@@ -660,7 +660,9 @@ impl Server {
         }
 
         loop {
-            match self.channel.read_message() {
+            let request = self.channel.read_message();
+            debug!("Received request {:?}", request);
+            match request {
                 Ok(request) => match request.content.request_type {
                     Some(RequestType::HardStop(_)) => {
                         let req_id = request.id.clone();
@@ -852,10 +854,11 @@ impl Server {
             QUEUE.with(|q| {
                 let mut queue = q.borrow_mut();
                 loop {
-                    if let Some(msg) = queue.pop_front() {
-                        if let Err(e) = self.channel.write_message(&msg) {
-                            error!("Could not write message {} on the channel: {}", msg, e);
-                            queue.push_front(msg);
+                    if let Some(resp) = queue.pop_front() {
+                        debug!("Sending response {:?}", resp);
+                        if let Err(e) = self.channel.write_message(&resp) {
+                            error!("Could not write message {} on the channel: {}", resp, e);
+                            queue.push_front(resp);
                         }
                     }
 

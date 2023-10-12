@@ -1211,7 +1211,7 @@ impl ConfigBuilder {
                 .unwrap_or_else(|| String::from("stdout")),
             max_buffers: file_config.max_buffers.unwrap_or(DEFAULT_MAX_BUFFERS),
             max_command_buffer_size: file_config
-                .command_buffer_size
+                .max_command_buffer_size
                 .unwrap_or(DEFAULT_MAX_COMMAND_BUFFER_SIZE),
             max_connections: file_config
                 .max_connections

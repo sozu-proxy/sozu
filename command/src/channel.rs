@@ -8,13 +8,11 @@ use std::{
         io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
         net::UnixStream as StdUnixStream,
     },
-    str::from_utf8,
     time::Duration,
 };
 
 use mio::{event::Source, net::UnixStream as MioUnixStream};
-use serde::{de::DeserializeOwned, ser::Serialize};
-use serde_json;
+use prost::{DecodeError, Message as ProstMessage};
 
 use crate::{buffer::growable::Buffer, ready::Ready};
 
@@ -46,10 +44,17 @@ pub enum ChannelError {
     BlockingStatus { fd: i32, error: String },
     #[error("Connection error: {0:?}")]
     Connection(Option<std::io::Error>),
+    #[error("Invalid protobuf message: {0}")]
+    InvalidProtobufMessage(DecodeError),
+    #[error("This should never happen (index out of bound on a tested buffer)")]
+    MismatchBufferSize,
 }
 
-/// A wrapper around unix socket using the mio crate.
-/// Used in pairs to communicate, in a blocking or non-blocking way.
+/// Channel meant for communication between Sōzu processes over a UNIX socket.
+/// It wraps a unix socket using the mio crate, and transmit prost messages
+/// by serializing them in a binary format, with a fix-sized delimiter.
+/// To function, channels must come in pairs, one for each agent.
+/// They can function in a blocking or non-blocking way.
 pub struct Channel<Tx, Rx> {
     pub sock: MioUnixStream,
     pub front_buf: Buffer,
@@ -80,7 +85,7 @@ impl<Tx, Rx> std::fmt::Debug for Channel<Tx, Rx> {
     }
 }
 
-impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
+impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Channel<Tx, Rx> {
     /// Creates a nonblocking channel on a given socket path
     pub fn from_path(
         path: &str,
@@ -107,7 +112,9 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         }
     }
 
-    pub fn into<Tx2: Debug + Serialize, Rx2: Debug + DeserializeOwned>(self) -> Channel<Tx2, Rx2> {
+    pub fn into<Tx2: Debug + ProstMessage + Default, Rx2: Debug + ProstMessage + Default>(
+        self,
+    ) -> Channel<Tx2, Rx2> {
         Channel {
             sock: self.sock,
             front_buf: self.front_buf,
@@ -170,6 +177,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         self.blocking
     }
 
+    /// Get the raw file descriptor of the UNIX socket
     pub fn fd(&self) -> RawFd {
         self.sock.as_raw_fd()
     }
@@ -182,7 +190,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         self.readiness & self.interest
     }
 
-    /// Checks wether we want and can read or write, and calls the appropriate handler.
+    /// Check wether we want and can read or write, and calls the appropriate handler.
     pub fn run(&mut self) -> Result<(), ChannelError> {
         let interest = self.interest & self.readiness;
 
@@ -196,7 +204,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         Ok(())
     }
 
-    /// Handles readability by filling the front buffer with the socket data.
+    /// Handle readability by filling the front buffer with the socket data.
     pub fn readable(&mut self) -> Result<usize, ChannelError> {
         if !(self.interest & self.readiness).is_readable() {
             return Err(ChannelError::Connection(None));
@@ -239,7 +247,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         Ok(count)
     }
 
-    /// Handles writability by writing the content of the back buffer onto the socket
+    /// Handle writability by writing the content of the back buffer onto the socket
     pub fn writable(&mut self) -> Result<usize, ChannelError> {
         if !(self.interest & self.readiness).is_writable() {
             return Err(ChannelError::Connection(None));
@@ -282,9 +290,9 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
 
     /// Depending on the blocking status:
     ///
-    /// Blocking: waits for the front buffer to be filled, and parses a message from it
+    /// Blocking: wait for the front buffer to be filled, and parse a message from it
     ///
-    /// Nonblocking: parses a message from the front buffer, without waiting.
+    /// Nonblocking: parse a message from the front buffer, without waiting.
     /// Prefer using `channel.readable()` before
     pub fn read_message(&mut self) -> Result<Rx, ChannelError> {
         if self.blocking {
@@ -294,35 +302,21 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         }
     }
 
-    /// Parses a message from the front buffer, without waiting
-    fn read_message_nonblocking(&mut self) -> Result<Rx, ChannelError> {
-        match self.front_buf.data().iter().position(|&x| x == 0) {
-            Some(position) => self.read_and_parse_from_front_buffer(position),
-            None => {
-                if self.front_buf.available_space() == 0 {
-                    if (self.front_buf.capacity() as u64) == self.max_buffer_size {
-                        error!("command buffer full, cannot grow more, ignoring");
-                    } else {
-                        println!("growing channel");
-                        let new_size = min(
-                            self.front_buf.capacity() + 5000,
-                            self.max_buffer_size as usize,
-                        );
-                        self.front_buf.grow(new_size);
-                    }
-                }
-
-                self.interest.insert(Ready::READABLE);
-                Err(ChannelError::NothingRead)
-            }
-        }
-    }
-
     fn read_message_blocking(&mut self) -> Result<Rx, ChannelError> {
         self.read_message_blocking_timeout(None)
     }
 
-    /// Waits for the front buffer to be filled, and parses a message from it.
+    /// Parse a message from the front buffer, without waiting
+    fn read_message_nonblocking(&mut self) -> Result<Rx, ChannelError> {
+        if let Some(message) = self.try_read_delimited_message()? {
+            return Ok(message);
+        }
+
+        self.interest.insert(Ready::READABLE);
+        Err(ChannelError::NothingRead)
+    }
+
+    /// Wait for the front buffer to be filled, and parses a message from it.
     pub fn read_message_blocking_timeout(
         &mut self,
         timeout: Option<Duration>,
@@ -339,29 +333,18 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                 }
             }
 
-            match self.front_buf.data().iter().position(|&x| x == 0) {
-                Some(position) => break self.read_and_parse_from_front_buffer(position),
-                None => {
-                    if self.front_buf.available_space() == 0 {
-                        if (self.front_buf.capacity() as u64) == self.max_buffer_size {
-                            return Err(ChannelError::BufferFull);
-                        }
-                        let new_size = min(
-                            self.front_buf.capacity() + 5000,
-                            self.max_buffer_size as usize,
-                        );
-                        self.front_buf.grow(new_size);
-                    }
-                    match self.sock.read(self.front_buf.space()) {
-                        Ok(0) => break Err(ChannelError::NoByteToRead),
-                        Ok(bytes_read) => self.front_buf.fill(bytes_read),
-                        Err(io_error) => match io_error.kind() {
-                            ErrorKind::WouldBlock => continue, // ignore 10 millisecond timeouts
-                            _ => break Err(ChannelError::Read(io_error)),
-                        },
-                    };
-                }
+            if let Some(message) = self.try_read_delimited_message()? {
+                return Ok(message);
             }
+
+            match self.sock.read(self.front_buf.space()) {
+                Ok(0) => return Err(ChannelError::NoByteToRead),
+                Ok(bytes_read) => self.front_buf.fill(bytes_read),
+                Err(io_error) => match io_error.kind() {
+                    ErrorKind::WouldBlock => continue, // ignore 10 millisecond timeouts
+                    _ => break Err(ChannelError::Read(io_error)),
+                },
+            };
         };
 
         self.set_timeout(None)?;
@@ -369,14 +352,34 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         status
     }
 
-    fn read_and_parse_from_front_buffer(&mut self, position: usize) -> Result<Rx, ChannelError> {
-        let utf8_str = from_utf8(&self.front_buf.data()[..position])
-            .map_err(|from_error| ChannelError::InvalidCharSet(from_error.to_string()))?;
+    /// parse a prost message from the front buffer, grow it if necessary
+    fn try_read_delimited_message(&mut self) -> Result<Option<Rx>, ChannelError> {
+        let buffer = self.front_buf.data();
+        if buffer.len() >= delimiter_size() {
+            let delimiter = buffer[..delimiter_size()]
+                .try_into()
+                .map_err(|_| ChannelError::MismatchBufferSize)?;
+            let message_len = usize::from_le_bytes(delimiter);
 
-        let json_parsed = serde_json::from_str(utf8_str).map_err(ChannelError::Serde)?;
+            if buffer.len() >= message_len {
+                let message = Rx::decode(&buffer[delimiter_size()..message_len])
+                    .map_err(|decode_error| ChannelError::InvalidProtobufMessage(decode_error))?;
+                self.front_buf.consume(message_len);
+                return Ok(Some(message));
+            }
+        }
 
-        self.front_buf.consume(position + 1);
-        Ok(json_parsed)
+        if self.front_buf.available_space() == 0 {
+            if (self.front_buf.capacity() as u64) == self.max_buffer_size {
+                return Err(ChannelError::BufferFull);
+            }
+            let new_size = min(
+                self.front_buf.capacity() + 5000,
+                self.max_buffer_size as usize,
+            );
+            self.front_buf.grow(new_size);
+        }
+        Ok(None)
     }
 
     /// Checks whether the channel is blocking or nonblocking, writes the message.
@@ -393,33 +396,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     /// Writes the message in the buffer, but NOT on the socket.
     /// you have to call channel.run() afterwards
     fn write_message_nonblocking(&mut self, message: &Tx) -> Result<(), ChannelError> {
-        let message = match serde_json::to_string(message) {
-            Ok(string) => string.into_bytes(),
-            Err(_) => Vec::new(),
-        };
-
-        let message_len = message.len() + 1;
-        if message_len > self.back_buf.available_space() {
-            self.back_buf.shift();
-        }
-
-        if message_len > self.back_buf.available_space() {
-            if message_len - self.back_buf.available_space() + self.back_buf.capacity()
-                > (self.max_buffer_size as usize)
-            {
-                return Err(ChannelError::MessageTooLarge(self.back_buf.capacity()));
-            }
-
-            let new_length =
-                message_len - self.back_buf.available_space() + self.back_buf.capacity();
-            self.back_buf.grow(new_length);
-        }
-
-        self.back_buf.write(&message).map_err(ChannelError::Write)?;
-
-        self.back_buf
-            .write(&b"\0"[..])
-            .map_err(ChannelError::Write)?;
+        self.write_delimited_message(message)?;
 
         self.interest.insert(Ready::WRITABLE);
 
@@ -428,32 +405,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
 
     /// fills the back buffer with data AND writes on the socket
     fn write_message_blocking(&mut self, message: &Tx) -> Result<(), ChannelError> {
-        let message = match serde_json::to_string(message) {
-            Ok(string) => string.into_bytes(),
-            Err(_) => Vec::new(),
-        };
-
-        let msg_len = &message.len() + 1;
-        if msg_len > self.back_buf.available_space() {
-            self.back_buf.shift();
-        }
-
-        if msg_len > self.back_buf.available_space() {
-            if msg_len - self.back_buf.available_space() + self.back_buf.capacity()
-                > (self.max_buffer_size as usize)
-            {
-                return Err(ChannelError::MessageTooLarge(self.back_buf.capacity()));
-            }
-
-            let new_len = msg_len - self.back_buf.available_space() + self.back_buf.capacity();
-            self.back_buf.grow(new_len);
-        }
-
-        self.back_buf.write(&message).map_err(ChannelError::Write)?;
-
-        self.back_buf
-            .write(&b"\0"[..])
-            .map_err(ChannelError::Write)?;
+        self.write_delimited_message(message)?;
 
         loop {
             let size = self.back_buf.available_data();
@@ -471,13 +423,51 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         }
         Ok(())
     }
+
+    /// write a message on the back buffer, using our own delimiter (the delimiter of prost
+    /// is not trustworthy since its size may change)
+    pub fn write_delimited_message(&mut self, message: &Tx) -> Result<(), ChannelError> {
+        let payload = message.encode_to_vec();
+
+        let payload_len = payload.len() + delimiter_size();
+
+        let delimiter = payload_len.to_le_bytes();
+
+        if payload_len > self.back_buf.available_space() {
+            self.back_buf.shift();
+        }
+
+        if payload_len > self.back_buf.available_space() {
+            if payload_len - self.back_buf.available_space() + self.back_buf.capacity()
+                > (self.max_buffer_size as usize)
+            {
+                return Err(ChannelError::MessageTooLarge(self.back_buf.capacity()));
+            }
+
+            let new_length =
+                payload_len - self.back_buf.available_space() + self.back_buf.capacity();
+            self.back_buf.grow(new_length);
+        }
+
+        self.back_buf
+            .write_all(&delimiter)
+            .map_err(ChannelError::Write)?;
+        self.back_buf
+            .write_all(&payload)
+            .map_err(ChannelError::Write)?;
+
+        Ok(())
+    }
+}
+
+/// the payload is prefixed with a delimiter of sizeof(usize) bytes
+pub const fn delimiter_size() -> usize {
+    std::mem::size_of::<usize>()
 }
 
 type ChannelResult<Tx, Rx> = Result<(Channel<Tx, Rx>, Channel<Rx, Tx>), ChannelError>;
 
-impl<Tx: Debug + DeserializeOwned + Serialize, Rx: Debug + DeserializeOwned + Serialize>
-    Channel<Tx, Rx>
-{
+impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Channel<Tx, Rx> {
     /// creates a channel pair: `(blocking_channel, nonblocking_channel)`
     pub fn generate(buffer_size: u64, max_buffer_size: u64) -> ChannelResult<Tx, Rx> {
         let (command, proxy) = MioUnixStream::pair().map_err(ChannelError::Read)?;
@@ -496,7 +486,9 @@ impl<Tx: Debug + DeserializeOwned + Serialize, Rx: Debug + DeserializeOwned + Se
     }
 }
 
-impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Iterator for Channel<Tx, Rx> {
+impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Iterator
+    for Channel<Tx, Rx>
+{
     type Item = Rx;
     fn next(&mut self) -> Option<Self::Item> {
         self.read_message().ok()
@@ -534,31 +526,35 @@ mod tests {
 
     use super::*;
 
-    #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct Serializable(u32);
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct ProtobufMessage {
+        #[prost(uint32, required, tag = "1")]
+        inner: u32,
+    }
+
+    fn test_channels() -> (
+        Channel<ProtobufMessage, ProtobufMessage>,
+        Channel<ProtobufMessage, ProtobufMessage>,
+    ) {
+        Channel::generate(1000, 10000).expect("could not generate blocking channels for testing")
+    }
 
     #[test]
     fn unblock_a_channel() {
-        let (mut blocking, _nonblocking): (
-            Channel<Serializable, Serializable>,
-            Channel<Serializable, Serializable>,
-        ) = Channel::generate(1000, 10000).expect("could not generate blocking channels");
+        let (mut blocking, _nonblocking) = test_channels();
         assert!(blocking.nonblocking().is_ok())
     }
 
     #[test]
     fn generate_blocking_and_nonblocking_channels() {
-        let (blocking_channel, nonblocking_channel): (
-            Channel<Serializable, Serializable>,
-            Channel<Serializable, Serializable>,
-        ) = Channel::generate(1000, 10000).expect("could not generatie blocking channels");
+        let (blocking_channel, nonblocking_channel) = test_channels();
 
         assert!(blocking_channel.is_blocking());
         assert!(!nonblocking_channel.is_blocking());
 
         let (nonblocking_channel_1, nonblocking_channel_2): (
-            Channel<Serializable, Serializable>,
-            Channel<Serializable, Serializable>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
         ) = Channel::generate_nonblocking(1000, 10000)
             .expect("could not generatie nonblocking channels");
 
@@ -568,12 +564,9 @@ mod tests {
 
     #[test]
     fn write_and_read_message_blocking() {
-        let (mut blocking_channel, mut nonblocking_channel): (
-            Channel<Serializable, Serializable>,
-            Channel<Serializable, Serializable>,
-        ) = Channel::generate(1000, 10000).expect("Could not create nonblocking channel");
+        let (mut blocking_channel, mut nonblocking_channel) = test_channels();
 
-        let message_to_send = Serializable(42);
+        let message_to_send = ProtobufMessage { inner: 42 };
 
         nonblocking_channel
             .blocking()
@@ -582,41 +575,38 @@ mod tests {
             .write_message(&message_to_send)
             .expect("Could not write message on channel");
 
-        println!("we wrote a message!");
+        trace!("we wrote a message!");
 
-        println!("reading message..");
+        trace!("reading message..");
         // blocking_channel.readable();
         let message = blocking_channel
             .read_message()
             .expect("Could not read message on channel");
-        println!("read message!");
+        trace!("read message!");
 
-        assert_eq!(message, Serializable(42));
+        assert_eq!(message, ProtobufMessage { inner: 42 });
     }
 
     #[test]
     fn read_message_blocking_with_timeout_fails() {
-        let (mut reading_channel, mut writing_channel): (
-            Channel<Serializable, Serializable>,
-            Channel<Serializable, Serializable>,
-        ) = Channel::generate(1000, 10000).expect("Could not create nonblocking channel");
+        let (mut reading_channel, mut writing_channel) = test_channels();
         writing_channel.blocking().expect("Could not block channel");
 
-        println!("reading message in a detached thread, with a timeout of 100 milliseconds...");
+        trace!("reading message in a detached thread, with a timeout of 100 milliseconds...");
         let awaiting_with_timeout = thread::spawn(move || {
             let message =
                 reading_channel.read_message_blocking_timeout(Some(Duration::from_millis(100)));
-            println!("read message!");
+            trace!("read message!");
             message
         });
 
-        println!("Waiting 200 milliseconds…");
+        trace!("Waiting 200 milliseconds…");
         thread::sleep(std::time::Duration::from_millis(200));
 
         writing_channel
-            .write_message(&Serializable(200))
+            .write_message(&ProtobufMessage { inner: 200 })
             .expect("Could not write message on channel");
-        println!("we wrote a message that should arrive too late!");
+        trace!("we wrote a message that should arrive too late!");
 
         let arrived_too_late = awaiting_with_timeout
             .join()
@@ -627,48 +617,42 @@ mod tests {
 
     #[test]
     fn read_message_blocking_with_timeout_succeeds() {
-        let (mut reading_channel, mut writing_channel): (
-            Channel<Serializable, Serializable>,
-            Channel<Serializable, Serializable>,
-        ) = Channel::generate(1000, 10000).expect("Could not create nonblocking channel");
+        let (mut reading_channel, mut writing_channel) = test_channels();
         writing_channel.blocking().expect("Could not block channel");
 
-        println!("reading message in a detached thread, with a timeout of 200 milliseconds...");
+        trace!("reading message in a detached thread, with a timeout of 200 milliseconds...");
         let awaiting_with_timeout = thread::spawn(move || {
             let message = reading_channel
                 .read_message_blocking_timeout(Some(Duration::from_millis(200)))
                 .expect("Could not read message with timeout on blocking channel");
-            println!("read message!");
+            trace!("read message!");
             message
         });
 
-        println!("Waiting 100 milliseconds…");
+        trace!("Waiting 100 milliseconds…");
         thread::sleep(std::time::Duration::from_millis(100));
 
         writing_channel
-            .write_message(&Serializable(100))
+            .write_message(&ProtobufMessage { inner: 100 })
             .expect("Could not write message on channel");
-        println!("we wrote a message that should arrive on time!");
+        trace!("we wrote a message that should arrive on time!");
 
         let arrived_on_time = awaiting_with_timeout
             .join()
             .expect("error with receiving message from awaiting thread");
 
-        assert_eq!(arrived_on_time, Serializable(100));
+        assert_eq!(arrived_on_time, ProtobufMessage { inner: 100 });
     }
 
     #[test]
     fn exhaustive_use_of_nonblocking_channels() {
         // - two nonblocking channels A and B, identical
-        let (mut channel_a, mut channel_b): (
-            Channel<Serializable, Serializable>,
-            Channel<Serializable, Serializable>,
-        ) = Channel::generate(1000, 10000).expect("Could not create nonblocking channel");
+        let (mut channel_a, mut channel_b) = test_channels();
         channel_a.nonblocking().expect("Could not block channel");
 
         // write on A
         channel_a
-            .write_message(&Serializable(1))
+            .write_message(&ProtobufMessage { inner: 1 })
             .expect("Could not write message on channel");
 
         // set B as readable, normally mio tells when to, by giving events
@@ -680,7 +664,7 @@ mod tests {
 
         // write another message on A
         channel_a
-            .write_message(&Serializable(2))
+            .write_message(&ProtobufMessage { inner: 2 })
             .expect("Could not write message on channel");
 
         // insert a handle_events Ready::writable on A
@@ -690,7 +674,7 @@ mod tests {
         channel_a.run().expect("Failed to run the channel");
 
         // maybe a thread sleep
-        // thread::sleep(std::time::Duration::from_millis(100));
+        thread::sleep(std::time::Duration::from_millis(100));
 
         // receive with B using run()
         channel_b.run().expect("Failed to run the channel");
@@ -699,11 +683,11 @@ mod tests {
         let message_1 = channel_b
             .read_message()
             .expect("Could not read message on channel");
-        assert_eq!(message_1, Serializable(1));
+        assert_eq!(message_1, ProtobufMessage { inner: 1 });
 
         let message_2 = channel_b
             .read_message()
             .expect("Could not read message on channel");
-        assert_eq!(message_2, Serializable(2));
+        assert_eq!(message_2, ProtobufMessage { inner: 2 });
     }
 }
