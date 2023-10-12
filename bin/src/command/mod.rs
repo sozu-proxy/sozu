@@ -27,9 +27,11 @@ use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,
 };
+use prost::Message;
 use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
+    channel::delimiter_size,
     config::Config,
     proto::command::{
         request::RequestType, response_content::ContentType, MetricsConfiguration, Request,
@@ -946,38 +948,61 @@ async fn client_loop(
         while let Some(response) = client_rx.next().await {
             trace!("sending back message to client: {:?}", response);
 
-            // let mut message: Vec<u8> = response.encode_to_vec();
-            let mut message: Vec<u8> = serde_json::to_string(&response)
-                .map(|string| string.into_bytes())
-                .unwrap_or_else(|_| Vec::new());
+            // TODO: the best would be to use a channel
+            let payload = response.encode_to_vec();
+            let payload_len = payload.len() + delimiter_size();
+            let delimiter = payload_len.to_le_bytes();
 
-            // separate all messages with a 0 byte
-            message.push(0);
-            let _ = write_stream.write_all(&message).await;
+            let _ = write_stream.write_all(&delimiter).await;
+            let _ = write_stream.write_all(&payload).await;
         }
     })
     .detach();
 
     debug!("will start receiving messages from client {}", client_id);
 
-    // Read the stream by splitting it on 0 bytes
-    let mut split_iterator = BufReader::new(read_stream).split(0);
-    while let Some(message) = split_iterator.next().await {
-        let message = match message {
+    // this does essentially what Channel::try_read_delimited_message() does
+    let mut buf_reader = BufReader::new(read_stream);
+    loop {
+        let buffer = match buf_reader.fill_buf().await {
+            Ok(buf) => buf,
             Err(e) => {
-                error!("could not split message: {:?}", e);
+                error!("could not fill buf reader of the client loop: {}", e);
                 break;
             }
-            Ok(msg) => msg,
         };
+        if buffer.is_empty() {
+            break;
+        }
+        println!(
+            "client loop: I just created a buffer from my read buf reader: {:?}",
+            buffer
+        );
+        if buffer.len() >= delimiter_size() {
+            let delimiter: [u8; 8] = match buffer[..delimiter_size()].try_into() {
+                Ok(delimiter) => delimiter,
+                Err(_) => {
+                    error!("mismatched buffer size");
+                    break;
+                }
+            };
+            let message_len = usize::from_le_bytes(delimiter);
 
-        // match Message::decode::<&[u8]>(&message) {
-        match serde_json::from_slice::<Request>(&message) {
-            Err(e) => {
-                error!("could not decode client message: {:?}", e);
-                break;
-            }
-            Ok(request) => {
+            println!(
+                "client loop: reading message of encoded length {}, here is the buffer data: {:?}",
+                message_len, buffer
+            );
+
+            if buffer.len() >= message_len {
+                let payload = &buffer[delimiter_size()..message_len];
+                let request = match Request::decode(payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!("could not decode client message {:?}: {:?}", payload, e);
+                        break;
+                    }
+                };
+                buf_reader.consume(message_len);
                 debug!("got command request: {:?}", request);
                 let client_id = client_id.clone();
                 if let Err(e) = command_tx
@@ -1020,40 +1045,64 @@ async fn worker_loop(
         debug!("will start sending messages to worker {}", worker_id);
         while let Some(worker_request) = worker_rx.next().await {
             debug!("sending to worker {}: {:?}", worker_id, worker_request);
-            // let mut message: Vec<u8> = worker_request.encode_to_vec();
-            let mut message: Vec<u8> = serde_json::to_string(&worker_request)
-                .map(|string| string.into_bytes())
-                .unwrap_or_else(|_| Vec::new());
 
-            // separate all messages with a 0 byte
-            message.push(0);
-            let _ = write_stream.write_all(&message).await;
+            // TODO: the best would be to use a channel
+            let payload = worker_request.encode_to_vec();
+            let payload_len = payload.len() + delimiter_size();
+            let delimiter = payload_len.to_le_bytes();
+
+            let _ = write_stream.write_all(&delimiter).await;
+            let _ = write_stream.write_all(&payload).await;
         }
     })
     .detach();
 
     debug!("will start receiving messages from worker {}", worker_id);
 
-    // Read the stream by splitting it on 0 bytes
-    let mut split_iterator = BufReader::new(read_stream).split(0);
-    while let Some(message) = split_iterator.next().await {
-        let message = match message {
+    // this does essentially what Channel::try_read_delimited_message() does
+    let mut buf_reader = BufReader::new(read_stream);
+    loop {
+        println!(
+            "The buf_reader in the client loop has this length: {}",
+            buf_reader.buffer().len()
+        );
+        let buffer = match buf_reader.fill_buf().await {
+            Ok(buf) => buf,
             Err(e) => {
-                error!("could not split message: {:?}", e);
+                error!("could not fill buf reader of the worker loop: {}", e);
                 break;
             }
-            Ok(msg) => msg,
         };
+        if buffer.is_empty() {
+            break;
+        }
 
-        // match Message::decode::<&[u8]>(&message) {
-        match serde_json::from_slice::<WorkerResponse>(&message) {
-            Err(e) => {
-                error!("could not decode worker message: {:?}", e);
-                break;
-            }
-            Ok(response) => {
-                debug!("worker {} replied message: {:?}", worker_id, response);
-                let worker_id = worker_id;
+        if buffer.len() >= delimiter_size() {
+            let delimiter: [u8; 8] = match buffer[..delimiter_size()].try_into() {
+                Ok(delimiter) => delimiter,
+                Err(_) => {
+                    error!("mismatched buffer size");
+                    break;
+                }
+            };
+            let message_len = usize::from_le_bytes(delimiter);
+
+            println!(
+                "worker loop: reading message of encoded length {}, here is the buffer data: {:?}",
+                message_len, buffer
+            );
+
+            if buffer.len() >= message_len {
+                let payload = &buffer[delimiter_size()..message_len];
+                let response = match WorkerResponse::decode(payload) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!("could not decode worker message: {:?}, {:?}", payload, e);
+                        break;
+                    }
+                };
+                buf_reader.consume(message_len);
+                debug!("got worker response: {:?}", response);
                 if let Err(e) = command_tx
                     .send(CommandMessage::WorkerResponse {
                         worker_id,

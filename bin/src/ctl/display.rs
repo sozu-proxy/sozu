@@ -7,8 +7,8 @@ use sozu_command_lib::proto::{
     command::{
         filtered_metrics, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
         CertificateAndKey, CertificatesWithFingerprints, ClusterMetrics, FilteredMetrics,
-        ListedFrontends, ListenersList, RequestCounts, ResponseContent, WorkerInfos, WorkerMetrics,
-        WorkerResponses,
+        ListedFrontends, ListenersList, RequestCounts, ResponseContent, RunState, WorkerInfos,
+        WorkerMetrics, WorkerResponses,
     },
     display::concatenate_vector,
 };
@@ -125,7 +125,11 @@ pub fn print_status(worker_infos: WorkerInfos) {
     table.add_row(row!["worker id", "pid", "run state"]);
 
     for worker_info in worker_infos.vec {
-        let row = row!(worker_info.id, worker_info.pid, worker_info.run_state);
+        let row = row!(
+            worker_info.id,
+            worker_info.pid,
+            RunState::try_from(worker_info.run_state).unwrap().as_str_name()
+        );
         table.add_row(row);
     }
 
