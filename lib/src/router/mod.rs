@@ -59,7 +59,7 @@ impl Router {
 
         if let Some((_, path_rules)) = self.tree.lookup(hostname, true) {
             let mut prefix_length = 0;
-            let mut res = None;
+            let mut route = None;
 
             for (rule, method_rule, cluster_id) in path_rules {
                 match rule.matches(path) {
@@ -68,7 +68,7 @@ impl Router {
                             MethodRuleResult::Equals => return Some(cluster_id.clone()),
                             MethodRuleResult::All => {
                                 prefix_length = path.len();
-                                res = Some(cluster_id);
+                                route = Some(cluster_id);
                             }
                             MethodRuleResult::None => {}
                         }
@@ -79,11 +79,11 @@ impl Router {
                                 // FIXME: the rule order will be important here
                                 MethodRuleResult::Equals => {
                                     prefix_length = size;
-                                    res = Some(cluster_id);
+                                    route = Some(cluster_id);
                                 }
                                 MethodRuleResult::All => {
                                     prefix_length = size;
-                                    res = Some(cluster_id);
+                                    route = Some(cluster_id);
                                 }
                                 MethodRuleResult::None => {}
                             }
@@ -93,7 +93,7 @@ impl Router {
                 }
             }
 
-            if let Some(cluster_id) = res {
+            if let Some(cluster_id) = route {
                 return Some(cluster_id.clone());
             }
         }
@@ -493,16 +493,16 @@ pub enum PathRuleResult {
 impl PathRule {
     pub fn matches(&self, path: &[u8]) -> PathRuleResult {
         match self {
-            PathRule::Prefix(s) => {
-                if path.starts_with(s.as_bytes()) {
-                    PathRuleResult::Prefix(s.len())
+            PathRule::Prefix(prefix) => {
+                if path.starts_with(prefix.as_bytes()) {
+                    PathRuleResult::Prefix(prefix.len())
                 } else {
                     PathRuleResult::None
                 }
             }
-            PathRule::Regex(r) => {
+            PathRule::Regex(regex) => {
                 let start = Instant::now();
-                let is_a_match = r.is_match(path);
+                let is_a_match = regex.is_match(path);
                 let now = Instant::now();
                 time!("regex_matching_time", (now - start).whole_milliseconds());
 
@@ -512,8 +512,8 @@ impl PathRule {
                     PathRuleResult::None
                 }
             }
-            PathRule::Equals(s) => {
-                if path == s.as_bytes() {
+            PathRule::Equals(pattern) => {
+                if path == pattern.as_bytes() {
                     PathRuleResult::Equals
                 } else {
                     PathRuleResult::None
@@ -682,6 +682,126 @@ mod tests {
         );
         assert!(
             PathRule::Prefix("/hello".to_string()).matches("/".as_bytes()) == PathRuleResult::None
+        );
+    }
+
+    ///  [io]
+    ///      \
+    ///       [sozu]
+    ///             \
+    ///              [*]  <- this wildcard has multiple children
+    ///             /   \
+    ///         (base) (api)
+    #[test]
+    fn multiple_children_on_a_wildcard() {
+        let mut router = Router::new();
+
+        assert!(router.add_tree_rule(
+            b"*.sozu.io",
+            &PathRule::Prefix("".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("base".to_string())
+        ));
+        println!("{:#?}", router.tree);
+        assert_eq!(
+            router.lookup("www.sozu.io".as_bytes(), "/api".as_bytes(), &Method::Get),
+            Some(Route::ClusterId("base".to_string()))
+        );
+        assert!(router.add_tree_rule(
+            b"*.sozu.io",
+            &PathRule::Prefix("/api".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("api".to_string())
+        ));
+        println!("{:#?}", router.tree);
+        assert_eq!(
+            router.lookup("www.sozu.io".as_bytes(), "/ap".as_bytes(), &Method::Get),
+            Some(Route::ClusterId("base".to_string()))
+        );
+        assert_eq!(
+            router.lookup("www.sozu.io".as_bytes(), "/api".as_bytes(), &Method::Get),
+            Some(Route::ClusterId("api".to_string()))
+        );
+    }
+
+    ///  [io]
+    ///      \
+    ///       [sozu]  <- this node has multiple children including a wildcard
+    ///      /      \
+    ///   (api)      [*]  <- this wildcard has multiple children
+    ///                 \
+    ///                (base)
+    #[test]
+    fn multiple_children_including_one_with_wildcard() {
+        let mut router = Router::new();
+
+        assert!(router.add_tree_rule(
+            b"*.sozu.io",
+            &PathRule::Prefix("".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("base".to_string())
+        ));
+        println!("{:#?}", router.tree);
+        assert_eq!(
+            router.lookup("www.sozu.io".as_bytes(), "/api".as_bytes(), &Method::Get),
+            Some(Route::ClusterId("base".to_string()))
+        );
+        assert!(router.add_tree_rule(
+            b"api.sozu.io",
+            &PathRule::Prefix("".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("api".to_string())
+        ));
+        println!("{:#?}", router.tree);
+        assert_eq!(
+            router.lookup("www.sozu.io".as_bytes(), "/api".as_bytes(), &Method::Get),
+            Some(Route::ClusterId("base".to_string()))
+        );
+        assert_eq!(
+            router.lookup("api.sozu.io".as_bytes(), "/api".as_bytes(), &Method::Get),
+            Some(Route::ClusterId("api".to_string()))
+        );
+    }
+
+    #[test]
+    fn router_insert_remove_through_regex() {
+        let mut router = Router::new();
+
+        assert!(router.add_tree_rule(
+            b"www./.*/.io",
+            &PathRule::Prefix("".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("base".to_string())
+        ));
+        println!("{:#?}", router.tree);
+        assert!(router.add_tree_rule(
+            b"www.doc./.*/.io",
+            &PathRule::Prefix("".to_string()),
+            &MethodRule::new(Some("GET".to_string())),
+            &Route::ClusterId("doc".to_string())
+        ));
+        println!("{:#?}", router.tree);
+        assert_eq!(
+            router.lookup("www.sozu.io".as_bytes(), "/".as_bytes(), &Method::Get),
+            Some(Route::ClusterId("base".to_string()))
+        );
+        assert_eq!(
+            router.lookup("www.doc.sozu.io".as_bytes(), "/".as_bytes(), &Method::Get),
+            Some(Route::ClusterId("doc".to_string()))
+        );
+        assert!(router.remove_tree_rule(
+            b"www./.*/.io",
+            &PathRule::Prefix("".to_string()),
+            &MethodRule::new(Some("GET".to_string()))
+        ));
+        println!("{:#?}", router.tree);
+        assert_eq!(
+            router.lookup("www.sozu.io".as_bytes(), "/".as_bytes(), &Method::Get),
+            None
+        );
+        assert_eq!(
+            router.lookup("www.doc.sozu.io".as_bytes(), "/".as_bytes(), &Method::Get),
+            Some(Route::ClusterId("doc".to_string()))
         );
     }
 
