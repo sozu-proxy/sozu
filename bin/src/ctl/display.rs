@@ -451,8 +451,10 @@ pub fn print_cluster_responses(
         for (worker_id, response_content) in worker_responses.map.iter() {
             if let Some(ContentType::Clusters(clusters)) = &response_content.content_type {
                 for cluster in clusters.vec.iter() {
-                    let entry = cluster_infos.entry(cluster).or_insert(Vec::new());
-                    entry.push(worker_id.to_owned());
+                    if cluster.configuration.is_some() {
+                        let entry = cluster_infos.entry(cluster).or_insert(Vec::new());
+                        entry.push(worker_id.to_owned());
+                    }
 
                     for frontend in cluster.http_frontends.iter() {
                         let entry = http_frontends.entry(frontend).or_insert(Vec::new());
@@ -485,7 +487,7 @@ pub fn print_cluster_responses(
                 .configuration
                 .as_ref()
                 .map(|conf| conf.cluster_id.to_owned())
-                .unwrap_or_else(String::new)));
+                .unwrap_or_else(|| String::from("None"))));
             row.push(cell!(cluster_info
                 .configuration
                 .as_ref()
