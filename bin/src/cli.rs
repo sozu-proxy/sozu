@@ -404,27 +404,6 @@ pub enum FrontendCmd {
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
-pub enum ClusterId {
-    /// traffic will go to the backend servers with this cluster id
-    Id {
-        /// traffic will go to the backend servers with this cluster id
-        id: String,
-    },
-    /// traffic to this frontend will be rejected with HTTP 401
-    Deny,
-}
-
-#[allow(clippy::from_over_into)]
-impl std::convert::Into<Option<StateClusterId>> for ClusterId {
-    fn into(self) -> Option<StateClusterId> {
-        match self {
-            ClusterId::Deny => None,
-            ClusterId::Id { id } => Some(id),
-        }
-    }
-}
-
-#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum HttpFrontendCmd {
     #[clap(name = "add")]
     Add {
@@ -434,8 +413,8 @@ pub enum HttpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
-        #[clap(subcommand, name = "cluster_id")]
-        cluster_id: ClusterId,
+        #[clap(short = 'i', long = "cluster-id", help = "identifies a cluster")]
+        cluster_id: String,
         #[clap(long = "hostname", aliases = &["host"])]
         hostname: String,
         #[clap(short = 'p', long = "path-prefix", help = "URL prefix of the frontend")]
@@ -454,6 +433,12 @@ pub enum HttpFrontendCmd {
         method: Option<String>,
         #[clap(long = "tags", help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')", value_parser = parse_tags)]
         tags: Option<BTreeMap<String, String>>,
+        #[clap(
+            short = 'd',
+            long = "deny-traffic",
+            help = "send a 401 on this address"
+        )]
+        deny_traffic: Option<bool>,
     },
     #[clap(name = "remove")]
     Remove {
@@ -463,8 +448,8 @@ pub enum HttpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
-        #[clap(subcommand, name = "cluster_id")]
-        cluster_id: ClusterId,
+        #[clap(short = 'i', long = "cluster-id", help = "identifies a cluster")]
+        cluster_id: String,
         #[clap(long = "hostname", aliases = &["host"])]
         hostname: String,
         #[clap(short = 'p', long = "path-prefix", help = "URL prefix of the frontend")]
@@ -506,6 +491,12 @@ pub enum TcpFrontendCmd {
             value_parser = parse_tags
         )]
         tags: Option<BTreeMap<String, String>>,
+        #[clap(
+            short = 'd',
+            long = "deny-traffic",
+            help = "send a 401 on this address"
+        )]
+        deny_traffic: Option<bool>,
     },
     #[clap(name = "remove")]
     Remove {

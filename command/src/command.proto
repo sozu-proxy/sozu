@@ -209,7 +209,6 @@ message ListenersList {
 
 // An HTTP or HTTPS frontend, as order to, or received from, Sōzu
 message RequestHttpFrontend {
-    optional string cluster_id = 1;
     required string address = 2;
     required string hostname = 3;
     required PathRule path = 4;
@@ -217,14 +216,17 @@ message RequestHttpFrontend {
     required RulePosition position = 6 [default = TREE];
     // custom tags to identify the frontend in the access logs
     map<string, string> tags = 7;
+    required string cluster_id = 8;
+    required bool deny_traffic = 9 [default = false];
 }
 
 message RequestTcpFrontend {
-    required string cluster_id = 1;
     // the socket address on which to listen for incoming traffic
     required string address = 2;
     // custom tags to identify the frontend in the access logs
     map<string, string> tags = 3;
+    required string cluster_id = 4;
+    required bool deny_traffic = 5 [default = false];
 }
 
 // list the frontends, filtered by protocol and/or domain

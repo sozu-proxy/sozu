@@ -65,7 +65,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let http_front = RequestHttpFrontend {
-        cluster_id: Some("my-cluster".to_string()),
+        cluster_id: "my-cluster".to_string(),
         address: "127.0.0.1:8080".to_string(),
         hostname: "example.com".to_string(),
         path: PathRule::prefix(String::from("/")),

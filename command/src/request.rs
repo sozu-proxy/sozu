@@ -151,6 +151,7 @@ impl RequestHttpFrontend {
                 }
             })?,
             tags: Some(self.tags),
+            deny_traffic: self.deny_traffic,
         })
     }
 }

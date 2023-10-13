@@ -26,8 +26,7 @@ impl Response {
 /// An HTTP or HTTPS frontend, as used *within* Sōzu
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpFrontend {
-    /// Send a 401, DENY, if cluster_id is None
-    pub cluster_id: Option<ClusterId>,
+    pub cluster_id: ClusterId,
     pub address: SocketAddr,
     pub hostname: String,
     #[serde(default)]
@@ -39,6 +38,8 @@ pub struct HttpFrontend {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    /// Send a 401, DENY, if true
+    pub deny_traffic: bool,
 }
 
 impl From<HttpFrontend> for RequestHttpFrontend {
@@ -55,6 +56,7 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             method: val.method,
             position: val.position.into(),
             tags,
+            deny_traffic: val.deny_traffic,
         }
     }
 }
@@ -148,6 +150,8 @@ pub struct TcpFrontend {
     pub address: SocketAddr,
     /// custom tags to identify the frontend in the access logs
     pub tags: BTreeMap<String, String>,
+    /// Send a 401, DENY, if true
+    pub deny_traffic: bool,
 }
 
 impl From<TcpFrontend> for RequestTcpFrontend {
@@ -156,6 +160,7 @@ impl From<TcpFrontend> for RequestTcpFrontend {
             cluster_id: val.cluster_id,
             address: val.address.to_string(),
             tags: val.tags,
+            deny_traffic: val.deny_traffic,
         }
     }
 }

@@ -1148,7 +1148,7 @@ mod tests {
         });
 
         let front = RequestHttpFrontend {
-            cluster_id: Some(String::from("cluster_1")),
+            cluster_id: String::from("cluster_1"),
             address: "127.0.0.1:1024".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
@@ -1234,7 +1234,7 @@ mod tests {
             address: "127.0.0.1:1031".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
-            cluster_id: Some(String::from("cluster_1")),
+            cluster_id: String::from("cluster_1"),
             ..Default::default()
         };
         command
@@ -1356,7 +1356,7 @@ mod tests {
             address: "127.0.0.1:1041".to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
-            cluster_id: Some(String::from("cluster_1")),
+            cluster_id: String::from("cluster_1"),
             ..Default::default()
         };
         command
@@ -1463,8 +1463,9 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri1),
                 position: RulePosition::Tree,
-                cluster_id: Some(cluster_id1),
+                cluster_id: cluster_id1,
                 tags: None,
+                deny_traffic: false,
             })
             .expect("Could not add http frontend");
         fronts
@@ -1474,8 +1475,9 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri2),
                 position: RulePosition::Tree,
-                cluster_id: Some(cluster_id2),
+                cluster_id: cluster_id2,
                 tags: None,
+                deny_traffic: false,
             })
             .expect("Could not add http frontend");
         fronts
@@ -1485,19 +1487,21 @@ mod tests {
                 method: None,
                 path: PathRule::prefix(uri3),
                 position: RulePosition::Tree,
-                cluster_id: Some(cluster_id3),
+                cluster_id: cluster_id3,
                 tags: None,
+                deny_traffic: false,
             })
             .expect("Could not add http frontend");
         fronts
             .add_http_front(&HttpFrontend {
                 address: "0.0.0.0:80".parse().unwrap(),
                 hostname: "other.domain".to_owned(),
-                method: None,
                 path: PathRule::prefix("/test".to_owned()),
                 position: RulePosition::Tree,
-                cluster_id: Some("cluster_1".to_owned()),
+                cluster_id: "cluster_1".to_owned(),
+                method: None,
                 tags: None,
+                deny_traffic: false,
             })
             .expect("Could not add http frontend");
 

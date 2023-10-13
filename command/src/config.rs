@@ -657,6 +657,7 @@ pub struct FileClusterFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    pub deny_traffic: Option<bool>,
 }
 
 impl FileClusterFrontendConfig {
@@ -686,6 +687,7 @@ impl FileClusterFrontendConfig {
         Ok(TcpFrontendConfig {
             address: self.address,
             tags: self.tags.clone(),
+            deny_traffic: self.deny_traffic,
         })
     }
 
@@ -742,6 +744,7 @@ impl FileClusterFrontendConfig {
             path,
             method: self.method.clone(),
             tags: self.tags.clone(),
+            deny_traffic: self.deny_traffic,
         })
     }
 }
@@ -892,6 +895,7 @@ pub struct HttpFrontendConfig {
     #[serde(default)]
     pub position: RulePosition,
     pub tags: Option<BTreeMap<String, String>>,
+    pub deny_traffic: Option<bool>,
 }
 
 impl HttpFrontendConfig {
@@ -921,13 +925,14 @@ impl HttpFrontendConfig {
 
             v.push(
                 RequestType::AddHttpsFrontend(RequestHttpFrontend {
-                    cluster_id: Some(cluster_id.to_string()),
+                    cluster_id: cluster_id.to_string(),
                     address: self.address.to_string(),
                     hostname: self.hostname.clone(),
                     path: self.path.clone(),
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
+                    deny_traffic: self.deny_traffic.unwrap_or(false),
                 })
                 .into(),
             );
@@ -935,13 +940,14 @@ impl HttpFrontendConfig {
             //create the front both for HTTP and HTTPS if possible
             v.push(
                 RequestType::AddHttpFrontend(RequestHttpFrontend {
-                    cluster_id: Some(cluster_id.to_string()),
+                    cluster_id: cluster_id.to_string(),
                     address: self.address.to_string(),
                     hostname: self.hostname.clone(),
                     path: self.path.clone(),
                     method: self.method.clone(),
                     position: self.position.into(),
                     tags,
+                    deny_traffic: self.deny_traffic.unwrap_or(false),
                 })
                 .into(),
             );
@@ -1010,6 +1016,7 @@ impl HttpClusterConfig {
 pub struct TcpFrontendConfig {
     pub address: SocketAddr,
     pub tags: Option<BTreeMap<String, String>>,
+    pub deny_traffic: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1042,6 +1049,7 @@ impl TcpClusterConfig {
                     cluster_id: self.cluster_id.clone(),
                     address: frontend.address.to_string(),
                     tags: frontend.tags.clone().unwrap_or(BTreeMap::new()),
+                    deny_traffic: frontend.deny_traffic.unwrap_or(false),
                 })
                 .into(),
             );

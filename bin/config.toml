@@ -260,6 +260,7 @@ load_balancing = "ROUND_ROBIN"
 # - sticky_session = false # activates sticky sessions for this cluster
 # - https_redirect = false #  activates automatic redirection to HTTPS for this cluster
 # - custom_tag: a tag to retrieve a frontend with the CLI or in the logs
+# - deny_traffic: return a 401 for this frontend (defaults to false)
 frontends = [
     { address = "0.0.0.0:8080", hostname = "lolcatho.st", tags = { key = "value" }, path = "/api" },
     # HTTPS frontends also have an optional `tls_versions` key like the HTTPS listeners

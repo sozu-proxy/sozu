@@ -301,7 +301,7 @@ impl Worker {
         address: SocketAddr,
     ) -> RequestHttpFrontend {
         RequestHttpFrontend {
-            cluster_id: Some(cluster_id.into()),
+            cluster_id: cluster_id.into(),
             address: address.to_string(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
