@@ -1,16 +1,17 @@
 use std::{
     io::{IoSlice, IoSliceMut},
-    net::SocketAddr,
+    net::{AddrParseError, SocketAddr},
     os::unix::{
         io::{FromRawFd, IntoRawFd, RawFd},
         net::UnixStream as StdUnixStream,
     },
-    str::from_utf8,
 };
 
 use mio::net::TcpListener;
 use nix::{cmsg_space, sys::socket};
-use serde_json;
+use prost::{DecodeError, Message};
+
+use crate::proto::command::ListenersCount;
 
 pub const MAX_FDS_OUT: usize = 200;
 pub const MAX_BYTES_OUT: usize = 4096;
@@ -30,6 +31,13 @@ pub enum ScmSocketError {
     InvalidCharSet(String),
     #[error("Could not deserialize utf8 string into listeners: {0}")]
     ListenerParse(String),
+    #[error("Wrong socket address {address}: {error}")]
+    WrongSocketAddress {
+        address: String,
+        error: AddrParseError,
+    },
+    #[error("error decoding the protobuf format of the listeners: {0}")]
+    DecodeError(DecodeError),
 }
 
 /// A unix socket specialized for file descriptor passing
@@ -80,14 +88,12 @@ impl ScmSocket {
     /// Send listeners (socket addresses and file descriptors) via an scm socket
     pub fn send_listeners(&self, listeners: &Listeners) -> Result<(), ScmSocketError> {
         let listeners_count = ListenersCount {
-            http: listeners.http.iter().map(|t| t.0).collect(),
-            tls: listeners.tls.iter().map(|t| t.0).collect(),
-            tcp: listeners.tcp.iter().map(|t| t.0).collect(),
+            http: listeners.http.iter().map(|t| t.0.to_string()).collect(),
+            tls: listeners.tls.iter().map(|t| t.0.to_string()).collect(),
+            tcp: listeners.tcp.iter().map(|t| t.0.to_string()).collect(),
         };
 
-        let message = serde_json::to_string(&listeners_count)
-            .map(|s| s.into_bytes())
-            .unwrap_or_else(|_| Vec::new());
+        let message = listeners_count.encode_length_delimited_to_vec();
 
         let mut file_descriptors: Vec<RawFd> = Vec::new();
 
@@ -109,18 +115,18 @@ impl ScmSocket {
 
         debug!("{} received :{:?}", self.fd, (size, file_descriptor_length));
 
-        let raw_listener_list = from_utf8(&buf[..size])
-            .map_err(|utf8_error| ScmSocketError::InvalidCharSet(utf8_error.to_string()))?;
+        let listeners_count = ListenersCount::decode_length_delimited(&buf[..size])
+            .map_err(|error| ScmSocketError::DecodeError(error))?;
 
-        let mut listeners_count = serde_json::from_str::<ListenersCount>(raw_listener_list)
-            .map_err(|error| ScmSocketError::ListenerParse(error.to_string()))?;
+        let mut http_addresses = parse_addresses(&listeners_count.http)?;
+        let mut tls_addresses = parse_addresses(&listeners_count.tls)?;
+        let mut tcp_addresses = parse_addresses(&listeners_count.tcp)?;
 
         let mut index = 0;
         let len = listeners_count.http.len();
         let mut http = Vec::new();
         http.extend(
-            listeners_count
-                .http
+            http_addresses
                 .drain(..)
                 .zip(received_fds[index..index + len].iter().cloned()),
         );
@@ -129,8 +135,7 @@ impl ScmSocket {
         let len = listeners_count.tls.len();
         let mut tls = Vec::new();
         tls.extend(
-            listeners_count
-                .tls
+            tls_addresses
                 .drain(..)
                 .zip(received_fds[index..index + len].iter().cloned()),
         );
@@ -138,8 +143,7 @@ impl ScmSocket {
         index += len;
         let mut tcp = Vec::new();
         tcp.extend(
-            listeners_count
-                .tcp
+            tcp_addresses
                 .drain(..)
                 .zip(received_fds[index..file_descriptor_length].iter().cloned()),
         );
@@ -208,19 +212,12 @@ impl ScmSocket {
     }
 }
 
-/// Socket addresses and file descriptors needed by a Proxy to start listening
+/// Socket addresses and file descriptors of TCP sockets, needed by a Proxy to start listening
 #[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Listeners {
     pub http: Vec<(SocketAddr, RawFd)>,
     pub tls: Vec<(SocketAddr, RawFd)>,
     pub tcp: Vec<(SocketAddr, RawFd)>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ListenersCount {
-    pub http: Vec<SocketAddr>,
-    pub tls: Vec<SocketAddr>,
-    pub tcp: Vec<SocketAddr>,
 }
 
 impl Listeners {
@@ -265,6 +262,19 @@ impl Listeners {
             }
         }
     }
+}
+
+fn parse_addresses(addresses: &Vec<String>) -> Result<Vec<SocketAddr>, ScmSocketError> {
+    let mut parsed_addresses = Vec::new();
+    for address in addresses {
+        parsed_addresses.push(address.parse::<SocketAddr>().map_err(|error| {
+            ScmSocketError::WrongSocketAddress {
+                address: address.to_owned(),
+                error,
+            }
+        })?);
+    }
+    Ok(parsed_addresses)
 }
 
 #[cfg(test)]

@@ -675,3 +675,13 @@ message ServerConfig {
     required uint64 max_command_buffer_size = 14 [default = 2000000];
     optional ServerMetricsConfig metrics = 15;
 }
+
+// Addresses of listeners, passed to new workers
+message ListenersCount {
+    // socket addresses of HTTP listeners
+    repeated string http = 1;
+    // socket addresses of HTTPS listeners
+    repeated string tls = 2;
+    // socket addresses of TCP listeners
+    repeated string tcp = 3;
+}
