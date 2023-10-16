@@ -1,11 +1,10 @@
 use anyhow::{self, bail, Context};
 use prettytable::Table;
-use serde::Serialize;
 
 use sozu_command_lib::proto::command::{
     request::RequestType, response_content::ContentType, ListWorkers, QueryCertificatesFilters,
     QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions, Request, Response,
-    ResponseContent, ResponseStatus, RunState, UpgradeMain, WorkerInfo,
+    ResponseContent, ResponseStatus, RunState, UpgradeMain,
 };
 
 use crate::ctl::{
@@ -17,13 +16,6 @@ use crate::ctl::{
     },
     CommandManager,
 };
-
-// Used to display the JSON response of the status command
-#[derive(Serialize, Debug)]
-struct WorkerStatus<'a> {
-    pub worker: &'a WorkerInfo,
-    pub status: &'a String,
-}
 
 impl CommandManager {
     fn write_request_on_channel(&mut self, request: Request) -> anyhow::Result<()> {
@@ -39,14 +31,6 @@ impl CommandManager {
     }
 
     pub fn send_request(&mut self, request: Request) -> Result<(), anyhow::Error> {
-        self.send_request_to_workers(request, false)
-    }
-
-    pub fn send_request_to_workers(
-        &mut self,
-        request: Request,
-        json: bool,
-    ) -> Result<(), anyhow::Error> {
         self.channel
             .write_message(&request)
             .with_context(|| "Could not write the request")?;
@@ -60,29 +44,22 @@ impl CommandManager {
                 }
                 ResponseStatus::Failure => bail!("Request failed: {}", response.message),
                 ResponseStatus::Ok => {
-                    if json {
-                        // why do we need to print a success message in json?
-                        print_json_response(&response.message)?;
-                    } else {
-                        println!("{}", response.message);
-                    }
+                    println!("{}", response.message);
 
                     if let Some(response_content) = response.content {
                         match response_content.content_type {
                             Some(ContentType::RequestCounts(request_counts)) => {
-                                print_request_counts(&request_counts)
+                                print_request_counts(&request_counts, self.json)?;
                             }
                             Some(ContentType::FrontendList(frontends)) => {
-                                print_frontend_list(frontends)
+                                print_frontend_list(frontends, self.json)?;
                             }
                             Some(ContentType::Workers(worker_infos)) => {
-                                if json {
-                                    print_json_response(&worker_infos)?;
-                                } else {
-                                    print_status(worker_infos);
-                                }
+                                print_status(worker_infos, self.json)?;
                             }
-                            Some(ContentType::ListenersList(list)) => print_listeners(list),
+                            Some(ContentType::ListenersList(list)) => {
+                                print_listeners(list, self.json)?;
+                            }
                             _ => {}
                         }
                     }
@@ -220,7 +197,6 @@ impl CommandManager {
 
     pub fn get_metrics(
         &mut self,
-        json: bool,
         list: bool,
         refresh: Option<u32>,
         metric_names: Vec<String>,
@@ -250,7 +226,7 @@ impl CommandManager {
                         debug!("Proxy is processing: {}", response.message);
                     }
                     ResponseStatus::Failure => {
-                        if json {
+                        if self.json {
                             return print_json_response(&response.message);
                         } else {
                             bail!("could not query proxy state: {}", response.message);
@@ -260,10 +236,10 @@ impl CommandManager {
                         if let Some(response_content) = response.content {
                             match response_content.content_type {
                                 Some(ContentType::Metrics(aggregated_metrics_data)) => {
-                                    print_metrics(aggregated_metrics_data, json)?
+                                    print_metrics(aggregated_metrics_data, self.json)?
                                 }
                                 Some(ContentType::AvailableMetrics(available)) => {
-                                    print_available_metrics(&available)?;
+                                    print_available_metrics(&available, self.json)?;
                                 }
                                 _ => {
                                     debug!("Wrong kind of response here");
@@ -293,7 +269,6 @@ impl CommandManager {
 
     pub fn query_cluster(
         &mut self,
-        json: bool,
         cluster_id: Option<String>,
         domain: Option<String>,
     ) -> Result<(), anyhow::Error> {
@@ -334,17 +309,22 @@ impl CommandManager {
                     debug!("Proxy is processing: {}", response.message);
                 }
                 ResponseStatus::Failure => {
-                    if json {
+                    if self.json {
                         print_json_response(&response.message)?;
                     }
                     bail!("could not query proxy state: {}", response.message);
                 }
                 ResponseStatus::Ok => {
-                    if let Some(ResponseContent {
-                        content_type: Some(ContentType::WorkerResponses(worker_responses)),
-                    }) = response.content
-                    {
-                        print_cluster_responses(cluster_id, domain, worker_responses, json)?
+                    match response.content {
+                        Some(ResponseContent {
+                            content_type: Some(ContentType::WorkerResponses(worker_responses)),
+                        }) => print_cluster_responses(
+                            cluster_id,
+                            domain,
+                            worker_responses,
+                            self.json,
+                        )?,
+                        _ => bail!("Wrong response content"),
                     }
                     break;
                 }
@@ -356,7 +336,6 @@ impl CommandManager {
 
     pub fn query_certificates(
         &mut self,
-        json: bool,
         fingerprint: Option<String>,
         domain: Option<String>,
         query_workers: bool,
@@ -367,15 +346,14 @@ impl CommandManager {
         };
 
         if query_workers {
-            self.query_certificates_from_workers(json, filters)
+            self.query_certificates_from_workers(filters)
         } else {
-            self.query_certificates_from_the_state(json, filters)
+            self.query_certificates_from_the_state(filters)
         }
     }
 
     fn query_certificates_from_workers(
         &mut self,
-        json: bool,
         filters: QueryCertificatesFilters,
     ) -> Result<(), anyhow::Error> {
         self.write_request_on_channel(RequestType::QueryCertificatesFromWorkers(filters).into())?;
@@ -388,19 +366,17 @@ impl CommandManager {
                     debug!("Proxy is processing: {}", response.message);
                 }
                 ResponseStatus::Failure => {
-                    if json {
+                    if self.json {
                         print_json_response(&response.message)?;
-                        bail!("We received an error message");
-                    } else {
-                        bail!("could not get certificate: {}", response.message);
                     }
+                    bail!("could not get certificate: {}", response.message);
                 }
                 ResponseStatus::Ok => {
                     info!("We did get a response from the proxy");
                     match response.content {
                         Some(ResponseContent {
                             content_type: Some(ContentType::WorkerResponses(worker_responses)),
-                        }) => print_certificates_by_worker(worker_responses.map, json)?,
+                        }) => print_certificates_by_worker(worker_responses.map, self.json)?,
                         _ => bail!("unexpected response: {:?}", response.content),
                     }
                     break;
@@ -412,7 +388,6 @@ impl CommandManager {
 
     fn query_certificates_from_the_state(
         &mut self,
-        json: bool,
         filters: QueryCertificatesFilters,
     ) -> anyhow::Result<()> {
         self.write_request_on_channel(RequestType::QueryCertificatesFromTheState(filters).into())?;
@@ -440,9 +415,8 @@ impl CommandManager {
                             bail!("No certificates match your request.");
                         }
 
-                        if json {
-                            print_json_response(&certs)
-                                .with_context(|| "Could not print certificates in JSON")?;
+                        if self.json {
+                            print_json_response(&certs)?;
                         } else {
                             print_certificates_with_validity(certs)
                                 .with_context(|| "Could not show certificate")?;

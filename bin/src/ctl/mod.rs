@@ -22,6 +22,8 @@ pub struct CommandManager {
     channel: Channel<Request, Response>,
     timeout: Duration,
     config: Config,
+    /// wether to display the response in JSON
+    json: bool,
 }
 
 pub fn ctl(args: cli::Args) -> anyhow::Result<()> {
@@ -49,6 +51,7 @@ pub fn ctl(args: cli::Args) -> anyhow::Result<()> {
         channel,
         timeout,
         config,
+        json: args.json,
     };
 
     command_manager.handle_command(args.cmd)
@@ -56,6 +59,7 @@ pub fn ctl(args: cli::Args) -> anyhow::Result<()> {
 
 impl CommandManager {
     fn handle_command(&mut self, command: SubCmd) -> anyhow::Result<()> {
+        debug!("Executing command {:?}", command);
         match command {
             SubCmd::Shutdown { hard } => {
                 if hard {
@@ -68,15 +72,15 @@ impl CommandManager {
                 None => self.upgrade_main(),
                 Some(worker_id) => self.upgrade_worker(worker_id),
             },
-            SubCmd::Status { json } => self.status(json),
-            SubCmd::Metrics { cmd, json } => match cmd {
+            SubCmd::Status {} => self.status(),
+            SubCmd::Metrics { cmd } => match cmd {
                 MetricsCmd::Get {
                     list,
                     refresh,
                     names,
                     clusters,
                     backends,
-                } => self.get_metrics(json, list, refresh, names, clusters, backends),
+                } => self.get_metrics(list, refresh, names, clusters, backends),
                 _ => self.configure_metrics(cmd),
             },
             SubCmd::Logging { level } => self.logging_filter(&level),
@@ -85,8 +89,8 @@ impl CommandManager {
                 StateCmd::Load { file } => self.load_state(file),
                 StateCmd::Stats => self.count_requests(),
             },
-            SubCmd::Reload { file, json } => self.reload_configuration(file, json),
-            SubCmd::Cluster { cmd, json } => self.cluster_command(cmd, json),
+            SubCmd::Reload { file } => self.reload_configuration(file),
+            SubCmd::Cluster { cmd } => self.cluster_command(cmd),
             SubCmd::Backend { cmd } => self.backend_command(cmd),
             SubCmd::Frontend { cmd } => match cmd {
                 FrontendCmd::Http { cmd } => self.http_frontend_command(cmd),
@@ -105,7 +109,7 @@ impl CommandManager {
                 ListenerCmd::Tcp { cmd } => self.tcp_listener_command(cmd),
                 ListenerCmd::List => self.list_listeners(),
             },
-            SubCmd::Certificate { cmd, json } => match cmd {
+            SubCmd::Certificate { cmd } => match cmd {
                 CertificateCmd::Add {
                     certificate,
                     chain,
@@ -149,7 +153,7 @@ impl CommandManager {
                     fingerprint,
                     domain,
                     query_workers,
-                } => self.query_certificates(json, fingerprint, domain, query_workers),
+                } => self.query_certificates(fingerprint, domain, query_workers),
             },
             SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
             SubCmd::Events => self.events(),

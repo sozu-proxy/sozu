@@ -24,6 +24,13 @@ pub struct Args {
         help = "Sets a custom timeout for commands (in milliseconds). 0 disables the timeout"
     )]
     pub timeout: Option<u64>,
+    #[clap(
+        short = 'j',
+        long = "json",
+        global = true,
+        help = "display responses to queries in a JSON format"
+    )]
+    pub json: bool,
     #[clap(subcommand)]
     pub cmd: SubCmd,
 }
@@ -109,26 +116,12 @@ pub enum SubCmd {
     },
 
     #[clap(name = "status", about = "gets information on the running workers")]
-    Status {
-        #[clap(
-            short = 'j',
-            long = "json",
-            help = "Print the command result in JSON format"
-        )]
-        json: bool,
-    },
+    Status,
     #[clap(
         name = "metrics",
         about = "gets statistics on the main process and its workers"
     )]
     Metrics {
-        #[clap(
-            short = 'j',
-            long = "json",
-            help = "Print the command result in JSON format",
-            global = true
-        )]
-        json: bool,
         #[clap(subcommand)]
         cmd: MetricsCmd,
     },
@@ -153,22 +146,9 @@ pub enum SubCmd {
             help = "use a different configuration file from the current one"
         )]
         file: Option<String>,
-        #[clap(
-            short = 'j',
-            long = "json",
-            help = "Print the command result in JSON format"
-        )]
-        json: bool,
     },
     #[clap(name = "cluster", about = "cluster management")]
     Cluster {
-        #[clap(
-            short = 'j',
-            long = "json",
-            help = "Print the command result in JSON format",
-            global = true
-        )]
-        json: bool,
         #[clap(subcommand)]
         cmd: ClusterCmd,
     },
@@ -189,13 +169,6 @@ pub enum SubCmd {
     },
     #[clap(name = "certificate", about = "list, add and remove certificates")]
     Certificate {
-        #[clap(
-            short = 'j',
-            long = "json",
-            help = "Print the command result in JSON format",
-            global = true
-        )]
-        json: bool,
         #[clap(subcommand)]
         cmd: CertificateCmd,
     },
@@ -216,7 +189,10 @@ pub enum MetricsCmd {
     Disable,
     #[clap(name = "clear", about = "Deletes local metrics data")]
     Clear,
-    #[clap(name = "get", about = "get all or filtered metrics")]
+    #[clap(
+        name = "get",
+        about = "get all metrics, filtered, or a list of available metrics"
+    )]
     Get {
         #[clap(short, long, help = "list the available metrics on the proxy level")]
         list: bool,

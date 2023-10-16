@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{self, Context};
 use prettytable::{Row, Table};
+use time::format_description;
+use x509_parser::time::ASN1Time;
 
 use sozu_command_lib::proto::{
     command::{
@@ -12,10 +14,11 @@ use sozu_command_lib::proto::{
     },
     display::concatenate_vector,
 };
-use time::format_description;
-use x509_parser::time::ASN1Time;
 
-pub fn print_listeners(listeners_list: ListenersList) {
+pub fn print_listeners(listeners_list: ListenersList, json: bool) -> anyhow::Result<()> {
+    if json {
+        return print_json_response(&listeners_list);
+    }
     println!("\nHTTP LISTENERS\n================");
 
     for (_, http_listener) in listeners_list.http_listeners.iter() {
@@ -117,9 +120,13 @@ pub fn print_listeners(listeners_list: ListenersList) {
         }
         table.printstd();
     }
+    Ok(())
 }
 
-pub fn print_status(worker_infos: WorkerInfos) {
+pub fn print_status(worker_infos: WorkerInfos, json: bool) -> anyhow::Result<()> {
+    if json {
+        return print_json_response(&worker_infos);
+    }
     let mut table = Table::new();
     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
     table.add_row(row!["worker id", "pid", "run state"]);
@@ -130,9 +137,13 @@ pub fn print_status(worker_infos: WorkerInfos) {
     }
 
     table.printstd();
+    Ok(())
 }
 
-pub fn print_frontend_list(frontends: ListedFrontends) {
+pub fn print_frontend_list(frontends: ListedFrontends, json: bool) -> anyhow::Result<()> {
+    if json {
+        return print_json_response(&frontends);
+    }
     trace!(" We received this frontends to display {:#?}", frontends);
     // HTTP frontends
     if !frontends.http_frontends.is_empty() {
@@ -211,6 +222,7 @@ pub fn print_frontend_list(frontends: ListedFrontends) {
         }
         table.printstd();
     }
+    Ok(())
 }
 
 pub fn print_metrics(
@@ -416,11 +428,11 @@ pub fn print_cluster_responses(
     worker_responses: WorkerResponses,
     json: bool,
 ) -> anyhow::Result<()> {
-    if let Some(needle) = cluster_id.or(domain) {
-        if json {
-            return print_json_response(&worker_responses);
-        }
+    if json {
+        return print_json_response(&worker_responses);
+    }
 
+    if let Some(needle) = cluster_id.or(domain) {
         let mut cluster_table = create_cluster_table(
             vec!["id", "sticky_session", "https_redirect"],
             &worker_responses.map,
@@ -654,8 +666,7 @@ pub fn print_certificates_by_worker(
     json: bool,
 ) -> anyhow::Result<()> {
     if json {
-        print_json_response(&response_contents)?;
-        return Ok(());
+        return print_json_response(&response_contents);
     }
 
     for (worker_id, response_content) in response_contents.iter() {
@@ -690,7 +701,13 @@ fn format_tags_to_string(tags: &BTreeMap<String, String>) -> String {
         .join(", ")
 }
 
-pub fn print_available_metrics(available_metrics: &AvailableMetrics) -> anyhow::Result<()> {
+pub fn print_available_metrics(
+    available_metrics: &AvailableMetrics,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        return print_json_response(&available_metrics);
+    }
     println!("Available metrics on the proxy level:");
     for metric_name in &available_metrics.proxy_metrics {
         println!("\t{metric_name}");
@@ -746,7 +763,10 @@ pub fn print_certificates_with_validity(
     Ok(())
 }
 
-pub fn print_request_counts(request_counts: &RequestCounts) {
+pub fn print_request_counts(request_counts: &RequestCounts, json: bool) -> anyhow::Result<()> {
+    if json {
+        return print_json_response(&request_counts);
+    }
     let mut table = Table::new();
     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
     table.add_row(row!["request type", "count"]);
@@ -755,6 +775,7 @@ pub fn print_request_counts(request_counts: &RequestCounts) {
         table.add_row(row!(request_type, count));
     }
     table.printstd();
+    Ok(())
 }
 
 // ISO 8601

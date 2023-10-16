@@ -42,19 +42,19 @@ impl CommandManager {
     pub fn soft_stop(&mut self) -> anyhow::Result<()> {
         debug!("shutting down proxy softly");
 
-        self.send_request_to_workers(RequestType::SoftStop(SoftStop {}).into(), false)
+        self.send_request(RequestType::SoftStop(SoftStop {}).into())
     }
 
     pub fn hard_stop(&mut self) -> anyhow::Result<()> {
         debug!("shutting down proxy the hard way");
 
-        self.send_request_to_workers(RequestType::HardStop(HardStop {}).into(), false)
+        self.send_request(RequestType::HardStop(HardStop {}).into())
     }
 
-    pub fn status(&mut self, json: bool) -> anyhow::Result<()> {
+    pub fn status(&mut self) -> anyhow::Result<()> {
         debug!("Requesting status…");
 
-        self.send_request_to_workers(RequestType::Status(Status {}).into(), json)
+        self.send_request(RequestType::Status(Status {}).into())
     }
 
     pub fn configure_metrics(&mut self, cmd: MetricsCmd) -> anyhow::Result<()> {
@@ -70,13 +70,13 @@ impl CommandManager {
         self.send_request(RequestType::ConfigureMetrics(configuration as i32).into())
     }
 
-    pub fn reload_configuration(&mut self, path: Option<String>, json: bool) -> anyhow::Result<()> {
+    pub fn reload_configuration(&mut self, path: Option<String>) -> anyhow::Result<()> {
         debug!("Reloading configuration…");
         let path = match path {
             Some(p) => p,
             None => String::new(),
         };
-        self.send_request_to_workers(RequestType::ReloadConfiguration(path).into(), json)
+        self.send_request(RequestType::ReloadConfiguration(path).into())
     }
 
     pub fn list_frontends(
@@ -137,7 +137,7 @@ impl CommandManager {
         }
     }
 
-    pub fn cluster_command(&mut self, cmd: ClusterCmd, json: bool) -> anyhow::Result<()> {
+    pub fn cluster_command(&mut self, cmd: ClusterCmd) -> anyhow::Result<()> {
         match cmd {
             ClusterCmd::Add {
                 id,
@@ -166,7 +166,7 @@ impl CommandManager {
                 )
             }
             ClusterCmd::Remove { id } => self.send_request(RequestType::RemoveCluster(id).into()),
-            ClusterCmd::List { id, domain } => self.query_cluster(json, id, domain),
+            ClusterCmd::List { id, domain } => self.query_cluster(id, domain),
         }
     }
 
