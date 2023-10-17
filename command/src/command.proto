@@ -467,6 +467,7 @@ message ResponseContent {
     }
 }
 
+// a map of worker_id -> ResponseContent
 message WorkerResponses {
     map<string, ResponseContent> map = 1;
 }

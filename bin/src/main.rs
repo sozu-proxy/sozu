@@ -24,8 +24,6 @@
 //! to Sōzu via its UNIX socket.
 
 #[macro_use]
-extern crate prettytable;
-#[macro_use]
 extern crate sozu_lib as sozu;
 #[macro_use]
 extern crate sozu_command_lib;

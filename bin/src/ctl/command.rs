@@ -1,21 +1,11 @@
 use anyhow::{self, bail, Context};
-use prettytable::Table;
 
 use sozu_command_lib::proto::command::{
-    request::RequestType, response_content::ContentType, ListWorkers, QueryCertificatesFilters,
-    QueryClusterByDomain, QueryClustersHashes, QueryMetricsOptions, Request, Response,
-    ResponseContent, ResponseStatus, RunState, UpgradeMain,
+    request::RequestType, response_content::ContentType, ListWorkers, QueryMetricsOptions, Request,
+    Response, ResponseContent, ResponseStatus, RunState, UpgradeMain,
 };
 
-use crate::ctl::{
-    create_channel,
-    display::{
-        print_available_metrics, print_certificates_by_worker, print_certificates_with_validity,
-        print_cluster_responses, print_frontend_list, print_json_response, print_listeners,
-        print_metrics, print_request_counts, print_status,
-    },
-    CommandManager,
-};
+use crate::ctl::{create_channel, CommandManager};
 
 impl CommandManager {
     fn write_request_on_channel(&mut self, request: Request) -> anyhow::Result<()> {
@@ -44,25 +34,7 @@ impl CommandManager {
                 }
                 ResponseStatus::Failure => bail!("Request failed: {}", response.message),
                 ResponseStatus::Ok => {
-                    println!("{}", response.message);
-
-                    if let Some(response_content) = response.content {
-                        match response_content.content_type {
-                            Some(ContentType::RequestCounts(request_counts)) => {
-                                print_request_counts(&request_counts, self.json)?;
-                            }
-                            Some(ContentType::FrontendList(frontends)) => {
-                                print_frontend_list(frontends, self.json)?;
-                            }
-                            Some(ContentType::Workers(worker_infos)) => {
-                                print_status(worker_infos, self.json)?;
-                            }
-                            Some(ContentType::ListenersList(list)) => {
-                                print_listeners(list, self.json)?;
-                            }
-                            _ => {}
-                        }
-                    }
+                    response.display(self.json)?;
                     break;
                 }
             }
@@ -96,17 +68,8 @@ impl CommandManager {
                         content_type: Some(ContentType::Workers(ref worker_infos)),
                     }) = response.content
                     {
-                        let mut table = Table::new();
-                        table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
-                        table.add_row(row!["Worker", "pid", "run state"]);
-                        for worker in worker_infos.vec.iter() {
-                            let run_state = format!("{:?}", worker.run_state);
-                            table.add_row(row![worker.id, worker.pid, run_state]);
-                        }
-
-                        println!();
-                        table.printstd();
-                        println!();
+                        // display worker status
+                        response.display(false)?;
 
                         self.write_request_on_channel(
                             RequestType::UpgradeMain(UpgradeMain {}).into(),
@@ -225,28 +188,8 @@ impl CommandManager {
                     ResponseStatus::Processing => {
                         debug!("Proxy is processing: {}", response.message);
                     }
-                    ResponseStatus::Failure => {
-                        if self.json {
-                            return print_json_response(&response.message);
-                        } else {
-                            bail!("could not query proxy state: {}", response.message);
-                        }
-                    }
-                    ResponseStatus::Ok => {
-                        if let Some(response_content) = response.content {
-                            match response_content.content_type {
-                                Some(ContentType::Metrics(aggregated_metrics_data)) => {
-                                    print_metrics(aggregated_metrics_data, self.json)?
-                                }
-                                Some(ContentType::AvailableMetrics(available)) => {
-                                    print_available_metrics(&available, self.json)?;
-                                }
-                                _ => {
-                                    debug!("Wrong kind of response here");
-                                }
-                            }
-                        }
-
+                    ResponseStatus::Failure | ResponseStatus::Ok => {
+                        response.display(self.json)?;
                         break;
                     }
                 }
@@ -264,171 +207,6 @@ impl CommandManager {
             );
         }
 
-        Ok(())
-    }
-
-    pub fn query_cluster(
-        &mut self,
-        cluster_id: Option<String>,
-        domain: Option<String>,
-    ) -> Result<(), anyhow::Error> {
-        if cluster_id.is_some() && domain.is_some() {
-            bail!("Error: Either request an cluster ID or a domain name");
-        }
-
-        let request = if let Some(ref cluster_id) = cluster_id {
-            RequestType::QueryClusterById(cluster_id.to_string()).into()
-        } else if let Some(ref domain) = domain {
-            let splitted: Vec<String> =
-                domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
-
-            if splitted.is_empty() {
-                bail!("Domain can't be empty");
-            }
-
-            let query_domain = QueryClusterByDomain {
-                hostname: splitted
-                    .get(0)
-                    .with_context(|| "Domain can't be empty")?
-                    .clone(),
-                path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
-            };
-
-            RequestType::QueryClustersByDomain(query_domain).into()
-        } else {
-            RequestType::QueryClustersHashes(QueryClustersHashes {}).into()
-        };
-
-        self.write_request_on_channel(request)?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            match response.status() {
-                ResponseStatus::Processing => {
-                    debug!("Proxy is processing: {}", response.message);
-                }
-                ResponseStatus::Failure => {
-                    if self.json {
-                        print_json_response(&response.message)?;
-                    }
-                    bail!("could not query proxy state: {}", response.message);
-                }
-                ResponseStatus::Ok => {
-                    match response.content {
-                        Some(ResponseContent {
-                            content_type: Some(ContentType::WorkerResponses(worker_responses)),
-                        }) => print_cluster_responses(
-                            cluster_id,
-                            domain,
-                            worker_responses,
-                            self.json,
-                        )?,
-                        _ => bail!("Wrong response content"),
-                    }
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn query_certificates(
-        &mut self,
-        fingerprint: Option<String>,
-        domain: Option<String>,
-        query_workers: bool,
-    ) -> Result<(), anyhow::Error> {
-        let filters = QueryCertificatesFilters {
-            domain,
-            fingerprint,
-        };
-
-        if query_workers {
-            self.query_certificates_from_workers(filters)
-        } else {
-            self.query_certificates_from_the_state(filters)
-        }
-    }
-
-    fn query_certificates_from_workers(
-        &mut self,
-        filters: QueryCertificatesFilters,
-    ) -> Result<(), anyhow::Error> {
-        self.write_request_on_channel(RequestType::QueryCertificatesFromWorkers(filters).into())?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            match response.status() {
-                ResponseStatus::Processing => {
-                    debug!("Proxy is processing: {}", response.message);
-                }
-                ResponseStatus::Failure => {
-                    if self.json {
-                        print_json_response(&response.message)?;
-                    }
-                    bail!("could not get certificate: {}", response.message);
-                }
-                ResponseStatus::Ok => {
-                    info!("We did get a response from the proxy");
-                    match response.content {
-                        Some(ResponseContent {
-                            content_type: Some(ContentType::WorkerResponses(worker_responses)),
-                        }) => print_certificates_by_worker(worker_responses.map, self.json)?,
-                        _ => bail!("unexpected response: {:?}", response.content),
-                    }
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn query_certificates_from_the_state(
-        &mut self,
-        filters: QueryCertificatesFilters,
-    ) -> anyhow::Result<()> {
-        self.write_request_on_channel(RequestType::QueryCertificatesFromTheState(filters).into())?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            match response.status() {
-                ResponseStatus::Processing => {
-                    debug!("Proxy is processing: {}", response.message);
-                }
-                ResponseStatus::Failure => {
-                    bail!("could not get certificate: {}", response.message);
-                }
-                ResponseStatus::Ok => {
-                    debug!("We did get a response from the proxy");
-                    trace!("response message: {:?}\n", response.message);
-
-                    if let Some(response_content) = response.content {
-                        let certs = match response_content.content_type {
-                            Some(ContentType::CertificatesWithFingerprints(certs)) => certs.certs,
-                            _ => bail!(format!("Wrong response content {:?}", response_content)),
-                        };
-                        if certs.is_empty() {
-                            bail!("No certificates match your request.");
-                        }
-
-                        if self.json {
-                            print_json_response(&certs)?;
-                        } else {
-                            print_certificates_with_validity(certs)
-                                .with_context(|| "Could not show certificate")?;
-                        }
-                    } else {
-                        debug!("No response content.");
-                    }
-
-                    break;
-                }
-            }
-        }
         Ok(())
     }
 }

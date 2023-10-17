@@ -14,8 +14,6 @@ use crate::{
 };
 
 mod command;
-/// TODO: just create a display() method on sozu_command_lib::Response and put everything in there
-mod display;
 mod request_builder;
 
 pub struct CommandManager {
