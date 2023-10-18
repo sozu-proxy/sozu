@@ -117,7 +117,7 @@ pub fn handle_header<C>(
                 version: Version::V20,
                 code,
                 status,
-                reason: Store::Static(b"Default"),
+                reason: Store::Static(b"FromH2"),
             }
         }
     };

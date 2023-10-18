@@ -44,7 +44,7 @@ impl Backend {
 
     /// Binds itself to its address, stores the yielded TCP listener
     pub fn connect(&mut self) {
-        let listener = TcpListener::bind(self.address).expect("could not bind");
+        let listener = TcpListener::bind(self.address).expect(&format!("could not bind on: {}", self.address));
         let timeout = Duration::from_millis(100);
         let timeout = libc::timeval {
             tv_sec: 0,

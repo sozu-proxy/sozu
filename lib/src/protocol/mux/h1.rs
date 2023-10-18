@@ -39,6 +39,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         E: Endpoint,
     {
         println_!("======= MUX H1 READABLE {:?}", self.position);
+        self.timeout_container.reset();
         let stream = &mut context.streams[self.stream];
         let parts = stream.split(&self.position);
         let kawa = parts.rbuffer;
@@ -67,6 +68,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             return MuxResult::Continue;
         }
         if kawa.is_terminated() {
+            self.timeout_container.cancel();
             self.readiness.interest.remove(Ready::READABLE);
         }
         if kawa.is_main_phase() {
@@ -95,6 +97,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         E: Endpoint,
     {
         println_!("======= MUX H1 WRITABLE {:?}", self.position);
+        self.timeout_container.reset();
         let stream = &mut context.streams[self.stream];
         let kawa = stream.wbuffer(&self.position);
         kawa.prepare(&mut kawa::h1::BlockConverter);
@@ -121,12 +124,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     match kawa.detached.status_line {
                         kawa::StatusLine::Response { code: 101, .. } => {
                             println!("============== HANDLE UPGRADE!");
-                            // unimplemented!();
                             return MuxResult::Upgrade;
                         }
                         kawa::StatusLine::Response { code: 100, .. } => {
                             println!("============== HANDLE CONTINUE!");
                             // after a 100 continue, we expect the client to continue with its request
+                            self.timeout_container.reset();
                             self.readiness.interest.insert(Ready::READABLE);
                             kawa.clear();
                             return MuxResult::Continue;
@@ -134,7 +137,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         kawa::StatusLine::Response { code: 103, .. } => {
                             println!("============== HANDLE EARLY HINT!");
                             if let StreamState::Linked(token) = stream.state {
-                                // after a 103 early hints, we expect the server to send its response
+                                // after a 103 early hints, we expect the backend to send its response
                                 endpoint
                                     .readiness_mut(token)
                                     .interest
@@ -149,6 +152,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     }
                     let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
                     if stream.context.keep_alive_frontend {
+                        self.timeout_container.reset();
                         println!("{old_state:?} {:?}", self.readiness);
                         if let StreamState::Linked(token) = old_state {
                             println!("{:?}", endpoint.readiness(token));
@@ -160,7 +164,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         stream.back.clear();
                         stream.back.storage.clear();
                         stream.front.clear();
-                        // do not clear stream.front.storage because of H1 pipelining
+                        // do not stream.front.storage.clear() because of H1 pipelining
                         stream.attempts = 0;
                     } else {
                         return MuxResult::CloseSession;

@@ -39,7 +39,7 @@ impl Client {
     /// Establish a TCP connection with its address,
     /// register the yielded TCP stream, apply timeouts
     pub fn connect(&mut self) {
-        let stream = TcpStream::connect(self.address).expect("could not connect");
+        let stream = TcpStream::connect(self.address).expect(&format!("could not connect to: {}", self.address));
         stream
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("could not set read timeout");

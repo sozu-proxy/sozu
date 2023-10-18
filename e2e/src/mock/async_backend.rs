@@ -35,7 +35,7 @@ impl<A: Aggregator + Send + Sync + 'static> BackendHandle<A> {
         let name = name.into();
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
         let (mut aggregator_tx, aggregator_rx) = mpsc::channel::<A>(1);
-        let listener = TcpListener::bind(address).expect("could not bind");
+        let listener = TcpListener::bind(address).expect(&format!("could not bind on: {address}"));
         let mut clients = Vec::new();
         let thread_name = name.to_owned();
 

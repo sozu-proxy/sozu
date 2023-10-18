@@ -1,8 +1,8 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    io::Write,
-    net::SocketAddr,
+    io::{ErrorKind, Write},
+    net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
 };
 
@@ -47,7 +47,7 @@ macro_rules! println_ {
     };
 }
 fn debug_kawa(_kawa: &GenericHttpStream) {
-    kawa::debug_kawa(_kawa);
+    // kawa::debug_kawa(_kawa);
 }
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
@@ -299,16 +299,22 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => &mut c.position,
         }
     }
-    pub fn timeout_container(&mut self) -> &mut TimeoutContainer {
-        match self {
-            Connection::H1(c) => &mut c.timeout_container,
-            Connection::H2(c) => &mut c.timeout_container,
-        }
-    }
     pub fn socket(&self) -> &TcpStream {
         match self {
             Connection::H1(c) => c.socket.socket_ref(),
             Connection::H2(c) => c.socket.socket_ref(),
+        }
+    }
+    pub fn socket_mut(&mut self) -> &mut TcpStream {
+        match self {
+            Connection::H1(c) => c.socket.socket_mut(),
+            Connection::H2(c) => c.socket.socket_mut(),
+        }
+    }
+    pub fn timeout_container(&mut self) -> &mut TimeoutContainer {
+        match self {
+            Connection::H1(c) => &mut c.timeout_container,
+            Connection::H2(c) => &mut c.timeout_container,
         }
     }
     fn force_disconnect(&mut self) -> MuxResult {
@@ -949,6 +955,9 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                                 *position = Position::Client(BackendStatus::Connected(
                                     std::mem::take(cluster_id),
                                 ));
+                                backend
+                                    .timeout_container()
+                                    .set_duration(self.router.configured_backend_timeout);
                             }
                             _ => {}
                         }
@@ -979,7 +988,29 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                 }
                 if !dead_backends.is_empty() {
                     for token in &dead_backends {
-                        self.router.backends.remove(token);
+                        let proxy_borrow = proxy.borrow();
+                        if let Some(mut backend) = self.router.backends.remove(token) {
+                            backend.timeout_container().cancel();
+                            let socket = backend.socket_mut();
+                            if let Err(e) = proxy_borrow.deregister_socket(socket) {
+                                error!("error deregistering back socket({:?}): {:?}", socket, e);
+                            }
+                            if let Err(e) = socket.shutdown(Shutdown::Both) {
+                                if e.kind() != ErrorKind::NotConnected {
+                                    error!(
+                                        "error shutting down back socket({:?}): {:?}",
+                                        socket, e
+                                    );
+                                }
+                            }
+                        } else {
+                            error!("session {:?} has no backend!", token);
+                        }
+                        if !proxy_borrow.remove_session(*token) {
+                            error!("session {:?} was already removed!", token);
+                        } else {
+                            println!("SUCCESS: session {token:?} was removed!");
+                        }
                     }
                     println_!("FRONTEND: {:#?}", self.frontend);
                     println_!("BACKENDS: {:#?}", self.router.backends);
@@ -1011,10 +1042,15 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
             }
 
             let context = &mut self.context;
-            let front_readiness = self.frontend.readiness_mut();
             let mut dirty = false;
             for stream_id in 0..context.streams.len() {
                 if context.streams[stream_id].state == StreamState::Link {
+                    // Before the first request triggers a stream Link, the frontend timeout is set
+                    // to a shorter request_timeout, here we switch to the longer nominal timeout
+                    self.frontend
+                        .timeout_container()
+                        .set_duration(self.configured_frontend_timeout);
+                    let front_readiness = self.frontend.readiness_mut();
                     dirty = true;
                     match self.router.connect(
                         stream_id,
@@ -1103,9 +1139,9 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
                         should_write = true;
                     }
                     StreamState::Linked(_) => {
-                        // A stream Linked to a backend is waiting for the response, not the answer.
+                        // A stream Linked to a backend is waiting for the response, not the request.
                         // For streaming or malformed requests, it is possible that the request is not
-                        // terminated at this point. For now, we do nothing and
+                        // terminated at this point. For now, we do nothing
                         should_close = false;
                     }
                     StreamState::Unlinked => {
@@ -1200,27 +1236,48 @@ impl<Front: SocketHandler + std::fmt::Debug> SessionState for Mux<Front> {
         }
     }
 
-    fn close(&mut self, _proxy: Rc<RefCell<dyn L7Proxy>>, _metrics: &mut SessionMetrics) {
-        let s = match &mut self.frontend {
-            Connection::H1(c) => &mut c.socket,
-            Connection::H2(c) => &mut c.socket,
-        };
-        let mut b = [0; 1024];
-        let (size, status) = s.socket_read(&mut b);
-        println_!("{size} {status:?} {:?}", &b[..size]);
-        for stream in &mut self.context.streams {
-            for kawa in [&mut stream.front, &mut stream.back] {
-                debug_kawa(kawa);
-                kawa.prepare(&mut kawa::h1::BlockConverter);
-                let out = kawa.as_io_slice();
-                let mut writer = std::io::BufWriter::new(Vec::new());
-                let amount = writer.write_vectored(&out).unwrap();
-                println_!(
-                    "amount: {amount}\n{}",
-                    String::from_utf8_lossy(writer.buffer())
-                );
+    fn close(&mut self, proxy: Rc<RefCell<dyn L7Proxy>>, _metrics: &mut SessionMetrics) {
+        println_!("FRONTEND: {:#?}", self.frontend);
+        println_!("BACKENDS: {:#?}", self.router.backends);
+
+        for (token, backend) in &mut self.router.backends {
+            let proxy_borrow = proxy.borrow();
+            backend.timeout_container().cancel();
+            let socket = backend.socket_mut();
+            if let Err(e) = proxy_borrow.deregister_socket(socket) {
+                error!("error deregistering back socket({:?}): {:?}", socket, e);
+            }
+            if let Err(e) = socket.shutdown(Shutdown::Both) {
+                if e.kind() != ErrorKind::NotConnected {
+                    error!("error shutting down back socket({:?}): {:?}", socket, e);
+                }
+            }
+            if !proxy_borrow.remove_session(*token) {
+                error!("session {:?} was already removed!", token);
+            } else {
+                println!("SUCCESS: session {token:?} was removed!");
             }
         }
+        // let s = match &mut self.frontend {
+        //     Connection::H1(c) => &mut c.socket,
+        //     Connection::H2(c) => &mut c.socket,
+        // };
+        // let mut b = [0; 1024];
+        // let (size, status) = s.socket_read(&mut b);
+        // println_!("{size} {status:?} {:?}", &b[..size]);
+        // for stream in &mut self.context.streams {
+        //     for kawa in [&mut stream.front, &mut stream.back] {
+        //         debug_kawa(kawa);
+        //         kawa.prepare(&mut kawa::h1::BlockConverter);
+        //         let out = kawa.as_io_slice();
+        //         let mut writer = std::io::BufWriter::new(Vec::new());
+        //         let amount = writer.write_vectored(&out).unwrap();
+        //         println_!(
+        //             "amount: {amount}\n{}",
+        //             String::from_utf8_lossy(writer.buffer())
+        //         );
+        //     }
+        // }
     }
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {

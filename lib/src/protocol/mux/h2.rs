@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::from_utf8_unchecked};
+use std::collections::HashMap;
 
 use rusty_ulid::Ulid;
 use sozu_command::ready::Ready;
@@ -60,7 +60,7 @@ impl Default for H2Settings {
         Self {
             settings_header_table_size: 4096,
             settings_enable_push: true,
-            settings_max_concurrent_streams: 256,
+            settings_max_concurrent_streams: 100,
             settings_initial_window_size: (1 << 16) - 1,
             settings_max_frame_size: 1 << 14,
             settings_max_header_list_size: u32::MAX,
@@ -128,6 +128,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
     {
         println_!("======= MUX H2 READABLE {:?}", self.position);
+        self.timeout_container.reset();
         let (stream_id, kawa) = if let Some((stream_id, amount)) = self.expect_read {
             let kawa = match stream_id {
                 H2StreamId::Zero => &mut self.zero,
@@ -269,7 +270,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         self.expect_read = Some((stream_id, header.payload_len as usize));
                         self.state = H2State::Frame(header);
                     }
-                    Err(e) => panic!("stream error: {:?}", error_nom_to_h2(e)),
+                    Err(_) => return self.goaway(H2Error::ProtocolError),
                 };
             }
             (H2State::ContinuationHeader(headers), _) => {
@@ -287,7 +288,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         headers.header_block_fragment.len += header.payload_len;
                         self.state = H2State::ContinuationFrame(headers);
                     }
-                    Err(e) => panic!("stream error: {:?}", error_nom_to_h2(e)),
+                    Err(_) => return self.goaway(H2Error::ProtocolError),
                 };
             }
             (H2State::Frame(header), _) => {
@@ -325,6 +326,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
     {
         println_!("======= MUX H2 WRITABLE {:?}", self.position);
+        self.timeout_container.reset();
         if let Some(H2StreamId::Zero) = self.expect_write {
             let kawa = &mut self.zero;
             println_!("{:?}", kawa.storage.data());
@@ -607,7 +609,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     rst_stream.error_code,
                     error_code_to_str(rst_stream.error_code)
                 );
-                self.streams.remove(&rst_stream.stream_id);
+                if let Some(stream_id) = self.streams.remove(&rst_stream.stream_id) {
+                    let stream = &mut context.streams[stream_id];
+                    if let StreamState::Linked(token) = stream.state {
+                        endpoint.end_stream(token, stream_id, context);
+                    }
+                    let stream = &mut context.streams[stream_id];
+                    match self.position {
+                        Position::Client(_) => {}
+                        Position::Server => {
+                            stream.state = StreamState::Recycle;
+                        }
+                    }
+                }
             }
             Frame::Settings(settings) => {
                 if settings.ack {
