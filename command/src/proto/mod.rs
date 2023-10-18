@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use command::{filtered_metrics::Inner, AggregatedMetrics, ClusterMetrics, FilteredMetrics};
+use command::{
+    filtered_metrics::Inner, AggregatedMetrics, Bucket, ClusterMetrics, FilteredHistogram,
+    FilteredMetrics,
+};
 use prost::DecodeError;
 
 /// Contains all types received by and sent from Sōzu
@@ -130,13 +133,39 @@ impl FilteredMetrics {
                     inner: Some(Inner::Count(a + b)),
                 };
             }
+            (Some(Inner::Histogram(a)), Some(Inner::Histogram(b))) => {
+                let longest_len = a.buckets.len().max(b.buckets.len());
+
+                let buckets = (0..longest_len)
+                    .map(|i| Bucket {
+                        le: (1 << i) - 1, // the bucket less-or-equal limits are normalized: 0, 1, 3, 7, 15, ...
+                        count: a
+                            .buckets
+                            .get(i)
+                            .and_then(|buck| Some(buck.count))
+                            .unwrap_or(0)
+                            + b.buckets
+                                .get(i)
+                                .and_then(|buck| Some(buck.count))
+                                .unwrap_or(0),
+                    })
+                    .collect();
+
+                *self = Self {
+                    inner: Some(Inner::Histogram(FilteredHistogram {
+                        count: a.count + b.count,
+                        sum: a.sum + b.sum,
+                        buckets,
+                    })),
+                };
+            }
             _ => {}
         }
     }
 
     fn is_mergeable(&self) -> bool {
         match &self.inner {
-            Some(Inner::Gauge(_)) | Some(Inner::Count(_)) => true,
+            Some(Inner::Gauge(_)) | Some(Inner::Count(_)) | Some(Inner::Histogram(_)) => true,
             // Inner::Time and Inner::Timeserie are never used in Sōzu
             Some(Inner::Time(_))
             | Some(Inner::Percentiles(_))

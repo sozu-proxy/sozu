@@ -25,6 +25,8 @@ use crate::{
     AsString,
 };
 
+use super::command::FilteredHistogram;
+
 impl Display for CertificateAndKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let versions = self.versions.iter().fold(String::new(), |acc, tls_v| {
@@ -240,14 +242,14 @@ pub fn print_metrics(aggregated_metrics: &AggregatedMetrics) -> Result<(), Displ
     println!("\nMAIN PROCESS\n============");
     print_proxy_metrics(&aggregated_metrics.main);
 
-    if aggregated_metrics.proxying.len() != 0 {
+    if !aggregated_metrics.proxying.is_empty() {
         println!("\nPROXYING\n============");
         print_proxy_metrics(&aggregated_metrics.proxying);
     }
 
     // workers
     for (worker_id, worker) in aggregated_metrics.workers.iter() {
-        if worker.clusters.len() != 0 && worker.proxy.len() != 0 {
+        if !worker.clusters.is_empty() && !worker.proxy.is_empty() {
             println!("\nWorker {worker_id}\n=========");
             print_worker_metrics(worker)?;
         }
@@ -266,6 +268,7 @@ fn print_proxy_metrics(proxy_metrics: &BTreeMap<String, FilteredMetrics>) {
     let filtered = filter_metrics(proxy_metrics);
     print_gauges_and_counts(&filtered);
     print_percentiles(&filtered);
+    print_histograms(&filtered);
 }
 
 fn print_worker_metrics(worker_metrics: &WorkerMetrics) -> Result<(), DisplayError> {
@@ -282,6 +285,7 @@ fn print_cluster_metrics(cluster_metrics: &BTreeMap<String, ClusterMetrics>) {
         let filtered = filter_metrics(&cluster_metrics_data.cluster);
         print_gauges_and_counts(&filtered);
         print_percentiles(&filtered);
+        print_histograms(&filtered);
 
         // backend_id -> (metric_name -> value )
         let mut backend_metric_acc: HashMap<String, BTreeMap<String, FilteredMetrics>> =
@@ -303,6 +307,7 @@ fn print_cluster_metrics(cluster_metrics: &BTreeMap<String, ClusterMetrics>) {
             let filtered = filter_metrics(&metrics);
             print_gauges_and_counts(&filtered);
             print_percentiles(&filtered);
+            print_histograms(&filtered);
         }
     }
 }
@@ -419,6 +424,59 @@ fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     }
 
     percentile_table.printstd();
+}
+
+fn print_histograms(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
+    let histograms: BTreeMap<String, FilteredHistogram> = filtered_metrics
+        .iter()
+        .filter_map(|(name, metric)| match metric.inner.clone() {
+            Some(filtered_metrics::Inner::Histogram(hist)) => Some((name.to_owned(), hist)),
+            _ => None,
+        })
+        .collect();
+
+    let mut histogram_titles: Vec<String> = histograms.keys().map(ToOwned::to_owned).collect();
+    histogram_titles.sort();
+    if histogram_titles.is_empty() {
+        return;
+    }
+
+    let mut histogram_table = Table::new();
+    histogram_table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+
+    let mut first_row = Row::new(vec![cell!("Histograms (ms)"), cell!("sum"), cell!("count")]);
+
+    let biggest_hist_length = histograms
+        .values()
+        .map(|hist| hist.buckets.len())
+        .max()
+        .unwrap_or(0);
+
+    // 0, 1, 3, 7... in the upper row
+    for exponent in 0..biggest_hist_length {
+        first_row.add_cell(cell!(format!("{}", (1 << exponent) - 1)));
+    }
+    histogram_table.set_titles(first_row);
+
+    for title in histogram_titles {
+        if let Some(hist) = histograms.get(&title) {
+            let trimmed_name = title.strip_suffix("_histogram").unwrap_or_default();
+            let mut row = Row::new(vec![
+                cell!(trimmed_name),
+                cell!(hist.sum),
+                cell!(hist.count),
+            ]);
+            // display the count by bucket, not the incremented count
+            let mut last_bucket_count = 0;
+            for bucket in &hist.buckets {
+                row.add_cell(cell!(bucket.count - last_bucket_count));
+                last_bucket_count = bucket.count;
+            }
+            histogram_table.add_row(row);
+        }
+    }
+
+    histogram_table.printstd();
 }
 
 fn print_available_metrics(available_metrics: &AvailableMetrics) -> Result<(), DisplayError> {
