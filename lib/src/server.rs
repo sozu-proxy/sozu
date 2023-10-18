@@ -957,7 +957,6 @@ impl Server {
             }
             _other_request => {}
         }
-
         self.notify_proxys(message);
     }
 
