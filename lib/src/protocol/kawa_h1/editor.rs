@@ -171,11 +171,9 @@ impl HttpContext {
             let has_forwarded = forwarded.is_some();
 
             if let Some(header) = x_for {
-                header.val = kawa::Store::from_string(format!(
-                    "{}, {}",
-                    unsafe { from_utf8_unchecked(header.val.data(buf)) },
-                    peer_ip
-                ));
+                header.val = kawa::Store::from_string(format!("{}, {peer_ip}", unsafe {
+                    from_utf8_unchecked(header.val.data(buf))
+                }));
             }
             if let Some(header) = &mut forwarded {
                 let value = unsafe { from_utf8_unchecked(header.val.data(buf)) };
@@ -208,19 +206,13 @@ impl HttpContext {
                     val: kawa::Store::from_string(peer_ip.to_string()),
                 }));
             }
-            if !has_x_port {
-                request.push_block(kawa::Block::Header(kawa::Pair {
-                    key: kawa::Store::Static(b"X-Forwarded-Port"),
-                    val: kawa::Store::from_string(peer_port.to_string()),
-                }));
-            }
             if !has_forwarded {
                 let value = match (peer_ip, public_ip) {
                     (IpAddr::V4(_), IpAddr::V4(_)) => {
                         format!("proto={proto};for={peer_ip}:{peer_port};by={public_ip}")
                     }
                     (IpAddr::V4(_), IpAddr::V6(_)) => {
-                        format!("proto={proto};for={peer_ip}:{peer_port};by=\"{public_ip}")
+                        format!("proto={proto};for={peer_ip}:{peer_port};by=\"{public_ip}\"")
                     }
                     (IpAddr::V6(_), IpAddr::V4(_)) => {
                         format!("proto={proto};for=\"{peer_ip}:{peer_port}\";by={public_ip}")
@@ -234,6 +226,12 @@ impl HttpContext {
                     val: kawa::Store::from_string(value),
                 }));
             }
+        }
+        if !has_x_port {
+            request.push_block(kawa::Block::Header(kawa::Pair {
+                key: kawa::Store::Static(b"X-Forwarded-Port"),
+                val: kawa::Store::from_string(public_port.to_string()),
+            }));
         }
         if !has_x_proto {
             request.push_block(kawa::Block::Header(kawa::Pair {

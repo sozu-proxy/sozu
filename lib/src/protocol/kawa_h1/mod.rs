@@ -238,6 +238,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.container_backend_timeout.cancel();
         self.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
         self.backend_readiness.interest = Ready::HUP | Ready::ERROR;
+        if !self.request_stream.storage.is_empty() {
+            self.frontend_readiness.event.insert(Ready::READABLE);
+        }
     }
 
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
