@@ -1409,6 +1409,131 @@ pub fn try_head() -> State {
     State::Success
 }
 
+fn try_wildcard() -> State {
+    use sozu_command_lib::proto::command::{PathRule, RulePosition};
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let mut worker = Worker::start_new_worker("WLD_CRD", config, &listeners, state);
+    worker.send_proxy_request(
+        RequestType::AddHttpListener(
+            ListenerBuilder::new_http(front_address)
+                .to_http(None)
+                .unwrap(),
+        )
+        .into(),
+    );
+    worker.send_proxy_request(
+        RequestType::ActivateListener(ActivateListener {
+            address: front_address.to_string(),
+            proxy: ListenerType::Http.into(),
+            from_scm: false,
+        })
+        .into(),
+    );
+
+    worker.send_proxy_request(
+        RequestType::AddCluster(Worker::default_cluster("cluster_0", false)).into(),
+    );
+    worker.send_proxy_request(
+        RequestType::AddCluster(Worker::default_cluster("cluster_1", false)).into(),
+    );
+
+    worker.send_proxy_request(
+        RequestType::AddHttpFrontend(RequestHttpFrontend {
+            cluster_id: Some("cluster_0".to_string()),
+            address: front_address.to_string(),
+            hostname: String::from("*.sozu.io"),
+            path: PathRule::prefix(String::from("")),
+            position: RulePosition::Tree.into(),
+            ..Default::default()
+        })
+        .into(),
+    );
+
+    let back_address: SocketAddr = create_local_address();
+    worker.send_proxy_request(
+        RequestType::AddBackend(Worker::default_backend(
+            "cluster_0",
+            "cluster_0-0",
+            back_address.to_string(),
+            None,
+        ))
+        .into(),
+    );
+    worker.read_to_last();
+
+    let mut backend0 = SyncBackend::new(
+        "BACKEND_0",
+        back_address,
+        http_ok_response(format!("pong0")),
+    );
+
+    let mut client = Client::new(
+        "client",
+        front_address,
+        http_request(
+            "POST",
+            "/api",
+            format!("ping"),
+            "www.sozu.io",
+        ),
+    );
+
+    backend0.connect();
+    client.connect();
+    client.send();
+    let accepted = backend0.accept(0);
+    assert!(accepted);
+    let request = backend0.receive(0);
+    println!("request: {request:?}");
+    backend0.send(0);
+    let response = client.receive();
+    println!("response: {response:?}");
+
+    worker.send_proxy_request(
+        RequestType::AddHttpFrontend(RequestHttpFrontend {
+            cluster_id: Some("cluster_1".to_string()),
+            address: front_address.to_string(),
+            hostname: String::from("*.sozu.io"),
+            path: PathRule::prefix(String::from("/api")),
+            position: RulePosition::Tree.into(),
+            ..Default::default()
+        })
+        .into(),
+    );
+    let back_address: SocketAddr = create_local_address();
+    worker.send_proxy_request(
+        RequestType::AddBackend(Worker::default_backend(
+            "cluster_1",
+            "cluster_1-0",
+            back_address.to_string(),
+            None,
+        ))
+        .into(),
+    );
+
+    let mut backend1 = SyncBackend::new(
+        "BACKEND_1",
+        back_address,
+        http_ok_response(format!("pong1")),
+    );
+
+    worker.read_to_last();
+
+    backend1.connect();
+
+    client.send();
+    let accepted = backend1.accept(0);
+    assert!(accepted);
+    let request = backend1.receive(0);
+    println!("request: {request:?}");
+    backend1.send(0);
+    let response = client.receive();
+    println!("response: {response:?}");
+
+    State::Success
+}
 
 #[test]
 fn test_sync() {
@@ -1577,6 +1702,14 @@ fn test_max_connections() {
 fn test_head() {
     assert_eq!(
         repeat_until_error_or(10, "Head request", try_head),
+        State::Success
+    );
+}
+
+#[test]
+fn test_wildcard() {
+    assert_eq!(
+        repeat_until_error_or(1, "Hostname with wildcard", try_wildcard),
         State::Success
     );
 }

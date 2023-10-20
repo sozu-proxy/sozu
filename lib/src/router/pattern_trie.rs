@@ -28,6 +28,12 @@ fn find_last_slash(input: &[u8]) -> Option<usize> {
     (0..input.len()).rev().find(|&i| input[i] == b'/')
 }
 
+/// Implementation of a trie tree structure.
+/// In Sozu this is used to store and lookup domains recursively.
+/// Each node represents a "level domain".
+/// A leaf node (leftmost label) can be a wildcard, a regex pattern or a plain string.
+/// Leaves also store a value associated with the complete domain.
+/// For Sozu it is a list of (PathRule, MethodRule, ClusterId). See the Router strucure.
 #[derive(Debug)]
 pub struct TrieNode<V> {
     key_value: Option<KeyValue<Key, V>>,
@@ -81,7 +87,10 @@ impl<V: Debug + Clone> TrieNode<V> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.key_value.is_none() && self.wildcard.is_none() && self.children.is_empty()
+        self.key_value.is_none()
+            && self.wildcard.is_none()
+            && self.regexps.is_empty()
+            && self.children.is_empty()
     }
 
     pub fn insert(&mut self, key: Key, value: V) -> InsertResult {
@@ -93,9 +102,9 @@ impl<V: Debug + Clone> TrieNode<V> {
             return InsertResult::Failed;
         }
 
-        let res = self.insert_recursive(&key, &key, value);
-        assert_ne!(res, InsertResult::Failed);
-        res
+        let insert_result = self.insert_recursive(&key, &key, value);
+        assert_ne!(insert_result, InsertResult::Failed);
+        insert_result
     }
 
     pub fn insert_recursive(&mut self, partial_key: &[u8], key: &Key, value: V) -> InsertResult {
@@ -111,9 +120,9 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
-                    for t in self.regexps.iter() {
+                    for t in self.regexps.iter_mut() {
                         if t.0.as_str() == s {
-                            return InsertResult::Existing;
+                            return t.1.insert_recursive(&partial_key[..pos - 1], key, value);
                         }
                     }
 
@@ -205,12 +214,28 @@ impl<V: Debug + Clone> TrieNode<V> {
             let pos = find_last_slash(&partial_key[..partial_key.len() - 1]);
 
             if let Some(pos) = pos {
+                if pos > 0 && partial_key[pos - 1] != b'.' {
+                    return RemoveResult::NotFound;
+                }
+
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
-                    let len = self.regexps.len();
-                    // FIXME: we might have multiple entries with the same regex
-                    self.regexps.retain(|(r, _)| r.as_str() != s);
-                    if len > self.regexps.len() {
-                        return RemoveResult::Ok;
+                    if pos > 0 {
+                        let mut remove_result = RemoveResult::NotFound;
+                        for t in self.regexps.iter_mut() {
+                            if t.0.as_str() == s {
+                                if t.1.remove_recursive(&partial_key[..pos - 1]) == RemoveResult::Ok
+                                {
+                                    remove_result = RemoveResult::Ok;
+                                }
+                            }
+                        }
+                        return remove_result;
+                    } else {
+                        let len = self.regexps.len();
+                        self.regexps.retain(|(r, _)| r.as_str() != s);
+                        if len > self.regexps.len() {
+                            return RemoveResult::Ok;
+                        }
                     }
                 }
             }
@@ -229,18 +254,14 @@ impl<V: Debug + Clone> TrieNode<V> {
             Some(child) => match child.remove_recursive(prefix) {
                 RemoveResult::NotFound => return RemoveResult::NotFound,
                 RemoveResult::Ok => {
-                    if !child.is_empty() {
-                        return RemoveResult::Ok;
+                    if child.is_empty() {
+                        self.children.remove(suffix);
                     }
+                    return RemoveResult::Ok;
                 }
             },
             None => return RemoveResult::NotFound,
         }
-
-        // if we reach here, that means we called remove_recursive on a child
-        // and the child is now empty
-        self.children.remove(suffix);
-        RemoveResult::Ok
     }
 
     pub fn lookup(&self, partial_key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key, V>> {
@@ -261,7 +282,6 @@ impl<V: Debug + Clone> TrieNode<V> {
             Some(child) => child.lookup(prefix, accept_wildcard),
             None => {
                 //println!("no child found, testing wildcard and regexps");
-                //self.print();
 
                 if prefix.is_empty() && self.wildcard.is_some() && accept_wildcard {
                     //println!("no dot, wildcard applies");
@@ -269,15 +289,15 @@ impl<V: Debug + Clone> TrieNode<V> {
                 } else {
                     //println!("there's still a subdomain, wildcard does not apply");
 
-                    for (ref r, ref child) in self.regexps.iter() {
-                        let s = if suffix[0] == b'.' {
+                    for (ref regexp, ref child) in self.regexps.iter() {
+                        let suffix = if suffix[0] == b'.' {
                             &suffix[1..]
                         } else {
                             suffix
                         };
                         //println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
 
-                        if r.is_match(s) {
+                        if regexp.is_match(suffix) {
                             //println!("matched");
                             return child.lookup(prefix, accept_wildcard);
                         }
@@ -300,6 +320,30 @@ impl<V: Debug + Clone> TrieNode<V> {
             return self.key_value.as_mut();
         }
 
+        if partial_key == &b"*"[..] {
+            return self.wildcard.as_mut();
+        }
+
+        if partial_key[partial_key.len() - 1] == b'/' {
+            let pos = find_last_slash(&partial_key[..partial_key.len() - 1]);
+
+            if let Some(pos) = pos {
+                if pos > 0 && partial_key[pos - 1] != b'.' {
+                    return None;
+                }
+
+                if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
+                    for t in self.regexps.iter_mut() {
+                        if t.0.as_str() == s {
+                            return t.1.lookup_mut(&partial_key[..pos - 1], accept_wildcard);
+                        }
+                    }
+                }
+            }
+
+            return None;
+        }
+
         let pos = find_last_dot(partial_key);
         let (prefix, suffix) = match pos {
             None => (&b""[..], partial_key),
@@ -318,15 +362,15 @@ impl<V: Debug + Clone> TrieNode<V> {
                 } else {
                     //println!("there's still a subdomain, wildcard does not apply");
 
-                    for (ref r, ref mut child) in self.regexps.iter_mut() {
-                        let s = if suffix[0] == b'.' {
+                    for (ref regexp, ref mut child) in self.regexps.iter_mut() {
+                        let suffix = if suffix[0] == b'.' {
                             &suffix[1..]
                         } else {
                             suffix
                         };
                         //println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
 
-                        if r.is_match(s) {
+                        if regexp.is_match(suffix) {
                             //println!("matched");
                             return child.lookup_mut(prefix, accept_wildcard);
                         }
@@ -492,6 +536,45 @@ mod tests {
         assert_eq!(root3.insert(Vec::from(&b"abcd"[..]), 1), InsertResult::Ok);
         root3.print();
         assert_eq!(root, root3);
+    }
+
+    #[test]
+    fn insert_remove_through_regex() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+        println!("creating root:");
+        root.print();
+
+        println!("adding (www./.*/.com, 1)");
+        assert_eq!(
+            root.insert(Vec::from(&b"www./.*/.com"[..]), 1),
+            InsertResult::Ok
+        );
+        root.print();
+        println!("adding (www.doc./.*/.com, 2)");
+        assert_eq!(
+            root.insert(Vec::from(&b"www.doc./.*/.com"[..]), 2),
+            InsertResult::Ok
+        );
+        root.print();
+        assert_eq!(
+            root.domain_lookup(&b"www.sozu.com".to_vec(), false),
+            Some(&(b"www./.*/.com".to_vec(), 1))
+        );
+        assert_eq!(
+            root.domain_lookup(&b"www.doc.sozu.com".to_vec(), false),
+            Some(&(b"www.doc./.*/.com".to_vec(), 2))
+        );
+
+        assert_eq!(
+            root.domain_remove(&b"www./.*/.com".to_vec()),
+            RemoveResult::Ok
+        );
+        root.print();
+        assert_eq!(root.domain_lookup(&b"www.sozu.com".to_vec(), false), None);
+        assert_eq!(
+            root.domain_lookup(&b"www.doc.sozu.com".to_vec(), false),
+            Some(&(b"www.doc./.*/.com".to_vec(), 2))
+        );
     }
 
     #[test]
