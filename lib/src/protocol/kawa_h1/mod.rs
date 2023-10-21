@@ -1435,8 +1435,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             if self.backend_readiness.event.is_hup() && !self.test_backend_socket() {
                 //retry connecting the backend
                 error!(
-                    "{} error connecting to backend, trying again",
-                    self.log_context()
+                    "{} error connecting to backend, trying again, attempt {}",
+                    self.log_context(),
+                    self.connection_attempts
                 );
 
                 self.connection_attempts += 1;
