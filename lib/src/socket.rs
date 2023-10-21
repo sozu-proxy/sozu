@@ -222,7 +222,10 @@ impl SocketHandler for FrontRustls {
             while !self.session.wants_read() {
                 match self.session.reader().read(&mut buf[size..]) {
                     Ok(0) => break,
-                    Ok(sz) => size += sz,
+                    Ok(sz) => {
+                        size += sz;
+                        can_read = true;
+                    },
                     Err(e) => match e.kind() {
                         ErrorKind::WouldBlock => {
                             break;
