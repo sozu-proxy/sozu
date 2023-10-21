@@ -221,6 +221,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     pub fn log_request_error(&self, metrics: &SessionMetrics, message: &str) {
         incr!("pipe.errors");
+        warn!("could not process request properly got: {}", message);
+        self.print_state(&self.log_context().to_string());
         self.log_request(metrics, Some(message));
     }
 
