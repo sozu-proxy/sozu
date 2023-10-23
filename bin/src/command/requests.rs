@@ -64,7 +64,9 @@ impl CommandServer {
                     Err(_) => Err(anyhow::Error::msg("wrong i32 for metrics configuration")),
                 }
             }
-            Some(RequestType::Logging(logging_filter)) => self.set_logging_level(logging_filter),
+            Some(RequestType::Logging(logging_filter)) => {
+                self.set_logging_level(logging_filter, client_id).await
+            }
             Some(RequestType::SubscribeEvents(_)) => {
                 self.event_subscribers.insert(client_id.clone());
                 Ok(Some(Success::SubscribeEvent(client_id.clone())))
@@ -1187,7 +1189,11 @@ impl CommandServer {
         Ok(None)
     }
 
-    pub fn set_logging_level(&mut self, logging_filter: String) -> anyhow::Result<Option<Success>> {
+    pub async fn set_logging_level(
+        &mut self,
+        logging_filter: String,
+        client_id: String,
+    ) -> anyhow::Result<Option<Success>> {
         debug!("Changing main process log level to {}", logging_filter);
         logging::LOGGER.with(|l| {
             let directives = logging::parse_logging_spec(&logging_filter);
@@ -1197,6 +1203,14 @@ impl CommandServer {
         // will have the new logging filter value
         ::std::env::set_var("RUST_LOG", &logging_filter);
         debug!("Logging level now: {}", ::std::env::var("RUST_LOG")?);
+
+        // notify the workers too
+        let _worker_success = self
+            .worker_requests(
+                client_id,
+                RequestType::Logging(logging_filter.clone()).into(),
+            )
+            .await?;
         Ok(Some(Success::Logging(logging_filter)))
     }
 
