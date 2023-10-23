@@ -125,7 +125,7 @@ pub struct LocalDrain {
     cluster_metrics: BTreeMap<String, BTreeMap<String, AggregatedMetric>>,
     use_tagged_metrics: bool,
     origin: String,
-    enabled: bool,
+    disable_cluster_metrics: bool,
 }
 
 impl LocalDrain {
@@ -138,14 +138,14 @@ impl LocalDrain {
             backend_to_cluster: BTreeMap::new(),
             use_tagged_metrics: false,
             origin: String::from("x"),
-            enabled: false,
+            disable_cluster_metrics: false,
         }
     }
 
     pub fn configure(&mut self, config: &MetricsConfiguration) {
         match config {
-            MetricsConfiguration::Enabled => self.enabled = true,
-            MetricsConfiguration::Disabled => self.enabled = false,
+            MetricsConfiguration::Enabled => self.disable_cluster_metrics = false,
+            MetricsConfiguration::Disabled => self.disable_cluster_metrics = true,
             MetricsConfiguration::Clear => self.clear(),
         }
     }
@@ -383,7 +383,7 @@ impl LocalDrain {
         backend_id: Option<&str>,
         metric_value: MetricValue,
     ) {
-        if !self.enabled {
+        if self.disable_cluster_metrics {
             return;
         }
 
