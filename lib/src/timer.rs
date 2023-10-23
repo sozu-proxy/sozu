@@ -180,6 +180,16 @@ impl TimeoutContainer {
     }
 }
 
+impl std::ops::Drop for TimeoutContainer {
+    fn drop(&mut self) {
+        if self.cancel() {
+            error!("Dropping Timeout({:?}, {})", self.token, self.duration);
+        } else {
+            trace!("Dropping Timeout({:?}, {})", self.token, self.duration);
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 struct WheelEntry {
     next_tick: Tick,
