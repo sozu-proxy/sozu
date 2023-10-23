@@ -208,7 +208,7 @@ impl HttpsSession {
 
     fn upgrade_expect(
         &mut self,
-        expect: ExpectProxyProtocol<MioTcpStream>,
+        mut expect: ExpectProxyProtocol<MioTcpStream>,
         ssl: ServerConnection,
     ) -> Option<HttpsStateMachine> {
         if let Some(ref addresses) = expect.addresses {
@@ -245,7 +245,10 @@ impl HttpsSession {
         }
 
         // currently, only happens in expect proxy protocol with AF_UNSPEC address
-        // error!("failed to upgrade from expect");
+        if !expect.container_frontend_timeout.cancel() {
+            error!("failed to cancel request timeout on expect upgrade phase for 'expect proxy protocol with AF_UNSPEC address'");
+        }
+
         None
     }
 

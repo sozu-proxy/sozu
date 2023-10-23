@@ -180,6 +180,14 @@ impl TimeoutContainer {
     }
 }
 
+impl std::ops::Drop for TimeoutContainer {
+    fn drop(&mut self) {
+        if self.cancel() {
+            error!("Cancel a dangling timeout that haven't be handled in session lifecycle, token ({:?}), duration {}", self.token, self.duration);
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 struct WheelEntry {
     next_tick: Tick,
