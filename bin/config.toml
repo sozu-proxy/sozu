@@ -136,6 +136,8 @@ activate_listeners = true
 # tagged_metrics = false
 # metrics key prefix
 # prefix = "sozu"
+# by default, sozu register metrics for clusters, unless you want to spare ressources
+# disable_cluster_metrics = true
 
 # Listeners
 # configuration options specific to a TCP listen socket

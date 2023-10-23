@@ -845,7 +845,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     fn writable_default_answer(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         let res = match self.status {
-            SessionStatus::DefaultAnswer(_, ref buf, mut index) => {
+            SessionStatus::DefaultAnswer(status, ref buf, mut index) => {
                 let len = buf.len();
 
                 let mut sz = 0usize;
@@ -866,6 +866,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 }
 
                 if index == len {
+                    save_http_status_metric(Some(status.into()), self.log_context());
                     self.log_default_answer_success(metrics);
                     self.frontend_readiness.reset();
                     self.backend_readiness.reset();

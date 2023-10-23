@@ -64,8 +64,9 @@ use crate::{
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
         Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, PathRule, ProxyProtocolConfig, Request,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, TcpListenerConfig, TlsVersion,
+        LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProxyProtocolConfig,
+        Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition, TcpListenerConfig,
+        TlsVersion,
     },
     request::WorkerRequest,
     ObjectKind,
@@ -154,6 +155,9 @@ pub const DEFAULT_COMMAND_BUFFER_SIZE: usize = 1_000_000;
 
 /// maximum size of the buffer for the channels, in bytes. (2 MB)
 pub const DEFAULT_MAX_COMMAND_BUFFER_SIZE: usize = 2_000_000;
+
+/// wether to avoid register cluster metrics in the local drain
+pub const DEFAULT_DISABLE_CLUSTER_METRICS: bool = false;
 
 #[derive(Debug)]
 pub enum IncompatibilityKind {
@@ -1106,6 +1110,7 @@ pub struct FileConfig {
     pub worker_count: Option<u16>,
     pub worker_automatic_restart: Option<bool>,
     pub metrics: Option<MetricsConfig>,
+    pub disable_cluster_metrics: Option<bool>,
     pub listeners: Option<Vec<ListenerBuilder>>,
     pub clusters: Option<HashMap<String, FileClusterConfig>>,
     pub handle_process_affinity: Option<bool>,
@@ -1229,6 +1234,9 @@ impl ConfigBuilder {
                 .max_connections
                 .unwrap_or(DEFAULT_MAX_CONNECTIONS),
             metrics: file_config.metrics.clone(),
+            disable_cluster_metrics: file_config
+                .disable_cluster_metrics
+                .unwrap_or(DEFAULT_DISABLE_CLUSTER_METRICS),
             min_buffers: std::cmp::min(
                 file_config.min_buffers.unwrap_or(1),
                 file_config.max_buffers.unwrap_or(1000),
@@ -1462,6 +1470,8 @@ pub struct Config {
     pub worker_count: u16,
     pub worker_automatic_restart: bool,
     pub metrics: Option<MetricsConfig>,
+    #[serde(default = "default_disable_cluster_metrics")]
+    pub disable_cluster_metrics: bool,
     pub http_listeners: Vec<HttpListenerConfig>,
     pub https_listeners: Vec<HttpsListenerConfig>,
     pub tcp_listeners: Vec<TcpListenerConfig>,
@@ -1506,6 +1516,10 @@ fn default_zombie_check_interval() -> u32 {
 
 fn default_accept_queue_timeout() -> u32 {
     DEFAULT_ACCEPT_QUEUE_TIMEOUT
+}
+
+fn default_disable_cluster_metrics() -> bool {
+    DEFAULT_DISABLE_CLUSTER_METRICS
 }
 
 impl Config {
@@ -1600,6 +1614,15 @@ impl Config {
                 });
                 count += 1;
             }
+        }
+
+        if self.disable_cluster_metrics {
+            v.push(WorkerRequest {
+                id: format!("CONFIG-{count}"),
+                content: RequestType::ConfigureMetrics(MetricsConfiguration::Disabled.into())
+                    .into(),
+            });
+            // count += 1; // uncomment if code is added below
         }
 
         Ok(v)
