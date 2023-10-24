@@ -311,23 +311,6 @@ impl HttpsSession {
                 )
                 .ok()?;
 
-                match http
-                    .frontend_socket
-                    .session
-                    .reader()
-                    .read(http.request_stream.storage.space())
-                {
-                    Ok(sz) => {
-                        //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-                        http.request_stream.storage.fill(sz);
-                        count!("bytes_in", sz as i64);
-                        self.metrics.bin += sz;
-                    }
-                    Err(e) => {
-                        error!("read error: {:?}", e);
-                    }
-                }
-
                 http.frontend_readiness.event = handshake.frontend_readiness.event;
 
                 gauge_add!("protocol.https", 1);
