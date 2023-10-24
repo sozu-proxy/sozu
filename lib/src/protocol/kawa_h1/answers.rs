@@ -20,6 +20,8 @@ pub struct DefaultAnswers {
     pub ServiceUnavailable: Rc<Vec<u8>>,
     /// 504
     pub GatewayTimeout: Rc<Vec<u8>>,
+    /// 507
+    pub InsufficientStorage: Rc<Vec<u8>>,
 }
 
 #[allow(non_snake_case)]
@@ -56,6 +58,9 @@ impl HttpAnswers {
                 GatewayTimeout: Rc::new(Vec::from(
                     &b"HTTP/1.1 504 Gateway Timeout\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
                 )),
+                InsufficientStorage: Rc::new(Vec::from(
+                    &b"HTTP/1.1 507 Insufficient Storage\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                )),
             },
             custom: HashMap::new(),
         }
@@ -89,6 +94,7 @@ impl HttpAnswers {
                 .and_then(|c| c.ServiceUnavailable.clone())
                 .unwrap_or_else(|| self.default.ServiceUnavailable.clone()),
             DefaultAnswerStatus::Answer504 => self.default.GatewayTimeout.clone(),
+            DefaultAnswerStatus::Answer507 => self.default.InsufficientStorage.clone(),
         }
     }
 }

@@ -1145,7 +1145,6 @@ impl ConfigState {
             })
             .collect();
 
-            
         for front in self.http_fronts.values() {
             if let Some(cluster_id) = &front.cluster_id {
                 if let Some(hasher) = hm.get_mut(cluster_id) {
