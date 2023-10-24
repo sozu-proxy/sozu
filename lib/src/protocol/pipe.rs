@@ -221,8 +221,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     pub fn log_request_error(&self, metrics: &SessionMetrics, message: &str) {
         incr!("pipe.errors");
-        warn!("could not process request properly got: {}", message);
-        self.print_state(&self.log_context().to_string());
+        error!("{} Could not process request properly got: {}", self.log_context(), message);
+        self.print_state(self.protocol_string());
         self.log_request(metrics, Some(message));
     }
 
@@ -712,7 +712,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
             );
             incr!("http.infinite_loop.error");
 
-            self.print_state(&format!("{:?}", self.protocol));
+            self.print_state(self.protocol_string());
 
             return SessionResult::Close;
         }

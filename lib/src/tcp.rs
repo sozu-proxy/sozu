@@ -930,6 +930,12 @@ impl ProxySession for TcpSession {
         }
 
         if self.state.failed() {
+            match self.state.marker() {
+                StateMarker::Pipe => incr!("tcp.upgrade.pipe.failed"),
+                StateMarker::SendProxyProtocol => incr!("tcp.upgrade.send.failed"),
+                StateMarker::RelayProxyProtocol => incr!("tcp.upgrade.relay.failed"),
+                StateMarker::ExpectProxyProtocol => incr!("tcp.upgrade.expect.failed"),
+            }
             return;
         }
 

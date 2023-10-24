@@ -1409,6 +1409,65 @@ pub fn try_head() -> State {
     State::Success
 }
 
+pub fn try_status_header_split() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) =
+        setup_sync_test("SPLIT", config, listeners, state, front_address, 1, false);
+    let mut backend = backends.pop().unwrap();
+
+    backend.connect();
+
+    let mut client = Client::new("client", front_address, "");
+
+    client.connect();
+
+    let mut accepted = false;
+    for (i, chunk) in [
+        "POST /api HTTP/1.",
+        "1\r\n",
+        "Host: localhost\r\n",
+        "Content-Length",
+        ":",
+        " 1",
+        "0",
+        "\r",
+        "\n\r",
+        "\n012",
+        "34567",
+        "89",
+    ]
+    .iter()
+    .enumerate()
+    {
+        println!("{accepted} {i} {chunk:?}");
+        client.set_request(*chunk);
+        client.send();
+        if !accepted {
+            println!("accepting");
+            accepted = backend.accept(0);
+            if accepted {
+                assert_eq!(i, 9);
+            }
+            backend.send(0);
+        }
+        if accepted {
+            println!("receiving");
+            let request = backend.receive(0);
+            println!("request: {request:?}");
+        }
+    }
+    backend.send(0);
+    let response = client.receive();
+    println!("response: {response:?}");
+    assert!(response.is_some());
+
+    worker.hard_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
 fn try_wildcard() -> State {
     use sozu_command_lib::proto::command::{PathRule, RulePosition};
     let front_address = create_local_address();
@@ -1472,12 +1531,7 @@ fn try_wildcard() -> State {
     let mut client = Client::new(
         "client",
         front_address,
-        http_request(
-            "POST",
-            "/api",
-            format!("ping"),
-            "www.sozu.io",
-        ),
+        http_request("POST", "/api", format!("ping"), "www.sozu.io"),
     );
 
     backend0.connect();
@@ -1709,7 +1763,15 @@ fn test_head() {
 #[test]
 fn test_wildcard() {
     assert_eq!(
-        repeat_until_error_or(1, "Hostname with wildcard", try_wildcard),
+        repeat_until_error_or(2, "Hostname with wildcard", try_wildcard),
+        State::Success
+    );
+}
+
+#[test]
+fn test_status_header_split() {
+    assert_eq!(
+        repeat_until_error_or(2, "Status line and Headers split", try_status_header_split),
         State::Success
     );
 }
