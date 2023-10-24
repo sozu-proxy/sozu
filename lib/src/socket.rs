@@ -225,7 +225,7 @@ impl SocketHandler for FrontRustls {
                     Ok(sz) => {
                         size += sz;
                         can_read = true;
-                    },
+                    }
                     Err(e) => match e.kind() {
                         ErrorKind::WouldBlock => {
                             break;

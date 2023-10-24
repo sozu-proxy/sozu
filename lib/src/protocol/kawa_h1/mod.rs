@@ -65,6 +65,7 @@ pub enum DefaultAnswerStatus {
     Answer502,
     Answer503,
     Answer504,
+    Answer507,
 }
 
 #[allow(clippy::from_over_into)]
@@ -80,6 +81,7 @@ impl Into<u16> for DefaultAnswerStatus {
             Self::Answer502 => 502,
             Self::Answer503 => 503,
             Self::Answer504 => 504,
+            Self::Answer507 => 507,
         }
     }
 }
@@ -454,7 +456,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 _ => (),
             }
 
-            if !(self.request_stream.is_terminated() && self.request_stream.is_completed()) {
+            if !(self.request_stream.is_terminated() && self.request_stream.is_completed())
+                && self.request_stream.body_size != kawa::BodySize::Empty
+            {
                 error!("Response terminated before request, this case is not handled properly yet");
                 incr!("http.early_response_close");
                 // FIXME: this will cause problems with pipelining
@@ -604,8 +608,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 self.frontend_readiness.interest.insert(Ready::WRITABLE);
             } else {
                 // server has filled its buffer and we can't empty it
-                // FIXME: should we send 507 Insufficient Storage ?
-                self.set_answer(DefaultAnswerStatus::Answer502, None);
+                self.set_answer(DefaultAnswerStatus::Answer507, None);
             }
             return SessionResult::Continue;
         }
@@ -781,7 +784,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
     pub fn log_request_error(&mut self, metrics: &mut SessionMetrics, message: &str) {
         incr!("http.errors");
-        error!("{} Could not process request properly got: {}", self.log_context(), message);
+        error!(
+            "{} Could not process request properly got: {}",
+            self.log_context(),
+            message
+        );
         self.print_state(self.protocol_string());
         self.log_request(metrics, Some(message));
     }
@@ -828,6 +835,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 ),
                 DefaultAnswerStatus::Answer504 => incr!(
                     "http.504.errors",
+                    self.cluster_id.as_deref(),
+                    self.backend_id.as_deref()
+                ),
+                DefaultAnswerStatus::Answer507 => incr!(
+                    "http.507.errors",
                     self.cluster_id.as_deref(),
                     self.backend_id.as_deref()
                 ),
