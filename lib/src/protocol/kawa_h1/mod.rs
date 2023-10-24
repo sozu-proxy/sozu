@@ -250,7 +250,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 "could not reset front timeout {:?}",
                 self.configured_frontend_timeout
             );
-            self.print_state(&format!("{:?}", self.context.protocol));
+            self.print_state(self.protocol_string());
         }
 
         if let SessionStatus::DefaultAnswer(_, _, _) = self.status {
@@ -331,47 +331,44 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     pub fn readable_parse(&mut self, _metrics: &mut SessionMetrics) -> StateResult {
         trace!("==============readable_parse");
         let was_initial = self.request_stream.is_initial();
+        let was_not_proxying = !self.request_stream.is_main_phase();
 
         kawa::h1::parse(&mut self.request_stream, &mut self.context);
         // kawa::debug_kawa(&self.request_stream);
 
         if was_initial && !self.request_stream.is_initial() {
+            // if it was the first request, the front timeout duration
+            // was set to request_timeout, which is much lower. For future
+            // requests on this connection, we can wait a bit more
+            self.container_frontend_timeout
+                .set_duration(self.configured_frontend_timeout);
             gauge_add!("http.active_requests", 1);
             incr!("http.requests");
         }
 
         if self.request_stream.is_error() {
             incr!("http.frontend_parse_errors");
-            // was_initial is maybe too restrictive
-            // from what I understand the only condition should be:
-            // "did we already sent byte?"
-            if was_initial {
-                self.set_answer(DefaultAnswerStatus::Answer400, None);
-                // gauge_add!("http.active_requests", 1);
-                return StateResult::Continue;
-            } else {
+            if self.response_stream.consumed {
                 return StateResult::CloseSession;
+            } else {
+                self.set_answer(DefaultAnswerStatus::Answer400, None);
+                return StateResult::Continue;
             }
         }
 
         if self.request_stream.is_main_phase() {
             self.backend_readiness.interest.insert(Ready::WRITABLE);
-            // if it was the first request, the front timeout duration
-            // was set to request_timeout, which is much lower. For future
-            // requests on this connection, we can wait a bit more
-            self.container_frontend_timeout
-                .set_duration(self.configured_frontend_timeout);
+            if was_not_proxying {
+                // Sozu tries to connect only once all the headers were gathered and edited
+                // this could be improved
+                trace!("============== HANDLE CONNECTION!");
+                return StateResult::ConnectBackend;
+            }
         }
         if self.request_stream.is_terminated() {
             self.frontend_readiness.interest.remove(Ready::READABLE);
         }
 
-        if was_initial {
-            if let kawa::StatusLine::Request { .. } = self.request_stream.detached.status_line {
-                trace!("============== HANDLE CONNECTION!");
-                return StateResult::ConnectBackend;
-            }
-        }
         StateResult::Continue
     }
 
@@ -455,6 +452,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     return StateResult::Continue;
                 }
                 _ => (),
+            }
+
+            if !(self.request_stream.is_terminated() && self.request_stream.is_completed()) {
+                error!("Response terminated before request, this case is not handled properly yet");
+                incr!("http.early_response_close");
+                // FIXME: this will cause problems with pipelining
+                // return StateResult::CloseSession;
             }
 
             // FIXME: we could get smarter about this
@@ -574,7 +578,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 "could not reset back timeout {:?}",
                 self.configured_backend_timeout
             );
-            self.print_state(&format!("{:?}", self.context.protocol));
+            self.print_state(self.protocol_string());
         }
 
         if let SessionStatus::DefaultAnswer(_, _, _) = self.status {
@@ -600,7 +604,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 self.frontend_readiness.interest.insert(Ready::WRITABLE);
             } else {
                 // server has filled its buffer and we can't empty it
-                // FIXME: what error code should we use?
+                // FIXME: should we send 507 Insufficient Storage ?
                 self.set_answer(DefaultAnswerStatus::Answer502, None);
             }
             return SessionResult::Continue;
@@ -609,7 +613,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let (size, socket_state) = backend_socket.socket_read(self.response_stream.storage.space());
         debug!(
             "{}\tBACK  [{}<-{:?}]: read {} bytes",
-            "ctx", // self.log_context(),
+            "ctx", // FIXME: self.log_context(),
             self.frontend_token.0,
             self.backend_token,
             size
@@ -651,21 +655,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     pub fn backend_readable_parse(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         trace!("==============backend_readable_parse");
-        let was_initial = self.response_stream.is_initial();
-
         kawa::h1::parse(&mut self.response_stream, &mut self.context);
         // kawa::debug_kawa(&self.response_stream);
 
         if self.response_stream.is_error() {
             incr!("http.backend_parse_errors");
-            // was_initial is maybe too restrictive
-            // from what I understand the only condition should be:
-            // "did we already sent byte?"
-            if was_initial {
+            if self.response_stream.consumed {
+                return SessionResult::Close;
+            } else {
                 self.set_answer(DefaultAnswerStatus::Answer502, None);
                 return SessionResult::Continue;
-            } else {
-                return SessionResult::Close;
             }
         }
 
@@ -782,6 +781,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
     pub fn log_request_error(&mut self, metrics: &mut SessionMetrics, message: &str) {
         incr!("http.errors");
+        error!("{} Could not process request properly got: {}", self.log_context(), message);
+        self.print_state(self.protocol_string());
         self.log_request(metrics, Some(message));
     }
 
@@ -1580,7 +1581,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             );
             incr!("http.infinite_loop.error");
 
-            self.print_state(&format!("{:?}", self.context.protocol));
+            self.print_state(self.protocol_string());
 
             return SessionResult::Close;
         }
@@ -1704,7 +1705,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
     fn print_state(&self, context: &str) {
         error!(
             "\
-{} Session(Pipe)
+{} Session(Kawa)
 \tFrontend:
 \t\ttoken: {:?}\treadiness: {:?}\tstate: {:?}
 \tBackend:

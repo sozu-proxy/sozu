@@ -285,6 +285,11 @@ impl ProxySession for HttpSession {
         }
 
         if self.state.failed() {
+            match self.state.marker() {
+                StateMarker::Expect => incr!("http.upgrade.expect.failed"),
+                StateMarker::Http => incr!("http.upgrade.http.failed"),
+                StateMarker::WebSocket => incr!("http.upgrade.ws.failed"),
+            }
             return;
         }
 
