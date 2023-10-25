@@ -4,6 +4,7 @@ use hex::FromHex;
 use serde::de::{self, Visitor};
 use sha2::{Digest, Sha256};
 use x509_parser::{
+    extensions::{GeneralName, ParsedExtension},
     oid_registry::{OID_X509_COMMON_NAME, OID_X509_EXT_SUBJECT_ALT_NAME},
     pem::{parse_x509_pem, Pem},
 };
@@ -52,14 +53,17 @@ pub fn get_cn_and_san_attributes(pem: &Pem) -> Result<HashSet<String>, Certifica
         );
     }
 
-    for name in x509.subject().iter_by_oid(&OID_X509_EXT_SUBJECT_ALT_NAME) {
-        names.insert(
-            name.as_str()
-                .map(String::from)
-                .unwrap_or_else(|_| String::from_utf8_lossy(name.as_slice()).to_string()),
-        );
+    for extension in x509.extensions() {
+        if extension.oid == OID_X509_EXT_SUBJECT_ALT_NAME {
+            if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
+                for name in &san.general_names {
+                    if let GeneralName::DNSName(name) = name {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+        }
     }
-
     Ok(names)
 }
 
