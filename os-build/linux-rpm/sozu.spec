@@ -6,7 +6,7 @@
 
 Summary:	A lightweight, fast, always-up reverse proxy server.
 Name:		sozu
-Version:	0.15.12
+Version:	0.15.13
 Release:	1%{?dist}
 Epoch:		1
 License:	AGPL-3.0
