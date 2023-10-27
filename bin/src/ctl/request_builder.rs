@@ -24,7 +24,7 @@ use crate::{
 
 impl CommandManager {
     pub fn save_state(&mut self, path: String) -> anyhow::Result<()> {
-        debug!("Loading the state to file {}", path);
+        debug!("Saving the state to file {}", path);
 
         self.send_request(RequestType::SaveState(path).into())
     }
