@@ -142,9 +142,28 @@ impl HttpContext {
                     } else if compare_no_case(key, b"X-Forwarded-Proto") {
                         has_x_proto = true;
                         // header.val = kawa::Store::Static(proto.as_bytes());
+                        incr!("http.trusting.x_proto");
+                        let val = header.val.data(buf);
+                        if !compare_no_case(val, proto.as_bytes()) {
+                            incr!("http.trusting.x_proto.diff");
+                            debug!(
+                                "Trusting X-Forwarded-Proto for {:?} even though {:?} != {}",
+                                self.authority, val, proto
+                            );
+                        }
                     } else if compare_no_case(key, b"X-Forwarded-Port") {
                         has_x_port = true;
                         // header.val = kawa::Store::from_string(public_port.to_string());
+                        incr!("http.trusting.x_port");
+                        let val = header.val.data(buf);
+                        let expected = public_port.to_string();
+                        if !compare_no_case(val, expected.as_bytes()) {
+                            incr!("http.trusting.x_port.diff");
+                            debug!(
+                                "Trusting X-Forwarded-Port for {:?} even though {:?} != {}",
+                                self.authority, val, expected
+                            );
+                        }
                     } else if compare_no_case(key, b"X-Forwarded-For") {
                         x_for = Some(header);
                     } else if compare_no_case(key, b"Forwarded") {
