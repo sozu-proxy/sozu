@@ -4,6 +4,58 @@
 
 See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av0.16.0)
 
+## 0.15.13 - 2023-10-27
+
+> This changelog merge all modifications between versions 0.15.6 and 0.15.13
+
+- We have deployed the new release of Sōzu at Clever Cloud on production and find out some bugs during the deployment process, see [`5d2f3b9`](https://github.com/sozu-proxy/sozu/commit/5d2f3b9de024c538577baf3ef2c6f4ab9b60e236), [`7b61c04`](https://github.com/sozu-proxy/sozu/commit/7b61c043fb7d5e2cb63113627376b5eb85bcea1c), [`72e9d44`](https://github.com/sozu-proxy/sozu/commit/72e9d4497e9326c3538fed1088cb26b9524c0700), [`bf026ee`](https://github.com/sozu-proxy/sozu/commit/bf026ee8ecf9dda2dd75c672baf3b231bc1d3231), [`76e0e7d`](https://github.com/sozu-proxy/sozu/commit/76e0e7d6ce2a74e93d4c75ea2ab891aa2d92c45d), [`0bdf61d`](https://github.com/sozu-proxy/sozu/commit/0bdf61d235406868c770c0199167d10e59809e53), [`89bf73a`](https://github.com/sozu-proxy/sozu/commit/89bf73af57218260e3579a5004eebd61bca18196), [`1196a90`](https://github.com/sozu-proxy/sozu/commit/1196a900d3759fbc579bf4434e5f945b45980790), [`e562299`](https://github.com/sozu-proxy/sozu/commit/e562299d5e140f9ae133f6692f47eaf0f31ad343), [`4c47cfc`](https://github.com/sozu-proxy/sozu/commit/4c47cfc75ee125d942c33849e9107f4b879aec0f), [`cda2f01`](https://github.com/sozu-proxy/sozu/commit/cda2f01789b4abde2ef4441d85be636b6e589384), [`ea0b8af`](https://github.com/sozu-proxy/sozu/commit/ea0b8afefeaaafb11a9a9fb27fa1e8348378829f) and [`437eb12`](https://github.com/sozu-proxy/sozu/commit/437eb1252f4f999001dac7d162694dd455dfa057).
+- We have added debug logging, see [`8854576`](https://github.com/sozu-proxy/sozu/commit/88545767284284c31b8c13dab90d581b39c07b56) and [`887babe`](https://github.com/sozu-proxy/sozu/commit/887babe4c0ec81d8c73f4054af837222acb2a076).
+- We now retrieve subject alternative names for certificate, see [`ea6bacd`](https://github.com/sozu-proxy/sozu/commit/ea6bacd463d5fd085fa77e411c73ae9e2e94ebbe).
+- We have enable metrics of clusters by default and add some error status code, see [`9648cf0`](https://github.com/sozu-proxy/sozu/commit/9648cf0433df13bd84efbb14dfd8321b520a91e2) and [`6b53071`](https://github.com/sozu-proxy/sozu/commit/6b53071303eb56fe45e0242b756fa73bb1fb16d1).
+- We have updated sozu to hot reload logging level not only for the main processn but also workers, see [`641daa3`](https://github.com/sozu-proxy/sozu/commit/641daa3fc86b7883bd794c6dc9f0c601c9289d24)?
+
+### Changelog
+
+#### ➕ Added
+
+- [ [`be2cfe6`](https://github.com/sozu-proxy/sozu/commit/be2cfe6da18d7098565b2526b3127651eb8384b9) ] Add 507 default answer [`Eloi DEMOLIS`] (`2023-10-24`)
+
+#### ⛑️ Fixed
+
+- [ [`5d2f3b9`](https://github.com/sozu-proxy/sozu/commit/5d2f3b9de024c538577baf3ef2c6f4ab9b60e236) ] fix misleading CLI line on state saving [`Emmanuel Bosquet`] (`2023-10-27`)
+- [ [`7b61c04`](https://github.com/sozu-proxy/sozu/commit/7b61c043fb7d5e2cb63113627376b5eb85bcea1c) ] build: add missing assets [`Florentin Dubois`] (`2023-10-27`)
+- [ [`72e9d44`](https://github.com/sozu-proxy/sozu/commit/72e9d4497e9326c3538fed1088cb26b9524c0700) ] Don't override X-Forwarded-Proto and X-Forwarded-Port [`Eloi DEMOLIS`] (`2023-10-26`)
+- [ [`bf026ee`](https://github.com/sozu-proxy/sozu/commit/bf026ee8ecf9dda2dd75c672baf3b231bc1d3231) ] Add a default certificate when none are found for a host [`Eloi DEMOLIS`] (`2023-10-27`)
+- [ [`76e0e7d`](https://github.com/sozu-proxy/sozu/commit/76e0e7d6ce2a74e93d4c75ea2ab891aa2d92c45d) ] Fix early connect trials [`Eloi DEMOLIS`] (`2023-10-24`)
+- [ [`0bdf61d`](https://github.com/sozu-proxy/sozu/commit/0bdf61d235406868c770c0199167d10e59809e53) ] fix cluster metrics [`Emmanuel Bosquet`] (`2023-10-24`)
+- [ [`89bf73a`](https://github.com/sozu-proxy/sozu/commit/89bf73af57218260e3579a5004eebd61bca18196) ] fix(timeout): implements cancel on drop [`Florentin Dubois`] (`2023-10-23`)
+- [ [`1196a90`](https://github.com/sozu-proxy/sozu/commit/1196a900d3759fbc579bf4434e5f945b45980790) ] include TCP clusters in command 'cluster list' [`Emmanuel Bosquet`] (`2023-09-19`)
+- [ [`e562299`](https://github.com/sozu-proxy/sozu/commit/e562299d5e140f9ae133f6692f47eaf0f31ad343) ] Fix TrieNode wildcard and regexp management [`Eloi DEMOLIS`] (`2023-10-17`)
+- [ [`4c47cfc`](https://github.com/sozu-proxy/sozu/commit/4c47cfc75ee125d942c33849e9107f4b879aec0f) ] fix the display of non-existing cluster information in cluster list [`Emmanuel Bosquet`] (`2023-10-13`)
+- [ [`cda2f01`](https://github.com/sozu-proxy/sozu/commit/cda2f01789b4abde2ef4441d85be636b6e589384) ] Fix X-Forwarded-Port when not present [`Eloi DEMOLIS`] (`2023-10-20`)
+- [ [`ea0b8af`](https://github.com/sozu-proxy/sozu/commit/ea0b8afefeaaafb11a9a9fb27fa1e8348378829f) ] fix(rustls): read buffer if we received a bufffer full error instead of processing new packets [`Florentin Dubois`] (`2023-10-21`)
+- [ [`437eb12`](https://github.com/sozu-proxy/sozu/commit/437eb1252f4f999001dac7d162694dd455dfa057) ] fix: allow to read [`Florentin Dubois`] (`2023-10-21`)
+
+#### ✍️ Changed
+
+- [ [`8854576`](https://github.com/sozu-proxy/sozu/commit/88545767284284c31b8c13dab90d581b39c07b56) ] Add log on suspicious X-Forwarded-Proto and Port [`Eloi DEMOLIS`] (`2023-10-27`)
+- [ [`ea6bacd`](https://github.com/sozu-proxy/sozu/commit/ea6bacd463d5fd085fa77e411c73ae9e2e94ebbe) ] Get Subject Alternative Names from extensions [`Eloi DEMOLIS`] (`2023-10-25`)
+- [ [`8595cf9`](https://github.com/sozu-proxy/sozu/commit/8595cf9e8aeae1d4c1fc5f8111f9c27d68dc3613) ] Remove early read on TLS upgrade [`Eloi DEMOLIS`] (`2023-10-24`)
+- [ [`9648cf0`](https://github.com/sozu-proxy/sozu/commit/9648cf0433df13bd84efbb14dfd8321b520a91e2) ] enable cluster metrics by default [`Emmanuel Bosquet`] (`2023-10-23`)
+- [ [`6b53071`](https://github.com/sozu-proxy/sozu/commit/6b53071303eb56fe45e0242b756fa73bb1fb16d1) ] save 4xx and 5xx status codes in cluster metrics [`Emmanuel Bosquet`] (`2023-10-23`)
+- [ [`a1d60b2`](https://github.com/sozu-proxy/sozu/commit/a1d60b2fe3203fbf9b2c36c498c1c6f9629b7c20) ] more sensible CLI defaults params in config.toml [`Emmanuel Bosquet`] (`2023-09-21`)
+- [ [`641daa3`](https://github.com/sozu-proxy/sozu/commit/641daa3fc86b7883bd794c6dc9f0c601c9289d24) ] send logging level change requests to workers [`Emmanuel Bosquet`] (`2023-10-18`)
+- [ [`887babe`](https://github.com/sozu-proxy/sozu/commit/887babe4c0ec81d8c73f4054af837222acb2a076) ] chore: increase logs on access error [`Florentin Dubois`] (`2023-10-21`)
+
+#### 📚 Documentation
+
+- [ [`9301048`](https://github.com/sozu-proxy/sozu/commit/9301048af9ec64517bf06a7d2f38181fbf1eeae8) ] doc(changelog): add 0.15.6 entry [`Florentin Dubois`] (`2023-10-11`)
+
+### 🥹 Contributors
+* @keksoj
+* @FlorentinDUBOIS
+* @Wonshtrum
+
 ## 0.15.6 - 2023-10-11
 
 ### ⛑️ Fixed
@@ -41,9 +93,6 @@ We fix a bug that can occurs with pki using T.61 charset, see [`a5412b9`](https:
 #### ⛑️ Fixed
 
 - [[`a5412b9`](https://github.com/sozu-proxy/sozu/commit/a5412b9764e860eedc2a206b16e81144946a8d7f) ] fix(command): retrieve name and san from slice [`Florentin Dubois`] (`2023-09-21`)
-
-
-
 - [ [`24c4407`](https://github.com/sozu-proxy/sozu/commit/24c4407d654dfbcd7c490e3a23c46fe8289bce4e) ] chore: update changelog to add 0.15.4 [`Florentin Dubois`] (`2023-09-13`)
 - [ [`6de9cf5`](https://github.com/sozu-proxy/sozu/commit/6de9cf541368fca3d874b14df7e068a856d4d183) ] chore: update dependencies [`Florentin Dubois`] (`2023-09-21`)
 
