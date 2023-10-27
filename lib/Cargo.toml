@@ -51,6 +51,7 @@ socket2 = { version = "^0.5.4", features = ["all"] }
 thiserror = "^1.0.49"
 time = "^0.3.29"
 x509-parser = "^0.15.1"
+once_cell = "1.18.0"
 
 sozu-command-lib = { path = "../command", version = "^0.15.10" }
 

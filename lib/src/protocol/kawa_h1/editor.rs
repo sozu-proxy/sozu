@@ -141,10 +141,10 @@ impl HttpContext {
                         }
                     } else if compare_no_case(key, b"X-Forwarded-Proto") {
                         has_x_proto = true;
-                        header.val = kawa::Store::Static(proto.as_bytes());
+                        // header.val = kawa::Store::Static(proto.as_bytes());
                     } else if compare_no_case(key, b"X-Forwarded-Port") {
                         has_x_port = true;
-                        header.val = kawa::Store::from_string(public_port.to_string());
+                        // header.val = kawa::Store::from_string(public_port.to_string());
                     } else if compare_no_case(key, b"X-Forwarded-For") {
                         x_for = Some(header);
                     } else if compare_no_case(key, b"Forwarded") {

@@ -918,7 +918,7 @@ impl ProxySession for TcpSession {
         }
 
         // TODO: the state should handle the timeouts
-        info!("Closing TCP session");
+        trace!("Closing TCP session");
         self.metrics.service_stop();
 
         // Restore gauges
