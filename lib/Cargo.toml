@@ -24,6 +24,7 @@ include = [
   "/examples/main.rs",
   "/examples/minimal.rs",
   "assets/certificate.pem",
+  "assets/certificate_chain.pem",
   "assets/key.pem",
 ]
 
