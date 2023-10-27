@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{hash_map::Entry, BTreeMap, HashMap},
-    io::{ErrorKind, Read},
+    io::ErrorKind,
     net::{Shutdown, SocketAddr as StdSocketAddr},
     os::unix::{io::AsRawFd, net::UnixStream},
     rc::{Rc, Weak},
@@ -394,7 +394,7 @@ impl ProxySession for HttpsSession {
             return;
         }
 
-        debug!("Closing HTTPS session");
+        trace!("Closing HTTPS session");
         self.metrics.service_stop();
 
         // Restore gauges

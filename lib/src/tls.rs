@@ -10,6 +10,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use once_cell::sync::Lazy;
 use rustls::{
     server::{ClientHello, ResolvesServerCert},
     sign::{CertifiedKey, RsaSigningKey},
@@ -24,6 +25,20 @@ use sozu_command::{
 };
 
 use crate::router::trie::{Key, KeyValue, TrieNode};
+
+// -----------------------------------------------------------------------------
+// Default ParsedCertificateAndKey
+
+static DEFAULT_CERTIFICATE: Lazy<ParsedCertificateAndKey> = Lazy::new(|| {
+    let certificate_and_key = CertificateAndKey {
+        certificate: include_str!("../assets/certificate.pem").to_string(),
+        certificate_chain: vec![include_str!("../assets/certificate_chain.pem").to_string()],
+        key: include_str!("../assets/key.pem").to_string(),
+        versions: vec![],
+        names: vec![],
+    };
+    GenericCertificateResolver::parse(&certificate_and_key).unwrap()
+});
 
 // -----------------------------------------------------------------------------
 // CertificateResolver trait
@@ -536,8 +551,12 @@ impl ResolvesServerCert for MutexWrappedCertificateResolver {
             }
         }
 
-        error!("could not look up a certificate for server name '{}'", name);
-        None
+        // error!("could not look up a certificate for server name '{}'", name);
+        // This certificate is used for TLS tunneling with another TLS termination endpoint
+        // Note that this is unsafe and you should provide a valid certificate
+        debug!("Default certificate is used for {}", name);
+        incr!("tls.default_cert_used");
+        Self::generate_certified_key(&DEFAULT_CERTIFICATE).map(Arc::new)
     }
 }
 
