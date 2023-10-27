@@ -14,7 +14,7 @@ use sozu_command::{
 
 use crate::{protocol::http::parser::Method, router::pattern_trie::TrieNode};
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, PartialEq)]
 pub enum RouterError {
     #[error("Could not parse rule from frontend path {0:?}")]
     InvalidPathRule(String),
@@ -24,6 +24,12 @@ pub enum RouterError {
     AddRoute(String),
     #[error("Could not remove route {0}")]
     RemoveRoute(String),
+    #[error("no route for {method} {host} {path}")]
+    RouteNotFound {
+        host: String,
+        path: String,
+        method: Method,
+    },
 }
 
 pub struct Router {
@@ -47,27 +53,34 @@ impl Router {
         }
     }
 
-    pub fn lookup(&self, hostname: &[u8], path: &[u8], method: &Method) -> Option<Route> {
+    pub fn lookup(
+        &self,
+        hostname: &str,
+        path: &str,
+        method: &Method,
+    ) -> Result<Route, RouterError> {
+        let hostname_b = hostname.as_bytes();
+        let path_b = path.as_bytes();
         for (domain_rule, path_rule, method_rule, cluster_id) in &self.pre {
-            if domain_rule.matches(hostname)
-                && path_rule.matches(path) != PathRuleResult::None
+            if domain_rule.matches(hostname_b)
+                && path_rule.matches(path_b) != PathRuleResult::None
                 && method_rule.matches(method) != MethodRuleResult::None
             {
-                return Some(cluster_id.clone());
+                return Ok(cluster_id.clone());
             }
         }
 
-        if let Some((_, path_rules)) = self.tree.lookup(hostname, true) {
+        if let Some((_, path_rules)) = self.tree.lookup(hostname_b, true) {
             let mut prefix_length = 0;
             let mut route = None;
 
             for (rule, method_rule, cluster_id) in path_rules {
-                match rule.matches(path) {
+                match rule.matches(path_b) {
                     PathRuleResult::Regex | PathRuleResult::Equals => {
                         match method_rule.matches(method) {
-                            MethodRuleResult::Equals => return Some(cluster_id.clone()),
+                            MethodRuleResult::Equals => return Ok(cluster_id.clone()),
                             MethodRuleResult::All => {
-                                prefix_length = path.len();
+                                prefix_length = path_b.len();
                                 route = Some(cluster_id);
                             }
                             MethodRuleResult::None => {}
@@ -94,20 +107,24 @@ impl Router {
             }
 
             if let Some(cluster_id) = route {
-                return Some(cluster_id.clone());
+                return Ok(cluster_id.clone());
             }
         }
 
         for (domain_rule, path_rule, method_rule, cluster_id) in self.post.iter() {
-            if domain_rule.matches(hostname)
-                && path_rule.matches(path) != PathRuleResult::None
+            if domain_rule.matches(hostname_b)
+                && path_rule.matches(path_b) != PathRuleResult::None
                 && method_rule.matches(method) != MethodRuleResult::None
             {
-                return Some(cluster_id.clone());
+                return Ok(cluster_id.clone());
             }
         }
 
-        None
+        Err(RouterError::RouteNotFound {
+            host: hostname.to_owned(),
+            path: path.to_owned(),
+            method: method.to_owned(),
+        })
     }
 
     pub fn add_http_front(&mut self, front: &HttpFrontend) -> Result<(), RouterError> {
@@ -704,8 +721,8 @@ mod tests {
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
-            router.lookup("www.sozu.io".as_bytes(), "/api".as_bytes(), &Method::Get),
-            Some(Route::ClusterId("base".to_string()))
+            router.lookup("www.sozu.io", "/api", &Method::Get),
+            Ok(Route::ClusterId("base".to_string()))
         );
         assert!(router.add_tree_rule(
             b"*.sozu.io",
@@ -715,12 +732,12 @@ mod tests {
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
-            router.lookup("www.sozu.io".as_bytes(), "/ap".as_bytes(), &Method::Get),
-            Some(Route::ClusterId("base".to_string()))
+            router.lookup("www.sozu.io", "/ap", &Method::Get),
+            Ok(Route::ClusterId("base".to_string()))
         );
         assert_eq!(
-            router.lookup("www.sozu.io".as_bytes(), "/api".as_bytes(), &Method::Get),
-            Some(Route::ClusterId("api".to_string()))
+            router.lookup("www.sozu.io", "/api", &Method::Get),
+            Ok(Route::ClusterId("api".to_string()))
         );
     }
 
@@ -743,8 +760,8 @@ mod tests {
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
-            router.lookup("www.sozu.io".as_bytes(), "/api".as_bytes(), &Method::Get),
-            Some(Route::ClusterId("base".to_string()))
+            router.lookup("www.sozu.io", "/api", &Method::Get),
+            Ok(Route::ClusterId("base".to_string()))
         );
         assert!(router.add_tree_rule(
             b"api.sozu.io",
@@ -754,12 +771,12 @@ mod tests {
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
-            router.lookup("www.sozu.io".as_bytes(), "/api".as_bytes(), &Method::Get),
-            Some(Route::ClusterId("base".to_string()))
+            router.lookup("www.sozu.io", "/api", &Method::Get),
+            Ok(Route::ClusterId("base".to_string()))
         );
         assert_eq!(
-            router.lookup("api.sozu.io".as_bytes(), "/api".as_bytes(), &Method::Get),
-            Some(Route::ClusterId("api".to_string()))
+            router.lookup("api.sozu.io", "/api", &Method::Get),
+            Ok(Route::ClusterId("api".to_string()))
         );
     }
 
@@ -782,12 +799,12 @@ mod tests {
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
-            router.lookup("www.sozu.io".as_bytes(), "/".as_bytes(), &Method::Get),
-            Some(Route::ClusterId("base".to_string()))
+            router.lookup("www.sozu.io", "/", &Method::Get),
+            Ok(Route::ClusterId("base".to_string()))
         );
         assert_eq!(
-            router.lookup("www.doc.sozu.io".as_bytes(), "/".as_bytes(), &Method::Get),
-            Some(Route::ClusterId("doc".to_string()))
+            router.lookup("www.doc.sozu.io", "/", &Method::Get),
+            Ok(Route::ClusterId("doc".to_string()))
         );
         assert!(router.remove_tree_rule(
             b"www./.*/.io",
@@ -795,13 +812,10 @@ mod tests {
             &MethodRule::new(Some("GET".to_string()))
         ));
         println!("{:#?}", router.tree);
+        assert!(router.lookup("www.sozu.io", "/", &Method::Get).is_err());
         assert_eq!(
-            router.lookup("www.sozu.io".as_bytes(), "/".as_bytes(), &Method::Get),
-            None
-        );
-        assert_eq!(
-            router.lookup("www.doc.sozu.io".as_bytes(), "/".as_bytes(), &Method::Get),
-            Some(Route::ClusterId("doc".to_string()))
+            router.lookup("www.doc.sozu.io", "/", &Method::Get),
+            Ok(Route::ClusterId("doc".to_string()))
         );
     }
 
@@ -835,44 +849,31 @@ mod tests {
         ));
 
         assert_eq!(
-            router.lookup(
-                "www.example.com".as_bytes(),
-                "/helloA".as_bytes(),
-                &Method::new(&b"GET"[..])
-            ),
-            Some(Route::ClusterId("example".to_string()))
+            router.lookup("www.example.com", "/helloA", &Method::new(&b"GET"[..])),
+            Ok(Route::ClusterId("example".to_string()))
         );
         assert_eq!(
             router.lookup(
-                "www.example.com".as_bytes(),
-                "/.well-known/acme-challenge".as_bytes(),
+                "www.example.com",
+                "/.well-known/acme-challenge",
                 &Method::new(&b"GET"[..])
             ),
-            Some(Route::ClusterId("acme".to_string()))
+            Ok(Route::ClusterId("acme".to_string()))
         );
+        assert!(router
+            .lookup("www.test.example.com", "/", &Method::new(&b"GET"[..]))
+            .is_err());
         assert_eq!(
             router.lookup(
-                "www.test.example.com".as_bytes(),
-                "/".as_bytes(),
+                "www.test.example.com",
+                "/helloAB/",
                 &Method::new(&b"GET"[..])
             ),
-            None
+            Ok(Route::ClusterId("examplewildcard".to_string()))
         );
         assert_eq!(
-            router.lookup(
-                "www.test.example.com".as_bytes(),
-                "/helloAB/".as_bytes(),
-                &Method::new(&b"GET"[..])
-            ),
-            Some(Route::ClusterId("examplewildcard".to_string()))
-        );
-        assert_eq!(
-            router.lookup(
-                "test1.example.com".as_bytes(),
-                "/helloAB/".as_bytes(),
-                &Method::new(&b"GET"[..])
-            ),
-            Some(Route::ClusterId("exampleregex".to_string()))
+            router.lookup("test1.example.com", "/helloAB/", &Method::new(&b"GET"[..])),
+            Ok(Route::ClusterId("exampleregex".to_string()))
         );
     }
 }

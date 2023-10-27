@@ -593,7 +593,7 @@ impl TcpSession {
                     }
                     // TODO: should we return CloseSession here?
                     Err(connection_error) => {
-                        error!("Error connecting to backend: {}", connection_error);
+                        error!("Error connecting to backend: {}", connection_error)
                     }
                 }
             } else if self.back_readiness().unwrap().event != Ready::EMPTY {
