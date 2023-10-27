@@ -70,7 +70,12 @@ pub trait CertificateResolver {
             expired_at: opts.new_expired_at.to_owned(),
         })?;
 
-        self.remove_certificate(&fingerprint)?;
+        match hex::decode(&opts.old_fingerprint) {
+            Ok(old_fingerprint) =>  self.remove_certificate(&Fingerprint(old_fingerprint))?,
+            Err(err) => {
+                error!("failed to parse fingerprint, {}", err);
+            }
+        }
 
         Ok(fingerprint)
     }
