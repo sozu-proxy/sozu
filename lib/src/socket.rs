@@ -172,6 +172,7 @@ impl SocketHandler for FrontRustls {
         let mut is_error = false;
         let mut is_closed = false;
 
+        let mut iter = 0;
         loop {
             if size == buf.len() {
                 break;
@@ -181,7 +182,12 @@ impl SocketHandler for FrontRustls {
                 break;
             }
 
-            let mut is_rustls_backpressuring = false;
+            iter += 1;
+            if iter > 100 {
+                error!("Still reading TLS after {} iterations, breaking the loop", iter);
+                return (size, SocketResult::WouldBlock);
+            }
+
             match self.session.read_tls(&mut self.stream) {
                 Ok(0) => {
                     can_read = false;
@@ -201,7 +207,6 @@ impl SocketHandler for FrontRustls {
                     // [`ErrorKind::Other`] error signal that the buffer is full, we need to read it before processing new packets.
                     ErrorKind::Other => {
                         warn!("rustls buffer is full, we will consume it, before processing new incoming packets, to mitigate this issue, you could try to increase the buffer size, {:?}", e);
-                        is_rustls_backpressuring = true;
                     }
                     _ => {
                         error!("could not read TLS stream from socket: {:?}", e);
@@ -211,12 +216,10 @@ impl SocketHandler for FrontRustls {
                 },
             }
 
-            if !is_rustls_backpressuring {
-                if let Err(e) = self.session.process_new_packets() {
-                    error!("could not process read TLS packets: {:?}", e);
-                    is_error = true;
-                    break;
-                }
+            if let Err(e) = self.session.process_new_packets() {
+                error!("could not process read TLS packets: {:?}", e);
+                is_error = true;
+                break;
             }
 
             while !self.session.wants_read() {

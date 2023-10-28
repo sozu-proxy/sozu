@@ -1573,7 +1573,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
             if backend_interest.is_hup() || backend_interest.is_error() {
                 let state_result = self.backend_hup();
-                error!("PROXY session {:?} back error", self.frontend_token);
+                error!(
+                    "PROXY session {:?} back error {:?} {:?} -> {:?} {:?}",
+                    self.frontend_token,
+                    self.frontend_readiness,
+                    self.request_stream.parsing_phase,
+                    self.backend_readiness,
+                    self.response_stream.parsing_phase
+                );
                 trace!("backend_hup: {:?}", state_result);
                 match state_result {
                     StateResult::Continue => {}
