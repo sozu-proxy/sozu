@@ -346,7 +346,7 @@ pub mod retry;
 pub mod router;
 pub mod socket;
 pub mod timer;
-pub mod tls;
+pub mod tls_backends;
 
 /// unused for now but may be usefull for bypassing sozu on a low level
 #[cfg(feature = "splice")]
@@ -371,7 +371,7 @@ use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
 use router::RouterError;
 use time::{Duration, Instant};
-use tls::GenericCertificateResolverError;
+use tls_backends::GenericCertificateResolverError;
 
 use sozu_command::{
     proto::command::{Cluster, ListenerType, RequestHttpFrontend},
@@ -383,6 +383,13 @@ use sozu_command::{
 };
 
 use crate::{backends::BackendMap, router::Route};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsProvider {
+    Openssl,
+    Rustls,
+}
+const GLOBAL_PROVIDER: TlsProvider = TlsProvider::Rustls;
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,6 +670,8 @@ pub enum ListenerError {
     PemParse(String),
     #[error("failed to build rustls context, {0}")]
     BuildRustls(String),
+    #[error("failed to build openssl context, {0}")]
+    BuildOpenssl(String),
     #[error("Wrong socket address")]
     SocketParse { address: String, error: String },
     #[error("could not activate listener with address {address}: {error}")]

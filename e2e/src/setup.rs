@@ -1,5 +1,3 @@
-mod tests;
-
 use std::{
     io::stdin,
     net::SocketAddr,
@@ -31,8 +29,14 @@ pub enum State {
 
 static PORT_PROVIDER: AtomicU16 = AtomicU16::new(2000);
 
-fn provide_port() -> u16 {
+pub fn provide_port() -> u16 {
     PORT_PROVIDER.fetch_add(1, Ordering::SeqCst)
+}
+
+pub fn create_local_address() -> SocketAddr {
+    format!("127.0.0.1:{}", provide_port())
+        .parse()
+        .expect("could not parse front address")
 }
 
 /// Setup a Sozu worker with

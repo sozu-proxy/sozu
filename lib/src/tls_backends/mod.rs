@@ -11,9 +11,8 @@ use std::{
 };
 
 use once_cell::sync::Lazy;
-use rustls::{
-    server::{ClientHello, ResolvesServerCert},
-    sign::{CertifiedKey, RsaSigningKey},
+use ::rustls::{
+    sign::{self, CertifiedKey, RsaSigningKey},
     Certificate, PrivateKey,
 };
 use sha2::{Digest, Sha256};
@@ -26,14 +25,17 @@ use sozu_command::{
 
 use crate::router::trie::{Key, KeyValue, TrieNode};
 
+pub mod openssl;
+pub mod rustls;
+
 // -----------------------------------------------------------------------------
 // Default ParsedCertificateAndKey
 
 static DEFAULT_CERTIFICATE: Lazy<ParsedCertificateAndKey> = Lazy::new(|| {
     let certificate_and_key = CertificateAndKey {
-        certificate: include_str!("../assets/certificate.pem").to_string(),
-        certificate_chain: vec![include_str!("../assets/certificate_chain.pem").to_string()],
-        key: include_str!("../assets/key.pem").to_string(),
+        certificate: include_str!("../../assets/certificate.pem").to_string(),
+        certificate_chain: vec![include_str!("../../assets/certificate_chain.pem").to_string()],
+        key: include_str!("../../assets/key.pem").to_string(),
         versions: vec![],
         names: vec![],
     };
@@ -71,7 +73,7 @@ pub trait CertificateResolver {
         })?;
 
         match hex::decode(&opts.old_fingerprint) {
-            Ok(old_fingerprint) =>  self.remove_certificate(&Fingerprint(old_fingerprint))?,
+            Ok(old_fingerprint) => self.remove_certificate(&Fingerprint(old_fingerprint))?,
             Err(err) => {
                 error!("failed to parse fingerprint, {}", err);
             }
@@ -371,7 +373,7 @@ impl CertificateResolverHelper for GenericCertificateResolver {
                 }
 
                 // try to read as ecdsa private key
-                if rustls::sign::any_ecdsa_type(&key).is_ok() {
+                if sign::any_ecdsa_type(&key).is_ok() {
                     let versions = certificate_and_key
                         .versions
                         .iter()
@@ -524,47 +526,6 @@ impl GenericCertificateResolver {
 #[derive(Debug)]
 pub struct MutexWrappedCertificateResolver(pub Mutex<GenericCertificateResolver>);
 
-impl ResolvesServerCert for MutexWrappedCertificateResolver {
-    fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
-        let server_name = client_hello.server_name();
-        let sigschemes = client_hello.signature_schemes();
-
-        if server_name.is_none() {
-            error!("cannot look up certificate: no SNI from session");
-            return None;
-        }
-
-        let name: &str = server_name.unwrap();
-        trace!(
-            "trying to resolve name: {:?} for signature scheme: {:?}",
-            name,
-            sigschemes
-        );
-        if let Ok(ref mut resolver) = self.0.try_lock() {
-            //resolver.domains.print();
-            if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
-                trace!(
-                    "looking for certificate for {:?} with fingerprint {:?}",
-                    name,
-                    fingerprint
-                );
-                return resolver
-                    .certificates
-                    .get(fingerprint)
-                    .and_then(Self::generate_certified_key)
-                    .map(Arc::new);
-            }
-        }
-
-        // error!("could not look up a certificate for server name '{}'", name);
-        // This certificate is used for TLS tunneling with another TLS termination endpoint
-        // Note that this is unsafe and you should provide a valid certificate
-        debug!("Default certificate is used for {}", name);
-        incr!("tls.default_cert_used");
-        Self::generate_certified_key(&DEFAULT_CERTIFICATE).map(Arc::new)
-    }
-}
-
 impl Default for MutexWrappedCertificateResolver {
     fn default() -> Self {
         Self(Mutex::new(GenericCertificateResolver::default()))
@@ -606,7 +567,7 @@ impl MutexWrappedCertificateResolver {
                         if let Ok(signing_key) = RsaSigningKey::new(&key) {
                             let certified = CertifiedKey::new(chains, Arc::new(signing_key));
                             return Some(certified);
-                        } else if let Ok(k) = rustls::sign::any_ecdsa_type(&key) {
+                        } else if let Ok(k) = sign::any_ecdsa_type(&key) {
                             let certified = CertifiedKey::new(chains, k);
                             return Some(certified);
                         } else {
@@ -648,8 +609,8 @@ mod tests {
         let address = "127.0.0.1:8080".to_string();
         let mut resolver = GenericCertificateResolver::new();
         let certificate_and_key = CertificateAndKey {
-            certificate: String::from(include_str!("../assets/certificate.pem")),
-            key: String::from(include_str!("../assets/key.pem")),
+            certificate: String::from(include_str!("../../assets/certificate.pem")),
+            key: String::from(include_str!("../../assets/key.pem")),
             ..Default::default()
         };
 
@@ -693,8 +654,8 @@ mod tests {
         let address = "127.0.0.1:8080".to_string();
         let mut resolver = GenericCertificateResolver::new();
         let certificate_and_key = CertificateAndKey {
-            certificate: String::from(include_str!("../assets/certificate.pem")),
-            key: String::from(include_str!("../assets/key.pem")),
+            certificate: String::from(include_str!("../../assets/certificate.pem")),
+            key: String::from(include_str!("../../assets/key.pem")),
             names: vec!["localhost".into(), "lolcatho.st".into()],
             ..Default::default()
         };
@@ -753,8 +714,8 @@ mod tests {
         // ---------------------------------------------------------------------
         // load first certificate
         let certificate_and_key_1y = CertificateAndKey {
-            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
-            key: String::from(include_str!("../assets/tests/key-1y.pem")),
+            certificate: String::from(include_str!("../../assets/tests/certificate-1y.pem")),
+            key: String::from(include_str!("../../assets/tests/key-1y.pem")),
             ..Default::default()
         };
 
@@ -775,8 +736,8 @@ mod tests {
         // ---------------------------------------------------------------------
         // load second certificate
         let certificate_and_key_2y = CertificateAndKey {
-            certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
-            key: String::from(include_str!("../assets/tests/key-2y.pem")),
+            certificate: String::from(include_str!("../../assets/tests/certificate-2y.pem")),
+            key: String::from(include_str!("../../assets/tests/key-2y.pem")),
             ..Default::default()
         };
 
@@ -820,8 +781,8 @@ mod tests {
         // ---------------------------------------------------------------------
         // load first certificate
         let certificate_and_key_1y = CertificateAndKey {
-            certificate: String::from(include_str!("../assets/tests/certificate-1y.pem")),
-            key: String::from(include_str!("../assets/tests/key-1y.pem")),
+            certificate: String::from(include_str!("../../assets/tests/certificate-1y.pem")),
+            key: String::from(include_str!("../../assets/tests/key-1y.pem")),
             ..Default::default()
         };
 
@@ -846,8 +807,8 @@ mod tests {
         // ---------------------------------------------------------------------
         // load second certificate
         let certificate_and_key_2y = CertificateAndKey {
-            certificate: String::from(include_str!("../assets/tests/certificate-2y.pem")),
-            key: String::from(include_str!("../assets/tests/key-2y.pem")),
+            certificate: String::from(include_str!("../../assets/tests/certificate-2y.pem")),
+            key: String::from(include_str!("../../assets/tests/key-2y.pem")),
             ..Default::default()
         };
 
@@ -889,33 +850,33 @@ mod tests {
         // load certificates
         let mut certificates = vec![
             CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-1.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
+                certificate: include_str!("../../assets/tests/certificate-1.pem").to_string(),
+                key: include_str!("../../assets/tests/key.pem").to_string(),
                 ..Default::default()
             },
             CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-2.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
+                certificate: include_str!("../../assets/tests/certificate-2.pem").to_string(),
+                key: include_str!("../../assets/tests/key.pem").to_string(),
                 ..Default::default()
             },
             CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-3.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
+                certificate: include_str!("../../assets/tests/certificate-3.pem").to_string(),
+                key: include_str!("../../assets/tests/key.pem").to_string(),
                 ..Default::default()
             },
             CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-4.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
+                certificate: include_str!("../../assets/tests/certificate-4.pem").to_string(),
+                key: include_str!("../../assets/tests/key.pem").to_string(),
                 ..Default::default()
             },
             CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-5.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
+                certificate: include_str!("../../assets/tests/certificate-5.pem").to_string(),
+                key: include_str!("../../assets/tests/key.pem").to_string(),
                 ..Default::default()
             },
             CertificateAndKey {
-                certificate: include_str!("../assets/tests/certificate-6.pem").to_string(),
-                key: include_str!("../assets/tests/key.pem").to_string(),
+                certificate: include_str!("../../assets/tests/certificate-6.pem").to_string(),
+                key: include_str!("../../assets/tests/key.pem").to_string(),
                 ..Default::default()
             },
         ];

@@ -29,6 +29,9 @@ include = [
 ]
 
 [dependencies]
+openssl = "0.10.57"
+openssl-sys = "0.9.93"
+foreign-types-shared = "^0.1.1"
 anyhow = "^1.0.75"
 cookie-factory = "^0.3.2"
 hdrhistogram = "^7.5.2"

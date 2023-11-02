@@ -90,6 +90,17 @@ pub const DEFAULT_RUSTLS_CIPHER_LIST: [&str; 9] = [
     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
 ];
 
+pub const DEFAULT_OPENSSL_CIPHER_LIST: [&str; 8] = [
+    "ECDHE-ECDSA-AES256-GCM-SHA384",
+    "ECDHE-ECDSA-AES128-GCM-SHA256",
+    "ECDHE-ECDSA-AES256-CCM",
+    "ECDHE-ECDSA-AES128-CCM",
+    "ECDHE-ECDSA-CHACHA20-POLY1305",
+    "ECDHE-RSA-AES256-GCM-SHA384",
+    "ECDHE-RSA-AES128-GCM-SHA256",
+    "ECDHE-RSA-CHACHA20-POLY1305",
+];
+
 pub const DEFAULT_CIPHER_SUITES: [&str; 4] = [
     "TLS_AES_256_GCM_SHA384",
     "TLS_AES_128_GCM_SHA256",
@@ -461,12 +472,12 @@ impl ListenerBuilder {
             });
         }
 
-        let default_cipher_list = DEFAULT_RUSTLS_CIPHER_LIST
-            .into_iter()
-            .map(String::from)
-            .collect();
+        // let default_cipher_list = DEFAULT_RUSTLS_CIPHER_LIST
+        //     .into_iter()
+        //     .map(String::from)
+        //     .collect();
 
-        let cipher_list = self.cipher_list.clone().unwrap_or(default_cipher_list);
+        let cipher_list = self.cipher_list.clone().unwrap_or_default(); //unwrap_or(default_cipher_list);
 
         let default_cipher_suites = DEFAULT_CIPHER_SUITES
             .into_iter()

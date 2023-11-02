@@ -1,10 +1,8 @@
 #![allow(dead_code)]
 
-mod http_utils;
-mod mock;
-mod sozu;
-#[cfg(test)]
-#[cfg(not(tarpaulin))]
-mod tests;
+pub mod http_utils;
+pub mod mock;
+pub mod sozu;
+pub mod setup;
 
-const BUFFER_SIZE: usize = 4096;
+pub const BUFFER_SIZE: usize = 4096;

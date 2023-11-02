@@ -19,7 +19,7 @@ pub enum TlsState {
 pub struct TlsHandshake {
     pub container_frontend_timeout: TimeoutContainer,
     pub frontend_readiness: Readiness,
-    frontend_token: Token,
+    pub frontend_token: Token,
     pub request_id: Ulid,
     pub session: ServerConnection,
     pub stream: TcpStream,
@@ -207,7 +207,13 @@ impl SessionState for TlsHandshake {
             }
 
             if frontend_interest.is_readable() {
+                // let start = std::time::Instant::now();
                 let protocol_result = self.readable();
+                // println!(
+                //     "RUSTLS_HANDSHAKE {:?} ELAPSED: {:?}",
+                //     self.frontend_token,
+                //     start.elapsed()
+                // );
                 if protocol_result != SessionResult::Continue {
                     return protocol_result;
                 }

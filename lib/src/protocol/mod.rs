@@ -2,7 +2,7 @@ pub mod h2;
 pub mod kawa_h1;
 pub mod pipe;
 pub mod proxy_protocol;
-pub mod rustls;
+pub mod tls_handshake;
 
 use std::{cell::RefCell, rc::Rc};
 
@@ -15,7 +15,8 @@ use crate::{
 
 pub use crate::protocol::{
     http::Http, kawa_h1 as http, pipe::Pipe, proxy_protocol::send::SendProxyProtocol,
-    rustls::TlsHandshake,
+    tls_handshake::openssl::TlsHandshake as OpensslHandshake,
+    tls_handshake::rustls::TlsHandshake as RustlsHandshake,
 };
 
 /// All States should satisfy this trait in order to receive and handle Session events

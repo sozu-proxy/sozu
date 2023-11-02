@@ -4,6 +4,7 @@ use std::{
 };
 
 use mio::net::{TcpListener, TcpStream};
+use openssl::ssl::{ErrorCode, SslStream, SslVersion};
 use rustls::{ProtocolVersion, ServerConnection};
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -160,6 +161,108 @@ impl SocketHandler for TcpStream {
     }
 }
 
+pub type FrontOpenssl = SslStream<TcpStream>;
+impl SocketHandler for FrontOpenssl {
+    fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+        let mut size = 0usize;
+        loop {
+            if size == buf.len() {
+                return (size, SocketResult::Continue);
+            }
+            match self.ssl_read(&mut buf[size..]) {
+                Ok(0) => return (size, SocketResult::Continue),
+                Ok(sz) => size += sz,
+                Err(e) => match e.code() {
+                    ErrorCode::WANT_READ => return (size, SocketResult::WouldBlock),
+                    ErrorCode::WANT_WRITE => return (size, SocketResult::WouldBlock),
+                    ErrorCode::SSL => {
+                        debug!(
+                            "SOCKET-TLS\treadable TLS socket SSL error: {:?} -> {:?}",
+                            e,
+                            e.ssl_error()
+                        );
+                        return (size, SocketResult::Error);
+                    }
+                    ErrorCode::SYSCALL => return (size, SocketResult::Error),
+                    ErrorCode::ZERO_RETURN => return (size, SocketResult::Closed),
+                    _ => {
+                        debug!(
+                            "SOCKET-TLS\treadable TLS socket error={:?} -> {:?}",
+                            e,
+                            e.ssl_error()
+                        );
+                        return (size, SocketResult::Error);
+                    }
+                },
+            }
+        }
+    }
+
+    fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+        let mut size = 0usize;
+        loop {
+            if size == buf.len() {
+                return (size, SocketResult::Continue);
+            }
+            match self.ssl_write(&buf[size..]) {
+                Ok(0) => return (size, SocketResult::Continue),
+                Ok(sz) => size += sz,
+                Err(e) => match e.code() {
+                    ErrorCode::WANT_READ => return (size, SocketResult::WouldBlock),
+                    ErrorCode::WANT_WRITE => return (size, SocketResult::WouldBlock),
+                    ErrorCode::SSL => {
+                        debug!(
+                            "SOCKET-TLS\twritable TLS socket SSL error: {:?} -> {:?}",
+                            e,
+                            e.ssl_error()
+                        );
+                        return (size, SocketResult::Error);
+                    }
+                    ErrorCode::SYSCALL => return (size, SocketResult::Error),
+                    ErrorCode::ZERO_RETURN => return (size, SocketResult::Closed),
+                    _ => {
+                        debug!(
+                            "SOCKET-TLS\twritable TLS socket error={:?} -> {:?}",
+                            e,
+                            e.ssl_error()
+                        );
+                        return (size, SocketResult::Error);
+                    }
+                },
+            }
+        }
+    }
+
+    fn socket_ref(&self) -> &TcpStream {
+        self.get_ref()
+    }
+
+    fn socket_mut(&mut self) -> &mut TcpStream {
+        self.get_mut()
+    }
+
+    fn protocol(&self) -> TransportProtocol {
+        self.ssl()
+            .version2()
+            .map(|version| match version {
+                SslVersion::SSL3 => TransportProtocol::Ssl3,
+                SslVersion::TLS1 => TransportProtocol::Tls1_0,
+                SslVersion::TLS1_1 => TransportProtocol::Tls1_1,
+                SslVersion::TLS1_2 => TransportProtocol::Tls1_2,
+                _ => TransportProtocol::Tls1_3,
+            })
+            .unwrap_or(TransportProtocol::Tcp)
+    }
+
+    fn read_error(&self) {
+        incr!("openssl.read.error");
+    }
+
+    fn write_error(&self) {
+        incr!("openssl.write.error");
+    }
+}
+
 pub struct FrontRustls {
     pub stream: TcpStream,
     pub session: ServerConnection,
@@ -181,7 +284,7 @@ impl SocketHandler for FrontRustls {
                 break;
             }
 
-            let mut is_rustls_backpressuring = false;
+            // let mut is_rustls_backpressuring = false;
             match self.session.read_tls(&mut self.stream) {
                 Ok(0) => {
                     can_read = false;
@@ -200,8 +303,14 @@ impl SocketHandler for FrontRustls {
                     // According to rustls comment here https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500,
                     // [`ErrorKind::Other`] error signal that the buffer is full, we need to read it before processing new packets.
                     ErrorKind::Other => {
-                        warn!("rustls buffer is full, we will consume it, before processing new incoming packets, to mitigate this issue, you could try to increase the buffer size, {:?}", e);
-                        is_rustls_backpressuring = true;
+                        warn!(
+                            "rustls buffer is full {:?}, trying to read {} bytes, {} remaining",
+                            e,
+                            buf.len(),
+                            buf.len() - size
+                        );
+                        // panic!("BACKPRESSURE");
+                        // is_rustls_backpressuring = true;
                     }
                     _ => {
                         error!("could not read TLS stream from socket: {:?}", e);
@@ -211,20 +320,20 @@ impl SocketHandler for FrontRustls {
                 },
             }
 
-            if !is_rustls_backpressuring {
-                if let Err(e) = self.session.process_new_packets() {
-                    error!("could not process read TLS packets: {:?}", e);
-                    is_error = true;
-                    break;
-                }
+            // if !is_rustls_backpressuring {
+            if let Err(e) = self.session.process_new_packets() {
+                error!("could not process read TLS packets: {:?}", e);
+                is_error = true;
+                break;
             }
+            // }
 
             while !self.session.wants_read() {
                 match self.session.reader().read(&mut buf[size..]) {
                     Ok(0) => break,
                     Ok(sz) => {
                         size += sz;
-                        can_read = true;
+                        // can_read = true;
                     }
                     Err(e) => match e.kind() {
                         ErrorKind::WouldBlock => {
