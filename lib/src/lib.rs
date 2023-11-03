@@ -389,7 +389,7 @@ pub enum TlsProvider {
     Openssl,
     Rustls,
 }
-const GLOBAL_PROVIDER: TlsProvider = TlsProvider::Rustls;
+const GLOBAL_PROVIDER: TlsProvider = TlsProvider::Openssl;
 
 /// Anything that can be registered in mio (subscribe to kernel events)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

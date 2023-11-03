@@ -48,9 +48,10 @@ pub enum TransportProtocol {
 pub trait SocketHandler {
     fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult);
     fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult);
-    fn socket_write_vectored(&mut self, _buf: &[std::io::IoSlice]) -> (usize, SocketResult) {
-        unimplemented!()
-    }
+    fn socket_write_vectored(&mut self, _buf: &[std::io::IoSlice]) -> (usize, SocketResult);
+    // {
+    //     unimplemented!()
+    // }
     fn has_vectored_writes(&self) -> bool {
         false
     }
@@ -231,6 +232,20 @@ impl SocketHandler for FrontOpenssl {
                 },
             }
         }
+    }
+
+    fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
+        let mut total_size = 0;
+        let mut socket_state = SocketResult::Continue;
+        let mut size;
+        for buf in bufs {
+            (size, socket_state) = self.socket_write(buf);
+            total_size += size;
+            if socket_state != SocketResult::Continue {
+                break;
+            }
+        }
+        (total_size, socket_state)
     }
 
     fn socket_ref(&self) -> &TcpStream {
