@@ -17,7 +17,7 @@
 # "trace". For performance reasons, the logs at "debug" or "trace" level are
 # not compiled by default. To activate them, pass the "logs-debug" and
 # "logs-trace" compilation options to cargo
-log_level = "info"
+log_level = "debug"
 
 # where the logs will be sent. It defaults to sending the logs on standard output,
 # but they could be written to a UDP address:
@@ -34,6 +34,7 @@ log_target = "stdout"
 # optional different target for access logs (IP addresses, domains, URI, HTTP status, etc)
 # It supports the same options as log_target
 # log_access_target = "file:///var/logs/sozu-access.log"
+log_access_target = "file:///var/logs/sozu-access.log"
 
 # path to the unix socket file used to send commands to sozu
 # default value points to "sozu.sock" file in the current directory
@@ -44,9 +45,9 @@ command_socket = "./sozu.sock"
 # buffer will grow up to max_command_buffer_size. If the buffer is still not large
 # enough sozu will close the connection
 # defaults to 1000000
-command_buffer_size = 16384
+command_buffer_size = 163840
 # defaults to command_buffer_size * 2
-max_command_buffer_size = 163840
+max_command_buffer_size = 1638400
 
 # the number of worker processes that will handle traffic
 # defaults to 2 workers
@@ -263,9 +264,10 @@ load_balancing = "ROUND_ROBIN"
 # - https_redirect = false #  activates automatic redirection to HTTPS for this cluster
 # - custom_tag: a tag to retrieve a frontend with the CLI or in the logs
 frontends = [
-    { address = "0.0.0.0:8080", hostname = "lolcatho.st", tags = { key = "value" }, path = "/api" },
+    { address = "0.0.0.0:8080", hostname = "lolcatho.st", tags = { route = "root" }, path = "/" },
+    { address = "0.0.0.0:8080", hostname = "lolcatho.st", tags = { route = "api" }, path = "/api" },
     # HTTPS frontends also have an optional `tls_versions` key like the HTTPS listeners
-    { address = "0.0.0.0:8443", hostname = "lolcatho.st", tags = { key = "value" }, certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" },
+    { address = "0.0.0.0:8443", hostname = "lolcatho.st", tags = { key = "value", route = "tls" }, certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" },
 ]
 
 # backends configuration

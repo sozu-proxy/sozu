@@ -271,7 +271,7 @@ impl ProxySession for HttpSession {
             return;
         }
 
-        debug!("Closing HTTP session");
+        trace!("Closing HTTP session");
         self.metrics.service_stop();
 
         // Restore gauges

@@ -184,7 +184,10 @@ impl SocketHandler for FrontRustls {
 
             iter += 1;
             if iter > 100 {
-                error!("Still reading TLS after {} iterations, breaking the loop", iter);
+                error!(
+                    "Still reading TLS after {} iterations, breaking the loop",
+                    iter
+                );
                 return (size, SocketResult::WouldBlock);
             }
 
@@ -193,9 +196,12 @@ impl SocketHandler for FrontRustls {
                     can_read = false;
                     is_closed = true;
                 }
-                Ok(_sz) => {}
+                Ok(_sz) => {
+                    println!("tls_to_read: {_sz}");
+                }
                 Err(e) => match e.kind() {
                     ErrorKind::WouldBlock => {
+                        println!("tls_to_read: wouldblock");
                         can_read = false;
                     }
                     ErrorKind::ConnectionReset
@@ -206,7 +212,11 @@ impl SocketHandler for FrontRustls {
                     // According to rustls comment here https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500,
                     // [`ErrorKind::Other`] error signal that the buffer is full, we need to read it before processing new packets.
                     ErrorKind::Other => {
-                        warn!("rustls buffer is full, we will consume it, before processing new incoming packets, to mitigate this issue, you could try to increase the buffer size, {:?}", e);
+                        error!(
+                            "rustls buffer is full {:?}, trying to read {} bytes, {} remaining after {} iterations",
+                            e, buf.len(), buf.len()-size, iter
+                        );
+                        panic!("Backpressure");
                     }
                     _ => {
                         error!("could not read TLS stream from socket: {:?}", e);
@@ -216,19 +226,21 @@ impl SocketHandler for FrontRustls {
                 },
             }
 
-            if let Err(e) = self.session.process_new_packets() {
-                error!("could not process read TLS packets: {:?}", e);
-                is_error = true;
-                break;
+            match self.session.process_new_packets() {
+                Ok(o) => {
+                    println!("plain_to_read: {}", o.plaintext_bytes_to_read());
+                },
+                Err(e) => {
+                    error!("could not process read TLS packets: {:?}", e);
+                    is_error = true;
+                    break;
+                }
             }
 
             while !self.session.wants_read() {
                 match self.session.reader().read(&mut buf[size..]) {
                     Ok(0) => break,
-                    Ok(sz) => {
-                        size += sz;
-                        can_read = true;
-                    }
+                    Ok(sz) => size += sz,
                     Err(e) => match e.kind() {
                         ErrorKind::WouldBlock => {
                             break;

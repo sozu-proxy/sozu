@@ -222,11 +222,10 @@ impl<V: Debug + Clone> TrieNode<V> {
                     if pos > 0 {
                         let mut remove_result = RemoveResult::NotFound;
                         for t in self.regexps.iter_mut() {
-                            if t.0.as_str() == s {
-                                if t.1.remove_recursive(&partial_key[..pos - 1]) == RemoveResult::Ok
-                                {
-                                    remove_result = RemoveResult::Ok;
-                                }
+                            if t.0.as_str() == s
+                                && t.1.remove_recursive(&partial_key[..pos - 1]) == RemoveResult::Ok
+                            {
+                                remove_result = RemoveResult::Ok;
                             }
                         }
                         return remove_result;
@@ -252,15 +251,15 @@ impl<V: Debug + Clone> TrieNode<V> {
 
         match self.children.get_mut(suffix) {
             Some(child) => match child.remove_recursive(prefix) {
-                RemoveResult::NotFound => return RemoveResult::NotFound,
+                RemoveResult::NotFound => RemoveResult::NotFound,
                 RemoveResult::Ok => {
                     if child.is_empty() {
                         self.children.remove(suffix);
                     }
-                    return RemoveResult::Ok;
+                    RemoveResult::Ok
                 }
             },
-            None => return RemoveResult::NotFound,
+            None => RemoveResult::NotFound,
         }
     }
 

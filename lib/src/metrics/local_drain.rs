@@ -359,7 +359,7 @@ impl LocalDrain {
                 .iter()
                 .find(|backend_metrics| backend_metrics.backend_id == backend_id)
             {
-                return Ok(backend_metrics.to_filtered_metrics(metric_names)?);
+                return backend_metrics.to_filtered_metrics(metric_names);
             }
         }
 
@@ -486,7 +486,7 @@ impl LocalDrain {
         match self.cluster_metrics.entry(cluster_id.to_owned()) {
             Entry::Vacant(entry) => {
                 let mut metrics = BTreeMap::new();
-                metrics.insert(metric_name.to_owned(), aggregated_metric.clone());
+                metrics.insert(metric_name.to_owned(), aggregated_metric);
                 let backends = [LocalBackendMetrics {
                     backend_id: backend_id.to_owned(),
                     metrics,
@@ -497,11 +497,10 @@ impl LocalDrain {
                     cluster: BTreeMap::new(),
                     backends,
                 });
-                return;
             }
             Entry::Occupied(mut entry) => {
                 for backend_metrics in &mut entry.get_mut().backends {
-                    if &backend_metrics.backend_id == backend_id {
+                    if backend_metrics.backend_id == backend_id {
                         if let Some(existing_metric) = backend_metrics.metrics.get_mut(metric_name)
                         {
                             existing_metric.update(metric_name, metric);

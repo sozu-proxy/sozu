@@ -9,7 +9,7 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use kawa;
+use kawa::{self, ParsingPhase};
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use time::{Duration, Instant};
@@ -276,6 +276,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             return StateResult::Continue;
         }
 
+        info!(
+            "Trying read on {} [{} {} {}]",
+            self.frontend_token.0,
+            self.request_stream.storage.start,
+            self.request_stream.storage.head,
+            self.request_stream.storage.end
+        );
         let (size, socket_state) = self
             .frontend_socket
             .socket_read(self.request_stream.storage.space());
@@ -348,8 +355,24 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             incr!("http.requests");
         }
 
-        if self.request_stream.is_error() {
+        if let ParsingPhase::Error { marker, kind } = self.request_stream.parsing_phase {
             incr!("http.frontend_parse_errors");
+            debug!(
+                "{} Parsing request error in {:?}: {}",
+                self.log_context(),
+                marker,
+                match kind {
+                    kawa::ParsingErrorKind::Consuming { index } => {
+                        let kawa = &self.request_stream;
+                        parser::view(
+                            kawa.storage.used(),
+                            16,
+                            &[kawa.storage.head, index as usize],
+                        )
+                    }
+                    kawa::ParsingErrorKind::Processing { message } => message.to_owned(),
+                }
+            );
             if self.response_stream.consumed {
                 return StateResult::CloseSession;
             } else {
@@ -661,8 +684,24 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         kawa::h1::parse(&mut self.response_stream, &mut self.context);
         // kawa::debug_kawa(&self.response_stream);
 
-        if self.response_stream.is_error() {
+        if let ParsingPhase::Error { marker, kind } = self.response_stream.parsing_phase {
             incr!("http.backend_parse_errors");
+            debug!(
+                "{} Parsing request error in {:?}: {}",
+                self.log_context(),
+                marker,
+                match kind {
+                    kawa::ParsingErrorKind::Consuming { index } => {
+                        let kawa = &self.request_stream;
+                        parser::view(
+                            kawa.storage.used(),
+                            16,
+                            &[kawa.storage.head, index as usize],
+                        )
+                    }
+                    kawa::ParsingErrorKind::Processing { message } => message.to_owned(),
+                }
+            );
             if self.response_stream.consumed {
                 return SessionResult::Close;
             } else {
