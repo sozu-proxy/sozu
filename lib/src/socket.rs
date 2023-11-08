@@ -174,7 +174,6 @@ impl SocketHandler for FrontRustls {
                 break;
             }
 
-            let mut is_rustls_backpressuring = false;
             match self.session.read_tls(&mut self.stream) {
                 Ok(0) => {
                     can_read = false;
@@ -190,11 +189,9 @@ impl SocketHandler for FrontRustls {
                     | ErrorKind::BrokenPipe => {
                         is_closed = true;
                     }
-                    // According to rustls comment here https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500,
-                    // [`ErrorKind::Other`] error signal that the buffer is full, we need to read it before processing new packets.
+                    // https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500,
                     ErrorKind::Other => {
                         warn!("rustls buffer is full, we will consume it, before processing new incoming packets, to mitigate this issue, you could try to increase the buffer size, {:?}", e);
-                        is_rustls_backpressuring = true;
                     }
                     _ => {
                         error!("could not read TLS stream from socket: {:?}", e);
@@ -204,12 +201,10 @@ impl SocketHandler for FrontRustls {
                 },
             }
 
-            if !is_rustls_backpressuring {
-                if let Err(e) = self.session.process_new_packets() {
-                    error!("could not process read TLS packets: {:?}", e);
-                    is_error = true;
-                    break;
-                }
+            if let Err(e) = self.session.process_new_packets() {
+                error!("could not process read TLS packets: {:?}", e);
+                is_error = true;
+                break;
             }
 
             while !self.session.wants_read() {
