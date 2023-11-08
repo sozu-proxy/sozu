@@ -159,6 +159,12 @@ pub const DEFAULT_MAX_COMMAND_BUFFER_SIZE: usize = 2_000_000;
 /// wether to avoid register cluster metrics in the local drain
 pub const DEFAULT_DISABLE_CLUSTER_METRICS: bool = false;
 
+/// Number of TLS 1.3 tickets to send to a client when establishing a connection.
+/// The tickets allow the client to resume a session. This protects the client
+/// agains session tracking. Increases the number of getrandom syscalls,
+/// with little influence on performance. Defaults to 4.
+pub const DEFAULT_SEND_TLS_13_TICKETS: u64 = 4;
+
 #[derive(Debug)]
 pub enum IncompatibilityKind {
     PublicAddress,
@@ -249,6 +255,10 @@ pub struct ListenerBuilder {
     pub request_timeout: Option<u32>,
     /// A [Config] to pull defaults from
     pub config: Option<Config>,
+    /// Number of TLS 1.3 tickets to send to a client when establishing a connection.
+    /// The ticket allow the client to resume a session. This protects the client
+    /// agains session tracking. Defaults to 4.
+    pub send_tls13_tickets: Option<u64>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -550,6 +560,9 @@ impl ListenerBuilder {
             signature_algorithms,
             groups_list,
             active: false,
+            send_tls13_tickets: self
+                .send_tls13_tickets
+                .unwrap_or(DEFAULT_SEND_TLS_13_TICKETS),
         };
 
         Ok(https_listener_config)
