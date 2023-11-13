@@ -371,7 +371,7 @@ use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
 use router::RouterError;
 use time::{Duration, Instant};
-use tls::GenericCertificateResolverError;
+use tls::CertificateResolverError;
 
 use sozu_command::{
     proto::command::{Cluster, ListenerType, RequestHttpFrontend},
@@ -658,7 +658,7 @@ pub enum ListenerError {
     #[error("failed to acquire the lock, {0}")]
     Lock(String),
     #[error("failed to handle certificate request, got a resolver error, {0}")]
-    Resolver(GenericCertificateResolverError),
+    Resolver(CertificateResolverError),
     #[error("failed to parse pem, {0}")]
     PemParse(String),
     #[error("failed to build rustls context, {0}")]

@@ -307,6 +307,12 @@ impl<V: Debug + Clone> TrieNode<V> {
     }
 }
 
+impl<T: Clone + Debug> Default for TrieNode<T> {
+    fn default() -> Self {
+        Self::root()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

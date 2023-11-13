@@ -4,8 +4,10 @@ use hex::FromHex;
 use serde::de::{self, Visitor};
 use sha2::{Digest, Sha256};
 use x509_parser::{
+    certificate::X509Certificate,
     extensions::{GeneralName, ParsedExtension},
     oid_registry::{OID_X509_COMMON_NAME, OID_X509_EXT_SUBJECT_ALT_NAME},
+    parse_x509_certificate,
     pem::{parse_x509_pem, Pem},
 };
 
@@ -27,21 +29,26 @@ pub enum CertificateError {
 
 /// parse a pem file encoded as binary and convert it into the right structure
 /// (a.k.a [`Pem`])
-pub fn parse(certificate: &[u8]) -> Result<Pem, CertificateError> {
+pub fn parse_pem(certificate: &[u8]) -> Result<Pem, CertificateError> {
     let (_, pem) = parse_x509_pem(certificate)
         .map_err(|err| CertificateError::InvalidCertificate(err.to_string()))?;
 
     Ok(pem)
 }
 
+pub fn parse_x509(pem_bytes: &[u8]) -> Result<X509Certificate, CertificateError> {
+    parse_x509_certificate(pem_bytes)
+        .map_err(|nom_e| CertificateError::InvalidCertificate(nom_e.to_string()))
+        .map(|t| t.1)
+}
+
 // -----------------------------------------------------------------------------
 // get_cn_and_san_attributes
 
-/// Retrieve from the [`Pem`] structure the common name (a.k.a `CN`) and the
+/// Retrieve from the pem (as bytes) the common name (a.k.a `CN`) and the
 /// subject alternate names (a.k.a `SAN`)
-pub fn get_cn_and_san_attributes(pem: &Pem) -> Result<HashSet<String>, CertificateError> {
-    let x509 = pem
-        .parse_x509()
+pub fn get_cn_and_san_attributes(pem_bytes: &[u8]) -> Result<HashSet<String>, CertificateError> {
+    let x509 = parse_x509(pem_bytes)
         .map_err(|err| CertificateError::InvalidCertificate(err.to_string()))?;
 
     let mut names: HashSet<String> = HashSet::new();
@@ -150,7 +157,7 @@ pub fn calculate_fingerprint_from_der(certificate: &[u8]) -> Vec<u8> {
 
 /// Compute fingerprint from a certificate that is encoded in pem format
 pub fn calculate_fingerprint(certificate: &[u8]) -> Result<Vec<u8>, CertificateError> {
-    let parsed_certificate = parse(certificate)
+    let parsed_certificate = parse_pem(certificate)
         .map_err(|parse_error| CertificateError::InvalidCertificate(parse_error.to_string()))?;
 
     Ok(calculate_fingerprint_from_der(&parsed_certificate.contents))

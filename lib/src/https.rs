@@ -62,7 +62,7 @@ use crate::{
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     timer::TimeoutContainer,
-    tls::{CertificateResolver, MutexWrappedCertificateResolver, ParsedCertificateAndKey},
+    tls::{MutexWrappedCertificateResolver, ResolveCertificate, StoredCertificate},
     util::UnwrapLog,
     AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
@@ -597,10 +597,10 @@ impl L7ListenerHandler for HttpsListener {
     }
 }
 
-impl CertificateResolver for HttpsListener {
+impl ResolveCertificate for HttpsListener {
     type Error = ListenerError;
 
-    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<ParsedCertificateAndKey> {
+    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<StoredCertificate> {
         let resolver = self
             .resolver
             .0
@@ -641,7 +641,7 @@ impl HttpsListener {
         config: HttpsListenerConfig,
         token: Token,
     ) -> Result<HttpsListener, ListenerError> {
-        let resolver = Arc::new(MutexWrappedCertificateResolver::new());
+        let resolver = Arc::new(MutexWrappedCertificateResolver::default());
 
         let server_config = Arc::new(Self::create_rustls_context(&config, resolver.to_owned())?);
 
@@ -1640,7 +1640,7 @@ mod tests {
 
         let address: StdSocketAddr = FromStr::from_str("127.0.0.1:1032")
             .expect("test address 127.0.0.1:1032 should be parsed");
-        let resolver = Arc::new(MutexWrappedCertificateResolver::new());
+        let resolver = Arc::new(MutexWrappedCertificateResolver::default());
 
         let server_config = ServerConfig::builder()
             .with_safe_default_cipher_suites()

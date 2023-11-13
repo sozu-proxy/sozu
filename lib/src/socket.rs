@@ -333,7 +333,7 @@ impl SocketHandler for FrontRustls {
         let mut is_error = false;
         let mut is_closed = false;
 
-        match self.session.writer().write_vectored(&bufs) {
+        match self.session.writer().write_vectored(bufs) {
             Ok(0) => {}
             Ok(sz) => {
                 buffered_size += sz;

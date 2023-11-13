@@ -390,7 +390,7 @@ pub fn try_tls_endpoint() -> State {
     let certificate_and_key = CertificateAndKey {
         certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
         key: String::from(include_str!("../../../lib/assets/local-key.pem")),
-        certificate_chain: vec![],
+        certificate_chain: vec![], // in config.toml the certificate chain would be the same as the certificate
         versions: vec![],
         names: vec![],
     };
