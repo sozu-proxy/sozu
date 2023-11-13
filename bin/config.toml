@@ -218,6 +218,12 @@ cipher_list = [
 #key = "../lib/assets/key_test.pem"
 #certificate_chain = "../lib/assets/certificate_chain.pem"
 
+# Number of TLS 1.3 tickets to send to a client when establishing a connection.
+# The tickets allow the client to resume a session. This protects the client
+# agains session tracking. Increases the number of getrandom syscalls,
+# with little influence on performance. Defaults to 4.
+# send_tls13_tickets = 4
+
 # options specific to a TCP proxy listener
 #[[listeners]]
 # protocol = "tcp"

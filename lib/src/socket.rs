@@ -50,9 +50,6 @@ pub trait SocketHandler {
     fn socket_write_vectored(&mut self, _buf: &[std::io::IoSlice]) -> (usize, SocketResult) {
         unimplemented!()
     }
-    fn has_vectored_writes(&self) -> bool {
-        false
-    }
     fn socket_ref(&self) -> &TcpStream;
     fn socket_mut(&mut self) -> &mut TcpStream;
     fn protocol(&self) -> TransportProtocol;
@@ -135,10 +132,6 @@ impl SocketHandler for TcpStream {
         }
     }
 
-    fn has_vectored_writes(&self) -> bool {
-        true
-    }
-
     fn socket_ref(&self) -> &TcpStream {
         self
     }
@@ -181,7 +174,6 @@ impl SocketHandler for FrontRustls {
                 break;
             }
 
-            let mut is_rustls_backpressuring = false;
             match self.session.read_tls(&mut self.stream) {
                 Ok(0) => {
                     can_read = false;
@@ -197,11 +189,9 @@ impl SocketHandler for FrontRustls {
                     | ErrorKind::BrokenPipe => {
                         is_closed = true;
                     }
-                    // According to rustls comment here https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500,
-                    // [`ErrorKind::Other`] error signal that the buffer is full, we need to read it before processing new packets.
+                    // https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500,
                     ErrorKind::Other => {
                         warn!("rustls buffer is full, we will consume it, before processing new incoming packets, to mitigate this issue, you could try to increase the buffer size, {:?}", e);
-                        is_rustls_backpressuring = true;
                     }
                     _ => {
                         error!("could not read TLS stream from socket: {:?}", e);
@@ -211,12 +201,10 @@ impl SocketHandler for FrontRustls {
                 },
             }
 
-            if !is_rustls_backpressuring {
-                if let Err(e) = self.session.process_new_packets() {
-                    error!("could not process read TLS packets: {:?}", e);
-                    is_error = true;
-                    break;
-                }
+            if let Err(e) = self.session.process_new_packets() {
+                error!("could not process read TLS packets: {:?}", e);
+                is_error = true;
+                break;
             }
 
             while !self.session.wants_read() {
@@ -339,22 +327,72 @@ impl SocketHandler for FrontRustls {
         }
     }
 
-    fn has_vectored_writes(&self) -> bool {
-        true
-    }
-
     fn socket_write_vectored(&mut self, bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
-        let mut total_size = 0;
-        let mut socket_state = SocketResult::Continue;
-        let mut size;
-        for buf in bufs {
-            (size, socket_state) = self.socket_write(buf);
-            total_size += size;
-            if socket_state != SocketResult::Continue {
-                break;
+        let mut buffered_size = 0usize;
+        let mut can_write = true;
+        let mut is_error = false;
+        let mut is_closed = false;
+
+        match self.session.writer().write_vectored(&bufs) {
+            Ok(0) => {}
+            Ok(sz) => {
+                buffered_size += sz;
+            }
+            Err(e) => match e.kind() {
+                ErrorKind::WouldBlock => {
+                    // we don't need to do anything, the session will return false in wants_write?
+                    //error!("rustls socket_write wouldblock");
+                }
+                ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe => {
+                    //FIXME: this should probably not happen here
+                    incr!("rustls.write.error");
+                    is_closed = true;
+                }
+                _ => {
+                    error!("could not write data to TLS stream: {:?}", e);
+                    incr!("rustls.write.error");
+                    is_error = true;
+                }
+            },
+        }
+
+        loop {
+            match self.session.write_tls(&mut self.stream) {
+                Ok(0) => {
+                    //can_write = false;
+                    break;
+                }
+                Ok(_sz) => {}
+                Err(e) => match e.kind() {
+                    ErrorKind::WouldBlock => can_write = false,
+                    ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe => {
+                        incr!("rustls.write.error");
+                        is_closed = true;
+                        break;
+                    }
+                    _ => {
+                        error!("could not write TLS stream to socket: {:?}", e);
+                        incr!("rustls.write.error");
+                        is_error = true;
+                        break;
+                    }
+                },
             }
         }
-        (total_size, socket_state)
+
+        if is_error {
+            (buffered_size, SocketResult::Error)
+        } else if is_closed {
+            (buffered_size, SocketResult::Closed)
+        } else if !can_write {
+            (buffered_size, SocketResult::WouldBlock)
+        } else {
+            (buffered_size, SocketResult::Continue)
+        }
     }
 
     fn socket_ref(&self) -> &TcpStream {

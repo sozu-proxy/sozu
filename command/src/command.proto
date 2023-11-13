@@ -157,6 +157,10 @@ message HttpsListenerConfig {
     optional string certificate = 17;
     repeated string certificate_chain = 18;
     optional string key = 19;
+    // Number of TLS 1.3 tickets to send to a client when establishing a connection.
+    // The tickets allow the client to resume a session. This protects the client
+    // agains session tracking. Defaults to 4.
+    required uint64 send_tls13_tickets = 20;
 }
 
 // details of an TCP listener

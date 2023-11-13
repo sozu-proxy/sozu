@@ -759,6 +759,7 @@ impl HttpsListener {
             .map_err(|err| ListenerError::BuildRustls(err.to_string()))?
             .with_no_client_auth()
             .with_cert_resolver(resolver);
+        server_config.send_tls13_tickets = config.send_tls13_tickets as usize;
 
         let mut protocols = SERVER_PROTOS
             .iter()
