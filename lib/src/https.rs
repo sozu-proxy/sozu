@@ -578,13 +578,10 @@ impl L7ListenerHandler for HttpsListener {
         // chars in there
         let host = unsafe { from_utf8_unchecked(hostname) };
 
-        let route = self
-            .fronts
-            .lookup(host.as_bytes(), uri.as_bytes(), method)
-            .ok_or_else(|| {
-                incr!("http.failed_backend_matching");
-                FrontendFromRequestError::NoClusterFound
-            })?;
+        let route = self.fronts.lookup(host, uri, method).map_err(|e| {
+            incr!("http.failed_backend_matching");
+            FrontendFromRequestError::NoClusterFound(e)
+        })?;
 
         let now = Instant::now();
 

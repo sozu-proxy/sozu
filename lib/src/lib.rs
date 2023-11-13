@@ -574,8 +574,8 @@ pub enum FrontendFromRequestError {
     HostParse { host: String, error: String },
     #[error("invalid remaining chars after hostname. Host: {0}")]
     InvalidCharsAfterHost(String),
-    #[error("no cluster found")]
-    NoClusterFound,
+    #[error("no cluster: {0}")]
+    NoClusterFound(RouterError),
 }
 
 pub trait L7ListenerHandler {
@@ -637,7 +637,7 @@ pub enum RetrieveClusterError {
     NoPath,
     #[error("unauthorized route")]
     UnauthorizedRoute,
-    #[error("failed to retrieve the frontend for the request: {0}")]
+    #[error("{0}")]
     RetrieveFrontend(FrontendFromRequestError),
 }
 
