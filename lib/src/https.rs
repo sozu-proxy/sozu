@@ -62,7 +62,7 @@ use crate::{
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
     socket::{server_bind, FrontRustls},
     timer::TimeoutContainer,
-    tls::{MutexWrappedCertificateResolver, ResolveCertificate, StoredCertificate},
+    tls::{CertifiedKeyWrapper, MutexWrappedCertificateResolver, ResolveCertificate},
     util::UnwrapLog,
     AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
@@ -600,7 +600,7 @@ impl L7ListenerHandler for HttpsListener {
 impl ResolveCertificate for HttpsListener {
     type Error = ListenerError;
 
-    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<StoredCertificate> {
+    fn get_certificate(&self, fingerprint: &Fingerprint) -> Option<CertifiedKeyWrapper> {
         let resolver = self
             .resolver
             .0
