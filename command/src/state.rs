@@ -1253,10 +1253,10 @@ impl ConfigState {
                 .flat_map(|hash_map| hash_map.iter())
                 .flat_map(|(fingerprint, cert)| {
                     if cert.names.is_empty() {
-                        let pem = certificate::parse(cert.certificate.as_bytes()).ok()?;
+                        let pem = certificate::parse_pem(cert.certificate.as_bytes()).ok()?;
                         let mut c = cert.to_owned();
 
-                        c.names = certificate::get_cn_and_san_attributes(&pem)
+                        c.names = certificate::get_cn_and_san_attributes(&pem.contents)
                             .ok()?
                             .into_iter()
                             .collect();
@@ -1276,10 +1276,10 @@ impl ConfigState {
                 .filter(|(fingerprint, _cert)| fingerprint.to_string() == f)
                 .flat_map(|(fingerprint, cert)| {
                     if cert.names.is_empty() {
-                        let pem = certificate::parse(cert.certificate.as_bytes()).ok()?;
+                        let pem = certificate::parse_pem(cert.certificate.as_bytes()).ok()?;
                         let mut c = cert.to_owned();
 
-                        c.names = certificate::get_cn_and_san_attributes(&pem)
+                        c.names = certificate::get_cn_and_san_attributes(&pem.contents)
                             .ok()?
                             .into_iter()
                             .collect();
@@ -1297,10 +1297,10 @@ impl ConfigState {
                 .flat_map(|hash_map| hash_map.iter())
                 .flat_map(|(fingerprint, cert)| {
                     if cert.names.is_empty() {
-                        let pem = certificate::parse(cert.certificate.as_bytes()).ok()?;
+                        let pem = certificate::parse_pem(cert.certificate.as_bytes()).ok()?;
                         let mut c = cert.to_owned();
 
-                        c.names = certificate::get_cn_and_san_attributes(&pem)
+                        c.names = certificate::get_cn_and_san_attributes(&pem.contents)
                             .ok()?
                             .into_iter()
                             .collect();
