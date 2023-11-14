@@ -9,6 +9,7 @@ use std::{
     convert::From,
     io::BufReader,
     sync::{Arc, Mutex},
+    str::FromStr
 };
 
 use once_cell::sync::Lazy;
@@ -18,7 +19,6 @@ use rustls::{
     Certificate, PrivateKey,
 };
 use sha2::{Digest, Sha256};
-
 use sozu_command::{
     certificate::{
         get_cn_and_san_attributes, parse_pem, parse_x509, CertificateError, Fingerprint,
@@ -68,20 +68,18 @@ pub trait ResolveCertificate {
         &mut self,
         opts: &ReplaceCertificate,
     ) -> Result<Fingerprint, Self::Error> {
-        let fingerprint = self.add_certificate(&AddCertificate {
-            address: opts.address.to_owned(),
-            certificate: opts.new_certificate.to_owned(),
-            expired_at: opts.new_expired_at.to_owned(),
-        })?;
-
-        match hex::decode(&opts.old_fingerprint) {
-            Ok(old_fingerprint) => self.remove_certificate(&Fingerprint(old_fingerprint))?,
+        match Fingerprint::from_str(&opts.old_fingerprint) {
+            Ok(old_fingerprint) => self.remove_certificate(&old_fingerprint)?,
             Err(err) => {
                 error!("failed to parse fingerprint, {}", err);
             }
         }
 
-        Ok(fingerprint)
+        self.add_certificate(&AddCertificate {
+            address: opts.address.to_owned(),
+            certificate: opts.new_certificate.to_owned(),
+            expired_at: opts.new_expired_at.to_owned(),
+        })
     }
 }
 
@@ -132,8 +130,6 @@ pub enum CertificateResolverError {
     InvalidCommonNameAndSubjectAlternateNames(CertificateError),
     #[error("invalid private key: {0}")]
     InvalidPrivateKey(String),
-    #[error("certificate is still in use")]
-    IsStillInUse,
     #[error("empty key")]
     EmptyKeys,
     #[error("certificate error: {0}")]
@@ -221,10 +217,6 @@ impl ResolveCertificate for CertificateResolver {
                 Some(names) => names,
                 None => self.certificate_names(certified_key_and_pem.pem_bytes())?,
             };
-
-            if self.is_required_for_domain(&names, fingerprint) {
-                return Err(CertificateResolverError::IsStillInUse);
-            }
 
             for name in &names {
                 if let Some(fingerprints) = self.name_fingerprint_idx.get_mut(name) {
@@ -325,18 +317,6 @@ impl CertificateResolver {
 }
 
 impl CertificateResolver {
-    fn is_required_for_domain(&self, names: &HashSet<String>, fingerprint: &Fingerprint) -> bool {
-        for name in names {
-            if let Some(fingerprints) = self.name_fingerprint_idx.get(name) {
-                if 1 == fingerprints.len() && fingerprints.get(fingerprint).is_some() {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
     fn should_insert(
         &self,
         fingerprint: &Fingerprint,
@@ -489,7 +469,7 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use super::{fingerprint, CertificateResolver, CertificateResolverError, ResolveCertificate};
+    use super::{fingerprint, CertificateResolver, ResolveCertificate};
 
     use rand::{seq::SliceRandom, thread_rng};
     use sozu_command::{
@@ -520,20 +500,15 @@ mod tests {
         }
 
         if let Err(err) = resolver.remove_certificate(&fingerprint) {
-            match err {
-                CertificateResolverError::IsStillInUse => {}
-                _ => {
-                    return Err(format!("the certificate must not been removed, {err}").into());
-                }
-            }
+            return Err(format!("the certificate must not been removed, {err}").into());
         }
 
         let names = resolver.certificate_names(&pem.contents)?;
-        if resolver.find_certificates_by_names(&names)?.is_empty()
-            || resolver.get_certificate(&fingerprint).is_none()
+        if !resolver.find_certificates_by_names(&names)?.is_empty()
+            && resolver.get_certificate(&fingerprint).is_some()
         {
             return Err(
-                "failed to retrieve certificate that we had the command to delete, but mandatory"
+                "We have retrieve the certificate that should be deleted"
                     .into(),
             );
         }
@@ -564,32 +539,27 @@ mod tests {
             return Err("failed to retrieve certificate".into());
         }
 
-        if let Err(err) = resolver.remove_certificate(&fingerprint) {
-            match err {
-                CertificateResolverError::IsStillInUse => {}
-                _ => {
-                    return Err(format!("the certificate must not been removed, {err}").into());
-                }
-            }
-        }
-
-        let names = resolver.certificate_names(&pem.contents)?;
-        if resolver.find_certificates_by_names(&names)?.is_empty()
-            || resolver.get_certificate(&fingerprint).is_none()
-        {
-            return Err(
-                "failed to retrieve certificate that we had the command to delete, but mandatory"
-                    .into(),
-            );
-        }
-
         let mut lolcat = HashSet::new();
         lolcat.insert(String::from("lolcatho.st"));
         if resolver.find_certificates_by_names(&lolcat)?.is_empty()
             || resolver.get_certificate(&fingerprint).is_none()
         {
             return Err(
-                "failed to retrieve certificate that we had the command to delete, but mandatory"
+                "failed to retrieve certificate with custom names"
+                    .into(),
+            );
+        }
+
+        if let Err(err) = resolver.remove_certificate(&fingerprint) {
+            return Err(format!("the certificate must not been removed, {err}").into());
+        }
+
+        let names = resolver.certificate_names(&pem.contents)?;
+        if !resolver.find_certificates_by_names(&names)?.is_empty()
+            && resolver.get_certificate(&fingerprint).is_some()
+        {
+            return Err(
+                "We have retrieve the certificate that should be deleted"
                     .into(),
             );
         }
