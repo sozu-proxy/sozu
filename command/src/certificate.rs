@@ -1,6 +1,6 @@
 use std::{collections::HashSet, fmt, str::FromStr};
 
-use hex::FromHex;
+use hex::{FromHex, FromHexError};
 use serde::de::{self, Visitor};
 use sha2::{Digest, Sha256};
 use x509_parser::{
@@ -22,6 +22,8 @@ pub enum CertificateError {
     InvalidCertificate(String),
     #[error("failed to parse tls version '{0}'")]
     InvalidTlsVersion(String),
+    #[error("failed to parse fingerprint, {0}")]
+    InvalidFingerprint(FromHexError),
 }
 
 // -----------------------------------------------------------------------------
@@ -100,6 +102,16 @@ impl FromStr for TlsVersion {
 /// A TLS certificates, encoded in bytes
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Fingerprint(pub Vec<u8>);
+
+impl FromStr for Fingerprint {
+    type Err = CertificateError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        hex::decode(s)
+            .map_err(CertificateError::InvalidFingerprint)
+            .map(Fingerprint)
+    }
+}
 
 impl fmt::Debug for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {

@@ -21,6 +21,7 @@ fn find_last_dot(input: &[u8]) -> Option<usize> {
     (0..input.len()).rev().find(|&i| input[i] == b'.')
 }
 
+/// A custom implementation of the [Trie data structure](https://www.wikiwand.com/en/Trie)
 #[derive(Debug, PartialEq)]
 pub struct TrieNode<V> {
     key_value: Option<KeyValue<Key, V>>,
