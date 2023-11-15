@@ -1,0 +1,2 @@
+[target.x86_64-unknown-linux-gnu]
+rustflags = ['-C', 'target-feature=+sse3,+sse4.1,+sse4.2,+ssse3,+avx,+aes']
