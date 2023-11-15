@@ -35,7 +35,7 @@ hdrhistogram = "^7.5.2"
 hex = "^0.4.3"
 hpack = "^0.3.0"
 idna = "^0.4.0"
-kawa = { version = "^0.6.3", default-features = false }
+kawa = { version = "^0.6.4", default-features = false }
 libc = "^0.2.149"
 memchr = "^2.6.4"
 mio = { version = "^0.8.8", features = ["os-poll", "os-ext", "net"] }
@@ -68,7 +68,7 @@ logs-debug = []
 logs-trace = []
 simd = ["kawa/simd"]
 splice = []
-tolerant-http1-parser = []
+tolerant-http1-parser = ["kawa/tolerant-parsing"]
 unstable = []
 
 [badges]

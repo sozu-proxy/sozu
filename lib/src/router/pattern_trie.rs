@@ -251,7 +251,7 @@ impl<V: Debug + Clone> TrieNode<V> {
 
         match self.children.get_mut(suffix) {
             Some(child) => match child.remove_recursive(prefix) {
-                RemoveResult::NotFound => return RemoveResult::NotFound,
+                RemoveResult::NotFound => RemoveResult::NotFound,
                 RemoveResult::Ok => {
                     if child.is_empty() {
                         self.children.remove(suffix);
