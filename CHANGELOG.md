@@ -4,6 +4,44 @@
 
 See milestone [`v0.16.0`](https://github.com/sozu-proxy/sozu/projects/3?card_filter_query=milestone%3Av0.16.0)
 
+## 0.15.15 - 2023-11-15
+
+> This changelog merge all modifications between versions 0.15.13 and 0.15.15
+
+- Since the deployment of the version 0.15.x at Clever Cloud, we have seen some performance issues around tls handshake and we made several efforts to dig in and fix them, see [`8364454`](https://github.com/sozu-proxy/sozu/commit/8364454da2ac4df3ea8fae517f619431ac0c068e) and [`92a277c`](https://github.com/sozu-proxy/sozu/commit/92a277c79fa0d319a0f8ad1f192d62b72ffd52a1).
+- We have fix a bug when we replace a tls certificate that resolve the old onem once replaced, see [`50afe7a`](https://github.com/sozu-proxy/sozu/commit/50afe7aa0e33b5d583a301de40f17772eb72c213)
+- We also allow to choose the number of ticket tls given to a new tls handshake, see [`0c3c129`](https://github.com/sozu-proxy/sozu/commit/0c3c129647baae1f0972c7f8af78cbb1200dd78e).
+- Update the systemd service to set start interval and burst, see [`af5ea00`](https://github.com/sozu-proxy/sozu/commit/af5ea0025eeed64c8ccfafa8387f0a1a4aef8d88).
+- We also document a way to benchmark sozu, see [`e754a15`](https://github.com/sozu-proxy/sozu/commit/e754a159dc9abf34285c2f33970e6ecbee765e6e).
+
+### Changelog
+
+#### 🚀 Performance
+
+- [ [`8364454`](https://github.com/sozu-proxy/sozu/commit/8364454da2ac4df3ea8fae517f619431ac0c068e) ] Use rustls::Writer::write_vectored to reduce writev syscalls [`Eloi DEMOLIS`] (`2023-11-08`)
+- [ [`92a277c`](https://github.com/sozu-proxy/sozu/commit/92a277c79fa0d319a0f8ad1f192d62b72ffd52a1) ] store certificates in parsed form in  CertificateResolver [`Eloi DEMOLIS`] (`2023-11-14`)
+
+#### ⛑️ Fixed
+
+- [ [`50afe7a`](https://github.com/sozu-proxy/sozu/commit/50afe7aa0e33b5d583a301de40f17772eb72c213) ] fix(tls): certificate replacement and remove is still-in-use security [`Florentin Dubois`] (`2023-11-14`)
+
+#### ✍️ Changed
+
+- [ [`0c3c129`](https://github.com/sozu-proxy/sozu/commit/0c3c129647baae1f0972c7f8af78cbb1200dd78e) ] make send_tls13_tickets configurable [`Emmanuel Bosquet`] (`2023-11-09`)
+- [ [`1406954`](https://github.com/sozu-proxy/sozu/commit/140695475a38afa6f461a82d46b19fb35778b4e9) ] Remove rustls backpressuring flag [`Eloi DEMOLIS`] (`2023-11-08`)
+- [ [`9b29dcf`](https://github.com/sozu-proxy/sozu/commit/9b29dcfa98c95626f641013a0c7615529505e0f2) ] proper logging of RouterError::RouteNotFound [`Emmanuel Bosquet`] (`2023-11-13`)
+- [ [`af5ea00`](https://github.com/sozu-proxy/sozu/commit/af5ea0025eeed64c8ccfafa8387f0a1a4aef8d88) ] distribution(systemd): set start limit interval and burst [`Florentin Dubois`] (`2023-11-14`)
+- [ [`cc12789`](https://github.com/sozu-proxy/sozu/commit/cc12789f4516d217fb15a7d8b8dd7b5848fc211d) ] comments and renaming in lib::tls [`Emmanuel Bosquet`] (`2023-11-14`)
+
+#### 📚 Documentation
+
+- [ [`e754a15`](https://github.com/sozu-proxy/sozu/commit/e754a159dc9abf34285c2f33970e6ecbee765e6e) ] document benchmarking technique [`Emmanuel Bosquet`] (`2023-11-10`)
+
+### 🥹 Contributors
+* @keksoj
+* @FlorentinDUBOIS
+* @Wonshtrum
+
 ## 0.15.13 - 2023-10-27
 
 > This changelog merge all modifications between versions 0.15.6 and 0.15.13
@@ -172,7 +210,7 @@ We fix a bug that can occurs with pki using T.61 charset, see [`a5412b9`](https:
 - Fix the loading of configuration from a file that was limited to the buffer size, see [`df69ba6`](https://github.com/sozu-proxy/sozu/commit/df69ba6fa1b99866506c9bde54f18d55f848236a).
 - Fix the display of domain names in the command line, see [`14868dd`](https://github.com/sozu-proxy/sozu/commit/14868dd65d8a32980c9a57d434bbab032ea516bb) and [`c738545`](https://github.com/sozu-proxy/sozu/commit/c7385458299bbecce39e90707f3d3808338a02a9).
 
-### Changelog 
+### Changelog
 
 #### ➕ Added
 
