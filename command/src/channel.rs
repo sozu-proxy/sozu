@@ -36,11 +36,9 @@ pub enum ChannelError {
     NothingRead,
     #[error("invalid char set in command message, ignoring: {0}")]
     InvalidCharSet(String),
-    #[error("Error deserializing message")]
-    Serde(serde_json::error::Error),
     #[error("could not set the timeout of the unix stream with file descriptor {fd}: {error}")]
     SetTimeout { fd: i32, error: String },
-    #[error("Could not change the blocking status of the unix stream with file descriptor {fd}: {error}")]
+    #[error("Could not change the blocking status ef the unix stream with file descriptor {fd}: {error}")]
     BlockingStatus { fd: i32, error: String },
     #[error("Connection error: {0:?}")]
     Connection(Option<std::io::Error>),
