@@ -176,12 +176,14 @@ impl CommandManager {
         metric_names: Vec<String>,
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
+        no_clusters: bool,
     ) -> Result<(), anyhow::Error> {
         let request: Request = RequestType::QueryMetrics(QueryMetricsOptions {
             list,
             cluster_ids,
             backend_ids,
             metric_names,
+            no_clusters,
         })
         .into();
 
