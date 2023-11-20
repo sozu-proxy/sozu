@@ -257,10 +257,19 @@ impl LocalDrain {
             cluster_ids,
             backend_ids,
             list,
+            no_clusters,
         } = options;
 
         if *list {
             return self.list_all_metric_names();
+        }
+
+        if *no_clusters {
+            let proxy_metrics = self.dump_proxy_metrics(metric_names);
+            return Ok(ContentType::WorkerMetrics(WorkerMetrics {
+                proxy: proxy_metrics,
+                clusters: BTreeMap::new(),
+            }).into());
         }
 
         let worker_metrics = match (cluster_ids.is_empty(), backend_ids.is_empty()) {

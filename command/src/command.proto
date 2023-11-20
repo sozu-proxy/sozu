@@ -412,6 +412,8 @@ message QueryMetricsOptions {
     repeated string backend_ids = 3;
     // query only these metrics
     repeated string metric_names = 4;
+    // query only worker and main process metrics (no cluster metrics)
+    required bool no_clusters = 5;
 }
 
 // options to configure metrics collection
