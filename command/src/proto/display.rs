@@ -114,7 +114,12 @@ pub fn print_json_response<T: ::serde::Serialize>(input: &T) -> Result<(), Displ
 impl Response {
     pub fn display(&self, json: bool) -> Result<(), DisplayError> {
         match self.status() {
-            ResponseStatus::Ok => println!("Success: {}", self.message),
+            ResponseStatus::Ok => {
+                // avoid displaying anything else than JSON
+                if !json {
+                    println!("Success: {}", self.message)
+                }
+            }
             ResponseStatus::Failure => println!("Failure: {}", self.message),
             ResponseStatus::Processing => {
                 return Err(DisplayError::WrongResponseType(

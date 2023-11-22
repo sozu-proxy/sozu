@@ -30,10 +30,15 @@ impl CommandManager {
 
             match response.status() {
                 ResponseStatus::Processing => {
-                    debug!("Proxy is processing: {}", response.message);
+                    if !self.json {
+                        debug!("Proxy is processing: {}", response.message);
+                    }
                 }
                 ResponseStatus::Failure => bail!("Request failed: {}", response.message),
                 ResponseStatus::Ok => {
+                    if !self.json {
+                        info!("{}", response.message);
+                    }
                     response.display(self.json)?;
                     break;
                 }
@@ -55,7 +60,9 @@ impl CommandManager {
 
             match response.status() {
                 ResponseStatus::Processing => {
-                    debug!("Processing: {}", response.message);
+                    if !self.json {
+                        debug!("Processing: {}", response.message);
+                    }
                 }
                 ResponseStatus::Failure => {
                     bail!(
@@ -143,7 +150,11 @@ impl CommandManager {
             let response = self.read_channel_message_with_timeout()?;
 
             match response.status() {
-                ResponseStatus::Processing => info!("Proxy is processing: {}", response.message),
+                ResponseStatus::Processing => {
+                    if !self.json {
+                        info!("Proxy is processing: {}", response.message);
+                    }
+                }
                 ResponseStatus::Failure => bail!(
                     "could not stop the worker {}: {}",
                     worker_id,
@@ -186,7 +197,9 @@ impl CommandManager {
 
                 match response.status() {
                     ResponseStatus::Processing => {
-                        debug!("Proxy is processing: {}", response.message);
+                        if !self.json {
+                            debug!("Proxy is processing: {}", response.message);
+                        }
                     }
                     ResponseStatus::Failure | ResponseStatus::Ok => {
                         response.display(self.json)?;
