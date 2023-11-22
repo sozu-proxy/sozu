@@ -1020,7 +1020,7 @@ impl CommandServer {
             ),
             Some(RequestType::QueryClusterById(cluster_id)) => Some(
                 ContentType::Clusters(ClusterInformations {
-                    vec: vec![self.state.cluster_state(cluster_id)],
+                    vec: self.state.cluster_state(cluster_id).into_iter().collect(),
                 })
                 .into(),
             ),
@@ -1030,7 +1030,7 @@ impl CommandServer {
                     .get_cluster_ids_by_domain(domain.hostname.clone(), domain.path.clone());
                 let vec = cluster_ids
                     .iter()
-                    .map(|cluster_id| self.state.cluster_state(cluster_id))
+                    .filter_map(|cluster_id| self.state.cluster_state(cluster_id))
                     .collect();
                 Some(ContentType::Clusters(ClusterInformations { vec }).into())
             }

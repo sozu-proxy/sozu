@@ -634,6 +634,11 @@ fn print_cluster_infos(worker_responses: &WorkerResponses) -> Result<(), Display
         }
     }
 
+    if cluster_infos.is_empty() {
+        println!("no cluster found");
+        return Ok(());
+    }
+
     println!("Cluster level configuration:\n");
 
     for (cluster_info, workers_the_cluster_is_present_on) in cluster_infos.iter() {
