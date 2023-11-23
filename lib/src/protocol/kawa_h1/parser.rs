@@ -1,4 +1,8 @@
-use std::{fmt::{self, Write}, str::from_utf8_unchecked};
+use std::{
+    cmp::min,
+    fmt::{self, Write},
+    str::from_utf8_unchecked,
+};
 
 use nom::{
     bytes::{self, complete::take_while},
@@ -114,7 +118,14 @@ pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<&[u8]>)> {
     Ok((i, (host, port)))
 }
 
+// (used, 16, [head, index])
 pub fn view(buf: &[u8], size: usize, points: &[usize]) -> String {
+    let len = buf.len();
+    let (start, end) = match (points.first(), points.last()) {
+        (Some(start), Some(end)) => (min(*start, len), min(*end + size, len)),
+        _ => return "NO POINTS".to_string(),
+    };
+    return format!("{:02X?}", &buf[start..end]);
     let mut view = String::new();
     let mut end = 0;
     for (i, point) in points.iter().enumerate() {
