@@ -350,7 +350,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if let kawa::ParsingPhase::Error { marker, kind } = self.request_stream.parsing_phase {
             incr!("http.frontend_parse_errors");
-            debug!(
+            warn!(
                 "{} Parsing request error in {:?}: {}",
                 self.log_context(),
                 marker,
@@ -679,13 +679,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if let kawa::ParsingPhase::Error { marker, kind } = self.response_stream.parsing_phase {
             incr!("http.backend_parse_errors");
-            debug!(
-                "{} Parsing request error in {:?}: {}",
+            warn!(
+                "{} Parsing response error in {:?}: {}",
                 self.log_context(),
                 marker,
                 match kind {
                     kawa::ParsingErrorKind::Consuming { index } => {
-                        let kawa = &self.request_stream;
+                        let kawa = &self.response_stream;
                         parser::view(
                             kawa.storage.used(),
                             16,
@@ -1502,7 +1502,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         return SessionResult::Continue;
                     }
                     Err(connection_error) => {
-                        error!("Error connecting to backend: {}", connection_error)
+                        warn!("Error connecting to backend: {}", connection_error)
                     }
                 }
             } else {
@@ -1557,7 +1557,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                                 return SessionResult::Continue;
                             }
                             Err(connection_error) => {
-                                error!("Error connecting to backend: {}", connection_error)
+                                warn!("Error connecting to backend: {}", connection_error)
                             }
                         }
                     }

@@ -650,7 +650,6 @@ macro_rules! error_access {
 #[macro_export]
 macro_rules! warn {
     ($format:expr, $($arg:tt)*) => {
-        use time;
         log!($crate::logging::LogLevel::Warn, $format, "WARN", $($arg)*);
     };
     ($format:expr) => {
