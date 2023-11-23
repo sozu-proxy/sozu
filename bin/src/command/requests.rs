@@ -897,7 +897,7 @@ impl CommandServer {
                 self.in_flight
                     .insert(worker_request_id.clone(), (status_tx.clone(), 1));
             }
-            worker_info_map.insert(worker_request_id, worker.info());
+            worker_info_map.insert(worker_request_id, worker.querying_info());
         }
 
         let command_tx = self.command_tx.clone();
