@@ -1418,36 +1418,44 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn backend_hup(&mut self) -> StateResult {
-        // println!("=====backend_hup");
+        // there might still data we can read on the socket
         if self.backend_readiness.event.is_readable()
             && self.backend_readiness.interest.is_readable()
         {
-            // there might still data we can read on the socket
-            // println!("=====backend_hup:continue");
             return StateResult::Continue;
         }
+
+        // the backend finished to answer we can close
         if self.response_stream.is_terminated() {
-            // the backend finished to answer we can close
-            // println!("=====backend_hup:terminated");
             return StateResult::CloseBackend;
         }
         match (
             self.request_stream.is_initial(),
             self.response_stream.is_initial(),
         ) {
-            // the backend started to answer so we close
+            // backend stopped before response is finished,
+            // or maybe it was malformed in the first place (no Content-Length)
             (_, false) => {
-                // println!("=====backend_hup:close");
+                error!(
+                    "PROXY session {:?}, backend closed before session is over",
+                    self.frontend_token
+                );
                 StateResult::CloseSession
             }
             // probably backend hup between keep alive request, change backend
             (true, true) => {
-                // println!("=====backend_hup:close_backend");
+                trace!(
+                    "PROXY session {:?} backend hanged up inbetween requests",
+                    self.frontend_token
+                );
                 StateResult::CloseBackend
             }
             // the frontend already transmitted data so we can't redirect
             (false, true) => {
-                // println!("=====backend_hup:503");
+                error!(
+                    "PROXY session {:?}, the front transmitted data but the back closed",
+                    self.frontend_token
+                );
                 self.set_answer(DefaultAnswerStatus::Answer503, None);
                 self.backend_readiness.interest = Ready::EMPTY;
                 StateResult::Continue
@@ -1605,7 +1613,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
             if backend_interest.is_hup() || backend_interest.is_error() {
                 let state_result = self.backend_hup();
-                error!("PROXY session {:?} back error", self.frontend_token);
+
                 trace!("backend_hup: {:?}", state_result);
                 match state_result {
                     StateResult::Continue => {}
