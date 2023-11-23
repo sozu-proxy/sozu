@@ -3,6 +3,7 @@ use std::{cell::RefCell, rc::Rc};
 use mio::{net::TcpStream, *};
 use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
+use sozu_command::config::MAX_LOOP_ITERATIONS;
 
 use crate::{
     logs::LogContext,
@@ -211,13 +212,12 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
-        let max_loop_iterations = 100000;
 
         if self.frontend_readiness.event.is_hup() {
             return SessionResult::Close;
         }
 
-        while counter < max_loop_iterations {
+        while counter < MAX_LOOP_ITERATIONS {
             let frontend_interest = self.frontend_readiness.filter_interest();
 
             trace!(
@@ -251,10 +251,10 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
             counter += 1;
         }
 
-        if counter == max_loop_iterations {
+        if counter >= MAX_LOOP_ITERATIONS {
             error!(
                 "PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                self.frontend_token, max_loop_iterations
+                self.frontend_token, MAX_LOOP_ITERATIONS
             );
             incr!("http.infinite_loop.error");
 

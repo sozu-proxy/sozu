@@ -6,6 +6,7 @@ use std::{
 use mio::net::{TcpListener, TcpStream};
 use rustls::{ProtocolVersion, ServerConnection};
 use socket2::{Domain, Protocol, Socket, Type};
+use sozu_command::config::MAX_LOOP_ITERATIONS;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ServerBindError {
@@ -60,7 +61,13 @@ pub trait SocketHandler {
 impl SocketHandler for TcpStream {
     fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
         let mut size = 0usize;
+        let mut counter = 0;
         loop {
+            counter += 1;
+            if counter > MAX_LOOP_ITERATIONS {
+                error!("MAX_LOOP_ITERATION reached in TcpStream::socket_read");
+                incr!("socket.read.infinite_loop.error");
+            }
             if size == buf.len() {
                 return (size, SocketResult::Continue);
             }
@@ -83,7 +90,13 @@ impl SocketHandler for TcpStream {
 
     fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
         let mut size = 0usize;
+        let mut counter = 0;
         loop {
+            counter += 1;
+            if counter > MAX_LOOP_ITERATIONS {
+                error!("MAX_LOOP_ITERATION reached in TcpStream::socket_write");
+                incr!("socket.write.infinite_loop.error");
+            }
             if size == buf.len() {
                 return (size, SocketResult::Continue);
             }
@@ -165,7 +178,14 @@ impl SocketHandler for FrontRustls {
         let mut is_error = false;
         let mut is_closed = false;
 
+        let mut counter = 0;
         loop {
+            counter += 1;
+            if counter > MAX_LOOP_ITERATIONS {
+                error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_read");
+                incr!("socket.read.infinite_loop.error");
+            }
+
             if size == buf.len() {
                 break;
             }
@@ -251,7 +271,13 @@ impl SocketHandler for FrontRustls {
         let mut is_error = false;
         let mut is_closed = false;
 
+        let mut counter = 0;
         loop {
+            counter += 1;
+            if counter > MAX_LOOP_ITERATIONS {
+                error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write");
+                incr!("socket.write.infinite_loop.error");
+            }
             if buffered_size == buf.len() {
                 break;
             }
@@ -297,7 +323,10 @@ impl SocketHandler for FrontRustls {
                     }
                     Ok(_sz) => {}
                     Err(e) => match e.kind() {
-                        ErrorKind::WouldBlock => can_write = false,
+                        ErrorKind::WouldBlock => {
+                            can_write = false;
+                            break;
+                        }
                         ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted
                         | ErrorKind::BrokenPipe => {
@@ -358,7 +387,13 @@ impl SocketHandler for FrontRustls {
             },
         }
 
+        let mut counter = 0;
         loop {
+            counter += 1;
+            if counter > MAX_LOOP_ITERATIONS {
+                error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored");
+                incr!("socket.write.infinite_loop.error");
+            }
             match self.session.write_tls(&mut self.stream) {
                 Ok(0) => {
                     //can_write = false;
@@ -366,7 +401,10 @@ impl SocketHandler for FrontRustls {
                 }
                 Ok(_sz) => {}
                 Err(e) => match e.kind() {
-                    ErrorKind::WouldBlock => can_write = false,
+                    ErrorKind::WouldBlock => {
+                        can_write = false;
+                        break;
+                    }
                     ErrorKind::ConnectionReset
                     | ErrorKind::ConnectionAborted
                     | ErrorKind::BrokenPipe => {

@@ -14,7 +14,7 @@ use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
-use sozu_command::proto::command::{Event, EventKind, ListenerType};
+use sozu_command::{proto::command::{Event, EventKind, ListenerType}, config::MAX_LOOP_ITERATIONS};
 
 use crate::{
     backends::{Backend, BackendError},
@@ -350,7 +350,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if let kawa::ParsingPhase::Error { marker, kind } = self.request_stream.parsing_phase {
             incr!("http.frontend_parse_errors");
-            debug!(
+            warn!(
                 "{} Parsing request error in {:?}: {}",
                 self.log_context(),
                 marker,
@@ -679,13 +679,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         if let kawa::ParsingPhase::Error { marker, kind } = self.response_stream.parsing_phase {
             incr!("http.backend_parse_errors");
-            debug!(
-                "{} Parsing request error in {:?}: {}",
+            warn!(
+                "{} Parsing response error in {:?}: {}",
                 self.log_context(),
                 marker,
                 match kind {
                     kawa::ParsingErrorKind::Consuming { index } => {
-                        let kawa = &self.request_stream;
+                        let kawa = &self.response_stream;
                         parser::view(
                             kawa.storage.used(),
                             16,
@@ -1481,7 +1481,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
-        let max_loop_iterations = 100000;
 
         if self.backend_connection_status.is_connecting()
             && !self.backend_readiness.event.is_empty()
@@ -1510,7 +1509,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         return SessionResult::Continue;
                     }
                     Err(connection_error) => {
-                        error!("Error connecting to backend: {}", connection_error)
+                        warn!("Error connecting to backend: {}", connection_error)
                     }
                 }
             } else {
@@ -1527,7 +1526,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             return SessionResult::Close;
         }
 
-        while counter < max_loop_iterations {
+        while counter < MAX_LOOP_ITERATIONS {
             let frontend_interest = self.frontend_readiness.filter_interest();
             let backend_interest = self.backend_readiness.filter_interest();
 
@@ -1565,7 +1564,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                                 return SessionResult::Continue;
                             }
                             Err(connection_error) => {
-                                error!("Error connecting to backend: {}", connection_error)
+                                warn!("Error connecting to backend: {}", connection_error)
                             }
                         }
                     }
@@ -1626,10 +1625,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             counter += 1;
         }
 
-        if counter == max_loop_iterations {
+        if counter >= MAX_LOOP_ITERATIONS {
             error!(
                 "PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                self.frontend_token, max_loop_iterations
+                self.frontend_token, MAX_LOOP_ITERATIONS
             );
             incr!("http.infinite_loop.error");
 

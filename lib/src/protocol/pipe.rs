@@ -2,6 +2,7 @@ use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 
 use mio::{net::TcpStream, Token};
 use rusty_ulid::Ulid;
+use sozu_command::config::MAX_LOOP_ITERATIONS;
 
 use crate::{
     backends::Backend,
@@ -624,14 +625,13 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
         let mut counter = 0;
-        let max_loop_iterations = 100000;
 
         if self.frontend_readiness.event.is_hup() {
             return SessionResult::Close;
         }
 
         let token = self.frontend_token;
-        while counter < max_loop_iterations {
+        while counter < MAX_LOOP_ITERATIONS {
             let frontend_interest = self.frontend_readiness.filter_interest();
             let backend_interest = self.backend_readiness.filter_interest();
 
@@ -709,10 +709,10 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
             counter += 1;
         }
 
-        if counter == max_loop_iterations {
+        if counter >= MAX_LOOP_ITERATIONS {
             error!(
                 "PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection",
-                self.frontend_token, max_loop_iterations
+                self.frontend_token, MAX_LOOP_ITERATIONS
             );
             incr!("http.infinite_loop.error");
 

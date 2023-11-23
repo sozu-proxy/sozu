@@ -1,4 +1,4 @@
-use std::{fmt::{self, Write}, str::from_utf8_unchecked};
+use std::{cmp::min, fmt, str::from_utf8_unchecked};
 
 use nom::{
     bytes::{self, complete::take_while},
@@ -115,35 +115,41 @@ pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<&[u8]>)> {
 }
 
 pub fn view(buf: &[u8], size: usize, points: &[usize]) -> String {
-    let mut view = String::new();
-    let mut end = 0;
-    for (i, point) in points.iter().enumerate() {
-        let start = if end + size < *point {
-            view.push_str("... ");
-            point - size
-        } else {
-            end
-        };
-        let stop = if i + 1 < points.len() {
-            points[i + 1]
-        } else {
-            buf.len()
-        };
-        end = if point + size > stop {
-            stop
-        } else {
-            point + size
-        };
-        for element in &buf[start..*point] {
-            let _ = view.write_fmt(format_args!("{element:02X} "));
-        }
-        view.push_str("| ");
-        for element in &buf[*point..end] {
-            let _ = view.write_fmt(format_args!("{element:02X} "));
-        }
-    }
-    if end < buf.len() {
-        view.push_str("...")
-    }
-    view
+    let len = buf.len();
+    let (start, end) = match (points.first(), points.last()) {
+        (Some(start), Some(end)) => (min(*start, len), min(*end + size, len)),
+        _ => return "NO POINTS".to_string(),
+    };
+    return format!("{:02X?}", &buf[start..end]);
+    // let mut view = String::new();
+    // let mut end = 0;
+    // for (i, point) in points.iter().enumerate() {
+    //     let start = if end + size < *point {
+    //         view.push_str("... ");
+    //         point - size
+    //     } else {
+    //         end
+    //     };
+    //     let stop = if i + 1 < points.len() {
+    //         points[i + 1]
+    //     } else {
+    //         buf.len()
+    //     };
+    //     end = if point + size > stop {
+    //         stop
+    //     } else {
+    //         point + size
+    //     };
+    //     for element in &buf[start..*point] {
+    //         let _ = view.write_fmt(format_args!("{element:02X} "));
+    //     }
+    //     view.push_str("| ");
+    //     for element in &buf[*point..end] {
+    //         let _ = view.write_fmt(format_args!("{element:02X} "));
+    //     }
+    // }
+    // if end < buf.len() {
+    //     view.push_str("...")
+    // }
+    // view
 }
