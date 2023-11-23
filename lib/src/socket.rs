@@ -6,6 +6,7 @@ use std::{
 use mio::net::{TcpListener, TcpStream};
 use rustls::{ProtocolVersion, ServerConnection};
 use socket2::{Domain, Protocol, Socket, Type};
+use sozu_command::config::MAX_LOOP_ITERATIONS;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ServerBindError {
@@ -44,8 +45,6 @@ pub enum TransportProtocol {
     Tls1_3,
 }
 
-const MAX_LOOP_ITERATION: usize = 100000;
-
 pub trait SocketHandler {
     fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult);
     fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult);
@@ -65,7 +64,7 @@ impl SocketHandler for TcpStream {
         let mut counter = 0;
         loop {
             counter += 1;
-            if counter > MAX_LOOP_ITERATION {
+            if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in TcpStream::socket_read");
                 incr!("socket.read.infinite_loop.error");
             }
@@ -94,7 +93,7 @@ impl SocketHandler for TcpStream {
         let mut counter = 0;
         loop {
             counter += 1;
-            if counter > MAX_LOOP_ITERATION {
+            if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in TcpStream::socket_write");
                 incr!("socket.write.infinite_loop.error");
             }
@@ -182,7 +181,7 @@ impl SocketHandler for FrontRustls {
         let mut counter = 0;
         loop {
             counter += 1;
-            if counter > MAX_LOOP_ITERATION {
+            if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_read");
                 incr!("socket.read.infinite_loop.error");
             }
@@ -275,7 +274,7 @@ impl SocketHandler for FrontRustls {
         let mut counter = 0;
         loop {
             counter += 1;
-            if counter > MAX_LOOP_ITERATION {
+            if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write");
                 incr!("socket.write.infinite_loop.error");
             }
@@ -391,7 +390,7 @@ impl SocketHandler for FrontRustls {
         let mut counter = 0;
         loop {
             counter += 1;
-            if counter > MAX_LOOP_ITERATION {
+            if counter > MAX_LOOP_ITERATIONS {
                 error!("MAX_LOOP_ITERATION reached in FrontRustls::socket_write_vectored");
                 incr!("socket.write.infinite_loop.error");
             }

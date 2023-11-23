@@ -159,6 +159,8 @@ pub const DEFAULT_MAX_COMMAND_BUFFER_SIZE: usize = 2_000_000;
 /// wether to avoid register cluster metrics in the local drain
 pub const DEFAULT_DISABLE_CLUSTER_METRICS: bool = false;
 
+pub const MAX_LOOP_ITERATIONS: usize = 100000;
+
 /// Number of TLS 1.3 tickets to send to a client when establishing a connection.
 /// The tickets allow the client to resume a session. This protects the client
 /// agains session tracking. Increases the number of getrandom syscalls,

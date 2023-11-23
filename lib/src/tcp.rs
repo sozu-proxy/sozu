@@ -18,7 +18,7 @@ use rusty_ulid::Ulid;
 use slab::Slab;
 use time::{Duration, Instant};
 
-use sozu_command::{proto::command::request::RequestType, ObjectKind};
+use sozu_command::{config::MAX_LOOP_ITERATIONS, proto::command::request::RequestType, ObjectKind};
 
 use crate::{
     backends::{Backend, BackendMap},
@@ -572,7 +572,6 @@ impl TcpSession {
 
     fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> StateResult {
         let mut counter = 0;
-        let max_loop_iterations = 100000;
 
         let back_connected = self.back_connected();
         if back_connected.is_connecting() {
@@ -634,7 +633,7 @@ impl TcpSession {
         }
 
         let token = self.frontend_token;
-        while counter < max_loop_iterations {
+        while counter < MAX_LOOP_ITERATIONS {
             let front_interest = self.front_readiness().interest & self.front_readiness().event;
             let back_interest = self
                 .back_readiness()
@@ -754,8 +753,11 @@ impl TcpSession {
             counter += 1;
         }
 
-        if counter == max_loop_iterations {
-            error!("PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
+        if counter >= MAX_LOOP_ITERATIONS {
+            error!(
+                "PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection",
+                self.frontend_token, MAX_LOOP_ITERATIONS
+            );
             incr!("tcp.infinite_loop.error");
 
             let front_interest = self.front_readiness().interest & self.front_readiness().event;
