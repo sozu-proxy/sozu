@@ -396,9 +396,9 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "chunked_transfer"
-version = "1.4.1"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cca491388666e04d7248af3f60f0c40cfb0991c72205595d7c396e3510207d1a"
+checksum = "6e4de3bc4ea267985becf712dc6d9eed8b04c953b3fcfb339ebc87acd9804901"
 
 [[package]]
 name = "clap"
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "sozu"
-version = "0.15.16"
+version = "0.15.17"
 dependencies = [
  "anyhow",
  "async-dup",
@@ -1920,7 +1920,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "0.15.16"
+version = "0.15.17"
 dependencies = [
  "hex",
  "libc",
@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-e2e"
-version = "0.15.16"
+version = "0.15.17"
 dependencies = [
  "futures",
  "hyper",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "0.15.16"
+version = "0.15.17"
 dependencies = [
  "anyhow",
  "cookie-factory",
@@ -2329,9 +2329,9 @@ checksum = "9c8d87e72b64a3b4db28d11ce29237c246188f4f51057d65a7eab63b7987e423"
 
 [[package]]
 name = "webpki-roots"
-version = "0.25.2"
+version = "0.25.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14247bb57be4f377dfb94c72830b8ce8fc6beac03cf4bf7b9732eadd414123fc"
+checksum = "1778a42e8b3b90bff8d0f5032bf22250792889a5cdc752aa0020c84abe3aaf10"
 
 [[package]]
 name = "which"
