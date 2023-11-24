@@ -269,7 +269,7 @@ impl Server {
         worker_to_main_channel: ProxyChannel,
         worker_to_main_scm: ScmSocket,
         config: Config,
-        config_state: ConfigState,
+        initial_state: Vec<WorkerRequest>,
         expects_initial_status: bool,
     ) -> anyhow::Result<Self> {
         let event_loop = Poll::new().with_context(|| "could not create event loop")?;
@@ -331,7 +331,7 @@ impl Server {
             Some(https),
             None,
             server_config,
-            Some(config_state),
+            Some(initial_state),
             expects_initial_status,
         )
     }
@@ -348,7 +348,7 @@ impl Server {
         https: Option<https::HttpsProxy>,
         tcp: Option<tcp::TcpProxy>,
         server_config: ServerConfig,
-        config_state: Option<ConfigState>,
+        initial_state: Option<Vec<WorkerRequest>>,
         expects_initial_status: bool,
     ) -> anyhow::Result<Self> {
         FEATURES.with(|_features| {
@@ -438,16 +438,10 @@ impl Server {
         };
 
         // initialize the worker with the state we got from a file
-        if let Some(state) = config_state {
-            for (counter, request) in state.generate_requests().iter().enumerate() {
-                let id = format!("INIT-{counter}");
-                let worker_request = WorkerRequest {
-                    id,
-                    content: request.to_owned(),
-                };
-
-                trace!("generating initial config request: {:#?}", worker_request);
-                server.notify_proxys(worker_request);
+        if let Some(requests) = initial_state {
+            for request in requests {
+                trace!("generating initial config request: {:#?}", request);
+                server.notify_proxys(request);
             }
 
             // do not send back answers to the initialization messages

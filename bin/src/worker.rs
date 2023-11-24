@@ -32,7 +32,7 @@ use sozu_command_lib::{
     logging::target_to_backend,
     proto::command::{request::RequestType, Request, RunState, Status, WorkerInfo},
     ready::Ready,
-    request::WorkerRequest,
+    request::{read_requests_from_file, WorkerRequest},
     response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
     state::ConfigState,
@@ -216,8 +216,9 @@ pub fn begin_worker_process(
         error!("Could not block the worker-to-main channel: {}", e);
     }
 
-    let configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
-    let config_state: ConfigState = serde_json::from_reader(configuration_state_file)
+    let mut configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
+
+    let initial_state = read_requests_from_file(&mut configuration_state_file)
         .with_context(|| "could not parse configuration state data")?;
 
     let worker_config = worker_to_main_channel
@@ -275,7 +276,7 @@ pub fn begin_worker_process(
         worker_to_main_channel,
         worker_to_main_scm_socket,
         worker_config,
-        config_state,
+        initial_state,
         true,
     )
     .with_context(|| "Could not create server from config")?;
@@ -305,8 +306,9 @@ pub fn fork_main_into_worker(
         tempfile().with_context(|| "could not create temporary file for configuration state")?;
     util::disable_close_on_exec(state_file.as_raw_fd())?;
 
-    serde_json::to_writer(&mut state_file, state)
-        .with_context(|| "could not write upgrade data to temporary file")?;
+    state
+        .write_requests_to_file(&mut state_file)
+        .with_context(|| "Could not write state to file")?;
 
     state_file
         .rewind()

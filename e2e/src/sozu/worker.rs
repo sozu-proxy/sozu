@@ -102,11 +102,19 @@ impl Worker {
             .send_listeners(&listeners)
             .expect("could not send listeners");
 
+        let initial_state = state
+            .generate_requests()
+            .into_iter()
+            .map(|request| WorkerRequest {
+                id: "initial_state".to_string(),
+                content: request,
+            })
+            .collect();
         let server = Server::try_new_from_config(
             cmd_worker_to_main,
             scm_worker_to_main,
             config,
-            state,
+            initial_state,
             false,
         )
         .expect("could not create sozu worker");
@@ -139,7 +147,14 @@ impl Worker {
             .expect("could not send listeners");
 
         let thread_config = config.to_owned();
-        let thread_state = state.to_owned();
+        let initial_state = state
+            .generate_requests()
+            .into_iter()
+            .map(|request| WorkerRequest {
+                id: "initial_state".to_string(),
+                content: request,
+            })
+            .collect();
         let thread_name = name.to_owned();
         let thread_scm_worker_to_main = scm_worker_to_main.to_owned();
 
@@ -157,7 +172,7 @@ impl Worker {
                 cmd_worker_to_main,
                 thread_scm_worker_to_main,
                 thread_config,
-                thread_state,
+                initial_state,
                 false,
             )
             .expect("could not create sozu worker");
