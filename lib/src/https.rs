@@ -162,6 +162,7 @@ impl HttpsSession {
                 sock,
                 token,
                 request_id,
+                peer_address,
             ))
         };
 
@@ -232,6 +233,7 @@ impl HttpsSession {
                     frontend,
                     self.frontend_token,
                     request_id,
+                    self.peer_address,
                 );
                 handshake.frontend_readiness.event = readiness.event;
                 // Can we remove this? If not why?

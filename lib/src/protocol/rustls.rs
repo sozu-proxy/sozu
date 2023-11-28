@@ -1,4 +1,4 @@
-use std::{cell::RefCell, io::ErrorKind, rc::Rc};
+use std::{cell::RefCell, io::ErrorKind, net::SocketAddr, rc::Rc};
 
 use mio::{net::TcpStream, Token};
 use rustls::ServerConnection;
@@ -21,6 +21,7 @@ pub struct TlsHandshake {
     pub container_frontend_timeout: TimeoutContainer,
     pub frontend_readiness: Readiness,
     frontend_token: Token,
+    pub peer_address: Option<SocketAddr>,
     pub request_id: Ulid,
     pub session: ServerConnection,
     pub stream: TcpStream,
@@ -37,6 +38,7 @@ impl TlsHandshake {
         stream: TcpStream,
         frontend_token: Token,
         request_id: Ulid,
+        peer_address: Option<SocketAddr>,
     ) -> TlsHandshake {
         TlsHandshake {
             container_frontend_timeout,
@@ -45,6 +47,7 @@ impl TlsHandshake {
                 event: Ready::EMPTY,
             },
             frontend_token,
+            peer_address,
             request_id,
             session,
             stream,
@@ -72,14 +75,24 @@ impl TlsHandshake {
                             can_read = false
                         }
                         _ => {
-                            error!("could not perform handshake: {:?}", e);
+                            error!(
+                                "Session(sni={:?}, source={:?}) could not perform handshake: {:?}",
+                                self.session.server_name(),
+                                self.peer_address,
+                                e
+                            );
                             return SessionResult::Close;
                         }
                     },
                 }
 
                 if let Err(e) = self.session.process_new_packets() {
-                    error!("could not perform handshake: {:?}", e);
+                    error!(
+                        "Session(sni={:?}, source={:?}) could not perform handshake: {:?}",
+                        self.session.server_name(),
+                        self.peer_address,
+                        e
+                    );
                     return SessionResult::Close;
                 }
             }
@@ -129,14 +142,24 @@ impl TlsHandshake {
                             can_write = false
                         }
                         _ => {
-                            error!("could not perform handshake: {:?}", e);
+                            error!(
+                                "Session(sni={:?}, source={:?}) could not perform handshake: {:?}",
+                                self.session.server_name(),
+                                self.peer_address,
+                                e
+                            );
                             return SessionResult::Close;
                         }
                     },
                 }
 
                 if let Err(e) = self.session.process_new_packets() {
-                    error!("could not perform handshake: {:?}", e);
+                    error!(
+                        "Session(sni={:?}, source={:?}) could not perform handshake: {:?}",
+                        self.session.server_name(),
+                        self.peer_address,
+                        e
+                    );
                     return SessionResult::Close;
                 }
             }
