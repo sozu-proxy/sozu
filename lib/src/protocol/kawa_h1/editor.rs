@@ -6,9 +6,10 @@ use std::{
 use rusty_ulid::Ulid;
 
 use crate::{
+    logs::Endpoint,
     pool::Checkout,
     protocol::http::{parser::compare_no_case, GenericHttpStream, Method},
-    Protocol,
+    Protocol, RetrieveClusterError,
 };
 
 /// This is the container used to store and use information about the session from within a Kawa parser callback
@@ -36,7 +37,7 @@ pub struct HttpContext {
     pub user_agent: Option<String>,
 
     // ========== Read only
-    /// signals wether Kawa should write a "Connection" header with a "close" value (request and response)
+    /// signals whether Kawa should write a "Connection" header with a "close" value (request and response)
     pub closing: bool,
     /// the value of the custom header, named "Sozu-Id", that Kawa should write (request and response)
     pub id: Ulid,
@@ -336,5 +337,41 @@ impl HttpContext {
             key: kawa::Store::Static(b"Sozu-Id"),
             val: kawa::Store::from_string(self.id.to_string()),
         }));
+    }
+
+    // -> host, path, method
+    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
+        let given_method = self.method.as_ref().ok_or(RetrieveClusterError::NoMethod)?;
+        let given_authority = self
+            .authority
+            .as_deref()
+            .ok_or(RetrieveClusterError::NoHost)?;
+        let given_path = self.path.as_deref().ok_or(RetrieveClusterError::NoPath)?;
+
+        Ok((given_authority, given_path, given_method))
+    }
+
+    /// Format the context of the websocket into a loggable String
+    pub fn websocket_context(&self) -> String {
+        Endpoint::Http {
+            method: self.method.as_ref(),
+            authority: self.authority.as_deref(),
+            path: self.path.as_deref(),
+            status: self.status,
+            reason: self.reason.as_deref(),
+        }
+        .to_string()
+    }
+
+    pub fn reset(&mut self) {
+        self.keep_alive_backend = true;
+        self.sticky_session_found = None;
+        self.method = None;
+        self.authority = None;
+        self.path = None;
+        self.status = None;
+        self.reason = None;
+        self.user_agent = None;
+        self.id = Ulid::generate();
     }
 }

@@ -515,9 +515,7 @@ macro_rules! StateMachineBuilder {
             /// leaving a FailedUpgrade in its place.
             /// The FailedUpgrade retains the marker of the previous State.
             fn take(&mut self) -> $state_name {
-                let mut owned_state = $state_name::FailedUpgrade(self.marker());
-                std::mem::swap(&mut owned_state, self);
-                owned_state
+                std::mem::replace(self, $state_name::FailedUpgrade(self.marker()))
             }
             _fn_impl!{front_socket(&, self) -> &mio::net::TcpStream}
         }
@@ -620,6 +618,8 @@ pub enum BackendConnectionError {
     MaxConnectionRetries(Option<String>),
     #[error("the sessions slab has reached maximum capacity")]
     MaxSessionsMemory,
+    #[error("the checkout pool has reached maximum capacity")]
+    MaxBuffers,
     #[error("error from the backend: {0}")]
     Backend(BackendError),
     #[error("failed to retrieve the cluster: {0}")]
@@ -639,6 +639,8 @@ pub enum RetrieveClusterError {
     UnauthorizedRoute,
     #[error("{0}")]
     RetrieveFrontend(FrontendFromRequestError),
+    #[error("https redirect")]
+    HttpsRedirect,
 }
 
 /// Used in sessions

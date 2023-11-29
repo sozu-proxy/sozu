@@ -219,10 +219,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     /// Reset the connection in case of keep-alive to be ready for the next request
     pub fn reset(&mut self) {
         trace!("==============reset");
-        self.context.keep_alive_frontend = true;
-        self.context.keep_alive_backend = true;
-        self.context.sticky_session_found = None;
-        self.context.id = Ulid::generate();
+        self.context.reset();
 
         self.request_stream.clear();
         self.response_stream.clear();
@@ -758,20 +755,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    /// Format the context of the websocket into a loggable String
-    pub fn websocket_context(&self) -> String {
-        format!(
-            "{}",
-            Endpoint::Http {
-                method: self.context.method.as_ref(),
-                authority: self.context.authority.as_deref(),
-                path: self.context.path.as_deref(),
-                status: self.context.status,
-                reason: self.context.reason.as_deref(),
-            }
-        )
-    }
-
     pub fn log_request(&self, metrics: &SessionMetrics, message: Option<&str>) {
         let listener = self.listener.borrow();
         let tags = self.context.authority.as_ref().and_then(|host| {
@@ -1078,32 +1061,11 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         true
     }
 
-    // -> host, path, method
-    pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
-        let given_method = self
-            .context
-            .method
-            .as_ref()
-            .ok_or(RetrieveClusterError::NoMethod)?;
-        let given_authority = self
-            .context
-            .authority
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoHost)?;
-        let given_path = self
-            .context
-            .path
-            .as_deref()
-            .ok_or(RetrieveClusterError::NoPath)?;
-
-        Ok((given_authority, given_path, given_method))
-    }
-
     fn cluster_id_from_request(
         &mut self,
         proxy: Rc<RefCell<dyn L7Proxy>>,
     ) -> Result<String, RetrieveClusterError> {
-        let (host, uri, method) = match self.extract_route() {
+        let (host, uri, method) = match self.context.extract_route() {
             Ok(tuple) => tuple,
             Err(cluster_error) => {
                 self.set_answer(DefaultAnswerStatus::Answer400, None);
@@ -1125,7 +1087,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         };
 
         let cluster_id = match route {
-            Route::ClusterId(cluster_id) => cluster_id,
+            Route::Cluster { id, .. } => id,
             Route::Deny => {
                 self.set_answer(DefaultAnswerStatus::Answer401, None);
                 return Err(RetrieveClusterError::UnauthorizedRoute);

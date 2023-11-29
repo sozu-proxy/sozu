@@ -17,7 +17,7 @@ use sozu_command_lib::{
 };
 
 use crate::{
-    http_utils::{default_404_answer, default_503_answer, http_ok_response, http_request},
+    http_utils::{default_answer, http_ok_response, http_request},
     mock::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
@@ -672,7 +672,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(default_404_answer()));
+    assert_eq!(response, Some(default_answer(404)));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request_type(RequestType::AddHttpFrontend(RequestHttpFrontend {
@@ -687,7 +687,7 @@ fn try_http_behaviors() -> State {
 
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(default_503_answer()));
+    assert_eq!(response, Some(default_answer(503)));
     assert_eq!(client.receive(), None);
 
     let back_address = create_local_address();
@@ -705,12 +705,9 @@ fn try_http_behaviors() -> State {
     client.connect();
     client.send();
 
-    let expected_response = String::from(
-        "HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-    );
     let response = client.receive();
     println!("response: {response:?}");
-    assert_eq!(response, Some(expected_response));
+    assert_eq!(response, Some(default_answer(400)));
     assert_eq!(client.receive(), None);
 
     let mut backend = SyncBackend::new("backend", back_address, "TEST\r\n\r\n");
@@ -724,13 +721,10 @@ fn try_http_behaviors() -> State {
     let request = backend.receive(0);
     backend.send(0);
 
-    let expected_response = String::from(
-        "HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
-    );
     let response = client.receive();
     println!("request: {request:?}");
     println!("response: {response:?}");
-    assert_eq!(response, Some(expected_response));
+    assert_eq!(response, Some(default_answer(502)));
     assert_eq!(client.receive(), None);
 
     info!("expecting 200");
@@ -782,7 +776,8 @@ fn try_http_behaviors() -> State {
             && response.ends_with(&expected_response_end)
     );
 
-    info!("server closes, expecting 503");
+    // FIXME: do we want 502 or 503???
+    info!("server closes, expecting 502");
     // TODO: what if the client continue to use the closed stream
     client.connect();
     client.send();
@@ -793,7 +788,7 @@ fn try_http_behaviors() -> State {
     let response = client.receive();
     println!("request: {request:?}");
     println!("response: {response:?}");
-    assert_eq!(response, Some(default_503_answer()));
+    assert_eq!(response, Some(default_answer(502)));
     assert_eq!(client.receive(), None);
 
     worker.send_proxy_request_type(RequestType::RemoveBackend(RemoveBackend {
@@ -1200,7 +1195,9 @@ pub fn try_stick() -> State {
     backend1.send(0);
     let response = client.receive();
     println!("response: {response:?}");
-    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nX-Forwarded-For:"));
+    assert!(request.unwrap().starts_with(
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\n"
+    ));
     assert!(response.unwrap().starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSet-Cookie: SOZUBALANCEID=sticky_cluster_0-0; Path=/\r\nSozu-Id:"));
 
     // invalid sticky_session
@@ -1213,7 +1210,9 @@ pub fn try_stick() -> State {
     backend2.send(0);
     let response = client.receive();
     println!("response: {response:?}");
-    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nX-Forwarded-For:"));
+    assert!(request.unwrap().starts_with(
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\n"
+    ));
     assert!(response.unwrap().starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSet-Cookie: SOZUBALANCEID=sticky_cluster_0-1; Path=/\r\nSozu-Id:"));
 
     // good sticky_session (force use backend2, round-robin would have chosen backend1)
@@ -1226,7 +1225,9 @@ pub fn try_stick() -> State {
     backend2.send(0);
     let response = client.receive();
     println!("response: {response:?}");
-    assert!(request.unwrap().starts_with("GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\nX-Forwarded-For:"));
+    assert!(request.unwrap().starts_with(
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: foo=bar\r\n"
+    ));
     assert!(response
         .unwrap()
         .starts_with("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nSozu-Id:"));

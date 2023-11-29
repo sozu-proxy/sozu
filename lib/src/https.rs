@@ -33,10 +33,10 @@ use sozu_command::{
     config::DEFAULT_CIPHER_SUITES,
     logging,
     proto::command::{
-        request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
-        CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
-        ListenerType, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        ResponseContent, TlsVersion,
+        request::RequestType, response_content::ContentType, AddCertificate, AlpnProtocol,
+        CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
+        ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
     },
     ready::Ready,
     request::WorkerRequest,
@@ -49,14 +49,14 @@ use crate::{
     backends::BackendMap,
     pool::Pool,
     protocol::{
-        h2::Http2,
         http::{
             answers::HttpAnswers,
             parser::{hostname_and_port, Method},
         },
+        mux::{self, Mux},
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
-        Http, Pipe, SessionState,
+        Pipe, SessionState,
     },
     router::{Route, Router},
     server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
@@ -68,9 +68,6 @@ use crate::{
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
     SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };
-
-// const SERVER_PROTOS: &[&str] = &["http/1.1", "h2"];
-const SERVER_PROTOS: &[&str] = &["http/1.1"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsCluster {
@@ -89,15 +86,11 @@ StateMachineBuilder! {
     enum HttpsStateMachine impl SessionState {
         Expect(ExpectProxyProtocol<MioTcpStream>, ServerConnection),
         Handshake(TlsHandshake),
-        Http(Http<FrontRustls, HttpsListener>),
+        Mux(Mux<FrontRustls>),
+        // Http(Http<FrontRustls, HttpsListener>),
         WebSocket(Pipe<FrontRustls, HttpsListener>),
-        Http2(Http2<FrontRustls>) -> todo!("H2"),
+        // Http2(Http2<FrontRustls>) -> todo!("H2"),
     }
-}
-
-pub enum AlpnProtocols {
-    H2,
-    Http11,
 }
 
 pub struct HttpsSession {
@@ -191,8 +184,9 @@ impl HttpsSession {
         let new_state = match self.state.take() {
             HttpsStateMachine::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
             HttpsStateMachine::Handshake(handshake) => self.upgrade_handshake(handshake),
-            HttpsStateMachine::Http(http) => self.upgrade_http(http),
-            HttpsStateMachine::Http2(_) => self.upgrade_http2(),
+            // HttpsStateMachine::Http(http) => self.upgrade_http(http),
+            HttpsStateMachine::Mux(mux) => self.upgrade_mux(mux),
+            // HttpsStateMachine::Http2(_) => self.upgrade_http2(),
             HttpsStateMachine::WebSocket(wss) => self.upgrade_websocket(wss),
             HttpsStateMachine::FailedUpgrade(_) => unreachable!(),
         };
@@ -255,12 +249,6 @@ impl HttpsSession {
     }
 
     fn upgrade_handshake(&mut self, handshake: TlsHandshake) -> Option<HttpsStateMachine> {
-        // Add 1st routing phase
-        // - get SNI
-        // - get ALPN
-        // - find corresponding listener
-        // - determine next protocol (tcps, https ,http2)
-
         let sni = handshake.session.server_name();
         let alpn = handshake.session.alpn_protocol();
         let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
@@ -270,15 +258,16 @@ impl HttpsSession {
         );
 
         let alpn = match alpn {
-            Some("http/1.1") => AlpnProtocols::Http11,
-            Some("h2") => AlpnProtocols::H2,
+            Some("http/1.1") => AlpnProtocol::Http11,
+            Some("h2") => AlpnProtocol::H2,
             Some(other) => {
                 error!("Unsupported ALPN protocol: {}", other);
                 return None;
             }
             // Some client don't fill in the ALPN protocol, in this case we default to Http/1.1
-            None => AlpnProtocols::Http11,
+            None => AlpnProtocol::Http11,
         };
+        println!("ALPN: {alpn:?}");
 
         if let Some(version) = handshake.session.protocol_version() {
             incr!(rustls_version_str(version));
@@ -293,80 +282,146 @@ impl HttpsSession {
         };
 
         gauge_add!("protocol.tls.handshake", -1);
-        match alpn {
-            AlpnProtocols::Http11 => {
-                let mut http = Http::new(
-                    self.answers.clone(),
-                    self.configured_backend_timeout,
-                    self.configured_connect_timeout,
-                    self.configured_frontend_timeout,
-                    handshake.container_frontend_timeout,
-                    front_stream,
-                    self.frontend_token,
-                    self.listener.clone(),
-                    self.pool.clone(),
-                    Protocol::HTTPS,
-                    self.public_address,
-                    handshake.request_id,
-                    self.peer_address,
-                    self.sticky_name.clone(),
-                )
-                .ok()?;
 
-                http.frontend_readiness.event = handshake.frontend_readiness.event;
-
-                gauge_add!("protocol.https", 1);
-                Some(HttpsStateMachine::Http(http))
+        let router = mux::Router::new(
+            self.configured_backend_timeout,
+            self.configured_connect_timeout,
+            self.listener.clone(),
+        );
+        let mut context = mux::Context::new(self.pool.clone());
+        let mut frontend = match alpn {
+            AlpnProtocol::Http11 => {
+                context.create_stream(handshake.request_id, 1 << 16)?;
+                mux::Connection::new_h1_server(front_stream, handshake.container_frontend_timeout)
             }
-            AlpnProtocols::H2 => {
-                let mut http = Http2::new(
-                    front_stream,
-                    self.frontend_token,
-                    self.pool.clone(),
-                    Some(self.public_address),
-                    None,
-                    self.sticky_name.clone(),
-                );
+            AlpnProtocol::H2 => mux::Connection::new_h2_server(
+                front_stream,
+                self.pool.clone(),
+                handshake.container_frontend_timeout,
+            )?,
+        };
+        frontend.readiness_mut().event = handshake.frontend_readiness.event;
 
-                http.frontend.readiness.event = handshake.frontend_readiness.event;
-
-                gauge_add!("protocol.http2", 1);
-                Some(HttpsStateMachine::Http2(http))
-            }
-        }
+        gauge_add!("protocol.https", 1);
+        Some(HttpsStateMachine::Mux(Mux {
+            configured_frontend_timeout: self.configured_frontend_timeout,
+            frontend_token: self.frontend_token,
+            frontend,
+            context,
+            router,
+            public_address: self.public_address,
+            peer_address: self.peer_address,
+            sticky_name: self.sticky_name.clone(),
+        }))
     }
 
-    fn upgrade_http(&self, http: Http<FrontRustls, HttpsListener>) -> Option<HttpsStateMachine> {
-        debug!("https switching to wss");
-        let front_token = self.frontend_token;
-        let back_token = unwrap_msg!(http.backend_token);
-        let ws_context = http.websocket_context();
+    // fn upgrade_http(&self, http: Http<FrontRustls, HttpsListener>) -> Option<HttpsStateMachine> {
+    //     debug!("https switching to wss");
+    //     let front_token = self.frontend_token;
+    //     let back_token = unwrap_msg!(http.backend_token);
+    //     let ws_context = http.context.websocket_context();
 
-        let mut container_frontend_timeout = http.container_frontend_timeout;
-        let mut container_backend_timeout = http.container_backend_timeout;
+    //     let mut container_frontend_timeout = http.container_frontend_timeout;
+    //     let mut container_backend_timeout = http.container_backend_timeout;
+    //     container_frontend_timeout.reset();
+    //     container_backend_timeout.reset();
+
+    //     let mut pipe = Pipe::new(
+    //         http.response_stream.storage.buffer,
+    //         http.backend_id,
+    //         http.backend_socket,
+    //         http.backend,
+    //         Some(container_backend_timeout),
+    //         Some(container_frontend_timeout),
+    //         http.cluster_id,
+    //         http.request_stream.storage.buffer,
+    //         front_token,
+    //         http.frontend_socket,
+    //         self.listener.clone(),
+    //         Protocol::HTTP,
+    //         http.context.id,
+    //         http.context.session_address,
+    //         Some(ws_context),
+    //     );
+
+    //     pipe.frontend_readiness.event = http.frontend_readiness.event;
+    //     pipe.backend_readiness.event = http.backend_readiness.event;
+    //     pipe.set_back_token(back_token);
+
+    //     gauge_add!("protocol.https", -1);
+    //     gauge_add!("protocol.wss", 1);
+    //     gauge_add!("http.active_requests", -1);
+    //     gauge_add!("websocket.active_requests", 1);
+    //     Some(HttpsStateMachine::WebSocket(pipe))
+    // }
+
+    fn upgrade_mux(&self, mut mux: Mux<FrontRustls>) -> Option<HttpsStateMachine> {
+        debug!("mux switching to wss");
+        let stream = mux.context.streams.pop().unwrap();
+
+        let (frontend_readiness, frontend_socket, mut container_frontend_timeout) =
+            match mux.frontend {
+                mux::Connection::H1(mux::ConnectionH1 {
+                    readiness,
+                    socket,
+                    timeout_container,
+                    ..
+                }) => (readiness, socket, timeout_container),
+                mux::Connection::H2(_) => {
+                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    return None;
+                }
+            };
+
+        let mux::StreamState::Linked(back_token) = stream.state else {
+            error!("Upgrading stream should be linked to a backend");
+            return None;
+        };
+        let backend = mux.router.backends.remove(&back_token).unwrap();
+        let (cluster_id, backend_readiness, backend_socket, mut container_backend_timeout) =
+            match backend {
+                mux::Connection::H1(mux::ConnectionH1 {
+                    position: mux::Position::Client(mux::BackendStatus::Connected(cluster_id)),
+                    readiness,
+                    socket,
+                    timeout_container,
+                    ..
+                }) => (cluster_id, readiness, socket, timeout_container),
+                mux::Connection::H1(_) => {
+                    error!("The backend disconnected just after upgrade, abort");
+                    return None;
+                }
+                mux::Connection::H2(_) => {
+                    error!("Only h1<->h1 connections can upgrade to websocket");
+                    return None;
+                }
+            };
+
+        let ws_context = stream.context.websocket_context();
+
         container_frontend_timeout.reset();
         container_backend_timeout.reset();
 
         let mut pipe = Pipe::new(
-            http.response_stream.storage.buffer,
-            http.backend_id,
-            http.backend_socket,
-            http.backend,
+            stream.back.storage.buffer,
+            None,
+            Some(backend_socket),
+            None,
             Some(container_backend_timeout),
             Some(container_frontend_timeout),
-            http.cluster_id,
-            http.request_stream.storage.buffer,
-            front_token,
-            http.frontend_socket,
+            Some(cluster_id),
+            stream.front.storage.buffer,
+            self.frontend_token,
+            frontend_socket,
             self.listener.clone(),
-            Protocol::HTTP,
-            http.context.id,
-            http.context.session_address,
+            Protocol::HTTPS,
+            stream.context.id,
+            stream.context.session_address,
             Some(ws_context),
         );
 
-        pipe.frontend_readiness.event = http.frontend_readiness.event;
-        pipe.backend_readiness.event = http.backend_readiness.event;
+        pipe.frontend_readiness.event = frontend_readiness.event;
+        pipe.backend_readiness.event = backend_readiness.event;
         pipe.set_back_token(back_token);
 
         gauge_add!("protocol.https", -1);
@@ -374,10 +429,6 @@ impl HttpsSession {
         gauge_add!("http.active_requests", -1);
         gauge_add!("websocket.active_requests", 1);
         Some(HttpsStateMachine::WebSocket(pipe))
-    }
-
-    fn upgrade_http2(&self) -> Option<HttpsStateMachine> {
-        todo!()
     }
 
     fn upgrade_websocket(
@@ -403,21 +454,20 @@ impl ProxySession for HttpsSession {
         match self.state.marker() {
             StateMarker::Expect => gauge_add!("protocol.proxy.expect", -1),
             StateMarker::Handshake => gauge_add!("protocol.tls.handshake", -1),
-            StateMarker::Http => gauge_add!("protocol.https", -1),
+            // StateMarker::Http => gauge_add!("protocol.https", -1),
+            StateMarker::Mux => gauge_add!("protocol.https", -1),
             StateMarker::WebSocket => {
                 gauge_add!("protocol.wss", -1);
                 gauge_add!("websocket.active_requests", -1);
-            }
-            StateMarker::Http2 => gauge_add!("protocol.http2", -1),
+            } // StateMarker::Http2 => gauge_add!("protocol.http2", -1),
         }
 
         if self.state.failed() {
             match self.state.marker() {
                 StateMarker::Expect => incr!("https.upgrade.expect.failed"),
                 StateMarker::Handshake => incr!("https.upgrade.handshake.failed"),
-                StateMarker::Http => incr!("https.upgrade.http.failed"),
                 StateMarker::WebSocket => incr!("https.upgrade.wss.failed"),
-                StateMarker::Http2 => incr!("https.upgrade.http2.failed"),
+                StateMarker::Mux => incr!("https.upgrade.http.failed"),
             }
             return;
         }
@@ -466,17 +516,23 @@ impl ProxySession for HttpsSession {
             token,
             super::ready_to_string(events)
         );
+        println!("EVENT: {token:?}->{events:?}");
         self.last_event = Instant::now();
         self.metrics.wait_start();
         self.state.update_readiness(token, events);
     }
 
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+        let start = std::time::Instant::now();
+        println!("READY {start:?}");
         self.metrics.service_start();
 
         let session_result =
             self.state
                 .ready(session.clone(), self.proxy.clone(), &mut self.metrics);
+
+        let end = std::time::Instant::now();
+        println!("READY END {end:?} -> {:?}", end.duration_since(start));
 
         let to_be_closed = match session_result {
             SessionResult::Close => true,
@@ -561,7 +617,6 @@ impl L7ListenerHandler for HttpsListener {
         let (remaining_input, (hostname, _)) = match hostname_and_port(host.as_bytes()) {
             Ok(tuple) => tuple,
             Err(parse_error) => {
-                // parse_error contains a slice of given_host, which should NOT escape this scope
                 return Err(FrontendFromRequestError::HostParse {
                     host: host.to_owned(),
                     error: parse_error.to_string(),
@@ -587,7 +642,7 @@ impl L7ListenerHandler for HttpsListener {
 
         let now = Instant::now();
 
-        if let Route::ClusterId(cluster) = &route {
+        if let Route::Cluster { id: cluster, .. } = &route {
             time!(
                 "frontend_matching_time",
                 cluster,
@@ -760,11 +815,20 @@ impl HttpsListener {
             .with_cert_resolver(resolver);
         server_config.send_tls13_tickets = config.send_tls13_tickets as usize;
 
-        let mut protocols = SERVER_PROTOS
+        let protocols = config
+            .alpn
             .iter()
-            .map(|proto| proto.as_bytes().to_vec())
+            .filter_map(|protocol| match AlpnProtocol::try_from(*protocol) {
+                Ok(AlpnProtocol::Http11) => Some("http/1.1"),
+                Ok(AlpnProtocol::H2) => Some("h2"),
+                other_protocol => {
+                    error!("unsupported ALPN protocol: {:?}", other_protocol);
+                    None
+                }
+            })
+            .map(|protocol| protocol.as_bytes().to_vec())
             .collect::<Vec<_>>();
-        server_config.alpn_protocols.append(&mut protocols);
+        server_config.alpn_protocols = protocols;
 
         Ok(server_config)
     }
@@ -872,7 +936,7 @@ impl HttpsProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::SoftStop {
                 proxy_protocol: "HTTPS".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -895,7 +959,7 @@ impl HttpsProxy {
         if !socket_errors.is_empty() {
             return Err(ProxyError::HardStop {
                 proxy_protocol: "HTTPS".to_string(),
-                error: format!("Error deregistering listen sockets: {:?}", socket_errors),
+                error: format!("Error deregistering listen sockets: {socket_errors:?}"),
             });
         }
 
@@ -1619,25 +1683,37 @@ mod tests {
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri1),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id1.clone())
+            &Route::Cluster {
+                id: cluster_id1.clone(),
+                h2: false
+            }
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri2),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id2)
+            &Route::Cluster {
+                id: cluster_id2,
+                h2: false
+            }
         ));
         assert!(fronts.add_tree_rule(
             "lolcatho.st".as_bytes(),
             &PathRule::Prefix(uri3),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id3)
+            &Route::Cluster {
+                id: cluster_id3,
+                h2: false
+            }
         ));
         assert!(fronts.add_tree_rule(
             "other.domain".as_bytes(),
             &PathRule::Prefix("test".to_string()),
             &MethodRule::new(None),
-            &Route::ClusterId(cluster_id1)
+            &Route::Cluster {
+                id: cluster_id1,
+                h2: false
+            }
         ));
 
         let address: StdSocketAddr = FromStr::from_str("127.0.0.1:1032")
@@ -1679,25 +1755,37 @@ mod tests {
         let frontend1 = listener.frontend_from_request("lolcatho.st", "/", &Method::Get);
         assert_eq!(
             frontend1.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            Route::Cluster {
+                id: "cluster_1".to_string(),
+                h2: false
+            }
         );
         println!("TEST {}", line!());
         let frontend2 = listener.frontend_from_request("lolcatho.st", "/test", &Method::Get);
         assert_eq!(
             frontend2.expect("should find a frontend"),
-            Route::ClusterId("cluster_1".to_string())
+            Route::Cluster {
+                id: "cluster_1".to_string(),
+                h2: false
+            }
         );
         println!("TEST {}", line!());
         let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test", &Method::Get);
         assert_eq!(
             frontend3.expect("should find a frontend"),
-            Route::ClusterId("cluster_2".to_string())
+            Route::Cluster {
+                id: "cluster_2".to_string(),
+                h2: false
+            }
         );
         println!("TEST {}", line!());
         let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag", &Method::Get);
         assert_eq!(
             frontend4.expect("should find a frontend"),
-            Route::ClusterId("cluster_3".to_string())
+            Route::Cluster {
+                id: "cluster_3".to_string(),
+                h2: false
+            }
         );
         println!("TEST {}", line!());
         let frontend5 = listener.frontend_from_request("domain", "/", &Method::Get);
