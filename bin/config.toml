@@ -57,6 +57,12 @@ worker_count = 2
 # defaults to true
 worker_automatic_restart = true
 
+# maximum time to wait for a worker to respond, until it is deemed NotAnswering (10 seconds).
+# Beware that if this duration is bigger than ctl_command timeout (that defaults to 1 second),
+# and if a worker is not responding,
+# you may not receive a reply from Sōzu at all when doing "sozu status"
+worker_timeout = 10
+
 # indicates if worker process will be pinned on a core. If you activate this, be sure
 # that you do not have more workers than CPU cores (and leave at least one core for
 # the kernel and the main process)

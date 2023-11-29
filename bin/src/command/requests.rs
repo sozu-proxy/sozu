@@ -897,12 +897,12 @@ impl CommandServer {
                 self.in_flight
                     .insert(worker_request_id.clone(), (status_tx.clone(), 1));
             }
-            worker_info_map.insert(worker_request_id, worker.info());
+            worker_info_map.insert(worker_request_id, worker.querying_info());
         }
 
         let command_tx = self.command_tx.clone();
         let thread_client_id = client_id.clone();
-
+        let worker_timeout = self.config.worker_timeout;
         let now = Instant::now();
 
         smol::spawn(async move {
@@ -923,7 +923,7 @@ impl CommandServer {
                     .and_modify(|worker_info| worker_info.run_state = new_run_state as i32);
 
                 i += 1;
-                if i == count || now.elapsed() > Duration::from_secs(10) {
+                if i == count || now.elapsed() > Duration::from_secs(worker_timeout as u64) {
                     break;
                 }
             }

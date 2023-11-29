@@ -99,11 +99,18 @@ impl Worker {
         kill(Pid::from_raw(self.pid), None).is_ok()
     }
 
-    pub fn info(&self) -> WorkerInfo {
+    /// get info about a worker, with a NotAnswering run state by default,
+    /// to be updated when the worker responds
+    pub fn querying_info(&self) -> WorkerInfo {
+        let run_state = match self.run_state {
+            RunState::Stopping => RunState::Stopping,
+            RunState::Stopped => RunState::Stopped,
+            RunState::Running | RunState::NotAnswering => RunState::NotAnswering,
+        };
         WorkerInfo {
             id: self.id,
             pid: self.pid,
-            run_state: self.run_state as i32,
+            run_state: run_state as i32,
         }
     }
 

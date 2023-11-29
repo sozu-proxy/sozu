@@ -123,6 +123,9 @@ pub const DEFAULT_CONNECT_TIMEOUT: u32 = 3;
 /// maximum time to receive a request since the connection started (10 seconds)
 pub const DEFAULT_REQUEST_TIMEOUT: u32 = 10;
 
+/// maximum time to wait for a worker to respond, until it is deemed NotAnswering (10 seconds)
+pub const DEFAULT_WORKER_TIMEOUT: u32 = 10;
+
 /// a name applied to sticky sessions ("SOZUBALANCEID")
 pub const DEFAULT_STICKY_NAME: &str = "SOZUBALANCEID";
 
@@ -1144,6 +1147,8 @@ pub struct FileConfig {
     pub accept_queue_timeout: Option<u32>,
     #[serde(default)]
     pub request_timeout: Option<u32>,
+    #[serde(default)]
+    pub worker_timeout: Option<u32>,
 }
 
 impl FileConfig {
@@ -1268,6 +1273,7 @@ impl ConfigBuilder {
             zombie_check_interval: file_config
                 .zombie_check_interval
                 .unwrap_or(DEFAULT_ZOMBIE_CHECK_INTERVAL),
+            worker_timeout: file_config.worker_timeout.unwrap_or(DEFAULT_WORKER_TIMEOUT),
             ..Default::default()
         };
 
@@ -1507,6 +1513,8 @@ pub struct Config {
     pub accept_queue_timeout: u32,
     #[serde(default = "default_request_timeout")]
     pub request_timeout: u32,
+    #[serde(default = "default_worker_timeout")]
+    pub worker_timeout: u32,
 }
 
 fn default_front_timeout() -> u32 {
@@ -1535,6 +1543,10 @@ fn default_accept_queue_timeout() -> u32 {
 
 fn default_disable_cluster_metrics() -> bool {
     DEFAULT_DISABLE_CLUSTER_METRICS
+}
+
+fn default_worker_timeout() -> u32 {
+    DEFAULT_WORKER_TIMEOUT
 }
 
 impl Config {
