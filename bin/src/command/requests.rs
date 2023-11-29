@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fs::File,
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Read},
     os::unix::io::{FromRawFd, IntoRawFd},
     os::unix::net::UnixStream,
     time::{Duration, Instant},
@@ -127,50 +127,13 @@ impl CommandServer {
             .with_context(|| format!("could not open file at path: {}", &path))?;
 
         let counter = self
-            .save_state_to_file(&mut file)
+            .state
+            .write_requests_to_file(&mut file)
             .with_context(|| "failed writing state to file")?;
 
         info!("wrote {} commands to {}", counter, path);
 
         Ok(Some(Success::SaveState(counter, path.into())))
-    }
-
-    pub fn save_state_to_file(&mut self, file: &mut File) -> anyhow::Result<usize> {
-        let mut counter = 0usize;
-        let requests = self.state.generate_requests();
-
-        let result: anyhow::Result<usize> = (move || {
-            for request in requests {
-                let message = WorkerRequest::new(format!("SAVE-{counter}"), request);
-
-                file.write_all(
-                    &serde_json::to_string(&message)
-                        .map(|s| s.into_bytes())
-                        .unwrap_or_default(),
-                )
-                .with_context(|| {
-                    format!(
-                        "Could not add this instruction line to the saved state file: {message:?}"
-                    )
-                })?;
-
-                file.write_all(&b"\n\0"[..])
-                    .with_context(|| "Could not add new line to the saved state file")?;
-
-                if counter % 1000 == 0 {
-                    info!("writing command {}", counter);
-                    file.sync_all()
-                        .with_context(|| "Failed to sync the saved state file")?;
-                }
-                counter += 1;
-            }
-            file.sync_all()
-                .with_context(|| "Failed to sync the saved state file")?;
-
-            Ok(counter)
-        })();
-
-        result.with_context(|| "Could not write the state onto the state file")
     }
 
     pub async fn load_state(
@@ -1237,10 +1200,12 @@ impl CommandServer {
                     "Saving state to file",
                 )
                 .await;
+
                 let mut file = File::create(&path)
                     .with_context(|| "Could not create file to automatically save the state")?;
 
-                self.save_state_to_file(&mut file)
+                self.state
+                    .write_requests_to_file(&mut file)
                     .with_context(|| format!("could not save state automatically to {path}"))?;
             }
         }

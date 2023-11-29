@@ -1,11 +1,17 @@
 use std::{
     error,
     fmt::{self, Display},
+    fs::File,
+    io::Read,
     net::SocketAddr,
     str::FromStr,
 };
 
+use nom::{HexDisplay, Offset};
+
 use crate::{
+    buffer::fixed::Buffer,
+    parser::parse_several_requests,
     proto::command::{
         request::RequestType, LoadBalancingAlgorithms, PathRuleKind, Request, RequestHttpFrontend,
         RulePosition,
@@ -19,6 +25,10 @@ pub enum RequestError {
     InvalidSocketAddress { address: String, error: String },
     #[error("invalid value {value} for field '{name}'")]
     InvalidValue { name: String, value: i32 },
+    #[error("Could not read requests from file: {0}")]
+    FileError(std::io::Error),
+    #[error("Could not parse requests: {0}")]
+    ParseError(String),
 }
 
 impl Request {
@@ -121,6 +131,55 @@ impl fmt::Display for WorkerRequest {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}-{:?}", self.id, self.content)
     }
+}
+
+pub fn read_requests_from_file(file: &mut File) -> Result<Vec<WorkerRequest>, RequestError> {
+    let mut acc = Vec::new();
+    let mut buffer = Buffer::with_capacity(200000);
+    loop {
+        let previous = buffer.available_data();
+
+        let bytes_read = file
+            .read(buffer.space())
+            .map_err(|e| RequestError::FileError(e))?;
+
+        buffer.fill(bytes_read);
+
+        if buffer.available_data() == 0 {
+            debug!("Empty buffer");
+            break;
+        }
+
+        let mut offset = 0usize;
+        match parse_several_requests::<WorkerRequest>(buffer.data()) {
+            Ok((i, requests)) => {
+                if !i.is_empty() {
+                    debug!("could not parse {} bytes", i.len());
+                    if previous == buffer.available_data() {
+                        break;
+                    }
+                }
+                offset = buffer.data().offset(i);
+
+                acc.push(requests);
+            }
+            Err(nom::Err::Incomplete(_)) => {
+                if buffer.available_data() == buffer.capacity() {
+                    error!(
+                        "message too big, stopping parsing:\n{}",
+                        buffer.data().to_hex(16)
+                    );
+                    break;
+                }
+            }
+            Err(parse_error) => {
+                return Err(RequestError::ParseError(parse_error.to_string()));
+            }
+        }
+        buffer.consume(offset);
+    }
+    let requests = acc.into_iter().flatten().collect();
+    Ok(requests)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

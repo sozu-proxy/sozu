@@ -3,7 +3,9 @@ use std::{
         btree_map::Entry as BTreeMapEntry, hash_map::DefaultHasher, BTreeMap, BTreeSet, HashMap,
         HashSet,
     },
+    fs::File,
     hash::{Hash, Hasher},
+    io::Write,
     iter::{repeat, FromIterator},
     net::SocketAddr,
 };
@@ -23,6 +25,7 @@ use crate::{
         },
         display::format_request_type,
     },
+    request::WorkerRequest,
     response::{Backend, HttpFrontend, TcpFrontend},
     ObjectKind,
 };
@@ -56,6 +59,8 @@ pub enum StateError {
         "Could not convert the frontend to an insertable one. Frontend: {frontend} error: {error}"
     )]
     FrontendConversion { frontend: String, error: String },
+    #[error("Could not write state to file: {0}")]
+    FileError(std::io::Error),
 }
 
 impl From<DecodeError> for StateError {
@@ -1366,6 +1371,37 @@ impl ConfigState {
             https_listeners: self.https_listeners.clone(),
             tcp_listeners: self.tcp_listeners.clone(),
         }
+    }
+
+    /// generate requests necessary to recreate the state,
+    /// write them in a JSON form in a file, separated by \n\0,
+    /// returns the number of written requests
+    pub fn write_requests_to_file(&self, file: &mut File) -> Result<usize, StateError> {
+        let mut counter = 0usize;
+        let requests = self.generate_requests();
+
+        for request in requests {
+            let message = WorkerRequest::new(format!("SAVE-{counter}"), request);
+
+            file.write_all(
+                &serde_json::to_string(&message)
+                    .map(|s| s.into_bytes())
+                    .unwrap_or_default(),
+            )
+            .map_err(StateError::FileError)?;
+
+            file.write_all(&b"\n\0"[..])
+                .map_err(StateError::FileError)?;
+
+            if counter % 1000 == 0 {
+                info!("writing command {}", counter);
+                file.sync_all().map_err(StateError::FileError)?;
+            }
+            counter += 1;
+        }
+        file.sync_all().map_err(StateError::FileError)?;
+
+        Ok(counter)
     }
 }
 
