@@ -42,7 +42,7 @@ use sozu_command::{
         request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
         CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
         ListenerType, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        ResponseContent, ServerConfig, TlsVersion, WorkerRequest, WorkerResponse,
+        ResponseContent, TlsVersion, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
     response::HttpFrontend,

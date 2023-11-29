@@ -685,3 +685,9 @@ message ListenersCount {
     // socket addresses of TCP listeners
     repeated string tcp = 3;
 }
+
+// the Sōzu state, passed to a new worker.
+// Consists in a collection of worker requests
+message InitialState {
+    repeated WorkerRequest requests = 1;
+}

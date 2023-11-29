@@ -29,7 +29,7 @@ use sozu_command_lib::{
     logging::setup_logging,
     proto::command::{ServerConfig, WorkerRequest, WorkerResponse},
     ready::Ready,
-    request::{read_requests_from_file, RequestError},
+    request::{read_initial_state_from_file, RequestError},
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
     state::{ConfigState, StateError},
 };
@@ -124,8 +124,12 @@ pub fn begin_worker_process(
         worker_config
     );
     info!("worker {} starting...", id);
-    let initial_state = read_requests_from_file(&mut configuration_state_file)
+
+    // let initial_state = read_requests_from_file(&mut configuration_state_file)
+
+    let initial_state = read_initial_state_from_file(&mut configuration_state_file)
         .map_err(WorkerError::ReadRequestsFromFile)?;
+    // .expect("could not parse configuration state data");
 
     worker_to_main_channel
         .nonblocking()
@@ -197,8 +201,10 @@ pub fn fork_main_into_worker(
     })?;
 
     state
-        .write_requests_to_file(&mut state_file)
+        // .write_requests_to_file(&mut state_file)
+        .write_initial_state_to_file(&mut state_file)
         .map_err(WorkerError::WriteStateFile)?;
+    // .expect("Could not write state to file");
 
     state_file.rewind().map_err(WorkerError::Rewind)?;
 

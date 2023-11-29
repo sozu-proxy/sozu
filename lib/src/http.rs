@@ -20,7 +20,7 @@ use sozu_command::{
     logging,
     proto::command::{
         request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,
-        RequestHttpFrontend, ServerConfig, WorkerRequest, WorkerResponse,
+        RequestHttpFrontend, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
     response::HttpFrontend,

@@ -2,20 +2,19 @@ use std::{
     error,
     fmt::{self, Display},
     fs::File,
-    io::Read,
+    io::{BufReader, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
 };
 
-use nom::{HexDisplay, Offset};
+use prost::Message;
 
 use crate::{
-    buffer::fixed::Buffer,
-    parser::parse_several_requests,
     proto::{
         command::{
-            ip_address, request::RequestType, IpAddress, LoadBalancingAlgorithms, PathRuleKind,
-            Request, RequestHttpFrontend, RulePosition, SocketAddress, Uint128, WorkerRequest,
+            ip_address, request::RequestType, InitialState, IpAddress, LoadBalancingAlgorithms,
+            PathRuleKind, Request, RequestHttpFrontend, RulePosition, SocketAddress, Uint128,
+            WorkerRequest,
         },
         display::format_request_type,
     },
@@ -134,51 +133,16 @@ impl fmt::Display for WorkerRequest {
     }
 }
 
-pub fn read_requests_from_file(file: &mut File) -> Result<Vec<WorkerRequest>, RequestError> {
-    let mut acc = Vec::new();
-    let mut buffer = Buffer::with_capacity(200000);
-    loop {
-        let previous = buffer.available_data();
+pub fn read_initial_state_from_file(file: &mut File) -> Result<InitialState, RequestError> {
+    let mut buf_reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+    buf_reader
+        .read_to_end(&mut buffer)
+        .map_err(|e| RequestError::FileError(e))?;
 
-        let bytes_read = file.read(buffer.space()).map_err(RequestError::FileError)?;
-
-        buffer.fill(bytes_read);
-
-        if buffer.available_data() == 0 {
-            trace!("read_requests_from_file: empty buffer");
-            break;
-        }
-
-        let mut offset = 0usize;
-        match parse_several_requests::<WorkerRequest>(buffer.data()) {
-            Ok((i, requests)) => {
-                if !i.is_empty() {
-                    trace!("read_requests_from_file: could not parse {} bytes", i.len());
-                    if previous == buffer.available_data() {
-                        break;
-                    }
-                }
-                offset = buffer.data().offset(i);
-
-                acc.push(requests);
-            }
-            Err(nom::Err::Incomplete(_)) => {
-                if buffer.available_data() == buffer.capacity() {
-                    error!(
-                        "read_requests_from_file: message too big, stopping parsing:\n{}",
-                        buffer.data().to_hex(16)
-                    );
-                    break;
-                }
-            }
-            Err(parse_error) => {
-                return Err(RequestError::ParseError(parse_error.to_string()));
-            }
-        }
-        buffer.consume(offset);
-    }
-    let requests = acc.into_iter().flatten().collect();
-    Ok(requests)
+    let initial_state =
+        InitialState::decode(&buffer[..]).map_err(|e| RequestError::ParseError(e.to_string()))?;
+    Ok(initial_state)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

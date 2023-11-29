@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
 };
 
-use prost::DecodeError;
+use prost::{DecodeError, Message};
 
 use crate::{
     certificate::{self, calculate_fingerprint, Fingerprint},
@@ -18,8 +18,8 @@ use crate::{
         command::{
             request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
             Cluster, ClusterInformation, DeactivateListener, FrontendFilters, HttpListenerConfig,
-            HttpsListenerConfig, ListedFrontends, ListenerType, ListenersList, PathRule,
-            QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
+            HttpsListenerConfig, InitialState, ListedFrontends, ListenerType, ListenersList,
+            PathRule, QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
             ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend, RequestTcpFrontend,
             SocketAddress, TcpListenerConfig, WorkerRequest,
         },
@@ -539,7 +539,8 @@ impl ConfigState {
         Ok(())
     }
 
-    pub fn generate_requests(&self) -> Vec<Request> {
+    /// creates all requests needed to bootstrap the state
+    fn generate_requests(&self) -> Vec<Request> {
         let mut v: Vec<Request> = Vec::new();
 
         for listener in self.http_listeners.values() {
@@ -1378,6 +1379,35 @@ impl ConfigState {
                 .map(|(addr, listener)| (addr.to_string(), listener.clone()))
                 .collect(),
         }
+    }
+
+    // create requests needed for a worker to recreate the state
+    pub fn produce_initial_state(&self) -> InitialState {
+        let mut counter = 0usize;
+        let mut worker_requests = Vec::new();
+        for request in self.generate_requests() {
+            worker_requests.push(WorkerRequest::new(format!("SAVE-{counter}"), request));
+            counter += 1;
+        }
+        InitialState {
+            requests: worker_requests,
+        }
+    }
+
+    /// generate requests necessary to recreate the state,
+    /// in protobuf, to a temp file
+    pub fn write_initial_state_to_file(&self, file: &mut File) -> Result<usize, StateError> {
+        let initial_state = self.produce_initial_state();
+        let count = initial_state.requests.len();
+
+        let bytes_to_write = initial_state.encode_to_vec();
+        println!("writing {} in the temp file", bytes_to_write.len());
+        file.write_all(&bytes_to_write)
+            .map_err(StateError::FileError)?;
+
+        file.sync_all().map_err(StateError::FileError)?;
+
+        Ok(count)
     }
 
     /// generate requests necessary to recreate the state,

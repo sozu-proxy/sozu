@@ -88,14 +88,7 @@ impl Worker {
             .send_listeners(&listeners)
             .expect("could not send listeners");
 
-        let initial_state = state
-            .generate_requests()
-            .into_iter()
-            .map(|request| WorkerRequest {
-                id: "initial_state".to_string(),
-                content: request,
-            })
-            .collect();
+        let initial_state = state.produce_initial_state();
         let server = Server::try_new_from_config(
             cmd_worker_to_main,
             scm_worker_to_main,
@@ -133,14 +126,7 @@ impl Worker {
             .expect("could not send listeners");
 
         let thread_config = config.to_owned();
-        let initial_state = state
-            .generate_requests()
-            .into_iter()
-            .map(|request| WorkerRequest {
-                id: "initial_state".to_string(),
-                content: request,
-            })
-            .collect();
+        let initial_state = state.produce_initial_state();
         let thread_name = name.to_owned();
         let thread_scm_worker_to_main = scm_worker_to_main.to_owned();
 

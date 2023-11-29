@@ -20,10 +20,10 @@ use sozu_command::{
     proto::command::{
         request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
         CertificatesWithFingerprints, Cluster, ClusterHashes, ClusterInformations,
-        DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, Request,
-        ResponseStatus, ServerConfig, TcpListenerConfig as CommandTcpListener, WorkerRequest,
-        WorkerResponse,
+        DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, InitialState,
+        ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend,
+        Request, ResponseStatus, ServerConfig, TcpListenerConfig as CommandTcpListener,
+        WorkerRequest, WorkerResponse,
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
@@ -243,7 +243,7 @@ impl Server {
         worker_to_main_channel: ProxyChannel,
         worker_to_main_scm: ScmSocket,
         config: ServerConfig,
-        initial_state: Vec<WorkerRequest>,
+        initial_state: InitialState,
         expects_initial_status: bool,
     ) -> Result<Self, ServerError> {
         let event_loop = Poll::new().map_err(ServerError::CreatePoll)?;
@@ -321,7 +321,7 @@ impl Server {
         https: Option<https::HttpsProxy>,
         tcp: Option<tcp::TcpProxy>,
         server_config: ServerConfig,
-        initial_state: Option<Vec<WorkerRequest>>,
+        initial_state: Option<InitialState>,
         expects_initial_status: bool,
     ) -> Result<Self, ServerError> {
         FEATURES.with(|_features| {
@@ -413,8 +413,8 @@ impl Server {
         };
 
         // initialize the worker with the state we got from a file
-        if let Some(requests) = initial_state {
-            for request in requests {
+        if let Some(state) = initial_state {
+            for request in state.requests {
                 trace!("generating initial config request: {:#?}", request);
                 server.notify_proxys(request);
             }
