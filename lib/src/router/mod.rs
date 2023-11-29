@@ -937,7 +937,7 @@ mod tests {
             ),
             Ok(Route::Cluster {
                 id: "examplewildcard".to_string(),
-                h2: true
+                h2: false
             })
         );
         assert_eq!(

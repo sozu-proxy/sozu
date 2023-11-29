@@ -49,7 +49,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             return MuxResult::Continue;
         }
 
-        let was_initial = kawa.is_initial();
+        let was_main_phase = kawa.is_main_phase();
         kawa::h1::parse(kawa, parts.context);
         debug_kawa(kawa);
         if kawa.is_error() {
@@ -80,7 +80,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             match self.position {
                 Position::Server => {
-                    if was_initial {
+                    if !was_main_phase {
                         self.requests += 1;
                         println_!("REQUESTS: {}", self.requests);
                         stream.state = StreamState::Link

@@ -1,7 +1,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    io::{ErrorKind, Write},
+    io::ErrorKind,
     net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
 };
