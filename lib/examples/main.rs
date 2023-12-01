@@ -5,14 +5,14 @@ extern crate sozu_lib;
 extern crate sozu_command_lib;
 extern crate time;
 
-use std::{env, io::stdout, thread};
+use std::thread;
 
 use anyhow::Context;
 
 use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
-    logging::{Logger, LoggerBackend},
+    logging::setup_logging,
     proto::command::{
         request::RequestType, AddBackend, AddCertificate, CertificateAndKey, LoadBalancingParams,
         PathRule, RequestHttpFrontend,
@@ -21,21 +21,7 @@ use sozu_command_lib::{
 };
 
 fn main() -> anyhow::Result<()> {
-    if env::var("RUST_LOG").is_ok() {
-        Logger::init(
-            "EXAMPLE".to_string(),
-            &env::var("RUST_LOG").with_context(|| "could not get the RUST_LOG env var")?,
-            LoggerBackend::Stdout(stdout()),
-            None,
-        );
-    } else {
-        Logger::init(
-            "EXAMPLE".to_string(),
-            "info",
-            LoggerBackend::Stdout(stdout()),
-            None,
-        );
-    }
+    setup_logging("stdout", None, "info", "EXAMPLE");
 
     info!("MAIN\tstarting up");
 

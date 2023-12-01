@@ -1895,7 +1895,6 @@ dependencies = [
  "futures-lite 1.13.0",
  "hex",
  "jemallocator",
- "lazy_static",
  "libc",
  "log 0.4.20",
  "mio",

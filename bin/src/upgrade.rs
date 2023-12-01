@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use tempfile::tempfile;
 
 use sozu_command_lib::{
-    channel::Channel, config::Config, proto::command::RunState, request::WorkerRequest,
-    state::ConfigState,
+    channel::Channel, config::Config, logging::setup_logging_with_config, proto::command::RunState,
+    request::WorkerRequest, state::ConfigState,
 };
 
 use crate::{command::CommandServer, util, worker::Worker};
@@ -155,7 +155,7 @@ pub fn begin_new_main_process(
         serde_json::from_reader(upgrade_file).with_context(|| "could not parse upgrade data")?;
     let config = upgrade_data.config.clone();
 
-    util::setup_logging(&config, "MAIN");
+    setup_logging_with_config(&config, "MAIN");
     util::setup_metrics(&config).with_context(|| "Could not setup metrics")?;
     //info!("new main got upgrade data: {:?}", upgrade_data);
 

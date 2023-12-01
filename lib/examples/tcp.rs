@@ -4,12 +4,12 @@ extern crate sozu_lib;
 extern crate sozu_command_lib;
 extern crate time;
 
-use std::{io::stdout, thread};
+use std::thread;
 
 use anyhow::Context;
 use sozu_command_lib::{
     channel::Channel,
-    logging::{Logger, LoggerBackend},
+    logging::setup_logging,
     proto::command::{
         request::RequestType, AddBackend, LoadBalancingParams, RequestTcpFrontend,
         TcpListenerConfig,
@@ -18,19 +18,7 @@ use sozu_command_lib::{
 };
 
 fn main() -> anyhow::Result<()> {
-    /*
-    if env::var("RUST_LOG").is_ok() {
-     Logger::init("EXAMPLE".to_string(), &env::var("RUST_LOG").with_context(|| "could not get the RUST_LOG env var"), LoggerBackend::Stdout(stdout()));
-    } else {
-     Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()));
-    }
-    */
-    Logger::init(
-        "EXAMPLE".to_string(),
-        "debug",
-        LoggerBackend::Stdout(stdout()),
-        None,
-    );
+    setup_logging("stdout", None, "info", "EXAMPLE");
 
     info!("starting up");
 
@@ -45,12 +33,7 @@ fn main() -> anyhow::Result<()> {
             address: "127.0.0.1:8080".parse().expect("could not parse address"),
             ..Default::default()
         };
-        Logger::init(
-            "TCP".to_string(),
-            "debug",
-            LoggerBackend::Stdout(stdout()),
-            None,
-        );
+        setup_logging("stdout", None, "debug", "TCP");
         sozu_lib::tcp::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 

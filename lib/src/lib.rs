@@ -223,7 +223,7 @@
 //!     channel::Channel,
 //!     config::ListenerBuilder,
 //!     info,
-//!     logging::{Logger, LoggerBackend},
+//!     logging::setup_logging,
 //!     proto::command::{
 //!         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
 //!         PathRule, Request, RequestHttpFrontend, RulePosition,
@@ -232,21 +232,7 @@
 //! };
 //!
 //! fn main() -> anyhow::Result<()> {
-//!     if env::var("RUST_LOG").is_ok() {
-//!         Logger::init(
-//!             "EXAMPLE".to_string(),
-//!             &env::var("RUST_LOG").with_context(|| "could not get the RUST_LOG env var")?,
-//!             LoggerBackend::Stdout(stdout()),
-//!             None,
-//!         );
-//!     } else {
-//!         Logger::init(
-//!             "EXAMPLE".to_string(),
-//!             "info",
-//!             LoggerBackend::Stdout(stdout()),
-//!             None,
-//!         );
-//!     }
+//!     setup_logging("stdout", None, "info", "EXAMPLE");
 //!
 //!     info!("starting up");
 //!
