@@ -11,7 +11,6 @@ hyper-rustls = { version = "^0.24.1", default-features = false, features = ["web
 libc = "^0.2.149"
 mio = "^0.8.8"
 rustls = { version = "^0.21.7", features = ["dangerous_configuration"] }
-slab = "^0.4.9"
 time = "^0.3.29"
 tokio = { version = "1.33.0", features = ["net", "rt-multi-thread"] }
 
