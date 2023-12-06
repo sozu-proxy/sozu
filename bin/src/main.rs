@@ -24,8 +24,6 @@
 //! to Sōzu via its UNIX socket.
 
 #[macro_use]
-extern crate lazy_static;
-#[macro_use]
 extern crate prettytable;
 #[macro_use]
 extern crate sozu_lib as sozu;
@@ -37,9 +35,6 @@ extern crate num_cpus;
 #[cfg(feature = "jemallocator")]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
-
-#[macro_use]
-mod logging;
 
 /// the arguments to the sozu command line
 mod cli;
@@ -63,7 +58,7 @@ use libc::{cpu_set_t, pid_t};
 #[cfg(target_os = "linux")]
 use regex::Regex;
 use sozu::metrics::METRICS;
-use sozu_command_lib::config::Config;
+use sozu_command_lib::{config::Config, logging::setup_logging_with_config};
 use std::panic;
 
 use crate::worker::{get_executable_path, start_workers, Worker};
@@ -122,7 +117,7 @@ fn start(args: &cli::Args) -> Result<(), anyhow::Error> {
     let config_file_path = get_config_file_path(args)?;
     let config = load_configuration(config_file_path)?;
 
-    util::setup_logging(&config, "MAIN");
+    setup_logging_with_config(&config, "MAIN");
     info!("Starting up");
     util::setup_metrics(&config).with_context(|| "Could not setup metrics")?;
     util::write_pid_file(&config).with_context(|| "PID file is not writeable")?;

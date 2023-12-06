@@ -4,12 +4,13 @@ use anyhow::Context;
 use sozu_command_lib::{
     channel::Channel,
     config::Config,
+    logging::setup_logging_with_config,
     proto::command::{Request, Response},
 };
 
 use crate::{
     cli::{self, *},
-    get_config_file_path, load_configuration, util,
+    get_config_file_path, load_configuration,
 };
 
 mod command;
@@ -27,7 +28,7 @@ pub fn ctl(args: cli::Args) -> anyhow::Result<()> {
     let config_file_path = get_config_file_path(&args)?;
     let config = load_configuration(config_file_path)?;
 
-    util::setup_logging(&config, "CTL");
+    setup_logging_with_config(&config, "CTL");
 
     // If the command is `config check` then exit because if we are here, the configuration is valid
     if let SubCmd::Config {

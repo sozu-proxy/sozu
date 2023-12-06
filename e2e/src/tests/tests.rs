@@ -1,5 +1,4 @@
 use std::{
-    io::stdout,
     net::SocketAddr,
     thread,
     time::{Duration, Instant},
@@ -7,8 +6,8 @@ use std::{
 
 use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
-    info,
-    logging::{Logger, LoggerBackend},
+    info, log,
+    logging::setup_logging,
     proto::command::{
         request::RequestType, ActivateListener, AddCertificate, CertificateAndKey, ListenerType,
         RemoveBackend, RequestHttpFrontend,
@@ -633,13 +632,7 @@ pub fn try_hard_or_soft_stop(soft: bool) -> State {
 }
 
 fn try_http_behaviors() -> State {
-    use sozu_command_lib::log;
-    Logger::init(
-        "BEHAVE-OUT".to_string(),
-        "debug",
-        LoggerBackend::Stdout(stdout()),
-        None,
-    );
+    setup_logging("stdout", None, "debug", "BEHAVE-OUT");
 
     info!("starting up");
 
@@ -1077,13 +1070,7 @@ pub fn try_blue_geen() -> State {
 }
 
 pub fn try_keep_alive() -> State {
-    use sozu_command_lib::log;
-    Logger::init(
-        "KA-OUT".to_string(),
-        "debug",
-        LoggerBackend::Stdout(stdout()),
-        None,
-    );
+    setup_logging("stdout", None, "debug", "KA-OUT");
 
     let front_address = create_local_address();
 

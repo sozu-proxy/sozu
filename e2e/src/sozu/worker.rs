@@ -1,6 +1,4 @@
 use std::{
-    env,
-    io::stdout,
     net::SocketAddr,
     os::unix::prelude::{AsRawFd, FromRawFd, IntoRawFd},
     thread::{self, JoinHandle},
@@ -15,7 +13,7 @@ use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
     config::{Config, ConfigBuilder, FileConfig},
-    logging::{Logger, LoggerBackend},
+    logging::setup_logging,
     proto::command::{
         request::RequestType, AddBackend, Cluster, HardStop, LoadBalancingParams, PathRule,
         Request, RequestHttpFrontend, RequestTcpFrontend, ReturnListenSockets, RulePosition,
@@ -161,13 +159,7 @@ impl Worker {
         println!("Setting up logging");
 
         let server_job = thread::spawn(move || {
-            let log_level = env::var("RUST_LOG").unwrap_or("error".to_string());
-            Logger::init(
-                thread_name.to_owned(),
-                &log_level,
-                LoggerBackend::Stdout(stdout()),
-                None,
-            );
+            setup_logging("stdout", None, "error", &thread_name);
             let mut server = Server::try_new_from_config(
                 cmd_worker_to_main,
                 thread_scm_worker_to_main,

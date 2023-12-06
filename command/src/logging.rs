@@ -14,9 +14,11 @@ use libc;
 use mio::net::UnixDatagram;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 
+use crate::config::Config;
+
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
-  pub static TAG:    String          = LOGGER.with(|logger| logger.borrow().tag.clone());
+  pub static TAG: String = LOGGER.with(|logger| {logger.borrow().tag.clone()});
 }
 
 pub static COMPAT_LOGGER: CompatLogger = CompatLogger;
@@ -482,6 +484,38 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
     }
 
     dirs
+}
+
+/// start the logger from config (takes RUST_LOG into account)
+pub fn setup_logging_with_config(config: &Config, tag: &str) {
+    setup_logging(
+        &config.log_target,
+        config.log_access_target.as_deref(),
+        &config.log_level,
+        tag,
+    )
+}
+
+/// start the logger, after:
+///
+/// - determining logging backends
+/// - taking RUST_LOG into account
+pub fn setup_logging(
+    log_target: &str,
+    log_access_target: Option<&str>,
+    log_level: &str,
+    tag: &str,
+) {
+    let backend = target_to_backend(log_target);
+    let access_backend = log_access_target.map(target_to_backend);
+
+    if let Ok(env_log_level) = env::var("RUST_LOG") {
+        Logger::init(tag.to_string(), &env_log_level, backend, access_backend);
+    } else {
+        // We set the env variable so every worker can access it
+        env::set_var("RUST_LOG", log_level);
+        Logger::init(tag.to_string(), log_level, backend, access_backend);
+    }
 }
 
 pub fn target_to_backend(target: &str) -> LoggerBackend {

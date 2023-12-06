@@ -31,7 +31,6 @@ futures = "^0.3.28"
 futures-lite = "^1.13.0"
 hex = "^0.4.3"
 jemallocator = { version = "^0.5.4", optional = true }
-lazy_static = "^1.4.0"
 libc = "^0.2.149"
 log = "^0.4.20"
 mio = { version = "^0.8.8", features = ["os-poll", "net"] }

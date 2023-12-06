@@ -29,7 +29,7 @@ use sozu::{metrics, server::Server};
 use sozu_command_lib::{
     channel::Channel,
     config::Config,
-    logging::target_to_backend,
+    logging::setup_logging_with_config,
     proto::command::{request::RequestType, Request, RunState, Status, WorkerInfo},
     ready::Ready,
     request::{read_requests_from_file, WorkerRequest},
@@ -38,7 +38,7 @@ use sozu_command_lib::{
     state::ConfigState,
 };
 
-use crate::{logging, util};
+use crate::util;
 
 /// An instance of Sōzu, as seen from the main process
 pub struct Worker {
@@ -225,39 +225,23 @@ pub fn begin_worker_process(
 
     let mut configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
 
-    let initial_state = read_requests_from_file(&mut configuration_state_file)
-        .with_context(|| "could not parse configuration state data")?;
-
     let worker_config = worker_to_main_channel
         .read_message()
         .with_context(|| "worker could not read configuration from socket")?;
 
     let worker_id = format!("{}-{:02}", "WRK", id);
-    logging::setup(
-        worker_id.clone(),
-        &worker_config.log_level,
-        &worker_config.log_target,
-        worker_config.log_access_target.as_deref(),
-    );
+
+    // do not try to log anything before this, or the logger will panic
+    setup_logging_with_config(&worker_config, &worker_id);
 
     trace!(
         "Creating worker {} with config: {:#?}",
         worker_id,
         worker_config
     );
-
-    let backend = target_to_backend(&worker_config.log_target);
-    let access_backend = worker_config
-        .log_access_target
-        .as_deref()
-        .map(target_to_backend);
-    sozu_command_lib::logging::Logger::init(
-        worker_id.clone(),
-        &worker_config.log_level,
-        backend,
-        access_backend,
-    );
     info!("worker {} starting...", id);
+    let initial_state = read_requests_from_file(&mut configuration_state_file)
+        .with_context(|| "could not parse configuration state data")?;
 
     if let Err(e) = worker_to_main_channel.nonblocking() {
         error!("Could not unblock the worker-to-main channel: {}", e);
