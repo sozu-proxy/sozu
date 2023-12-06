@@ -3,13 +3,16 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Context};
 
 use sozu_command_lib::{
-    certificate::{calculate_fingerprint, split_certificate_chain, Fingerprint},
-    config::{Config, ListenerBuilder},
+    certificate::{
+        decode_fingerprint, get_fingerprint_from_certificate_path, load_full_certificate,
+    },
+    config::ListenerBuilder,
     proto::command::{
-        request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
-        Cluster, CountRequests, DeactivateListener, FrontendFilters, HardStop, ListListeners,
-        ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
-        RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        request::RequestType, ActivateListener, AddBackend, AddCertificate, Cluster, CountRequests,
+        DeactivateListener, FrontendFilters, HardStop, ListListeners, ListenerType,
+        LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
+        QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
         RequestTcpFrontend, RulePosition, SoftStop, Status, SubscribeEvents, TlsVersion,
     },
 };
@@ -42,19 +45,19 @@ impl CommandManager {
     pub fn soft_stop(&mut self) -> anyhow::Result<()> {
         debug!("shutting down proxy softly");
 
-        self.send_request_to_workers(RequestType::SoftStop(SoftStop {}).into(), false)
+        self.send_request(RequestType::SoftStop(SoftStop {}).into())
     }
 
     pub fn hard_stop(&mut self) -> anyhow::Result<()> {
         debug!("shutting down proxy the hard way");
 
-        self.send_request_to_workers(RequestType::HardStop(HardStop {}).into(), false)
+        self.send_request(RequestType::HardStop(HardStop {}).into())
     }
 
-    pub fn status(&mut self, json: bool) -> anyhow::Result<()> {
+    pub fn status(&mut self) -> anyhow::Result<()> {
         debug!("Requesting status…");
 
-        self.send_request_to_workers(RequestType::Status(Status {}).into(), json)
+        self.send_request(RequestType::Status(Status {}).into())
     }
 
     pub fn configure_metrics(&mut self, cmd: MetricsCmd) -> anyhow::Result<()> {
@@ -70,13 +73,13 @@ impl CommandManager {
         self.send_request(RequestType::ConfigureMetrics(configuration as i32).into())
     }
 
-    pub fn reload_configuration(&mut self, path: Option<String>, json: bool) -> anyhow::Result<()> {
+    pub fn reload_configuration(&mut self, path: Option<String>) -> anyhow::Result<()> {
         debug!("Reloading configuration…");
         let path = match path {
             Some(p) => p,
             None => String::new(),
         };
-        self.send_request_to_workers(RequestType::ReloadConfiguration(path).into(), json)
+        self.send_request(RequestType::ReloadConfiguration(path).into())
     }
 
     pub fn list_frontends(
@@ -137,7 +140,7 @@ impl CommandManager {
         }
     }
 
-    pub fn cluster_command(&mut self, cmd: ClusterCmd, json: bool) -> anyhow::Result<()> {
+    pub fn cluster_command(&mut self, cmd: ClusterCmd) -> anyhow::Result<()> {
         match cmd {
             ClusterCmd::Add {
                 id,
@@ -166,7 +169,39 @@ impl CommandManager {
                 )
             }
             ClusterCmd::Remove { id } => self.send_request(RequestType::RemoveCluster(id).into()),
-            ClusterCmd::List { id, domain } => self.query_cluster(json, id, domain),
+            ClusterCmd::List {
+                id: cluster_id,
+                domain,
+            } => {
+                if cluster_id.is_some() && domain.is_some() {
+                    bail!("Error: Either request an cluster ID or a domain name");
+                }
+
+                let request = if let Some(ref cluster_id) = cluster_id {
+                    RequestType::QueryClusterById(cluster_id.to_string()).into()
+                } else if let Some(ref domain) = domain {
+                    let splitted: Vec<String> =
+                        domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
+
+                    if splitted.is_empty() {
+                        bail!("Domain can't be empty");
+                    }
+
+                    let query_domain = QueryClusterByDomain {
+                        hostname: splitted
+                            .get(0)
+                            .with_context(|| "Domain can't be empty")?
+                            .clone(),
+                        path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
+                    };
+
+                    RequestType::QueryClustersByDomain(query_domain).into()
+                } else {
+                    RequestType::QueryClustersHashes(QueryClustersHashes {}).into()
+                };
+
+                self.send_request(request)
+            }
         }
     }
 
@@ -551,51 +586,22 @@ impl CommandManager {
             .into(),
         )
     }
-}
 
-fn get_fingerprint_from_certificate_path(certificate_path: &str) -> anyhow::Result<Fingerprint> {
-    let bytes = Config::load_file_bytes(certificate_path)
-        .with_context(|| format!("could not load certificate file on path {certificate_path}"))?;
+    pub fn query_certificates(
+        &mut self,
+        fingerprint: Option<String>,
+        domain: Option<String>,
+        query_workers: bool,
+    ) -> Result<(), anyhow::Error> {
+        let filters = QueryCertificatesFilters {
+            domain,
+            fingerprint,
+        };
 
-    let parsed_bytes = calculate_fingerprint(&bytes).with_context(|| {
-        format!("could not calculate fingerprint for the certificate at {certificate_path}")
-    })?;
-
-    Ok(Fingerprint(parsed_bytes))
-}
-
-fn decode_fingerprint(fingerprint: &str) -> anyhow::Result<Fingerprint> {
-    let bytes = hex::decode(fingerprint)
-        .with_context(|| "Failed at decoding the string (expected hexadecimal data)")?;
-    Ok(Fingerprint(bytes))
-}
-
-fn load_full_certificate(
-    certificate_path: &str,
-    certificate_chain_path: &str,
-    key_path: &str,
-    versions: Vec<TlsVersion>,
-    names: Vec<String>,
-) -> Result<CertificateAndKey, anyhow::Error> {
-    let certificate = Config::load_file(certificate_path)
-        .with_context(|| format!("Could not load certificate file on path {certificate_path}"))?;
-
-    let certificate_chain = Config::load_file(certificate_chain_path)
-        .map(split_certificate_chain)
-        .with_context(|| {
-            format!("could not load certificate chain on path: {certificate_chain_path}")
-        })?;
-
-    let key = Config::load_file(key_path)
-        .with_context(|| format!("Could not load key file on path {key_path}"))?;
-
-    let versions = versions.iter().map(|v| *v as i32).collect();
-
-    Ok(CertificateAndKey {
-        certificate,
-        certificate_chain,
-        key,
-        versions,
-        names,
-    })
+        if query_workers {
+            self.send_request(RequestType::QueryCertificatesFromWorkers(filters).into())
+        } else {
+            self.send_request(RequestType::QueryCertificatesFromTheState(filters).into())
+        }
+    }
 }

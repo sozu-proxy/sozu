@@ -898,7 +898,11 @@ impl Server {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
                     ContentType::Clusters(ClusterInformations {
-                        vec: vec![self.config_state.cluster_state(cluster_id)],
+                        vec: self
+                            .config_state
+                            .cluster_state(cluster_id)
+                            .into_iter()
+                            .collect(),
                     })
                     .into(),
                 ));
@@ -909,7 +913,7 @@ impl Server {
                     .get_cluster_ids_by_domain(domain.hostname.clone(), domain.path.clone());
                 let vec = cluster_ids
                     .iter()
-                    .map(|cluster_id| self.config_state.cluster_state(cluster_id))
+                    .filter_map(|cluster_id| self.config_state.cluster_state(cluster_id))
                     .collect();
 
                 push_queue(WorkerResponse::ok_with_content(

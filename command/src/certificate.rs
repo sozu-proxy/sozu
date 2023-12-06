@@ -11,12 +11,15 @@ use x509_parser::{
     pem::{parse_x509_pem, Pem},
 };
 
-use crate::proto::command::TlsVersion;
+use crate::{
+    config::{Config, ConfigError},
+    proto::command::{CertificateAndKey, TlsVersion},
+};
 
 // -----------------------------------------------------------------------------
 // CertificateError
 
-#[derive(thiserror::Error, Clone, Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum CertificateError {
     #[error("Could not parse PEM certificate from bytes: {0}")]
     InvalidCertificate(String),
@@ -24,6 +27,10 @@ pub enum CertificateError {
     InvalidTlsVersion(String),
     #[error("failed to parse fingerprint, {0}")]
     InvalidFingerprint(FromHexError),
+    #[error("could not load file on path {path}: {error}")]
+    LoadFile { path: String, error: ConfigError },
+    #[error("Failed at decoding the hex encoded certificate: {0}")]
+    DecodeError(FromHexError),
 }
 
 // -----------------------------------------------------------------------------
@@ -190,4 +197,60 @@ pub fn split_certificate_chain(mut chain: String) -> Vec<String> {
     }
 
     v
+}
+
+pub fn get_fingerprint_from_certificate_path(
+    certificate_path: &str,
+) -> Result<Fingerprint, CertificateError> {
+    let bytes =
+        Config::load_file_bytes(certificate_path).map_err(|e| CertificateError::LoadFile {
+            path: certificate_path.to_string(),
+            error: e,
+        })?;
+
+    let parsed_bytes = calculate_fingerprint(&bytes)?;
+
+    Ok(Fingerprint(parsed_bytes))
+}
+
+pub fn decode_fingerprint(fingerprint: &str) -> Result<Fingerprint, CertificateError> {
+    let bytes =
+        hex::decode(fingerprint).map_err(|hex_error| CertificateError::DecodeError(hex_error))?;
+    Ok(Fingerprint(bytes))
+}
+
+pub fn load_full_certificate(
+    certificate_path: &str,
+    certificate_chain_path: &str,
+    key_path: &str,
+    versions: Vec<TlsVersion>,
+    names: Vec<String>,
+) -> Result<CertificateAndKey, CertificateError> {
+    let certificate =
+        Config::load_file(certificate_path).map_err(|e| CertificateError::LoadFile {
+            path: certificate_path.to_string(),
+            error: e,
+        })?;
+
+    let certificate_chain = Config::load_file(certificate_chain_path)
+        .map(split_certificate_chain)
+        .map_err(|e| CertificateError::LoadFile {
+            path: certificate_chain_path.to_string(),
+            error: e,
+        })?;
+
+    let key = Config::load_file(key_path).map_err(|e| CertificateError::LoadFile {
+        path: key_path.to_string(),
+        error: e,
+    })?;
+
+    let versions = versions.iter().map(|v| *v as i32).collect();
+
+    Ok(CertificateAndKey {
+        certificate,
+        certificate_chain,
+        key,
+        versions,
+        names,
+    })
 }

@@ -1173,43 +1173,51 @@ impl ConfigState {
 
     /// Gives details about a given cluster.
     /// Types like `HttpFrontend` are converted into protobuf ones, like `RequestHttpFrontend`
-    pub fn cluster_state(&self, cluster_id: &str) -> ClusterInformation {
-        let mut http_frontends = Vec::new();
-        let mut https_frontends = Vec::new();
-        let mut tcp_frontends = Vec::new();
-        let mut backends = Vec::new();
-
-        for http_frontend in self.http_fronts.values() {
-            if let Some(id) = &http_frontend.cluster_id {
-                if id == cluster_id {
-                    http_frontends.push(http_frontend.clone().into());
-                }
-            }
+    pub fn cluster_state(&self, cluster_id: &str) -> Option<ClusterInformation> {
+        let configuration = self.clusters.get(cluster_id).cloned();
+        if configuration.is_none() {
+            return None;
         }
 
-        for https_frontend in self.https_fronts.values() {
-            if let Some(id) = &https_frontend.cluster_id {
-                if id == cluster_id {
-                    https_frontends.push(https_frontend.clone().into());
-                }
-            }
-        }
+        let http_frontends: Vec<RequestHttpFrontend> = self
+            .http_fronts
+            .values()
+            .filter(|front| front.cluster_id.as_deref() == Some(cluster_id))
+            .map(|front| front.clone().into())
+            .collect();
 
-        for tcp_f in self.tcp_fronts.get(cluster_id).cloned().unwrap_or_default() {
-            tcp_frontends.push(tcp_f.clone().into());
-        }
+        let https_frontends: Vec<RequestHttpFrontend> = self
+            .https_fronts
+            .values()
+            .filter(|front| front.cluster_id.as_deref() == Some(cluster_id))
+            .map(|front| front.clone().into())
+            .collect();
 
-        for backend in self.backends.get(cluster_id).cloned().unwrap_or_default() {
-            backends.push(backend.clone().into())
-        }
+        let tcp_frontends: Vec<RequestTcpFrontend> = self
+            .tcp_fronts
+            .get(cluster_id)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|front| front.clone().into())
+            .collect();
 
-        ClusterInformation {
-            configuration: self.clusters.get(cluster_id).cloned(),
+        let backends: Vec<AddBackend> = self
+            .backends
+            .get(cluster_id)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|backend| backend.clone().into())
+            .collect();
+
+        Some(ClusterInformation {
+            configuration,
             http_frontends,
             https_frontends,
             tcp_frontends,
             backends,
-        }
+        })
     }
 
     pub fn count_backends(&self) -> usize {

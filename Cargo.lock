@@ -1902,7 +1902,6 @@ dependencies = [
  "nom",
  "num_cpus",
  "paw",
- "prettytable-rs",
  "regex",
  "serde",
  "serde_json",
@@ -1912,7 +1911,6 @@ dependencies = [
  "tempfile",
  "termion",
  "time",
- "x509-parser",
 ]
 
 [[package]]
@@ -1928,6 +1926,7 @@ dependencies = [
  "nom",
  "pool",
  "poule",
+ "prettytable-rs",
  "prost",
  "prost-build",
  "rand",
