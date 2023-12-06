@@ -1903,11 +1903,9 @@ dependencies = [
  "num_cpus",
  "paw",
  "prettytable-rs",
- "rand",
  "regex",
  "serde",
  "serde_json",
- "slab",
  "smol",
  "sozu-command-lib",
  "sozu-lib",
@@ -1953,7 +1951,6 @@ dependencies = [
  "libc",
  "mio",
  "rustls",
- "slab",
  "sozu-command-lib",
  "sozu-lib",
  "time",
@@ -1991,7 +1988,6 @@ dependencies = [
  "thiserror",
  "time",
  "tiny_http",
- "x509-parser",
 ]
 
 [[package]]
