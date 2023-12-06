@@ -28,8 +28,8 @@ pub enum ChannelError {
     MessageTooLarge(usize),
     #[error("channel could not write on the back buffer")]
     Write(std::io::Error),
-    #[error("channel buffer is full, cannot grow more")]
-    BufferFull,
+    #[error("channel buffer is full ({0} bytes), cannot grow more")]
+    BufferFull(usize),
     #[error("Timeout is reached: {0:?}")]
     TimeoutReached(Duration),
     #[error("Could not read anything on the channel")]
@@ -368,8 +368,8 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
         }
 
         if self.front_buf.available_space() == 0 {
-            if (self.front_buf.capacity() as u64) == self.max_buffer_size {
-                return Err(ChannelError::BufferFull);
+            if (self.front_buf.capacity() as u64) >= self.max_buffer_size {
+                return Err(ChannelError::BufferFull(self.front_buf.capacity()));
             }
             let new_size = min(
                 self.front_buf.capacity() + 5000,
