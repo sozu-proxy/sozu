@@ -12,12 +12,11 @@ use std::{
 use kawa;
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
-use time::{Duration, Instant};
-
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
     proto::command::{Event, EventKind, ListenerType},
 };
+use time::{Duration, Instant};
 
 use crate::{
     backends::{Backend, BackendError},
@@ -243,8 +242,33 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.container_backend_timeout.cancel();
         self.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
         self.backend_readiness.interest = Ready::HUP | Ready::ERROR;
+
+        // We are resetting the offset of request and response stream buffers
+        // We do have to keep cursor position on the request, if there is data
+        // in the request stream to preserve http pipelining.
+
+        // Print the left-over response buffer output to track in which case it
+        // may happens
+        if !self.response_stream.storage.is_empty() {
+            warn!(
+                "{} Leftover fragment from response: {}",
+                self.log_context(),
+                parser::view(
+                    self.response_stream.storage.used(),
+                    16,
+                    &[
+                        self.response_stream.storage.start,
+                        self.response_stream.storage.end,
+                    ],
+                )
+            );
+        }
+
+        self.response_stream.storage.clear();
         if !self.request_stream.storage.is_empty() {
             self.frontend_readiness.event.insert(Ready::READABLE);
+        } else {
+            self.request_stream.storage.clear();
         }
     }
 
