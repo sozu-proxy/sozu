@@ -577,7 +577,7 @@ impl TcpSession {
         if back_connected.is_connecting() {
             if self.back_readiness().unwrap().event.is_hup() && !self.test_back_socket() {
                 //retry connecting the backend
-                error!("error connecting to backend, trying again");
+                debug!("error connecting to backend, trying again");
                 self.connection_attempt += 1;
                 self.fail_backend_connection();
 
