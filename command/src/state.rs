@@ -1523,6 +1523,8 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use rand::{seq::SliceRandom, thread_rng, Rng};
+
     use super::*;
     use crate::proto::command::{LoadBalancingParams, RequestHttpFrontend, RulePosition};
 
@@ -1927,6 +1929,100 @@ mod tests {
             .expect("Could not execute order");
 
         assert_eq!(state.backends.get("cluster_1").unwrap(), &vec![b]);
+    }
+
+    #[test]
+    fn remove_backend() {
+        let mut state: ConfigState = Default::default();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_1"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+
+        for i in 0..10 {
+            state
+                .dispatch(
+                    &RequestType::AddBackend(AddBackend {
+                        cluster_id: String::from("cluster_1"),
+                        backend_id: format!("cluster_1-{i}"),
+                        address: "127.0.0.1:1026".to_string(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("Could not execute request");
+        }
+
+        assert_eq!(state.backends.get("cluster_1").unwrap().len(), 10);
+
+        let remove_backend_2 = RequestType::RemoveBackend(RemoveBackend {
+            cluster_id: String::from("cluster_1"),
+            backend_id: String::from("cluster_1-0"),
+            address: "127.0.0.1:1026".to_string(),
+        })
+        .into();
+
+        let remove_backend_result = state.dispatch(&remove_backend_2);
+
+        assert!(remove_backend_result.is_ok());
+        assert_eq!(state.backends.get("cluster_1").unwrap().len(), 9);
+
+        let redundant_remove = state.dispatch(&remove_backend_2);
+        assert!(matches!(redundant_remove, Err(StateError::NoChange)));
+        assert_eq!(state.backends.get("cluster_1").unwrap().len(), 9);
+    }
+
+    #[test]
+    fn remove_backends_randomly() {
+        let mut state: ConfigState = Default::default();
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: String::from("cluster_1"),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("Could not execute request");
+
+        for _ in 0..1000 {
+            for i in 0..10 {
+                state
+                    .dispatch(
+                        &RequestType::AddBackend(AddBackend {
+                            cluster_id: String::from("cluster_1"),
+                            backend_id: format!("cluster_1-{i}"),
+                            address: "127.0.0.1:1026".to_string(),
+                            ..Default::default()
+                        })
+                        .into(),
+                    )
+                    .expect("Could not execute request");
+            }
+
+            let mut rng = thread_rng();
+            let mut indexes = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+            indexes.shuffle(&mut rng);
+            let random_count = rng.gen_range(1..indexes.len());
+            let random_indexes: Vec<i32> = indexes.into_iter().take(random_count).collect();
+
+            for j in random_indexes {
+                let remove_backend_result = state.dispatch(
+                    &RequestType::RemoveBackend(RemoveBackend {
+                        cluster_id: String::from("cluster_1"),
+                        backend_id: format!("cluster_1-{j}"),
+                        address: "127.0.0.1:1026".to_string(),
+                    })
+                    .into(),
+                );
+                assert!(remove_backend_result.is_ok());
+            }
+        }
     }
 
     #[test]
