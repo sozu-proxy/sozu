@@ -512,8 +512,6 @@ pub fn setup_logging(
     if let Ok(env_log_level) = env::var("RUST_LOG") {
         Logger::init(tag.to_string(), &env_log_level, backend, access_backend);
     } else {
-        // We set the env variable so every worker can access it
-        env::set_var("RUST_LOG", log_level);
         Logger::init(tag.to_string(), log_level, backend, access_backend);
     }
 }
