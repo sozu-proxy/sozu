@@ -14,7 +14,10 @@ use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
-use sozu_command::{proto::command::{Event, EventKind, ListenerType}, config::MAX_LOOP_ITERATIONS};
+use sozu_command::{
+    config::MAX_LOOP_ITERATIONS,
+    proto::command::{Event, EventKind, ListenerType},
+};
 
 use crate::{
     backends::{Backend, BackendError},
@@ -360,7 +363,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         parser::view(
                             kawa.storage.used(),
                             16,
-                            &[kawa.storage.head, index as usize],
+                            &[
+                                kawa.storage.start,
+                                kawa.storage.head,
+                                index as usize,
+                                kawa.storage.end,
+                            ],
                         )
                     }
                     kawa::ParsingErrorKind::Processing { message } => message.to_owned(),
@@ -689,7 +697,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                         parser::view(
                             kawa.storage.used(),
                             16,
-                            &[kawa.storage.head, index as usize],
+                            &[
+                                kawa.storage.start,
+                                kawa.storage.head,
+                                index as usize,
+                                kawa.storage.end,
+                            ],
                         )
                     }
                     kawa::ParsingErrorKind::Processing { message } => message.to_owned(),
