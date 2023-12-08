@@ -1411,7 +1411,7 @@ impl ProxyConfiguration for TcpProxy {
                 }
             }
             command => {
-                error!(
+                debug!(
                     "{} unsupported message for TCP proxy, ignoring {:?}",
                     message.id, command
                 );

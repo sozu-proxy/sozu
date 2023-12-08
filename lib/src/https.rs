@@ -1371,8 +1371,8 @@ impl ProxyConfiguration for HttpsProxy {
                 }
             }
             other_request => {
-                error!(
-                    "{} unsupported request for HTTPS proxy, ignoring {:?}",
+                debug!(
+                    "{} unsupported message for HTTPS proxy, ignoring {:?}",
                     request.id, other_request
                 );
                 Err(ProxyError::UnsupportedMessage)
