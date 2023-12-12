@@ -294,6 +294,10 @@ impl WorkerResponse {
             content: None,
         }
     }
+
+    pub fn is_failure(&self) -> bool {
+        self.status == ResponseStatus::Failure
+    }
 }
 
 impl fmt::Display for WorkerResponse {
