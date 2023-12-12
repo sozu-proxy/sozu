@@ -982,14 +982,24 @@ impl Server {
         };
 
         let proxy_destinations = request.content.get_destinations();
+        let mut notify_response = None;
         if proxy_destinations.to_http_proxy {
-            push_queue(self.http.borrow_mut().notify(request.clone()));
+            notify_response = Some(self.http.borrow_mut().notify(request.clone()));
         }
         if proxy_destinations.to_https_proxy {
-            push_queue(self.https.borrow_mut().notify(request.clone()));
+            let http_proxy_response = self.https.borrow_mut().notify(request.clone());
+            if http_proxy_response.is_failure() || notify_response.is_none() {
+                notify_response = Some(http_proxy_response);
+            }
         }
         if proxy_destinations.to_tcp_proxy {
-            push_queue(self.tcp.borrow_mut().notify(request.clone()));
+            let tcp_proxy_response = self.tcp.borrow_mut().notify(request.clone());
+            if tcp_proxy_response.is_failure() || notify_response.is_none() {
+                notify_response = Some(tcp_proxy_response);
+            }
+        }
+        if let Some(response) = notify_response {
+            push_queue(response);
         }
 
         match request.content.request_type {
