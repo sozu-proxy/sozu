@@ -10,7 +10,7 @@ hyper = { version = "^0.14.27", features = ["client", "http1"] }
 hyper-rustls = { version = "^0.24.1", default-features = false, features = ["webpki-tokio", "http1", "tls12", "logging"] }
 libc = "^0.2.149"
 mio = "^0.8.8"
-rustls = { version = "^0.21.7", features = ["dangerous_configuration"] }
+rustls = { version = "^0.21.10", features = ["dangerous_configuration"] }
 time = "^0.3.29"
 tokio = { version = "1.33.0", features = ["net", "rt-multi-thread"] }
 
