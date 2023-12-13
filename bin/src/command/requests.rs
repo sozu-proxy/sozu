@@ -396,24 +396,28 @@ impl CommandServer {
 
         self.next_worker_id += 1;
 
-        let sock = worker
+        let worker_channel_fd = worker
             .worker_channel
             .take()
             .expect("No channel on the worker being launched")
-            .sock;
+            .sock
+            .into_raw_fd();
+
         let (worker_tx, worker_rx) = channel(10000);
         worker.sender = Some(worker_tx);
 
+        /*
         let stream = Async::new(unsafe {
-            let fd = sock.into_raw_fd();
+            let fd = worker_channel_fd.into_raw_fd();
             UnixStream::from_raw_fd(fd)
         })?;
+        */
 
         let id = worker.id;
         let command_tx = self.command_tx.clone();
 
         smol::spawn(async move {
-            super::worker_loop(id, stream, command_tx, worker_rx).await;
+            super::worker_loop(id, worker_channel_fd, command_tx, worker_rx).await;
         })
         .detach();
 
@@ -529,11 +533,13 @@ impl CommandServer {
 
         self.next_worker_id += 1;
 
-        let sock = new_worker
+        let worker_channel_fd = new_worker
             .worker_channel
             .take()
             .with_context(|| "No channel on new worker".to_string())?
-            .sock;
+            .sock
+            .into_raw_fd();
+
         let (worker_tx, worker_rx) = channel(10000);
         new_worker.sender = Some(worker_tx);
 
@@ -689,15 +695,17 @@ impl CommandServer {
             None => error!("could not get the list of listeners from the previous worker"),
         };
 
+        /*
         let stream = Async::new(unsafe {
             let fd = sock.into_raw_fd();
             UnixStream::from_raw_fd(fd)
         })?;
+        */
 
         let id = new_worker.id;
         let command_tx = self.command_tx.clone();
         smol::spawn(async move {
-            super::worker_loop(id, stream, command_tx, worker_rx).await;
+            super::worker_loop(id, worker_channel_fd, command_tx, worker_rx).await;
         })
         .detach();
 

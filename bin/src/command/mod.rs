@@ -23,6 +23,7 @@ use futures_lite::{
     future,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
 };
+use mio::net::UnixStream as MioUnixStream;
 use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,
@@ -30,6 +31,7 @@ use nix::{
 use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
+    channel::Channel,
     config::Config,
     proto::command::{
         request::RequestType, response_content::ContentType, MetricsConfiguration, Request,
@@ -252,24 +254,27 @@ impl CommandServer {
         let state: ConfigState = Default::default();
 
         for worker in workers.iter_mut() {
-            let main_to_worker_channel = worker
+            let main_to_worker_stream_fd = worker
                 .worker_channel
                 .take()
                 .with_context(|| format!("No channel present in worker {}", worker.id))?
-                .sock;
+                .sock
+                .into_raw_fd();
             let (worker_tx, worker_rx) = channel(10000);
             worker.sender = Some(worker_tx);
 
-            let main_to_worker_stream = Async::new(unsafe {
-                let fd = main_to_worker_channel.into_raw_fd();
-                UnixStream::from_raw_fd(fd)
-            })
-            .with_context(|| "Could not get a unix stream from the file descriptor")?;
+            /*
+                let main_to_worker_stream = Async::new(unsafe {
+                    let fd = main_to_worker_stream_fd.into_raw_fd();
+                    UnixStream::from_raw_fd(fd)
+                })
+                .with_context(|| "Could not get a unix stream from the file descriptor")?;
+            */
 
             let id = worker.id;
             let command_tx = command_tx.clone();
             smol::spawn(async move {
-                worker_loop(id, main_to_worker_stream, command_tx, worker_rx).await;
+                worker_loop(id, main_to_worker_stream_fd, command_tx, worker_rx).await;
             })
             .detach();
         }
@@ -422,11 +427,14 @@ impl CommandServer {
             let sender = Some(worker_tx);
 
             debug!("deserializing worker: {:?}", serialized);
+            /*
             let worker_stream = Async::new(unsafe { UnixStream::from_raw_fd(serialized.fd) })
-                .with_context(|| "Could not create an async unix stream to spawn the worker")?;
+            .with_context(|| "Could not create an async unix stream to spawn the worker")?;
+            */
 
             let id = serialized.id;
             let command_tx = tx.clone();
+            let worker_stream = serialized.fd;
             //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
             smol::spawn(async move {
                 worker_loop(id, worker_stream, command_tx, worker_rx).await;
@@ -635,7 +643,7 @@ impl CommandServer {
         info!("created new worker: {}", new_worker_id);
         self.next_worker_id += 1;
 
-        let sock = new_worker
+        let worker_channel_fd = new_worker
             .worker_channel
             .take()
             .with_context(|| {
@@ -644,19 +652,22 @@ impl CommandServer {
                     new_worker.id
                 )
             })? // this used to crash with unwrap(), do we still want to crash?
-            .sock;
+            .sock
+            .into_raw_fd();
         let (worker_tx, worker_rx) = channel(10_000);
         new_worker.sender = Some(worker_tx);
 
+        /*
         let stream = Async::new(unsafe {
             let fd = sock.into_raw_fd();
             UnixStream::from_raw_fd(fd)
         })?;
+        */
 
         let new_worker_id = new_worker.id;
         let command_tx = self.command_tx.clone();
         smol::spawn(async move {
-            worker_loop(new_worker_id, stream, command_tx, worker_rx).await;
+            worker_loop(new_worker_id, worker_channel_fd, command_tx, worker_rx).await;
         })
         .detach();
 
@@ -894,7 +905,7 @@ async fn accept_clients(
 ) {
     let mut counter = 0usize;
     let mut accept_cancel_rx = Some(accept_cancel_rx);
-    info!("Accepting client connections");
+    println!("Accepting client connections");
     loop {
         let accept_client = async_listener.accept();
         futures::pin_mut!(accept_client);
@@ -944,6 +955,8 @@ async fn client_loop(
     let read_stream = Arc::new(stream);
     let mut write_stream = read_stream.clone();
 
+    println!("starting to sending messages to client {}", client_id);
+
     smol::spawn(async move {
         while let Some(response) = client_rx.next().await {
             trace!("sending back message to client: {:?}", response);
@@ -958,7 +971,7 @@ async fn client_loop(
     })
     .detach();
 
-    debug!("will start receiving messages from client {}", client_id);
+    println!("will start receiving messages from client {}", client_id);
 
     // Read the stream by splitting it on 0 bytes
     let mut split_iterator = BufReader::new(read_stream).split(0);
@@ -977,7 +990,7 @@ async fn client_loop(
                 break;
             }
             Ok(request) => {
-                debug!("got command request: {:?}", request);
+                println!("got command request: {:?}", request);
                 let client_id = client_id.clone();
                 if let Err(e) = command_tx
                     .send(CommandMessage::ClientRequest { client_id, request })
@@ -1008,30 +1021,71 @@ async fn client_loop(
 /// - parse ProxyResponses from the unix stream and send them to the CommandServer
 async fn worker_loop(
     worker_id: u32,
-    stream: Async<UnixStream>,
+    socket_fd: i32,
     mut command_tx: Sender<CommandMessage>,
     mut worker_rx: Receiver<WorkerRequest>,
 ) {
-    let read_stream = Arc::new(stream);
-    let mut write_stream = read_stream.clone();
+    println!("starting worker loop to speak with worker {}", worker_id);
+    // let read_stream = Arc::new(stream);
+    // let mut write_stream = read_stream.clone();
+
+    let read_stream = unsafe { MioUnixStream::from_raw_fd(socket_fd) };
+    let mut read_channel: Channel<WorkerRequest, WorkerResponse> =
+        Channel::new(read_stream, 0, 164_800);
+    // read_channel.blocking().unwrap();
+
+    let mut read_lock = Async::new(unsafe { UnixStream::from_raw_fd(socket_fd) }).unwrap();
+
+    let write_stream = unsafe { MioUnixStream::from_raw_fd(socket_fd) };
+    let mut write_channel: Channel<WorkerRequest, ()> = Channel::new(write_stream, 0, 169_480);
+    write_channel.blocking().unwrap();
 
     smol::spawn(async move {
-        debug!("will start sending messages to worker {}", worker_id);
+        println!("will start sending messages to worker {}", worker_id);
         while let Some(worker_request) = worker_rx.next().await {
-            debug!("sending to worker {}: {:?}", worker_id, worker_request);
-            let mut message: Vec<u8> = serde_json::to_string(&worker_request)
-                .map(|string| string.into_bytes())
-                .unwrap_or_else(|_| Vec::new());
-
+            println!("sending to worker {}: {:?}", worker_id, worker_request);
+            write_channel
+                .write_message(&worker_request)
+                .expect("failed to write message in ");
             // separate all messages with a 0 byte
-            message.push(0);
-            let _ = write_stream.write_all(&message).await;
+            // message.push(0);
+            // let _ = write_stream.write_all(&message).await;
         }
     })
     .detach();
 
-    debug!("will start receiving messages from worker {}", worker_id);
+    use futures::AsyncReadExt;
 
+    println!("will start receiving messages from worker {}", worker_id);
+    loop {
+        println!("waiting for read_lock");
+        read_lock
+            .read(&mut [])
+            .await
+            .expect("could not read on the read_lock");
+        println!("the read_lock returned");
+        match read_channel.read_message() {
+            Ok(response) => {
+                println!("got worker response: {:?}", response);
+                if let Err(e) = command_tx
+                    .send(CommandMessage::WorkerResponse {
+                        worker_id,
+                        response,
+                    })
+                    .await
+                {
+                    error!("error sending worker response to command server: {:?}", e);
+                }
+            }
+            Err(e) => {
+                println!("Could not read message: {}", e);
+                println!("breaking the worker loop");
+                break;
+            }
+        }
+    }
+
+    /*
     // Read the stream by splitting it on 0 bytes
     let mut split_iterator = BufReader::new(read_stream).split(0);
     while let Some(message) = split_iterator.next().await {
@@ -1063,6 +1117,7 @@ async fn worker_loop(
             }
         }
     }
+    */
 
     error!("worker loop stopped, will close the worker {}", worker_id);
 
