@@ -342,7 +342,7 @@ impl HttpsSession {
         let back_token = match http.backend_token {
             Some(back_token) => back_token,
             None => {
-                warn!("Could not upgrade https request on cluster '{:?}' using backend '{:?}' into secure websocket for request '{}", http.cluster_id, http.backend_id, http.context.id);
+                warn!("Could not upgrade https request on cluster '{:?}' ({:?}) using backend '{:?}' into secure websocket for request '{}'", http.cluster_id, self.frontend_token, http.backend_id, http.context.id);
                 return None;
             }
         };
