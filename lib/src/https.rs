@@ -339,9 +339,15 @@ impl HttpsSession {
     fn upgrade_http(&self, http: Http<FrontRustls, HttpsListener>) -> Option<HttpsStateMachine> {
         debug!("https switching to wss");
         let front_token = self.frontend_token;
-        let back_token = unwrap_msg!(http.backend_token);
-        let ws_context = http.websocket_context();
+        let back_token = match http.backend_token {
+            Some(back_token) => back_token,
+            None => {
+                warn!("Could not upgrade https request on cluster '{:?}' using backend '{:?}' into secure websocket for request '{}", http.cluster_id, http.backend_id, http.context.id);
+                return None;
+            }
+        };
 
+        let ws_context = http.websocket_context();
         let mut container_frontend_timeout = http.container_frontend_timeout;
         let mut container_backend_timeout = http.container_backend_timeout;
         container_frontend_timeout.reset();
