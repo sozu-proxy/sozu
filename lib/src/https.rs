@@ -16,11 +16,18 @@ use mio::{
     Interest, Poll, Registry, Token,
 };
 use rustls::{
-    cipher_suite::{
-        TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
-        TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-        TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-        TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    crypto::{
+        ring::{
+            self,
+            cipher_suite::{
+                TLS13_AES_128_GCM_SHA256, TLS13_AES_256_GCM_SHA384, TLS13_CHACHA20_POLY1305_SHA256,
+                TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            },
+        },
+        CryptoProvider,
     },
     CipherSuite, ProtocolVersion, ServerConfig, ServerConnection, SupportedCipherSuite,
 };
@@ -757,9 +764,12 @@ impl HttpsListener {
             })
             .collect::<Vec<_>>();
 
-        let mut server_config = ServerConfig::builder()
-            .with_cipher_suites(&ciphers[..])
-            .with_safe_default_kx_groups()
+        let provider = CryptoProvider {
+            cipher_suites: ciphers,
+            ..ring::default_provider()
+        };
+
+        let mut server_config = ServerConfig::builder_with_provider(provider.into())
             .with_protocol_versions(&versions[..])
             .map_err(|err| ListenerError::BuildRustls(err.to_string()))?
             .with_no_client_auth()
@@ -1650,14 +1660,12 @@ mod tests {
             .expect("test address 127.0.0.1:1032 should be parsed");
         let resolver = Arc::new(MutexWrappedCertificateResolver::default());
 
-        let server_config = ServerConfig::builder()
-            .with_safe_default_cipher_suites()
-            .with_safe_default_kx_groups()
-            .with_protocol_versions(&[&rustls::version::TLS12, &rustls::version::TLS13])
-            .map_err(|err| ListenerError::BuildRustls(err.to_string()))
-            .expect("could not create Rustls server config")
-            .with_no_client_auth()
-            .with_cert_resolver(resolver.clone());
+        let server_config = ServerConfig::builder_with_protocol_versions(&[
+            &rustls::version::TLS12,
+            &rustls::version::TLS13,
+        ])
+        .with_no_client_auth()
+        .with_cert_resolver(resolver.clone());
 
         let rustls_details = Arc::new(server_config);
 
