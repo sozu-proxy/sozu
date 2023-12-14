@@ -1056,7 +1056,9 @@ impl CommandServer {
         smol::spawn(async move {
             let mut responses = Vec::new();
             let mut i = 0;
+            println!("WAITING FOR WORKER RESPONSES");
             while let Some((proxy_response, worker_id)) = query_rx.next().await {
+                println!("GOT WORKER RESPONSE");
                 match proxy_response.status {
                     ResponseStatus::Ok => {
                         responses.push((worker_id, proxy_response));
@@ -1368,7 +1370,7 @@ impl CommandServer {
             }
         };
 
-        trace!(
+        println!(
             "Sending response to request sent by client {}: {:?}",
             client_id,
             command_response
@@ -1376,7 +1378,7 @@ impl CommandServer {
 
         match self.clients.get_mut(&client_id) {
             Some(client_tx) => {
-                trace!("sending from main process to client loop");
+                println!("sending from main process to client loop");
                 client_tx.send(command_response).await.with_context(|| {
                     format!("Could not notify client {client_id} about request")
                 })?;

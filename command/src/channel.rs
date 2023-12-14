@@ -13,7 +13,7 @@ use std::{
 };
 
 use mio::{event::Source, net::UnixStream as MioUnixStream};
-use serde::{de::DeserializeOwned, ser::Serialize};
+use serde::{__private::from_utf8_lossy, de::DeserializeOwned, ser::Serialize};
 use serde_json;
 
 use crate::{buffer::growable::Buffer, ready::Ready};
@@ -174,6 +174,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                 break;
             }
 
+            println!("reading on {}...", self.sock.as_raw_fd());
             match self.sock.read(self.front_buf.space()) {
                 Ok(0) => {
                     self.interest = Ready::EMPTY;
@@ -197,6 +198,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                     self.front_buf.fill(bytes_read);
                 }
             };
+            println!("escaped read");
         }
 
         Ok(count)
@@ -259,6 +261,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
 
     /// Parses a message from the front buffer, without waiting
     fn read_message_nonblocking(&mut self) -> Result<Rx, ChannelError> {
+        println!("FRONT_BUFF_FILL: {}", self.front_buf.available_data());
         match self.front_buf.data().iter().position(|&x| x == 0) {
             Some(position) => self.read_and_parse_from_front_buffer(position),
             None => {

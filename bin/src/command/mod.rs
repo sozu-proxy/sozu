@@ -37,6 +37,7 @@ use sozu_command_lib::{
         request::RequestType, response_content::ContentType, MetricsConfiguration, Request,
         Response, ResponseContent, ResponseStatus, RunState, Status,
     },
+    ready::Ready,
     request::WorkerRequest,
     response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket},
@@ -327,10 +328,12 @@ impl CommandServer {
                 CommandMessage::WorkerResponse {
                     worker_id,
                     response,
-                } => self
-                    .handle_worker_response(worker_id, response)
-                    .await
-                    .with_context(|| "Could not handle worker response"),
+                } => {
+                    println!("MAIN EVENT LOOP: HANDLE WORKERRESPONSE");
+                    self.handle_worker_response(worker_id, response)
+                        .await
+                        .with_context(|| "Could not handle worker response")
+                }
                 CommandMessage::Advancement {
                     client_id,
                     advancement: response,
@@ -764,9 +767,10 @@ impl CommandServer {
                 // FIXME: this message happens a lot at startup because AddCluster
                 // messages receive responses from each of the HTTP, HTTPS and TCP
                 // proxys. The clusters list should be merged
-                debug!("unknown response id: {}", response.id);
+                println!("unknown response id: {}", response.id);
             }
             Some((mut requester_tx, mut expected_responses)) => {
+                println!("MAIN LOOP: sending advancement to client loop");
                 let response_id = response.id.clone();
 
                 // if a worker returned Ok or Error, we're not expecting any more
@@ -778,13 +782,15 @@ impl CommandServer {
                     _ => {}
                 };
 
+                println!("before");
                 if requester_tx
                     .send((response.clone(), worker_id))
                     .await
                     .is_err()
                 {
-                    error!("Failed to send worker response back: {}", response);
+                    println!("Failed to send worker response back: {}", response);
                 };
+                println!("after");
 
                 // reinsert the message_id and sender into the hashmap, for later reuse
                 if expected_responses > 0 {
@@ -959,14 +965,16 @@ async fn client_loop(
 
     smol::spawn(async move {
         while let Some(response) = client_rx.next().await {
-            trace!("sending back message to client: {:?}", response);
+            println!("sending back message to client: {:?}", response);
             let mut message: Vec<u8> = serde_json::to_string(&response)
                 .map(|string| string.into_bytes())
                 .unwrap_or_else(|_| Vec::new());
 
             // separate all messages with a 0 byte
             message.push(0);
-            let _ = write_stream.write_all(&message).await;
+            println!("write_stream_fd: {}", write_stream.as_raw_fd());
+            let status = write_stream.write_all(&message).await;
+            println!("write_stream: {status:?}");
         }
     })
     .detach();
@@ -1030,15 +1038,14 @@ async fn worker_loop(
     // let mut write_stream = read_stream.clone();
 
     let read_stream = unsafe { MioUnixStream::from_raw_fd(socket_fd) };
-    let mut read_channel: Channel<WorkerRequest, WorkerResponse> =
-        Channel::new(read_stream, 0, 164_800);
-    // read_channel.blocking().unwrap();
+    let mut read_channel: Channel<(), WorkerResponse> = Channel::new(read_stream, 0, 164_800);
+    read_channel.nonblocking().unwrap();
 
-    let mut read_lock = Async::new(unsafe { UnixStream::from_raw_fd(socket_fd) }).unwrap();
+    let read_lock = Async::new(unsafe { UnixStream::from_raw_fd(socket_fd) }).unwrap();
 
     let write_stream = unsafe { MioUnixStream::from_raw_fd(socket_fd) };
     let mut write_channel: Channel<WorkerRequest, ()> = Channel::new(write_stream, 0, 169_480);
-    write_channel.blocking().unwrap();
+    write_channel.nonblocking().unwrap();
 
     smol::spawn(async move {
         println!("will start sending messages to worker {}", worker_id);
@@ -1047,6 +1054,10 @@ async fn worker_loop(
             write_channel
                 .write_message(&worker_request)
                 .expect("failed to write message in ");
+            write_channel.interest.insert(Ready::WRITABLE);
+            write_channel.readiness.insert(Ready::WRITABLE);
+            let status = write_channel.run();
+            println!("write_message: {status:?}");
             // separate all messages with a 0 byte
             // message.push(0);
             // let _ = write_stream.write_all(&message).await;
@@ -1054,33 +1065,38 @@ async fn worker_loop(
     })
     .detach();
 
-    use futures::AsyncReadExt;
-
     println!("will start receiving messages from worker {}", worker_id);
     loop {
         println!("waiting for read_lock");
         read_lock
-            .read(&mut [])
+            .readable()
             .await
             .expect("could not read on the read_lock");
         println!("the read_lock returned");
+        read_channel.interest.insert(Ready::READABLE);
+        read_channel.readiness.insert(Ready::READABLE);
+        let status = read_channel.run();
+        println!("{status:?}");
         match read_channel.read_message() {
             Ok(response) => {
                 println!("got worker response: {:?}", response);
-                if let Err(e) = command_tx
+                match command_tx
                     .send(CommandMessage::WorkerResponse {
                         worker_id,
                         response,
                     })
                     .await
                 {
-                    error!("error sending worker response to command server: {:?}", e);
+                    Ok(()) => println!("sent the worker response to the main event loop"),
+                    Err(e) => {
+                        error!("error sending worker response to command server: {:?}", e);
+                    }
                 }
             }
             Err(e) => {
-                println!("Could not read message: {}", e);
-                println!("breaking the worker loop");
-                break;
+                println!("==============Could not read message: {}", e);
+                // println!("breaking the worker loop");
+                // break;
             }
         }
     }
