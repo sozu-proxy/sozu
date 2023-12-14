@@ -12,9 +12,12 @@ use nom::{HexDisplay, Offset};
 use crate::{
     buffer::fixed::Buffer,
     parser::parse_several_requests,
-    proto::command::{
-        request::RequestType, LoadBalancingAlgorithms, PathRuleKind, Request, RequestHttpFrontend,
-        RulePosition,
+    proto::{
+        command::{
+            request::RequestType, LoadBalancingAlgorithms, PathRuleKind, Request,
+            RequestHttpFrontend, RulePosition,
+        },
+        display::format_request_type,
     },
     response::{HttpFrontend, MessageId},
 };
@@ -112,6 +115,13 @@ impl Request {
             Some(RequestType::SoftStop(_)) | Some(RequestType::HardStop(_))
         )
     }
+
+    pub fn short_name(&self) -> &str {
+        match &self.request_type {
+            Some(request_type) => format_request_type(request_type),
+            None => "Unallowed",
+        }
+    }
 }
 
 /// This is sent only from Sōzu to Sōzu
@@ -139,14 +149,12 @@ pub fn read_requests_from_file(file: &mut File) -> Result<Vec<WorkerRequest>, Re
     loop {
         let previous = buffer.available_data();
 
-        let bytes_read = file
-            .read(buffer.space())
-            .map_err(|e| RequestError::FileError(e))?;
+        let bytes_read = file.read(buffer.space()).map_err(RequestError::FileError)?;
 
         buffer.fill(bytes_read);
 
         if buffer.available_data() == 0 {
-            debug!("Empty buffer");
+            trace!("read_requests_from_file: empty buffer");
             break;
         }
 
@@ -154,7 +162,7 @@ pub fn read_requests_from_file(file: &mut File) -> Result<Vec<WorkerRequest>, Re
         match parse_several_requests::<WorkerRequest>(buffer.data()) {
             Ok((i, requests)) => {
                 if !i.is_empty() {
-                    debug!("could not parse {} bytes", i.len());
+                    trace!("read_requests_from_file: could not parse {} bytes", i.len());
                     if previous == buffer.available_data() {
                         break;
                     }
@@ -166,7 +174,7 @@ pub fn read_requests_from_file(file: &mut File) -> Result<Vec<WorkerRequest>, Re
             Err(nom::Err::Incomplete(_)) => {
                 if buffer.available_data() == buffer.capacity() {
                     error!(
-                        "message too big, stopping parsing:\n{}",
+                        "read_requests_from_file: message too big, stopping parsing:\n{}",
                         buffer.data().to_hex(16)
                     );
                     break;

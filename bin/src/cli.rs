@@ -109,7 +109,10 @@ pub enum SubCmd {
         #[clap(long = "hard", help = "do not wait for connections to finish")]
         hard: bool,
     },
-    #[clap(name = "upgrade", about = "upgrade the proxy")]
+    #[clap(
+        name = "upgrade",
+        about = "upgrade the main process OR a specific worker. Specify a longer timeout."
+    )]
     Upgrade {
         #[clap(long = "worker", help = "upgrade a specific worker")]
         worker: Option<u32>,

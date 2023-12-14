@@ -7,7 +7,7 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use mio::{
     net::TcpListener as MioTcpListener,
     net::{TcpStream as MioTcpStream, UnixStream},
@@ -1233,11 +1233,15 @@ impl TcpProxy {
         Ok(())
     }
 
-    pub fn remove_tcp_front(&mut self, front: RequestTcpFrontend) -> anyhow::Result<()> {
-        let address = front
-            .address
-            .parse()
-            .with_context(|| "wrong socket address")?;
+    pub fn remove_tcp_front(&mut self, front: RequestTcpFrontend) -> Result<(), ProxyError> {
+        let address =
+            front
+                .address
+                .parse::<SocketAddr>()
+                .map_err(|parse_error| ProxyError::SocketParse {
+                    address: front.address.clone(),
+                    error: parse_error.to_string(),
+                })?;
 
         let mut listener = match self
             .listeners
@@ -1245,7 +1249,7 @@ impl TcpProxy {
             .find(|l| l.borrow().address == address)
         {
             Some(l) => l.borrow_mut(),
-            None => bail!(format!("no such listener for '{}'", front.address)),
+            None => return Err(ProxyError::NoListenerFound(address)),
         };
 
         listener.set_tags(front.address, None);
@@ -1761,11 +1765,7 @@ mod tests {
             let server_scm_socket =
                 ScmSocket::new(scm_server.as_raw_fd()).expect("Could not create scm socket");
             client_scm_socket
-                .send_listeners(&Listeners {
-                    http: Vec::new(),
-                    tls: Vec::new(),
-                    tcp: Vec::new(),
-                })
+                .send_listeners(&Listeners::default())
                 .unwrap();
 
             let server_config = server::ServerConfig {

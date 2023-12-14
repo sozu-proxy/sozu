@@ -269,7 +269,8 @@ impl LocalDrain {
             return Ok(ContentType::WorkerMetrics(WorkerMetrics {
                 proxy: proxy_metrics,
                 clusters: BTreeMap::new(),
-            }).into());
+            })
+            .into());
         }
 
         let worker_metrics = match (cluster_ids.is_empty(), backend_ids.is_empty()) {

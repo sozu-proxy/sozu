@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Context};
-
 use sozu_command_lib::{
     certificate::{
         decode_fingerprint, get_fingerprint_from_certificate_path, load_full_certificate,
@@ -23,57 +21,60 @@ use crate::{
         MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
+    util::parse_socket_address,
 };
 
+use super::CtlError;
+
 impl CommandManager {
-    pub fn save_state(&mut self, path: String) -> anyhow::Result<()> {
+    pub fn save_state(&mut self, path: String) -> Result<(), CtlError> {
         debug!("Saving the state to file {}", path);
 
         self.send_request(RequestType::SaveState(path).into())
     }
 
-    pub fn load_state(&mut self, path: String) -> anyhow::Result<()> {
+    pub fn load_state(&mut self, path: String) -> Result<(), CtlError> {
         debug!("Loading the state on path {}", path);
 
         self.send_request(RequestType::LoadState(path).into())
     }
 
-    pub fn count_requests(&mut self) -> anyhow::Result<()> {
+    pub fn count_requests(&mut self) -> Result<(), CtlError> {
         self.send_request(RequestType::CountRequests(CountRequests {}).into())
     }
 
-    pub fn soft_stop(&mut self) -> anyhow::Result<()> {
+    pub fn soft_stop(&mut self) -> Result<(), CtlError> {
         debug!("shutting down proxy softly");
 
         self.send_request(RequestType::SoftStop(SoftStop {}).into())
     }
 
-    pub fn hard_stop(&mut self) -> anyhow::Result<()> {
+    pub fn hard_stop(&mut self) -> Result<(), CtlError> {
         debug!("shutting down proxy the hard way");
 
         self.send_request(RequestType::HardStop(HardStop {}).into())
     }
 
-    pub fn status(&mut self) -> anyhow::Result<()> {
+    pub fn status(&mut self) -> Result<(), CtlError> {
         debug!("Requesting status…");
 
         self.send_request(RequestType::Status(Status {}).into())
     }
 
-    pub fn configure_metrics(&mut self, cmd: MetricsCmd) -> anyhow::Result<()> {
+    pub fn configure_metrics(&mut self, cmd: MetricsCmd) -> Result<(), CtlError> {
         debug!("Configuring metrics: {:?}", cmd);
 
         let configuration = match cmd {
             MetricsCmd::Enable => MetricsConfiguration::Enabled,
             MetricsCmd::Disable => MetricsConfiguration::Disabled,
             MetricsCmd::Clear => MetricsConfiguration::Clear,
-            _ => bail!("The command passed to the configure_metrics function is wrong."),
+            _ => return Ok(()), // completely unlikely
         };
 
         self.send_request(RequestType::ConfigureMetrics(configuration as i32).into())
     }
 
-    pub fn reload_configuration(&mut self, path: Option<String>) -> anyhow::Result<()> {
+    pub fn reload_configuration(&mut self, path: Option<String>) -> Result<(), CtlError> {
         debug!("Reloading configuration…");
         let path = match path {
             Some(p) => p,
@@ -88,7 +89,7 @@ impl CommandManager {
         https: bool,
         tcp: bool,
         domain: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CtlError> {
         debug!("Listing frontends");
 
         self.send_request(
@@ -102,11 +103,11 @@ impl CommandManager {
         )
     }
 
-    pub fn events(&mut self) -> anyhow::Result<()> {
-        self.send_request(RequestType::SubscribeEvents(SubscribeEvents {}).into())
+    pub fn events(&mut self) -> Result<(), CtlError> {
+        self.send_request_no_timeout(RequestType::SubscribeEvents(SubscribeEvents {}).into())
     }
 
-    pub fn backend_command(&mut self, cmd: BackendCmd) -> anyhow::Result<()> {
+    pub fn backend_command(&mut self, cmd: BackendCmd) -> Result<(), CtlError> {
         match cmd {
             BackendCmd::Add {
                 id,
@@ -140,7 +141,7 @@ impl CommandManager {
         }
     }
 
-    pub fn cluster_command(&mut self, cmd: ClusterCmd) -> anyhow::Result<()> {
+    pub fn cluster_command(&mut self, cmd: ClusterCmd) -> Result<(), CtlError> {
         match cmd {
             ClusterCmd::Add {
                 id,
@@ -174,7 +175,10 @@ impl CommandManager {
                 domain,
             } => {
                 if cluster_id.is_some() && domain.is_some() {
-                    bail!("Error: Either request an cluster ID or a domain name");
+                    return Err(CtlError::ArgsNeeded(
+                        "a cluster id".to_string(),
+                        "a domain name".to_string(),
+                    ));
                 }
 
                 let request = if let Some(ref cluster_id) = cluster_id {
@@ -184,14 +188,11 @@ impl CommandManager {
                         domain.splitn(2, '/').map(|elem| elem.to_string()).collect();
 
                     if splitted.is_empty() {
-                        bail!("Domain can't be empty");
+                        return Err(CtlError::NeedClusterDomain)?;
                     }
 
                     let query_domain = QueryClusterByDomain {
-                        hostname: splitted
-                            .get(0)
-                            .with_context(|| "Domain can't be empty")?
-                            .clone(),
+                        hostname: splitted.get(0).ok_or(CtlError::NeedClusterDomain)?.clone(),
                         path: splitted.get(1).cloned().map(|path| format!("/{path}")), // We add the / again because of the splitn removing it
                     };
 
@@ -205,7 +206,7 @@ impl CommandManager {
         }
     }
 
-    pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> anyhow::Result<()> {
+    pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> Result<(), CtlError> {
         match cmd {
             TcpFrontendCmd::Add { id, address, tags } => self.send_request(
                 RequestType::AddTcpFrontend(RequestTcpFrontend {
@@ -226,7 +227,7 @@ impl CommandManager {
         }
     }
 
-    pub fn http_frontend_command(&mut self, cmd: HttpFrontendCmd) -> anyhow::Result<()> {
+    pub fn http_frontend_command(&mut self, cmd: HttpFrontendCmd) -> Result<(), CtlError> {
         match cmd {
             HttpFrontendCmd::Add {
                 hostname,
@@ -274,7 +275,7 @@ impl CommandManager {
         }
     }
 
-    pub fn https_frontend_command(&mut self, cmd: HttpFrontendCmd) -> anyhow::Result<()> {
+    pub fn https_frontend_command(&mut self, cmd: HttpFrontendCmd) -> Result<(), CtlError> {
         match cmd {
             HttpFrontendCmd::Add {
                 hostname,
@@ -322,7 +323,7 @@ impl CommandManager {
         }
     }
 
-    pub fn https_listener_command(&mut self, cmd: HttpsListenerCmd) -> anyhow::Result<()> {
+    pub fn https_listener_command(&mut self, cmd: HttpsListenerCmd) -> Result<(), CtlError> {
         match cmd {
             HttpsListenerCmd::Add {
                 address,
@@ -351,7 +352,7 @@ impl CommandManager {
                     .with_request_timeout(request_timeout)
                     .with_connect_timeout(connect_timeout)
                     .to_tls(Some(&self.config))
-                    .with_context(|| "Error creating HTTPS listener")?;
+                    .map_err(CtlError::CreateListener)?;
 
                 self.send_request(RequestType::AddHttpsListener(https_listener).into())
             }
@@ -367,7 +368,7 @@ impl CommandManager {
         }
     }
 
-    pub fn http_listener_command(&mut self, cmd: HttpListenerCmd) -> anyhow::Result<()> {
+    pub fn http_listener_command(&mut self, cmd: HttpListenerCmd) -> Result<(), CtlError> {
         match cmd {
             HttpListenerCmd::Add {
                 address,
@@ -392,7 +393,8 @@ impl CommandManager {
                     .with_back_timeout(back_timeout)
                     .with_connect_timeout(connect_timeout)
                     .to_http(Some(&self.config))
-                    .with_context(|| "Error creating HTTP listener")?;
+                    .map_err(CtlError::CreateListener)?;
+
                 self.send_request(RequestType::AddHttpListener(http_listener).into())
             }
             HttpListenerCmd::Remove { address } => {
@@ -407,7 +409,7 @@ impl CommandManager {
         }
     }
 
-    pub fn tcp_listener_command(&mut self, cmd: TcpListenerCmd) -> anyhow::Result<()> {
+    pub fn tcp_listener_command(&mut self, cmd: TcpListenerCmd) -> Result<(), CtlError> {
         match cmd {
             TcpListenerCmd::Add {
                 address,
@@ -418,7 +420,7 @@ impl CommandManager {
                     .with_public_address(public_address)
                     .with_expect_proxy(expect_proxy)
                     .to_tcp(Some(&self.config))
-                    .with_context(|| "Could not create TCP listener")?;
+                    .map_err(CtlError::CreateListener)?;
 
                 self.send_request(RequestType::AddTcpListener(listener).into())
             }
@@ -434,7 +436,7 @@ impl CommandManager {
         }
     }
 
-    pub fn list_listeners(&mut self) -> anyhow::Result<()> {
+    pub fn list_listeners(&mut self) -> Result<(), CtlError> {
         self.send_request(RequestType::ListListeners(ListListeners {}).into())
     }
 
@@ -442,10 +444,13 @@ impl CommandManager {
         &mut self,
         address: String,
         listener_type: ListenerType,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CtlError> {
+        let address = parse_socket_address(&address)
+            .map_err(|util_err| CtlError::WrongAddress(address, util_err))?;
+
         self.send_request(
             RequestType::RemoveListener(RemoveListener {
-                address: address.parse().with_context(|| "wrong socket address")?,
+                address: address.to_string(),
                 proxy: listener_type.into(),
             })
             .into(),
@@ -456,10 +461,13 @@ impl CommandManager {
         &mut self,
         address: String,
         listener_type: ListenerType,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CtlError> {
+        let address = parse_socket_address(&address)
+            .map_err(|util_err| CtlError::WrongAddress(address, util_err))?;
+
         self.send_request(
             RequestType::ActivateListener(ActivateListener {
-                address: address.parse().with_context(|| "wrong socket address")?,
+                address: address.to_string(),
                 proxy: listener_type.into(),
                 from_scm: false,
             })
@@ -471,10 +479,13 @@ impl CommandManager {
         &mut self,
         address: String,
         listener_type: ListenerType,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CtlError> {
+        let address = parse_socket_address(&address)
+            .map_err(|util_err| CtlError::WrongAddress(address, util_err))?;
+
         self.send_request(
             RequestType::DeactivateListener(DeactivateListener {
-                address: address.parse().with_context(|| "wrong socket address")?,
+                address: address.to_string(),
                 proxy: listener_type.into(),
                 to_scm: false,
             })
@@ -482,7 +493,7 @@ impl CommandManager {
         )
     }
 
-    pub fn logging_filter(&mut self, filter: &LoggingLevel) -> anyhow::Result<()> {
+    pub fn logging_filter(&mut self, filter: &LoggingLevel) -> Result<(), CtlError> {
         self.send_request(RequestType::Logging(filter.to_string().to_lowercase()).into())
     }
 
@@ -493,7 +504,7 @@ impl CommandManager {
         certificate_chain_path: &str,
         key_path: &str,
         versions: Vec<TlsVersion>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CtlError> {
         let new_certificate = load_full_certificate(
             certificate_path,
             certificate_chain_path,
@@ -501,7 +512,7 @@ impl CommandManager {
             versions,
             vec![],
         )
-        .with_context(|| "Could not load the full certificate")?;
+        .map_err(CtlError::LoadCertificate)?;
 
         self.send_request(
             RequestType::AddCertificate(AddCertificate {
@@ -523,18 +534,21 @@ impl CommandManager {
         old_certificate_path: Option<&str>,
         old_fingerprint: Option<&str>,
         versions: Vec<TlsVersion>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CtlError> {
         let old_fingerprint = match (old_certificate_path, old_fingerprint) {
             (None, None) | (Some(_), Some(_)) => {
-                bail!("Error: Please provide either one, the old certificate's path OR its fingerprint")
+                return Err(CtlError::ArgsNeeded(
+                    "the path to the old certificate".to_string(),
+                    "the path to the old fingerprint".to_string(),
+                ))
             }
             (Some(old_certificate_path), None) => {
-                get_fingerprint_from_certificate_path(old_certificate_path).with_context(|| {
-                    "Could not retrieve the fingerprint from the given certificate path"
-                })?
+                get_fingerprint_from_certificate_path(old_certificate_path)
+                    .map_err(CtlError::GetFingerprint)?
             }
-            (None, Some(fingerprint)) => decode_fingerprint(fingerprint)
-                .with_context(|| "Error decoding the given fingerprint")?,
+            (None, Some(fingerprint)) => {
+                decode_fingerprint(fingerprint).map_err(CtlError::DecodeFingerprint)?
+            }
         };
 
         let new_certificate = load_full_certificate(
@@ -544,7 +558,7 @@ impl CommandManager {
             versions,
             vec![],
         )
-        .with_context(|| "Could not load the full certificate")?;
+        .map_err(CtlError::LoadCertificate)?;
 
         self.send_request(
             RequestType::ReplaceCertificate(ReplaceCertificate {
@@ -564,18 +578,21 @@ impl CommandManager {
         address: String,
         certificate_path: Option<&str>,
         fingerprint: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), CtlError> {
         let fingerprint = match (certificate_path, fingerprint) {
             (None, None) | (Some(_), Some(_)) => {
-                bail!("Error: Please provide either one, the path OR the fingerprint of the certificate")
+                return Err(CtlError::ArgsNeeded(
+                    "the path to the certificate".to_string(),
+                    "the fingerprint of the certificate".to_string(),
+                ))
             }
             (Some(certificate_path), None) => {
-                get_fingerprint_from_certificate_path(certificate_path).with_context(|| {
-                    "Could not retrieve the finger print from the given certificate path"
-                })?
+                get_fingerprint_from_certificate_path(certificate_path)
+                    .map_err(CtlError::GetFingerprint)?
             }
-            (None, Some(fingerprint)) => decode_fingerprint(fingerprint)
-                .with_context(|| "Error decoding the given fingerprint")?,
+            (None, Some(fingerprint)) => {
+                decode_fingerprint(fingerprint).map_err(CtlError::DecodeFingerprint)?
+            }
         };
 
         self.send_request(
@@ -592,7 +609,7 @@ impl CommandManager {
         fingerprint: Option<String>,
         domain: Option<String>,
         query_workers: bool,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), CtlError> {
         let filters = QueryCertificatesFilters {
             domain,
             fingerprint,
@@ -603,5 +620,10 @@ impl CommandManager {
         } else {
             self.send_request(RequestType::QueryCertificatesFromTheState(filters).into())
         }
+    }
+
+    pub fn upgrade_worker(&mut self, worker_id: u32) -> Result<(), CtlError> {
+        debug!("upgrading worker {}", worker_id);
+        self.send_request(RequestType::UpgradeWorker(worker_id).into())
     }
 }

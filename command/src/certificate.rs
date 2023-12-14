@@ -214,8 +214,7 @@ pub fn get_fingerprint_from_certificate_path(
 }
 
 pub fn decode_fingerprint(fingerprint: &str) -> Result<Fingerprint, CertificateError> {
-    let bytes =
-        hex::decode(fingerprint).map_err(|hex_error| CertificateError::DecodeError(hex_error))?;
+    let bytes = hex::decode(fingerprint).map_err(CertificateError::DecodeError)?;
     Ok(Fingerprint(bytes))
 }
 

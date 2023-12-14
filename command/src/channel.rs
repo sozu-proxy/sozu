@@ -52,7 +52,7 @@ pub enum ChannelError {
 /// Used in pairs to communicate, in a blocking or non-blocking way.
 pub struct Channel<Tx, Rx> {
     pub sock: MioUnixStream,
-    front_buf: Buffer,
+    pub front_buf: Buffer,
     pub back_buf: Buffer,
     max_buffer_size: usize,
     pub readiness: Ready,
@@ -60,6 +60,24 @@ pub struct Channel<Tx, Rx> {
     blocking: bool,
     phantom_tx: PhantomData<Tx>,
     phantom_rx: PhantomData<Rx>,
+}
+
+impl<Tx, Rx> std::fmt::Debug for Channel<Tx, Rx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(&format!(
+            "Channel<{}, {}>",
+            std::any::type_name::<Tx>(),
+            std::any::type_name::<Rx>()
+        ))
+        .field("sock", &self.sock.as_raw_fd())
+        // .field("front_buf", &self.front_buf)
+        // .field("back_buf", &self.back_buf)
+        // .field("max_buffer_size", &self.max_buffer_size)
+        .field("readiness", &self.readiness)
+        .field("interest", &self.interest)
+        .field("blocking", &self.blocking)
+        .finish()
+    }
 }
 
 impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
@@ -187,6 +205,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         let mut count = 0usize;
         loop {
             let size = self.front_buf.available_space();
+            trace!("channel available space: {}", size);
             if size == 0 {
                 self.interest.remove(Ready::READABLE);
                 break;
@@ -284,6 +303,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                     if self.front_buf.capacity() == self.max_buffer_size {
                         error!("command buffer full, cannot grow more, ignoring");
                     } else {
+                        println!("growing channel");
                         let new_size = min(self.front_buf.capacity() + 5000, self.max_buffer_size);
                         self.front_buf.grow(new_size);
                     }

@@ -12,6 +12,7 @@ use sozu_command_lib::{
         request::RequestType, ActivateListener, AddCertificate, CertificateAndKey, ListenerType,
         RemoveBackend, RequestHttpFrontend,
     },
+    scm_socket::Listeners,
     state::ConfigState,
 };
 
@@ -171,9 +172,9 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
 
     let config = Worker::into_config(FileConfig {
         zombie_check_interval: zombie,
-        ..Worker::empty_file_config()
+        ..FileConfig::default()
     });
-    let listeners = Worker::empty_listeners();
+    let listeners = Listeners::default();
     let state = ConfigState::new();
     let (mut worker, mut backends) = setup_async_test(
         "BACKSTOP",

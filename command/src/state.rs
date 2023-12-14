@@ -155,7 +155,7 @@ impl ConfigState {
         if let Some(request_type) = &request.request_type {
             let count = self
                 .request_counts
-                .entry(format_request_type(request_type))
+                .entry(format_request_type(request_type).to_owned())
                 .or_insert(1);
             *count += 1;
         }
@@ -1175,9 +1175,7 @@ impl ConfigState {
     /// Types like `HttpFrontend` are converted into protobuf ones, like `RequestHttpFrontend`
     pub fn cluster_state(&self, cluster_id: &str) -> Option<ClusterInformation> {
         let configuration = self.clusters.get(cluster_id).cloned();
-        if configuration.is_none() {
-            return None;
-        }
+        configuration.as_ref()?;
 
         let http_frontends: Vec<RequestHttpFrontend> = self
             .http_fronts
@@ -1402,7 +1400,7 @@ impl ConfigState {
                 .map_err(StateError::FileError)?;
 
             if counter % 1000 == 0 {
-                info!("writing command {}", counter);
+                info!("writing {} commands to file", counter);
                 file.sync_all().map_err(StateError::FileError)?;
             }
             counter += 1;

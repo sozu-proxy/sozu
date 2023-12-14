@@ -209,7 +209,7 @@ impl ScmSocket {
 }
 
 /// Socket addresses and file descriptors needed by a Proxy to start listening
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Listeners {
     pub http: Vec<(SocketAddr, RawFd)>,
     pub tls: Vec<(SocketAddr, RawFd)>,
@@ -305,11 +305,7 @@ mod tests {
         let receiving_scm_socket =
             ScmSocket::new(stream_2.as_raw_fd()).expect("Could not create scm socket");
 
-        let listeners = Listeners {
-            http: vec![],
-            tcp: vec![],
-            tls: vec![],
-        };
+        let listeners = Listeners::default();
 
         sending_scm_socket
             .send_listeners(&listeners)

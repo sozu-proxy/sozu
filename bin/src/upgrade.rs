@@ -1,60 +1,74 @@
 use std::{
     fs::File,
-    io::Seek,
+    io::{Error as IoError, Write},
+    io::{Read, Seek},
     os::unix::io::{AsRawFd, FromRawFd},
     os::unix::process::CommandExt,
     process::Command,
 };
 
-use anyhow::{bail, Context};
-use futures_lite::future;
 use libc::{self, pid_t};
 use mio::net::UnixStream;
-use nix::unistd::{fork, ForkResult};
-use serde::{Deserialize, Serialize};
-
+use nix::{
+    errno::Errno,
+    unistd::{fork, ForkResult},
+};
+use serde_json::Error as SerdeError;
 use tempfile::tempfile;
 
 use sozu_command_lib::{
-    channel::Channel, config::Config, logging::setup_logging_with_config, proto::command::RunState,
-    request::WorkerRequest, state::ConfigState,
+    channel::{Channel, ChannelError},
+    logging::setup_logging_with_config,
 };
 
-use crate::{command::CommandServer, util, worker::Worker};
+use crate::{
+    command::{
+        server::{CommandHub, HubError, ServerError},
+        upgrade::UpgradeData,
+    },
+    util::{self, UtilError},
+};
 
-#[derive(Deserialize, Serialize, Debug)]
-pub struct SerializedWorker {
-    pub fd: i32,
-    pub pid: i32,
-    pub id: u32,
-    pub run_state: RunState,
-    pub queue: Vec<WorkerRequest>,
-    pub scm: i32,
-}
-
-impl SerializedWorker {
-    pub fn from_worker(worker: &Worker) -> SerializedWorker {
-        SerializedWorker {
-            fd: worker.worker_channel_fd,
-            pid: worker.pid,
-            id: worker.id,
-            run_state: worker.run_state,
-            queue: worker.queue.clone().into(),
-            scm: worker.scm_socket.raw_fd(),
-        }
-    }
-}
-
-/// the data needed to start a new main process
-#[derive(Deserialize, Serialize, Debug)]
-pub struct UpgradeData {
-    /// file descriptor of the unix command socket
-    pub command_socket_fd: i32,
-    pub config: Config,
-    /// JSON serialized workers
-    pub workers: Vec<SerializedWorker>,
-    pub state: ConfigState,
-    pub next_id: u32,
+#[derive(thiserror::Error, Debug)]
+pub enum UpgradeError {
+    #[error("could not create temporary state file for the upgrade: {0}")]
+    CreateUpgradeFile(IoError),
+    #[error("could not disable cloexec on {fd_name}'s file descriptor: {util_err}")]
+    DisableCloexec {
+        fd_name: String,
+        util_err: UtilError,
+    },
+    #[error("could not create MIO pair of unix stream: {0}")]
+    CreateUnixStream(IoError),
+    #[error("could not rewind the temporary upgrade file: {0}")]
+    Rewind(IoError),
+    #[error("could not write upgrade data to temporary file: {0}")]
+    SerdeWriteError(SerdeError),
+    #[error("could not write upgrade data to temporary file: {0}")]
+    WriteFile(IoError),
+    #[error("could not read upgrade data from file: {0}")]
+    ReadFile(IoError),
+    #[error("could not read upgrade data to temporary file: {0}")]
+    SerdeReadError(SerdeError),
+    #[error("unix fork failed: {0}")]
+    Fork(Errno),
+    #[error("failed to set metrics on the new main process: {0}")]
+    SetupMetrics(UtilError),
+    #[error("could not write PID file of new main process: {0}")]
+    WritePidFile(UtilError),
+    #[error(
+        "the channel failed to send confirmation of upgrade {result} to the old main process: {channel_err}"
+    )]
+    SendConfirmation {
+        result: String,
+        channel_err: ChannelError,
+    },
+    #[error("Could not block the fork confirmation channel: {0}. This is not normal, you may need to restart sozu")]
+    BlockChannel(ChannelError),
+    #[error("could not create a command hub from the upgrade data: {0}")]
+    CreateHub(HubError),
+    #[error("could not enable cloexec after upgrade: {0}")]
+    EnableCloexec(ServerError),
 }
 
 /// unix-forks the main process
@@ -66,23 +80,34 @@ pub struct UpgradeData {
 pub fn fork_main_into_new_main(
     executable_path: String,
     upgrade_data: UpgradeData,
-) -> Result<(pid_t, Channel<(), bool>), anyhow::Error> {
+) -> Result<(pid_t, Channel<(), bool>), UpgradeError> {
     trace!("parent({})", unsafe { libc::getpid() });
 
-    let mut upgrade_file =
-        tempfile().with_context(|| "could not create temporary file for upgrade")?;
+    let mut upgrade_file = tempfile().map_err(UpgradeError::CreateUpgradeFile)?;
 
-    util::disable_close_on_exec(upgrade_file.as_raw_fd())?;
+    util::disable_close_on_exec(upgrade_file.as_raw_fd()).map_err(|util_err| {
+        UpgradeError::DisableCloexec {
+            fd_name: "upgrade-file".to_string(),
+            util_err,
+        }
+    })?;
 
-    serde_json::to_writer(&mut upgrade_file, &upgrade_data)
-        .with_context(|| "could not write upgrade data to temporary file")?;
+    info!("Writing upgrade data to file");
+    let upgrade_data_string =
+        serde_json::to_string(&upgrade_data).map_err(UpgradeError::SerdeWriteError)?;
     upgrade_file
-        .rewind()
-        .with_context(|| "could not seek to beginning of file")?;
+        .write_all(upgrade_data_string.as_bytes())
+        .map_err(UpgradeError::WriteFile)?;
+    upgrade_file.rewind().map_err(UpgradeError::Rewind)?;
 
-    let (old_to_new, new_to_old) = UnixStream::pair()?;
+    let (old_to_new, new_to_old) = UnixStream::pair().map_err(UpgradeError::CreateUnixStream)?;
 
-    util::disable_close_on_exec(new_to_old.as_raw_fd())?;
+    util::disable_close_on_exec(new_to_old.as_raw_fd()).map_err(|util_err| {
+        UpgradeError::DisableCloexec {
+            fd_name: "new-main-to-old-main-channel".to_string(),
+            util_err,
+        }
+    })?;
 
     let mut fork_confirmation_channel: Channel<(), bool> = Channel::new(
         old_to_new,
@@ -90,24 +115,14 @@ pub fn fork_main_into_new_main(
         upgrade_data.config.max_command_buffer_size,
     );
 
-    if let Err(e) = fork_confirmation_channel.blocking() {
-        error!(
-            "Could not block the fork confirmation channel: {}. This is not normal, you may need to restart sozu",
-            e
-        );
-    }
+    fork_confirmation_channel
+        .blocking()
+        .map_err(UpgradeError::BlockChannel)?;
 
     info!("launching new main");
-    match unsafe { fork().with_context(|| "fork failed")? } {
+    match unsafe { fork().map_err(UpgradeError::Fork)? } {
         ForkResult::Parent { child } => {
-            info!("main launched: {}", child);
-
-            if let Err(e) = fork_confirmation_channel.nonblocking() {
-                error!(
-                    "Could not unblock the fork confirmation channel: {}. This is not normal, you may need to restart sozu",
-                    e
-                );
-            }
+            info!("new main launched, with pid {}", child);
 
             Ok((child.into(), fork_confirmation_channel))
         }
@@ -138,7 +153,7 @@ pub fn begin_new_main_process(
     upgrade_file_fd: i32,
     command_buffer_size: usize,
     max_command_buffer_size: usize,
-) -> anyhow::Result<()> {
+) -> Result<(), UpgradeError> {
     let mut fork_confirmation_channel: Channel<bool, ()> = Channel::new(
         unsafe { UnixStream::from_raw_fd(new_to_old_channel_fd) },
         command_buffer_size,
@@ -150,36 +165,43 @@ pub fn begin_new_main_process(
         error!("Could not block the fork confirmation channel: {}", e);
     }
 
-    let upgrade_file = unsafe { File::from_raw_fd(upgrade_file_fd) };
+    println!("reading upgrade data from file");
+
+    let mut upgrade_file = unsafe { File::from_raw_fd(upgrade_file_fd) };
+    let mut content = String::new();
+    let _ = upgrade_file
+        .read_to_string(&mut content)
+        .map_err(UpgradeError::ReadFile)?;
+
     let upgrade_data: UpgradeData =
-        serde_json::from_reader(upgrade_file).with_context(|| "could not parse upgrade data")?;
+        serde_json::from_str(&content).map_err(UpgradeError::SerdeReadError)?;
+
     let config = upgrade_data.config.clone();
 
-    setup_logging_with_config(&config, "MAIN");
-    util::setup_metrics(&config).with_context(|| "Could not setup metrics")?;
-    //info!("new main got upgrade data: {:?}", upgrade_data);
+    println!("Setting up logging");
 
-    let mut server = CommandServer::from_upgrade_data(upgrade_data)?;
-    server.enable_cloexec_after_upgrade()?;
+    setup_logging_with_config(&config, "MAIN");
+    util::setup_metrics(&config).map_err(UpgradeError::SetupMetrics)?;
+
+    let mut command_hub =
+        CommandHub::from_upgrade_data(upgrade_data).map_err(UpgradeError::CreateHub)?;
+
+    command_hub
+        .enable_cloexec_after_upgrade()
+        .map_err(UpgradeError::EnableCloexec)?;
+
+    util::write_pid_file(&config).map_err(UpgradeError::WritePidFile)?;
+
+    fork_confirmation_channel
+        .write_message(&true)
+        .map_err(|channel_err| UpgradeError::SendConfirmation {
+            result: "success".to_string(),
+            channel_err,
+        })?;
+
     info!("starting new main loop");
-    match util::write_pid_file(&config) {
-        Ok(()) => {
-            fork_confirmation_channel
-                .write_message(&true)
-                .with_context(|| "Could not send confirmation of fork using the channel")?;
-            future::block_on(async {
-                server.run().await;
-            });
-            info!("main process stopped");
-            Ok(())
-        }
-        Err(e) => {
-            fork_confirmation_channel
-                .write_message(&false)
-                .with_context(|| "Could not send fork failure message using the channel")?;
-            error!("Couldn't write PID file. Error: {:?}", e);
-            error!("Couldn't upgrade main process");
-            bail!("begin_new_main_process() failed");
-        }
-    }
+    command_hub.run();
+
+    info!("main process stopped");
+    Ok(())
 }
