@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use sozu_command_lib::{
     config::Config,
+    logging::setup_logging_with_config,
     proto::command::{
         request::RequestType, response_content::ContentType, MetricsConfiguration, Request,
         Response, ResponseContent, ResponseStatus, RunState, Status,
@@ -399,11 +400,13 @@ impl CommandServer {
         let (accept_cancel_tx, accept_cancel_rx) = oneshot::channel();
         let (command_tx, command_rx) = channel(10000);
         let cloned_command_tx = command_tx.clone();
+        let cloned_config = config.clone();
 
         smol::spawn(accept_clients(
             cloned_command_tx,
             async_listener,
             accept_cancel_rx,
+            cloned_config,
         ))
         .detach();
 
@@ -838,11 +841,13 @@ pub fn start_server(
         let (accept_cancel_tx, accept_cancel_rx) = oneshot::channel();
         let (command_tx, command_rx) = channel(10000);
         let cloned_command_tx = command_tx.clone();
+        let cloned_config = config.clone();
 
         smol::spawn(accept_clients(
             cloned_command_tx,
             async_listener,
             accept_cancel_rx,
+            cloned_config,
         ))
         .detach();
 
@@ -891,7 +896,9 @@ async fn accept_clients(
     mut command_tx: Sender<CommandMessage>,
     async_listener: Async<UnixListener>,
     accept_cancel_rx: oneshot::Receiver<()>,
+    config: Config,
 ) {
+    setup_logging_with_config(&config, "MAIN");
     let mut counter = 0usize;
     let mut accept_cancel_rx = Some(accept_cancel_rx);
     info!("Accepting client connections");
