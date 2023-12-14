@@ -1065,11 +1065,7 @@ pub fn start_http_worker(
     let server_scm_socket =
         ScmSocket::new(scm_server.as_raw_fd()).with_context(|| "Could not create scm socket")?;
 
-    if let Err(e) = client_scm_socket.send_listeners(&Listeners {
-        http: Vec::new(),
-        tls: Vec::new(),
-        tcp: Vec::new(),
-    }) {
+    if let Err(e) = client_scm_socket.send_listeners(&Listeners::default()) {
         error!("error sending empty listeners: {:?}", e);
     }
 

@@ -1,207 +1,81 @@
+#[cfg(target_os = "freebsd")]
+use std::{ffi::c_void, iter::repeat, mem::size_of};
 use std::{
-    collections::VecDeque,
-    fmt,
     fs::File,
+    io::Error as IoError,
     io::Seek,
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
     os::unix::process::CommandExt,
     process::Command,
 };
-#[cfg(target_os = "freebsd")]
-use std::{ffi::c_void, iter::repeat, mem::size_of};
 
-#[cfg(target_os = "linux")]
-use anyhow::bail;
-use anyhow::Context;
-use futures::SinkExt;
 #[cfg(target_os = "macos")]
 use libc::c_char;
 use libc::{self, pid_t};
 #[cfg(target_os = "freebsd")]
 use libc::{sysctl, CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX};
 use mio::net::UnixStream;
-use nix::{self, unistd::*};
-use nix::{sys::signal::kill, unistd::Pid};
-
+use nix::{
+    self,
+    errno::Errno,
+    unistd::{fork, ForkResult},
+};
 use tempfile::tempfile;
 
-use sozu::{metrics, server::Server};
 use sozu_command_lib::{
-    channel::Channel,
+    channel::{Channel, ChannelError},
     config::Config,
     logging::setup_logging_with_config,
-    proto::command::{request::RequestType, Request, RunState, Status, WorkerInfo},
     ready::Ready,
-    request::{read_requests_from_file, WorkerRequest},
+    request::{read_requests_from_file, RequestError, WorkerRequest},
     response::WorkerResponse,
-    scm_socket::{Listeners, ScmSocket},
-    state::ConfigState,
+    scm_socket::{Listeners, ScmSocket, ScmSocketError},
+    state::{ConfigState, StateError},
+};
+use sozu_lib::{
+    metrics::{self, MetricError},
+    server::{Server, ServerError as LibServerError},
 };
 
-use crate::util;
+use crate::util::{self, UtilError};
 
-/// An instance of Sōzu, as seen from the main process
-pub struct Worker {
-    pub id: u32,
-    /// for the worker to receive requests and respond to the main process
-    pub worker_channel: Option<Channel<WorkerRequest, WorkerResponse>>,
-    /// file descriptor of the command channel
-    pub worker_channel_fd: i32,
-    pub pid: pid_t,
-    pub run_state: RunState,
-    pub queue: VecDeque<WorkerRequest>,
-    /// Used to send and receive listeners (socket addresses and file descriptors)
-    pub scm_socket: ScmSocket,
-    /// Used to send proxyrequests to the worker loop
-    pub sender: Option<futures::channel::mpsc::Sender<WorkerRequest>>,
-}
-
-impl Worker {
-    pub fn new(
-        id: u32,
-        pid: pid_t,
-        command_channel: Channel<WorkerRequest, WorkerResponse>,
-        scm_socket: ScmSocket,
-        _: &Config,
-    ) -> Worker {
-        Worker {
-            id,
-            worker_channel_fd: command_channel.sock.as_raw_fd(),
-            worker_channel: Some(command_channel),
-            sender: None,
-            pid,
-            run_state: RunState::Running,
-            queue: VecDeque::new(),
-            scm_socket,
-        }
-    }
-
-    /// send proxy request to the worker, via the mpsc sender
-    pub async fn send(&mut self, order_id: String, content: Request) {
-        if let Some(worker_tx) = self.sender.as_mut() {
-            if let Err(e) = worker_tx
-                .send(WorkerRequest {
-                    id: order_id.clone(),
-                    content,
-                })
-                .await
-            {
-                error!(
-                    "error sending message {} to worker {:?}: {:?}",
-                    order_id, self.id, e
-                );
-            }
-        }
-    }
-
-    /// send a kill -0 to check on the pid, if it's dead it should be an error
-    pub fn the_pid_is_alive(&self) -> bool {
-        kill(Pid::from_raw(self.pid), None).is_ok()
-    }
-
-    /// get info about a worker, with a NotAnswering run state by default,
-    /// to be updated when the worker responds
-    pub fn querying_info(&self) -> WorkerInfo {
-        let run_state = match self.run_state {
-            RunState::Stopping => RunState::Stopping,
-            RunState::Stopped => RunState::Stopped,
-            RunState::Running | RunState::NotAnswering => RunState::NotAnswering,
-        };
-        WorkerInfo {
-            id: self.id,
-            pid: self.pid,
-            run_state: run_state as i32,
-        }
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.run_state != RunState::Stopping && self.run_state != RunState::Stopped
-    }
-
-    /*
-    pub fn push_message(&mut self, message: ProxyRequest) {
-      self.queue.push_back(message);
-      self.channel.interest.insert(Ready::WRITABLE);
-    }
-
-    pub fn can_handle_events(&self) -> bool {
-      self.channel.readiness().is_readable() || (!self.queue.is_empty() && self.channel.readiness().is_writable())
-    }*/
-}
-
-impl fmt::Debug for Worker {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "Worker {{ id: {}, run_state: {:?} }}",
-            self.id, self.run_state
-        )
-    }
-}
-
-/// Called once at the beginning of the main process, this forks main into as many workers
-pub fn start_workers(executable_path: String, config: &Config) -> anyhow::Result<Vec<Worker>> {
-    let state = ConfigState::new();
-    let mut workers = Vec::new();
-    for index in 0..config.worker_count {
-        let listeners = Some(Listeners {
-            http: Vec::new(),
-            tls: Vec::new(),
-            tcp: Vec::new(),
-        });
-
-        let (pid, command_channel, scm_socket) = fork_main_into_worker(
-            &index.to_string(),
-            config,
-            executable_path.clone(),
-            &state,
-            listeners,
-        )?;
-        let mut worker = Worker::new(index as u32, pid, command_channel, scm_socket, config);
-
-        // the new worker expects a status message at startup
-        if let Some(worker_channel) = worker.worker_channel.as_mut() {
-            if let Err(e) = worker_channel.blocking() {
-                error!("Could not block the worker channel: {}", e);
-            }
-
-            worker_channel
-                .write_message(&WorkerRequest {
-                    id: format!("start-status-{index}"),
-                    content: RequestType::Status(Status {}).into(),
-                })
-                .with_context(|| "Could not send status request to the worker")?;
-
-            if let Err(e) = worker_channel.nonblocking() {
-                error!("Could not unblock the worker channel: {}", e);
-            }
-        }
-
-        workers.push(worker);
-    }
-    info!("Created workers");
-    Ok(workers)
-}
-
-/// called by the CommandServer to start an individual worker
-/// returns a handle of the worker, with channels to write to it
-pub fn start_worker(
-    id: u32,
-    config: &Config,
-    executable_path: String,
-    state: &ConfigState,
-    listeners: Option<Listeners>,
-) -> anyhow::Result<Worker> {
-    let (worker_pid, main_to_worker_channel, main_to_worker_scm) =
-        fork_main_into_worker(&id.to_string(), config, executable_path, state, listeners)?;
-
-    Ok(Worker::new(
-        id,
-        worker_pid,
-        main_to_worker_channel,
-        main_to_worker_scm,
-        config,
-    ))
+#[derive(thiserror::Error, Debug)]
+pub enum WorkerError {
+    #[error("could not read on the channel")]
+    ReadChannel(ChannelError),
+    #[error("could not parse configuration from temporary file: {0}")]
+    ReadRequestsFromFile(RequestError),
+    #[error("could not setup metrics on new worker: {0}")]
+    SetupMetrics(MetricError),
+    #[error("could not create new worker from config: {0}")]
+    NewServerFromConfig(LibServerError),
+    #[error("could not create {kind} scm socket: {scm_err}")]
+    CreateScmSocket {
+        kind: String,
+        scm_err: ScmSocketError,
+    },
+    #[error("could not create temporary file to pass the state to the new worker: {0}")]
+    CreateStateFile(IoError),
+    #[error("could not disable cloexec on {fd_name}'s file descriptor: {util_err}")]
+    DisableCloexec {
+        fd_name: String,
+        util_err: UtilError,
+    },
+    #[error("could not write state to temporary file: {0}")]
+    WriteStateFile(StateError),
+    #[error("could not rewind the temporary state file: {0}")]
+    Rewind(IoError),
+    #[error("could not create MIO pair of unix stream: {0}")]
+    CreateUnixStream(IoError),
+    #[error("could not send config to the new worker: {0}")]
+    SendConfig(ChannelError),
+    #[error("unix fork failed: {0}")]
+    Fork(Errno),
+    #[error("Could not set the worker-to-main channel to {state}: {channel_err}")]
+    SetChannel {
+        state: String,
+        channel_err: ChannelError,
+    },
 }
 
 /// called within a worker process, this starts the actual proxy
@@ -212,22 +86,25 @@ pub fn begin_worker_process(
     id: i32,
     command_buffer_size: usize,
     max_command_buffer_size: usize,
-) -> Result<(), anyhow::Error> {
+) -> Result<(), WorkerError> {
     let mut worker_to_main_channel: Channel<WorkerResponse, Config> = Channel::new(
         unsafe { UnixStream::from_raw_fd(worker_to_main_channel_fd) },
         command_buffer_size,
         max_command_buffer_size,
     );
 
-    if let Err(e) = worker_to_main_channel.blocking() {
-        error!("Could not block the worker-to-main channel: {}", e);
-    }
+    worker_to_main_channel
+        .blocking()
+        .map_err(|channel_err| WorkerError::SetChannel {
+            state: "blocking".to_string(),
+            channel_err,
+        })?;
 
     let mut configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
 
     let worker_config = worker_to_main_channel
         .read_message()
-        .with_context(|| "worker could not read configuration from socket")?;
+        .map_err(WorkerError::ReadChannel)?;
 
     let worker_id = format!("{}-{:02}", "WRK", id);
 
@@ -241,11 +118,14 @@ pub fn begin_worker_process(
     );
     info!("worker {} starting...", id);
     let initial_state = read_requests_from_file(&mut configuration_state_file)
-        .with_context(|| "could not parse configuration state data")?;
+        .map_err(WorkerError::ReadRequestsFromFile)?;
 
-    if let Err(e) = worker_to_main_channel.nonblocking() {
-        error!("Could not unblock the worker-to-main channel: {}", e);
-    }
+    worker_to_main_channel
+        .nonblocking()
+        .map_err(|channel_err| WorkerError::SetChannel {
+            state: "nonblocking".to_string(),
+            channel_err,
+        })?;
 
     let mut worker_to_main_channel: Channel<WorkerResponse, WorkerRequest> =
         worker_to_main_channel.into();
@@ -258,10 +138,14 @@ pub fn begin_worker_process(
             metrics.tagged_metrics,
             metrics.prefix.clone(),
         )
-        .with_context(|| "Could not setup metrics")?;
+        .map_err(WorkerError::SetupMetrics)?;
     }
-    let worker_to_main_scm_socket = ScmSocket::new(worker_to_main_scm_fd)
-        .with_context(|| "could not create worker-to-main scm socket")?;
+
+    let worker_to_main_scm_socket =
+        ScmSocket::new(worker_to_main_scm_fd).map_err(|scm_err| WorkerError::CreateScmSocket {
+            kind: "worker-to-main".to_string(),
+            scm_err,
+        })?;
 
     let mut server = Server::try_new_from_config(
         worker_to_main_channel,
@@ -270,7 +154,7 @@ pub fn begin_worker_process(
         initial_state,
         true,
     )
-    .with_context(|| "Could not create server from config")?;
+    .map_err(WorkerError::NewServerFromConfig)?;
 
     info!("starting event loop");
     server.run();
@@ -280,7 +164,7 @@ pub fn begin_worker_process(
 
 /// unix-forks the main process
 ///
-/// - Parent: sends config and listeners to the new worker
+/// - Parent: sends config, state and listeners to the new worker
 /// - Child: calls the sozu executable path like so: `sozu worker --id <worker_id> [...]`
 ///
 /// returns the child process pid, and channels to talk to it.
@@ -290,29 +174,48 @@ pub fn fork_main_into_worker(
     executable_path: String,
     state: &ConfigState,
     listeners: Option<Listeners>,
-) -> anyhow::Result<(pid_t, Channel<WorkerRequest, WorkerResponse>, ScmSocket)> {
+) -> Result<(pid_t, Channel<WorkerRequest, WorkerResponse>, ScmSocket), WorkerError> {
     trace!("parent({})", unsafe { libc::getpid() });
 
-    let mut state_file =
-        tempfile().with_context(|| "could not create temporary file for configuration state")?;
-    util::disable_close_on_exec(state_file.as_raw_fd())?;
+    let mut state_file = tempfile().map_err(WorkerError::CreateStateFile)?;
+    util::disable_close_on_exec(state_file.as_raw_fd()).map_err(|util_err| {
+        WorkerError::DisableCloexec {
+            fd_name: "state_file".to_string(),
+            util_err,
+        }
+    })?;
 
     state
         .write_requests_to_file(&mut state_file)
-        .with_context(|| "Could not write state to file")?;
+        .map_err(WorkerError::WriteStateFile)?;
 
-    state_file
-        .rewind()
-        .with_context(|| "could not seek to beginning of file")?;
+    state_file.rewind().map_err(WorkerError::Rewind)?;
 
-    let (main_to_worker, worker_to_main) = UnixStream::pair()?;
-    let (main_to_worker_scm, worker_to_main_scm) = UnixStream::pair()?;
+    let (main_to_worker, worker_to_main) =
+        UnixStream::pair().map_err(WorkerError::CreateUnixStream)?;
+    let (main_to_worker_scm, worker_to_main_scm) =
+        UnixStream::pair().map_err(WorkerError::CreateUnixStream)?;
 
-    let main_to_worker_scm = ScmSocket::new(main_to_worker_scm.into_raw_fd())
-        .with_context(|| "Could not create main-to-worker scm socket")?;
+    let main_to_worker_scm =
+        ScmSocket::new(main_to_worker_scm.into_raw_fd()).map_err(|scm_err| {
+            WorkerError::CreateScmSocket {
+                kind: "main-to-worker".to_string(),
+                scm_err,
+            }
+        })?;
 
-    util::disable_close_on_exec(worker_to_main.as_raw_fd())?;
-    util::disable_close_on_exec(worker_to_main_scm.as_raw_fd())?;
+    util::disable_close_on_exec(worker_to_main.as_raw_fd()).map_err(|util_err| {
+        WorkerError::DisableCloexec {
+            fd_name: "worker-to-main".to_string(),
+            util_err,
+        }
+    })?;
+    util::disable_close_on_exec(worker_to_main_scm.as_raw_fd()).map_err(|util_err| {
+        WorkerError::DisableCloexec {
+            fd_name: "worker-to-main-scm".to_string(),
+            util_err,
+        }
+    })?;
 
     let mut main_to_worker_channel: Channel<Config, WorkerResponse> = Channel::new(
         main_to_worker,
@@ -325,18 +228,22 @@ pub fn fork_main_into_worker(
         error!("Could not block the main-to-worker channel: {}", e);
     }
 
-    info!("{} launching worker", worker_id);
+    info!("launching worker {}", worker_id);
     debug!("executable path is {}", executable_path);
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { child: worker_pid }) => {
-            info!("{} worker launched: {}", worker_id, worker_pid);
+
+    match unsafe { fork().map_err(WorkerError::Fork)? } {
+        ForkResult::Parent { child: worker_pid } => {
+            info!("launching worker {} with pid {}", worker_id, worker_pid);
             main_to_worker_channel
                 .write_message(config)
-                .with_context(|| "Could not send config to the new worker using the channel")?;
+                .map_err(WorkerError::SendConfig)?;
 
-            if let Err(e) = main_to_worker_channel.nonblocking() {
-                error!("Could not unblock the main-to-worker channel: {}", e);
-            }
+            main_to_worker_channel
+                .nonblocking()
+                .map_err(|channel_err| WorkerError::SetChannel {
+                    state: "nonblocking".to_string(),
+                    channel_err,
+                })?;
 
             if let Some(listeners) = listeners {
                 info!("sending listeners to new worker: {:?}", listeners);
@@ -344,7 +251,13 @@ pub fn fork_main_into_worker(
                 info!("sent listeners from main: {:?}", result);
                 listeners.close();
             };
-            util::disable_close_on_exec(main_to_worker_scm.fd)?;
+
+            util::disable_close_on_exec(main_to_worker_scm.fd).map_err(|util_err| {
+                WorkerError::DisableCloexec {
+                    fd_name: "main-to-worker-main-scm".to_string(),
+                    util_err,
+                }
+            })?;
 
             Ok((
                 worker_pid.into(),
@@ -352,7 +265,7 @@ pub fn fork_main_into_worker(
                 main_to_worker_scm,
             ))
         }
-        Ok(ForkResult::Child) => {
+        ForkResult::Child => {
             trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
             Command::new(executable_path)
                 .arg("worker")
@@ -372,70 +285,5 @@ pub fn fork_main_into_worker(
 
             unreachable!();
         }
-        Err(e) => {
-            error!("Error during fork(): {}", e);
-            Err(anyhow::Error::from(e))
-        }
     }
-}
-
-#[cfg(target_os = "linux")]
-pub unsafe fn get_executable_path() -> anyhow::Result<String> {
-    use std::fs;
-
-    let path = fs::read_link("/proc/self/exe").with_context(|| "/proc/self/exe doesn't exist")?;
-
-    let mut path_str = match path.into_os_string().into_string() {
-        Ok(s) => s,
-        Err(_) => bail!("Failed to convert PathBuf to String"),
-    };
-
-    if path_str.ends_with(" (deleted)") {
-        // The kernel appends " (deleted)" to the symlink when the original executable has been replaced
-        let len = path_str.len();
-        path_str.truncate(len - 10)
-    }
-
-    Ok(path_str)
-}
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    pub fn _NSGetExecutablePath(buf: *mut c_char, size: *mut u32) -> i32;
-}
-
-#[cfg(target_os = "macos")]
-pub unsafe fn get_executable_path() -> anyhow::Result<String> {
-    let path =
-        std::env::current_exe().with_context(|| "failed to retrieve current executable path")?;
-    Ok(path.to_string_lossy().to_string())
-}
-
-#[cfg(target_os = "freebsd")]
-pub unsafe fn get_executable_path() -> anyhow::Result<String> {
-    let mut capacity = PATH_MAX as usize;
-    let mut path: Vec<u8> = Vec::with_capacity(capacity);
-    path.extend(repeat(0).take(capacity));
-
-    let mib: Vec<i32> = vec![CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1];
-    let len = mib.len() * size_of::<i32>();
-    let element_size = size_of::<i32>();
-
-    let res = sysctl(
-        mib.as_ptr(),
-        (len / element_size) as u32,
-        path.as_mut_ptr() as *mut c_void,
-        &mut capacity,
-        std::ptr::null() as *const c_void,
-        0,
-    );
-    if res != 0 {
-        panic!("Could not retrieve the path of the executable");
-    }
-
-    Ok(String::from_raw_parts(
-        path.as_mut_ptr(),
-        capacity - 1,
-        path.len(),
-    ))
 }

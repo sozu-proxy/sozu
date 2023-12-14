@@ -58,50 +58,50 @@ pub fn concatenate_vector(vec: &[String]) -> String {
     vec.join(", ")
 }
 
-pub fn format_request_type(request_type: &RequestType) -> String {
+pub fn format_request_type(request_type: &RequestType) -> &str {
     match request_type {
-        RequestType::SaveState(_) => "SaveState".to_owned(),
-        RequestType::LoadState(_) => "LoadState".to_owned(),
-        RequestType::CountRequests(_) => "CountRequests".to_owned(),
-        RequestType::ListWorkers(_) => "ListWorkers".to_owned(),
-        RequestType::ListFrontends(_) => "ListFrontends".to_owned(),
-        RequestType::ListListeners(_) => "ListListeners".to_owned(),
-        RequestType::LaunchWorker(_) => "LaunchWorker".to_owned(),
-        RequestType::UpgradeMain(_) => "UpgradeMain".to_owned(),
-        RequestType::UpgradeWorker(_) => "UpgradeWorker".to_owned(),
-        RequestType::SubscribeEvents(_) => "SubscribeEvents".to_owned(),
-        RequestType::ReloadConfiguration(_) => "ReloadConfiguration".to_owned(),
-        RequestType::Status(_) => "Status".to_owned(),
-        RequestType::AddCluster(_) => "AddCluster".to_owned(),
-        RequestType::RemoveCluster(_) => "RemoveCluster".to_owned(),
-        RequestType::AddHttpFrontend(_) => "AddHttpFrontend".to_owned(),
-        RequestType::RemoveHttpFrontend(_) => "RemoveHttpFrontend".to_owned(),
-        RequestType::AddHttpsFrontend(_) => "AddHttpsFrontend".to_owned(),
-        RequestType::RemoveHttpsFrontend(_) => "RemoveHttpsFrontend".to_owned(),
-        RequestType::AddCertificate(_) => "AddCertificate".to_owned(),
-        RequestType::ReplaceCertificate(_) => "ReplaceCertificate".to_owned(),
-        RequestType::RemoveCertificate(_) => "RemoveCertificate".to_owned(),
-        RequestType::AddTcpFrontend(_) => "AddTcpFrontend".to_owned(),
-        RequestType::RemoveTcpFrontend(_) => "RemoveTcpFrontend".to_owned(),
-        RequestType::AddBackend(_) => "AddBackend".to_owned(),
-        RequestType::RemoveBackend(_) => "RemoveBackend".to_owned(),
-        RequestType::AddHttpListener(_) => "AddHttpListener".to_owned(),
-        RequestType::AddHttpsListener(_) => "AddHttpsListener".to_owned(),
-        RequestType::AddTcpListener(_) => "AddTcpListener".to_owned(),
-        RequestType::RemoveListener(_) => "RemoveListener".to_owned(),
-        RequestType::ActivateListener(_) => "ActivateListener".to_owned(),
-        RequestType::DeactivateListener(_) => "DeactivateListener".to_owned(),
-        RequestType::QueryClusterById(_) => "QueryClusterById".to_owned(),
-        RequestType::QueryClustersByDomain(_) => "QueryClustersByDomain".to_owned(),
-        RequestType::QueryClustersHashes(_) => "QueryClustersHashes".to_owned(),
-        RequestType::QueryMetrics(_) => "QueryMetrics".to_owned(),
-        RequestType::SoftStop(_) => "SoftStop".to_owned(),
-        RequestType::HardStop(_) => "HardStop".to_owned(),
-        RequestType::ConfigureMetrics(_) => "ConfigureMetrics".to_owned(),
-        RequestType::Logging(_) => "Logging".to_owned(),
-        RequestType::ReturnListenSockets(_) => "ReturnListenSockets".to_owned(),
-        RequestType::QueryCertificatesFromTheState(_) => "QueryCertificatesFromTheState".to_owned(),
-        RequestType::QueryCertificatesFromWorkers(_) => "QueryCertificatesFromWorkers".to_owned(),
+        RequestType::SaveState(_) => "SaveState",
+        RequestType::LoadState(_) => "LoadState",
+        RequestType::CountRequests(_) => "CountRequests",
+        RequestType::ListWorkers(_) => "ListWorkers",
+        RequestType::ListFrontends(_) => "ListFrontends",
+        RequestType::ListListeners(_) => "ListListeners",
+        RequestType::LaunchWorker(_) => "LaunchWorker",
+        RequestType::UpgradeMain(_) => "UpgradeMain",
+        RequestType::UpgradeWorker(_) => "UpgradeWorker",
+        RequestType::SubscribeEvents(_) => "SubscribeEvents",
+        RequestType::ReloadConfiguration(_) => "ReloadConfiguration",
+        RequestType::Status(_) => "Status",
+        RequestType::AddCluster(_) => "AddCluster",
+        RequestType::RemoveCluster(_) => "RemoveCluster",
+        RequestType::AddHttpFrontend(_) => "AddHttpFrontend",
+        RequestType::RemoveHttpFrontend(_) => "RemoveHttpFrontend",
+        RequestType::AddHttpsFrontend(_) => "AddHttpsFrontend",
+        RequestType::RemoveHttpsFrontend(_) => "RemoveHttpsFrontend",
+        RequestType::AddCertificate(_) => "AddCertificate",
+        RequestType::ReplaceCertificate(_) => "ReplaceCertificate",
+        RequestType::RemoveCertificate(_) => "RemoveCertificate",
+        RequestType::AddTcpFrontend(_) => "AddTcpFrontend",
+        RequestType::RemoveTcpFrontend(_) => "RemoveTcpFrontend",
+        RequestType::AddBackend(_) => "AddBackend",
+        RequestType::RemoveBackend(_) => "RemoveBackend",
+        RequestType::AddHttpListener(_) => "AddHttpListener",
+        RequestType::AddHttpsListener(_) => "AddHttpsListener",
+        RequestType::AddTcpListener(_) => "AddTcpListener",
+        RequestType::RemoveListener(_) => "RemoveListener",
+        RequestType::ActivateListener(_) => "ActivateListener",
+        RequestType::DeactivateListener(_) => "DeactivateListener",
+        RequestType::QueryClusterById(_) => "QueryClusterById",
+        RequestType::QueryClustersByDomain(_) => "QueryClustersByDomain",
+        RequestType::QueryClustersHashes(_) => "QueryClustersHashes",
+        RequestType::QueryMetrics(_) => "QueryMetrics",
+        RequestType::SoftStop(_) => "SoftStop",
+        RequestType::HardStop(_) => "HardStop",
+        RequestType::ConfigureMetrics(_) => "ConfigureMetrics",
+        RequestType::Logging(_) => "Logging",
+        RequestType::ReturnListenSockets(_) => "ReturnListenSockets",
+        RequestType::QueryCertificatesFromTheState(_) => "QueryCertificatesFromTheState",
+        RequestType::QueryCertificatesFromWorkers(_) => "QueryCertificatesFromWorkers",
     }
 }
 
@@ -128,12 +128,17 @@ impl Response {
             }
         }
 
-        let content = match &self.content {
-            Some(content) => content,
-            None => return Ok(println!("No content")),
-        };
-
-        content.display(json)
+        match &self.content {
+            Some(content) => content.display(json),
+            None => {
+                if json {
+                    println!("{{}}");
+                } else {
+                    println!("No content");
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -153,9 +158,9 @@ impl ResponseContent {
             ContentType::Metrics(aggr_metrics) => print_metrics(aggr_metrics),
             ContentType::FrontendList(frontends) => print_frontends(frontends),
             ContentType::ListenersList(listeners) => print_listeners(listeners),
-            ContentType::WorkerMetrics(worker_metrics) => print_worker_metrics(&worker_metrics),
-            ContentType::AvailableMetrics(list) => print_available_metrics(&list),
-            ContentType::RequestCounts(request_counts) => print_request_counts(&request_counts),
+            ContentType::WorkerMetrics(worker_metrics) => print_worker_metrics(worker_metrics),
+            ContentType::AvailableMetrics(list) => print_available_metrics(list),
+            ContentType::RequestCounts(request_counts) => print_request_counts(request_counts),
             ContentType::CertificatesWithFingerprints(certs) => {
                 print_certificates_with_validity(certs)
             }
@@ -205,12 +210,15 @@ pub fn print_status(worker_infos: &WorkerInfos) -> Result<(), DisplayError> {
     table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
     table.add_row(row!["worker id", "pid", "run state"]);
 
-    for worker_info in &worker_infos.vec {
+    let mut sorted_infos = worker_infos.vec.clone();
+    sorted_infos.sort_by_key(|worker| worker.id);
+
+    for worker_info in &sorted_infos {
         let row = row!(
             worker_info.id,
             worker_info.pid,
             RunState::try_from(worker_info.run_state)
-                .map_err(|e| DisplayError::DecodeError(e))?
+                .map_err(DisplayError::DecodeError)?
                 .as_str_name()
         );
         table.add_row(row);

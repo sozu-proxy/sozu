@@ -1,20 +1,61 @@
+mod command;
+mod request_builder;
+
 use std::time::Duration;
 
-use anyhow::Context;
 use sozu_command_lib::{
-    channel::Channel,
-    config::Config,
+    certificate::CertificateError,
+    channel::{Channel, ChannelError},
+    config::{Config, ConfigError},
     logging::setup_logging_with_config,
-    proto::command::{Request, Response},
+    proto::{
+        command::{Request, Response},
+        DisplayError,
+    },
 };
 
 use crate::{
     cli::{self, *},
-    get_config_file_path, load_configuration,
+    util::{get_config_file_path, UtilError},
 };
 
-mod command;
-mod request_builder;
+#[derive(thiserror::Error, Debug)]
+pub enum CtlError {
+    #[error("failed to get config: {0}")]
+    GetConfig(UtilError),
+    #[error("failed to load config: {0}")]
+    LoadConfig(ConfigError),
+    #[error("could not create channel to Sōzu. Are you sure the proxy is up?: {0}")]
+    CreateChannel(ChannelError),
+    #[error("failed to find the path of the command socket: {0}")]
+    GetCommandSocketPath(ConfigError),
+    #[error("failed to block channel to Sōzu: {0}")]
+    BlockChannel(ChannelError),
+    #[error("could not display response: {0}")]
+    Display(DisplayError),
+    #[error("could not read message on a blocking channel: {0}")]
+    ReadBlocking(ChannelError),
+    #[error("Request failed: {0}")]
+    Failure(String),
+    #[error("could not write request on channel: {0}")]
+    WriteRequest(ChannelError),
+    #[error("could not get certificate fingerprint")]
+    GetFingerprint(CertificateError),
+    #[error("could not decode fingerprint")]
+    DecodeFingerprint(CertificateError),
+    #[error("Please provide either one, {0} OR {1}")]
+    ArgsNeeded(String, String),
+    #[error("could not load certificate")]
+    LoadCertificate(CertificateError),
+    #[error("wrong address {0}: {1}")]
+    WrongAddress(String, UtilError),
+    #[error("wrong input to create listener")]
+    CreateListener(ConfigError),
+    #[error("domain can not be empty")]
+    NeedClusterDomain,
+    #[error("wrong response from Sōzu: {0:?}")]
+    WrongResponse(Response),
+}
 
 pub struct CommandManager {
     channel: Channel<Request, Response>,
@@ -24,11 +65,15 @@ pub struct CommandManager {
     json: bool,
 }
 
-pub fn ctl(args: cli::Args) -> anyhow::Result<()> {
-    let config_file_path = get_config_file_path(&args)?;
-    let config = load_configuration(config_file_path)?;
+pub fn ctl(args: cli::Args) -> Result<(), CtlError> {
+    let config_path = get_config_file_path(&args).map_err(CtlError::GetConfig)?;
 
-    setup_logging_with_config(&config, "CTL");
+    let config = Config::load_from_path(config_path).map_err(CtlError::LoadConfig)?;
+
+    // prevent logging for json responses for a clean output
+    if !args.json {
+        setup_logging_with_config(&config, "CTL");
+    }
 
     // If the command is `config check` then exit because if we are here, the configuration is valid
     if let SubCmd::Config {
@@ -39,9 +84,7 @@ pub fn ctl(args: cli::Args) -> anyhow::Result<()> {
         std::process::exit(0);
     }
 
-    let channel = create_channel(&config).with_context(|| {
-        "could not connect to the command unix socket. Are you sure the proxy is up?"
-    })?;
+    let channel = create_channel(&config)?;
 
     let timeout = Duration::from_millis(args.timeout.unwrap_or(config.ctl_command_timeout));
     if !args.json {
@@ -59,7 +102,7 @@ pub fn ctl(args: cli::Args) -> anyhow::Result<()> {
 }
 
 impl CommandManager {
-    fn handle_command(&mut self, command: SubCmd) -> anyhow::Result<()> {
+    fn handle_command(&mut self, command: SubCmd) -> Result<(), CtlError> {
         debug!("Executing command {:?}", command);
         match command {
             SubCmd::Shutdown { hard } => {
@@ -167,16 +210,18 @@ impl CommandManager {
 }
 
 /// creates a blocking channel
-pub fn create_channel(config: &Config) -> anyhow::Result<Channel<Request, Response>> {
+pub fn create_channel(config: &Config) -> Result<Channel<Request, Response>, CtlError> {
+    let command_socket_path = &config
+        .command_socket_path()
+        .map_err(CtlError::GetCommandSocketPath)?;
+
     let mut channel = Channel::from_path(
-        &config.command_socket_path()?,
+        command_socket_path,
         config.command_buffer_size,
         config.max_command_buffer_size,
     )
-    .with_context(|| "Could not create Channel from the given path")?;
+    .map_err(CtlError::CreateChannel)?;
 
-    channel
-        .blocking()
-        .with_context(|| "Could not block the channel used to communicate with Sōzu")?;
+    channel.blocking().map_err(CtlError::BlockChannel)?;
     Ok(channel)
 }

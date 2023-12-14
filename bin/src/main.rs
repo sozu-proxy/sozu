@@ -37,40 +37,48 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 /// the arguments to the sozu command line
 mod cli;
 /// Receives orders from the CLI, transmits to workers
+// mod command;
 mod command;
 /// The command line logic
 mod ctl;
 /// Forking & restarting the main process using a more recent executable of Sōzu
 mod upgrade;
 /// Some unix helper functions
-mod util;
+pub mod util;
 /// Start and restart the worker UNIX processes
 mod worker;
 
-#[cfg(target_os = "linux")]
-use anyhow::bail;
-use anyhow::Context;
-use cli::Args;
-#[cfg(target_os = "linux")]
-use libc::{cpu_set_t, pid_t};
-#[cfg(target_os = "linux")]
-use regex::Regex;
-use sozu::metrics::METRICS;
-use sozu_command_lib::{config::Config, logging::setup_logging_with_config};
 use std::panic;
 
-use crate::worker::{get_executable_path, start_workers, Worker};
+#[cfg(target_os = "linux")]
+use libc::{cpu_set_t, pid_t};
+
+use sozu::metrics::METRICS;
+
+use cli::Args;
+use command::{begin_main_process, sessions::WorkerSession, StartError};
+use ctl::CtlError;
+use upgrade::UpgradeError;
+use worker::WorkerError;
+
+#[derive(thiserror::Error, Debug)]
+enum MainError {
+    #[error("failed to start Sōzu: {0}")]
+    StartMain(StartError),
+    #[error("failed to start new worker: {0}")]
+    BeginWorker(WorkerError),
+    #[error("failed to start new main process: {0}")]
+    BeginNewMain(UpgradeError),
+    #[error("{0}")]
+    Cli(CtlError),
+}
 
 #[paw::main]
-fn main(args: Args) -> anyhow::Result<()> {
+fn main(args: Args) {
     register_panic_hook();
 
-    match args.cmd {
-        cli::SubCmd::Start => {
-            start(&args)?;
-            info!("main process stopped");
-            Ok(())
-        }
+    let result = match args.cmd {
+        cli::SubCmd::Start => begin_main_process(&args).map_err(MainError::StartMain),
         // this is used only by the CLI when upgrading
         cli::SubCmd::Worker {
             fd: worker_to_main_channel_fd,
@@ -90,6 +98,7 @@ fn main(args: Args) -> anyhow::Result<()> {
                 command_buffer_size,
                 max_command_buffer_size,
             )
+            .map_err(MainError::BeginWorker)
         }
         // this is used only by the CLI when upgrading
         cli::SubCmd::Main {
@@ -106,53 +115,14 @@ fn main(args: Args) -> anyhow::Result<()> {
                 command_buffer_size,
                 max_command_buffer_size,
             )
+            .map_err(MainError::BeginNewMain)
         }
-        _ => ctl::ctl(args),
+        _ => ctl::ctl(args).map_err(MainError::Cli),
+    };
+    match result {
+        Ok(_) => {}
+        Err(main_error) => println!("{}", main_error),
     }
-}
-
-fn start(args: &cli::Args) -> Result<(), anyhow::Error> {
-    let config_file_path = get_config_file_path(args)?;
-    let config = load_configuration(config_file_path)?;
-
-    setup_logging_with_config(&config, "MAIN");
-    info!("Starting up");
-    util::setup_metrics(&config).with_context(|| "Could not setup metrics")?;
-    util::write_pid_file(&config).with_context(|| "PID file is not writeable")?;
-
-    update_process_limits(&config)?;
-
-    let executable_path =
-        unsafe { get_executable_path().with_context(|| "Could not get executable path")? };
-    let workers =
-        start_workers(executable_path, &config).with_context(|| "Failed at spawning workers")?;
-
-    if config.handle_process_affinity {
-        set_workers_affinity(&workers);
-    }
-
-    let command_socket_path = config.command_socket_path()?;
-
-    command::start_server(config, command_socket_path, workers)
-        .with_context(|| "could not start Sozu")?;
-
-    Ok(())
-}
-
-pub fn get_config_file_path(args: &cli::Args) -> Result<&str, anyhow::Error> {
-    match args.config.as_ref() {
-        Some(config_file) => Ok(config_file.as_str()),
-        None => option_env!("SOZU_CONFIG").ok_or_else(|| {
-            anyhow::Error::msg(
-                "Configuration file hasn't been specified. Either use -c with the start command \
-            or use the SOZU_CONFIG environment variable when building sozu.",
-            )
-        }),
-    }
-}
-
-pub fn load_configuration(config_file: &str) -> Result<Config, anyhow::Error> {
-    Config::load_from_path(config_file).with_context(|| "Invalid configuration file.")
 }
 
 /// Set workers process affinity, see man sched_setaffinity
@@ -160,7 +130,7 @@ pub fn load_configuration(config_file: &str) -> Result<Config, anyhow::Error> {
 /// Can bind multiple processes to a CPU core if there are more processes
 /// than CPU cores. Only works on Linux.
 #[cfg(target_os = "linux")]
-fn set_workers_affinity(workers: &Vec<Worker>) {
+fn set_workers_affinity(workers: &Vec<WorkerSession>) {
     let mut cpu_count = 0;
     let max_cpu = num_cpus::get();
 
@@ -208,80 +178,6 @@ fn set_process_affinity(pid: pid_t, cpu: usize) {
 
         debug!("Worker {} bound to CPU core {}", pid, cpu);
     };
-}
-
-#[cfg(target_os = "linux")]
-// We check the hard_limit. The soft_limit can be changed at runtime
-// by the process or any user. hard_limit can only be changed by root
-fn update_process_limits(config: &Config) -> Result<(), anyhow::Error> {
-    let wanted_opened_files = (config.max_connections as u64) * 2;
-
-    // Ensure we don't exceed the system maximum capacity
-    let f = Config::load_file("/proc/sys/fs/file-max")
-        .with_context(|| "Couldn't read /proc/sys/fs/file-max")?;
-    let re_max = Regex::new(r"(\d*)")?;
-    let system_max_fd = re_max
-        .captures(&f)
-        .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse::<usize>().ok())
-        .with_context(|| "Couldn't parse /proc/sys/fs/file-max")?;
-    if config.max_connections > system_max_fd {
-        error!(
-            "Proxies total max_connections can't be higher than system's file-max limit. \
-            Current limit: {}, current value: {}",
-            system_max_fd, config.max_connections
-        );
-        bail!("Too many allowed connections");
-    }
-
-    // Get the soft and hard limits for the current process
-    let mut limits = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) };
-
-    // Ensure we don't exceed the hard limit
-    if limits.rlim_max < wanted_opened_files {
-        error!(
-            "at least one worker can't have that many connections. \
-              current max file descriptor hard limit is: {}, \
-              configured max_connections is {} (the worker needs two file descriptors \
-              per client connection)",
-            limits.rlim_max, config.max_connections
-        );
-        bail!("Too many allowed connection for a worker");
-    }
-
-    if limits.rlim_cur < wanted_opened_files && limits.rlim_cur != limits.rlim_max {
-        // Try to get twice what we need to be safe, or rlim_max if we exceed that
-        limits.rlim_cur = limits.rlim_max.min(wanted_opened_files * 2);
-        unsafe {
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limits);
-
-            // Refresh the data we have
-            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits);
-        }
-    }
-
-    // Ensure we don't exceed the new soft limit
-    if limits.rlim_cur < wanted_opened_files {
-        error!(
-            "at least one worker can't have that many connections. \
-              current max file descriptor soft limit is: {}, \
-              configured max_connections is {} (the worker needs two file descriptors \
-              per client connection)",
-            limits.rlim_cur, config.max_connections
-        );
-        bail!("Too many allowed connection for a worker");
-    }
-
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn update_process_limits(_: &Config) -> Result<(), anyhow::Error> {
-    Ok(())
 }
 
 fn register_panic_hook() {
