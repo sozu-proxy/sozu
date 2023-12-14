@@ -7,6 +7,7 @@ use std::{
     borrow::ToOwned,
     collections::{HashMap, HashSet},
     convert::From,
+    fmt::Debug,
     io::BufReader,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -14,9 +15,10 @@ use std::{
 
 use once_cell::sync::Lazy;
 use rustls::{
+    crypto::ring::sign::any_supported_type,
+    pki_types::{CertificateDer, PrivateKeyDer},
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
-    Certificate, PrivateKey,
 };
 use sha2::{Digest, Sha256};
 use sozu_command::{
@@ -118,7 +120,7 @@ pub struct CertifiedKeyWrapper {
 impl CertifiedKeyWrapper {
     /// bytes of the pem formatted certificate, first of the chain
     fn pem_bytes(&self) -> &[u8] {
-        &self.inner.cert[0].0
+        self.inner.cert[0].as_ref()
     }
 }
 
@@ -288,11 +290,11 @@ impl CertificateResolver {
         let certificate_pem =
             sozu_command::certificate::parse_pem(certificate_and_key.certificate.as_bytes())?;
 
-        let mut chain = vec![Certificate(certificate_pem.contents)];
+        let mut chain = vec![CertificateDer::from(certificate_pem.contents)];
         for cert in &certificate_and_key.certificate_chain {
             let chain_link = parse_pem(cert.as_bytes())?.contents;
 
-            chain.push(Certificate(chain_link));
+            chain.push(CertificateDer::from(chain_link));
         }
 
         let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
@@ -305,12 +307,12 @@ impl CertificateResolver {
         };
 
         let private_key = match item {
-            rustls_pemfile::Item::RSAKey(rsa_key) => PrivateKey(rsa_key),
-            rustls_pemfile::Item::PKCS8Key(pkcs8_key) => PrivateKey(pkcs8_key),
-            rustls_pemfile::Item::ECKey(ec_key) => PrivateKey(ec_key),
+            rustls_pemfile::Item::Pkcs1Key(rsa_key) => PrivateKeyDer::from(rsa_key),
+            rustls_pemfile::Item::Pkcs8Key(pkcs8_key) => PrivateKeyDer::from(pkcs8_key),
+            rustls_pemfile::Item::Sec1Key(ec_key) => PrivateKeyDer::from(ec_key),
             _ => return Err(CertificateResolverError::EmptyKeys),
         };
-        match rustls::sign::any_supported_type(&private_key) {
+        match any_supported_type(&private_key) {
             Ok(signing_key) => {
                 let stored_certificate = CertifiedKeyWrapper {
                     inner: Arc::new(CertifiedKey::new(chain, signing_key)),
@@ -463,6 +465,12 @@ impl ResolvesServerCert for MutexWrappedCertificateResolver {
         debug!("Default certificate is used for {}", name);
         incr!("tls.default_cert_used");
         DEFAULT_CERTIFICATE.clone()
+    }
+}
+
+impl Debug for MutexWrappedCertificateResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MutexWrappedCertificateResolver")
     }
 }
 
