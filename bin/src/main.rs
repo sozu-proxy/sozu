@@ -38,6 +38,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 mod cli;
 /// Receives orders from the CLI, transmits to workers
 mod command;
+mod command_v2;
 /// The command line logic
 mod ctl;
 /// Forking & restarting the main process using a more recent executable of Sōzu
@@ -133,7 +134,7 @@ fn start(args: &cli::Args) -> Result<(), anyhow::Error> {
 
     let command_socket_path = config.command_socket_path()?;
 
-    command::start_server(config, command_socket_path, workers)
+    command_v2::start_server(config, command_socket_path, workers)
         .with_context(|| "could not start Sozu")?;
 
     Ok(())
