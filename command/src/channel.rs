@@ -166,7 +166,6 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
 
     /// Checks wether we want and can read or write, and calls the appropriate handler.
     pub fn run(&mut self) -> Result<(), ChannelError> {
-        println!("RUN WITH: {:?} {:?}", self.readiness, self.interest);
         let interest = self.interest & self.readiness;
 
         if interest.is_readable() {
@@ -193,7 +192,6 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                 break;
             }
 
-            println!("READING ON {}", self.sock.as_raw_fd());
             match self.sock.read(self.front_buf.space()) {
                 Ok(0) => {
                     self.interest = Ready::EMPTY;
@@ -279,7 +277,6 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
 
     /// Parses a message from the front buffer, without waiting
     fn read_message_nonblocking(&mut self) -> Result<Rx, ChannelError> {
-        println!("FILL_BUFF: {}", self.front_buf.available_data());
         match self.front_buf.data().iter().position(|&x| x == 0) {
             Some(position) => self.read_and_parse_from_front_buffer(position),
             None => {

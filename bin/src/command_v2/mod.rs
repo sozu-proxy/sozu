@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    ops::{Deref, DerefMut},
+    path::PathBuf,
+};
 
 use anyhow::{bail, Context};
 use libc::pid_t;
@@ -23,6 +28,140 @@ use sozu_command_lib::{
 
 use crate::worker::Worker;
 
+mod requests;
+
+/// This trait is used for command that need to wait for worker responses
+pub trait GatheringCallback: std::fmt::Debug {
+    /// This is called once every worker has answered
+    /// It allows to operate both on the server (lauch workers...) and the client (send an answer...)
+    fn gather(
+        &mut self,
+        server: &mut Server,
+        client: &mut ClientSession,
+        gathered_responses: GatheredResponses,
+    );
+}
+
+#[derive(Debug)]
+pub struct GatheredResponses {
+    pub worker_responses: Vec<WorkerResponse>,
+    pub main_response: Option<ResponseContent>,
+    pub expected_worker_responses: usize,
+}
+
+#[derive(Debug)]
+pub enum SessionState {
+    WaitingForRequest,
+    HandlingRequest,
+    Gathering {
+        responses: GatheredResponses,
+        callback: Box<dyn GatheringCallback>,
+    },
+    Finishing,
+}
+
+#[derive(Debug)]
+enum ClientResult {
+    NothingToDo,
+    NewRequest(Request),
+    CloseSession,
+}
+
+#[derive(Debug)]
+pub struct ClientSession {
+    pub channel: Channel<Response, Request>,
+    pub id: u32,
+    pub token: Token,
+    pub state: SessionState,
+}
+
+impl ClientSession {
+    fn new(mut channel: Channel<Response, Request>, id: u32, token: Token) -> Self {
+        channel.interest = Ready::READABLE | Ready::ERROR | Ready::HUP;
+        Self {
+            channel,
+            id,
+            token,
+            state: SessionState::WaitingForRequest,
+        }
+    }
+    fn finish(&mut self, response: Response) {
+        println!("Writing message on client channel");
+        self.channel.write_message(&response).unwrap();
+        self.state = SessionState::Finishing;
+    }
+
+    fn finish_ok(&mut self, content: Option<ResponseContent>) {
+        self.finish(Response {
+            status: ResponseStatus::Ok.into(),
+            message: "Successfully handled request".to_owned(),
+            content,
+        })
+    }
+
+    fn return_processing<S: Into<String>>(&mut self, message: S) {
+        let message = message.into();
+        println!("Return: {}", message);
+        let message = Response {
+            status: ResponseStatus::Processing.into(),
+            message,
+            content: None,
+        };
+        self.channel.write_message(&message).unwrap()
+    }
+
+    fn update_readiness(&mut self, events: Ready) {
+        self.channel.handle_events(events);
+    }
+
+    fn ready(&mut self) -> ClientResult {
+        if self.channel.readiness.is_error() || self.channel.readiness.is_hup() {
+            return ClientResult::CloseSession;
+        }
+
+        println!("Running: {:?}", self.token);
+        let status = self.channel.run();
+        println!("{status:?}");
+        if let Err(error) = status {
+            error!("Error handling client: {:?}", error);
+            return ClientResult::NothingToDo;
+        }
+
+        match self.state {
+            SessionState::WaitingForRequest => {
+                let message = self.channel.read_message();
+                println!("Client got request: {message:?}");
+                match message {
+                    Ok(request) => {
+                        self.channel.interest = Ready::WRITABLE | Ready::ERROR | Ready::HUP;
+                        self.state = SessionState::HandlingRequest;
+                        ClientResult::NewRequest(request)
+                    }
+                    Err(error) => {
+                        error!("Client channel read: {:?}", error);
+                        ClientResult::NothingToDo
+                    }
+                }
+            }
+            SessionState::Finishing => {
+                if self.channel.back_buf.available_data() == 0 {
+                    self.channel.interest = Ready::READABLE | Ready::ERROR | Ready::HUP;
+                    self.state = SessionState::WaitingForRequest;
+                }
+                ClientResult::NothingToDo
+            }
+            _ => ClientResult::NothingToDo,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum WorkerResult {
+    NothingToDo,
+    NewResponse(WorkerResponse),
+    CloseSession,
+}
+
 #[derive(Debug)]
 struct WorkerSession {
     pub channel: Channel<WorkerRequest, WorkerResponse>,
@@ -32,139 +171,58 @@ struct WorkerSession {
     pub token: Token,
 }
 
-#[derive(Debug)]
-enum SessionState {
-    WaitingForRequest,
-    Gathering {
-        gathered_responses: Vec<WorkerResponse>,
-        main_response: Option<ResponseContent>,
-        expected_worker_responses: usize,
-        request_type: RequestType,
-    },
-    Finishing,
-}
-
-#[derive(Debug)]
-struct ClientSession {
-    pub channel: Channel<Response, Request>,
-    pub id: u32,
-    pub token: Token,
-    pub state: SessionState,
-}
-
-impl ClientSession {
-    fn finish(&self, response: Response) {
-        self.channel.write_message(&response);
-    }
-    fn finish_ok(&self, content: Option<ResponseContent>) {
-        self.channel.write_message(&Response {
-            status: ResponseStatus::Ok.into(),
-            message: "Successfully handled request".to_owned(),
-            content,
-        });
-    }
-}
-
 impl WorkerSession {
-    fn update_readiness(&mut self, events: Ready) {
-        self.channel.handle_events(events);
-    }
-
-    fn ready(&mut self) -> Option<WorkerResponse> {
-        let status = self.channel.run();
-        println!("{status:?}");
-    }
-}
-
-impl ClientSession {
-    fn update_readiness(&mut self, events: Ready) {
-        self.channel.handle_events(events);
-    }
-
-    fn ready(&mut self) -> Option<Request> {
-        let status = self.channel.run();
-        println!("{status:?}");
-        if status.is_err() {
-            return None;
+    fn new(
+        mut channel: Channel<WorkerRequest, WorkerResponse>,
+        id: u32,
+        pid: pid_t,
+        token: Token,
+    ) -> Self {
+        channel.interest = Ready::READABLE | Ready::WRITABLE | Ready::ERROR | Ready::HUP;
+        Self {
+            channel,
+            id,
+            pid,
+            run_state: RunState::Running,
+            token,
         }
+    }
+
+    fn update_readiness(&mut self, events: Ready) {
+        self.channel.handle_events(events);
+    }
+
+    fn ready(&mut self) -> WorkerResult {
+        if self.channel.readiness.is_error() || self.channel.readiness.is_hup() {
+            return WorkerResult::CloseSession;
+        }
+
+        let status = self.channel.run();
+        println!("{status:?}");
         let message = self.channel.read_message();
         println!("{message:?}");
-        match self.state {
-            SessionState::WaitingForRequest => message.ok(),
-            _ => {
-                error!("Received a request when we didn't expected it");
-                None
-            }
+        match message {
+            Ok(message) => WorkerResult::NewResponse(message),
+            Err(_) => WorkerResult::NothingToDo,
         }
-        // match self.advancement {
-        // Advancement::WaitingForRequest => {
-        //     let status = self.channel.run();
-        //     println!("{status:?}");
-        //     if status.is_err() {
-        //         return;
-        //     }
-        //     let message = self.channel.read_message().unwrap();
-        //     println!("{message:?}");
-        //     use sozu_command_lib::proto::command::request::RequestType;
-        //     match message.request_type.unwrap() {
-        //         RequestType::QueryClustersHashes(_) => Advancement::Handling(Box::new()),
-        //         _ => todo!(),
-        //     }
-        // }
-        // }
     }
 }
 
-// enum Advancement {
-//     WaitingForRequest,
-//     Handling(Box<dyn Command>),
-// }
-
-// trait Command {
-//     fn on_request()
-// }
-
-// impl Command for Query {
-//     fn on_request(&mut self, message, ctx) {
-//         let response = ctx.query(message, Main)
-//         ctx.finish(response)
-//     }
-// }
-
-// struct StatusCommand {
-//     main_response
-//     worker_responses
-// }
-
-// impl Command for StatusCommand {
-//     fn on_request(&mut self, message, ctx) {
-//         self.main_response = ctx.query(message, Main);
-//         ctx.scatter(message, ctx.workers);
-//     }
-//     fn gather_storage(&mut self) -> Vec<Response> {
-//         &mut self.responses
-//     }
-//     fn on_gather(&mut self, response) {
-//         match response {
-//             Ok => self.gather_storage().push(response)
-//             ...
-//         }
-//     }
-//     fn on_gather_complete(&mut self, ctx) {
-//         let response = merge(main_response, worker_responses)
-//         ctx.finish(response)
-//     }
-// }
-
 #[derive(Debug)]
-struct CommandServer {
+pub struct Server {
+    in_flight: HashMap<String, Token>,
     next_client_id: u32,
     next_session_token: usize,
     poll: Poll,
-    client_sessions: HashMap<Token, ClientSession>,
-    worker_sessions: HashMap<Token, WorkerSession>,
+    sessions_to_tick: HashSet<Token>,
     unix_listener: UnixListener,
-    in_flight: HashMap<String, Token>,
+    worker_sessions: HashMap<Token, WorkerSession>,
+}
+
+#[derive(Debug)]
+struct CommandHub {
+    server: Server,
+    clients: HashMap<Token, ClientSession>,
 }
 
 pub fn start_server(
@@ -210,14 +268,143 @@ pub fn start_server(
     //     bail!("couldn't start server");
     // }
 
-    let mut command_server = CommandServer::new(unix_listener)?;
+    let mut command_server = CommandHub::new(unix_listener)?;
     for mut worker in workers {
         command_server.register_worker(worker.id, worker.pid, worker.worker_channel.take().unwrap())
     }
     command_server.run();
 }
 
-impl CommandServer {
+impl Deref for CommandHub {
+    type Target = Server;
+
+    fn deref(&self) -> &Self::Target {
+        &self.server
+    }
+}
+impl DerefMut for CommandHub {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.server
+    }
+}
+
+impl CommandHub {
+    fn new(unix_listener: UnixListener) -> anyhow::Result<Self> {
+        Ok(Self {
+            server: Server::new(unix_listener)?,
+            clients: HashMap::new(),
+        })
+    }
+
+    fn get_client_mut(&mut self, token: &Token) -> Option<(&mut Server, &mut ClientSession)> {
+        let Self {
+            server,
+            clients: client_sessions,
+        } = self;
+        if let Some(client) = client_sessions.get_mut(token) {
+            Some((server, client))
+        } else {
+            None
+        }
+    }
+
+    fn run(&mut self) -> ! {
+        let mut events = Events::with_capacity(100);
+        println!("{self:#?}");
+
+        loop {
+            println!("Sessions to tick: {:?}", self.sessions_to_tick);
+            let CommandHub {
+                server:
+                    Server {
+                        worker_sessions,
+                        sessions_to_tick,
+                        ..
+                    },
+                clients,
+            } = self;
+            for token in sessions_to_tick.drain() {
+                if let Some(client) = clients.get_mut(&token) {
+                    client.ready();
+                }
+                if let Some(worker) = worker_sessions.get_mut(&token) {
+                    worker.ready();
+                }
+            }
+
+            events.clear();
+            match self.poll.poll(&mut events, None) {
+                Ok(()) => {}
+                Err(error) => error!("Error while polling: {:?}", error),
+            }
+
+            for event in &events {
+                match event.token() {
+                    Token(0) => {
+                        if event.is_readable() {
+                            while let Ok((mut stream, addr)) = self.unix_listener.accept() {
+                                info!("New client connected: {:?}", addr);
+                                let token = self.next_session_token();
+                                self.register(token, &mut stream);
+                                let channel = Channel::new(stream, 4096, usize::MAX);
+                                let id = self.next_client_id();
+                                let session = ClientSession::new(channel, id, token);
+                                info!("{:#?}", session);
+                                self.clients.insert(token, session);
+                            }
+                        }
+                    }
+                    token => {
+                        info!("{:?} got event: {:?}", token, event);
+                        if let Some((server, client)) = self.get_client_mut(&token) {
+                            client.update_readiness(Ready::from(event));
+                            match client.ready() {
+                                ClientResult::NothingToDo => {}
+                                ClientResult::NewRequest(request) => {
+                                    server.handle_request(request, client);
+                                }
+                                ClientResult::CloseSession => {
+                                    println!("Closing client {client:#?}");
+                                    self.clients.remove(&token);
+                                }
+                            }
+                        }
+                        if let Some(worker) = self.worker_sessions.get_mut(&token) {
+                            worker.update_readiness(Ready::from(event));
+                            match worker.ready() {
+                                WorkerResult::NothingToDo => {}
+                                WorkerResult::NewResponse(response) => {
+                                    self.handle_response(response);
+                                }
+                                WorkerResult::CloseSession => {
+                                    self.worker_sessions.remove(&token);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_response(&mut self, response: WorkerResponse) {
+        let Some(token) = self.in_flight.remove(&response.id) else { return; };
+        let Some((server, client)) = self.get_client_mut(&token) else { return; };
+        let SessionState::Gathering { responses, .. } = &mut client.state else { return; };
+
+        responses.worker_responses.push(response);
+        if responses.worker_responses.len() >= responses.expected_worker_responses {
+            let SessionState::Gathering {
+                responses,
+                mut callback
+            } = std::mem::replace(&mut client.state, SessionState::Finishing) else { return; };
+            server.tick_later(client.token);
+            callback.gather(server, client, responses);
+        }
+    }
+}
+
+impl Server {
     fn new(mut unix_listener: UnixListener) -> anyhow::Result<Self> {
         let poll = mio::Poll::new().with_context(|| "Poll::new() failed")?;
         poll.registry()
@@ -229,13 +416,13 @@ impl CommandServer {
             .with_context(|| "should register the channel")?;
 
         Ok(Self {
-            client_sessions: HashMap::new(),
             in_flight: HashMap::new(),
             next_client_id: 0,
             next_session_token: 1,
             poll,
             unix_listener,
             worker_sessions: HashMap::new(),
+            sessions_to_tick: HashSet::new(),
         })
     }
 
@@ -265,95 +452,18 @@ impl CommandServer {
     ) {
         let token = self.next_session_token();
         self.register(token, &mut channel.sock);
-        self.worker_sessions.insert(
-            token,
-            WorkerSession {
-                channel,
-                id,
-                pid,
-                run_state: RunState::Running,
-                token,
-            },
-        );
+        self.worker_sessions
+            .insert(token, WorkerSession::new(channel, id, pid, token));
     }
 
-    fn run(&mut self) -> ! {
-        let mut events = Events::with_capacity(100);
-        println!("{self:#?}");
-
-        loop {
-            events.clear();
-            match self.poll.poll(&mut events, None) {
-                Ok(()) => {}
-                Err(error) => error!("Error while polling: {:?}", error),
-            }
-
-            for event in &events {
-                match event.token() {
-                    Token(0) => {
-                        if event.is_readable() {
-                            while let Ok((mut stream, addr)) = self.unix_listener.accept() {
-                                info!("New client connected: {:?}", addr);
-                                let token = self.next_session_token();
-                                self.register(token, &mut stream);
-                                let channel = Channel::new(stream, 4096, usize::MAX);
-                                let id = self.next_client_id();
-                                let session = ClientSession {
-                                    id,
-                                    token,
-                                    channel,
-                                    state: SessionState::WaitingForRequest,
-                                };
-                                info!("{:#?}", session);
-                                self.client_sessions.insert(token, session);
-                            }
-                        }
-                    }
-                    token => {
-                        info!("{:?} got event: {:?}", token, event);
-                        if let Some(session) = self.client_sessions.get_mut(&token) {
-                            session.update_readiness(Ready::from(event));
-                            if let Some(request) = session.ready() {
-                                self.handle_request(request, session);
-                            }
-                        }
-                        if let Some(session) = self.worker_sessions.get_mut(&token) {
-                            session.update_readiness(Ready::from(event));
-                            if let Some(response) = session.ready() {
-                                self.handle_response(response, session);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn handle_response(&mut self, response: WorkerResponse, origin: &mut WorkerSession) {
-        let Some(token) = self.in_flight.remove(&response.id) else { return; };
-        let Some(session) = self.client_sessions.get(&token) else { return; };
-        let SessionState::Gathering {
-            gathered_responses,
-            main_response,
-            expected_worker_responses,
-            request_type
-        } = &mut session.state else { return; };
-
-        gathered_responses.push(response);
-        if gathered_responses.len() >= *expected_worker_responses {
-            self.finish_session(session);
-        }
-    }
-
-    fn handle_request(&mut self, request: Request, origin: &mut ClientSession) {
+    fn handle_request(&mut self, request: Request, client: &mut ClientSession) {
         let request_type = request.request_type.unwrap();
         match request_type {
             RequestType::SaveState(_) => todo!(),
             RequestType::LoadState(_) => todo!(),
             RequestType::ListWorkers(_) => todo!(),
-            RequestType::ListFrontends(_) => {
-                let response = self.query_main(request_type).ok();
-                origin.finish_ok(response);
+            RequestType::ListFrontends(inner) => {
+                requests::list_frontend_command(self, client, inner);
             }
             RequestType::ListListeners(_) => todo!(),
             RequestType::LaunchWorker(_) => todo!(),
@@ -383,9 +493,8 @@ impl CommandServer {
             RequestType::DeactivateListener(_) => todo!(),
             RequestType::QueryClusterById(_) => todo!(),
             RequestType::QueryClustersByDomain(_) => todo!(),
-            RequestType::QueryClustersHashes(_) => {
-                origin.main_response = self.query_main(request_type).ok();
-                self.scatter(origin, request);
+            RequestType::QueryClustersHashes(inner) => {
+                requests::query_cluster_hashes(self, client, inner);
             }
             RequestType::QueryMetrics(_) => todo!(),
             RequestType::SoftStop(_) => todo!(),
@@ -397,99 +506,61 @@ impl CommandServer {
             RequestType::QueryCertificatesFromWorkers(_) => todo!(),
             RequestType::CountRequests(_) => todo!(),
         }
+
+        self.tick_later(client.token);
     }
 
-    fn finish_session(&mut self, session: &mut ClientSession) {
-        let SessionState::Gathering {
-            gathered_responses,
-            main_response,
-            expected_worker_responses,
-            request_type
-        } = &mut session.state else { return; };
-        match request_type {
-            RequestType::SaveState(_) => todo!(),
-            RequestType::LoadState(_) => todo!(),
-            RequestType::ListWorkers(_) => todo!(),
-            RequestType::ListFrontends(_) => todo!(),
-            RequestType::ListListeners(_) => todo!(),
-            RequestType::LaunchWorker(_) => todo!(),
-            RequestType::UpgradeMain(_) => todo!(),
-            RequestType::UpgradeWorker(_) => todo!(),
-            RequestType::SubscribeEvents(_) => todo!(),
-            RequestType::ReloadConfiguration(_) => todo!(),
-            RequestType::Status(_) => todo!(),
-            RequestType::AddCluster(_) => todo!(),
-            RequestType::RemoveCluster(_) => todo!(),
-            RequestType::AddHttpFrontend(_) => todo!(),
-            RequestType::RemoveHttpFrontend(_) => todo!(),
-            RequestType::AddHttpsFrontend(_) => todo!(),
-            RequestType::RemoveHttpsFrontend(_) => todo!(),
-            RequestType::AddCertificate(_) => todo!(),
-            RequestType::ReplaceCertificate(_) => todo!(),
-            RequestType::RemoveCertificate(_) => todo!(),
-            RequestType::AddTcpFrontend(_) => todo!(),
-            RequestType::RemoveTcpFrontend(_) => todo!(),
-            RequestType::AddBackend(_) => todo!(),
-            RequestType::RemoveBackend(_) => todo!(),
-            RequestType::AddHttpListener(_) => todo!(),
-            RequestType::AddHttpsListener(_) => todo!(),
-            RequestType::AddTcpListener(_) => todo!(),
-            RequestType::RemoveListener(_) => todo!(),
-            RequestType::ActivateListener(_) => todo!(),
-            RequestType::DeactivateListener(_) => todo!(),
-            RequestType::QueryClusterById(_) => todo!(),
-            RequestType::QueryClustersByDomain(_) => todo!(),
-            RequestType::QueryClustersHashes(_) => todo!(),
-            RequestType::QueryMetrics(_) => todo!(),
-            RequestType::SoftStop(_) => todo!(),
-            RequestType::HardStop(_) => todo!(),
-            RequestType::ConfigureMetrics(_) => todo!(),
-            RequestType::Logging(_) => todo!(),
-            RequestType::ReturnListenSockets(_) => todo!(),
-            RequestType::QueryCertificatesFromTheState(_) => todo!(),
-            RequestType::QueryCertificatesFromWorkers(_) => todo!(),
-            RequestType::CountRequests(_) => todo!(),
-        }
-    }
-
-    fn scatter(&mut self, client: &mut ClientSession, request: Request) {
+    fn scatter<S: Into<String>>(
+        &mut self,
+        message: S,
+        client: &mut ClientSession,
+        request: Request,
+        callback: Box<dyn GatheringCallback>,
+    ) {
+        client.return_processing(message);
         let mut worker_count = 0;
-        for worker in self
-            .worker_sessions
-            .values()
+        let mut worker_request = WorkerRequest {
+            id: String::new(),
+            content: request,
+        };
+        let Server {
+            worker_sessions,
+            in_flight,
+            sessions_to_tick,
+            ..
+        } = self;
+
+        for worker in worker_sessions
+            .values_mut()
             .filter(|w| w.run_state == RunState::Running)
         {
             worker_count += 1;
-            let req_id = format!("{}-query-{}", client.id, worker.id);
-            self.in_flight.insert(req_id, client.token);
+            worker_request.id = format!("{}-query-{}", client.id, worker.id);
+            in_flight.insert(worker_request.id.clone(), client.token);
+            println!("Sending to worker: {worker_request:?}");
             worker
                 .channel
-                .write_message(&WorkerRequest {
-                    id: req_id,
-                    content: request,
-                })
+                .write_message(&worker_request)
                 .expect("could not send request on worker");
+            sessions_to_tick.insert(worker.token);
         }
-        client.expected_worker_responses = worker_count;
-        client.request_type = request.request_type.unwrap();
+
+        let request_type = worker_request.content.request_type.unwrap();
+        client.state = SessionState::Gathering {
+            responses: GatheredResponses {
+                worker_responses: Vec::with_capacity(worker_count),
+                main_response: self.query_main(&request_type).unwrap(),
+                expected_worker_responses: worker_count,
+            },
+            callback,
+        };
     }
 
-    fn query_main(&self, request: RequestType) -> Result<ResponseContent, ()> {
-        todo!()
+    fn query_main(&self, request: &RequestType) -> Result<Option<ResponseContent>, ()> {
+        Ok(None)
+    }
+
+    fn tick_later(&mut self, token: Token) {
+        self.sessions_to_tick.insert(token);
     }
 }
-
-// trait Command {
-//     fn on_request(ctx: &mut CommandServer, request: Request, origin: &mut ClientSession);
-//     fn on_finish() {
-//         unreachable!()
-//     }
-// }
-
-// struct Status {}
-
-// impl Command for Status {
-//     fn on_request(ctx: &mut CommandServer, request: Request, origin: &mut ClientSession) {
-//         ctx.scatter(client, request);
-//     }
-// }
