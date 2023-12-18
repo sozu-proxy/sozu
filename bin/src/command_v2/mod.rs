@@ -30,34 +30,57 @@ use crate::worker::Worker;
 
 mod requests;
 
-/// This trait is used for command that need to wait for worker responses
-pub trait GatheringCallback: std::fmt::Debug {
-    /// This is called once every worker has answered
-    /// It allows to operate both on the server (lauch workers...) and the client (send an answer...)
-    fn gather(
+#[allow(unused)]
+pub trait Gatherer {
+    fn add_expected_responses(&mut self, count: usize);
+    fn on_message(
         &mut self,
         server: &mut Server,
         client: &mut ClientSession,
-        gathered_responses: GatheredResponses,
-    );
+        message: WorkerResponse,
+    ) -> bool {
+        unimplemented!("The parent task expected no client");
+    }
+    fn on_message_no_client(&mut self, server: &mut Server, message: WorkerResponse) -> bool {
+        unimplemented!("The parent task expected a client");
+    }
 }
 
-#[derive(Debug)]
-pub struct GatheredResponses {
-    pub worker_responses: Vec<WorkerResponse>,
-    pub main_response: Option<ResponseContent>,
-    pub expected_worker_responses: usize,
+/// This trait is used for command that need to wait for worker responses
+#[allow(unused)]
+pub trait GatheringTask: std::fmt::Debug {
+    fn client_token(&self) -> Option<Token>;
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer;
+    /// This is called once every worker has answered
+    /// It allows to operate both on the server (lauch workers...) and the client (send an answer...)
+    fn on_finish(&mut self, server: &mut Server, client: &mut ClientSession) {}
+    fn on_finish_no_client(&mut self, server: &mut Server) {}
 }
 
-#[derive(Debug)]
-pub enum SessionState {
-    WaitingForRequest,
-    HandlingRequest,
-    Gathering {
-        responses: GatheredResponses,
-        callback: Box<dyn GatheringCallback>,
-    },
-    Finishing,
+#[derive(Debug, Default)]
+pub struct DefaultGatherer {
+    pub responses: Vec<WorkerResponse>,
+    pub expected_responses: usize,
+}
+
+#[allow(unused)]
+impl Gatherer for DefaultGatherer {
+    fn add_expected_responses(&mut self, count: usize) {
+        self.expected_responses += count;
+    }
+    fn on_message(
+        &mut self,
+        server: &mut Server,
+        client: &mut ClientSession,
+        message: WorkerResponse,
+    ) -> bool {
+        self.responses.push(message);
+        self.responses.len() >= self.expected_responses
+    }
+    fn on_message_no_client(&mut self, server: &mut Server, message: WorkerResponse) -> bool {
+        self.responses.push(message);
+        self.responses.len() >= self.expected_responses
+    }
 }
 
 #[derive(Debug)]
@@ -72,23 +95,18 @@ pub struct ClientSession {
     pub channel: Channel<Response, Request>,
     pub id: u32,
     pub token: Token,
-    pub state: SessionState,
 }
 
 impl ClientSession {
     fn new(mut channel: Channel<Response, Request>, id: u32, token: Token) -> Self {
         channel.interest = Ready::READABLE | Ready::ERROR | Ready::HUP;
-        Self {
-            channel,
-            id,
-            token,
-            state: SessionState::WaitingForRequest,
-        }
+        Self { channel, id, token }
     }
+
     fn finish(&mut self, response: Response) {
         println!("Writing message on client channel");
         self.channel.write_message(&response).unwrap();
-        self.state = SessionState::Finishing;
+        self.channel.interest.insert(Ready::WRITABLE);
     }
 
     fn finish_ok(&mut self, content: Option<ResponseContent>) {
@@ -107,7 +125,8 @@ impl ClientSession {
             message,
             content: None,
         };
-        self.channel.write_message(&message).unwrap()
+        self.channel.write_message(&message).unwrap();
+        self.channel.interest.insert(Ready::WRITABLE);
     }
 
     fn update_readiness(&mut self, events: Ready) {
@@ -127,30 +146,14 @@ impl ClientSession {
             return ClientResult::NothingToDo;
         }
 
-        match self.state {
-            SessionState::WaitingForRequest => {
-                let message = self.channel.read_message();
-                println!("Client got request: {message:?}");
-                match message {
-                    Ok(request) => {
-                        self.channel.interest = Ready::WRITABLE | Ready::ERROR | Ready::HUP;
-                        self.state = SessionState::HandlingRequest;
-                        ClientResult::NewRequest(request)
-                    }
-                    Err(error) => {
-                        error!("Client channel read: {:?}", error);
-                        ClientResult::NothingToDo
-                    }
-                }
-            }
-            SessionState::Finishing => {
-                if self.channel.back_buf.available_data() == 0 {
-                    self.channel.interest = Ready::READABLE | Ready::ERROR | Ready::HUP;
-                    self.state = SessionState::WaitingForRequest;
-                }
+        let message = self.channel.read_message();
+        println!("Client got request: {message:?}");
+        match message {
+            Ok(request) => ClientResult::NewRequest(request),
+            Err(error) => {
+                error!("Client channel read: {:?}", error);
                 ClientResult::NothingToDo
             }
-            _ => ClientResult::NothingToDo,
         }
     }
 }
@@ -178,7 +181,7 @@ impl WorkerSession {
         pid: pid_t,
         token: Token,
     ) -> Self {
-        channel.interest = Ready::READABLE | Ready::WRITABLE | Ready::ERROR | Ready::HUP;
+        channel.interest = Ready::READABLE | Ready::ERROR | Ready::HUP;
         Self {
             channel,
             id,
@@ -186,6 +189,12 @@ impl WorkerSession {
             run_state: RunState::Running,
             token,
         }
+    }
+
+    fn send(&mut self, message: &WorkerRequest) {
+        println!("Sending to worker: {message:?}");
+        self.channel.write_message(message).unwrap();
+        self.channel.interest.insert(Ready::WRITABLE);
     }
 
     fn update_readiness(&mut self, events: Ready) {
@@ -210,19 +219,22 @@ impl WorkerSession {
 
 #[derive(Debug)]
 pub struct Server {
-    in_flight: HashMap<String, Token>,
+    in_flight: HashMap<String, usize>,
     next_client_id: u32,
     next_session_token: usize,
+    next_task_id: usize,
     poll: Poll,
+    queued_tasks: HashMap<usize, Box<dyn GatheringTask>>,
     sessions_to_tick: HashSet<Token>,
     unix_listener: UnixListener,
-    worker_sessions: HashMap<Token, WorkerSession>,
+    workers: HashMap<Token, WorkerSession>,
 }
 
 #[derive(Debug)]
 struct CommandHub {
     server: Server,
     clients: HashMap<Token, ClientSession>,
+    tasks: HashMap<usize, Box<dyn GatheringTask>>,
 }
 
 pub fn start_server(
@@ -293,15 +305,15 @@ impl CommandHub {
         Ok(Self {
             server: Server::new(unix_listener)?,
             clients: HashMap::new(),
+            tasks: HashMap::new(),
         })
     }
 
     fn get_client_mut(&mut self, token: &Token) -> Option<(&mut Server, &mut ClientSession)> {
         let Self {
-            server,
-            clients: client_sessions,
+            server, clients, ..
         } = self;
-        if let Some(client) = client_sessions.get_mut(token) {
+        if let Some(client) = clients.get_mut(token) {
             Some((server, client))
         } else {
             None
@@ -313,21 +325,24 @@ impl CommandHub {
         println!("{self:#?}");
 
         loop {
-            println!("Sessions to tick: {:?}", self.sessions_to_tick);
             let CommandHub {
                 server:
                     Server {
-                        worker_sessions,
+                        queued_tasks,
                         sessions_to_tick,
+                        workers,
                         ..
                     },
+                tasks,
                 clients,
             } = self;
+            tasks.extend(queued_tasks.drain());
+
+            println!("Sessions to tick: {:?}", sessions_to_tick);
             for token in sessions_to_tick.drain() {
                 if let Some(client) = clients.get_mut(&token) {
                     client.ready();
-                }
-                if let Some(worker) = worker_sessions.get_mut(&token) {
+                } else if let Some(worker) = workers.get_mut(&token) {
                     worker.ready();
                 }
             }
@@ -361,15 +376,14 @@ impl CommandHub {
                             match client.ready() {
                                 ClientResult::NothingToDo => {}
                                 ClientResult::NewRequest(request) => {
-                                    server.handle_request(request, client);
+                                    server.handle_request(client, request);
                                 }
                                 ClientResult::CloseSession => {
                                     println!("Closing client {client:#?}");
                                     self.clients.remove(&token);
                                 }
                             }
-                        }
-                        if let Some(worker) = self.worker_sessions.get_mut(&token) {
+                        } else if let Some(worker) = self.workers.get_mut(&token) {
                             worker.update_readiness(Ready::from(event));
                             match worker.ready() {
                                 WorkerResult::NothingToDo => {}
@@ -377,7 +391,7 @@ impl CommandHub {
                                     self.handle_response(response);
                                 }
                                 WorkerResult::CloseSession => {
-                                    self.worker_sessions.remove(&token);
+                                    self.workers.remove(&token);
                                 }
                             }
                         }
@@ -388,18 +402,35 @@ impl CommandHub {
     }
 
     fn handle_response(&mut self, response: WorkerResponse) {
-        let Some(token) = self.in_flight.remove(&response.id) else { return; };
-        let Some((server, client)) = self.get_client_mut(&token) else { return; };
-        let SessionState::Gathering { responses, .. } = &mut client.state else { return; };
+        let Some(task_id) = self.in_flight.get(&response.id).copied() else {
+            println!("==========HANDLE_RESPONSE not in flight: {}", response);
+            return;
+        };
+        let CommandHub {
+            server,
+            clients,
+            tasks,
+        } = self;
+        let task = tasks.get_mut(&task_id).unwrap();
 
-        responses.worker_responses.push(response);
-        if responses.worker_responses.len() >= responses.expected_worker_responses {
-            let SessionState::Gathering {
-                responses,
-                mut callback
-            } = std::mem::replace(&mut client.state, SessionState::Finishing) else { return; };
-            server.tick_later(client.token);
-            callback.gather(server, client, responses);
+        if let Some(token) = task.client_token() {
+            let client = clients.get_mut(&token).unwrap();
+            let is_finished = task.get_gatherer().on_message(server, client, response);
+            if is_finished {
+                task.on_finish(server, client);
+                self.tasks.remove(&task_id);
+                self.in_flight.retain(|_, val| *val != task_id);
+            }
+            self.tick_later(token);
+        } else {
+            let is_finished = task
+                .get_gatherer()
+                .on_message_no_client(&mut self.server, response);
+            if is_finished {
+                task.on_finish_no_client(&mut self.server);
+                self.tasks.remove(&task_id);
+                self.in_flight.retain(|_, val| *val != task_id);
+            }
         }
     }
 }
@@ -418,11 +449,13 @@ impl Server {
         Ok(Self {
             in_flight: HashMap::new(),
             next_client_id: 0,
-            next_session_token: 1,
+            next_session_token: 1, // 0 is reserved for the UnixListener
+            next_task_id: 0,
             poll,
-            unix_listener,
-            worker_sessions: HashMap::new(),
+            queued_tasks: HashMap::new(),
             sessions_to_tick: HashSet::new(),
+            unix_listener,
+            workers: HashMap::new(),
         })
     }
 
@@ -434,6 +467,12 @@ impl Server {
     fn next_client_id(&mut self) -> u32 {
         let id = self.next_client_id;
         self.next_client_id += 1;
+        id
+    }
+
+    fn next_task_id(&mut self) -> usize {
+        let id = self.next_task_id;
+        self.next_task_id += 1;
         id
     }
 
@@ -452,11 +491,11 @@ impl Server {
     ) {
         let token = self.next_session_token();
         self.register(token, &mut channel.sock);
-        self.worker_sessions
+        self.workers
             .insert(token, WorkerSession::new(channel, id, pid, token));
     }
 
-    fn handle_request(&mut self, request: Request, client: &mut ClientSession) {
+    fn handle_request(&mut self, client: &mut ClientSession, request: Request) {
         let request_type = request.request_type.unwrap();
         match request_type {
             RequestType::SaveState(_) => todo!(),
@@ -510,54 +549,92 @@ impl Server {
         self.tick_later(client.token);
     }
 
-    fn scatter<S: Into<String>>(
-        &mut self,
-        message: S,
-        client: &mut ClientSession,
-        request: Request,
-        callback: Box<dyn GatheringCallback>,
-    ) {
-        client.return_processing(message);
+    fn query_main(&self, request: &RequestType) -> Result<Option<ResponseContent>, ()> {
+        return Ok(None);
+        match request {
+            RequestType::SaveState(_) => todo!(),
+            RequestType::LoadState(_) => todo!(),
+            RequestType::ListWorkers(_) => todo!(),
+            RequestType::ListFrontends(_) => todo!(),
+            RequestType::ListListeners(_) => todo!(),
+            RequestType::LaunchWorker(_) => todo!(),
+            RequestType::UpgradeMain(_) => todo!(),
+            RequestType::UpgradeWorker(_) => todo!(),
+            RequestType::SubscribeEvents(_) => todo!(),
+            RequestType::ReloadConfiguration(_) => todo!(),
+            RequestType::Status(_) => todo!(),
+            RequestType::AddCluster(_) => todo!(),
+            RequestType::RemoveCluster(_) => todo!(),
+            RequestType::AddHttpFrontend(_) => todo!(),
+            RequestType::RemoveHttpFrontend(_) => todo!(),
+            RequestType::AddHttpsFrontend(_) => todo!(),
+            RequestType::RemoveHttpsFrontend(_) => todo!(),
+            RequestType::AddCertificate(_) => todo!(),
+            RequestType::ReplaceCertificate(_) => todo!(),
+            RequestType::RemoveCertificate(_) => todo!(),
+            RequestType::AddTcpFrontend(_) => todo!(),
+            RequestType::RemoveTcpFrontend(_) => todo!(),
+            RequestType::AddBackend(_) => todo!(),
+            RequestType::RemoveBackend(_) => todo!(),
+            RequestType::AddHttpListener(_) => todo!(),
+            RequestType::AddHttpsListener(_) => todo!(),
+            RequestType::AddTcpListener(_) => todo!(),
+            RequestType::RemoveListener(_) => todo!(),
+            RequestType::ActivateListener(_) => todo!(),
+            RequestType::DeactivateListener(_) => todo!(),
+            RequestType::QueryClusterById(_) => todo!(),
+            RequestType::QueryClustersByDomain(_) => todo!(),
+            RequestType::QueryClustersHashes(_) => todo!(),
+            RequestType::QueryMetrics(_) => todo!(),
+            RequestType::SoftStop(_) => todo!(),
+            RequestType::HardStop(_) => todo!(),
+            RequestType::ConfigureMetrics(_) => todo!(),
+            RequestType::Logging(_) => todo!(),
+            RequestType::ReturnListenSockets(_) => todo!(),
+            RequestType::QueryCertificatesFromTheState(_) => todo!(),
+            RequestType::QueryCertificatesFromWorkers(_) => todo!(),
+            RequestType::CountRequests(_) => todo!(),
+        }
+    }
+
+    fn new_task(&mut self, task: Box<dyn GatheringTask>) -> usize {
+        let task_id = self.next_task_id();
+        self.queued_tasks.insert(task_id, task);
+        task_id
+    }
+
+    fn scatter(&mut self, request: Request, task: Box<dyn GatheringTask>) {
+        let task_id = self.next_task_id();
+        self.queued_tasks.insert(task_id, task);
+        self.scatter_on(request, task_id, 0);
+    }
+
+    fn scatter_on(&mut self, request: Request, task_id: usize, request_id: usize) {
+        let Server {
+            workers,
+            queued_tasks,
+            sessions_to_tick,
+            ..
+        } = self;
+
+        let task = queued_tasks.get_mut(&task_id).unwrap();
+
         let mut worker_count = 0;
         let mut worker_request = WorkerRequest {
             id: String::new(),
             content: request,
         };
-        let Server {
-            worker_sessions,
-            in_flight,
-            sessions_to_tick,
-            ..
-        } = self;
-
-        for worker in worker_sessions
+        for worker in workers
             .values_mut()
             .filter(|w| w.run_state == RunState::Running)
         {
             worker_count += 1;
-            worker_request.id = format!("{}-query-{}", client.id, worker.id);
-            in_flight.insert(worker_request.id.clone(), client.token);
-            println!("Sending to worker: {worker_request:?}");
-            worker
-                .channel
-                .write_message(&worker_request)
-                .expect("could not send request on worker");
+            worker_request.id = format!("{}-{}-query-{}", task_id, request_id, worker.id);
+            worker.send(&worker_request);
+            self.in_flight.insert(worker_request.id, task_id);
             sessions_to_tick.insert(worker.token);
         }
-
-        let request_type = worker_request.content.request_type.unwrap();
-        client.state = SessionState::Gathering {
-            responses: GatheredResponses {
-                worker_responses: Vec::with_capacity(worker_count),
-                main_response: self.query_main(&request_type).unwrap(),
-                expected_worker_responses: worker_count,
-            },
-            callback,
-        };
-    }
-
-    fn query_main(&self, request: &RequestType) -> Result<Option<ResponseContent>, ()> {
-        Ok(None)
+        task.get_gatherer().add_expected_responses(worker_count);
     }
 
     fn tick_later(&mut self, token: Token) {
