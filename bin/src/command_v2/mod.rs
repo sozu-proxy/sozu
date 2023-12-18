@@ -141,6 +141,14 @@ impl ClientSession {
         })
     }
 
+    fn finish_failure<T: Into<String>>(&mut self, error: T) {
+        self.finish(Response {
+            status: ResponseStatus::Failure.into(),
+            message: error.into(),
+            content: None,
+        })
+    }
+
     fn return_processing<S: Into<String>>(&mut self, message: S) {
         let message = message.into();
         println!("Return: {}", message);
@@ -162,7 +170,10 @@ impl ClientSession {
             return ClientResult::CloseSession;
         }
 
-        println!("Running: {:?}", self.token);
+        println!(
+            "Running: {:?}, readiness: {:?}, interest: {:?}",
+            self.token, self.channel.readiness, self.channel.interest
+        );
         let status = self.channel.run();
         println!("{status:?}");
         if let Err(error) = status {
@@ -259,6 +270,9 @@ pub struct Server {
     unix_listener: UnixListener,
     workers: HashMap<Token, WorkerSession>,
     state: ConfigState,
+    frontends_count: usize,
+    backends_count: usize,
+    config: Config,
 }
 
 /// A platform to receive client connections, pass orders to workers,
@@ -313,12 +327,12 @@ pub fn start_server(
     //     bail!("couldn't start server");
     // }
 
-    let mut command_hub = CommandHub::new(unix_listener)?;
+    let mut command_hub = CommandHub::new(unix_listener, config)?;
     for mut worker in workers {
         command_hub.register_worker(worker.id, worker.pid, worker.worker_channel.take().unwrap())
     }
 
-    load_static_config(&mut command_hub.server, &config);
+    load_static_config(&mut command_hub.server);
 
     command_hub.run();
 }
@@ -337,9 +351,9 @@ impl DerefMut for CommandHub {
 }
 
 impl CommandHub {
-    fn new(unix_listener: UnixListener) -> anyhow::Result<Self> {
+    fn new(unix_listener: UnixListener, config: Config) -> anyhow::Result<Self> {
         Ok(Self {
-            server: Server::new(unix_listener)?,
+            server: Server::new(unix_listener, config)?,
             clients: HashMap::new(),
             tasks: HashMap::new(),
         })
@@ -477,7 +491,7 @@ impl CommandHub {
 }
 
 impl Server {
-    fn new(mut unix_listener: UnixListener) -> anyhow::Result<Self> {
+    fn new(mut unix_listener: UnixListener, config: Config) -> anyhow::Result<Self> {
         let poll = mio::Poll::new().with_context(|| "Poll::new() failed")?;
         poll.registry()
             .register(
@@ -498,6 +512,9 @@ impl Server {
             sessions_to_tick: HashSet::new(),
             unix_listener,
             workers: HashMap::new(),
+            frontends_count: 0,
+            backends_count: 0,
+            config,
         })
     }
 
@@ -553,25 +570,27 @@ impl Server {
             RequestType::SubscribeEvents(_) => todo!(),
             RequestType::ReloadConfiguration(_) => todo!(),
             RequestType::Status(_) => todo!(),
-            RequestType::AddCluster(_) => todo!(),
-            RequestType::RemoveCluster(_) => todo!(),
-            RequestType::AddHttpFrontend(_) => todo!(),
-            RequestType::RemoveHttpFrontend(_) => todo!(),
-            RequestType::AddHttpsFrontend(_) => todo!(),
-            RequestType::RemoveHttpsFrontend(_) => todo!(),
-            RequestType::AddCertificate(_) => todo!(),
-            RequestType::ReplaceCertificate(_) => todo!(),
-            RequestType::RemoveCertificate(_) => todo!(),
-            RequestType::AddTcpFrontend(_) => todo!(),
-            RequestType::RemoveTcpFrontend(_) => todo!(),
-            RequestType::AddBackend(_) => todo!(),
-            RequestType::RemoveBackend(_) => todo!(),
-            RequestType::AddHttpListener(_) => todo!(),
-            RequestType::AddHttpsListener(_) => todo!(),
-            RequestType::AddTcpListener(_) => todo!(),
-            RequestType::RemoveListener(_) => todo!(),
-            RequestType::ActivateListener(_) => todo!(),
-            RequestType::DeactivateListener(_) => todo!(),
+            RequestType::AddCluster(_)
+            | RequestType::ActivateListener(_)
+            | RequestType::AddBackend(_)
+            | RequestType::AddCertificate(_)
+            | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpListener(_)
+            | RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsListener(_)
+            | RequestType::AddTcpFrontend(_)
+            | RequestType::AddTcpListener(_)
+            | RequestType::DeactivateListener(_)
+            | RequestType::RemoveBackend(_)
+            | RequestType::RemoveCertificate(_)
+            | RequestType::RemoveCluster(_)
+            | RequestType::RemoveHttpFrontend(_)
+            | RequestType::RemoveHttpsFrontend(_)
+            | RequestType::RemoveListener(_)
+            | RequestType::RemoveTcpFrontend(_)
+            | RequestType::ReplaceCertificate(_) => {
+                requests::worker_request(self, client, request_type);
+            }
             RequestType::QueryClustersHashes(_)
             | RequestType::QueryClustersByDomain(_)
             | RequestType::QueryClusterById(_) => {

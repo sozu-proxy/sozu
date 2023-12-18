@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fs::File};
 
 use mio::Token;
 use sozu_command_lib::{
     config::Config,
     proto::command::{
         request::RequestType, response_content::ContentType, FrontendFilters, QueryClustersHashes,
-        ResponseContent, ResponseStatus, WorkerResponses,
+        Request, ResponseContent, ResponseStatus, WorkerResponses,
     },
     response::WorkerResponse,
 };
@@ -134,14 +134,15 @@ struct LoadStaticConfig {
     pub expected_responses: usize,
 }
 
-pub fn load_static_config(server: &mut Server, config: &Config) {
+pub fn load_static_config(server: &mut Server) {
     let callback = Box::new(LoadStaticConfig {
         ok: 0,
         error: 0,
         expected_responses: 0,
     });
     let task_id = server.new_task(callback);
-    for (request_index, message) in config
+    for (request_index, message) in server
+        .config
         .generate_config_messages()
         .unwrap()
         .into_iter()
@@ -180,6 +181,11 @@ impl GatheringTask for LoadStaticConfig {
                 self.ok, self.error
             );
         }
+        server.backends_count = server.state.count_backends();
+        server.frontends_count = server.state.count_frontends();
+        gauge!("configuration.clusters", server.state.clusters.len());
+        gauge!("configuration.backends", server.backends_count);
+        gauge!("configuration.frontends", server.frontends_count);
     }
 }
 
@@ -210,5 +216,67 @@ impl Gatherer for LoadStaticConfig {
             }
         }
         self.ok + self.error >= self.expected_responses
+    }
+}
+
+// =========================================================
+// Worker request
+
+#[derive(Debug)]
+struct WorkerRequest {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+}
+
+pub fn worker_request(
+    server: &mut Server,
+    client: &mut ClientSession,
+    request_content: RequestType,
+) {
+    let request: Request = request_content.into();
+
+    if let Err(e) = server.state.dispatch(&request) {
+        return client.finish_failure(&format!(
+            "could not dispatch request on the main process state: {e}",
+        ));
+    }
+
+    server.scatter(
+        request,
+        Box::new(WorkerRequest {
+            client_token: client.token,
+            gatherer: DefaultGatherer::default(),
+        }),
+    )
+}
+
+impl GatheringTask for WorkerRequest {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn on_finish(&mut self, _server: &mut Server, client: &mut ClientSession) {
+        let mut messages = vec![];
+        let mut has_error = false;
+
+        for (worker_id, response) in self.gatherer.responses.drain(..) {
+            match response.status {
+                ResponseStatus::Failure => {
+                    messages.push(format!("{}: {}", worker_id, response.message));
+                    has_error = true;
+                }
+                _ => messages.push(format!("{}: OK", worker_id)),
+            }
+        }
+
+        if has_error {
+            client.finish_failure(messages.join(", "));
+        } else {
+            client.finish_ok(None);
+        }
     }
 }

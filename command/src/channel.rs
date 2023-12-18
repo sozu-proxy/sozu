@@ -187,6 +187,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
         let mut count = 0usize;
         loop {
             let size = self.front_buf.available_space();
+            println!("available space: {}", size);
             if size == 0 {
                 self.interest.remove(Ready::READABLE);
                 break;
@@ -284,6 +285,7 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
                     if self.front_buf.capacity() == self.max_buffer_size {
                         error!("command buffer full, cannot grow more, ignoring");
                     } else {
+                        println!("growing channel");
                         let new_size = min(self.front_buf.capacity() + 5000, self.max_buffer_size);
                         self.front_buf.grow(new_size);
                     }
