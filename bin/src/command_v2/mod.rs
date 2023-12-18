@@ -19,29 +19,44 @@ use sozu_command_lib::{
     channel::Channel,
     config::Config,
     proto::command::{
-        request::RequestType, Request, Response, ResponseContent, ResponseStatus, RunState,
+        request::RequestType, response_content::ContentType, ClusterHashes, ClusterInformations,
+        Request, Response, ResponseContent, ResponseStatus, RunState,
     },
     ready::Ready,
     request::WorkerRequest,
     response::WorkerResponse,
+    state::ConfigState,
 };
 
 use crate::worker::Worker;
 
+use self::requests::load_static_config;
+
 mod requests;
 
+///
 #[allow(unused)]
 pub trait Gatherer {
-    fn add_expected_responses(&mut self, count: usize);
+    fn inc_expected_responses(&mut self, count: usize);
+
+    /// Aggregate a response, return true if enough has been gathered
     fn on_message(
         &mut self,
         server: &mut Server,
         client: &mut ClientSession,
+        worker_id: u32,
         message: WorkerResponse,
     ) -> bool {
         unimplemented!("The parent task expected no client");
     }
-    fn on_message_no_client(&mut self, server: &mut Server, message: WorkerResponse) -> bool {
+
+    /// same as on_message but if no client is involved (a CLI, a connector…)
+    fn on_message_no_client(
+        &mut self,
+        server: &mut Server,
+        worker_id: u32,
+        message: WorkerResponse,
+    ) -> bool {
         unimplemented!("The parent task expected a client");
     }
 }
@@ -59,26 +74,34 @@ pub trait GatheringTask: std::fmt::Debug {
 
 #[derive(Debug, Default)]
 pub struct DefaultGatherer {
-    pub responses: Vec<WorkerResponse>,
+    pub responses: Vec<(u32, WorkerResponse)>,
     pub expected_responses: usize,
 }
 
 #[allow(unused)]
 impl Gatherer for DefaultGatherer {
-    fn add_expected_responses(&mut self, count: usize) {
+    fn inc_expected_responses(&mut self, count: usize) {
         self.expected_responses += count;
     }
+
     fn on_message(
         &mut self,
         server: &mut Server,
         client: &mut ClientSession,
+        worker_id: u32,
         message: WorkerResponse,
     ) -> bool {
-        self.responses.push(message);
+        self.responses.push((worker_id, message));
         self.responses.len() >= self.expected_responses
     }
-    fn on_message_no_client(&mut self, server: &mut Server, message: WorkerResponse) -> bool {
-        self.responses.push(message);
+
+    fn on_message_no_client(
+        &mut self,
+        server: &mut Server,
+        worker_id: u32,
+        message: WorkerResponse,
+    ) -> bool {
+        self.responses.push((worker_id, message));
         self.responses.len() >= self.expected_responses
     }
 }
@@ -90,6 +113,7 @@ enum ClientResult {
     CloseSession,
 }
 
+/// Follows a client request from start to finish
 #[derive(Debug)]
 pub struct ClientSession {
     pub channel: Channel<Response, Request>,
@@ -161,10 +185,11 @@ impl ClientSession {
 #[derive(Debug)]
 enum WorkerResult {
     NothingToDo,
-    NewResponse(WorkerResponse),
+    NewResponses(Vec<WorkerResponse>),
     CloseSession,
 }
 
+/// Follow a worker thoughout its lifetime (launching, communitation, softstop/hardstop)
 #[derive(Debug)]
 struct WorkerSession {
     pub channel: Channel<WorkerRequest, WorkerResponse>,
@@ -208,15 +233,20 @@ impl WorkerSession {
 
         let status = self.channel.run();
         println!("{status:?}");
-        let message = self.channel.read_message();
-        println!("{message:?}");
-        match message {
-            Ok(message) => WorkerResult::NewResponse(message),
-            Err(_) => WorkerResult::NothingToDo,
+        let mut responses = Vec::new();
+        while let Ok(response) = self.channel.read_message() {
+            responses.push(response);
         }
+        println!("{responses:?}");
+        if responses.is_empty() {
+            return WorkerResult::NothingToDo;
+        }
+
+        WorkerResult::NewResponses(responses)
     }
 }
 
+/// Manages workers
 #[derive(Debug)]
 pub struct Server {
     in_flight: HashMap<String, usize>,
@@ -228,8 +258,11 @@ pub struct Server {
     sessions_to_tick: HashSet<Token>,
     unix_listener: UnixListener,
     workers: HashMap<Token, WorkerSession>,
+    state: ConfigState,
 }
 
+/// A platform to receive client connections, pass orders to workers,
+/// gather data, etc.
 #[derive(Debug)]
 struct CommandHub {
     server: Server,
@@ -280,11 +313,14 @@ pub fn start_server(
     //     bail!("couldn't start server");
     // }
 
-    let mut command_server = CommandHub::new(unix_listener)?;
+    let mut command_hub = CommandHub::new(unix_listener)?;
     for mut worker in workers {
-        command_server.register_worker(worker.id, worker.pid, worker.worker_channel.take().unwrap())
+        command_hub.register_worker(worker.id, worker.pid, worker.worker_channel.take().unwrap())
     }
-    command_server.run();
+
+    load_static_config(&mut command_hub.server, &config);
+
+    command_hub.run();
 }
 
 impl Deref for CommandHub {
@@ -385,10 +421,13 @@ impl CommandHub {
                             }
                         } else if let Some(worker) = self.workers.get_mut(&token) {
                             worker.update_readiness(Ready::from(event));
+                            let worker_id = worker.id;
                             match worker.ready() {
                                 WorkerResult::NothingToDo => {}
-                                WorkerResult::NewResponse(response) => {
-                                    self.handle_response(response);
+                                WorkerResult::NewResponses(responses) => {
+                                    for response in responses {
+                                        self.handle_response(worker_id, response);
+                                    }
                                 }
                                 WorkerResult::CloseSession => {
                                     self.workers.remove(&token);
@@ -401,7 +440,7 @@ impl CommandHub {
         }
     }
 
-    fn handle_response(&mut self, response: WorkerResponse) {
+    fn handle_response(&mut self, worker_id: u32, response: WorkerResponse) {
         let Some(task_id) = self.in_flight.get(&response.id).copied() else {
             println!("==========HANDLE_RESPONSE not in flight: {}", response);
             return;
@@ -415,7 +454,9 @@ impl CommandHub {
 
         if let Some(token) = task.client_token() {
             let client = clients.get_mut(&token).unwrap();
-            let is_finished = task.get_gatherer().on_message(server, client, response);
+            let is_finished = task
+                .get_gatherer()
+                .on_message(server, client, worker_id, response);
             if is_finished {
                 task.on_finish(server, client);
                 self.tasks.remove(&task_id);
@@ -423,9 +464,9 @@ impl CommandHub {
             }
             self.tick_later(token);
         } else {
-            let is_finished = task
-                .get_gatherer()
-                .on_message_no_client(&mut self.server, response);
+            let is_finished =
+                task.get_gatherer()
+                    .on_message_no_client(&mut self.server, worker_id, response);
             if is_finished {
                 task.on_finish_no_client(&mut self.server);
                 self.tasks.remove(&task_id);
@@ -452,6 +493,7 @@ impl Server {
             next_session_token: 1, // 0 is reserved for the UnixListener
             next_task_id: 0,
             poll,
+            state: Default::default(),
             queued_tasks: HashMap::new(),
             sessions_to_tick: HashSet::new(),
             unix_listener,
@@ -530,10 +572,10 @@ impl Server {
             RequestType::RemoveListener(_) => todo!(),
             RequestType::ActivateListener(_) => todo!(),
             RequestType::DeactivateListener(_) => todo!(),
-            RequestType::QueryClusterById(_) => todo!(),
-            RequestType::QueryClustersByDomain(_) => todo!(),
-            RequestType::QueryClustersHashes(inner) => {
-                requests::query_cluster_hashes(self, client, inner);
+            RequestType::QueryClustersHashes(_)
+            | RequestType::QueryClustersByDomain(_)
+            | RequestType::QueryClusterById(_) => {
+                requests::query_clusters(self, client, request_type);
             }
             RequestType::QueryMetrics(_) => todo!(),
             RequestType::SoftStop(_) => todo!(),
@@ -550,50 +592,71 @@ impl Server {
     }
 
     fn query_main(&self, request: &RequestType) -> Result<Option<ResponseContent>, ()> {
-        return Ok(None);
         match request {
-            RequestType::SaveState(_) => todo!(),
-            RequestType::LoadState(_) => todo!(),
-            RequestType::ListWorkers(_) => todo!(),
-            RequestType::ListFrontends(_) => todo!(),
-            RequestType::ListListeners(_) => todo!(),
-            RequestType::LaunchWorker(_) => todo!(),
-            RequestType::UpgradeMain(_) => todo!(),
-            RequestType::UpgradeWorker(_) => todo!(),
-            RequestType::SubscribeEvents(_) => todo!(),
-            RequestType::ReloadConfiguration(_) => todo!(),
-            RequestType::Status(_) => todo!(),
-            RequestType::AddCluster(_) => todo!(),
-            RequestType::RemoveCluster(_) => todo!(),
-            RequestType::AddHttpFrontend(_) => todo!(),
-            RequestType::RemoveHttpFrontend(_) => todo!(),
-            RequestType::AddHttpsFrontend(_) => todo!(),
-            RequestType::RemoveHttpsFrontend(_) => todo!(),
-            RequestType::AddCertificate(_) => todo!(),
-            RequestType::ReplaceCertificate(_) => todo!(),
-            RequestType::RemoveCertificate(_) => todo!(),
-            RequestType::AddTcpFrontend(_) => todo!(),
-            RequestType::RemoveTcpFrontend(_) => todo!(),
-            RequestType::AddBackend(_) => todo!(),
-            RequestType::RemoveBackend(_) => todo!(),
-            RequestType::AddHttpListener(_) => todo!(),
-            RequestType::AddHttpsListener(_) => todo!(),
-            RequestType::AddTcpListener(_) => todo!(),
-            RequestType::RemoveListener(_) => todo!(),
-            RequestType::ActivateListener(_) => todo!(),
-            RequestType::DeactivateListener(_) => todo!(),
-            RequestType::QueryClusterById(_) => todo!(),
-            RequestType::QueryClustersByDomain(_) => todo!(),
-            RequestType::QueryClustersHashes(_) => todo!(),
-            RequestType::QueryMetrics(_) => todo!(),
-            RequestType::SoftStop(_) => todo!(),
-            RequestType::HardStop(_) => todo!(),
-            RequestType::ConfigureMetrics(_) => todo!(),
-            RequestType::Logging(_) => todo!(),
-            RequestType::ReturnListenSockets(_) => todo!(),
-            RequestType::QueryCertificatesFromTheState(_) => todo!(),
-            RequestType::QueryCertificatesFromWorkers(_) => todo!(),
-            RequestType::CountRequests(_) => todo!(),
+            // RequestType::SaveState(_) => todo!(),
+            // RequestType::LoadState(_) => todo!(),
+            // RequestType::ListWorkers(_) => todo!(),
+            // RequestType::ListFrontends(_) => todo!(),
+            // RequestType::ListListeners(_) => todo!(),
+            // RequestType::LaunchWorker(_) => todo!(),
+            // RequestType::UpgradeMain(_) => todo!(),
+            // RequestType::UpgradeWorker(_) => todo!(),
+            // RequestType::SubscribeEvents(_) => todo!(),
+            // RequestType::ReloadConfiguration(_) => todo!(),
+            // RequestType::Status(_) => todo!(),
+            // RequestType::AddCluster(_) => todo!(),
+            // RequestType::RemoveCluster(_) => todo!(),
+            // RequestType::AddHttpFrontend(_) => todo!(),
+            // RequestType::RemoveHttpFrontend(_) => todo!(),
+            // RequestType::AddHttpsFrontend(_) => todo!(),
+            // RequestType::RemoveHttpsFrontend(_) => todo!(),
+            // RequestType::AddCertificate(_) => todo!(),
+            // RequestType::ReplaceCertificate(_) => todo!(),
+            // RequestType::RemoveCertificate(_) => todo!(),
+            // RequestType::AddTcpFrontend(_) => todo!(),
+            // RequestType::RemoveTcpFrontend(_) => todo!(),
+            // RequestType::AddBackend(_) => todo!(),
+            // RequestType::RemoveBackend(_) => todo!(),
+            // RequestType::AddHttpListener(_) => todo!(),
+            // RequestType::AddHttpsListener(_) => todo!(),
+            // RequestType::AddTcpListener(_) => todo!(),
+            // RequestType::RemoveListener(_) => todo!(),
+            // RequestType::ActivateListener(_) => todo!(),
+            // RequestType::DeactivateListener(_) => todo!(),
+            RequestType::QueryClusterById(cluster_id) => Ok(Some(
+                ContentType::Clusters(ClusterInformations {
+                    vec: self.state.cluster_state(cluster_id).into_iter().collect(),
+                })
+                .into(),
+            )),
+            RequestType::QueryClustersByDomain(domain) => {
+                let cluster_ids = self
+                    .state
+                    .get_cluster_ids_by_domain(domain.hostname.clone(), domain.path.clone());
+                let vec = cluster_ids
+                    .iter()
+                    .filter_map(|cluster_id| self.state.cluster_state(cluster_id))
+                    .collect();
+                Ok(Some(
+                    ContentType::Clusters(ClusterInformations { vec }).into(),
+                ))
+            }
+            RequestType::QueryClustersHashes(_) => Ok(Some(
+                ContentType::ClusterHashes(ClusterHashes {
+                    map: self.state.hash_state(),
+                })
+                .into(),
+            )),
+            // RequestType::QueryMetrics(_) => todo!(),
+            // RequestType::SoftStop(_) => todo!(),
+            // RequestType::HardStop(_) => todo!(),
+            // RequestType::ConfigureMetrics(_) => todo!(),
+            // RequestType::Logging(_) => todo!(),
+            // RequestType::ReturnListenSockets(_) => todo!(),
+            // RequestType::QueryCertificatesFromTheState(_) => todo!(),
+            // RequestType::QueryCertificatesFromWorkers(_) => todo!(),
+            // RequestType::CountRequests(_) => todo!(),
+            _ => Ok(None),
         }
     }
 
@@ -634,7 +697,7 @@ impl Server {
             self.in_flight.insert(worker_request.id, task_id);
             sessions_to_tick.insert(worker.token);
         }
-        task.get_gatherer().add_expected_responses(worker_count);
+        task.get_gatherer().inc_expected_responses(worker_count);
     }
 
     fn tick_later(&mut self, token: Token) {
