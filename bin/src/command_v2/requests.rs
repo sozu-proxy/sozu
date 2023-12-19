@@ -27,7 +27,7 @@ impl Server {
     pub fn handle_request(&mut self, client: &mut ClientSession, request: Request) {
         let request_type = request.request_type.unwrap();
         match request_type {
-            RequestType::SaveState(path) => todo!(),
+            RequestType::SaveState(path) => save_state(self, client, &path),
             // RequestType::LoadState(path) => load_state(self, client, &path),
             RequestType::LoadState(_path) => todo!(),
 
@@ -151,7 +151,7 @@ impl Server {
 }
 
 //===============================================
-// List frontends
+// non-scattered commands
 
 pub fn list_frontend_command(
     server: &mut Server,
@@ -183,6 +183,19 @@ fn list_workers(server: &mut Server, client: &mut ClientSession) {
 fn list_listeners(server: &mut Server, client: &mut ClientSession) {
     let vec = server.state.list_listeners();
     client.finish_ok(Some(ContentType::ListenersList(vec).into()));
+}
+
+fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
+    let mut file = File::create(path).expect(&format!("could not open file at path: {}", &path));
+
+    let counter = server
+        .state
+        .write_requests_to_file(&mut file)
+        .expect("failed writing state to file");
+
+    info!("wrote {} commands to {}", counter, path);
+
+    client.finish_ok_message(format!("saved {counter} config messages to {path}"));
 }
 
 //===============================================
@@ -398,6 +411,9 @@ impl GatheringTask for WorkerRequestCommand {
         }
     }
 }
+
+// =========================================================
+// Save state
 
 // =========================================================
 // Load state

@@ -47,6 +47,14 @@ impl ClientSession {
         })
     }
 
+    pub fn finish_ok_message<T: Into<String>>(&mut self, message: T) {
+        self.finish(Response {
+            status: ResponseStatus::Ok.into(),
+            message: message.into(),
+            content: None,
+        })
+    }
+
     pub fn finish_failure<T: Into<String>>(&mut self, error: T) {
         self.finish(Response {
             status: ResponseStatus::Failure.into(),
