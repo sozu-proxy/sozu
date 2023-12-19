@@ -1,11 +1,10 @@
-use std::{collections::BTreeMap, fs::File};
+use std::collections::BTreeMap;
 
 use mio::Token;
 use sozu_command_lib::{
-    config::Config,
     proto::command::{
-        request::RequestType, response_content::ContentType, FrontendFilters, QueryClustersHashes,
-        Request, ResponseContent, ResponseStatus, WorkerResponses,
+        request::RequestType, response_content::ContentType, FrontendFilters, Request,
+        ResponseContent, ResponseStatus, WorkerResponses,
     },
     response::WorkerResponse,
 };
@@ -62,11 +61,11 @@ impl GatheringTask for QueryClustersCommand {
         &mut self.gatherer
     }
 
-    fn on_finish(&mut self, server: &mut Server, client: &mut ClientSession) {
+    fn on_finish(self: Box<Self>, server: &mut Server, client: &mut ClientSession) {
         let mut worker_responses: BTreeMap<String, ResponseContent> = self
             .gatherer
             .responses
-            .drain(..)
+            .into_iter()
             .filter_map(|(worker_id, proxy_response)| {
                 proxy_response
                     .content
@@ -83,44 +82,6 @@ impl GatheringTask for QueryClustersCommand {
             })
             .into(),
         ));
-    }
-}
-
-//===============================================
-// Query clusters
-
-#[derive(Debug)]
-pub struct QueryClustersByIdCommand {
-    pub client_token: Token,
-    pub data: QueryClustersHashes,
-    pub gatherer: DefaultGatherer,
-}
-
-pub fn query_cluster_hashes(
-    server: &mut Server,
-    client: &mut ClientSession,
-    data: QueryClustersHashes,
-) {
-    let task = Box::new(QueryClustersByIdCommand {
-        client_token: client.token,
-        data: data.clone(),
-        gatherer: DefaultGatherer::default(),
-    });
-    client.return_processing("Querying cluster hashes...");
-    server.scatter(RequestType::QueryClustersHashes(data).into(), task)
-}
-
-impl GatheringTask for QueryClustersByIdCommand {
-    fn client_token(&self) -> Option<Token> {
-        Some(self.client_token)
-    }
-
-    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
-        &mut self.gatherer
-    }
-
-    fn on_finish(&mut self, server: &mut Server, client: &mut ClientSession) {
-        client.finish_ok(None);
     }
 }
 
@@ -172,7 +133,7 @@ impl GatheringTask for LoadStaticConfig {
         self
     }
 
-    fn on_finish_no_client(&mut self, server: &mut Server) {
+    fn on_finish_no_client(self: Box<Self>, server: &mut Server) {
         if self.error == 0 {
             info!("loading state: {} ok messages, 0 errors", self.ok);
         } else {
@@ -259,11 +220,11 @@ impl GatheringTask for WorkerRequest {
         &mut self.gatherer
     }
 
-    fn on_finish(&mut self, _server: &mut Server, client: &mut ClientSession) {
+    fn on_finish(self: Box<Self>, _server: &mut Server, client: &mut ClientSession) {
         let mut messages = vec![];
         let mut has_error = false;
 
-        for (worker_id, response) in self.gatherer.responses.drain(..) {
+        for (worker_id, response) in self.gatherer.responses {
             match response.status {
                 ResponseStatus::Failure => {
                     messages.push(format!("{}: {}", worker_id, response.message));

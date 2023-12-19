@@ -68,8 +68,8 @@ pub trait GatheringTask: std::fmt::Debug {
     fn get_gatherer(&mut self) -> &mut dyn Gatherer;
     /// This is called once every worker has answered
     /// It allows to operate both on the server (lauch workers...) and the client (send an answer...)
-    fn on_finish(&mut self, server: &mut Server, client: &mut ClientSession) {}
-    fn on_finish_no_client(&mut self, server: &mut Server) {}
+    fn on_finish(self: Box<Self>, server: &mut Server, client: &mut ClientSession) {}
+    fn on_finish_no_client(self: Box<Self>, server: &mut Server) {}
 }
 
 #[derive(Debug, Default)]
@@ -472,8 +472,8 @@ impl CommandHub {
                 .get_gatherer()
                 .on_message(server, client, worker_id, response);
             if is_finished {
+                let task = self.tasks.remove(&task_id).unwrap();
                 task.on_finish(server, client);
-                self.tasks.remove(&task_id);
                 self.in_flight.retain(|_, val| *val != task_id);
             }
             self.tick_later(token);
@@ -482,8 +482,8 @@ impl CommandHub {
                 task.get_gatherer()
                     .on_message_no_client(&mut self.server, worker_id, response);
             if is_finished {
+                let task = self.tasks.remove(&task_id).unwrap();
                 task.on_finish_no_client(&mut self.server);
-                self.tasks.remove(&task_id);
                 self.in_flight.retain(|_, val| *val != task_id);
             }
         }
