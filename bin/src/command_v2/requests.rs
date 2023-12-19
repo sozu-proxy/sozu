@@ -25,7 +25,7 @@ impl Server {
             RequestType::ListFrontends(inner) => {
                 list_frontend_command(self, client, inner);
             }
-            RequestType::ListListeners(_) => todo!(),
+            RequestType::ListListeners(_) => list_listeners(self, client),
             RequestType::LaunchWorker(_) => todo!(),
             RequestType::UpgradeMain(_) => todo!(),
             RequestType::UpgradeWorker(_) => todo!(),
@@ -170,6 +170,11 @@ fn list_workers(server: &mut Server, client: &mut ClientSession) {
     debug!("workers: {:#?}", vec);
 
     client.finish_ok(Some(ContentType::Workers(WorkerInfos { vec }).into()));
+}
+
+fn list_listeners(server: &mut Server, client: &mut ClientSession) {
+    let vec = server.state.list_listeners();
+    client.finish_ok(Some(ContentType::ListenersList(vec).into()));
 }
 
 //===============================================
