@@ -3,13 +3,143 @@ use std::collections::BTreeMap;
 use mio::Token;
 use sozu_command_lib::{
     proto::command::{
-        request::RequestType, response_content::ContentType, FrontendFilters, Request,
-        ResponseContent, ResponseStatus, WorkerResponses,
+        request::RequestType, response_content::ContentType, ClusterHashes, ClusterInformations,
+        FrontendFilters, Request, ResponseContent, ResponseStatus, WorkerResponses,
     },
     response::WorkerResponse,
 };
 
-use crate::command_v2::{ClientSession, DefaultGatherer, Gatherer, GatheringTask, Server};
+use crate::command_v2::{
+    server::{DefaultGatherer, Gatherer, GatheringTask, Server},
+    ClientSession,
+};
+
+impl Server {
+    pub fn handle_request(&mut self, client: &mut ClientSession, request: Request) {
+        let request_type = request.request_type.unwrap();
+        match request_type {
+            RequestType::SaveState(_) => todo!(),
+            RequestType::LoadState(_) => todo!(),
+            RequestType::ListWorkers(_) => todo!(),
+            RequestType::ListFrontends(inner) => {
+                list_frontend_command(self, client, inner);
+            }
+            RequestType::ListListeners(_) => todo!(),
+            RequestType::LaunchWorker(_) => todo!(),
+            RequestType::UpgradeMain(_) => todo!(),
+            RequestType::UpgradeWorker(_) => todo!(),
+            RequestType::SubscribeEvents(_) => todo!(),
+            RequestType::ReloadConfiguration(_) => todo!(),
+            RequestType::Status(_) => todo!(),
+            RequestType::AddCluster(_)
+            | RequestType::ActivateListener(_)
+            | RequestType::AddBackend(_)
+            | RequestType::AddCertificate(_)
+            | RequestType::AddHttpFrontend(_)
+            | RequestType::AddHttpListener(_)
+            | RequestType::AddHttpsFrontend(_)
+            | RequestType::AddHttpsListener(_)
+            | RequestType::AddTcpFrontend(_)
+            | RequestType::AddTcpListener(_)
+            | RequestType::DeactivateListener(_)
+            | RequestType::RemoveBackend(_)
+            | RequestType::RemoveCertificate(_)
+            | RequestType::RemoveCluster(_)
+            | RequestType::RemoveHttpFrontend(_)
+            | RequestType::RemoveHttpsFrontend(_)
+            | RequestType::RemoveListener(_)
+            | RequestType::RemoveTcpFrontend(_)
+            | RequestType::ReplaceCertificate(_) => {
+                worker_request(self, client, request_type);
+            }
+            RequestType::QueryClustersHashes(_)
+            | RequestType::QueryClustersByDomain(_)
+            | RequestType::QueryClusterById(_) => {
+                query_clusters(self, client, request_type);
+            }
+            RequestType::QueryMetrics(_) => todo!(),
+            RequestType::SoftStop(_) => todo!(),
+            RequestType::HardStop(_) => todo!(),
+            RequestType::ConfigureMetrics(_) => todo!(),
+            RequestType::Logging(_) => todo!(),
+            RequestType::ReturnListenSockets(_) => todo!(),
+            RequestType::QueryCertificatesFromTheState(_) => todo!(),
+            RequestType::QueryCertificatesFromWorkers(_) => todo!(),
+            RequestType::CountRequests(_) => todo!(),
+        }
+
+        self.tick_later(client.token);
+    }
+
+    fn query_main(&self, request: &RequestType) -> Result<Option<ResponseContent>, ()> {
+        match request {
+            // RequestType::SaveState(_) => todo!(),
+            // RequestType::LoadState(_) => todo!(),
+            // RequestType::ListWorkers(_) => todo!(),
+            // RequestType::ListFrontends(_) => todo!(),
+            // RequestType::ListListeners(_) => todo!(),
+            // RequestType::LaunchWorker(_) => todo!(),
+            // RequestType::UpgradeMain(_) => todo!(),
+            // RequestType::UpgradeWorker(_) => todo!(),
+            // RequestType::SubscribeEvents(_) => todo!(),
+            // RequestType::ReloadConfiguration(_) => todo!(),
+            // RequestType::Status(_) => todo!(),
+            // RequestType::AddCluster(_) => todo!(),
+            // RequestType::RemoveCluster(_) => todo!(),
+            // RequestType::AddHttpFrontend(_) => todo!(),
+            // RequestType::RemoveHttpFrontend(_) => todo!(),
+            // RequestType::AddHttpsFrontend(_) => todo!(),
+            // RequestType::RemoveHttpsFrontend(_) => todo!(),
+            // RequestType::AddCertificate(_) => todo!(),
+            // RequestType::ReplaceCertificate(_) => todo!(),
+            // RequestType::RemoveCertificate(_) => todo!(),
+            // RequestType::AddTcpFrontend(_) => todo!(),
+            // RequestType::RemoveTcpFrontend(_) => todo!(),
+            // RequestType::AddBackend(_) => todo!(),
+            // RequestType::RemoveBackend(_) => todo!(),
+            // RequestType::AddHttpListener(_) => todo!(),
+            // RequestType::AddHttpsListener(_) => todo!(),
+            // RequestType::AddTcpListener(_) => todo!(),
+            // RequestType::RemoveListener(_) => todo!(),
+            // RequestType::ActivateListener(_) => todo!(),
+            // RequestType::DeactivateListener(_) => todo!(),
+            RequestType::QueryClusterById(cluster_id) => Ok(Some(
+                ContentType::Clusters(ClusterInformations {
+                    vec: self.state.cluster_state(cluster_id).into_iter().collect(),
+                })
+                .into(),
+            )),
+            RequestType::QueryClustersByDomain(domain) => {
+                let cluster_ids = self
+                    .state
+                    .get_cluster_ids_by_domain(domain.hostname.clone(), domain.path.clone());
+                let vec = cluster_ids
+                    .iter()
+                    .filter_map(|cluster_id| self.state.cluster_state(cluster_id))
+                    .collect();
+                Ok(Some(
+                    ContentType::Clusters(ClusterInformations { vec }).into(),
+                ))
+            }
+            RequestType::QueryClustersHashes(_) => Ok(Some(
+                ContentType::ClusterHashes(ClusterHashes {
+                    map: self.state.hash_state(),
+                })
+                .into(),
+            )),
+            // RequestType::QueryMetrics(_) => todo!(),
+            // RequestType::SoftStop(_) => todo!(),
+            // RequestType::HardStop(_) => todo!(),
+            // RequestType::ConfigureMetrics(_) => todo!(),
+            // RequestType::Logging(_) => todo!(),
+            // RequestType::ReturnListenSockets(_) => todo!(),
+            // RequestType::QueryCertificatesFromTheState(_) => todo!(),
+            // RequestType::QueryCertificatesFromWorkers(_) => todo!(),
+            // RequestType::CountRequests(_) => todo!(),
+            _ => Ok(None),
+        }
+    }
+}
 
 //===============================================
 // List frontends
@@ -61,7 +191,7 @@ impl GatheringTask for QueryClustersCommand {
         &mut self.gatherer
     }
 
-    fn on_finish(self: Box<Self>, server: &mut Server, client: &mut ClientSession) {
+    fn on_finish(self: Box<Self>, _server: &mut Server, client: &mut ClientSession) {
         let mut worker_responses: BTreeMap<String, ResponseContent> = self
             .gatherer
             .responses
@@ -142,11 +272,7 @@ impl GatheringTask for LoadStaticConfig {
                 self.ok, self.error
             );
         }
-        server.backends_count = server.state.count_backends();
-        server.frontends_count = server.state.count_frontends();
-        gauge!("configuration.clusters", server.state.clusters.len());
-        gauge!("configuration.backends", server.backends_count);
-        gauge!("configuration.frontends", server.frontends_count);
+        server.update_counts();
     }
 }
 
@@ -157,7 +283,7 @@ impl Gatherer for LoadStaticConfig {
 
     fn on_message_no_client(
         &mut self,
-        server: &mut Server,
+        _server: &mut Server,
         _worker_id: u32,
         message: WorkerResponse,
     ) -> bool {
