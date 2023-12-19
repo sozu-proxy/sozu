@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Debug,
     fs,
     ops::{Deref, DerefMut},
     path::PathBuf,
@@ -15,6 +16,7 @@ use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,
 };
+use serde::{de::DeserializeOwned, Serialize};
 use sozu_command_lib::{
     channel::Channel,
     config::Config,
@@ -63,7 +65,7 @@ pub trait Gatherer {
 
 /// This trait is used for command that need to wait for worker responses
 #[allow(unused)]
-pub trait GatheringTask: std::fmt::Debug {
+pub trait GatheringTask: Debug {
     fn client_token(&self) -> Option<Token>;
     fn get_gatherer(&mut self) -> &mut dyn Gatherer;
     /// This is called once every worker has answered
@@ -170,25 +172,17 @@ impl ClientSession {
             return ClientResult::CloseSession;
         }
 
-        println!(
-            "Running: {:?}, readiness: {:?}, interest: {:?}",
-            self.token, self.channel.readiness, self.channel.interest
-        );
-        let status = self.channel.run();
-        println!("{status:?}");
-        if let Err(error) = status {
-            error!("Error handling client: {:?}", error);
-            return ClientResult::NothingToDo;
-        }
-
-        let message = self.channel.read_message();
-        println!("Client got request: {message:?}");
-        match message {
-            Ok(request) => ClientResult::NewRequest(request),
-            Err(error) => {
-                error!("Client channel read: {:?}", error);
-                ClientResult::NothingToDo
+        let status = self.channel.writable();
+        println!("Client writable: {status:?}");
+        let mut requests = extract_messages(&mut self.channel);
+        match requests.pop() {
+            Some(request) => {
+                if !requests.is_empty() {
+                    error!("more than one request at a time");
+                }
+                ClientResult::NewRequest(request)
             }
+            None => ClientResult::NothingToDo,
         }
     }
 }
@@ -242,18 +236,37 @@ impl WorkerSession {
             return WorkerResult::CloseSession;
         }
 
-        let status = self.channel.run();
-        println!("{status:?}");
-        let mut responses = Vec::new();
-        while let Ok(response) = self.channel.read_message() {
-            responses.push(response);
-        }
-        println!("{responses:?}");
+        let status = self.channel.writable();
+        println!("Worker writable: {status:?}");
+        let responses = extract_messages(&mut self.channel);
         if responses.is_empty() {
-            return WorkerResult::NothingToDo;
+            WorkerResult::NothingToDo
+        } else {
+            WorkerResult::NewResponses(responses)
         }
+    }
+}
 
-        WorkerResult::NewResponses(responses)
+fn extract_messages<Tx, Rx>(channel: &mut Channel<Tx, Rx>) -> Vec<Rx>
+where
+    Tx: Debug + Serialize,
+    Rx: Debug + DeserializeOwned,
+{
+    let mut messages = Vec::new();
+    loop {
+        let status = channel.readable();
+        println!("Channel readable: {status:?}");
+        let old_capacity = channel.front_buf.capacity();
+        let message = channel.read_message();
+        match message {
+            Ok(message) => messages.push(message),
+            Err(error) => {
+                error!("Channel read_message: {:?}", error);
+                if old_capacity == channel.front_buf.capacity() {
+                    return messages;
+                }
+            }
+        }
     }
 }
 

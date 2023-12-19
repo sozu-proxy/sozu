@@ -50,7 +50,7 @@ pub enum ChannelError {
 /// Used in pairs to communicate, in a blocking or non-blocking way.
 pub struct Channel<Tx, Rx> {
     pub sock: MioUnixStream,
-    front_buf: Buffer,
+    pub front_buf: Buffer,
     pub back_buf: Buffer,
     max_buffer_size: usize,
     pub readiness: Ready,
