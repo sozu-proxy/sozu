@@ -10,13 +10,14 @@ use sozu_command_lib::{
     buffer::fixed::Buffer,
     parser::parse_several_requests,
     proto::command::{
-        request::RequestType, response_content::ContentType, ClusterHashes, ClusterInformations,
-        FrontendFilters, Request, ResponseContent, ResponseStatus, WorkerInfo, WorkerInfos,
-        WorkerResponses,
+        request::RequestType, response_content::ContentType, AggregatedMetrics, AvailableMetrics,
+        ClusterHashes, ClusterInformations, FrontendFilters, QueryMetricsOptions, Request,
+        ResponseContent, ResponseStatus, WorkerInfo, WorkerInfos, WorkerResponses,
     },
     request::WorkerRequest,
     response::WorkerResponse,
 };
+use sozu_lib::metrics::METRICS;
 
 use crate::command_v2::{
     server::{DefaultGatherer, Gatherer, GatheringTask, Server},
@@ -67,7 +68,7 @@ impl Server {
             | RequestType::QueryClusterById(_) => {
                 query_clusters(self, client, request_type);
             }
-            RequestType::QueryMetrics(_) => todo!(),
+            RequestType::QueryMetrics(inner) => query_metrics(self, client, inner),
             RequestType::SoftStop(_) => todo!(),
             RequestType::HardStop(_) => todo!(),
             RequestType::Logging(_) => todo!(),
@@ -422,7 +423,95 @@ impl GatheringTask for WorkerRequestCommand {
 }
 
 // =========================================================
-// Save state
+// Query Metrics
+
+#[derive(Debug)]
+struct QueryMetricsTask {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+    options: QueryMetricsOptions,
+}
+
+fn query_metrics(server: &mut Server, client: &mut ClientSession, options: QueryMetricsOptions) {
+    let request = RequestType::QueryMetrics(options.clone()).into();
+
+    server.scatter(
+        request,
+        Box::new(QueryMetricsTask {
+            client_token: client.token,
+            gatherer: DefaultGatherer::default(),
+            options,
+        }),
+    );
+}
+
+impl GatheringTask for QueryMetricsTask {
+    fn client_token(&self) -> Option<Token> {
+        Some(self.client_token)
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        &mut self.gatherer
+    }
+
+    fn on_finish(self: Box<Self>, _server: &mut Server, client: &mut ClientSession) {
+        let main_metrics =
+            METRICS.with(|metrics| (*metrics.borrow_mut()).dump_local_proxy_metrics());
+
+        if self.options.list {
+            let mut summed_proxy_metrics = Vec::new();
+            let mut summed_cluster_metrics = Vec::new();
+            for (_, response) in self.gatherer.responses {
+                if let Some(ResponseContent {
+                    content_type:
+                        Some(ContentType::AvailableMetrics(AvailableMetrics {
+                            proxy_metrics: listed_proxy_metrics,
+                            cluster_metrics: listed_cluster_metrics,
+                        })),
+                }) = response.content
+                {
+                    summed_proxy_metrics.append(&mut listed_proxy_metrics.clone());
+                    summed_cluster_metrics.append(&mut listed_cluster_metrics.clone());
+                }
+            }
+            return client.finish_ok(
+                Some(
+                    ContentType::AvailableMetrics(AvailableMetrics {
+                        proxy_metrics: summed_proxy_metrics,
+                        cluster_metrics: summed_cluster_metrics,
+                    })
+                    .into(),
+                ),
+                "Successfully listed available metrics",
+            );
+        }
+
+        let workers_metrics = self
+            .gatherer
+            .responses
+            .into_iter()
+            .filter_map(
+                |(worker_id, worker_response)| match worker_response.content {
+                    Some(ResponseContent {
+                        content_type: Some(ContentType::WorkerMetrics(worker_metrics)),
+                    }) => Some((worker_id.to_string(), worker_metrics)),
+                    _ => None,
+                },
+            )
+            .collect();
+
+        client.finish_ok(
+            Some(
+                ContentType::Metrics(AggregatedMetrics {
+                    main: main_metrics,
+                    workers: workers_metrics,
+                })
+                .into(),
+            ),
+            "Successfully aggregated all metrics",
+        );
+    }
+}
 
 // =========================================================
 // Load state
