@@ -4,8 +4,8 @@ use mio::Token;
 use sozu_command_lib::{
     proto::command::{
         request::RequestType, response_content::ContentType, ClusterHashes, ClusterInformations,
-        FrontendFilters, Request, ResponseContent, ResponseStatus, WorkerInfo, WorkerInfos,
-        WorkerResponses,
+        FrontendFilters, MetricsConfiguration, Request, ResponseContent, ResponseStatus,
+        WorkerInfo, WorkerInfos, WorkerResponses,
     },
     response::WorkerResponse,
 };
@@ -42,6 +42,7 @@ impl Server {
             | RequestType::AddHttpsListener(_)
             | RequestType::AddTcpFrontend(_)
             | RequestType::AddTcpListener(_)
+            | RequestType::ConfigureMetrics(_)
             | RequestType::DeactivateListener(_)
             | RequestType::RemoveBackend(_)
             | RequestType::RemoveCertificate(_)
@@ -61,7 +62,6 @@ impl Server {
             RequestType::QueryMetrics(_) => todo!(),
             RequestType::SoftStop(_) => todo!(),
             RequestType::HardStop(_) => todo!(),
-            RequestType::ConfigureMetrics(_) => todo!(),
             RequestType::Logging(_) => todo!(),
             RequestType::ReturnListenSockets(_) => todo!(),
             RequestType::QueryCertificatesFromTheState(_) => todo!(),
