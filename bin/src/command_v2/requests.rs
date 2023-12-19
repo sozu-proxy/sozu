@@ -4,7 +4,8 @@ use mio::Token;
 use sozu_command_lib::{
     proto::command::{
         request::RequestType, response_content::ContentType, ClusterHashes, ClusterInformations,
-        FrontendFilters, Request, ResponseContent, ResponseStatus, WorkerResponses,
+        FrontendFilters, Request, ResponseContent, ResponseStatus, WorkerInfo, WorkerInfos,
+        WorkerResponses,
     },
     response::WorkerResponse,
 };
@@ -20,7 +21,7 @@ impl Server {
         match request_type {
             RequestType::SaveState(_) => todo!(),
             RequestType::LoadState(_) => todo!(),
-            RequestType::ListWorkers(_) => todo!(),
+            RequestType::ListWorkers(_) => list_workers(self, client),
             RequestType::ListFrontends(inner) => {
                 list_frontend_command(self, client, inner);
             }
@@ -155,6 +156,22 @@ pub fn list_frontend_command(
     client.finish_ok(response);
 }
 
+fn list_workers(server: &mut Server, client: &mut ClientSession) {
+    let vec: Vec<WorkerInfo> = server
+        .workers
+        .iter()
+        .map(|(_, worker_session)| WorkerInfo {
+            id: worker_session.id,
+            pid: worker_session.pid,
+            run_state: worker_session.run_state as i32,
+        })
+        .collect();
+
+    debug!("workers: {:#?}", vec);
+
+    client.finish_ok(Some(ContentType::Workers(WorkerInfos { vec }).into()));
+}
+
 //===============================================
 // Query clusters
 
@@ -202,6 +219,7 @@ impl GatheringTask for QueryClustersCommand {
                     .map(|response_content| (worker_id.to_string(), response_content))
             })
             .collect();
+
         if let Some(main_response) = &self.main_process_response {
             worker_responses.insert(String::from("main"), main_response.clone());
         }

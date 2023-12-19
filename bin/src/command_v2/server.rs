@@ -115,7 +115,7 @@ pub struct Server {
     /// sessions that have business to do on the next tick
     sessions_to_tick: HashSet<Token>,
     unix_listener: UnixListener,
-    workers: HashMap<Token, WorkerSession>,
+    pub workers: HashMap<Token, WorkerSession>,
     pub state: ConfigState,
     frontends_count: usize,
     backends_count: usize,
