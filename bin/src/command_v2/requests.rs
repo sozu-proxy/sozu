@@ -1,12 +1,20 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{ErrorKind, Read},
+};
 
 use mio::Token;
+use nom::{HexDisplay, Offset};
 use sozu_command_lib::{
+    buffer::fixed::Buffer,
+    parser::parse_several_requests,
     proto::command::{
         request::RequestType, response_content::ContentType, ClusterHashes, ClusterInformations,
-        FrontendFilters, MetricsConfiguration, Request, ResponseContent, ResponseStatus,
-        WorkerInfo, WorkerInfos, WorkerResponses,
+        FrontendFilters, Request, ResponseContent, ResponseStatus, WorkerInfo, WorkerInfos,
+        WorkerResponses,
     },
+    request::WorkerRequest,
     response::WorkerResponse,
 };
 
@@ -19,12 +27,12 @@ impl Server {
     pub fn handle_request(&mut self, client: &mut ClientSession, request: Request) {
         let request_type = request.request_type.unwrap();
         match request_type {
-            RequestType::SaveState(_) => todo!(),
-            RequestType::LoadState(_) => todo!(),
+            RequestType::SaveState(path) => todo!(),
+            // RequestType::LoadState(path) => load_state(self, client, &path),
+            RequestType::LoadState(_path) => todo!(),
+
             RequestType::ListWorkers(_) => list_workers(self, client),
-            RequestType::ListFrontends(inner) => {
-                list_frontend_command(self, client, inner);
-            }
+            RequestType::ListFrontends(inner) => list_frontend_command(self, client, inner),
             RequestType::ListListeners(_) => list_listeners(self, client),
             RequestType::LaunchWorker(_) => todo!(),
             RequestType::UpgradeMain(_) => todo!(),
@@ -333,7 +341,7 @@ impl Gatherer for LoadStaticConfig {
 // Worker request
 
 #[derive(Debug)]
-struct WorkerRequest {
+struct WorkerRequestCommand {
     pub client_token: Token,
     pub gatherer: DefaultGatherer,
 }
@@ -353,14 +361,14 @@ pub fn worker_request(
 
     server.scatter(
         request,
-        Box::new(WorkerRequest {
+        Box::new(WorkerRequestCommand {
             client_token: client.token,
             gatherer: DefaultGatherer::default(),
         }),
     )
 }
 
-impl GatheringTask for WorkerRequest {
+impl GatheringTask for WorkerRequestCommand {
     fn client_token(&self) -> Option<Token> {
         Some(self.client_token)
     }
@@ -390,3 +398,111 @@ impl GatheringTask for WorkerRequest {
         }
     }
 }
+
+// =========================================================
+// Load state
+
+/*
+DRAFT: the best would be to have a Server::scatter that takes Vec<Request> instead of a single request
+so that we can run gather() only once
+#[derive(Debug)]
+struct LoadStateCommand {
+    pub client_token: Token,
+    pub gatherer: DefaultGatherer,
+    diff_counter: usize,
+}
+
+fn load_state(server: &mut Server, client: &mut ClientSession, path: &str) {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
+            info!("The state file does not exists, skipping the loading.");
+            server.update_counts();
+            return;
+        }
+        Err(err) => {
+            error!("Cannot open file at path {}", path);
+            return;
+        }
+    };
+
+    let mut buffer = Buffer::with_capacity(200000);
+
+    info!("starting to load state from {}", path);
+
+    let mut message_counter = 0usize;
+    let mut diff_counter = 0usize;
+
+    loop {
+        let previous = buffer.available_data();
+
+        //FIXME: we should read in streaming here
+        let bytes_read = file
+            .read(buffer.space())
+            .map_err(|e| format!("Error reading the saved state file: {}", e))
+            .unwrap();
+
+        buffer.fill(bytes_read);
+
+        if buffer.available_data() == 0 {
+            debug!("Empty buffer");
+            break;
+        }
+
+        let mut offset = 0usize;
+        match parse_several_requests::<WorkerRequest>(buffer.data()) {
+            Ok((i, requests)) => {
+                if !i.is_empty() {
+                    debug!("could not parse {} bytes", i.len());
+                    if previous == buffer.available_data() {
+                        error!("error consuming load state message");
+                        return;
+                    }
+                }
+                offset = buffer.data().offset(i);
+
+                for request in requests {
+                    message_counter += 1;
+
+                    if server.state.dispatch(&request.content).is_ok() {
+                        diff_counter += 1;
+
+                        server.scatter(
+                            request.content,
+                            Box::new(LoadStateCommand {
+                                client_token: client.token,
+                                gatherer: DefaultGatherer::default(),
+                                diff_counter,
+                            }),
+                        );
+                    }
+                }
+            }
+            Err(nom::Err::Incomplete(_)) => {
+                if buffer.available_data() == buffer.capacity() {
+                    error!(
+                        "message too big, stopping parsing:\n{}",
+                        buffer.data().to_hex(16)
+                    );
+                    break;
+                }
+            }
+            Err(parse_error) => {
+                error!("saved state parse error: {:?}", parse_error);
+                return;
+            }
+        }
+        buffer.consume(offset);
+    }
+}
+
+impl GatheringTask for LoadStateCommand {
+    fn client_token(&self) -> Option<Token> {
+        todo!()
+    }
+
+    fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+        todo!()
+    }
+}
+*/
