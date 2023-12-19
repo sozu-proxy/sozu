@@ -161,7 +161,7 @@ pub fn list_frontend_command(
     let response = server
         .query_main(&RequestType::ListFrontends(filters).into())
         .unwrap();
-    client.finish_ok(response);
+    client.finish_ok(response, "Successfully listed frontends");
 }
 
 fn list_workers(server: &mut Server, client: &mut ClientSession) {
@@ -177,12 +177,18 @@ fn list_workers(server: &mut Server, client: &mut ClientSession) {
 
     debug!("workers: {:#?}", vec);
 
-    client.finish_ok(Some(ContentType::Workers(WorkerInfos { vec }).into()));
+    client.finish_ok(
+        Some(ContentType::Workers(WorkerInfos { vec }).into()),
+        "Successfully listed workers",
+    );
 }
 
 fn list_listeners(server: &mut Server, client: &mut ClientSession) {
     let vec = server.state.list_listeners();
-    client.finish_ok(Some(ContentType::ListenersList(vec).into()));
+    client.finish_ok(
+        Some(ContentType::ListenersList(vec).into()),
+        "Successfully listed listeners",
+    );
 }
 
 fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
@@ -195,7 +201,7 @@ fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
 
     info!("wrote {} commands to {}", counter, path);
 
-    client.finish_ok_message(format!("saved {counter} config messages to {path}"));
+    client.finish_ok(None, format!("saved {counter} config messages to {path}"));
 }
 
 //===============================================
@@ -250,12 +256,15 @@ impl GatheringTask for QueryClustersCommand {
             worker_responses.insert(String::from("main"), main_response.clone());
         }
 
-        client.finish_ok(Some(
-            ContentType::WorkerResponses(WorkerResponses {
-                map: worker_responses,
-            })
-            .into(),
-        ));
+        client.finish_ok(
+            Some(
+                ContentType::WorkerResponses(WorkerResponses {
+                    map: worker_responses,
+                })
+                .into(),
+            ),
+            "Successfully queried clusters",
+        );
     }
 }
 
@@ -407,7 +416,7 @@ impl GatheringTask for WorkerRequestCommand {
         if has_error {
             client.finish_failure(messages.join(", "));
         } else {
-            client.finish_ok(None);
+            client.finish_ok(None, "Successfully applied request to all workers");
         }
     }
 }

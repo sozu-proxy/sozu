@@ -39,19 +39,11 @@ impl ClientSession {
         self.channel.interest.insert(Ready::WRITABLE);
     }
 
-    pub fn finish_ok(&mut self, content: Option<ResponseContent>) {
-        self.finish(Response {
-            status: ResponseStatus::Ok.into(),
-            message: "Successfully handled request".to_owned(),
-            content,
-        })
-    }
-
-    pub fn finish_ok_message<T: Into<String>>(&mut self, message: T) {
+    pub fn finish_ok<T: Into<String>>(&mut self, content: Option<ResponseContent>, message: T) {
         self.finish(Response {
             status: ResponseStatus::Ok.into(),
             message: message.into(),
-            content: None,
+            content,
         })
     }
 
