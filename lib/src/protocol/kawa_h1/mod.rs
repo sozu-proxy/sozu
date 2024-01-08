@@ -9,7 +9,7 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use kawa::{self, debug_kawa, ParsingPhase};
+use kawa;
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use sozu_command::{
@@ -357,7 +357,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.readable_parse(metrics)
     }
 
-    pub fn readable_parse(&mut self, _metrics: &mut SessionMetrics) -> StateResult {
+    pub fn readable_parse(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         trace!("==============readable_parse");
         let was_initial = self.request_stream.is_initial();
         let was_not_proxying = !self.request_stream.is_main_phase();
@@ -399,6 +399,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 }
             );
             if self.response_stream.consumed {
+                self.log_request_error(metrics, "Parsing error on the request");
                 return StateResult::CloseSession;
             } else {
                 self.set_answer(DefaultAnswerStatus::Answer400, None);
@@ -927,16 +928,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     fn writable_default_answer(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         trace!("==============writable_default_answer");
-        let res = match self.status {
+        let socket_result = match self.status {
             SessionStatus::DefaultAnswer(status, ref buf, mut index) => {
                 let len = buf.len();
 
                 let mut sz = 0usize;
-                let mut res = SocketResult::Continue;
-                while res == SocketResult::Continue && index < len {
+                let mut socket_result = SocketResult::Continue;
+                while socket_result == SocketResult::Continue && index < len {
                     let (current_sz, current_res) =
                         self.frontend_socket.socket_write(&buf[index..]);
-                    res = current_res;
+                    socket_result = current_res;
                     sz += current_sz;
                     index += current_sz;
                 }
@@ -944,7 +945,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 count!("bytes_out", sz as i64);
                 metrics.bout += sz;
 
-                if res != SocketResult::Continue {
+                if socket_result != SocketResult::Continue {
                     self.frontend_readiness.event.remove(Ready::WRITABLE);
                 }
 
@@ -956,12 +957,12 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     return StateResult::CloseSession;
                 }
 
-                res
+                socket_result
             }
             _ => return StateResult::CloseSession,
         };
 
-        if res == SocketResult::Error {
+        if socket_result == SocketResult::Error {
             self.frontend_socket.write_error();
             self.log_request_error(
                 metrics,
@@ -1457,7 +1458,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    pub fn backend_hup(&mut self) -> StateResult {
+    pub fn backend_hup(&mut self, metrics: &mut SessionMetrics) -> StateResult {
         // there might still data we can read on the socket
         if self.backend_readiness.event.is_readable()
             && self.backend_readiness.interest.is_readable()
@@ -1482,11 +1483,15 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 );
 
                 trace!("backend hang-up, setting the parsing phase of the response stream to terminated, this also takes care of responses that lack length information.");
-                self.response_stream.parsing_phase = ParsingPhase::Terminated;
+                self.response_stream.parsing_phase = kawa::ParsingPhase::Terminated;
 
                 // check if there is anything left to write
                 if self.response_stream.is_completed() {
                     // we have to close the session now, because writable would short-cut
+                    self.log_request_error(
+                        metrics,
+                        "backend hangs up, can not be sure that response is complete",
+                    );
                     StateResult::CloseSession
                 } else {
                     // writable() will be called again and finish the session properly
@@ -1650,7 +1655,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             }
 
             if backend_interest.is_hup() || backend_interest.is_error() {
-                let state_result = self.backend_hup();
+                let state_result = self.backend_hup(metrics);
 
                 trace!("backend_hup: {:?}", state_result);
                 match state_result {
