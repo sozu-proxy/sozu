@@ -9,7 +9,7 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use kawa;
+use kawa::{self, debug_kawa, ParsingPhase};
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use sozu_command::{
@@ -926,6 +926,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     fn writable_default_answer(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+        trace!("==============writable_default_answer");
         let res = match self.status {
             SessionStatus::DefaultAnswer(status, ref buf, mut index) => {
                 let len = buf.len();
@@ -1477,7 +1478,18 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     "PROXY session {:?}, backend closed before session is over",
                     self.frontend_token
                 );
-                StateResult::CloseSession
+
+                trace!("backend hang-up, setting the parsing phase of the response stream to terminated, this also takes care of responses that lack length information.");
+                self.response_stream.parsing_phase = ParsingPhase::Terminated;
+
+                // check if there is anything left to write
+                if self.response_stream.is_completed() {
+                    // we have to close the session now, because writable would short-cut
+                    StateResult::CloseSession
+                } else {
+                    // writable() will be called again and finish the session properly
+                    StateResult::CloseBackend
+                }
             }
             // probably backend hup between keep alive request, change backend
             (true, true) => {
