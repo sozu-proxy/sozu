@@ -40,7 +40,9 @@ pub enum ChannelError {
     InvalidCharSet(String),
     #[error("Error deserializing message")]
     Serde(serde_json::error::Error),
-    #[error("Could not change the blocking status ef the unix stream with file descriptor {fd}: {error}")]
+    #[error("could not set the timeout of the unix stream with file descriptor {fd}: {error}")]
+    SetTimeout { fd: i32, error: String },
+    #[error("Could not change the blocking status of the unix stream with file descriptor {fd}: {error}")]
     BlockingStatus { fd: i32, error: String },
     #[error("Connection error: {0:?}")]
     Connection(Option<std::io::Error>),
@@ -117,6 +119,22 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
             let _fd = stream.into_raw_fd();
         }
         self.blocking = !nonblocking;
+        Ok(())
+    }
+
+    /// set the read_timeout of the unix stream. This works only temporary, be sure to set the timeout to None afterwards.
+    fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ChannelError> {
+        unsafe {
+            let fd = self.sock.as_raw_fd();
+            let stream = StdUnixStream::from_raw_fd(fd);
+            stream
+                .set_read_timeout(timeout)
+                .map_err(|error| ChannelError::SetTimeout {
+                    fd,
+                    error: error.to_string(),
+                })?;
+            let _fd = stream.into_raw_fd();
+        }
         Ok(())
     }
 
@@ -288,35 +306,41 @@ impl<Tx: Debug + Serialize, Rx: Debug + DeserializeOwned> Channel<Tx, Rx> {
     ) -> Result<Rx, ChannelError> {
         let now = std::time::Instant::now();
 
-        loop {
+        // set a very small timeout, to repeat the loop often
+        self.set_timeout(Some(Duration::from_millis(10)))?;
+
+        let status = loop {
             if let Some(timeout) = timeout {
                 if now.elapsed() >= timeout {
-                    return Err(ChannelError::TimeoutReached(timeout));
+                    break Err(ChannelError::TimeoutReached(timeout));
                 }
             }
 
             match self.front_buf.data().iter().position(|&x| x == 0) {
-                Some(position) => return self.read_and_parse_from_front_buffer(position),
+                Some(position) => break self.read_and_parse_from_front_buffer(position),
                 None => {
                     if self.front_buf.available_space() == 0 {
                         if self.front_buf.capacity() == self.max_buffer_size {
-                            return Err(ChannelError::BufferFull);
+                            break Err(ChannelError::BufferFull);
                         }
                         let new_size = min(self.front_buf.capacity() + 5000, self.max_buffer_size);
                         self.front_buf.grow(new_size);
                     }
-
-                    match self
-                        .sock
-                        .read(self.front_buf.space())
-                        .map_err(ChannelError::Read)?
-                    {
-                        0 => return Err(ChannelError::NoByteToRead),
-                        bytes_read => self.front_buf.fill(bytes_read),
+                    match self.sock.read(self.front_buf.space()) {
+                        Ok(0) => break Err(ChannelError::NoByteToRead),
+                        Ok(bytes_read) => self.front_buf.fill(bytes_read),
+                        Err(io_error) => match io_error.kind() {
+                            ErrorKind::WouldBlock => continue, // ignore 10 millisecond timeouts
+                            _ => break Err(ChannelError::Read(io_error)),
+                        },
                     };
                 }
             }
-        }
+        };
+
+        self.set_timeout(None)?;
+
+        status
     }
 
     fn read_and_parse_from_front_buffer(&mut self, position: usize) -> Result<Rx, ChannelError> {
