@@ -44,6 +44,9 @@ pub fn ctl(args: cli::Args) -> anyhow::Result<()> {
     })?;
 
     let timeout = Duration::from_millis(args.timeout.unwrap_or(config.ctl_command_timeout));
+    if !args.json {
+        debug!("applying timeout {:?}", timeout);
+    }
 
     let mut command_manager = CommandManager {
         channel,
