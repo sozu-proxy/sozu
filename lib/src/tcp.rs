@@ -583,39 +583,20 @@ impl TcpSession {
 
                 // trigger a backend reconnection
                 self.close_backend();
-                match self.connect_to_backend(session.clone()) {
-                    // reuse connection or send a default answer, we can continue
-                    Ok(BackendConnectAction::Reuse) => {}
-                    Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                        // stop here, we must wait for an event
-                        return StateResult::Continue;
-                    }
-                    // TODO: should we return CloseSession here?
-                    Err(connection_error) => {
-                        error!("Error connecting to backend: {}", connection_error)
-                    }
+                let connection_result = self.connect_to_backend(session.clone());
+                if let Some(state_result) = handle_connection_result(connection_result) {
+                    return state_result;
                 }
             } else if self.back_readiness().unwrap().event != Ready::EMPTY {
                 self.reset_connection_attempt();
                 let back_token = self.backend_token.unwrap();
                 self.container_backend_timeout.set(back_token);
-                // Why is this here? this artificially reset the connection time for no apparent reasons
-                // TODO: maybe remove this?
-                self.backend_connected = BackendConnectionStatus::Connecting(Instant::now());
-
                 self.set_back_connected(BackendConnectionStatus::Connected);
             }
         } else if back_connected == BackendConnectionStatus::NotConnected {
-            match self.connect_to_backend(session.clone()) {
-                // reuse connection or send a default answer, we can continue
-                Ok(BackendConnectAction::Reuse) => {}
-                Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                    // we must wait for an event
-                    return StateResult::Continue;
-                }
-                Err(connection_error) => {
-                    error!("Error connecting to backend: {}", connection_error)
-                }
+            let connection_result = self.connect_to_backend(session.clone());
+            if let Some(state_result) = handle_connection_result(connection_result) {
+                return state_result;
             }
         }
 
@@ -668,16 +649,9 @@ impl TcpSession {
 
                 match order {
                     StateResult::ConnectBackend => {
-                        match self.connect_to_backend(session.clone()) {
-                            // reuse connection or send a default answer, we can continue
-                            Ok(BackendConnectAction::Reuse) => {}
-                            Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                                // we must wait for an event
-                                return StateResult::Continue;
-                            }
-                            Err(connection_error) => {
-                                error!("Error connecting to backend: {}", connection_error)
-                            }
+                        let connection_result = self.connect_to_backend(session.clone());
+                        if let Some(state_result) = handle_connection_result(connection_result) {
+                            return state_result;
                         }
                     }
                     StateResult::Continue => {}
@@ -1171,6 +1145,25 @@ impl TcpListener {
         self.listener = listener;
         self.active = true;
         Some(self.token)
+    }
+}
+
+fn handle_connection_result(
+    connection_result: Result<BackendConnectAction, BackendConnectionError>,
+) -> Option<StateResult> {
+    match connection_result {
+        // reuse connection or send a default answer, we can continue
+        Ok(BackendConnectAction::Reuse) => None,
+        Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
+            // we must wait for an event
+            Some(StateResult::Continue)
+        }
+        Err(connection_error) => {
+            error!("Error connecting to backend: {}", connection_error);
+            // in case of BackendConnectionError::Backend(BackendError::ConnectionFailures(..))
+            // we may want to retry instead of closing
+            Some(StateResult::CloseBackend)
+        }
     }
 }
 
