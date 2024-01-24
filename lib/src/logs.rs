@@ -5,6 +5,7 @@ use time::Duration;
 
 use crate::{protocol::http::parser::Method, SessionMetrics};
 
+#[derive(Debug)]
 pub struct LogContext<'a> {
     pub request_id: Ulid,
     pub cluster_id: Option<&'a str>,
@@ -92,6 +93,7 @@ impl fmt::Display for LogDuration {
     }
 }
 
+#[derive(Debug)]
 pub enum Endpoint<'a> {
     Http {
         method: Option<&'a Method>,
@@ -127,6 +129,7 @@ impl fmt::Display for Endpoint<'_> {
     }
 }
 
+#[derive(Debug)]
 pub struct RequestRecord<'a> {
     pub error: Option<&'a str>,
     pub context: LogContext<'a>,
