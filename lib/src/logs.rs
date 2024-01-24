@@ -141,11 +141,11 @@ pub struct RequestRecord<'a> {
     pub client_rtt: Option<Duration>,
     pub server_rtt: Option<Duration>,
     pub metrics: &'a SessionMetrics,
-    pub user_agent: Option<&'a str>,
+    pub user_agent: Option<String>,
 }
 
 impl RequestRecord<'_> {
-    pub fn log(&self) {
+    pub fn log(self) {
         let context = &self.context;
         let cluster_id = context.cluster_id;
         let tags = self.tags;
@@ -154,7 +154,7 @@ impl RequestRecord<'_> {
         let session_address = self.session_address;
         let backend_address = self.backend_address;
         let endpoint = &self.endpoint;
-        let user_agent = &self.user_agent;
+        let mut user_agent = self.user_agent;
 
         let metrics = self.metrics;
         // let backend_response_time = metrics.backend_response_time();
@@ -195,10 +195,23 @@ impl RequestRecord<'_> {
             }
         }
 
+        let (tags, ua_sep, user_agent) = match (tags, &mut user_agent) {
+            (None, None) => ("-", "", ""),
+            (Some(tags), None) => (tags, "", ""),
+            (None, Some(ua)) => {
+                prepare_user_agent(ua);
+                ("", "user-agent=", ua.as_str())
+            }
+            (Some(tags), Some(ua)) => {
+                prepare_user_agent(ua);
+                (tags, ", user-agent=", ua.as_str())
+            }
+        };
+
         match self.error {
             None => {
                 info_access!(
-                    "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {}{} {} {}",
+                    "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {}{}{} {} {}",
                     context,
                     session_address.as_str_or("X"),
                     backend_address.as_str_or("X"),
@@ -208,18 +221,9 @@ impl RequestRecord<'_> {
                     LogDuration(server_rtt),
                     metrics.bin,
                     metrics.bout,
-                    match user_agent {
-                        Some(_) => tags.as_str_or(""),
-                        None => tags.as_str_or("-"),
-                    },
-                    match tags {
-                        Some(tags) if !tags.is_empty() => user_agent
-                            .map(|ua| format!(", user-agent={ua}"))
-                            .unwrap_or_default(),
-                        Some(_) | None => user_agent
-                            .map(|ua| format!("user-agent={ua}"))
-                            .unwrap_or_default(),
-                    },
+                    tags,
+                    ua_sep,
+                    user_agent,
                     protocol,
                     endpoint
                 );
@@ -230,7 +234,7 @@ impl RequestRecord<'_> {
                 );
             }
             Some(message) => error_access!(
-                "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {}{} {} {} | {}",
+                "{}{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {}{}{} {} {} | {}",
                 context,
                 session_address.as_str_or("X"),
                 backend_address.as_str_or("X"),
@@ -240,22 +244,28 @@ impl RequestRecord<'_> {
                 LogDuration(server_rtt),
                 metrics.bin,
                 metrics.bout,
-                match user_agent {
-                    Some(_) => tags.as_str_or(""),
-                    None => tags.as_str_or("-"),
-                },
-                match tags {
-                    Some(tags) if !tags.is_empty() => user_agent
-                        .map(|ua| format!(", user-agent={ua}"))
-                        .unwrap_or_default(),
-                    Some(_) | None => user_agent
-                        .map(|ua| format!("user-agent={ua}"))
-                        .unwrap_or_default(),
-                },
+                tags,
+                ua_sep,
+                user_agent,
                 protocol,
                 endpoint,
                 message
             ),
         }
     }
+}
+
+fn prepare_user_agent(ua: &mut String) {
+    let mut ua_bytes = std::mem::take(ua).into_bytes();
+    for c in &mut ua_bytes {
+        if *c == b' ' {
+            *c = b'_';
+        }
+    }
+    if let Some(last) = ua_bytes.last_mut() {
+        if *last == b',' {
+            *last = b'!'
+        }
+    }
+    *ua = unsafe { String::from_utf8_unchecked(ua_bytes) };
 }
