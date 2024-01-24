@@ -220,6 +220,11 @@ pub enum MetricsCmd {
             // parse(try_from_str = split_slash)
         )]
         backends: Vec<String>,
+        #[clap(
+            long = "no-clusters",
+            help = "get only the metrics of main process and workers (no cluster metrics)"
+        )]
+        no_clusters: bool,
     },
 }
 
