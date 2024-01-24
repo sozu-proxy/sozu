@@ -282,41 +282,41 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
     }
 
-    pub fn frontend_hup(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+    pub fn frontend_hup(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.log_request_success(metrics);
         self.frontend_status = ConnectionStatus::Closed;
-        StateResult::CloseSession
+        SessionResult::Close
     }
 
-    pub fn backend_hup(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+    pub fn backend_hup(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.backend_status = ConnectionStatus::Closed;
         if self.backend_buffer.available_data() == 0 {
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
                 error!("Pipe::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?} -> {:?}", self.frontend_readiness, self.backend_readiness);
-                StateResult::Continue
+                SessionResult::Continue
             } else {
                 self.log_request_success(metrics);
-                StateResult::CloseSession
+                SessionResult::Close
             }
         } else {
             self.frontend_readiness.interest.insert(Ready::WRITABLE);
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
             }
-            StateResult::Continue
+            SessionResult::Continue
         }
     }
 
     // Read content from the session
-    pub fn readable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+    pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.reset_timeouts();
 
         trace!("pipe readable");
         if self.frontend_buffer.available_space() == 0 {
             self.frontend_readiness.interest.remove(Ready::READABLE);
             self.backend_readiness.interest.insert(Ready::WRITABLE);
-            return StateResult::Continue;
+            return SessionResult::Continue;
         }
 
         let (sz, res) = self.frontend.socket_read(self.frontend_buffer.space());
@@ -354,7 +354,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             self.frontend_readiness.reset();
             self.backend_readiness.reset();
             self.log_request_success(metrics);
-            return StateResult::CloseSession;
+            return SessionResult::Close;
         }
 
         match res {
@@ -362,13 +362,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 self.frontend_readiness.reset();
                 self.backend_readiness.reset();
                 self.log_request_error(metrics, "front socket read error");
-                return StateResult::CloseSession;
+                return SessionResult::Close;
             }
             SocketResult::Closed => {
                 self.frontend_readiness.reset();
                 self.backend_readiness.reset();
                 self.log_request_success(metrics);
-                return StateResult::CloseSession;
+                return SessionResult::Close;
             }
             SocketResult::WouldBlock => {
                 self.frontend_readiness.event.remove(Ready::READABLE);
@@ -377,16 +377,16 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         };
 
         self.backend_readiness.interest.insert(Ready::WRITABLE);
-        StateResult::Continue
+        SessionResult::Continue
     }
 
     // Forward content to session
-    pub fn writable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+    pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         trace!("pipe writable");
         if self.backend_buffer.available_data() == 0 {
             self.backend_readiness.interest.insert(Ready::READABLE);
             self.frontend_readiness.interest.remove(Ready::WRITABLE);
-            return StateResult::Continue;
+            return SessionResult::Continue;
         }
 
         let mut sz = 0usize;
@@ -398,7 +398,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 metrics.bout += sz;
                 self.backend_readiness.interest.insert(Ready::READABLE);
                 self.frontend_readiness.interest.remove(Ready::WRITABLE);
-                return StateResult::Continue;
+                return SessionResult::Continue;
             }
             let (current_sz, current_res) = self.frontend.socket_write(self.backend_buffer.data());
             res = current_res;
@@ -419,7 +419,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 self.frontend_readiness.reset();
                 self.backend_readiness.reset();
                 self.log_request_success(metrics);
-                return StateResult::CloseSession;
+                return SessionResult::Close;
             }
         }
 
@@ -443,13 +443,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 self.frontend_readiness.reset();
                 self.backend_readiness.reset();
                 self.log_request_error(metrics, "front socket write error");
-                return StateResult::CloseSession;
+                return SessionResult::Close;
             }
             SocketResult::Closed => {
                 self.frontend_readiness.reset();
                 self.backend_readiness.reset();
                 self.log_request_success(metrics);
-                return StateResult::CloseSession;
+                return SessionResult::Close;
             }
             SocketResult::WouldBlock => {
                 self.frontend_readiness.event.remove(Ready::WRITABLE);
@@ -457,17 +457,17 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             SocketResult::Continue => {}
         }
 
-        StateResult::Continue
+        SessionResult::Continue
     }
 
     // Forward content to cluster
-    pub fn backend_writable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+    pub fn backend_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         trace!("pipe back_writable");
 
         if self.frontend_buffer.available_data() == 0 {
             self.frontend_readiness.interest.insert(Ready::READABLE);
             self.backend_readiness.interest.remove(Ready::WRITABLE);
-            return StateResult::Continue;
+            return SessionResult::Continue;
         }
 
         let output_size = self.frontend_buffer.available_data();
@@ -481,7 +481,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 if self.frontend_buffer.available_data() == 0 {
                     self.frontend_readiness.interest.insert(Ready::READABLE);
                     self.backend_readiness.interest.remove(Ready::WRITABLE);
-                    return StateResult::Continue;
+                    return SessionResult::Continue;
                 }
 
                 let (current_sz, current_res) = backend.socket_write(self.frontend_buffer.data());
@@ -505,7 +505,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             self.frontend_readiness.reset();
             self.backend_readiness.reset();
             self.log_request_success(metrics);
-            return StateResult::CloseSession;
+            return SessionResult::Close;
         }
 
         debug!(
@@ -522,30 +522,30 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 self.frontend_readiness.reset();
                 self.backend_readiness.reset();
                 self.log_request_error(metrics, "back socket write error");
-                return StateResult::CloseSession;
+                return SessionResult::Close;
             }
             SocketResult::Closed => {
                 self.frontend_readiness.reset();
                 self.backend_readiness.reset();
                 self.log_request_success(metrics);
-                return StateResult::CloseSession;
+                return SessionResult::Close;
             }
             SocketResult::WouldBlock => {
                 self.backend_readiness.event.remove(Ready::WRITABLE);
             }
             SocketResult::Continue => {}
         }
-        StateResult::Continue
+        SessionResult::Continue
     }
 
     // Read content from cluster
-    pub fn backend_readable(&mut self, metrics: &mut SessionMetrics) -> StateResult {
+    pub fn backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.reset_timeouts();
 
         trace!("pipe back_readable");
         if self.backend_buffer.available_space() == 0 {
             self.backend_readiness.interest.remove(Ready::READABLE);
-            return StateResult::Continue;
+            return SessionResult::Continue;
         }
 
         if let Some(ref mut backend) = self.backend_socket {
@@ -579,7 +579,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                     self.frontend_readiness.reset();
                     self.backend_readiness.reset();
                     self.log_request_success(metrics);
-                    return StateResult::CloseSession;
+                    return SessionResult::Close;
                 }
             }
 
@@ -588,14 +588,14 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                     self.frontend_readiness.reset();
                     self.backend_readiness.reset();
                     self.log_request_error(metrics, "back socket read error");
-                    return StateResult::CloseSession;
+                    return SessionResult::Close;
                 }
                 SocketResult::Closed => {
                     if !self.check_connections() {
                         self.frontend_readiness.reset();
                         self.backend_readiness.reset();
                         self.log_request_success(metrics);
-                        return StateResult::CloseSession;
+                        return SessionResult::Close;
                     }
                 }
                 SocketResult::WouldBlock => {
@@ -605,7 +605,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             }
         }
 
-        StateResult::Continue
+        SessionResult::Continue
     }
 
     pub fn log_context(&self) -> LogContext {
@@ -654,31 +654,27 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
                 break;
             }
 
-            if frontend_interest.is_readable()
-                && self.readable(metrics) == StateResult::CloseSession
-            {
+            if frontend_interest.is_readable() && self.readable(metrics) == SessionResult::Close {
                 return SessionResult::Close;
             }
 
             if backend_interest.is_writable()
-                && self.backend_writable(metrics) == StateResult::CloseSession
+                && self.backend_writable(metrics) == SessionResult::Close
             {
                 return SessionResult::Close;
             }
 
             if backend_interest.is_readable()
-                && self.backend_readable(metrics) == StateResult::CloseSession
+                && self.backend_readable(metrics) == SessionResult::Close
             {
                 return SessionResult::Close;
             }
 
-            if frontend_interest.is_writable()
-                && self.writable(metrics) == StateResult::CloseSession
-            {
+            if frontend_interest.is_writable() && self.writable(metrics) == SessionResult::Close {
                 return SessionResult::Close;
             }
 
-            if backend_interest.is_hup() && self.backend_hup(metrics) == StateResult::CloseSession {
+            if backend_interest.is_hup() && self.backend_hup(metrics) == SessionResult::Close {
                 return SessionResult::Close;
             }
 
@@ -694,8 +690,7 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
                 return SessionResult::Close;
             }
 
-            if backend_interest.is_error() && self.backend_hup(metrics) == StateResult::CloseSession
-            {
+            if backend_interest.is_error() && self.backend_hup(metrics) == SessionResult::Close {
                 self.frontend_readiness.interest = Ready::EMPTY;
                 self.backend_readiness.interest = Ready::EMPTY;
 
