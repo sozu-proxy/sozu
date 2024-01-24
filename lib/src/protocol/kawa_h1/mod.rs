@@ -13,13 +13,13 @@ use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
+    logging::EndpointRecord,
     proto::command::{Event, EventKind, ListenerType},
 };
 use time::{Duration, Instant};
 
 use crate::{
     backends::{Backend, BackendError},
-    logs::{Endpoint, LogContext, RequestRecord},
     pool::{Checkout, Pool},
     protocol::{
         http::{editor::HttpContext, parser::Method},
@@ -29,7 +29,7 @@ use crate::{
     router::Route,
     server::{push_event, CONN_RETRIES},
     socket::{stats::socket_rtt, SocketHandler, SocketResult, TransportProtocol},
-    sozu_command::ready::Ready,
+    sozu_command::{logging::LogContext, ready::Ready},
     timer::TimeoutContainer,
     AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus,
     L7ListenerHandler, L7Proxy, ListenerHandler, Protocol, ProxySession, Readiness,
@@ -763,6 +763,20 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
+    fn log_endpoint(&self) -> EndpointRecord {
+        let status = match self.status {
+            SessionStatus::Normal => self.context.status,
+            SessionStatus::DefaultAnswer(answers, ..) => Some(answers.into()),
+        };
+        EndpointRecord::Http {
+            method: self.context.method.as_deref(),
+            authority: self.context.authority.as_deref(),
+            path: self.context.path.as_deref(),
+            reason: self.context.reason.as_deref(),
+            status,
+        }
+    }
+
     pub fn get_session_address(&self) -> Option<SocketAddr> {
         self.context
             .session_address
@@ -799,16 +813,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     /// Format the context of the websocket into a loggable String
     pub fn websocket_context(&self) -> String {
-        format!(
-            "{}",
-            Endpoint::Http {
-                method: self.context.method.as_ref(),
-                authority: self.context.authority.as_deref(),
-                path: self.context.path.as_deref(),
-                status: self.context.status,
-                reason: self.context.reason.as_deref(),
-            }
-        )
+        format!("{}", self.log_endpoint())
     }
 
     pub fn log_request(&mut self, metrics: &SessionMetrics, message: Option<&str>) {
@@ -818,34 +823,28 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 None => host,
                 Some((hostname, _)) => hostname,
             };
-            listener.get_concatenated_tags(hostname)
+            listener.get_tags(hostname)
         });
-        let status = match self.status {
-            SessionStatus::Normal => self.context.status,
-            SessionStatus::DefaultAnswer(answers, ..) => Some(answers.into()),
-        };
 
-        let user_agent = self.context.user_agent.take();
-        RequestRecord {
+        let context = self.log_context();
+        metrics.register_end_of_session(&context);
+
+        info_access! {
             error: message,
-            context: self.log_context(),
+            context,
             session_address: self.get_session_address(),
             backend_address: self.get_backend_address(),
             protocol: self.protocol_string(),
-            endpoint: Endpoint::Http {
-                method: self.context.method.as_ref(),
-                authority: self.context.authority.as_deref(),
-                path: self.context.path.as_deref(),
-                status,
-                reason: self.context.reason.as_deref(),
-            },
+            endpoint: self.log_endpoint(),
             tags,
             client_rtt: socket_rtt(self.front_socket()),
             server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
-            metrics,
-            user_agent,
-        }
-        .log();
+            service_time: metrics.service_time(),
+            response_time: metrics.response_time(),
+            bytes_in: metrics.bin,
+            bytes_out: metrics.bout,
+            user_agent: self.context.user_agent.clone(),
+        };
     }
 
     pub fn log_request_success(&mut self, metrics: &SessionMetrics) {

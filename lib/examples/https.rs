@@ -20,7 +20,7 @@ use sozu_command_lib::{
 };
 
 fn main() -> anyhow::Result<()> {
-    setup_logging("stdout", None, "info", "EXAMPLE");
+    setup_logging("stdout", None, None, "info", "EXAMPLE");
 
     info!("MAIN\tstarting up");
 

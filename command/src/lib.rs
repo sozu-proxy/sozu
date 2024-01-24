@@ -6,6 +6,7 @@ extern crate serde;
 #[macro_use]
 /// custom made logging macros
 pub mod logging;
+pub mod access_logs;
 /// Custom buffer used for parsing within the Sōzu codebase.
 pub mod buffer;
 /// TLS certificates

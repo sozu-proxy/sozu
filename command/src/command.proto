@@ -621,7 +621,7 @@ message SocketAddress {
 
 message IpAddress {
     oneof inner {
-        uint32 v4 = 1;
+        fixed32 v4 = 1;
         Uint128 v6 = 2;
     }
 }
@@ -632,7 +632,6 @@ message Uint128 {
     required uint64 low = 1;
     // lower value, last 8 bytes of the ip
     required uint64 high = 2;
-
 }
 
 // This is sent only from Sōzu to Sōzu
@@ -675,6 +674,12 @@ message ServerConfig {
     required uint64 command_buffer_size = 13 [default = 1000000];
     required uint64 max_command_buffer_size = 14 [default = 2000000];
     optional ServerMetricsConfig metrics = 15;
+    required ProtobufAccessLogFormat access_log_format = 16;
+}
+
+enum ProtobufAccessLogFormat {
+    Ascii = 1;
+    Protobuf = 2;
 }
 
 // Addresses of listeners, passed to new workers
@@ -691,4 +696,65 @@ message ListenersCount {
 // Consists in a collection of worker requests
 message InitialState {
     repeated WorkerRequest requests = 1;
+}
+
+// An access log, meant to be passed to another agent
+message ProtobufAccessLog {
+    // error message if any
+    optional string error = 1;
+    // LogContext = request_id + cluster_id + backend_id
+    required Uint128 request_id = 2;
+    // id of the cluster (set of frontend, backend, routing rules)
+    optional string cluster_id = 3;
+    // id of the backend (the server to which the traffic is redirected)
+    optional string backend_id = 4;
+    // ip and port of the client
+    optional SocketAddress session_address = 5;
+    // socket address of the backend server
+    optional SocketAddress backend_address = 6;
+    // the protocol, with SSL/TLS version, for instance "HTTPS-TLS1.1"
+    required string protocol = 7;
+    // TCP or HTTP endpoint (method, path, context...)
+    required ProtobufEndpoint endpoint = 8;
+    // round trip time for the client (microseconds)
+    optional uint64 client_rtt = 9;
+    // round trip time for the backend (microseconds)
+    optional uint64 server_rtt = 10;
+    // time for the backend to respond (microseconds)
+    required uint64 response_time = 12;
+    // time spent on a session (microseconds)
+    required uint64 service_time = 13;
+    // number of bytes received from the client
+    required uint64 bytes_in = 14;
+    // number of bytes written to the client
+    required uint64 bytes_out = 15;
+    // value of the User-Agent header, if any
+    optional string user_agent = 16;
+    // custom tags as key-values, for instance owner_id: MyOrganisation
+    map<string, string> tags = 17;
+    // short description of which process sends the log, for instance: "WRK-02"
+    required string tag = 18;
+    // POSIX timestamp, nanoseconds
+    required Uint128 time = 19;
+}
+
+message ProtobufEndpoint {
+    oneof inner {
+        HttpEndpoint http = 1;
+        TcpEndpoint tcp = 2;
+    }
+}
+
+message HttpEndpoint {
+    optional string method = 1;
+    optional string authority = 2;
+    optional string path = 3;
+    // warning: this should be a u16 but protobuf only has uint32.
+    // Make sure the value never exceeds u16 bounds.
+    optional uint32 status = 4;
+    optional string reason = 5;
+}
+
+message TcpEndpoint {
+    optional string context = 1;
 }

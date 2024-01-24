@@ -17,7 +17,7 @@ use sozu_command_lib::{
 };
 
 fn main() -> anyhow::Result<()> {
-    setup_logging("stdout", None, "info", "EXAMPLE");
+    setup_logging("stdout", None, None, "info", "EXAMPLE");
 
     info!("starting up");
 
@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
             address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
             ..Default::default()
         };
-        setup_logging("stdout", None, "debug", "TCP");
+        setup_logging("stdout", None, None, "debug", "TCP");
         sozu_lib::tcp::testing::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 

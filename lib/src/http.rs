@@ -17,7 +17,7 @@ use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
 use sozu_command::{
-    logging,
+    logging::{self, CachedTags},
     proto::command::{
         request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,
         RequestHttpFrontend, WorkerRequest, WorkerResponse,
@@ -42,7 +42,7 @@ use crate::{
     server::{ListenToken, SessionManager},
     socket::server_bind,
     timer::TimeoutContainer,
-    AcceptError, CachedTags, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
+    AcceptError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerError,
     ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession, SessionIsToBeClosed,
     SessionMetrics, SessionResult, StateMachineBuilder, StateResult,
 };

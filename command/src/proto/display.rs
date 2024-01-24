@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fmt::{Display, Formatter},
+    fmt::{self, Display, Formatter},
     net::SocketAddr,
 };
 
@@ -8,18 +8,23 @@ use prettytable::{cell, row, Row, Table};
 use time::format_description;
 use x509_parser::time::ASN1Time;
 
-use crate::proto::{
-    command::{
-        filtered_metrics, request::RequestType, response_content::ContentType, AggregatedMetrics,
-        AvailableMetrics, CertificateAndKey, CertificateSummary, CertificatesWithFingerprints,
-        ClusterMetrics, FilteredMetrics, ListOfCertificatesByAddress, ListedFrontends,
-        ListenersList, QueryCertificatesFilters, RequestCounts, Response, ResponseContent,
-        ResponseStatus, RunState, TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses,
+use crate::{
+    access_logs::{prepare_user_agent, EndpointRecord, LogContext, LogDuration, RequestRecord},
+    logging::LoggerBackend,
+    proto::{
+        command::{
+            filtered_metrics, request::RequestType, response_content::ContentType,
+            AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificateSummary,
+            CertificatesWithFingerprints, ClusterMetrics, FilteredMetrics,
+            ListOfCertificatesByAddress, ListedFrontends, ListenersList, QueryCertificatesFilters,
+            RequestCounts, Response, ResponseContent, ResponseStatus, RunState, TlsVersion,
+            WorkerInfos, WorkerMetrics, WorkerResponses,
+        },
+        DisplayError,
     },
-    DisplayError,
 };
 
-use super::command::SocketAddress;
+use super::command::{protobuf_endpoint, ProtobufEndpoint, HttpEndpoint, SocketAddress, TcpEndpoint};
 
 impl Display for CertificateAndKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -947,5 +952,171 @@ fn create_cluster_table(headers: Vec<&str>, data: &BTreeMap<String, ResponseCont
 impl Display for SocketAddress {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", SocketAddr::from(self.clone()))
+    }
+}
+
+impl Display for ProtobufEndpoint {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match &self.inner {
+            Some(protobuf_endpoint::Inner::Http(HttpEndpoint {
+                method,
+                authority,
+                path,
+                status,
+                ..
+            })) => write!(
+                f,
+                "{} {} {} -> {}",
+                authority.as_string_or("-"),
+                method.as_string_or("-"),
+                path.as_string_or("-"),
+                status.as_string_or("-"),
+            ),
+            Some(protobuf_endpoint::Inner::Tcp(TcpEndpoint { context })) => {
+                write!(f, "{}", context.as_string_or("-"))
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+pub trait AsString {
+    fn as_string_or(&self, default: &'static str) -> String;
+}
+
+impl<T: ToString> AsString for Option<T> {
+    fn as_string_or(&self, default: &'static str) -> String {
+        match self {
+            None => default.to_string(),
+            Some(t) => t.to_string(),
+        }
+    }
+}
+
+pub trait AsStr {
+    fn as_str_or(&self, default: &'static str) -> &str;
+}
+
+impl<T: AsRef<str>> AsStr for Option<T> {
+    fn as_str_or(&self, default: &'static str) -> &str {
+        match self {
+            None => default,
+            Some(s) => s.as_ref(),
+        }
+    }
+}
+
+impl AsRef<str> for LoggerBackend {
+    fn as_ref(&self) -> &str {
+        match self {
+            LoggerBackend::Stdout(_) => "stdout",
+            LoggerBackend::Unix(_) => "UNIX socket",
+            LoggerBackend::Udp(_, _) => "UDP socket",
+            LoggerBackend::Tcp(_) => "TCP socket",
+            LoggerBackend::File(_) => "file",
+        }
+    }
+}
+
+impl Display for LogDuration {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.0 {
+            None => write!(f, "-"),
+            Some(duration) => {
+                let secs = duration.whole_seconds();
+                if secs >= 10 {
+                    return write!(f, "{secs}s");
+                }
+
+                let ms = duration.whole_milliseconds();
+                if ms < 10 {
+                    let us = duration.whole_microseconds();
+                    if us >= 10 {
+                        return write!(f, "{us}μs");
+                    }
+
+                    let ns = duration.whole_nanoseconds();
+                    return write!(f, "{ns}ns");
+                }
+
+                write!(f, "{ms}ms")
+            }
+        }
+    }
+}
+
+impl Display for LogContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {}",
+            self.request_id,
+            self.cluster_id.unwrap_or("-"),
+            self.backend_id.unwrap_or("-")
+        )
+    }
+}
+
+impl Display for EndpointRecord<'_> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            Self::Http {
+                method,
+                authority,
+                path,
+                status,
+                ..
+            } => write!(
+                f,
+                "{} {} {} -> {}",
+                authority.as_str_or("-"),
+                method.as_str_or("-"),
+                path.as_str_or("-"),
+                status.as_string_or("-"),
+            ),
+            Self::Tcp { context } => {
+                write!(f, "{}", context.as_str_or("-"))
+            }
+        }
+    }
+}
+
+impl Display for RequestRecord<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let (tags, ua_separator, user_agent) = match (self.tags, &self.user_agent) {
+            (None, None) => ("-", "", String::new()),
+            (Some(tags), None) => (tags.concatenated.as_str(), "", String::new()),
+            (None, Some(ua)) => ("", "user-agent=", prepare_user_agent(ua)),
+            (Some(tags), Some(ua)) => (
+                tags.concatenated.as_str(),
+                ", user-agent=",
+                prepare_user_agent(ua),
+            ),
+        };
+
+        write!(
+            f,
+            "{} \t{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {}{}{} {} {}",
+            self.context,
+            self.session_address.as_string_or("X"),
+            self.backend_address.as_string_or("X"),
+            LogDuration(Some(*self.response_time)),
+            LogDuration(Some(*self.service_time)),
+            LogDuration(*self.client_rtt),
+            LogDuration(*self.server_rtt),
+            self.bytes_in,
+            self.bytes_out,
+            tags,
+            ua_separator,
+            user_agent,
+            self.protocol,
+            self.endpoint
+        )?;
+
+        if let Some(message) = &self.error {
+            writeln!(f, " | {}", message)
+        } else {
+            writeln!(f)
+        }
     }
 }

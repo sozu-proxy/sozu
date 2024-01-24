@@ -14,11 +14,15 @@ use mio::{
 use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
-use sozu_command::{config::MAX_LOOP_ITERATIONS, proto::command::request::RequestType, ObjectKind};
+use sozu_command::{
+    config::MAX_LOOP_ITERATIONS,
+    logging::{EndpointRecord, LogContext},
+    proto::command::request::RequestType,
+    ObjectKind,
+};
 
 use crate::{
     backends::{Backend, BackendMap},
-    logs::{Endpoint, LogContext, RequestRecord},
     pool::{Checkout, Pool},
     protocol::{
         proxy_protocol::{
@@ -191,20 +195,24 @@ impl TcpSession {
 
     fn log_request(&self) {
         let listener = self.listener.borrow();
-        RequestRecord {
+        let context = self.log_context();
+        self.metrics.register_end_of_session(&context);
+        info_access!(
             error: None,
-            context: self.log_context(),
+            context,
             session_address: self.frontend_address,
             backend_address: None,
             protocol: "TCP",
-            endpoint: Endpoint::Tcp { context: None },
-            tags: listener.get_concatenated_tags(&listener.get_addr().to_string()),
+            endpoint: EndpointRecord::Tcp { context: None },
+            tags: listener.get_tags(&listener.get_addr().to_string()),
             client_rtt: socket_rtt(self.state.front_socket()),
             server_rtt: None,
-            metrics: &self.metrics,
             user_agent: None,
-        }
-        .log();
+            service_time: self.metrics.service_time(),
+            response_time: self.metrics.response_time(),
+            bytes_in: self.metrics.bin,
+            bytes_out: self.metrics.bout
+        );
     }
 
     fn front_hup(&mut self) -> SessionResult {

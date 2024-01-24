@@ -3,11 +3,11 @@ use std::{cell::RefCell, io::ErrorKind, net::SocketAddr, rc::Rc};
 use mio::{net::TcpStream, Token};
 use rustls::ServerConnection;
 use rusty_ulid::Ulid;
-use sozu_command::config::MAX_LOOP_ITERATIONS;
+use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::LogContext};
 
 use crate::{
-    logs::LogContext, protocol::SessionState, timer::TimeoutContainer, Readiness, Ready,
-    SessionMetrics, SessionResult, StateResult,
+    protocol::SessionState, timer::TimeoutContainer, Readiness, Ready, SessionMetrics,
+    SessionResult, StateResult,
 };
 
 pub enum TlsState {

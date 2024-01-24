@@ -283,3 +283,9 @@ impl From<u128> for Uint128 {
         Uint128 { low, high }
     }
 }
+
+impl From<i128> for Uint128 {
+    fn from(value: i128) -> Self {
+        Uint128::from(value as u128)
+    }
+}

@@ -133,7 +133,7 @@ impl Worker {
         println!("Setting up logging");
 
         let server_job = thread::spawn(move || {
-            setup_logging("stdout", None, "error", &thread_name);
+            setup_logging("stdout", None, None, "error", &thread_name);
             let mut server = Server::try_new_from_config(
                 cmd_worker_to_main,
                 thread_scm_worker_to_main,

@@ -230,7 +230,7 @@
 //! };
 //!
 //! fn main() -> anyhow::Result<()> {
-//!     setup_logging("stdout", None, "info", "EXAMPLE");
+//!     setup_logging("stdout", None, None, "info", "EXAMPLE");
 //!
 //!     info!("starting up");
 //!
@@ -318,7 +318,6 @@ extern crate quickcheck;
 pub mod util;
 #[macro_use]
 pub mod metrics;
-mod logs;
 
 pub mod backends;
 pub mod features;
@@ -360,7 +359,11 @@ use time::{Duration, Instant};
 use tls::CertificateResolverError;
 
 use sozu_command::{
-    proto::command::{Cluster, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse},
+    logging::{CachedTags, LogContext},
+    proto::{
+        command::{Cluster, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse},
+        display::AsStr,
+    },
     ready::Ready,
     state::ClusterId,
     ObjectKind,
@@ -522,21 +525,6 @@ macro_rules! StateMachineBuilder {
     };
     ($($tt:tt)+) => {
         StateMachineBuilder!{($) $($tt)+}
-    }
-}
-
-pub struct CachedTags {
-    pub tags: BTreeMap<String, String>,
-    pub concatenated: String,
-}
-impl CachedTags {
-    fn new(tags: BTreeMap<String, String>) -> Self {
-        let concatenated = tags
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        Self { tags, concatenated }
     }
 }
 
@@ -1053,6 +1041,41 @@ impl SessionMetrics {
             (Some(start), Some(end)) => Some(end - start),
             _ => None,
         }
+    }
+
+    pub fn register_end_of_session(&self, context: &LogContext) {
+        let response_time = self.response_time();
+        let service_time = self.service_time();
+
+        if let Some(cluster_id) = context.cluster_id {
+            time!(
+                "response_time",
+                cluster_id,
+                response_time.whole_milliseconds()
+            );
+            time!(
+                "service_time",
+                cluster_id,
+                service_time.whole_milliseconds()
+            );
+        }
+        time!("response_time", response_time.whole_milliseconds());
+        time!("service_time", service_time.whole_milliseconds());
+
+        if let Some(backend_id) = self.backend_id.as_ref() {
+            if let Some(backend_response_time) = self.backend_response_time() {
+                record_backend_metrics!(
+                    context.cluster_id.as_str_or("-"),
+                    backend_id,
+                    backend_response_time.whole_milliseconds(),
+                    self.backend_connection_time(),
+                    self.backend_bin,
+                    self.backend_bout
+                );
+            }
+        }
+
+        incr!("access_logs.count", context.cluster_id, context.backend_id);
     }
 }
 

@@ -631,7 +631,7 @@ pub fn try_hard_or_soft_stop(soft: bool) -> State {
 }
 
 fn try_http_behaviors() -> State {
-    setup_logging("stdout", None, "debug", "BEHAVE-OUT");
+    setup_logging("stdout", None, None, "debug", "BEHAVE-OUT");
 
     info!("starting up");
 
@@ -1069,7 +1069,7 @@ pub fn try_blue_geen() -> State {
 }
 
 pub fn try_keep_alive() -> State {
-    setup_logging("stdout", None, "debug", "KA-OUT");
+    setup_logging("stdout", None, None, "debug", "KA-OUT");
 
     let front_address = create_local_address();
 

@@ -26,7 +26,7 @@ use tempfile::tempfile;
 use sozu_command_lib::{
     channel::{Channel, ChannelError},
     config::Config,
-    logging::setup_logging,
+    logging::{setup_logging, AccessLogFormat},
     proto::command::{ServerConfig, WorkerRequest, WorkerResponse},
     ready::Ready,
     request::{read_initial_state_from_file, RequestError},
@@ -110,10 +110,13 @@ pub fn begin_worker_process(
 
     let worker_id = format!("{}-{:02}", "WRK", id);
 
+    let access_log_format = AccessLogFormat::from(&worker_config.access_log_format());
+
     // do not try to log anything before this, or the logger will panic
     setup_logging(
         &worker_config.log_target,
         worker_config.log_access_target.as_deref(),
+        Some(access_log_format),
         &worker_config.log_level,
         &worker_id,
     );

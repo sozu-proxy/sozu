@@ -61,12 +61,14 @@ use toml;
 
 use crate::{
     certificate::split_certificate_chain,
+    logging::AccessLogFormat,
     proto::command::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
         Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
-        LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProxyProtocolConfig,
-        Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig,
-        ServerMetricsConfig, SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest,
+        LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProtobufAccessLogFormat,
+        ProxyProtocolConfig, Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
+        ServerConfig, ServerMetricsConfig, SocketAddress, TcpListenerConfig, TlsVersion,
+        WorkerRequest,
     },
     ObjectKind,
 };
@@ -1090,6 +1092,7 @@ pub struct FileConfig {
     pub log_target: Option<String>,
     #[serde(default)]
     pub log_access_target: Option<String>,
+    pub log_access_format: Option<AccessLogFormat>,
     pub worker_count: Option<u16>,
     pub worker_automatic_restart: Option<bool>,
     pub metrics: Option<MetricsConfig>,
@@ -1201,6 +1204,7 @@ impl ConfigBuilder {
             front_timeout: file_config.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
             handle_process_affinity: file_config.handle_process_affinity.unwrap_or(false),
             log_access_target: file_config.log_access_target.clone(),
+            log_access_format: file_config.log_access_format.clone(),
             log_level: file_config
                 .log_level
                 .clone()
@@ -1447,6 +1451,7 @@ pub struct Config {
     pub log_target: String,
     #[serde(default)]
     pub log_access_target: Option<String>,
+    pub log_access_format: Option<AccessLogFormat>,
     pub worker_count: u16,
     pub worker_automatic_restart: bool,
     pub metrics: Option<MetricsConfig>,
@@ -1777,6 +1782,8 @@ impl From<&Config> for ServerConfig {
             command_buffer_size: config.command_buffer_size,
             max_command_buffer_size: config.max_command_buffer_size,
             metrics,
+            access_log_format: ProtobufAccessLogFormat::from(&config.log_access_format) as i32,
+            // log_colored: config.log_colored,
         }
     }
 }

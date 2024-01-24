@@ -3,10 +3,9 @@ use std::{cell::RefCell, rc::Rc};
 use mio::{net::TcpStream, *};
 use nom::{Err, HexDisplay};
 use rusty_ulid::Ulid;
-use sozu_command::config::MAX_LOOP_ITERATIONS;
+use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::LogContext};
 
 use crate::{
-    logs::LogContext,
     pool::Checkout,
     protocol::{pipe::Pipe, SessionResult, SessionState},
     socket::{SocketHandler, SocketResult},
