@@ -51,7 +51,6 @@ use crate::{
     AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus, CachedTags,
     ListenerError, ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession,
     Readiness, SessionIsToBeClosed, SessionMetrics, SessionResult, StateMachineBuilder,
-    StateResult,
 };
 
 StateMachineBuilder! {
@@ -217,22 +216,22 @@ impl TcpSession {
         .log();
     }
 
-    fn front_hup(&mut self) -> StateResult {
+    fn front_hup(&mut self) -> SessionResult {
         match &mut self.state {
             TcpStateMachine::Pipe(pipe) => pipe.frontend_hup(&mut self.metrics),
             _ => {
                 self.log_request();
-                StateResult::CloseSession
+                SessionResult::Close
             }
         }
     }
 
-    fn back_hup(&mut self) -> StateResult {
+    fn back_hup(&mut self) -> SessionResult {
         match &mut self.state {
             TcpStateMachine::Pipe(pipe) => pipe.backend_hup(&mut self.metrics),
             _ => {
                 self.log_request();
-                StateResult::CloseSession
+                SessionResult::Close
             }
         }
     }
@@ -245,77 +244,48 @@ impl TcpSession {
         }
     }
 
-    fn readable(&mut self) -> StateResult {
+    fn readable(&mut self) -> SessionResult {
         if !self.container_frontend_timeout.reset() {
             error!("could not reset front timeout");
         }
 
-        let mut should_upgrade_protocol = SessionResult::Continue;
-
-        let state_result = match &mut self.state {
+        match &mut self.state {
             TcpStateMachine::Pipe(pipe) => pipe.readable(&mut self.metrics),
             TcpStateMachine::RelayProxyProtocol(pp) => pp.readable(&mut self.metrics),
-            TcpStateMachine::ExpectProxyProtocol(pp) => {
-                should_upgrade_protocol = pp.readable(&mut self.metrics);
-                match should_upgrade_protocol {
-                    SessionResult::Upgrade => StateResult::Continue,
-                    SessionResult::Continue => StateResult::Continue,
-                    SessionResult::Close => StateResult::CloseSession,
-                }
-            }
-            TcpStateMachine::SendProxyProtocol(_) => StateResult::Continue,
+            TcpStateMachine::ExpectProxyProtocol(pp) => pp.readable(&mut self.metrics),
+            TcpStateMachine::SendProxyProtocol(_) => SessionResult::Continue,
             TcpStateMachine::FailedUpgrade(_) => unreachable!(),
-        };
-
-        if let SessionResult::Upgrade = should_upgrade_protocol {
-            match self.upgrade() {
-                false => StateResult::Continue,
-                true => StateResult::CloseSession,
-            }
-        } else {
-            state_result
         }
     }
 
-    fn writable(&mut self) -> StateResult {
+    fn writable(&mut self) -> SessionResult {
         match &mut self.state {
             TcpStateMachine::Pipe(pipe) => pipe.writable(&mut self.metrics),
-            _ => StateResult::Continue,
+            _ => SessionResult::Continue,
         }
     }
 
-    fn back_readable(&mut self) -> StateResult {
+    fn back_readable(&mut self) -> SessionResult {
         if !self.container_backend_timeout.reset() {
             error!("could not reset back timeout");
         }
 
         match &mut self.state {
             TcpStateMachine::Pipe(pipe) => pipe.backend_readable(&mut self.metrics),
-            _ => StateResult::Continue,
+            _ => SessionResult::Continue,
         }
     }
 
-    fn back_writable(&mut self) -> StateResult {
-        let mut res = (SessionResult::Continue, StateResult::Continue);
-
+    fn back_writable(&mut self) -> SessionResult {
         match &mut self.state {
-            TcpStateMachine::Pipe(pipe) => res.1 = pipe.backend_writable(&mut self.metrics),
-            TcpStateMachine::RelayProxyProtocol(pp) => {
-                res = pp.back_writable(&mut self.metrics);
-            }
-            TcpStateMachine::SendProxyProtocol(pp) => {
-                res = pp.back_writable(&mut self.metrics);
-            }
-            TcpStateMachine::ExpectProxyProtocol(_) | TcpStateMachine::FailedUpgrade(_) => {
+            TcpStateMachine::Pipe(pipe) => pipe.backend_writable(&mut self.metrics),
+            TcpStateMachine::RelayProxyProtocol(pp) => pp.back_writable(&mut self.metrics),
+            TcpStateMachine::SendProxyProtocol(pp) => pp.back_writable(&mut self.metrics),
+            TcpStateMachine::ExpectProxyProtocol(_) => SessionResult::Continue,
+            TcpStateMachine::FailedUpgrade(_) => {
                 unreachable!()
             }
-        };
-
-        if let SessionResult::Upgrade = res.0 {
-            self.upgrade();
         }
-
-        res.1
     }
 
     fn back_socket_mut(&mut self) -> Option<&mut MioTcpStream> {
@@ -570,7 +540,7 @@ impl TcpSession {
         self.container_backend_timeout.cancel();
     }
 
-    fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> StateResult {
+    fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
         let mut counter = 0;
 
         let back_connected = self.back_connected();
@@ -583,53 +553,29 @@ impl TcpSession {
 
                 // trigger a backend reconnection
                 self.close_backend();
-                match self.connect_to_backend(session.clone()) {
-                    // reuse connection or send a default answer, we can continue
-                    Ok(BackendConnectAction::Reuse) => {}
-                    Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                        // stop here, we must wait for an event
-                        return StateResult::Continue;
-                    }
-                    // TODO: should we return CloseSession here?
-                    Err(connection_error) => {
-                        error!("Error connecting to backend: {}", connection_error)
-                    }
+                let connection_result = self.connect_to_backend(session.clone());
+                if let Some(state_result) = handle_connection_result(connection_result) {
+                    return state_result;
                 }
             } else if self.back_readiness().unwrap().event != Ready::EMPTY {
                 self.reset_connection_attempt();
                 let back_token = self.backend_token.unwrap();
                 self.container_backend_timeout.set(back_token);
-                // Why is this here? this artificially reset the connection time for no apparent reasons
-                // TODO: maybe remove this?
-                self.backend_connected = BackendConnectionStatus::Connecting(Instant::now());
-
                 self.set_back_connected(BackendConnectionStatus::Connected);
             }
         } else if back_connected == BackendConnectionStatus::NotConnected {
-            match self.connect_to_backend(session.clone()) {
-                // reuse connection or send a default answer, we can continue
-                Ok(BackendConnectAction::Reuse) => {}
-                Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                    // we must wait for an event
-                    return StateResult::Continue;
-                }
-                Err(connection_error) => {
-                    error!("Error connecting to backend: {}", connection_error)
-                }
+            let connection_result = self.connect_to_backend(session.clone());
+            if let Some(state_result) = handle_connection_result(connection_result) {
+                return state_result;
             }
         }
 
         if self.front_readiness().event.is_hup() {
-            let order = self.front_hup();
-            match order {
-                StateResult::CloseSession => {
-                    return order;
-                }
-                _ => {
-                    self.front_readiness().event.remove(Ready::HUP);
-                    return order;
-                }
+            let session_result = self.front_hup();
+            if session_result == SessionResult::Continue {
+                self.front_readiness().event.remove(Ready::HUP);
             }
+            return session_result;
         }
 
         let token = self.frontend_token;
@@ -663,65 +609,38 @@ impl TcpSession {
             }
 
             if front_interest.is_readable() {
-                let order = self.readable();
-                trace!("front readable\tinterpreting session order {:?}", order);
-
-                match order {
-                    StateResult::ConnectBackend => {
-                        match self.connect_to_backend(session.clone()) {
-                            // reuse connection or send a default answer, we can continue
-                            Ok(BackendConnectAction::Reuse) => {}
-                            Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                                // we must wait for an event
-                                return StateResult::Continue;
-                            }
-                            Err(connection_error) => {
-                                error!("Error connecting to backend: {}", connection_error)
-                            }
-                        }
-                    }
-                    StateResult::Continue => {}
-                    order => return order,
+                let session_result = self.readable();
+                if session_result != SessionResult::Continue {
+                    return session_result;
                 }
             }
 
             if back_interest.is_writable() {
-                let order = self.back_writable();
-                if order != StateResult::Continue {
-                    return order;
+                let session_result = self.back_writable();
+                if session_result != SessionResult::Continue {
+                    return session_result;
                 }
             }
 
             if back_interest.is_readable() {
-                let order = self.back_readable();
-                if order != StateResult::Continue {
-                    return order;
+                let session_result = self.back_readable();
+                if session_result != SessionResult::Continue {
+                    return session_result;
                 }
             }
 
             if front_interest.is_writable() {
-                let order = self.writable();
-                trace!("front writable\tinterpreting session order {:?}", order);
-                if order != StateResult::Continue {
-                    return order;
+                let session_result = self.writable();
+                if session_result != SessionResult::Continue {
+                    return session_result;
                 }
             }
 
             if back_interest.is_hup() {
-                let order = self.back_hup();
-                match order {
-                    StateResult::CloseSession => {
-                        return order;
-                    }
-                    StateResult::Continue => {}
-                    _ => {
-                        if let Some(r) = self.back_readiness() {
-                            r.event.remove(Ready::HUP);
-                        }
-
-                        return order;
-                    }
-                };
+                let session_result = self.back_hup();
+                if session_result != SessionResult::Continue {
+                    return session_result;
+                }
             }
 
             if front_interest.is_error() {
@@ -734,10 +653,10 @@ impl TcpSession {
                     r.interest = Ready::EMPTY;
                 }
 
-                return StateResult::CloseSession;
+                return SessionResult::Close;
             }
 
-            if back_interest.is_error() && self.back_hup() == StateResult::CloseSession {
+            if back_interest.is_error() && self.back_hup() == SessionResult::Close {
                 self.front_readiness().interest = Ready::EMPTY;
                 if let Some(r) = self.back_readiness() {
                     r.interest = Ready::EMPTY;
@@ -747,7 +666,7 @@ impl TcpSession {
                     "PROXY session {:?} back error, disconnecting",
                     self.frontend_token
                 );
-                return StateResult::CloseSession;
+                return SessionResult::Close;
             }
 
             counter += 1;
@@ -778,10 +697,10 @@ impl TcpSession {
             );
             self.print_session();
 
-            return StateResult::CloseSession;
+            return SessionResult::Close;
         }
 
-        StateResult::Continue
+        SessionResult::Continue
     }
 
     /// TCP session closes its backend on its own, without defering this task to the state
@@ -1015,17 +934,16 @@ impl ProxySession for TcpSession {
 
     fn ready(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
         self.metrics.service_start();
-        let state_result = self.ready_inner(session);
 
-        let to_bo_closed = match state_result {
-            StateResult::CloseBackend => {
-                self.close_backend();
-                false
-            }
-            StateResult::CloseSession => true,
-            StateResult::Continue => false,
-            StateResult::ConnectBackend => unreachable!(),
-            StateResult::Upgrade => unreachable!(),
+        let session_result = self.ready_inner(session.clone());
+
+        let to_bo_closed = match session_result {
+            SessionResult::Close => true,
+            SessionResult::Continue => false,
+            SessionResult::Upgrade => match self.upgrade() {
+                false => self.ready(session),
+                true => true,
+            },
         };
 
         self.metrics.service_stop();
@@ -1171,6 +1089,25 @@ impl TcpListener {
         self.listener = listener;
         self.active = true;
         Some(self.token)
+    }
+}
+
+fn handle_connection_result(
+    connection_result: Result<BackendConnectAction, BackendConnectionError>,
+) -> Option<SessionResult> {
+    match connection_result {
+        // reuse connection or send a default answer, we can continue
+        Ok(BackendConnectAction::Reuse) => None,
+        Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
+            // we must wait for an event
+            Some(SessionResult::Continue)
+        }
+        Err(connection_error) => {
+            error!("Error connecting to backend: {}", connection_error);
+            // in case of BackendConnectionError::Backend(BackendError::ConnectionFailures(..))
+            // we may want to retry instead of closing
+            Some(SessionResult::Close)
+        }
     }
 }
 

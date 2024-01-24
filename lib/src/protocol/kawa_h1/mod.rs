@@ -1204,6 +1204,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 proxy,
             )
             .map_err(|backend_error| {
+                // some backend errors are actually retryable
+                // TODO: maybe retry or return a different default answer
                 self.set_answer(DefaultAnswerStatus::Answer503, None);
                 BackendConnectionError::Backend(backend_error)
             })?;
@@ -1538,16 +1540,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
                 // trigger a backend reconnection
                 self.close_backend(proxy.clone(), metrics);
-                match self.connect_to_backend(session.clone(), proxy.clone(), metrics) {
-                    // reuse connection or send a default answer, we can continue
-                    Ok(BackendConnectAction::Reuse) => {}
-                    Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                        // we must wait for an event
-                        return SessionResult::Continue;
-                    }
-                    Err(connection_error) => {
-                        warn!("Error connecting to backend: {}", connection_error)
-                    }
+                let connection_result =
+                    self.connect_to_backend(session.clone(), proxy.clone(), metrics);
+                if let Some(session_result) = handle_connection_result(connection_result) {
+                    return session_result;
                 }
             } else {
                 metrics.backend_connected();
@@ -1593,16 +1589,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 match state_result {
                     StateResult::Continue => {}
                     StateResult::ConnectBackend => {
-                        match self.connect_to_backend(session.clone(), proxy.clone(), metrics) {
-                            // reuse connection or send a default answer, we can continue
-                            Ok(BackendConnectAction::Reuse) => {}
-                            Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
-                                // we must wait for an event
-                                return SessionResult::Continue;
-                            }
-                            Err(connection_error) => {
-                                warn!("Error connecting to backend: {}", connection_error)
-                            }
+                        let connection_result =
+                            self.connect_to_backend(session.clone(), proxy.clone(), metrics);
+                        if let Some(session_result) = handle_connection_result(connection_result) {
+                            return session_result;
                         }
                     }
                     StateResult::CloseBackend => unreachable!(),
@@ -1817,6 +1807,30 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
         } else {
             self.context.closing = true;
             false
+        }
+    }
+}
+
+fn handle_connection_result(
+    connection_result: Result<BackendConnectAction, BackendConnectionError>,
+) -> Option<SessionResult> {
+    match connection_result {
+        // reuse connection or send a default answer, we can continue
+        Ok(BackendConnectAction::Reuse) => None,
+        Ok(BackendConnectAction::New) | Ok(BackendConnectAction::Replace) => {
+            // we must wait for an event
+            Some(SessionResult::Continue)
+        }
+        Err(connection_error) => {
+            error!("Error connecting to backend: {}", connection_error);
+            // All BackendConnectionError already set a default answer
+            // the session must continue to serve it
+            // - NotFound: not used for http (only tcp)
+            // - RetrieveClusterError: 301/400/401/404,
+            // - MaxConnectionRetries: 503,
+            // - Backend: 503,
+            // - MaxSessionsMemory: not checked in connect_to_backend (TODO: check it?)
+            None
         }
     }
 }

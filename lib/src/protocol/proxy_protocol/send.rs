@@ -12,12 +12,11 @@ use crate::{
     protocol::{
         pipe::Pipe,
         proxy_protocol::header::{Command, HeaderV2, ProxyProtocolHeader},
-        SessionResult,
     },
     socket::SocketHandler,
     sozu_command::ready::Ready,
     tcp::TcpListener,
-    BackendConnectionStatus, Protocol, Readiness, SessionMetrics, StateResult,
+    BackendConnectionStatus, Protocol, Readiness, SessionMetrics, SessionResult,
 };
 
 pub struct SendProxyProtocol<Front: SocketHandler> {
@@ -65,7 +64,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
 
     // The header is send immediately at once upon the connection is establish
     // and prepended before any data.
-    pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> (SessionResult, StateResult) {
+    pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         debug!("Trying to write proxy protocol header");
 
         // Generate the proxy protocol header if not already exist.
@@ -81,7 +80,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
                         .into_bytes(),
                     );
                 } else {
-                    return (SessionResult::Continue, StateResult::CloseSession);
+                    return SessionResult::Close;
                 }
             };
         }
@@ -96,18 +95,18 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
 
                             if self.cursor_header == header.len() {
                                 debug!("Proxy protocol sent, upgrading");
-                                return (SessionResult::Upgrade, StateResult::Continue);
+                                return SessionResult::Upgrade;
                             }
                         }
                         Err(e) => match e.kind() {
                             ErrorKind::WouldBlock => {
                                 self.backend_readiness.event.remove(Ready::WRITABLE);
-                                return (SessionResult::Continue, StateResult::Continue);
+                                return SessionResult::Continue;
                             }
                             e => {
                                 incr!("proxy_protocol.errors");
                                 debug!("send proxy protocol write error {:?}", e);
-                                return (SessionResult::Continue, StateResult::CloseSession);
+                                return SessionResult::Close;
                             }
                         },
                     }
@@ -116,7 +115,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
         }
 
         error!("started Send proxy protocol with no header or backend socket");
-        (SessionResult::Continue, StateResult::CloseSession)
+        SessionResult::Close
     }
 
     pub fn front_socket(&self) -> &TcpStream {
@@ -209,7 +208,7 @@ mod send_test {
 
     use super::{
         super::parser::parse_v2_header, BackendConnectionStatus, ErrorKind, SendProxyProtocol,
-        SessionMetrics, SessionResult, StateResult, Token,
+        SessionMetrics, SessionResult, Token,
     };
 
     #[test]
@@ -261,15 +260,13 @@ mod send_test {
         send_pp.set_back_connected(BackendConnectionStatus::Connected);
 
         loop {
-            let (protocol, session) = send_pp.back_writable(&mut session_metrics);
-            if session != StateResult::Continue {
-                panic!(
-                    "state machine error: protocol result = {protocol:?}, session result = {session:?}"
-                );
+            let result = send_pp.back_writable(&mut session_metrics);
+            if result == SessionResult::Upgrade {
+                break;
             }
 
-            if protocol == SessionResult::Upgrade {
-                break;
+            if result != SessionResult::Continue {
+                panic!("state machine error: result = {result:?}");
             }
         }
     }
