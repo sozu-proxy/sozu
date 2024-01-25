@@ -810,7 +810,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         )
     }
 
-    pub fn log_request(&self, metrics: &SessionMetrics, message: Option<&str>) {
+    pub fn log_request(&mut self, metrics: &SessionMetrics, message: Option<&str>) {
         let listener = self.listener.borrow();
         let tags = self.context.authority.as_ref().and_then(|host| {
             let hostname = match host.split_once(':') {
@@ -824,6 +824,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             SessionStatus::DefaultAnswer(answers, ..) => Some(answers.into()),
         };
 
+        let user_agent = self.context.user_agent.take();
         RequestRecord {
             error: message,
             context: self.log_context(),
@@ -841,15 +842,15 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             client_rtt: socket_rtt(self.front_socket()),
             server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
             metrics,
-            user_agent: self.context.user_agent.as_deref(),
+            user_agent,
         }
         .log();
     }
 
-    pub fn log_request_success(&self, metrics: &SessionMetrics) {
+    pub fn log_request_success(&mut self, metrics: &SessionMetrics) {
         self.log_request(metrics, None);
     }
-    pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
+    pub fn log_default_answer_success(&mut self, metrics: &SessionMetrics) {
         self.log_request(metrics, None);
     }
     pub fn log_request_error(&mut self, metrics: &mut SessionMetrics, message: &str) {
