@@ -1913,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "sozu"
-version = "0.15.18"
+version = "0.15.19"
 dependencies = [
  "anyhow",
  "async-dup",
@@ -1943,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "0.15.18"
+version = "0.15.19"
 dependencies = [
  "hex",
  "libc",
@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-e2e"
-version = "0.15.18"
+version = "0.15.19"
 dependencies = [
  "futures",
  "hyper",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "0.15.18"
+version = "0.15.19"
 dependencies = [
  "anyhow",
  "cookie-factory",
