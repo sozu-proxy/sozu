@@ -36,9 +36,10 @@
 //! We need the `sozu_command_lib` to build a listener.
 //!
 //! ```
-//! use sozu_command_lib::config::ListenerBuilder;
+//! use sozu_command_lib::{config::ListenerBuilder, proto::command::SocketAddress};
 //!
-//! let http_listener = ListenerBuilder::new_http("127.0.0.1:8080")
+//! let address = SocketAddress::new_v4(127,0,0,1,8080);
+//! let http_listener = ListenerBuilder::new_http(address)
 //!     .to_http(None)
 //!     .expect("Could not create HTTP listener");
 //! ```
@@ -120,11 +121,11 @@
 //! ```
 //! use std::collections::BTreeMap;
 //!
-//!  use sozu_command_lib::proto::command::{PathRule, RequestHttpFrontend, RulePosition};
+//!  use sozu_command_lib::proto::command::{PathRule, RequestHttpFrontend, RulePosition, SocketAddress};
 //!
 //! let http_front = RequestHttpFrontend {
 //!     cluster_id: Some("my-cluster".to_string()),
-//!     address: "127.0.0.1:8080".to_string(),
+//!     address: SocketAddress::new_v4(127,0,0,1,8080),
 //!     hostname: "example.com".to_string(),
 //!     path: PathRule::prefix(String::from("/")),
 //!     position: RulePosition::Pre.into(),
@@ -144,12 +145,12 @@
 //! The `address` field must match the IP and port of the backend server.
 //!
 //! ```
-//! use sozu_command_lib::proto::command::{AddBackend, LoadBalancingParams};
+//! use sozu_command_lib::proto::command::{AddBackend, LoadBalancingParams, SocketAddress};
 //!
 //! let http_backend = AddBackend {
 //!     cluster_id: "my-cluster".to_string(),
 //!     backend_id: "test-backend".to_string(),
-//!     address: "127.0.0.1:8000".to_string(),
+//!     address: SocketAddress::new_v4(127,0,0,1,8000),
 //!     load_balancing_parameters: Some(LoadBalancingParams::default()),
 //!     ..Default::default()
 //! };
@@ -226,7 +227,7 @@
 //!     logging::setup_logging,
 //!     proto::command::{
 //!         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
-//!         PathRule, Request, RequestHttpFrontend, RulePosition,
+//!         PathRule, Request, RequestHttpFrontend, RulePosition, SocketAddress,
 //!     },
 //!     request::WorkerRequest,
 //! };
@@ -236,7 +237,7 @@
 //!
 //!     info!("starting up");
 //!
-//!     let http_listener = ListenerBuilder::new_http("127.0.0.1:8080")
+//!     let http_listener = ListenerBuilder::new_http(SocketAddress::new_v4(127,0,0,1,8080))
 //!         .to_http(None)
 //!         .expect("Could not create HTTP listener");
 //!
@@ -261,7 +262,7 @@
 //!
 //!     let http_front = RequestHttpFrontend {
 //!         cluster_id: Some("my-cluster".to_string()),
-//!         address: "127.0.0.1:8080".to_string(),
+//!         address: SocketAddress::new_v4(127,0,0,1,8080),
 //!         hostname: "example.com".to_string(),
 //!         path: PathRule::prefix(String::from("/")),
 //!         position: RulePosition::Pre.into(),
@@ -274,7 +275,7 @@
 //!     let http_backend = AddBackend {
 //!         cluster_id: "my-cluster".to_string(),
 //!         backend_id: "test-backend".to_string(),
-//!         address: "127.0.0.1:8000".to_string(),
+//!         address: SocketAddress::new_v4(127,0,0,1,8000),
 //!         load_balancing_parameters: Some(LoadBalancingParams::default()),
 //!         ..Default::default()
 //!     };
@@ -649,10 +650,8 @@ pub enum ListenerError {
     PemParse(String),
     #[error("failed to build rustls context, {0}")]
     BuildRustls(String),
-    #[error("Wrong socket address")]
-    SocketParse { address: String, error: String },
-    #[error("could not activate listener with address {address}: {error}")]
-    Activation { address: String, error: String },
+    #[error("could not activate listener with address {address:?}: {error}")]
+    Activation { address: SocketAddr, error: String },
     #[error("Could not register listener socket: {0}")]
     SocketRegistration(std::io::Error),
     #[error("could not add frontend: {0}")]
@@ -700,8 +699,6 @@ pub enum ProxyError {
     RemoveCertificate(ListenerError),
     #[error("could not replace certificate: {0}")]
     ReplaceCertificate(ListenerError),
-    #[error("Wrong address {address}: {error}")]
-    SocketParse { address: String, error: String },
     #[error("wrong certificate fingerprint: {0}")]
     WrongCertificateFingerprint(String),
     #[error("this request is not supported by the proxy")]

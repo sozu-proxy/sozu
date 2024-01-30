@@ -10,7 +10,7 @@ use sozu_command_lib::{
     logging::setup_logging,
     proto::command::{
         request::RequestType, ActivateListener, AddCertificate, CertificateAndKey, ListenerType,
-        RemoveBackend, RequestHttpFrontend,
+        RemoveBackend, RequestHttpFrontend, SocketAddress,
     },
     scm_socket::Listeners,
     state::ConfigState,
@@ -29,7 +29,7 @@ use crate::{
     tests::{provide_port, repeat_until_error_or, setup_async_test, setup_sync_test, State},
 };
 
-fn create_local_address() -> SocketAddr {
+pub fn create_local_address() -> SocketAddr {
     let address: SocketAddr = format!("127.0.0.1:{}", provide_port())
         .parse()
         .expect("could not parse front address");
@@ -295,12 +295,12 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     let mut worker = Worker::start_new_worker("810-PANIC", config, &listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddTcpListener(
-        ListenerBuilder::new_tcp(front_address)
+        ListenerBuilder::new_tcp(front_address.into())
             .to_tcp(None)
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
-        address: front_address.to_string(),
+        address: front_address.into(),
         proxy: ListenerType::Tcp.into(),
         from_scm: false,
     }));
@@ -310,13 +310,13 @@ pub fn try_issue_810_panic(part2: bool) -> State {
     )));
     worker.send_proxy_request_type(RequestType::AddTcpFrontend(Worker::default_tcp_frontend(
         "cluster_0",
-        front_address.to_string(),
+        front_address,
     )));
 
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0",
-        back_address.to_string(),
+        back_address,
         None,
     )));
     worker.read_to_last();
@@ -356,22 +356,20 @@ pub fn try_issue_810_panic(part2: bool) -> State {
 
 pub fn try_tls_endpoint() -> State {
     let front_port = provide_port();
-    let front_address: SocketAddr = format!("127.0.0.1:{}", front_port)
-        .parse()
-        .expect("could not parse front address");
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
     let back_address = create_local_address();
 
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker("TLS-ENDPOINT", config, &listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpsListener(
-        ListenerBuilder::new_https(front_address)
+        ListenerBuilder::new_https(front_address.clone().into())
             .to_tls(None)
             .unwrap(),
     ));
 
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
-        address: front_address.to_string(),
+        address: front_address.clone().into(),
         proxy: ListenerType::Https.into(),
         from_scm: false,
     }));
@@ -384,7 +382,7 @@ pub fn try_tls_endpoint() -> State {
     let hostname = "localhost".to_string();
     worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
         hostname: hostname.to_owned(),
-        ..Worker::default_http_frontend("cluster_0", front_address)
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
     }));
 
     let certificate_and_key = CertificateAndKey {
@@ -395,7 +393,7 @@ pub fn try_tls_endpoint() -> State {
         names: vec![],
     };
     let add_certificate = AddCertificate {
-        address: front_address.to_string(),
+        address: front_address.into(),
         certificate: certificate_and_key,
         expired_at: None,
     };
@@ -404,7 +402,7 @@ pub fn try_tls_endpoint() -> State {
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0",
-        back_address.to_string(),
+        back_address,
         None,
     )));
     worker.read_to_last();
@@ -643,12 +641,12 @@ fn try_http_behaviors() -> State {
     let mut worker = Worker::start_new_worker("BEHAVE-WORKER", config, &listeners, state);
 
     worker.send_proxy_request_type(RequestType::AddHttpListener(
-        ListenerBuilder::new_http(front_address)
+        ListenerBuilder::new_http(front_address.into())
             .to_http(None)
             .unwrap(),
     ));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
-        address: front_address.to_string(),
+        address: front_address.into(),
         proxy: ListenerType::Http.into(),
         from_scm: false,
     }));
@@ -689,7 +687,7 @@ fn try_http_behaviors() -> State {
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
-        back_address.to_string(),
+        back_address,
         None,
     )));
     worker.read_to_last();
@@ -731,12 +729,12 @@ fn try_http_behaviors() -> State {
     worker.send_proxy_request_type(RequestType::RemoveBackend(RemoveBackend {
         cluster_id: String::from("cluster_0"),
         backend_id: String::from("cluster_0-0"),
-        address: back_address.to_string(),
+        address: back_address.into(),
     }));
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
-        back_address.to_string(),
+        back_address,
         None,
     )));
     backend.disconnect();
@@ -793,12 +791,12 @@ fn try_http_behaviors() -> State {
     worker.send_proxy_request_type(RequestType::RemoveBackend(RemoveBackend {
         cluster_id: String::from("cluster_0"),
         backend_id: String::from("cluster_0-0"),
-        address: back_address.to_string(),
+        address: back_address.into(),
     }));
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0".to_string(),
-        back_address.to_string(),
+        back_address,
         None,
     )));
     backend.disconnect();
@@ -1012,7 +1010,7 @@ pub fn try_blue_geen() -> State {
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-0",
-        primary_address.to_string(),
+        primary_address.into(),
         None,
     )));
     worker.read_to_last();
@@ -1031,7 +1029,7 @@ pub fn try_blue_geen() -> State {
     worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
         "cluster_0",
         "cluster_0-1",
-        secondary_address.to_string(),
+        secondary_address.into(),
         None,
     )));
     worker.read_to_last();
@@ -1043,7 +1041,7 @@ pub fn try_blue_geen() -> State {
     worker.send_proxy_request_type(RequestType::RemoveBackend(RemoveBackend {
         cluster_id: "cluster_0".to_string(),
         backend_id: "cluster_0-0".to_string(),
-        address: primary_address.to_string(),
+        address: primary_address.into(),
     }));
     worker.read_to_last();
 
@@ -1464,7 +1462,7 @@ fn try_wildcard() -> State {
     let mut worker = Worker::start_new_worker("WLD_CRD", config, &listeners, state);
     worker.send_proxy_request(
         RequestType::AddHttpListener(
-            ListenerBuilder::new_http(front_address)
+            ListenerBuilder::new_http(front_address.into())
                 .to_http(None)
                 .unwrap(),
         )
@@ -1472,7 +1470,7 @@ fn try_wildcard() -> State {
     );
     worker.send_proxy_request(
         RequestType::ActivateListener(ActivateListener {
-            address: front_address.to_string(),
+            address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: false,
         })
@@ -1489,7 +1487,7 @@ fn try_wildcard() -> State {
     worker.send_proxy_request(
         RequestType::AddHttpFrontend(RequestHttpFrontend {
             cluster_id: Some("cluster_0".to_string()),
-            address: front_address.to_string(),
+            address: front_address.into(),
             hostname: String::from("*.sozu.io"),
             path: PathRule::prefix(String::from("")),
             position: RulePosition::Tree.into(),
@@ -1503,7 +1501,7 @@ fn try_wildcard() -> State {
         RequestType::AddBackend(Worker::default_backend(
             "cluster_0",
             "cluster_0-0",
-            back_address.to_string(),
+            back_address,
             None,
         ))
         .into(),
@@ -1536,7 +1534,7 @@ fn try_wildcard() -> State {
     worker.send_proxy_request(
         RequestType::AddHttpFrontend(RequestHttpFrontend {
             cluster_id: Some("cluster_1".to_string()),
-            address: front_address.to_string(),
+            address: front_address.into(),
             hostname: String::from("*.sozu.io"),
             path: PathRule::prefix(String::from("/api")),
             position: RulePosition::Tree.into(),
@@ -1549,7 +1547,7 @@ fn try_wildcard() -> State {
         RequestType::AddBackend(Worker::default_backend(
             "cluster_1",
             "cluster_1-0",
-            back_address.to_string(),
+            back_address,
             None,
         ))
         .into(),

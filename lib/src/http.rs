@@ -523,11 +523,12 @@ impl HttpProxy {
 
     pub fn remove_listener(&mut self, remove: RemoveListener) -> Result<(), ProxyError> {
         let len = self.listeners.len();
+        let remove_address = remove.address.clone().into();
         self.listeners
-            .retain(|_, l| l.borrow().address.to_string() != remove.address);
+            .retain(|_, l| l.borrow().address != remove_address);
 
         if !self.listeners.len() < len {
-            info!("no HTTP listener to remove at address {:?}", remove.address);
+            info!("no HTTP listener to remove at address {:?}", remove_address);
         }
         Ok(())
     }
@@ -714,16 +715,9 @@ impl HttpProxy {
 
 impl HttpListener {
     pub fn new(config: HttpListenerConfig, token: Token) -> Result<HttpListener, ListenerError> {
-        let address = config
-            .address
-            .parse::<SocketAddr>()
-            .map_err(|parse_error| ListenerError::SocketParse {
-                address: config.address.clone(),
-                error: parse_error.to_string(),
-            })?;
         Ok(HttpListener {
             active: false,
-            address,
+            address: config.address.clone().into(),
             answers: Rc::new(RefCell::new(HttpAnswers::new(
                 &config.answer_404,
                 &config.answer_503,
@@ -744,15 +738,16 @@ impl HttpListener {
         if self.active {
             return Ok(self.token);
         }
+        let address: SocketAddr = self.config.address.clone().into();
 
         let mut listener = match tcp_listener {
             Some(tcp_listener) => tcp_listener,
-            None => server_bind(self.config.address.clone()).map_err(|server_bind_error| {
-                ListenerError::Activation {
-                    address: self.config.address.clone(),
+            None => {
+                server_bind(address).map_err(|server_bind_error| ListenerError::Activation {
+                    address,
                     error: server_bind_error.to_string(),
-                }
-            })?,
+                })?
+            }
         };
 
         registry
@@ -916,13 +911,10 @@ impl ProxyConfiguration for HttpProxy {
             return Err(AcceptError::RegisterError);
         }
 
-        let public_address: SocketAddr = owned
-            .config
-            .public_address
-            .clone()
-            .unwrap_or(owned.config.address.clone())
-            .parse()
-            .map_err(|_| AcceptError::WrongSocketAddress)?;
+        let public_address: SocketAddr = match owned.config.public_address.clone() {
+            Some(pub_addr) => pub_addr.into(),
+            None => owned.config.address.clone().into(),
+        };
 
         let session = HttpSession::new(
             owned.answers.clone(),
@@ -1001,10 +993,7 @@ pub mod testing {
         max_buffers: usize,
         buffer_size: usize,
     ) -> anyhow::Result<()> {
-        let address = config
-            .address
-            .parse()
-            .with_context(|| "Could not parse socket address")?;
+        let address = config.address.clone().into();
 
         let ServerParts {
             event_loop,
@@ -1064,6 +1053,7 @@ mod tests {
 
     use super::testing::start_http_worker;
     use super::*;
+    use sozu_command::proto::command::SocketAddress;
 
     use crate::sozu_command::{
         channel::Channel,
@@ -1075,9 +1065,8 @@ mod tests {
 
     use std::{
         io::{Read, Write},
-        net::{SocketAddr, TcpStream},
+        net::TcpStream,
         str,
-        str::FromStr,
         sync::{Arc, Barrier},
         thread,
         time::Duration,
@@ -1103,7 +1092,7 @@ mod tests {
         start_server(1025, barrier.clone());
         barrier.wait();
 
-        let config = ListenerBuilder::new_http("127.0.0.1:1024")
+        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 1024))
             .to_http(None)
             .expect("could not create listener config");
 
@@ -1116,7 +1105,7 @@ mod tests {
 
         let front = RequestHttpFrontend {
             cluster_id: Some(String::from("cluster_1")),
-            address: "127.0.0.1:1024".to_string(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1024),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
             ..Default::default()
@@ -1130,7 +1119,7 @@ mod tests {
         let backend = Backend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-0"),
-            address: "127.0.0.1:1025".parse().unwrap(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1025).into(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id: None,
             backup: None,
@@ -1185,7 +1174,7 @@ mod tests {
         start_server(1028, barrier.clone());
         barrier.wait();
 
-        let config = ListenerBuilder::new_http("127.0.0.1:1031")
+        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 1031))
             .to_http(None)
             .expect("could not create listener config");
 
@@ -1198,7 +1187,7 @@ mod tests {
         });
 
         let front = RequestHttpFrontend {
-            address: "127.0.0.1:1031".to_string(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1031),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
             cluster_id: Some(String::from("cluster_1")),
@@ -1211,7 +1200,7 @@ mod tests {
             })
             .unwrap();
         let backend = Backend {
-            address: "127.0.0.1:1028".parse().unwrap(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1028).into(),
             backend_id: String::from("cluster_1-0"),
             backup: None,
             cluster_id: String::from("cluster_1"),
@@ -1295,7 +1284,7 @@ mod tests {
     fn https_redirect() {
         setup_test_logger!();
 
-        let config = ListenerBuilder::new_http("127.0.0.1:1041")
+        let config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 1041))
             .to_http(None)
             .expect("could not create listener config");
 
@@ -1320,7 +1309,7 @@ mod tests {
             })
             .unwrap();
         let front = RequestHttpFrontend {
-            address: "127.0.0.1:1041".to_string(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1041),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
             cluster_id: Some(String::from("cluster_1")),
@@ -1333,7 +1322,7 @@ mod tests {
             })
             .unwrap();
         let backend = Backend {
-            address: "127.0.0.1:1040".parse().unwrap(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1040).into(),
             backend_id: String::from("cluster_1-0"),
             backup: None,
             cluster_id: String::from("cluster_1"),
@@ -1468,16 +1457,15 @@ mod tests {
             })
             .expect("Could not add http frontend");
 
-        let address: SocketAddr =
-            FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1030);
 
-        let default_config = ListenerBuilder::new_http(address)
+        let default_config = ListenerBuilder::new_http(address.clone())
             .to_http(None)
             .expect("Could not create default HTTP listener config");
 
         let listener = HttpListener {
             listener: None,
-            address,
+            address: address.into(),
             fronts,
             answers: Rc::new(RefCell::new(HttpAnswers::new(
                 "HTTP/1.1 404 Not Found\r\n\r\n",

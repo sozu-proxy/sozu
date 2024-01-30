@@ -14,7 +14,7 @@ use sozu_command_lib::{
     logging::setup_logging,
     proto::command::{
         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
-        PathRule, RequestHttpFrontend, RulePosition,
+        PathRule, RequestHttpFrontend, RulePosition, SocketAddress,
     },
     request::WorkerRequest,
     response::WorkerResponse,
@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
 
     info!("starting up");
 
-    let http_listener = ListenerBuilder::new_http("127.0.0.1:8080")
+    let http_listener = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8080))
         .to_http(None)
         .expect("Could not create HTTP listener");
 
@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
 
     let http_front = RequestHttpFrontend {
         cluster_id: Some("my-cluster".to_string()),
-        address: "127.0.0.1:8080".to_string(),
+        address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
         hostname: "example.com".to_string(),
         path: PathRule::prefix(String::from("/")),
         position: RulePosition::Pre.into(),
@@ -70,7 +70,7 @@ fn main() -> anyhow::Result<()> {
     let http_backend = AddBackend {
         cluster_id: "my-cluster".to_string(),
         backend_id: "test-backend".to_string(),
-        address: "127.0.0.1:8000".to_string(),
+        address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         ..Default::default()
     };

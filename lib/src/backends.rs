@@ -169,7 +169,7 @@ impl std::ops::Drop for Backend {
         server::push_event(Event {
             kind: EventKind::RemovedBackendHasNoConnections as i32,
             backend_id: Some(self.backend_id.clone()),
-            address: Some(self.address.to_string()),
+            address: Some(self.address.into()),
             cluster_id: None,
         });
     }

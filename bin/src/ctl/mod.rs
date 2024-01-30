@@ -47,8 +47,6 @@ pub enum CtlError {
     ArgsNeeded(String, String),
     #[error("could not load certificate")]
     LoadCertificate(CertificateError),
-    #[error("wrong address {0}: {1}")]
-    WrongAddress(String, UtilError),
     #[error("wrong input to create listener")]
     CreateListener(ConfigError),
     #[error("domain can not be empty")]
@@ -161,19 +159,13 @@ impl CommandManager {
                     key,
                     address,
                     tls_versions,
-                } => self.add_certificate(
-                    address.to_string(),
-                    &certificate,
-                    &chain,
-                    &key,
-                    tls_versions,
-                ),
+                } => self.add_certificate(address.into(), &certificate, &chain, &key, tls_versions),
                 CertificateCmd::Remove {
                     certificate,
                     address,
                     fingerprint,
                 } => self.remove_certificate(
-                    address.to_string(),
+                    address.into(),
                     certificate.as_deref(),
                     fingerprint.as_deref(),
                 ),
@@ -186,7 +178,7 @@ impl CommandManager {
                     old_fingerprint,
                     tls_versions,
                 } => self.replace_certificate(
-                    address.to_string(),
+                    address.into(),
                     &certificate,
                     &chain,
                     &key,
