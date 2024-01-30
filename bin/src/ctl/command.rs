@@ -1,62 +1,45 @@
-use anyhow::{self, bail, Context};
+use std::time::Duration;
 
-use sozu_command_lib::proto::command::{
-    request::RequestType, response_content::ContentType, ListWorkers, QueryMetricsOptions, Request,
-    Response, ResponseContent, ResponseStatus, RunState, UpgradeMain,
+use sozu_command_lib::{
+    logging::setup_logging_with_config,
+    proto::command::{
+        request::RequestType, response_content::ContentType, ListWorkers, QueryMetricsOptions,
+        Request, Response, ResponseContent, ResponseStatus, UpgradeMain,
+    },
 };
 
-use crate::ctl::{create_channel, CommandManager};
+use crate::ctl::{create_channel, CommandManager, CtlError};
 
 impl CommandManager {
-    fn write_request_on_channel(&mut self, request: Request) -> anyhow::Result<()> {
+    fn write_request_on_channel(&mut self, request: Request) -> Result<(), CtlError> {
         self.channel
             .write_message(&request)
-            .with_context(|| "Could not write the request")
+            .map_err(CtlError::WriteRequest)
     }
 
-    fn read_channel_message_with_timeout(&mut self) -> anyhow::Result<Response> {
+    fn read_channel_message_with_timeout(&mut self) -> Result<Response, CtlError> {
         self.channel
             .read_message_blocking_timeout(Some(self.timeout))
-            .with_context(|| "Command timeout. The proxy didn't send an answer")
+            .map_err(CtlError::ReadBlocking)
     }
 
-    pub fn send_request(&mut self, request: Request) -> Result<(), anyhow::Error> {
+    fn send_request_get_response(
+        &mut self,
+        request: Request,
+        timeout: bool,
+    ) -> Result<Response, CtlError> {
         self.channel
             .write_message(&request)
-            .with_context(|| "Could not write the request")?;
+            .map_err(CtlError::WriteRequest)?;
 
         loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            match response.status() {
-                ResponseStatus::Processing => {
-                    if !self.json {
-                        debug!("Proxy is processing: {}", response.message);
-                    }
-                }
-                ResponseStatus::Failure => bail!("Request failed: {}", response.message),
-                ResponseStatus::Ok => {
-                    if !self.json {
-                        info!("{}", response.message);
-                    }
-                    response.display(self.json)?;
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    // 1. Request a list of workers
-    // 2. Send an UpgradeMain
-    // 3. Send an UpgradeWorker to each worker
-    pub fn upgrade_main(&mut self) -> Result<(), anyhow::Error> {
-        info!("Preparing to upgrade proxy...");
-
-        self.write_request_on_channel(RequestType::ListWorkers(ListWorkers {}).into())?;
-
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
+            let response = if timeout {
+                self.read_channel_message_with_timeout()?
+            } else {
+                self.channel
+                    .read_message_blocking_timeout(None)
+                    .map_err(CtlError::ReadBlocking)?
+            };
 
             match response.status() {
                 ResponseStatus::Processing => {
@@ -64,109 +47,28 @@ impl CommandManager {
                         debug!("Processing: {}", response.message);
                     }
                 }
-                ResponseStatus::Failure => {
-                    bail!(
-                        "Error: failed to get the list of worker: {}",
-                        response.message
-                    );
-                }
-                ResponseStatus::Ok => {
-                    if let Some(ResponseContent {
-                        content_type: Some(ContentType::Workers(ref worker_infos)),
-                    }) = response.content
-                    {
-                        // display worker status
-                        response.display(false)?;
-
-                        self.write_request_on_channel(
-                            RequestType::UpgradeMain(UpgradeMain {}).into(),
-                        )?;
-
-                        info!("Upgrading main process");
-
-                        loop {
-                            let response = self.read_channel_message_with_timeout()?;
-
-                            match response.status() {
-                                ResponseStatus::Processing => {
-                                    debug!("Main process is upgrading");
-                                }
-                                ResponseStatus::Failure => {
-                                    bail!(
-                                        "Error: failed to upgrade the main: {}",
-                                        response.message
-                                    );
-                                }
-                                ResponseStatus::Ok => {
-                                    info!("Main process upgrade succeeded: {}", response.message);
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Reconnect to the new main
-                        info!("Reconnecting to new main process...");
-                        self.channel = create_channel(&self.config)
-                            .with_context(|| "could not reconnect to the command unix socket")?;
-
-                        // Do a rolling restart of the workers
-                        let running_workers = worker_infos
-                            .vec
-                            .iter()
-                            .filter(|worker| worker.run_state == RunState::Running as i32)
-                            .collect::<Vec<_>>();
-                        let running_count = running_workers.len();
-                        for (i, worker) in running_workers.iter().enumerate() {
-                            info!(
-                                "Upgrading worker {} (#{} out of {})",
-                                worker.id,
-                                i + 1,
-                                running_count
-                            );
-
-                            self.upgrade_worker(worker.id)
-                                .with_context(|| "Upgrading the worker failed")?;
-                            //thread::sleep(Duration::from_millis(1000));
-                        }
-
-                        info!("Proxy successfully upgraded!");
-                    } else {
-                        info!("Received a response of the wrong kind: {:?}", response);
-                    }
-                    break;
-                }
+                ResponseStatus::Failure => return Err(CtlError::Failure(response.message)),
+                ResponseStatus::Ok => return Ok(response),
             }
         }
-        Ok(())
     }
 
-    pub fn upgrade_worker(&mut self, worker_id: u32) -> Result<(), anyhow::Error> {
-        trace!("upgrading worker {}", worker_id);
+    fn send_request_display_response(
+        &mut self,
+        request: Request,
+        timeout: bool,
+    ) -> Result<(), CtlError> {
+        self.send_request_get_response(request, timeout)?
+            .display(self.json)
+            .map_err(CtlError::Display)
+    }
 
-        //FIXME: we should be able to soft stop one specific worker
-        self.write_request_on_channel(RequestType::UpgradeWorker(worker_id).into())?;
+    pub fn send_request(&mut self, request: Request) -> Result<(), CtlError> {
+        self.send_request_display_response(request, true)
+    }
 
-        loop {
-            let response = self.read_channel_message_with_timeout()?;
-
-            match response.status() {
-                ResponseStatus::Processing => {
-                    if !self.json {
-                        info!("Proxy is processing: {}", response.message);
-                    }
-                }
-                ResponseStatus::Failure => bail!(
-                    "could not stop the worker {}: {}",
-                    worker_id,
-                    response.message
-                ),
-                ResponseStatus::Ok => {
-                    info!("Success: {}", response.message);
-                    break;
-                }
-            }
-        }
-        Ok(())
+    pub fn send_request_no_timeout(&mut self, request: Request) -> Result<(), CtlError> {
+        self.send_request_display_response(request, false)
     }
 
     pub fn get_metrics(
@@ -177,7 +79,7 @@ impl CommandManager {
         cluster_ids: Vec<String>,
         backend_ids: Vec<String>,
         no_clusters: bool,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), CtlError> {
         let request: Request = RequestType::QueryMetrics(QueryMetricsOptions {
             list,
             cluster_ids,
@@ -200,11 +102,11 @@ impl CommandManager {
                 match response.status() {
                     ResponseStatus::Processing => {
                         if !self.json {
-                            debug!("Proxy is processing: {}", response.message);
+                            debug!("Processing: {}", response.message);
                         }
                     }
                     ResponseStatus::Failure | ResponseStatus::Ok => {
-                        response.display(self.json)?;
+                        response.display(self.json).map_err(CtlError::Display)?;
                         break;
                     }
                 }
@@ -221,6 +123,74 @@ impl CommandManager {
                 termion::clear::BeforeCursor
             );
         }
+
+        Ok(())
+    }
+
+    pub fn upgrade_main(&mut self) -> Result<(), CtlError> {
+        debug!("updating main process");
+        self.send_request(RequestType::UpgradeMain(UpgradeMain {}).into())?;
+
+        info!("recreating a channel to reconnect with the new main process...");
+        self.channel = create_channel(&self.config)?;
+
+        info!("requesting the list of workers from the new main");
+        let response =
+            self.send_request_get_response(RequestType::ListWorkers(ListWorkers {}).into(), true)?;
+
+        let workers = match response.content {
+            Some(ResponseContent {
+                content_type: Some(ContentType::Workers(worker_infos)),
+            }) => worker_infos,
+            _ => return Err(CtlError::WrongResponse(response)),
+        };
+
+        info!("About to upgrade these workers: {:?}", workers);
+
+        let mut upgrade_jobs = Vec::new();
+
+        for worker in workers.vec {
+            info!("trying to upgrade worker {}", worker.id);
+            let config = self.config.clone();
+
+            upgrade_jobs.push(std::thread::spawn(move || {
+                setup_logging_with_config(&config, &format!("UPGRADE-WRK-{}", worker.id));
+
+                info!("creating channel to upgrade worker {}", worker.id);
+                let channel = match create_channel(&config) {
+                    Ok(channel) => channel,
+                    Err(e) => {
+                        error!(
+                            "could not create channel to worker {}, this is critical: {}",
+                            worker.id, e
+                        );
+                        return;
+                    }
+                };
+
+                info!("created channel to upgrade worker {}", worker.id);
+
+                let mut command_manager = CommandManager {
+                    channel,
+                    timeout: Duration::from_secs(60), // overriden by upgrade_timeout anyway
+                    config,
+                    json: false,
+                };
+
+                match command_manager.upgrade_worker(worker.id) {
+                    Ok(()) => info!("successfully upgraded worker {}", worker.id),
+                    Err(e) => error!("error upgrading worker {}: {}", worker.id, e),
+                }
+            }));
+        }
+
+        for job in upgrade_jobs {
+            if let Err(e) = job.join() {
+                error!("an upgrading job panicked: {:?}", e)
+            }
+        }
+
+        info!("Finished upgrading");
 
         Ok(())
     }

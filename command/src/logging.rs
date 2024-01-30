@@ -21,6 +21,9 @@ thread_local! {
   pub static TAG: String = LOGGER.with(|logger| {logger.borrow().tag.clone()});
 }
 
+// TODO: check if this error is critical:
+//     could not register compat logger: SetLoggerError(())
+// The CompatLogger may need a variable that tells wether it has been initiated already
 pub static COMPAT_LOGGER: CompatLogger = CompatLogger;
 
 pub struct Logger {

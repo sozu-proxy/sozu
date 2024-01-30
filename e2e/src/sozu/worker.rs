@@ -51,18 +51,6 @@ pub fn set_no_close_exec(fd: i32) {
 }
 
 impl Worker {
-    pub fn empty_file_config() -> FileConfig {
-        FileConfig::default()
-    }
-
-    pub fn empty_listeners() -> Listeners {
-        Listeners {
-            http: Vec::new(),
-            tls: Vec::new(),
-            tcp: Vec::new(),
-        }
-    }
-
     pub fn into_config(file_config: FileConfig) -> Config {
         ConfigBuilder::new(file_config, "")
             .into_config()
@@ -70,8 +58,8 @@ impl Worker {
     }
 
     pub fn empty_config() -> (Config, Listeners, ConfigState) {
-        let listeners = Worker::empty_listeners();
-        let config = Worker::empty_file_config();
+        let listeners = Listeners::default();
+        let config = FileConfig::default();
         let config = Worker::into_config(config);
         let state = ConfigState::new();
         (config, listeners, state)

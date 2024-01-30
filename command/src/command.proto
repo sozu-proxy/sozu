@@ -19,7 +19,10 @@ message Request {
     FrontendFilters list_frontends = 5;
     // list all listeners
     ListListeners list_listeners = 6;
-    // launch a new worker, giving its tag
+    // launch a new worker
+    // never implemented, the tag is unused and probably not needed
+    // we may still implement it later with no paramater
+    // the main process will automatically assign a new id to a new worker
     string launch_worker = 7;
     // upgrade the main process
     UpgradeMain upgrade_main = 8;

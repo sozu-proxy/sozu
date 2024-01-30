@@ -3,11 +3,11 @@ use std::{
     cell::RefCell,
     collections::{HashSet, VecDeque},
     convert::TryFrom,
+    io::Error as IoError,
     os::unix::io::{AsRawFd, FromRawFd},
     rc::Rc,
 };
 
-use anyhow::Context;
 use mio::{
     net::{TcpListener as MioTcpListener, TcpStream},
     Events, Interest, Poll, Token,
@@ -22,13 +22,13 @@ use sozu_command::{
         request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
         CertificatesWithFingerprints, Cluster, ClusterHashes, ClusterInformations,
         DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, ResponseStatus,
-        TcpListenerConfig as CommandTcpListener,
+        LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, Request,
+        ResponseStatus, TcpListenerConfig as CommandTcpListener,
     },
     ready::Ready,
     request::WorkerRequest,
     response::{MessageId, WorkerResponse},
-    scm_socket::{Listeners, ScmSocket},
+    scm_socket::{Listeners, ScmSocket, ScmSocketError},
     state::ConfigState,
 };
 
@@ -220,6 +220,21 @@ impl SessionManager {
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum ServerError {
+    #[error("could not create event loop with MIO poll: {0}")]
+    CreatePoll(IoError),
+    #[error("could not clone the MIO registry: {0}")]
+    CloneRegistry(IoError),
+    #[error("could not register the channel: {0}")]
+    RegisterChannel(IoError),
+    #[error("{msg}:{scm_err}")]
+    ScmSocket {
+        msg: String,
+        scm_err: ScmSocketError,
+    },
+}
+
 /// `Server` handles the event loop, the listeners, the sessions and
 /// communication with the configuration channel.
 ///
@@ -271,8 +286,8 @@ impl Server {
         config: Config,
         initial_state: Vec<WorkerRequest>,
         expects_initial_status: bool,
-    ) -> anyhow::Result<Self> {
-        let event_loop = Poll::new().with_context(|| "could not create event loop")?;
+    ) -> Result<Self, ServerError> {
+        let event_loop = Poll::new().map_err(ServerError::CreatePoll)?;
         let pool = Rc::new(RefCell::new(Pool::with_capacity(
             config.min_buffers,
             config.max_buffers,
@@ -315,7 +330,7 @@ impl Server {
         let registry = event_loop
             .registry()
             .try_clone()
-            .with_context(|| "could not clone the mio Registry")?;
+            .map_err(ServerError::CloneRegistry)?;
 
         let https =
             https::HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
@@ -350,7 +365,7 @@ impl Server {
         server_config: ServerConfig,
         initial_state: Option<Vec<WorkerRequest>>,
         expects_initial_status: bool,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, ServerError> {
         FEATURES.with(|_features| {
             // initializing feature flags
         });
@@ -361,7 +376,7 @@ impl Server {
                 Token(0),
                 Interest::READABLE | Interest::WRITABLE,
             )
-            .with_context(|| "should register the channel")?;
+            .map_err(ServerError::RegisterChannel)?;
 
         METRICS.with(|metrics| {
             if let Some(sock) = (*metrics.borrow_mut()).socket_mut() {
@@ -379,7 +394,8 @@ impl Server {
                 let registry = poll
                     .registry()
                     .try_clone()
-                    .with_context(|| "could not clone the mio Registry")?;
+                    .map_err(ServerError::CloneRegistry)?;
+
                 http::HttpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
             }
         }));
@@ -390,7 +406,7 @@ impl Server {
                 let registry = poll
                     .registry()
                     .try_clone()
-                    .with_context(|| "could not clone the mio Registry")?;
+                    .map_err(ServerError::CloneRegistry)?;
 
                 https::HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone())
             }
@@ -402,7 +418,8 @@ impl Server {
                 let registry = poll
                     .registry()
                     .try_clone()
-                    .with_context(|| "could not clone the mio Registry")?;
+                    .map_err(ServerError::CloneRegistry)?;
+
                 tcp::TcpProxy::new(registry, sessions.clone(), backends.clone())
             }
         }));
@@ -457,10 +474,19 @@ impl Server {
             let msg = server.channel.read_message();
             debug!("got message: {:?}", msg);
 
-            if let Ok(msg) = msg {
-                if let Err(e) = server.channel.write_message(&WorkerResponse::ok(msg.id)) {
+            if let Ok(WorkerRequest {
+                id,
+                content:
+                    Request {
+                        request_type: Some(RequestType::Status(_)),
+                    },
+            }) = msg
+            {
+                if let Err(e) = server.channel.write_message(&WorkerResponse::ok(id)) {
                     error!("Could not send an ok to the main process: {}", e);
                 }
+            } else {
+                panic!("plz give me a status request first when I start, you sent me this instead: {:?}", msg);
             }
             server.unblock_channel();
         }
@@ -469,15 +495,25 @@ impl Server {
         server
             .scm
             .set_blocking(true)
-            .with_context(|| "Could not set the scm socket to blocking")?;
-        let listeners = server
-            .scm
-            .receive_listeners()
-            .with_context(|| "could not receive listeners from the scm socket")?;
+            .map_err(|scm_err| ServerError::ScmSocket {
+                msg: "Could not set the scm socket to blocking".to_string(),
+                scm_err,
+            })?;
+        let listeners =
+            server
+                .scm
+                .receive_listeners()
+                .map_err(|scm_err| ServerError::ScmSocket {
+                    msg: "could not receive listeners from the scm socket".to_string(),
+                    scm_err,
+                })?;
         server
             .scm
             .set_blocking(false)
-            .with_context(|| "Could not set the scm socket to unblocking")?;
+            .map_err(|scm_err| ServerError::ScmSocket {
+                msg: "Could not set the scm socket to unblocking".to_string(),
+                scm_err,
+            })?;
         info!("received listeners: {:?}", listeners);
         server.scm_listeners = Some(listeners);
 
@@ -525,7 +561,7 @@ impl Server {
                         }
                         if event.is_read_closed() || event.is_write_closed() {
                             error!("command channel was closed");
-                            continue;
+                            return;
                         }
                         let ready = Ready::from(event);
                         self.channel.handle_events(ready);
@@ -686,7 +722,13 @@ impl Server {
                     }
                     Some(RequestType::ReturnListenSockets(_)) => {
                         info!("received ReturnListenSockets order");
-                        self.return_listen_sockets();
+                        match self.return_listen_sockets() {
+                            Ok(_) => push_queue(WorkerResponse::ok(request.id.clone())),
+                            Err(error) => push_queue(WorkerResponse::error(
+                                request.id.clone(),
+                                format!("Could not send listeners on scm socket: {error:?}"),
+                            )),
+                        }
                     }
                     _ => self.notify(request),
                 },
@@ -812,14 +854,20 @@ impl Server {
             if let Err(e) = self.channel.run() {
                 error!("Error while running the server channel: {}", e);
             }
-            self.block_channel();
+            // self.block_channel();
             let id = self
                 .shutting_down
                 .take()
                 .expect("should have shut down correctly"); // panicking here makes sense actually
+
+            debug!("Responding OK to main process for request {}", id);
+
             let proxy_response = WorkerResponse::ok(id);
             if let Err(e) = self.channel.write_message(&proxy_response) {
                 error!("Could not write response to the main process: {}", e);
+            }
+            if let Err(e) = self.channel.run() {
+                error!("Error while running the server channel: {}", e);
             }
             return true;
         }
@@ -940,6 +988,7 @@ impl Server {
                         )
                     };
                     push_queue(response);
+                    return;
                 }
                 // if all certificates are queried, or filtered by domain name,
                 // the request will be handled by the https proxy
@@ -1397,7 +1446,7 @@ impl Server {
     }
 
     /// Send all socket addresses and file descriptors of all proxies, via the scm socket
-    pub fn return_listen_sockets(&mut self) {
+    pub fn return_listen_sockets(&mut self) -> Result<(), ScmSocketError> {
         self.unblock_scm_socket();
 
         let mut http_listeners = self.http.borrow_mut().give_back_listeners();
@@ -1448,6 +1497,7 @@ impl Server {
         self.block_scm_socket();
 
         info!("sent default listeners: {:?}", res);
+        res
     }
 
     fn block_scm_socket(&mut self) {
