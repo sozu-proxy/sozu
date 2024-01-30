@@ -657,17 +657,9 @@ impl HttpsListener {
 
         let server_config = Arc::new(Self::create_rustls_context(&config, resolver.to_owned())?);
 
-        let address = config
-            .address
-            .parse::<StdSocketAddr>()
-            .map_err(|parse_error| ListenerError::SocketParse {
-                address: config.address.clone(),
-                error: parse_error.to_string(),
-            })?;
-
         Ok(HttpsListener {
             listener: None,
-            address,
+            address: config.address.clone().into(),
             resolver,
             rustls_details: server_config,
             active: false,
@@ -690,15 +682,16 @@ impl HttpsListener {
         if self.active {
             return Ok(self.token);
         }
+        let address: StdSocketAddr = self.config.address.clone().into();
 
         let mut listener = match tcp_listener {
             Some(tcp_listener) => tcp_listener,
-            None => server_bind(self.config.address.clone()).map_err(|server_bind_error| {
-                ListenerError::Activation {
-                    address: self.config.address.clone(),
+            None => {
+                server_bind(address).map_err(|server_bind_error| ListenerError::Activation {
+                    address,
                     error: server_bind_error.to_string(),
-                }
-            })?,
+                })?
+            }
         };
 
         registry
@@ -857,14 +850,12 @@ impl HttpsProxy {
     ) -> Result<Option<ResponseContent>, ProxyError> {
         let len = self.listeners.len();
 
+        let remove_address = remove.address.clone().into();
         self.listeners
-            .retain(|_, listener| listener.borrow().address.to_string() != remove.address);
+            .retain(|_, listener| listener.borrow().address != remove_address);
 
         if !self.listeners.len() < len {
-            info!(
-                "no HTTPS listener to remove at address {:?}",
-                remove.address
-            )
+            info!("no HTTPS listener to remove at address {}", remove_address)
         }
         Ok(None)
     }
@@ -944,7 +935,7 @@ impl HttpsProxy {
                     .collect();
 
                 CertificatesByAddress {
-                    address: owned.address.to_string(),
+                    address: owned.address.into(),
                     certificate_summaries,
                 }
             })
@@ -979,7 +970,7 @@ impl HttpsProxy {
                     });
                 }
                 CertificatesByAddress {
-                    address: owned.address.to_string(),
+                    address: owned.address.into(),
                     certificate_summaries,
                 }
             })
@@ -1134,13 +1125,7 @@ impl HttpsProxy {
         &mut self,
         add_certificate: AddCertificate,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let address = add_certificate
-            .address
-            .parse::<StdSocketAddr>()
-            .map_err(|parse_error| ProxyError::SocketParse {
-                address: add_certificate.address.clone(),
-                error: parse_error.to_string(),
-            })?;
+        let address = add_certificate.address.clone().into();
 
         let listener = self
             .listeners
@@ -1161,13 +1146,7 @@ impl HttpsProxy {
         &mut self,
         remove_certificate: RemoveCertificate,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let address = remove_certificate
-            .address
-            .parse::<StdSocketAddr>()
-            .map_err(|parse_error| ProxyError::SocketParse {
-                address: remove_certificate.address,
-                error: parse_error.to_string(),
-            })?;
+        let address = remove_certificate.address.into();
 
         let fingerprint = Fingerprint(
             hex::decode(&remove_certificate.fingerprint)
@@ -1193,13 +1172,7 @@ impl HttpsProxy {
         &mut self,
         replace_certificate: ReplaceCertificate,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let address = replace_certificate
-            .address
-            .parse::<StdSocketAddr>()
-            .map_err(|parse_error| ProxyError::SocketParse {
-                address: replace_certificate.address.clone(),
-                error: parse_error.to_string(),
-            })?;
+        let address = replace_certificate.address.clone().into();
 
         let listener = self
             .listeners
@@ -1266,13 +1239,10 @@ impl ProxyConfiguration for HttpsProxy {
                 AcceptError::RegisterError
             })?;
 
-        let public_address: StdSocketAddr = owned
-            .config
-            .public_address
-            .clone()
-            .unwrap_or(owned.config.address.clone())
-            .parse()
-            .map_err(|_| AcceptError::WrongSocketAddress)?;
+        let public_address: StdSocketAddr = match owned.config.public_address.clone() {
+            Some(pub_addr) => pub_addr.into(),
+            None => owned.config.address.clone().into(),
+        };
 
         let session = Rc::new(RefCell::new(HttpsSession::new(
             owned.answers.clone(),
@@ -1505,10 +1475,7 @@ pub mod testing {
         max_buffers: usize,
         buffer_size: usize,
     ) -> anyhow::Result<()> {
-        let address = config
-            .address
-            .parse()
-            .with_context(|| "Could not parse socket address")?;
+        let address = config.address.clone().into();
 
         let ServerParts {
             event_loop,
@@ -1566,9 +1533,9 @@ pub mod testing {
 mod tests {
     use super::*;
 
-    use std::{str::FromStr, sync::Arc};
+    use std::sync::Arc;
 
-    use sozu_command::config::ListenerBuilder;
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
 
     use crate::router::{trie::TrieNode, MethodRule, PathRule, Route, Router};
 
@@ -1624,8 +1591,7 @@ mod tests {
             &Route::ClusterId(cluster_id1)
         ));
 
-        let address: StdSocketAddr = FromStr::from_str("127.0.0.1:1032")
-            .expect("test address 127.0.0.1:1032 should be parsed");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
         let resolver = Arc::new(MutexWrappedCertificateResolver::default());
 
         let server_config = ServerConfig::builder_with_protocol_versions(&[
@@ -1637,13 +1603,13 @@ mod tests {
 
         let rustls_details = Arc::new(server_config);
 
-        let default_config = ListenerBuilder::new_https(address)
+        let default_config = ListenerBuilder::new_https(address.clone())
             .to_tls(None)
             .expect("Could not create default HTTPS listener config");
 
         let listener = HttpsListener {
             listener: None,
-            address,
+            address: address.into(),
             fronts,
             rustls_details,
             resolver,

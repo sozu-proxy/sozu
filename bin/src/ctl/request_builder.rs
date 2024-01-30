@@ -11,7 +11,8 @@ use sozu_command_lib::{
         LoadBalancingParams, MetricsConfiguration, PathRule, ProxyProtocolConfig,
         QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes, RemoveBackend,
         RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        RequestTcpFrontend, RulePosition, SoftStop, Status, SubscribeEvents, TlsVersion,
+        RequestTcpFrontend, RulePosition, SocketAddress, SoftStop, Status, SubscribeEvents,
+        TlsVersion,
     },
 };
 
@@ -21,7 +22,6 @@ use crate::{
         MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
-    util::parse_socket_address,
 };
 
 use super::CtlError;
@@ -118,7 +118,7 @@ impl CommandManager {
             } => self.send_request(
                 RequestType::AddBackend(AddBackend {
                     cluster_id: id,
-                    address: address.to_string(),
+                    address: address.into(),
                     backend_id,
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     sticky_id,
@@ -133,7 +133,7 @@ impl CommandManager {
             } => self.send_request(
                 RequestType::RemoveBackend(RemoveBackend {
                     cluster_id: id,
-                    address: address.to_string(),
+                    address: address.into(),
                     backend_id,
                 })
                 .into(),
@@ -211,7 +211,7 @@ impl CommandManager {
             TcpFrontendCmd::Add { id, address, tags } => self.send_request(
                 RequestType::AddTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
-                    address: address.to_string(),
+                    address: address.into(),
                     tags: tags.unwrap_or(BTreeMap::new()),
                 })
                 .into(),
@@ -219,7 +219,7 @@ impl CommandManager {
             TcpFrontendCmd::Remove { id, address } => self.send_request(
                 RequestType::RemoveTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
-                    address: address.to_string(),
+                    address: address.into(),
                     ..Default::default()
                 })
                 .into(),
@@ -241,7 +241,7 @@ impl CommandManager {
             } => self.send_request(
                 RequestType::AddHttpFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
-                    address: address.to_string(),
+                    address: address.into(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                     method: method.map(String::from),
@@ -264,7 +264,7 @@ impl CommandManager {
             } => self.send_request(
                 RequestType::RemoveHttpFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
-                    address: address.to_string(),
+                    address: address.into(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                     method: method.map(String::from),
@@ -289,7 +289,7 @@ impl CommandManager {
             } => self.send_request(
                 RequestType::AddHttpsFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
-                    address: address.to_string(),
+                    address: address.into(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                     method: method.map(String::from),
@@ -312,7 +312,7 @@ impl CommandManager {
             } => self.send_request(
                 RequestType::RemoveHttpsFrontend(RequestHttpFrontend {
                     cluster_id: route.into(),
-                    address: address.to_string(),
+                    address: address.into(),
                     hostname,
                     path: PathRule::from_cli_options(path_prefix, path_regex, path_equals),
                     method: method.map(String::from),
@@ -339,7 +339,7 @@ impl CommandManager {
                 request_timeout,
                 connect_timeout,
             } => {
-                let https_listener = ListenerBuilder::new_https(address)
+                let https_listener = ListenerBuilder::new_https(address.into())
                     .with_public_address(public_address)
                     .with_answer_404_path(answer_404)
                     .with_answer_503_path(answer_503)
@@ -357,13 +357,13 @@ impl CommandManager {
                 self.send_request(RequestType::AddHttpsListener(https_listener).into())
             }
             HttpsListenerCmd::Remove { address } => {
-                self.remove_listener(address.to_string(), ListenerType::Https)
+                self.remove_listener(address.into(), ListenerType::Https)
             }
             HttpsListenerCmd::Activate { address } => {
-                self.activate_listener(address.to_string(), ListenerType::Https)
+                self.activate_listener(address.into(), ListenerType::Https)
             }
             HttpsListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.to_string(), ListenerType::Https)
+                self.deactivate_listener(address.into(), ListenerType::Https)
             }
         }
     }
@@ -382,7 +382,7 @@ impl CommandManager {
                 request_timeout,
                 connect_timeout,
             } => {
-                let http_listener = ListenerBuilder::new_http(address)
+                let http_listener = ListenerBuilder::new_http(address.into())
                     .with_public_address(public_address)
                     .with_answer_404_path(answer_404)
                     .with_answer_503_path(answer_503)
@@ -398,13 +398,13 @@ impl CommandManager {
                 self.send_request(RequestType::AddHttpListener(http_listener).into())
             }
             HttpListenerCmd::Remove { address } => {
-                self.remove_listener(address.to_string(), ListenerType::Http)
+                self.remove_listener(address.into(), ListenerType::Http)
             }
             HttpListenerCmd::Activate { address } => {
-                self.activate_listener(address.to_string(), ListenerType::Http)
+                self.activate_listener(address.into(), ListenerType::Http)
             }
             HttpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.to_string(), ListenerType::Http)
+                self.deactivate_listener(address.into(), ListenerType::Http)
             }
         }
     }
@@ -416,7 +416,7 @@ impl CommandManager {
                 public_address,
                 expect_proxy,
             } => {
-                let listener = ListenerBuilder::new_tcp(address)
+                let listener = ListenerBuilder::new_tcp(address.into())
                     .with_public_address(public_address)
                     .with_expect_proxy(expect_proxy)
                     .to_tcp(Some(&self.config))
@@ -425,13 +425,13 @@ impl CommandManager {
                 self.send_request(RequestType::AddTcpListener(listener).into())
             }
             TcpListenerCmd::Remove { address } => {
-                self.remove_listener(address.to_string(), ListenerType::Tcp)
+                self.remove_listener(address.into(), ListenerType::Tcp)
             }
             TcpListenerCmd::Activate { address } => {
-                self.activate_listener(address.to_string(), ListenerType::Tcp)
+                self.activate_listener(address.into(), ListenerType::Tcp)
             }
             TcpListenerCmd::Deactivate { address } => {
-                self.deactivate_listener(address.to_string(), ListenerType::Tcp)
+                self.deactivate_listener(address.into(), ListenerType::Tcp)
             }
         }
     }
@@ -442,15 +442,12 @@ impl CommandManager {
 
     pub fn remove_listener(
         &mut self,
-        address: String,
+        address: SocketAddress,
         listener_type: ListenerType,
     ) -> Result<(), CtlError> {
-        let address = parse_socket_address(&address)
-            .map_err(|util_err| CtlError::WrongAddress(address, util_err))?;
-
         self.send_request(
             RequestType::RemoveListener(RemoveListener {
-                address: address.to_string(),
+                address,
                 proxy: listener_type.into(),
             })
             .into(),
@@ -459,15 +456,12 @@ impl CommandManager {
 
     pub fn activate_listener(
         &mut self,
-        address: String,
+        address: SocketAddress,
         listener_type: ListenerType,
     ) -> Result<(), CtlError> {
-        let address = parse_socket_address(&address)
-            .map_err(|util_err| CtlError::WrongAddress(address, util_err))?;
-
         self.send_request(
             RequestType::ActivateListener(ActivateListener {
-                address: address.to_string(),
+                address,
                 proxy: listener_type.into(),
                 from_scm: false,
             })
@@ -477,15 +471,12 @@ impl CommandManager {
 
     pub fn deactivate_listener(
         &mut self,
-        address: String,
+        address: SocketAddress,
         listener_type: ListenerType,
     ) -> Result<(), CtlError> {
-        let address = parse_socket_address(&address)
-            .map_err(|util_err| CtlError::WrongAddress(address, util_err))?;
-
         self.send_request(
             RequestType::DeactivateListener(DeactivateListener {
-                address: address.to_string(),
+                address,
                 proxy: listener_type.into(),
                 to_scm: false,
             })
@@ -499,7 +490,7 @@ impl CommandManager {
 
     pub fn add_certificate(
         &mut self,
-        address: String,
+        address: SocketAddress,
         certificate_path: &str,
         certificate_chain_path: &str,
         key_path: &str,
@@ -527,7 +518,7 @@ impl CommandManager {
     #[allow(clippy::too_many_arguments)]
     pub fn replace_certificate(
         &mut self,
-        address: String,
+        address: SocketAddress,
         new_certificate_path: &str,
         new_certificate_chain_path: &str,
         new_key_path: &str,
@@ -575,7 +566,7 @@ impl CommandManager {
 
     pub fn remove_certificate(
         &mut self,
-        address: String,
+        address: SocketAddress,
         certificate_path: Option<&str>,
         fingerprint: Option<&str>,
     ) -> Result<(), CtlError> {

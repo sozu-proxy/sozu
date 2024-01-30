@@ -115,8 +115,8 @@ message CountRequests {}
 
 // details of an HTTP listener
 message HttpListenerConfig {
-    required string address = 1;
-    optional string public_address = 2;
+    required SocketAddress address = 1;
+    optional SocketAddress public_address = 2;
     required string answer_404 = 3;
     required string answer_503 = 4;
     required bool expect_proxy = 5 [default = false];
@@ -135,8 +135,8 @@ message HttpListenerConfig {
 
 // details of an HTTPS listener
 message HttpsListenerConfig {
-    required string address = 1;
-    optional string public_address = 2;
+    required SocketAddress address = 1;
+    optional SocketAddress public_address = 2;
     required string answer_404 = 3;
     required string answer_503 = 4;
     required bool expect_proxy = 5 [default = false];
@@ -168,8 +168,8 @@ message HttpsListenerConfig {
 
 // details of an TCP listener
 message TcpListenerConfig {
-    required string address = 1;
-    optional string public_address = 2;
+    required SocketAddress address = 1;
+    optional SocketAddress public_address = 2;
     required bool expect_proxy = 3 [default = false];
     // client inactive time, in seconds
     required uint32 front_timeout = 4 [default = 60];
@@ -182,19 +182,19 @@ message TcpListenerConfig {
 }
 
 message ActivateListener {
-    required string address = 1;
+    required SocketAddress address = 1;
     required ListenerType proxy = 2;
     required bool from_scm = 3;
 }
 
 message DeactivateListener {
-    required string address = 1;
+    required SocketAddress address = 1;
     required ListenerType proxy = 2;
     required bool to_scm = 3;
 }
 
 message RemoveListener {
-    required string address = 1;
+    required SocketAddress address = 1;
     required ListenerType proxy = 2;
 }
 
@@ -217,7 +217,7 @@ message ListenersList {
 // An HTTP or HTTPS frontend, as order to, or received from, Sōzu
 message RequestHttpFrontend {
     optional string cluster_id = 1;
-    required string address = 2;
+    required SocketAddress address = 2;
     required string hostname = 3;
     required PathRule path = 4;
     optional string method = 5;
@@ -229,7 +229,7 @@ message RequestHttpFrontend {
 message RequestTcpFrontend {
     required string cluster_id = 1;
     // the socket address on which to listen for incoming traffic
-    required string address = 2;
+    required SocketAddress address = 2;
     // custom tags to identify the frontend in the access logs
     map<string, string> tags = 3;
 }
@@ -269,20 +269,20 @@ enum RulePosition {
 
 // Add a new TLS certificate to an HTTPs listener
 message AddCertificate {
-    required string address = 1;
+    required SocketAddress address = 1;
     required CertificateAndKey certificate = 2;
     // A unix timestamp. Overrides certificate expiration.
     optional int64 expired_at = 3;
 }
 
 message RemoveCertificate {
-    required string address = 1;
+    required SocketAddress address = 1;
     // a hex-encoded TLS fingerprint to identify the certificate to remove
     required string fingerprint = 2;
 }
 
 message ReplaceCertificate {
-    required string address = 1;
+    required SocketAddress address = 1;
     required CertificateAndKey new_certificate = 2;
     // a hex-encoded TLS fingerprint to identify the old certificate
     required string old_fingerprint = 3;
@@ -323,7 +323,7 @@ message ListOfCertificatesByAddress {
 
 // Summaries of certificates for a given address
 message CertificatesByAddress {
-    required string address = 1;
+    required SocketAddress address = 1;
     repeated CertificateSummary certificate_summaries = 2;
 }
 
@@ -382,7 +382,7 @@ message AddBackend {
     required string cluster_id = 1;
     required string backend_id = 2;
     // the socket address of the backend
-    required string address = 3;
+    required SocketAddress address = 3;
     optional string sticky_id = 4;
     optional LoadBalancingParams load_balancing_parameters = 5;
     optional bool backup = 6;
@@ -393,7 +393,7 @@ message RemoveBackend {
     required string cluster_id = 1;
     required string backend_id = 2;
     // the socket address of the backend
-    required string address = 3 ;
+    required SocketAddress address = 3 ;
 }
 
 message LoadBalancingParams {
@@ -502,7 +502,7 @@ message Event {
     required EventKind kind = 1;
     optional string cluster_id = 2;
     optional string backend_id = 3;
-    optional string address = 4;
+    optional SocketAddress address = 4;
 }
 
 enum EventKind {
@@ -607,4 +607,28 @@ message Percentiles {
 
 message RequestCounts {
     map<string, int32> map = 1;
+}
+
+// matches std::net::SocketAddr in the Rust library
+// beware that the ports are expressed with uint32 here,
+// but they should NOT exceed uint16 value
+message SocketAddress {
+    required IpAddress ip = 1;
+    required uint32 port = 2;
+}
+
+message IpAddress {
+    oneof inner {
+        uint32 v4 = 1;
+        Uint128 v6 = 2;
+    }
+}
+
+// used to represent the 128 bits of an IPv6 address
+message Uint128 {
+    // higher value, first 8 bytes of the ip
+    required uint64 low = 1;
+    // lower value, last 8 bytes of the ip
+    required uint64 high = 2;
+
 }

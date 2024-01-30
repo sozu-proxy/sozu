@@ -15,7 +15,7 @@ use sozu_command_lib::{
     logging::setup_logging,
     proto::command::{
         request::RequestType, AddBackend, AddCertificate, CertificateAndKey, LoadBalancingParams,
-        PathRule, RequestHttpFrontend,
+        PathRule, RequestHttpFrontend, SocketAddress,
     },
     request::WorkerRequest,
 };
@@ -26,16 +26,15 @@ fn main() -> anyhow::Result<()> {
     info!("MAIN\tstarting up");
 
     sozu_lib::metrics::setup(
-        &"127.0.0.1:8125"
-            .parse()
-            .with_context(|| "Could not parse address for metrics setup")?,
+        &SocketAddress::new_v4(127, 0, 0, 1, 8125).into(),
         "main",
         false,
         None,
     );
     gauge!("sozu.TEST", 42);
 
-    let http_listener = ListenerBuilder::new_http("127.0.0.1:8080").to_http(None)?;
+    let http_listener =
+        ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8080)).to_http(None)?;
 
     let (mut command, channel) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
@@ -52,7 +51,7 @@ fn main() -> anyhow::Result<()> {
 
     let http_front = RequestHttpFrontend {
         cluster_id: Some(String::from("cluster_1")),
-        address: "127.0.0.1:8080".to_string(),
+        address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
         ..Default::default()
@@ -62,7 +61,7 @@ fn main() -> anyhow::Result<()> {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026".to_string(),
+        address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };
@@ -80,7 +79,8 @@ fn main() -> anyhow::Result<()> {
     info!("MAIN\tHTTP -> {:?}", command.read_message());
     info!("MAIN\tHTTP -> {:?}", command.read_message());
 
-    let https_listener = ListenerBuilder::new_https("127.0.0.1:8443").to_tls(None)?;
+    let https_listener =
+        ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443)).to_tls(None)?;
 
     let (mut command2, channel2) =
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
@@ -108,9 +108,7 @@ fn main() -> anyhow::Result<()> {
     command2.write_message(&WorkerRequest {
         id: String::from("ID_IJKL1"),
         content: RequestType::AddCertificate(AddCertificate {
-            address: "127.0.0.1:8443"
-                .parse()
-                .with_context(|| "Could not parse certificate address")?,
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
             certificate: certificate_and_key,
             expired_at: None,
         })
@@ -119,7 +117,7 @@ fn main() -> anyhow::Result<()> {
 
     let tls_front = RequestHttpFrontend {
         cluster_id: Some(String::from("cluster_1")),
-        address: "127.0.0.1:8443".to_string(),
+        address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
         hostname: String::from("lolcatho.st"),
         path: PathRule::prefix(String::from("/")),
         ..Default::default()
@@ -133,7 +131,7 @@ fn main() -> anyhow::Result<()> {
         cluster_id: String::from("cluster_1"),
         backend_id: String::from("cluster_1-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026".to_string(),
+        address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };
@@ -157,9 +155,7 @@ fn main() -> anyhow::Result<()> {
     command2.write_message(&WorkerRequest {
         id: String::from("ID_QRST1"),
         content: RequestType::AddCertificate(AddCertificate {
-            address: "127.0.0.1:8443"
-                .parse()
-                .with_context(|| "Could not parse certificate address")?,
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
             certificate: certificate_and_key2,
             expired_at: None,
         })
@@ -168,7 +164,7 @@ fn main() -> anyhow::Result<()> {
 
     let tls_front2 = RequestHttpFrontend {
         cluster_id: Some(String::from("cluster_2")),
-        address: "127.0.0.1:8443".to_string(),
+        address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
         hostname: String::from("test.local"),
         path: PathRule::prefix(String::from("/")),
         ..Default::default()
@@ -183,7 +179,7 @@ fn main() -> anyhow::Result<()> {
         cluster_id: String::from("cluster_2"),
         backend_id: String::from("cluster_2-0"),
         sticky_id: None,
-        address: "127.0.0.1:1026".to_string(),
+        address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         backup: None,
     };

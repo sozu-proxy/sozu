@@ -22,6 +22,8 @@ use crate::{
     sozu::worker::Worker,
 };
 
+use self::tests::create_local_address;
+
 #[derive(PartialEq, Eq, Debug)]
 pub enum State {
     Success,
@@ -55,14 +57,14 @@ pub fn setup_test<S: Into<String>>(
 
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::AddHttpListener(
-            ListenerBuilder::new_http(front_address)
+            ListenerBuilder::new_http(front_address.into())
                 .to_http(None)
                 .unwrap(),
         )),
     });
     worker.send_proxy_request(Request {
         request_type: Some(RequestType::ActivateListener(ActivateListener {
-            address: front_address.to_string(),
+            address: front_address.into(),
             proxy: ListenerType::Http.into(),
             from_scm: false,
         })),
@@ -82,21 +84,21 @@ pub fn setup_test<S: Into<String>>(
 
     let mut backends = Vec::new();
     for i in 0..nb_backends {
-        let back_address: SocketAddr = format!("127.0.0.1:{}", provide_port())
-            .parse()
-            .expect("could not parse back address");
-        worker.send_proxy_request(Request {
-            request_type: Some(RequestType::AddBackend(Worker::default_backend(
+        let back_address = create_local_address();
+
+        worker.send_proxy_request(
+            RequestType::AddBackend(Worker::default_backend(
                 "cluster_0",
                 format!("cluster_0-{i}"),
-                back_address.to_string(),
+                back_address.into(),
                 if should_stick {
                     Some(format!("sticky_cluster_0-{i}"))
                 } else {
                     None
                 },
-            ))),
-        });
+            ))
+            .into(),
+        );
         backends.push(back_address);
     }
 

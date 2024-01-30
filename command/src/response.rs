@@ -49,7 +49,7 @@ impl From<HttpFrontend> for RequestHttpFrontend {
         };
         RequestHttpFrontend {
             cluster_id: val.cluster_id,
-            address: val.address.to_string(),
+            address: val.address.into(),
             hostname: val.hostname,
             path: val.path,
             method: val.method,
@@ -64,7 +64,7 @@ impl From<Backend> for AddBackend {
         AddBackend {
             cluster_id: val.cluster_id,
             backend_id: val.backend_id,
-            address: val.address.to_string(),
+            address: val.address.into(),
             sticky_id: val.sticky_id,
             load_balancing_parameters: val.load_balancing_parameters,
             backup: val.backup,
@@ -154,7 +154,7 @@ impl From<TcpFrontend> for RequestTcpFrontend {
     fn from(val: TcpFrontend) -> Self {
         RequestTcpFrontend {
             cluster_id: val.cluster_id,
-            address: val.address.to_string(),
+            address: val.address.into(),
             tags: val.tags,
         }
     }
@@ -202,7 +202,7 @@ impl Backend {
     pub fn to_add_backend(self) -> AddBackend {
         AddBackend {
             cluster_id: self.cluster_id,
-            address: self.address.to_string(),
+            address: self.address.into(),
             sticky_id: self.sticky_id,
             backend_id: self.backend_id,
             load_balancing_parameters: self.load_balancing_parameters,

@@ -1098,7 +1098,7 @@ impl Server {
     fn add_backend(&mut self, req_id: &str, add_backend: &AddBackend) -> WorkerResponse {
         let new_backend = Backend::new(
             &add_backend.backend_id,
-            add_backend.address.parse().unwrap(),
+            add_backend.address.clone().into(),
             add_backend.sticky_id.clone(),
             add_backend.load_balancing_parameters.clone(),
             add_backend.backup,
@@ -1111,7 +1111,7 @@ impl Server {
     }
 
     fn remove_backend(&mut self, req_id: &str, backend: &RemoveBackend) -> WorkerResponse {
-        let address = backend.address.parse().unwrap();
+        let address = backend.address.clone().into();
         self.backends
             .borrow_mut()
             .remove_backend(&backend.cluster_id, &address);
@@ -1232,10 +1232,7 @@ impl Server {
             req_id, activate.proxy, activate
         );
 
-        let address: std::net::SocketAddr = match activate.address.parse() {
-            Ok(a) => a,
-            Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {e}")),
-        };
+        let address: std::net::SocketAddr = activate.address.clone().into();
 
         match ListenerType::try_from(activate.proxy) {
             Ok(ListenerType::Http) => {
@@ -1312,10 +1309,7 @@ impl Server {
             req_id, deactivate.proxy, deactivate
         );
 
-        let address: std::net::SocketAddr = match deactivate.address.parse() {
-            Ok(a) => a,
-            Err(e) => return WorkerResponse::error(req_id, format!("Wrong socket address: {e}")),
-        };
+        let address: std::net::SocketAddr = deactivate.address.clone().into();
 
         match ListenerType::try_from(deactivate.proxy) {
             Ok(ListenerType::Http) => {

@@ -11,7 +11,7 @@ use sozu_command_lib::{
     channel::Channel,
     logging::setup_logging,
     proto::command::{
-        request::RequestType, AddBackend, LoadBalancingParams, RequestTcpFrontend,
+        request::RequestType, AddBackend, LoadBalancingParams, RequestTcpFrontend, SocketAddress,
         TcpListenerConfig,
     },
     request::WorkerRequest,
@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
         let max_buffers = 500;
         let buffer_size = 16384;
         let listener = TcpListenerConfig {
-            address: "127.0.0.1:8080".parse().expect("could not parse address"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
             ..Default::default()
         };
         setup_logging("stdout", None, "debug", "TCP");
@@ -39,13 +39,13 @@ fn main() -> anyhow::Result<()> {
 
     let tcp_front = RequestTcpFrontend {
         cluster_id: String::from("test"),
-        address: "127.0.0.1:8080".to_string(),
+        address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
         ..Default::default()
     };
     let tcp_backend = AddBackend {
         cluster_id: String::from("test"),
         backend_id: String::from("test-0"),
-        address: "127.0.0.1:1026".to_string(),
+        address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id: None,
         backup: None,

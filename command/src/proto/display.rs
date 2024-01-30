@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::{Display, Formatter},
+    net::SocketAddr,
 };
 
 use prettytable::{cell, row, Row, Table};
@@ -17,6 +18,8 @@ use crate::proto::{
     },
     DisplayError,
 };
+
+use super::command::SocketAddress;
 
 impl Display for CertificateAndKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -939,4 +942,10 @@ fn create_cluster_table(headers: Vec<&str>, data: &BTreeMap<String, ResponseCont
     }
     table.add_row(Row::new(row_header));
     table
+}
+
+impl Display for SocketAddress {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", SocketAddr::from(self.clone()))
+    }
 }
