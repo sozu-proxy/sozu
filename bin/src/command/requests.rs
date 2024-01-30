@@ -388,12 +388,12 @@ impl GatheringTask for LoadStaticConfigTask {
     ) {
         let mut messages = vec![];
         for (worker_id, response) in self.gatherer.responses {
-            match ResponseStatus::try_from(response.status).unwrap() {
-                ResponseStatus::Ok => {}
-                ResponseStatus::Failure => {
+            match ResponseStatus::try_from(response.status) {
+                Ok(ResponseStatus::Failure) => {
                     messages.push(format!("worker {worker_id}: {}", response.message))
                 }
-                ResponseStatus::Processing => {}
+                Ok(ResponseStatus::Ok) | Ok(ResponseStatus::Processing) => {}
+                Err(e) => warn!("error decoding response status: {}", e),
             }
         }
 
@@ -468,12 +468,11 @@ impl GatheringTask for WorkerTask {
         let mut messages = vec![];
 
         for (worker_id, response) in self.gatherer.responses {
-            match ResponseStatus::try_from(response.status).unwrap() {
-                ResponseStatus::Ok => messages.push(format!("{worker_id}: OK")),
-                ResponseStatus::Failure => {
+            match ResponseStatus::try_from(response.status) {
+                Ok(ResponseStatus::Ok) => messages.push(format!("{worker_id}: OK")),
+                Ok(ResponseStatus::Failure) | Ok(ResponseStatus::Processing) | Err(_) => {
                     messages.push(format!("{worker_id}: {}", response.message))
                 }
-                ResponseStatus::Processing => {}
             }
         }
 
@@ -750,10 +749,14 @@ impl GatheringTask for StatusTask {
         _timed_out: bool,
     ) {
         for (worker_id, response) in self.gatherer.responses {
-            let new_run_state = match ResponseStatus::try_from(response.status).unwrap() {
-                ResponseStatus::Ok => RunState::Running,
-                ResponseStatus::Processing => continue,
-                ResponseStatus::Failure => RunState::NotAnswering,
+            let new_run_state = match ResponseStatus::try_from(response.status) {
+                Ok(ResponseStatus::Ok) => RunState::Running,
+                Ok(ResponseStatus::Processing) => continue,
+                Ok(ResponseStatus::Failure) => RunState::NotAnswering,
+                Err(e) => {
+                    warn!("error decoding response status: {}", e);
+                    continue;
+                }
             };
 
             self.worker_infos

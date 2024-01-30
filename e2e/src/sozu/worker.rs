@@ -53,7 +53,7 @@ impl Worker {
         let config = ConfigBuilder::new(file_config, "")
             .into_config()
             .expect("could not create Config");
-        ServerConfig::from_config(&config)
+        ServerConfig::from(&config)
     }
 
     pub fn empty_config() -> (ServerConfig, Listeners, ConfigState) {

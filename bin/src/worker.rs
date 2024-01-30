@@ -125,11 +125,8 @@ pub fn begin_worker_process(
     );
     info!("worker {} starting...", id);
 
-    // let initial_state = read_requests_from_file(&mut configuration_state_file)
-
     let initial_state = read_initial_state_from_file(&mut configuration_state_file)
         .map_err(WorkerError::ReadRequestsFromFile)?;
-    // .expect("could not parse configuration state data");
 
     worker_to_main_channel
         .nonblocking()
@@ -201,10 +198,8 @@ pub fn fork_main_into_worker(
     })?;
 
     state
-        // .write_requests_to_file(&mut state_file)
         .write_initial_state_to_file(&mut state_file)
         .map_err(WorkerError::WriteStateFile)?;
-    // .expect("Could not write state to file");
 
     state_file.rewind().map_err(WorkerError::Rewind)?;
 
@@ -234,7 +229,7 @@ pub fn fork_main_into_worker(
         }
     })?;
 
-    let worker_config = ServerConfig::from_config(config);
+    let worker_config = ServerConfig::from(config);
 
     let mut main_to_worker_channel: Channel<ServerConfig, WorkerResponse> = Channel::new(
         main_to_worker,

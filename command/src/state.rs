@@ -1383,11 +1383,9 @@ impl ConfigState {
 
     // create requests needed for a worker to recreate the state
     pub fn produce_initial_state(&self) -> InitialState {
-        let mut counter = 0usize;
         let mut worker_requests = Vec::new();
-        for request in self.generate_requests() {
+        for (counter, request) in self.generate_requests().into_iter().enumerate() {
             worker_requests.push(WorkerRequest::new(format!("SAVE-{counter}"), request));
-            counter += 1;
         }
         InitialState {
             requests: worker_requests,

@@ -361,7 +361,7 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
 
             if buffer.len() >= message_len {
                 let message = Rx::decode(&buffer[delimiter_size()..message_len])
-                    .map_err(|decode_error| ChannelError::InvalidProtobufMessage(decode_error))?;
+                    .map_err(ChannelError::InvalidProtobufMessage)?;
                 self.front_buf.consume(message_len);
                 return Ok(Some(message));
             }

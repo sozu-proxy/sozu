@@ -153,13 +153,14 @@ impl Gatherer for DefaultGatherer {
         worker_id: WorkerId,
         message: WorkerResponse,
     ) {
-        match ResponseStatus::try_from(message.status).unwrap() {
-            ResponseStatus::Ok => self.ok += 1,
-            ResponseStatus::Failure => self.errors += 1,
-            ResponseStatus::Processing => client.return_processing(format!(
+        match ResponseStatus::try_from(message.status) {
+            Ok(ResponseStatus::Ok) => self.ok += 1,
+            Ok(ResponseStatus::Failure) => self.errors += 1,
+            Ok(ResponseStatus::Processing) => client.return_processing(format!(
                 "Worker {} is processing {}. {}",
                 worker_id, message.id, message.message
             )),
+            Err(e) => warn!("error decoding response status: {}", e),
         }
         self.responses.push((worker_id, message));
     }

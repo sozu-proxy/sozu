@@ -1747,16 +1747,21 @@ fn display_toml_error(file: &str, error: &toml::de::Error) {
 }
 
 impl ServerConfig {
-    /// reduce the config to the bare minimum needed by a worker
-    pub fn from_config(config: &Config) -> ServerConfig {
-        let metrics = config.metrics.clone().and_then(|m| {
-            Some(ServerMetricsConfig {
-                address: m.address.to_string(),
-                tagged_metrics: m.tagged_metrics,
-                prefix: m.prefix,
-            })
+    /// size of the slab for the Session manager
+    pub fn slab_capacity(&self) -> u64 {
+        10 + 2 * self.max_connections
+    }
+}
+
+/// reduce the config to the bare minimum needed by a worker
+impl From<&Config> for ServerConfig {
+    fn from(config: &Config) -> Self {
+        let metrics = config.metrics.clone().map(|m| ServerMetricsConfig {
+            address: m.address.to_string(),
+            tagged_metrics: m.tagged_metrics,
+            prefix: m.prefix,
         });
-        ServerConfig {
+        Self {
             max_connections: config.max_connections as u64,
             front_timeout: config.front_timeout,
             back_timeout: config.back_timeout,
@@ -1773,11 +1778,6 @@ impl ServerConfig {
             max_command_buffer_size: config.max_command_buffer_size,
             metrics,
         }
-    }
-
-    /// size of the slab for the Session manager
-    pub fn slab_capacity(&self) -> u64 {
-        10 + 2 * self.max_connections
     }
 }
 

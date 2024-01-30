@@ -116,7 +116,7 @@ impl ScmSocket {
         debug!("{} received :{:?}", self.fd, (size, file_descriptor_length));
 
         let listeners_count = ListenersCount::decode_length_delimited(&buf[..size])
-            .map_err(|error| ScmSocketError::DecodeError(error))?;
+            .map_err(ScmSocketError::DecodeError)?;
 
         let mut http_addresses = parse_addresses(&listeners_count.http)?;
         let mut tls_addresses = parse_addresses(&listeners_count.tls)?;

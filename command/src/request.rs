@@ -7,7 +7,7 @@ use std::{
     str::FromStr,
 };
 
-use prost::Message;
+use prost::{DecodeError, Message};
 
 use crate::{
     proto::{
@@ -26,9 +26,9 @@ pub enum RequestError {
     #[error("invalid value {value} for field '{name}'")]
     InvalidValue { name: String, value: i32 },
     #[error("Could not read requests from file: {0}")]
-    FileError(std::io::Error),
-    #[error("Could not parse requests: {0}")]
-    ParseError(String),
+    ReadFile(std::io::Error),
+    #[error("Could not decode requests: {0}")]
+    Decode(DecodeError),
 }
 
 impl Request {
@@ -135,14 +135,16 @@ impl fmt::Display for WorkerRequest {
 
 pub fn read_initial_state_from_file(file: &mut File) -> Result<InitialState, RequestError> {
     let mut buf_reader = BufReader::new(file);
-    let mut buffer = Vec::new();
-    buf_reader
-        .read_to_end(&mut buffer)
-        .map_err(|e| RequestError::FileError(e))?;
+    read_initial_state(&mut buf_reader)
+}
 
-    let initial_state =
-        InitialState::decode(&buffer[..]).map_err(|e| RequestError::ParseError(e.to_string()))?;
-    Ok(initial_state)
+pub fn read_initial_state<R: Read>(reader: &mut R) -> Result<InitialState, RequestError> {
+    let mut buffer = Vec::new();
+    reader
+        .read_to_end(&mut buffer)
+        .map_err(RequestError::ReadFile)?;
+
+    InitialState::decode(&buffer[..]).map_err(RequestError::Decode)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

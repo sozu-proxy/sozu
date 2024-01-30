@@ -73,8 +73,6 @@ pub fn ctl(args: cli::Args) -> Result<(), CtlError> {
         setup_logging_with_config(&config, "CTL");
     }
 
-    debug!("started CLI with config: {:?}", config);
-
     // If the command is `config check` then exit because if we are here, the configuration is valid
     if let SubCmd::Config {
         cmd: ConfigCmd::Check,
