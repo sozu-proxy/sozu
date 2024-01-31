@@ -9,6 +9,8 @@ use std::{
     sync::Arc,
 };
 
+use std::os::fd::IntoRawFd;
+
 use anyhow::Context;
 use mio::{
     net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
@@ -48,7 +50,7 @@ use sozu_command::{
     ready::Ready,
     request::WorkerRequest,
     response::{HttpFrontend, WorkerResponse},
-    scm_socket::ScmSocket,
+    scm_socket::{ScmSocket, Listeners},
     state::ClusterId,
 };
 
@@ -1521,21 +1523,21 @@ pub fn start_https_worker(
         let entry = sessions.vacant_entry();
         info!("taking token {:?} for channel", SessionToken(entry.key()));
         entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
+            protocol: Protocol::HTTPSListen,
         })));
     }
     {
         let entry = sessions.vacant_entry();
         info!("taking token {:?} for timer", SessionToken(entry.key()));
         entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
+            protocol: Protocol::HTTPSListen,
         })));
     }
     {
         let entry = sessions.vacant_entry();
         info!("taking token {:?} for metrics", SessionToken(entry.key()));
         entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
+            protocol: Protocol::HTTPSListen,
         })));
     }
 
@@ -1543,7 +1545,7 @@ pub fn start_https_worker(
         let entry = sessions.vacant_entry();
         let key = entry.key();
         let _e = entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
+            protocol: Protocol::HTTPSListen,
         })));
         Token(key)
     };
@@ -1565,8 +1567,12 @@ pub fn start_https_worker(
             )
             .is_ok()
     {
-        let (scm_server, _scm_client) =
+        let (scm_server, scm_client) =
             UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
+        let scm = ScmSocket::new(scm_client.into_raw_fd());
+        if let Err(e) = scm?.send_listeners(&Listeners::default()) {
+            error!("error sending empty listeners: {:?}", e);
+        }
         let server_config = server::ServerConfig {
             max_connections: max_buffers,
             ..Default::default()
