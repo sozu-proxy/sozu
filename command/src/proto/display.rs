@@ -18,6 +18,8 @@ use crate::proto::{
     DisplayError,
 };
 
+use super::command::FilteredHistogram;
+
 impl Display for CertificateAndKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let versions = self.versions.iter().fold(String::new(), |acc, tls_v| {
@@ -245,6 +247,7 @@ fn print_proxy_metrics(proxy_metrics: &BTreeMap<String, FilteredMetrics>) {
     let filtered = filter_metrics(proxy_metrics);
     print_gauges_and_counts(&filtered);
     print_percentiles(&filtered);
+    print_histograms(&filtered);
 }
 
 fn print_worker_metrics(worker_metrics: &WorkerMetrics) -> Result<(), DisplayError> {
@@ -383,6 +386,37 @@ fn print_percentiles(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
     }
 
     percentile_table.printstd();
+}
+
+fn print_histograms(filtered_metrics: &BTreeMap<String, FilteredMetrics>) {
+    let histograms: BTreeMap<String, FilteredHistogram> = filtered_metrics
+        .iter()
+        .filter_map(|(name, metric)| match metric.inner.clone() {
+            Some(filtered_metrics::Inner::Histogram(hist)) => Some((name.to_owned(), hist)),
+            _ => None,
+        })
+        .collect();
+
+    for (name, histogram) in histograms {
+        print_histogram(&name, &histogram);
+    }
+}
+
+fn print_histogram(metric_name: &str, hist: &FilteredHistogram) {
+    println!("{}", metric_name);
+    let mut first_row = Row::new(vec![cell!("sum"), cell!("count")]);
+    let mut value_row = Row::new(vec![cell!(hist.sum), cell!(hist.count)]);
+
+    for bucket in &hist.buckets {
+        first_row.add_cell(cell!(bucket.le));
+        value_row.add_cell(cell!(bucket.count));
+    }
+
+    let mut table = Table::new();
+    table.set_format(*prettytable::format::consts::FORMAT_BOX_CHARS);
+    table.add_row(first_row);
+    table.add_row(value_row);
+    table.printstd();
 }
 
 fn print_available_metrics(available_metrics: &AvailableMetrics) -> Result<(), DisplayError> {
