@@ -1,7 +1,7 @@
 # sozu_lib, a proxy development library
 
 `sozu_lib` provides tools to write a proxy that can be reconfigured
-without any downtime. See `examples/minimal.rs` for a small example
+without any downtime. See `examples/http.rs` for a small example
 of starting a HTTP proxy with one cluster.
 
 A proxy starts as an event loop with which you communicate through

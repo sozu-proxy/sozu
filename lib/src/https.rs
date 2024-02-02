@@ -3,17 +3,16 @@ use std::{
     collections::{hash_map::Entry, BTreeMap, HashMap},
     io::ErrorKind,
     net::{Shutdown, SocketAddr as StdSocketAddr},
-    os::unix::{io::AsRawFd, net::UnixStream},
+    os::unix::io::AsRawFd,
     rc::{Rc, Weak},
     str::{from_utf8, from_utf8_unchecked},
     sync::Arc,
 };
 
-use anyhow::Context;
 use mio::{
     net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
     unix::SourceFd,
-    Interest, Poll, Registry, Token,
+    Interest, Registry, Token,
 };
 use rustls::{
     crypto::{
@@ -32,7 +31,6 @@ use rustls::{
     CipherSuite, ProtocolVersion, ServerConfig, ServerConnection, SupportedCipherSuite,
 };
 use rusty_ulid::Ulid;
-use slab::Slab;
 use time::{Duration, Instant};
 
 use sozu_command::{
@@ -48,7 +46,6 @@ use sozu_command::{
     ready::Ready,
     request::WorkerRequest,
     response::{HttpFrontend, WorkerResponse},
-    scm_socket::ScmSocket,
     state::ClusterId,
 };
 
@@ -66,7 +63,7 @@ use crate::{
         Http, Pipe, SessionState,
     },
     router::{Route, Router},
-    server::{ListenSession, ListenToken, ProxyChannel, Server, SessionManager, SessionToken},
+    server::{ListenToken, SessionManager},
     socket::{server_bind, FrontRustls},
     timer::TimeoutContainer,
     tls::{CertifiedKeyWrapper, MutexWrappedCertificateResolver, ResolveCertificate},
@@ -1498,83 +1495,54 @@ fn rustls_ciphersuite_str(cipher: SupportedCipherSuite) -> &'static str {
     }
 }
 
-/// this function is not used, but is available for example and testing purposes
-pub fn start_https_worker(
-    config: HttpsListenerConfig,
-    channel: ProxyChannel,
-    max_buffers: usize,
-    buffer_size: usize,
-) -> anyhow::Result<()> {
-    use crate::server;
+pub mod testing {
+    use crate::testing::*;
 
-    let event_loop = Poll::new().with_context(|| "could not create event loop")?;
+    /// this function is not used, but is available for example and testing purposes
+    pub fn start_https_worker(
+        config: HttpsListenerConfig,
+        channel: ProxyChannel,
+        max_buffers: usize,
+        buffer_size: usize,
+    ) -> anyhow::Result<()> {
+        let address = config
+            .address
+            .parse()
+            .with_context(|| "Could not parse socket address")?;
 
-    let pool = Rc::new(RefCell::new(Pool::with_capacity(
-        1,
-        max_buffers,
-        buffer_size,
-    )));
-    let backends = Rc::new(RefCell::new(BackendMap::new()));
+        let ServerParts {
+            event_loop,
+            registry,
+            sessions,
+            pool,
+            backends,
+            client_scm_socket: _,
+            server_scm_socket,
+            server_config,
+        } = prebuild_server(max_buffers, buffer_size, true)?;
 
-    let mut sessions: Slab<Rc<RefCell<dyn ProxySession>>> = Slab::with_capacity(max_buffers);
-    {
-        let entry = sessions.vacant_entry();
-        info!("taking token {:?} for channel", SessionToken(entry.key()));
-        entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
-        })));
-    }
-    {
-        let entry = sessions.vacant_entry();
-        info!("taking token {:?} for timer", SessionToken(entry.key()));
-        entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
-        })));
-    }
-    {
-        let entry = sessions.vacant_entry();
-        info!("taking token {:?} for metrics", SessionToken(entry.key()));
-        entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
-        })));
-    }
-
-    let token = {
-        let entry = sessions.vacant_entry();
-        let key = entry.key();
-        let _e = entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::HTTPListen,
-        })));
-        Token(key)
-    };
-
-    let sessions = SessionManager::new(sessions, max_buffers);
-    let registry = event_loop
-        .registry()
-        .try_clone()
-        .with_context(|| "Failed at creating a registry")?;
-    let mut proxy = HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
-    let address = config.address.clone();
-    if proxy.add_listener(config, token).is_some()
-        && proxy
-            .activate_listener(
-                &address
-                    .parse()
-                    .with_context(|| "Could not parse socket address")?,
-                None,
-            )
-            .is_ok()
-    {
-        let (scm_server, _scm_client) =
-            UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
-        let server_config = server::ServerConfig {
-            max_connections: max_buffers,
-            ..Default::default()
+        let token = {
+            let mut sessions = sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            let _ = entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::HTTPSListen,
+            })));
+            Token(key)
         };
+
+        let mut proxy = HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+        proxy
+            .add_listener(config, token)
+            .with_context(|| "Failed at creating adding the listener")?;
+        proxy
+            .activate_listener(&address, None)
+            .with_context(|| "Failed at creating activating the listener")?;
+
         let mut server = Server::new(
             event_loop,
             channel,
-            ScmSocket::new(scm_server.as_raw_fd()).unwrap(),
+            server_scm_socket,
             sessions,
             pool,
             backends,
@@ -1585,24 +1553,24 @@ pub fn start_https_worker(
             None,
             false,
         )
-        .with_context(|| "Failed to create server")?;
+        .with_context(|| "Failed at creating server")?;
 
-        info!("starting event loop");
+        debug!("starting event loop");
         server.run();
-        info!("ending event loop");
+        debug!("ending event loop");
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     use std::{str::FromStr, sync::Arc};
 
     use sozu_command::config::ListenerBuilder;
 
     use crate::router::{trie::TrieNode, MethodRule, PathRule, Route, Router};
-
-    use super::*;
 
     /*
     #[test]
