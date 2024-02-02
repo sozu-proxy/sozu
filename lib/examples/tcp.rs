@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
             ..Default::default()
         };
         setup_logging("stdout", None, "debug", "TCP");
-        sozu_lib::tcp::start_tcp_worker(listener, max_buffers, buffer_size, channel);
+        sozu_lib::tcp::testing::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 
     let tcp_front = RequestTcpFrontend {

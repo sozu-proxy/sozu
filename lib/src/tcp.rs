@@ -7,15 +7,11 @@ use std::{
     rc::Rc,
 };
 
-use anyhow::Context;
 use mio::{
-    net::TcpListener as MioTcpListener,
-    net::{TcpStream as MioTcpStream, UnixStream},
-    unix::SourceFd,
-    Interest, Poll, Registry, Token,
+    net::TcpListener as MioTcpListener, net::TcpStream as MioTcpStream, unix::SourceFd, Interest,
+    Registry, Token,
 };
 use rusty_ulid::Ulid;
-use slab::Slab;
 use time::{Duration, Instant};
 
 use sozu_command::{config::MAX_LOOP_ITERATIONS, proto::command::request::RequestType, ObjectKind};
@@ -31,10 +27,7 @@ use crate::{
         Pipe,
     },
     retry::RetryPolicy,
-    server::{
-        push_event, ListenSession, ListenToken, ProxyChannel, Server, SessionManager, CONN_RETRIES,
-        TIMER,
-    },
+    server::{push_event, ListenToken, SessionManager, CONN_RETRIES, TIMER},
     socket::{server_bind, stats::socket_rtt},
     sozu_command::{
         logging,
@@ -44,7 +37,6 @@ use crate::{
         ready::Ready,
         request::WorkerRequest,
         response::WorkerResponse,
-        scm_socket::ScmSocket,
         state::ClusterId,
     },
     timer::TimeoutContainer,
@@ -1473,108 +1465,95 @@ impl ProxyConfiguration for TcpProxy {
     }
 }
 
-/// This is not directly used by Sōzu but is available for example and testing purposes
-pub fn start_tcp_worker(
-    config: TcpListenerConfig,
-    max_buffers: usize,
-    buffer_size: usize,
-    channel: ProxyChannel,
-) -> anyhow::Result<()> {
-    use crate::server;
+pub mod testing {
+    use crate::testing::*;
 
-    let poll = Poll::new().with_context(|| "could not create event loop")?;
-    let pool = Rc::new(RefCell::new(Pool::with_capacity(
-        1,
-        max_buffers,
-        buffer_size,
-    )));
-    let backends = Rc::new(RefCell::new(BackendMap::new()));
+    /// This is not directly used by Sōzu but is available for example and testing purposes
+    pub fn start_tcp_worker(
+        config: TcpListenerConfig,
+        max_buffers: usize,
+        buffer_size: usize,
+        channel: ProxyChannel,
+    ) -> anyhow::Result<()> {
+        let address = config
+            .address
+            .parse()
+            .with_context(|| "Could not parse socket address")?;
 
-    let mut sessions: Slab<Rc<RefCell<dyn ProxySession>>> = Slab::with_capacity(max_buffers);
-    {
-        let entry = sessions.vacant_entry();
-        info!("taking token {:?} for channel", entry.key());
-        entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::TCPListen,
-        })));
+        let ServerParts {
+            event_loop,
+            registry,
+            sessions,
+            pool,
+            backends,
+            client_scm_socket: _,
+            server_scm_socket,
+            server_config,
+        } = prebuild_server(max_buffers, buffer_size, true)?;
+
+        let token = {
+            let mut sessions = sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            let _ = entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::TCPListen,
+            })));
+            Token(key)
+        };
+
+        let mut proxy = TcpProxy::new(registry, sessions.clone(), backends.clone());
+        proxy
+            .add_listener(config, pool.clone(), token)
+            .with_context(|| "Failed at creating adding the listener")?;
+        proxy
+            .activate_listener(&address, None)
+            .with_context(|| "Failed at creating activating the listener")?;
+
+        let mut server = Server::new(
+            event_loop,
+            channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            Some(proxy),
+            server_config,
+            None,
+            false,
+        )
+        .with_context(|| "Failed at creating server")?;
+
+        debug!("starting event loop");
+        server.run();
+        debug!("ending event loop");
+        Ok(())
     }
-    {
-        let entry = sessions.vacant_entry();
-        info!("taking token {:?} for timer", entry.key());
-        entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::TCPListen,
-        })));
-    }
-    {
-        let entry = sessions.vacant_entry();
-        info!("taking token {:?} for metrics", entry.key());
-        entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::TCPListen,
-        })));
-    }
-
-    let token = {
-        let entry = sessions.vacant_entry();
-        let key = entry.key();
-        let _e = entry.insert(Rc::new(RefCell::new(ListenSession {
-            protocol: Protocol::TCPListen,
-        })));
-        Token(key)
-    };
-
-    let sessions = SessionManager::new(sessions, max_buffers);
-    let address = config.address.clone();
-    let registry = poll
-        .registry()
-        .try_clone()
-        .with_context(|| "Failed at creating a registry")?;
-    let mut configuration = TcpProxy::new(registry, sessions.clone(), backends.clone());
-    let _ = configuration.add_listener(config, pool.clone(), token);
-    let _ = configuration.activate_listener(&address.parse().unwrap(), None);
-    let (scm_server, _scm_client) =
-        UnixStream::pair().with_context(|| "Failed at creating scm stream sockets")?;
-    let scm_socket =
-        ScmSocket::new(scm_server.as_raw_fd()).with_context(|| "Could not create scm socket")?;
-    let server_config = server::ServerConfig {
-        max_connections: max_buffers,
-        ..Default::default()
-    };
-
-    let mut server = Server::new(
-        poll,
-        channel,
-        scm_socket,
-        sessions,
-        pool,
-        backends,
-        None,
-        None,
-        Some(configuration),
-        server_config,
-        None,
-        false,
-    )
-    .with_context(|| "Could not create tcp server")?;
-
-    info!("starting event loop");
-    server.run();
-    info!("ending event loop");
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::sozu_command::{
-        channel::Channel, proto::command::LoadBalancingParams, scm_socket::Listeners,
-    };
+    use super::testing::start_tcp_worker;
+    use crate::testing::*;
+
     use std::{
         io::{Read, Write},
         net::{Shutdown, TcpListener, TcpStream},
-        os::unix::io::IntoRawFd,
-        sync::atomic::{AtomicBool, Ordering},
-        sync::{Arc, Barrier},
-        {str, thread},
+        str,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier,
+        },
+        thread,
+    };
+
+    use sozu_command::{
+        channel::Channel,
+        config::ListenerBuilder,
+        proto::command::{request::RequestType, LoadBalancingParams, RequestTcpFrontend},
+        request::WorkerRequest,
+        response::WorkerResponse,
     };
     static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
 
@@ -1599,9 +1578,9 @@ mod tests {
         let _tx = start_proxy().expect("Could not start proxy");
         barrier.wait();
 
-        let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
-        let s3 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
-        let mut s2 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
+        let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not connect");
+        let s3 = TcpStream::connect("127.0.0.1:1234").expect("could not connect");
+        let mut s2 = TcpStream::connect("127.0.0.1:1234").expect("could not connect");
 
         s1.write(&b"hello "[..])
             .map_err(|e| {
@@ -1656,7 +1635,7 @@ mod tests {
     }
 
     fn start_server(barrier: Arc<Barrier>) {
-        let listener = TcpListener::bind("127.0.0.1:5678").expect("could not parse address");
+        let listener = TcpListener::bind("127.0.0.1:5678").expect("could not bind");
         fn handle_client(stream: &mut TcpStream, id: u8) {
             let mut buf = [0; 128];
             let _response = b" END";
@@ -1694,102 +1673,15 @@ mod tests {
 
     /// used in tests only
     pub fn start_proxy() -> anyhow::Result<Channel<WorkerRequest, WorkerResponse>> {
-        use crate::server;
+        let config = ListenerBuilder::new_tcp("127.0.0.1:1234")
+            .to_tcp(None)
+            .expect("could not create listener config");
 
-        info!("listen for connections");
         let (mut command, channel) =
             Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
-
-        // this thread should call a start() function that performs the same logic and returns Result<()>
-        // any error coming from this start() would be mapped and logged within the thread
-        thread::spawn(move || {
+        let _jg = thread::spawn(move || {
             setup_test_logger!();
-            info!("starting event loop");
-            let poll = Poll::new().expect("could not create event loop");
-            let max_connections = 100;
-            let buffer_size = 16384;
-            let pool = Rc::new(RefCell::new(Pool::with_capacity(
-                1,
-                2 * max_connections,
-                buffer_size,
-            )));
-            let backends = Rc::new(RefCell::new(BackendMap::new()));
-
-            let mut sessions: Slab<Rc<RefCell<dyn ProxySession>>> =
-                Slab::with_capacity(max_connections);
-            {
-                let entry = sessions.vacant_entry();
-                info!("taking token {:?} for channel", entry.key());
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::HTTPListen,
-                })));
-            }
-            {
-                let entry = sessions.vacant_entry();
-                info!("taking token {:?} for timer", entry.key());
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::HTTPListen,
-                })));
-            }
-            {
-                let entry = sessions.vacant_entry();
-                info!("taking token {:?} for metrics", entry.key());
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::HTTPListen,
-                })));
-            }
-
-            let sessions = SessionManager::new(sessions, max_connections);
-            let registry = poll.registry().try_clone().unwrap();
-            let mut configuration = TcpProxy::new(registry, sessions.clone(), backends.clone());
-            let listener_config = TcpListenerConfig {
-                address: "127.0.0.1:1234".to_string(),
-                ..Default::default()
-            };
-
-            {
-                let address = listener_config.address.clone();
-                let mut s = sessions.borrow_mut();
-                let entry = s.slab.vacant_entry();
-                let _ =
-                    configuration.add_listener(listener_config, pool.clone(), Token(entry.key()));
-                let _ = configuration.activate_listener(&address.parse().unwrap(), None);
-                entry.insert(Rc::new(RefCell::new(ListenSession {
-                    protocol: Protocol::TCPListen,
-                })));
-            }
-
-            let (scm_server, scm_client) = UnixStream::pair().unwrap();
-            let client_scm_socket =
-                ScmSocket::new(scm_client.into_raw_fd()).expect("Could not create scm socket");
-            let server_scm_socket =
-                ScmSocket::new(scm_server.as_raw_fd()).expect("Could not create scm socket");
-            client_scm_socket
-                .send_listeners(&Listeners::default())
-                .unwrap();
-
-            let server_config = server::ServerConfig {
-                max_connections,
-                ..Default::default()
-            };
-            let mut server = Server::new(
-                poll,
-                channel,
-                server_scm_socket,
-                sessions,
-                pool,
-                backends,
-                None,
-                None,
-                Some(configuration),
-                server_config,
-                None,
-                false,
-            )
-            .expect("Failed at creating the server");
-            info!("will run");
-            server.run();
-            info!("ending event loop");
+            start_tcp_worker(config, 100, 16384, channel).expect("could not start the tcp server");
         });
 
         command.blocking().unwrap();

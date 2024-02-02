@@ -76,7 +76,7 @@
 //! let worker_thread_join_handle = thread::spawn(move || {
 //!     let max_buffers = 500;
 //!     let buffer_size = 16384;
-//!     sozu_lib::http::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size);
+//!     sozu_lib::http::testing::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size);
 //! });
 //! ```
 //!
@@ -207,7 +207,7 @@
 //! let _ = worker_thread_join_handle.join();
 //! ```
 //!
-//! Here is the complete example for reference, it matches the `minimal.rs` example:
+//! Here is the complete example for reference, it matches the `examples/http.rs` example:
 //!
 //! ```
 //! extern crate time;
@@ -246,7 +246,7 @@
 //!     let worker_thread_join_handle = thread::spawn(move || {
 //!         let max_buffers = 500;
 //!         let buffer_size = 16384;
-//!         sozu_lib::http::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size)
+//!         sozu_lib::http::testing::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size)
 //!             .expect("The worker could not be started, or shut down");
 //!     });
 //!
@@ -1114,5 +1114,112 @@ impl PeakEWMA {
         self.observe(0.0);
 
         (active_requests + 1) as f64 * self.rtt
+    }
+}
+
+pub mod testing {
+    pub use std::{cell::RefCell, os::fd::IntoRawFd, rc::Rc};
+
+    pub use anyhow::Context;
+    pub use mio::{net::UnixStream, Poll, Registry, Token};
+    pub use slab::Slab;
+    pub use sozu_command::{
+        proto::command::{HttpListenerConfig, HttpsListenerConfig, TcpListenerConfig},
+        scm_socket::{Listeners, ScmSocket},
+    };
+
+    pub use crate::{
+        backends::BackendMap,
+        http::HttpProxy,
+        https::HttpsProxy,
+        pool::Pool,
+        server::Server,
+        server::{ListenSession, ProxyChannel, ServerConfig, SessionManager},
+        tcp::TcpProxy,
+        Protocol, ProxySession,
+    };
+
+    /// Everything needed to create a Server
+    pub struct ServerParts {
+        pub event_loop: Poll,
+        pub registry: Registry,
+        pub sessions: Rc<RefCell<SessionManager>>,
+        pub pool: Rc<RefCell<Pool>>,
+        pub backends: Rc<RefCell<BackendMap>>,
+        pub client_scm_socket: ScmSocket,
+        pub server_scm_socket: ScmSocket,
+        pub server_config: ServerConfig,
+    }
+
+    /// Setup a standalone server, for testing purposes
+    pub fn prebuild_server(
+        max_buffers: usize,
+        buffer_size: usize,
+        send_scm: bool,
+    ) -> anyhow::Result<ServerParts> {
+        let event_loop = Poll::new().with_context(|| "Failed at creating event loop")?;
+        let backends = Rc::new(RefCell::new(BackendMap::new()));
+        let server_config = ServerConfig {
+            max_connections: max_buffers,
+            ..Default::default()
+        };
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(
+            1,
+            max_buffers,
+            buffer_size,
+        )));
+
+        let mut sessions: Slab<Rc<RefCell<dyn ProxySession>>> = Slab::with_capacity(max_buffers);
+        {
+            let entry = sessions.vacant_entry();
+            info!("taking token {:?} for channel", entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::Channel,
+            })));
+        }
+        {
+            let entry = sessions.vacant_entry();
+            info!("taking token {:?} for timer", entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::Timer,
+            })));
+        }
+        {
+            let entry = sessions.vacant_entry();
+            info!("taking token {:?} for metrics", entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::Metrics,
+            })));
+        }
+        let sessions = SessionManager::new(sessions, max_buffers);
+
+        let registry = event_loop
+            .registry()
+            .try_clone()
+            .with_context(|| "Failed at creating a registry")?;
+
+        let (scm_server, scm_client) =
+            UnixStream::pair().with_context(|| "Failed at creating scm unix stream")?;
+        let client_scm_socket = ScmSocket::new(scm_client.into_raw_fd())
+            .with_context(|| "Failed at creating the scm client socket")?;
+        let server_scm_socket = ScmSocket::new(scm_server.into_raw_fd())
+            .with_context(|| "Failed at creating the scm server socket")?;
+        if send_scm {
+            client_scm_socket
+                .send_listeners(&Listeners::default())
+                .with_context(|| "Failed at sending empty listeners")?;
+        }
+
+        Ok(ServerParts {
+            event_loop,
+            registry,
+            sessions,
+            pool,
+            backends,
+            client_scm_socket,
+            server_scm_socket,
+            server_config,
+        })
     }
 }
