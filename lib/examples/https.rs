@@ -42,7 +42,12 @@ fn main() -> anyhow::Result<()> {
     let jg = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu_lib::http::start_http_worker(http_listener, channel, max_buffers, buffer_size);
+        sozu_lib::http::testing::start_http_worker(
+            http_listener,
+            channel,
+            max_buffers,
+            buffer_size,
+        );
     });
 
     let http_front = RequestHttpFrontend {
@@ -82,7 +87,12 @@ fn main() -> anyhow::Result<()> {
     let jg2 = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu_lib::https::start_https_worker(https_listener, channel2, max_buffers, buffer_size)
+        sozu_lib::https::testing::start_https_worker(
+            https_listener,
+            channel2,
+            max_buffers,
+            buffer_size,
+        )
     });
 
     let cert1 = include_str!("../assets/certificate.pem");

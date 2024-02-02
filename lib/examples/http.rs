@@ -37,8 +37,13 @@ fn main() -> anyhow::Result<()> {
     let worker_thread_join_handle = thread::spawn(move || {
         let max_buffers = 500;
         let buffer_size = 16384;
-        sozu_lib::http::start_http_worker(http_listener, proxy_channel, max_buffers, buffer_size)
-            .expect("The worker could not be started, or shut down");
+        sozu_lib::http::testing::start_http_worker(
+            http_listener,
+            proxy_channel,
+            max_buffers,
+            buffer_size,
+        )
+        .expect("The worker could not be started, or shut down");
     });
 
     let cluster = Cluster {
