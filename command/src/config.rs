@@ -65,8 +65,8 @@ use crate::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
         Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
         LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProxyProtocolConfig,
-        Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition, TcpListenerConfig,
-        TlsVersion,
+        Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition, SocketAddress,
+        TcpListenerConfig, TlsVersion,
     },
     request::WorkerRequest,
     ObjectKind,
@@ -185,8 +185,6 @@ pub enum MissingKind {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ConfigError {
-    #[error("Could not parse socket address {address}: {error}")]
-    ParseSocketAddress { address: String, error: String },
     #[error("env path not found: {0}")]
     Env(String),
     #[error("Could not open file {path_to_open}: {io_error}")]
@@ -209,8 +207,8 @@ pub enum ConfigError {
     InvalidFrontendConfig(String),
     #[error("invalid path {0:?}")]
     InvalidPath(PathBuf),
-    #[error("listening address {0} is already used in the configuration")]
-    ListenerAddressAlreadyInUse(String),
+    #[error("listening address {0:?} is already used in the configuration")]
+    ListenerAddressAlreadyInUse(SocketAddr),
     #[error("missing {0:?}")]
     Missing(MissingKind),
     #[error("could not get parent directory for file {0}")]
@@ -231,12 +229,12 @@ pub enum ConfigError {
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerBuilder {
-    pub address: String,
+    pub address: SocketAddr,
     pub protocol: Option<ListenerProtocol>,
-    pub public_address: Option<String>,
+    pub public_address: Option<SocketAddr>,
     /// path to the 404 html file
     pub answer_404: Option<String>,
     /// path to the 503 html file
@@ -273,50 +271,50 @@ pub fn default_sticky_name() -> String {
 impl ListenerBuilder {
     /// starts building an HTTP Listener with config values for timeouts,
     /// or defaults if no config is provided
-    pub fn new_http<S>(address: S) -> ListenerBuilder
-    where
-        S: ToString,
-    {
+    pub fn new_http(address: SocketAddress) -> ListenerBuilder {
         Self::new(address, ListenerProtocol::Http)
     }
 
     /// starts building an HTTPS Listener with config values for timeouts,
     /// or defaults if no config is provided
-    pub fn new_tcp<S>(address: S) -> ListenerBuilder
-    where
-        S: ToString,
-    {
+    pub fn new_tcp(address: SocketAddress) -> ListenerBuilder {
         Self::new(address, ListenerProtocol::Tcp)
     }
 
     /// starts building a TCP Listener with config values for timeouts,
     /// or defaults if no config is provided
-    pub fn new_https<S>(address: S) -> ListenerBuilder
-    where
-        S: ToString,
-    {
+    pub fn new_https(address: SocketAddress) -> ListenerBuilder {
         Self::new(address, ListenerProtocol::Https)
     }
 
     /// starts building a Listener
-    fn new<S>(address: S, protocol: ListenerProtocol) -> ListenerBuilder
-    where
-        S: ToString,
-    {
+    fn new(address: SocketAddress, protocol: ListenerProtocol) -> ListenerBuilder {
         ListenerBuilder {
-            address: address.to_string(),
+            address: address.into(),
             protocol: Some(protocol),
             sticky_name: DEFAULT_STICKY_NAME.to_string(),
-            ..Default::default()
+            public_address: None,
+            answer_404: None,
+            answer_503: None,
+            tls_versions: None,
+            cipher_list: None,
+            cipher_suites: None,
+            expect_proxy: None,
+            certificate: None,
+            certificate_chain: None,
+            key: None,
+            front_timeout: None,
+            back_timeout: None,
+            connect_timeout: None,
+            request_timeout: None,
+            config: None,
+            send_tls13_tickets: None,
         }
     }
 
-    pub fn with_public_address<S>(&mut self, public_address: Option<S>) -> &mut Self
-    where
-        S: ToString,
-    {
+    pub fn with_public_address(&mut self, public_address: Option<SocketAddr>) -> &mut Self {
         if let Some(address) = public_address {
-            self.public_address = Some(address.to_string());
+            self.public_address = Some(address);
         }
         self
     }
@@ -412,17 +410,6 @@ impl ListenerBuilder {
         self
     }
 
-    pub fn parse_address(&self) -> Result<SocketAddr, ConfigError> {
-        parse_socket_address(&self.address)
-    }
-
-    pub fn parse_public_address(&self) -> Result<Option<SocketAddr>, ConfigError> {
-        match &self.public_address {
-            Some(a) => Ok(Some(parse_socket_address(a)?)),
-            None => Ok(None),
-        }
-    }
-
     /// Assign the timeouts of the config to this listener, only if timeouts did not exist
     fn assign_config_timeouts(&mut self, config: &Config) {
         self.front_timeout = Some(self.front_timeout.unwrap_or(config.front_timeout));
@@ -446,13 +433,9 @@ impl ListenerBuilder {
 
         let (answer_404, answer_503) = self.get_404_503_answers()?;
 
-        let _address = self.parse_address()?;
-
-        let _public_address = self.parse_public_address()?;
-
         let configuration = HttpListenerConfig {
-            address: self.address.clone(),
-            public_address: self.public_address.clone(),
+            address: self.address.into(),
+            public_address: self.public_address.map(|a| a.into()),
             expect_proxy: self.expect_proxy.unwrap_or(false),
             sticky_name: self.sticky_name.clone(),
             front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
@@ -532,23 +515,16 @@ impl ListenerBuilder {
             .map(split_certificate_chain)
             .unwrap_or_else(Vec::new);
 
-        let (answer_404, answer_503) = self
-            .get_404_503_answers()
-            //.with_context(|| "Could not get 404 and 503 answers from file system")
-            ?;
-
-        let _address = self.parse_address()?;
-
-        let _public_address = self.parse_public_address()?;
+        let (answer_404, answer_503) = self.get_404_503_answers()?;
 
         if let Some(config) = config {
             self.assign_config_timeouts(config);
         }
 
         let https_listener_config = HttpsListenerConfig {
-            address: self.address.clone(),
+            address: self.address.into(),
             sticky_name: self.sticky_name.clone(),
-            public_address: self.public_address.clone(),
+            public_address: self.public_address.map(|a| a.into()),
             cipher_list,
             versions,
             expect_proxy: self.expect_proxy.unwrap_or(false),
@@ -582,17 +558,13 @@ impl ListenerBuilder {
             });
         }
 
-        let _address = self.parse_address()?;
-
-        let _public_address = self.parse_public_address()?;
-
         if let Some(config) = config {
             self.assign_config_timeouts(config);
         }
 
         Ok(TcpListenerConfig {
-            address: self.address.clone(),
-            public_address: self.public_address.clone(),
+            address: self.address.into(),
+            public_address: self.public_address.map(|a| a.into()),
             expect_proxy: self.expect_proxy.unwrap_or(false),
             front_timeout: self.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
             back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
@@ -615,15 +587,6 @@ impl ListenerBuilder {
         };
         Ok((answer_404, answer_503))
     }
-}
-
-fn parse_socket_address(address: &str) -> Result<SocketAddr, ConfigError> {
-    address
-        .parse::<SocketAddr>()
-        .map_err(|parse_error| ConfigError::ParseSocketAddress {
-            error: parse_error.to_string(),
-            address: address.to_owned(),
-        })
 }
 
 fn open_and_read_file(path: &str) -> Result<String, ConfigError> {
@@ -928,7 +891,7 @@ impl HttpFrontendConfig {
         if self.key.is_some() && self.certificate.is_some() {
             v.push(
                 RequestType::AddCertificate(AddCertificate {
-                    address: self.address.to_string(),
+                    address: self.address.into(),
                     certificate: CertificateAndKey {
                         key: self.key.clone().unwrap(),
                         certificate: self.certificate.clone().unwrap(),
@@ -944,7 +907,7 @@ impl HttpFrontendConfig {
             v.push(
                 RequestType::AddHttpsFrontend(RequestHttpFrontend {
                     cluster_id: Some(cluster_id.to_string()),
-                    address: self.address.to_string(),
+                    address: self.address.into(),
                     hostname: self.hostname.clone(),
                     path: self.path.clone(),
                     method: self.method.clone(),
@@ -958,7 +921,7 @@ impl HttpFrontendConfig {
             v.push(
                 RequestType::AddHttpFrontend(RequestHttpFrontend {
                     cluster_id: Some(cluster_id.to_string()),
-                    address: self.address.to_string(),
+                    address: self.address.into(),
                     hostname: self.hostname.clone(),
                     path: self.path.clone(),
                     method: self.method.clone(),
@@ -1015,7 +978,7 @@ impl HttpClusterConfig {
                     backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                         format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
                     }),
-                    address: backend.address.to_string(),
+                    address: backend.address.into(),
                     load_balancing_parameters,
                     sticky_id: backend.sticky_id.clone(),
                     backup: backend.backup,
@@ -1062,7 +1025,7 @@ impl TcpClusterConfig {
             v.push(
                 RequestType::AddTcpFrontend(RequestTcpFrontend {
                     cluster_id: self.cluster_id.clone(),
-                    address: frontend.address.to_string(),
+                    address: frontend.address.into(),
                     tags: frontend.tags.clone().unwrap_or(BTreeMap::new()),
                 })
                 .into(),
@@ -1080,7 +1043,7 @@ impl TcpClusterConfig {
                     backend_id: backend.backend_id.clone().unwrap_or_else(|| {
                         format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)
                     }),
-                    address: backend.address.to_string(),
+                    address: backend.address.into(),
                     load_balancing_parameters,
                     sticky_id: backend.sticky_id.clone(),
                     backup: backend.backup,
@@ -1167,12 +1130,10 @@ impl FileConfig {
 
         if let Some(listeners) = config.listeners.as_ref() {
             for listener in listeners.iter() {
-                if reserved_address.contains(&listener.parse_address()?) {
-                    return Err(ConfigError::ListenerAddressAlreadyInUse(
-                        listener.address.to_string(),
-                    ));
+                if reserved_address.contains(&listener.address) {
+                    return Err(ConfigError::ListenerAddressAlreadyInUse(listener.address));
                 }
-                reserved_address.insert(listener.parse_address()?);
+                reserved_address.insert(listener.address);
             }
         }
 
@@ -1305,26 +1266,23 @@ impl ConfigBuilder {
 
     fn populate_listeners(&mut self, listeners: Vec<ListenerBuilder>) -> Result<(), ConfigError> {
         for listener in listeners.iter() {
-            let address = listener.parse_address()?;
-            if self.known_addresses.contains_key(&address) {
-                return Err(ConfigError::ListenerAddressAlreadyInUse(
-                    listener.address.to_string(),
-                ));
+            if self.known_addresses.contains_key(&listener.address) {
+                return Err(ConfigError::ListenerAddressAlreadyInUse(listener.address));
             }
 
             let protocol = listener
                 .protocol
                 .ok_or(ConfigError::Missing(MissingKind::Protocol))?;
 
-            self.known_addresses.insert(address, protocol);
+            self.known_addresses.insert(listener.address, protocol);
             if listener.expect_proxy == Some(true) {
-                self.expect_proxy_addresses.insert(address);
+                self.expect_proxy_addresses.insert(listener.address);
             }
 
             if listener.public_address.is_some() && listener.expect_proxy == Some(true) {
                 return Err(ConfigError::Incompatible {
                     object: ObjectKind::Listener,
-                    id: listener.address.to_owned(),
+                    id: listener.address.to_string(),
                     kind: IncompatibilityKind::PublicAddress,
                 });
             }
@@ -1345,7 +1303,6 @@ impl ConfigBuilder {
         for (id, file_cluster_config) in file_cluster_configs.drain() {
             let mut cluster_config =
                 file_cluster_config.to_cluster_config(id.as_str(), &self.expect_proxy_addresses)?;
-            // .with_context(|| format!("error parsing cluster configuration for cluster {id}"))?;
 
             match cluster_config {
                 ClusterConfig::Http(ref mut http) => {
@@ -1367,7 +1324,7 @@ impl ConfigBuilder {
                                 if frontend.certificate.is_none() {
                                     if let Some(https_listener) =
                                         self.built.https_listeners.iter().find(|listener| {
-                                            listener.address == frontend.address.to_string()
+                                            listener.address == frontend.address.into()
                                                 && listener.certificate.is_some()
                                         })
                                     {
@@ -1390,14 +1347,14 @@ impl ConfigBuilder {
                                 // create a default listener for that front
                                 let file_listener_protocol = if frontend.certificate.is_some() {
                                     self.push_tls_listener(ListenerBuilder::new(
-                                        frontend.address.to_string(),
+                                        frontend.address.into(),
                                         ListenerProtocol::Https,
                                     ))?;
 
                                     ListenerProtocol::Https
                                 } else {
                                     self.push_http_listener(ListenerBuilder::new(
-                                        frontend.address.to_string(),
+                                        frontend.address.into(),
                                         ListenerProtocol::Http,
                                     ))?;
 
@@ -1422,7 +1379,7 @@ impl ConfigBuilder {
                             None => {
                                 // create a default listener for that front
                                 self.push_tcp_listener(ListenerBuilder::new(
-                                    frontend.address.to_string(),
+                                    frontend.address.into(),
                                     ListenerProtocol::Tcp,
                                 ))?;
                                 self.known_addresses
@@ -1794,14 +1751,20 @@ mod tests {
 
     #[test]
     fn serialize() {
-        let http = ListenerBuilder::new("127.0.0.1:8080", ListenerProtocol::Http)
-            .with_answer_404_path(Some("404.html"))
-            .to_owned();
+        let http = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            ListenerProtocol::Http,
+        )
+        .with_answer_404_path(Some("404.html"))
+        .to_owned();
         println!("http: {:?}", to_string(&http));
 
-        let https = ListenerBuilder::new("127.0.0.1:8443", ListenerProtocol::Https)
-            .with_answer_404_path(Some("404.html"))
-            .to_owned();
+        let https = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            ListenerProtocol::Https,
+        )
+        .with_answer_404_path(Some("404.html"))
+        .to_owned();
         println!("https: {:?}", to_string(&https));
 
         let listeners = vec![http, https];

@@ -282,11 +282,11 @@ impl Worker {
 
     pub fn default_tcp_frontend<S: Into<String>>(
         cluster_id: S,
-        address: String,
+        address: SocketAddr,
     ) -> RequestTcpFrontend {
         RequestTcpFrontend {
             cluster_id: cluster_id.into(),
-            address,
+            address: address.into(),
             ..Default::default()
         }
     }
@@ -297,7 +297,7 @@ impl Worker {
     ) -> RequestHttpFrontend {
         RequestHttpFrontend {
             cluster_id: Some(cluster_id.into()),
-            address: address.to_string(),
+            address: address.into(),
             hostname: String::from("localhost"),
             path: PathRule::prefix(String::from("/")),
             position: RulePosition::Tree.into(),
@@ -308,13 +308,13 @@ impl Worker {
     pub fn default_backend<S1: Into<String>, S2: Into<String>>(
         cluster_id: S1,
         backend_id: S2,
-        address: String,
+        address: SocketAddr,
         sticky_id: Option<String>,
     ) -> AddBackend {
         AddBackend {
             cluster_id: cluster_id.into(),
             backend_id: backend_id.into(),
-            address,
+            address: address.into(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
             sticky_id,
             backup: None,

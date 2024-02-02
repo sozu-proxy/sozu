@@ -465,20 +465,9 @@ impl SocketHandler for FrontRustls {
     }
 }
 
-pub fn server_bind(addr: String) -> Result<TcpListener, ServerBindError> {
-    let address = addr.parse::<SocketAddr>().map_err(|parse_error| {
-        ServerBindError::InvalidSocketAddress {
-            address: addr.clone(),
-            error: parse_error.to_string(),
-        }
-    })?;
-
-    let sock = Socket::new(
-        Domain::for_address(address),
-        Type::STREAM,
-        Some(Protocol::TCP),
-    )
-    .map_err(ServerBindError::SocketCreationError)?;
+pub fn server_bind(addr: SocketAddr) -> Result<TcpListener, ServerBindError> {
+    let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+        .map_err(ServerBindError::SocketCreationError)?;
 
     // set so_reuseaddr, but only on unix (mirrors what libstd does)
     if cfg!(unix) {
@@ -489,9 +478,8 @@ pub fn server_bind(addr: String) -> Result<TcpListener, ServerBindError> {
     sock.set_reuse_port(true)
         .map_err(ServerBindError::SetReusePort)?;
 
-    // bind the socket
-    let addr = address.into();
-    sock.bind(&addr).map_err(ServerBindError::BindError)?;
+    sock.bind(&addr.into())
+        .map_err(ServerBindError::BindError)?;
 
     sock.set_nonblocking(true)
         .map_err(ServerBindError::SetNonBlocking)?;

@@ -3,7 +3,7 @@ use std::{
     fmt::{self, Display},
     fs::File,
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
 };
 
@@ -14,8 +14,8 @@ use crate::{
     parser::parse_several_requests,
     proto::{
         command::{
-            request::RequestType, LoadBalancingAlgorithms, PathRuleKind, Request,
-            RequestHttpFrontend, RulePosition,
+            ip_address, request::RequestType, IpAddress, LoadBalancingAlgorithms, PathRuleKind,
+            Request, RequestHttpFrontend, RulePosition, SocketAddress, Uint128,
         },
         display::format_request_type,
     },
@@ -24,8 +24,6 @@ use crate::{
 
 #[derive(thiserror::Error, Debug)]
 pub enum RequestError {
-    #[error("Invalid address {address}: {error}")]
-    InvalidSocketAddress { address: String, error: String },
     #[error("invalid value {value} for field '{name}'")]
     InvalidValue { name: String, value: i32 },
     #[error("Could not read requests from file: {0}")]
@@ -201,12 +199,7 @@ impl RequestHttpFrontend {
     /// convert a requested frontend to a usable one by parsing its address
     pub fn to_frontend(self) -> Result<HttpFrontend, RequestError> {
         Ok(HttpFrontend {
-            address: self.address.parse::<SocketAddr>().map_err(|parse_error| {
-                RequestError::InvalidSocketAddress {
-                    address: self.address.clone(),
-                    error: parse_error.to_string(),
-                }
-            })?,
+            address: self.address.into(),
             cluster_id: self.cluster_id,
             hostname: self.hostname,
             path: self.path,
@@ -275,5 +268,59 @@ impl FromStr for LoadBalancingAlgorithms {
             "least_loaded" => Ok(LoadBalancingAlgorithms::LeastLoaded),
             _ => Err(ParseErrorLoadBalancing {}),
         }
+    }
+}
+
+impl SocketAddress {
+    pub fn new_v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> Self {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), port).into()
+    }
+}
+
+impl From<SocketAddr> for SocketAddress {
+    fn from(socket_addr: SocketAddr) -> SocketAddress {
+        let ip_inner = match socket_addr {
+            SocketAddr::V4(ip_v4_addr) => ip_address::Inner::V4(u32::from(*ip_v4_addr.ip())),
+            SocketAddr::V6(ip_v6_addr) => {
+                ip_address::Inner::V6(Uint128::from(u128::from(*ip_v6_addr.ip())))
+            }
+        };
+
+        SocketAddress {
+            port: socket_addr.port() as u32,
+            ip: IpAddress {
+                inner: Some(ip_inner),
+            },
+        }
+    }
+}
+
+impl From<SocketAddress> for SocketAddr {
+    fn from(socket_address: SocketAddress) -> Self {
+        let port = socket_address.port as u16;
+
+        let ip = match socket_address.ip.inner {
+            Some(inner) => match inner {
+                ip_address::Inner::V4(v4_value) => IpAddr::V4(Ipv4Addr::from(v4_value)),
+                ip_address::Inner::V6(v6_value) => IpAddr::V6(Ipv6Addr::from(u128::from(v6_value))),
+            },
+            None => IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), // should never happen
+        };
+
+        SocketAddr::new(ip, port)
+    }
+}
+
+impl From<Uint128> for u128 {
+    fn from(value: Uint128) -> Self {
+        value.low as u128 | ((value.high as u128) << 64)
+    }
+}
+
+impl From<u128> for Uint128 {
+    fn from(value: u128) -> Self {
+        let low = value as u64;
+        let high = (value >> 64) as u64;
+        Uint128 { low, high }
     }
 }

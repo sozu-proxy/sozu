@@ -21,7 +21,7 @@ use crate::{
             HttpsListenerConfig, ListedFrontends, ListenerType, ListenersList, PathRule,
             QueryCertificatesFilters, RemoveBackend, RemoveCertificate, RemoveListener,
             ReplaceCertificate, Request, RequestCounts, RequestHttpFrontend, RequestTcpFrontend,
-            TcpListenerConfig,
+            SocketAddress, TcpListenerConfig,
         },
         display::format_request_type,
     },
@@ -53,8 +53,6 @@ pub enum StateError {
     RemoveCertificate(String),
     #[error("Could not replace certificate: {0}")]
     ReplaceCertificate(String),
-    #[error("The provided socket address '{address}' is wrong: {error}")]
-    WrongSocketAddress { address: String, error: String },
     #[error(
         "Could not convert the frontend to an insertable one. Frontend: {frontend} error: {error}"
     )]
@@ -82,11 +80,11 @@ pub struct ConfigState {
     pub clusters: BTreeMap<ClusterId, Cluster>,
     pub backends: BTreeMap<ClusterId, Vec<Backend>>,
     /// socket address -> HTTP listener
-    pub http_listeners: BTreeMap<String, HttpListenerConfig>,
+    pub http_listeners: BTreeMap<SocketAddr, HttpListenerConfig>,
     /// socket address -> HTTPS listener
-    pub https_listeners: BTreeMap<String, HttpsListenerConfig>,
+    pub https_listeners: BTreeMap<SocketAddr, HttpsListenerConfig>,
     /// socket address -> TCP listener
-    pub tcp_listeners: BTreeMap<String, TcpListenerConfig>,
+    pub tcp_listeners: BTreeMap<SocketAddr, TcpListenerConfig>,
     /// HTTP frontends, indexed by a summary of each front's address;hostname;path, for uniqueness.
     /// For example: `"0.0.0.0:8080;lolcatho.st;P/api"`
     pub http_fronts: BTreeMap<String, HttpFrontend>,
@@ -184,13 +182,13 @@ impl ConfigState {
     }
 
     fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> Result<(), StateError> {
-        let address = listener.address.to_string();
-        match self.http_listeners.entry(address.clone()) {
+        let address: SocketAddr = listener.address.clone().into();
+        match self.http_listeners.entry(address) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             BTreeMapEntry::Occupied(_) => {
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpListener,
-                    id: address,
+                    id: address.to_string(),
                 })
             }
         };
@@ -198,13 +196,13 @@ impl ConfigState {
     }
 
     fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> Result<(), StateError> {
-        let address = listener.address.to_string();
-        match self.https_listeners.entry(address.clone()) {
+        let address: SocketAddr = listener.address.clone().into();
+        match self.https_listeners.entry(address) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             BTreeMapEntry::Occupied(_) => {
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpsListener,
-                    id: address,
+                    id: address.to_string(),
                 })
             }
         };
@@ -212,13 +210,13 @@ impl ConfigState {
     }
 
     fn add_tcp_listener(&mut self, listener: &TcpListenerConfig) -> Result<(), StateError> {
-        let address = listener.address.to_string();
-        match self.tcp_listeners.entry(address.clone()) {
+        let address: SocketAddr = listener.address.clone().into();
+        match self.tcp_listeners.entry(address) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             BTreeMapEntry::Occupied(_) => {
                 return Err(StateError::Exists {
                     kind: ObjectKind::TcpListener,
-                    id: address,
+                    id: address.to_string(),
                 })
             }
         };
@@ -227,27 +225,27 @@ impl ConfigState {
 
     fn remove_listener(&mut self, remove: &RemoveListener) -> Result<(), StateError> {
         match ListenerType::try_from(remove.proxy)? {
-            ListenerType::Http => self.remove_http_listener(&remove.address),
-            ListenerType::Https => self.remove_https_listener(&remove.address),
-            ListenerType::Tcp => self.remove_tcp_listener(&remove.address),
+            ListenerType::Http => self.remove_http_listener(&remove.address.clone().into()),
+            ListenerType::Https => self.remove_https_listener(&remove.address.clone().into()),
+            ListenerType::Tcp => self.remove_tcp_listener(&remove.address.clone().into()),
         }
     }
 
-    fn remove_http_listener(&mut self, address: &str) -> Result<(), StateError> {
+    fn remove_http_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
         if self.http_listeners.remove(address).is_none() {
             return Err(StateError::NoChange);
         }
         Ok(())
     }
 
-    fn remove_https_listener(&mut self, address: &str) -> Result<(), StateError> {
+    fn remove_https_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
         if self.https_listeners.remove(address).is_none() {
             return Err(StateError::NoChange);
         }
         Ok(())
     }
 
-    fn remove_tcp_listener(&mut self, address: &str) -> Result<(), StateError> {
+    fn remove_tcp_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
         if self.tcp_listeners.remove(address).is_none() {
             return Err(StateError::NoChange);
         }
@@ -258,27 +256,27 @@ impl ConfigState {
         match ListenerType::try_from(activate.proxy)? {
             ListenerType::Http => self
                 .http_listeners
-                .get_mut(&activate.address)
+                .get_mut(&activate.address.clone().into())
                 .map(|listener| listener.active = true)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpListener,
-                    id: activate.address.to_owned(),
+                    id: activate.address.to_string(),
                 }),
             ListenerType::Https => self
                 .https_listeners
-                .get_mut(&activate.address)
+                .get_mut(&activate.address.clone().into())
                 .map(|listener| listener.active = true)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpsListener,
-                    id: activate.address.to_owned(),
+                    id: activate.address.to_string(),
                 }),
             ListenerType::Tcp => self
                 .tcp_listeners
-                .get_mut(&activate.address)
+                .get_mut(&activate.address.clone().into())
                 .map(|listener| listener.active = true)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpListener,
-                    id: activate.address.to_owned(),
+                    id: activate.address.to_string(),
                 }),
         }
     }
@@ -287,27 +285,27 @@ impl ConfigState {
         match ListenerType::try_from(deactivate.proxy)? {
             ListenerType::Http => self
                 .http_listeners
-                .get_mut(&deactivate.address)
+                .get_mut(&deactivate.address.clone().into())
                 .map(|listener| listener.active = false)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpListener,
-                    id: deactivate.address.to_owned(),
+                    id: deactivate.address.to_string(),
                 }),
             ListenerType::Https => self
                 .https_listeners
-                .get_mut(&deactivate.address)
+                .get_mut(&deactivate.address.clone().into())
                 .map(|listener| listener.active = false)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::HttpsListener,
-                    id: deactivate.address.to_owned(),
+                    id: deactivate.address.to_string(),
                 }),
             ListenerType::Tcp => self
                 .tcp_listeners
-                .get_mut(&deactivate.address)
+                .get_mut(&deactivate.address.clone().into())
                 .map(|listener| listener.active = false)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpListener,
-                    id: deactivate.address.to_owned(),
+                    id: deactivate.address.to_string(),
                 }),
         }
     }
@@ -383,11 +381,9 @@ impl ConfigState {
             )?,
         );
 
-        let address = parse_socket_address(&add.address)?;
-
         let entry = self
             .certificates
-            .entry(address)
+            .entry(add.address.clone().into())
             .or_insert_with(HashMap::new);
 
         if entry.contains_key(&fingerprint) {
@@ -408,9 +404,7 @@ impl ConfigState {
                 .map_err(|decode_error| StateError::RemoveCertificate(decode_error.to_string()))?,
         );
 
-        let address = parse_socket_address(&remove.address)?;
-
-        if let Some(index) = self.certificates.get_mut(&address) {
+        if let Some(index) = self.certificates.get_mut(&remove.address.clone().into()) {
             index.remove(&fingerprint);
         }
 
@@ -422,18 +416,17 @@ impl ConfigState {
     /// - insert the new certificate with the new fingerprint as key
     /// - check that the new entry is present in the certificates hashmap
     fn replace_certificate(&mut self, replace: &ReplaceCertificate) -> Result<(), StateError> {
-        let address = parse_socket_address(&replace.address)?;
-
+        let replace_address = replace.address.clone().into();
         let old_fingerprint = Fingerprint(
             hex::decode(&replace.old_fingerprint)
                 .map_err(|decode_error| StateError::RemoveCertificate(decode_error.to_string()))?,
         );
 
         self.certificates
-            .get_mut(&address)
+            .get_mut(&replace_address)
             .ok_or(StateError::NotFound {
                 kind: ObjectKind::Certificate,
-                id: address.to_string(),
+                id: replace.address.to_string(),
             })?
             .remove(&old_fingerprint);
 
@@ -444,12 +437,12 @@ impl ConfigState {
         );
 
         self.certificates
-            .get_mut(&address)
+            .get_mut(&replace_address)
             .map(|certs| certs.insert(new_fingerprint.clone(), replace.new_certificate.clone()));
 
         if !self
             .certificates
-            .get(&address)
+            .get(&replace_address)
             .ok_or(StateError::ReplaceCertificate(
                 "Unlikely error. This entry in the certificate hashmap should be present"
                     .to_string(),
@@ -472,7 +465,7 @@ impl ConfigState {
 
         let tcp_frontend = TcpFrontend {
             cluster_id: front.cluster_id.clone(),
-            address: parse_socket_address(&front.address)?,
+            address: front.address.clone().into(),
             tags: front.tags.clone(),
         };
         if tcp_frontends.contains(&tcp_frontend) {
@@ -490,8 +483,6 @@ impl ConfigState {
         &mut self,
         front_to_remove: &RequestTcpFrontend,
     ) -> Result<(), StateError> {
-        let address = parse_socket_address(&front_to_remove.address)?;
-
         let tcp_frontends =
             self.tcp_fronts
                 .get_mut(&front_to_remove.cluster_id)
@@ -501,7 +492,7 @@ impl ConfigState {
                 })?;
 
         let len = tcp_frontends.len();
-        tcp_frontends.retain(|front| front.address != address);
+        tcp_frontends.retain(|front| front.address != front_to_remove.address.clone().into());
         if tcp_frontends.len() == len {
             return Err(StateError::NoChange);
         }
@@ -510,7 +501,7 @@ impl ConfigState {
 
     fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
         let backend = Backend {
-            address: parse_socket_address(&add_backend.address)?,
+            address: add_backend.address.clone().into(),
             cluster_id: add_backend.cluster_id.clone(),
             backend_id: add_backend.backend_id.clone(),
             sticky_id: add_backend.sticky_id.clone(),
@@ -540,9 +531,8 @@ impl ConfigState {
                 })?;
 
         let len = backend_list.len();
-        backend_list.retain(|b| {
-            b.backend_id != backend.backend_id || b.address.to_string() != backend.address
-        });
+        let remove_address = backend.address.clone().into();
+        backend_list.retain(|b| b.backend_id != backend.backend_id || b.address != remove_address);
         backend_list.sort();
         if backend_list.len() == len {
             return Err(StateError::NoChange);
@@ -607,7 +597,7 @@ impl ConfigState {
             for certificate_and_key in certs.values() {
                 v.push(
                     RequestType::AddCertificate(AddCertificate {
-                        address: front.to_string(),
+                        address: SocketAddress::from(*front),
                         certificate: certificate_and_key.clone(),
                         expired_at: None,
                     })
@@ -645,7 +635,7 @@ impl ConfigState {
         {
             v.push(
                 RequestType::ActivateListener(ActivateListener {
-                    address: front.to_string(),
+                    address: SocketAddress::from(*front),
                     proxy: ListenerType::Http.into(),
                     from_scm: false,
                 })
@@ -661,7 +651,7 @@ impl ConfigState {
         {
             v.push(
                 RequestType::ActivateListener(ActivateListener {
-                    address: front.to_string(),
+                    address: SocketAddress::from(*front),
                     proxy: ListenerType::Https.into(),
                     from_scm: false,
                 })
@@ -676,7 +666,7 @@ impl ConfigState {
         {
             v.push(
                 RequestType::ActivateListener(ActivateListener {
-                    address: front.to_string(),
+                    address: SocketAddress::from(*front),
                     proxy: ListenerType::Tcp.into(),
                     from_scm: false,
                 })
@@ -689,18 +679,18 @@ impl ConfigState {
 
     pub fn diff(&self, other: &ConfigState) -> Vec<Request> {
         //pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
-        let my_tcp_listeners: HashSet<&String> = self.tcp_listeners.keys().collect();
-        let their_tcp_listeners: HashSet<&String> = other.tcp_listeners.keys().collect();
+        let my_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
+        let their_tcp_listeners: HashSet<&SocketAddr> = other.tcp_listeners.keys().collect();
         let removed_tcp_listeners = my_tcp_listeners.difference(&their_tcp_listeners);
         let added_tcp_listeners = their_tcp_listeners.difference(&my_tcp_listeners);
 
-        let my_http_listeners: HashSet<&String> = self.http_listeners.keys().collect();
-        let their_http_listeners: HashSet<&String> = other.http_listeners.keys().collect();
+        let my_http_listeners: HashSet<&SocketAddr> = self.http_listeners.keys().collect();
+        let their_http_listeners: HashSet<&SocketAddr> = other.http_listeners.keys().collect();
         let removed_http_listeners = my_http_listeners.difference(&their_http_listeners);
         let added_http_listeners = their_http_listeners.difference(&my_http_listeners);
 
-        let my_https_listeners: HashSet<&String> = self.https_listeners.keys().collect();
-        let their_https_listeners: HashSet<&String> = other.https_listeners.keys().collect();
+        let my_https_listeners: HashSet<&SocketAddr> = self.https_listeners.keys().collect();
+        let their_https_listeners: HashSet<&SocketAddr> = other.https_listeners.keys().collect();
         let removed_https_listeners = my_https_listeners.difference(&their_https_listeners);
         let added_https_listeners = their_https_listeners.difference(&my_https_listeners);
 
@@ -710,7 +700,7 @@ impl ConfigState {
             if self.tcp_listeners[*address].active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: address.to_string(),
+                        address: SocketAddress::from(**address),
                         proxy: ListenerType::Tcp.into(),
                         to_scm: false,
                     })
@@ -720,7 +710,7 @@ impl ConfigState {
 
             v.push(
                 RequestType::RemoveListener(RemoveListener {
-                    address: address.to_string(),
+                    address: SocketAddress::from(**address),
                     proxy: ListenerType::Tcp.into(),
                 })
                 .into(),
@@ -733,7 +723,7 @@ impl ConfigState {
             if other.tcp_listeners[*address].active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: address.to_string(),
+                        address: SocketAddress::from(**address),
                         proxy: ListenerType::Tcp.into(),
                         from_scm: false,
                     })
@@ -746,7 +736,7 @@ impl ConfigState {
             if self.http_listeners[*address].active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: address.to_string(),
+                        address: SocketAddress::from(**address),
                         proxy: ListenerType::Http.into(),
                         to_scm: false,
                     })
@@ -756,7 +746,7 @@ impl ConfigState {
 
             v.push(
                 RequestType::RemoveListener(RemoveListener {
-                    address: address.to_string(),
+                    address: SocketAddress::from(**address),
                     proxy: ListenerType::Http.into(),
                 })
                 .into(),
@@ -769,7 +759,7 @@ impl ConfigState {
             if other.http_listeners[*address].active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: address.to_string(),
+                        address: SocketAddress::from(**address),
                         proxy: ListenerType::Http.into(),
                         from_scm: false,
                     })
@@ -782,7 +772,7 @@ impl ConfigState {
             if self.https_listeners[*address].active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: address.to_string(),
+                        address: SocketAddress::from(**address),
                         proxy: ListenerType::Https.into(),
                         to_scm: false,
                     })
@@ -792,7 +782,7 @@ impl ConfigState {
 
             v.push(
                 RequestType::RemoveListener(RemoveListener {
-                    address: address.to_string(),
+                    address: SocketAddress::from(**address),
                     proxy: ListenerType::Https.into(),
                 })
                 .into(),
@@ -805,7 +795,7 @@ impl ConfigState {
             if other.https_listeners[*address].active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: address.to_string(),
+                        address: SocketAddress::from(**address),
                         proxy: ListenerType::Https.into(),
                         from_scm: false,
                     })
@@ -821,7 +811,7 @@ impl ConfigState {
             if my_listener != their_listener {
                 v.push(
                     RequestType::RemoveListener(RemoveListener {
-                        address: addr.to_string(),
+                        address: SocketAddress::from(**addr),
                         proxy: ListenerType::Tcp.into(),
                     })
                     .into(),
@@ -835,7 +825,7 @@ impl ConfigState {
             if my_listener.active && !their_listener.active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: addr.to_string(),
+                        address: SocketAddress::from(**addr),
                         proxy: ListenerType::Tcp.into(),
                         to_scm: false,
                     })
@@ -846,7 +836,7 @@ impl ConfigState {
             if !my_listener.active && their_listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: addr.to_string(),
+                        address: SocketAddress::from(**addr),
                         proxy: ListenerType::Tcp.into(),
                         from_scm: false,
                     })
@@ -862,7 +852,7 @@ impl ConfigState {
             if my_listener != their_listener {
                 v.push(
                     RequestType::RemoveListener(RemoveListener {
-                        address: addr.to_string(),
+                        address: SocketAddress::from(**addr),
                         proxy: ListenerType::Http.into(),
                     })
                     .into(),
@@ -876,7 +866,7 @@ impl ConfigState {
             if my_listener.active && !their_listener.active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: addr.to_string(),
+                        address: SocketAddress::from(**addr),
                         proxy: ListenerType::Http.into(),
                         to_scm: false,
                     })
@@ -887,7 +877,7 @@ impl ConfigState {
             if !my_listener.active && their_listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: addr.to_string(),
+                        address: SocketAddress::from(**addr),
                         proxy: ListenerType::Http.into(),
                         from_scm: false,
                     })
@@ -903,7 +893,7 @@ impl ConfigState {
             if my_listener != their_listener {
                 v.push(
                     RequestType::RemoveListener(RemoveListener {
-                        address: addr.to_string(),
+                        address: SocketAddress::from(**addr),
                         proxy: ListenerType::Https.into(),
                     })
                     .into(),
@@ -917,7 +907,7 @@ impl ConfigState {
             if my_listener.active && !their_listener.active {
                 v.push(
                     RequestType::DeactivateListener(DeactivateListener {
-                        address: addr.to_string(),
+                        address: SocketAddress::from(**addr),
                         proxy: ListenerType::Https.into(),
                         to_scm: false,
                     })
@@ -928,7 +918,7 @@ impl ConfigState {
             if !my_listener.active && their_listener.active {
                 v.push(
                     RequestType::ActivateListener(ActivateListener {
-                        address: addr.to_string(),
+                        address: SocketAddress::from(**addr),
                         proxy: ListenerType::Https.into(),
                         from_scm: false,
                     })
@@ -978,7 +968,7 @@ impl ConfigState {
                         RequestType::RemoveBackend(RemoveBackend {
                             cluster_id: backend.cluster_id.clone(),
                             backend_id: backend.backend_id.clone(),
-                            address: backend.address.to_string(),
+                            address: SocketAddress::from(backend.address),
                         })
                         .into(),
                     );
@@ -994,7 +984,7 @@ impl ConfigState {
                         RequestType::RemoveBackend(RemoveBackend {
                             cluster_id: backend.cluster_id.clone(),
                             backend_id: backend.backend_id.clone(),
-                            address: backend.address.to_string(),
+                            address: SocketAddress::from(backend.address),
                         })
                         .into(),
                     );
@@ -1091,7 +1081,7 @@ impl ConfigState {
         for &(address, fingerprint) in removed_certificates {
             v.push(
                 RequestType::RemoveCertificate(RemoveCertificate {
-                    address: address.to_string(),
+                    address: SocketAddress::from(address),
                     fingerprint: fingerprint.to_string(),
                 })
                 .into(),
@@ -1106,7 +1096,7 @@ impl ConfigState {
             {
                 v.push(
                     RequestType::AddCertificate(AddCertificate {
-                        address: address.to_string(),
+                        address: SocketAddress::from(address),
                         certificate: certificate_and_key.clone(),
                         expired_at: None,
                     })
@@ -1373,9 +1363,21 @@ impl ConfigState {
 
     pub fn list_listeners(&self) -> ListenersList {
         ListenersList {
-            http_listeners: self.http_listeners.clone(),
-            https_listeners: self.https_listeners.clone(),
-            tcp_listeners: self.tcp_listeners.clone(),
+            http_listeners: self
+                .http_listeners
+                .iter()
+                .map(|(addr, listener)| (addr.to_string(), listener.clone()))
+                .collect(),
+            https_listeners: self
+                .https_listeners
+                .iter()
+                .map(|(addr, listener)| (addr.to_string(), listener.clone()))
+                .collect(),
+            tcp_listeners: self
+                .tcp_listeners
+                .iter()
+                .map(|(addr, listener)| (addr.to_string(), listener.clone()))
+                .collect(),
         }
     }
 
@@ -1409,15 +1411,6 @@ impl ConfigState {
 
         Ok(counter)
     }
-}
-
-fn parse_socket_address(address: &str) -> Result<SocketAddr, StateError> {
-    address
-        .parse::<SocketAddr>()
-        .map_err(|parse_error| StateError::WrongSocketAddress {
-            address: address.to_owned(),
-            error: parse_error.to_string(),
-        })
 }
 
 fn domain_check(
@@ -1535,7 +1528,7 @@ mod tests {
                     cluster_id: Some(String::from("cluster_1")),
                     hostname: String::from("lolcatho.st:8080"),
                     path: PathRule::prefix(String::from("/")),
-                    address: "0.0.0.0:8080".to_string(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                     position: RulePosition::Tree.into(),
                     ..Default::default()
                 })
@@ -1548,7 +1541,7 @@ mod tests {
                     cluster_id: Some(String::from("cluster_2")),
                     hostname: String::from("test.local"),
                     path: PathRule::prefix(String::from("/abc")),
-                    address: "0.0.0.0:8080".to_string(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                     position: RulePosition::Pre.into(),
                     ..Default::default()
                 })
@@ -1560,7 +1553,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_1"),
                     backend_id: String::from("cluster_1-0"),
-                    address: "127.0.0.1:1026".parse().unwrap(),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
                     ..Default::default()
                 })
                 .into(),
@@ -1571,7 +1564,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_1"),
                     backend_id: String::from("cluster_1-1"),
-                    address: "127.0.0.2:1027".parse().unwrap(),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1027),
                     ..Default::default()
                 })
                 .into(),
@@ -1582,7 +1575,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_2"),
                     backend_id: String::from("cluster_2-0"),
-                    address: "192.167.1.2:1026".parse().unwrap(),
+                    address: SocketAddress::new_v4(192, 167, 1, 2, 1026),
                     ..Default::default()
                 })
                 .into(),
@@ -1593,7 +1586,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_1"),
                     backend_id: String::from("cluster_1-3"),
-                    address: "192.168.1.3:1027".parse().unwrap(),
+                    address: SocketAddress::new_v4(192, 168, 1, 3, 1027),
                     ..Default::default()
                 })
                 .into(),
@@ -1604,7 +1597,7 @@ mod tests {
                 &RequestType::RemoveBackend(RemoveBackend {
                     cluster_id: String::from("cluster_1"),
                     backend_id: String::from("cluster_1-3"),
-                    address: "192.168.1.3:1027".parse().unwrap(),
+                    address: SocketAddress::new_v4(192, 168, 1, 3, 1027),
                 })
                 .into(),
             )
@@ -1630,7 +1623,7 @@ mod tests {
                     cluster_id: Some(String::from("cluster_1")),
                     hostname: String::from("lolcatho.st:8080"),
                     path: PathRule::prefix(String::from("/")),
-                    address: "0.0.0.0:8080".to_string(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                     position: RulePosition::Post.into(),
                     ..Default::default()
                 })
@@ -1643,7 +1636,7 @@ mod tests {
                     cluster_id: Some(String::from("cluster_2")),
                     hostname: String::from("test.local"),
                     path: PathRule::prefix(String::from("/abc")),
-                    address: "0.0.0.0:8080".to_string(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                     ..Default::default()
                 })
                 .into(),
@@ -1654,7 +1647,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_1"),
                     backend_id: String::from("cluster_1-0"),
-                    address: "127.0.0.1:1026".parse().unwrap(),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     ..Default::default()
                 })
@@ -1666,7 +1659,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_1"),
                     backend_id: String::from("cluster_1-1"),
-                    address: "127.0.0.2:1027".parse().unwrap(),
+                    address: SocketAddress::new_v4(127, 0, 0, 2, 1027),
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     ..Default::default()
                 })
@@ -1678,7 +1671,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_2"),
                     backend_id: String::from("cluster_2-0"),
-                    address: "192.167.1.2:1026".parse().unwrap(),
+                    address: SocketAddress::new_v4(192, 167, 1, 2, 1026),
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     ..Default::default()
                 })
@@ -1704,7 +1697,7 @@ mod tests {
                     cluster_id: Some(String::from("cluster_1")),
                     hostname: String::from("lolcatho.st:8080"),
                     path: PathRule::prefix(String::from("/")),
-                    address: "0.0.0.0:8080".to_string(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                     position: RulePosition::Post.into(),
                     ..Default::default()
                 })
@@ -1716,7 +1709,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_1"),
                     backend_id: String::from("cluster_1-0"),
-                    address: "127.0.0.1:1026".parse().unwrap(),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     ..Default::default()
                 })
@@ -1728,7 +1721,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_1"),
                     backend_id: String::from("cluster_1-1"),
-                    address: "127.0.0.2:1027".parse().unwrap(),
+                    address: SocketAddress::new_v4(127, 0, 0, 2, 1027),
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     ..Default::default()
                 })
@@ -1740,7 +1733,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_1"),
                     backend_id: String::from("cluster_1-2"),
-                    address: "127.0.0.2:1028".parse().unwrap(),
+                    address: SocketAddress::new_v4(127, 0, 0, 2, 1028),
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     ..Default::default()
                 })
@@ -1764,20 +1757,20 @@ mod tests {
                 cluster_id: Some(String::from("cluster_2")),
                 hostname: String::from("test.local"),
                 path: PathRule::prefix(String::from("/abc")),
-                address: "0.0.0.0:8080".to_string(),
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                 ..Default::default()
             })
             .into(),
             RequestType::RemoveBackend(RemoveBackend {
                 cluster_id: String::from("cluster_2"),
                 backend_id: String::from("cluster_2-0"),
-                address: "192.167.1.2:1026".to_string(),
+                address: SocketAddress::new_v4(192, 167, 1, 2, 1026),
             })
             .into(),
             RequestType::AddBackend(AddBackend {
                 cluster_id: String::from("cluster_1"),
                 backend_id: String::from("cluster_1-2"),
-                address: "127.0.0.2:1028".to_string(),
+                address: SocketAddress::new_v4(127, 0, 0, 2, 1028),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 ..Default::default()
             })
@@ -1806,7 +1799,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_1"),
                     backend_id: String::from("cluster_1-2"),
-                    address: "127.0.0.2:1028".to_string(),
+                    address: SocketAddress::new_v4(127, 0, 0, 2, 1028),
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     ..Default::default()
                 })
@@ -1828,7 +1821,7 @@ mod tests {
             cluster_id: Some(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("")),
-            address: "0.0.0.0:8080".to_string(),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
             ..Default::default()
         };
 
@@ -1836,7 +1829,7 @@ mod tests {
             cluster_id: Some(String::from("MyCluster_1")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("")),
-            address: "0.0.0.0:8443".to_string(),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
             ..Default::default()
         };
 
@@ -1844,7 +1837,7 @@ mod tests {
             cluster_id: Some(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("/api")),
-            address: "0.0.0.0:8080".to_string(),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
             ..Default::default()
         };
 
@@ -1852,7 +1845,7 @@ mod tests {
             cluster_id: Some(String::from("MyCluster_2")),
             hostname: String::from("lolcatho.st"),
             path: PathRule::prefix(String::from("/api")),
-            address: "0.0.0.0:8443".to_string(),
+            address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
             ..Default::default()
         };
 
@@ -1905,7 +1898,7 @@ mod tests {
                 &RequestType::AddBackend(AddBackend {
                     cluster_id: String::from("cluster_1"),
                     backend_id: String::from("cluster_1-0"),
-                    address: "127.0.0.1:1026".to_string(),
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
                     load_balancing_parameters: Some(LoadBalancingParams::default()),
                     ..Default::default()
                 })
@@ -1948,7 +1941,7 @@ mod tests {
                     &RequestType::AddBackend(AddBackend {
                         cluster_id: String::from("cluster_1"),
                         backend_id: format!("cluster_1-{i}"),
-                        address: "127.0.0.1:1026".to_string(),
+                        address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
                         ..Default::default()
                     })
                     .into(),
@@ -1961,7 +1954,7 @@ mod tests {
         let remove_backend_2 = RequestType::RemoveBackend(RemoveBackend {
             cluster_id: String::from("cluster_1"),
             backend_id: String::from("cluster_1-0"),
-            address: "127.0.0.1:1026".to_string(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
         })
         .into();
 
@@ -1995,7 +1988,7 @@ mod tests {
                         &RequestType::AddBackend(AddBackend {
                             cluster_id: String::from("cluster_1"),
                             backend_id: format!("cluster_1-{i}"),
-                            address: "127.0.0.1:1026".to_string(),
+                            address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
                             ..Default::default()
                         })
                         .into(),
@@ -2014,7 +2007,7 @@ mod tests {
                     &RequestType::RemoveBackend(RemoveBackend {
                         cluster_id: String::from("cluster_1"),
                         backend_id: format!("cluster_1-{j}"),
-                        address: "127.0.0.1:1026".to_string(),
+                        address: SocketAddress::new_v4(127, 0, 0, 1, 1026),
                     })
                     .into(),
                 );
@@ -2029,7 +2022,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::AddTcpListener(TcpListenerConfig {
-                    address: "0.0.0.0:1234".parse().unwrap(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
                     ..Default::default()
                 })
                 .into(),
@@ -2038,7 +2031,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::ActivateListener(ActivateListener {
-                    address: "0.0.0.0:1234".parse().unwrap(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
                     proxy: ListenerType::Tcp.into(),
                     from_scm: false,
                 })
@@ -2048,7 +2041,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::AddHttpListener(HttpListenerConfig {
-                    address: "0.0.0.0:8080".parse().unwrap(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                     ..Default::default()
                 })
                 .into(),
@@ -2057,7 +2050,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::AddHttpsListener(HttpsListenerConfig {
-                    address: "0.0.0.0:8443".parse().unwrap(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
                     ..Default::default()
                 })
                 .into(),
@@ -2066,7 +2059,7 @@ mod tests {
         state
             .dispatch(
                 &RequestType::ActivateListener(ActivateListener {
-                    address: "0.0.0.0:8443".parse().unwrap(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
                     proxy: ListenerType::Https.into(),
                     from_scm: false,
                 })
@@ -2078,7 +2071,7 @@ mod tests {
         state2
             .dispatch(
                 &RequestType::AddTcpListener(TcpListenerConfig {
-                    address: "0.0.0.0:1234".parse().unwrap(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
                     expect_proxy: true,
                     ..Default::default()
                 })
@@ -2088,7 +2081,7 @@ mod tests {
         state2
             .dispatch(
                 &RequestType::AddHttpListener(HttpListenerConfig {
-                    address: "0.0.0.0:8080".parse().unwrap(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                     answer_404: "test".to_string(),
                     ..Default::default()
                 })
@@ -2098,7 +2091,7 @@ mod tests {
         state2
             .dispatch(
                 &RequestType::ActivateListener(ActivateListener {
-                    address: "0.0.0.0:8080".parse().unwrap(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                     proxy: ListenerType::Http.into(),
                     from_scm: false,
                 })
@@ -2108,7 +2101,7 @@ mod tests {
         state2
             .dispatch(
                 &RequestType::AddHttpsListener(HttpsListenerConfig {
-                    address: "0.0.0.0:8443".parse().unwrap(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
                     answer_404: String::from("test"),
                     ..Default::default()
                 })
@@ -2118,7 +2111,7 @@ mod tests {
         state2
             .dispatch(
                 &RequestType::ActivateListener(ActivateListener {
-                    address: "0.0.0.0:8443".parse().unwrap(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
                     proxy: ListenerType::Https.into(),
                     from_scm: false,
                 })
@@ -2128,46 +2121,46 @@ mod tests {
 
         let e: Vec<Request> = vec![
             RequestType::RemoveListener(RemoveListener {
-                address: "0.0.0.0:1234".parse().unwrap(),
+                address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
                 proxy: ListenerType::Tcp.into(),
             })
             .into(),
             RequestType::AddTcpListener(TcpListenerConfig {
-                address: "0.0.0.0:1234".parse().unwrap(),
+                address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
                 expect_proxy: true,
                 ..Default::default()
             })
             .into(),
             RequestType::DeactivateListener(DeactivateListener {
-                address: "0.0.0.0:1234".parse().unwrap(),
+                address: SocketAddress::new_v4(0, 0, 0, 0, 1234),
                 proxy: ListenerType::Tcp.into(),
                 to_scm: false,
             })
             .into(),
             RequestType::RemoveListener(RemoveListener {
-                address: "0.0.0.0:8080".parse().unwrap(),
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                 proxy: ListenerType::Http.into(),
             })
             .into(),
             RequestType::AddHttpListener(HttpListenerConfig {
-                address: "0.0.0.0:8080".parse().unwrap(),
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                 answer_404: String::from("test"),
                 ..Default::default()
             })
             .into(),
             RequestType::ActivateListener(ActivateListener {
-                address: "0.0.0.0:8080".parse().unwrap(),
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
                 proxy: ListenerType::Http.into(),
                 from_scm: false,
             })
             .into(),
             RequestType::RemoveListener(RemoveListener {
-                address: "0.0.0.0:8443".parse().unwrap(),
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
                 proxy: ListenerType::Https.into(),
             })
             .into(),
             RequestType::AddHttpsListener(HttpsListenerConfig {
-                address: "0.0.0.0:8443".parse().unwrap(),
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
                 answer_404: String::from("test"),
                 ..Default::default()
             })
@@ -2196,7 +2189,7 @@ mod tests {
             names: vec!["lolcatho.st".to_string()],
         };
         let add_certificate = AddCertificate {
-            address: "127.0.0.1:8080".to_string(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
             certificate: certificate_and_key,
             expired_at: None,
         };

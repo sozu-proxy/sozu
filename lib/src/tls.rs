@@ -490,12 +490,12 @@ mod tests {
     use rand::{seq::SliceRandom, thread_rng};
     use sozu_command::{
         certificate::parse_pem,
-        proto::command::{AddCertificate, CertificateAndKey},
+        proto::command::{AddCertificate, CertificateAndKey, SocketAddress},
     };
 
     #[test]
     fn lifecycle() -> Result<(), Box<dyn Error + Send + Sync>> {
-        let address = "127.0.0.1:8080".to_string();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
         let mut resolver = CertificateResolver::default();
         let certificate_and_key = CertificateAndKey {
             certificate: String::from(include_str!("../assets/certificate.pem")),
@@ -531,7 +531,7 @@ mod tests {
 
     #[test]
     fn name_override() -> Result<(), Box<dyn Error + Send + Sync>> {
-        let address = "127.0.0.1:8080".to_string();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
         let mut resolver = CertificateResolver::default();
         let certificate_and_key = CertificateAndKey {
             certificate: String::from(include_str!("../assets/certificate.pem")),
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn replacement() -> Result<(), Box<dyn Error + Send + Sync>> {
-        let address = "127.0.0.1:8080".to_string();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
         let mut resolver = CertificateResolver::default();
 
         // ---------------------------------------------------------------------
@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn expiration_override() -> Result<(), Box<dyn Error + Send + Sync>> {
-        let address = "127.0.0.1:8080".to_string();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
         let mut resolver = CertificateResolver::default();
 
         // ---------------------------------------------------------------------
@@ -758,7 +758,7 @@ mod tests {
 
         // ---------------------------------------------------------------------
         // load certificates in resolver
-        let address = "127.0.0.1:8080".to_string();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8080);
         let mut resolver = CertificateResolver::default();
 
         for certificate in &certificates {

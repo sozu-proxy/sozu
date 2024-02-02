@@ -2,7 +2,6 @@ use std::{
     ffi::OsString,
     fs::{read_link, File},
     io::{Error as IoError, Write},
-    net::{AddrParseError, SocketAddr},
     os::unix::io::RawFd,
     path::PathBuf,
 };
@@ -45,8 +44,6 @@ pub enum UtilError {
     or use the SOZU_CONFIG environment variable when building sozu."
     )]
     GetConfigFilePath,
-    #[error("could not parse socket address: {0}")]
-    ParseSocketAddress(AddrParseError),
 }
 
 /// FD_CLOEXEC is set by default on every fd in Rust standard lib,
@@ -115,12 +112,6 @@ pub fn get_config_file_path(args: &cli::Args) -> Result<&str, UtilError> {
         Some(config_file) => Ok(config_file.as_str()),
         None => option_env!("SOZU_CONFIG").ok_or(UtilError::GetConfigFilePath),
     }
-}
-
-pub fn parse_socket_address(address: &str) -> Result<SocketAddr, UtilError> {
-    address
-        .parse::<SocketAddr>()
-        .map_err(UtilError::ParseSocketAddress)
 }
 
 #[cfg(target_os = "freebsd")]
