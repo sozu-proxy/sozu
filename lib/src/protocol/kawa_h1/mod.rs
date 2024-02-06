@@ -843,7 +843,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             response_time: metrics.response_time(),
             bytes_in: metrics.bin,
             bytes_out: metrics.bout,
-            user_agent: self.context.user_agent.clone(),
+            user_agent: self.context.user_agent.as_deref(),
         };
     }
 

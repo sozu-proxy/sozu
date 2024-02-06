@@ -6,6 +6,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{stdout, Error as IoError, ErrorKind as IoErrorKind, Stdout, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
+    ops::{Deref, DerefMut},
     path::Path,
     str::FromStr,
 };
@@ -19,7 +20,7 @@ use crate::proto::command::ProtobufAccessLogFormat;
 
 pub use crate::access_logs::*;
 
-use crate::{bind_format_args, config::Config};
+use crate::{config::Config, proto::display::AsString};
 
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
@@ -56,22 +57,25 @@ impl From<&Option<AccessLogFormat>> for ProtobufAccessLogFormat {
 }
 
 pub struct InnerLogger {
-    pub directives: Vec<LogDirective>,
-    pub backend: LoggerBackend,
+    version: u8,
+    directives: Vec<LogDirective>,
+    backend: LoggerBackend,
+    pub colored: bool,
     /// target of the access logs
-    pub access_backend: Option<LoggerBackend>,
+    access_backend: Option<LoggerBackend>,
     /// how to format the access logs
-    pub access_log_format: AccessLogFormat,
-    pub buffer: Vec<u8>,
+    access_format: AccessLogFormat,
+    access_colored: bool,
+    buffer: LoggerBuffer,
 }
 
 pub struct Logger {
-    pub inner: InnerLogger,
+    inner: InnerLogger,
     /// is displayed in each log, for instance "MAIN" or worker_id
-    pub tag: String,
+    tag: String,
     /// the pid of the current process (main or worker)
-    pub pid: i32,
-    pub initialized: bool,
+    pid: i32,
+    initialized: bool,
 }
 
 impl std::ops::Deref for Logger {
@@ -90,14 +94,17 @@ impl Default for Logger {
     fn default() -> Self {
         Self {
             inner: InnerLogger {
+                version: 1, // all call site start with a version of 0
                 directives: vec![LogDirective {
                     name: None,
                     level: LogLevelFilter::Error,
                 }],
                 backend: LoggerBackend::Stdout(stdout()),
+                colored: false,
                 access_backend: None,
-                access_log_format: AccessLogFormat::Ascii,
-                buffer: Vec::with_capacity(4096),
+                access_format: AccessLogFormat::Ascii,
+                access_colored: false,
+                buffer: LoggerBuffer(Vec::with_capacity(4096)),
             },
             tag: "UNINITIALIZED".to_string(),
             pid: 0,
@@ -115,17 +122,29 @@ impl Logger {
         tag: String,
         spec: &str,
         backend: LoggerBackend,
+        colored: bool,
         access_backend: Option<LoggerBackend>,
-        access_log_format: Option<AccessLogFormat>,
+        access_format: Option<AccessLogFormat>,
+        access_colored: Option<bool>,
     ) {
         let directives = parse_logging_spec(spec);
         LOGGER.with(|logger| {
             let mut logger = logger.borrow_mut();
             if !logger.initialized {
                 logger.set_directives(directives);
+                logger.colored = match backend {
+                    LoggerBackend::Stdout(_) => colored,
+                    _ => false,
+                };
+                logger.access_colored = match (&access_backend, &backend) {
+                    (Some(LoggerBackend::Stdout(_)), _) | (None, LoggerBackend::Stdout(_)) => {
+                        access_colored.unwrap_or(colored)
+                    }
+                    _ => false,
+                };
                 logger.backend = backend;
                 logger.access_backend = access_backend;
-                logger.access_log_format = access_log_format.unwrap_or(AccessLogFormat::Ascii);
+                logger.access_format = access_format.unwrap_or(AccessLogFormat::Ascii);
                 logger.tag = tag;
                 logger.pid = unsafe { libc::getpid() };
                 logger.initialized = true;
@@ -138,19 +157,34 @@ impl Logger {
         });
     }
 
+    pub fn set_directives(&mut self, directives: Vec<LogDirective>) {
+        self.version += 1;
+        if self.version >= LOG_LINE_ENABLED {
+            self.version = 0;
+        }
+        self.directives = directives;
+    }
+
     pub fn split(&mut self) -> (i32, &str, &mut InnerLogger) {
         (self.pid, &self.tag, &mut self.inner)
     }
 }
 
-trait LoggerBuffer {
-    fn fmt<F: FnOnce(&[u8]) -> Result<usize, IoError>>(
-        &mut self,
-        args: Arguments,
-        flush: F,
-    ) -> Result<(), IoError>;
+struct LoggerBuffer(Vec<u8>);
+
+impl Deref for LoggerBuffer {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
-impl LoggerBuffer for Vec<u8> {
+impl DerefMut for LoggerBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl LoggerBuffer {
     fn fmt<F: FnOnce(&[u8]) -> Result<usize, IoError>>(
         &mut self,
         args: Arguments,
@@ -163,46 +197,47 @@ impl LoggerBuffer for Vec<u8> {
     }
 }
 
+fn log_arguments(
+    args: Arguments,
+    backend: &mut LoggerBackend,
+    buffer: &mut LoggerBuffer,
+) -> Result<(), IoError> {
+    match backend {
+        LoggerBackend::Stdout(stdout) => {
+            let _ = stdout.write_fmt(args);
+            Ok(())
+        }
+        LoggerBackend::Tcp(socket) => socket.write_fmt(args),
+        LoggerBackend::File(file) => file.write_fmt(args),
+        LoggerBackend::Unix(socket) => buffer.fmt(args, |bytes| socket.send(bytes)),
+        LoggerBackend::Udp(sock, addr) => buffer.fmt(args, |b| sock.send_to(b, *addr)),
+    }
+}
+
 impl InnerLogger {
     pub fn log(&mut self, args: Arguments) {
-        let io_result = match &mut self.backend {
-            LoggerBackend::Stdout(stdout) => {
-                let _ = stdout.write_fmt(args);
-                return;
-            }
-            LoggerBackend::Tcp(socket) => socket.write_fmt(args),
-            LoggerBackend::File(file) => file.write_fmt(args),
-            LoggerBackend::Unix(socket) => self.buffer.fmt(args, |bytes| socket.send(bytes)),
-            LoggerBackend::Udp(sock, addr) => self.buffer.fmt(args, |b| sock.send_to(b, *addr)),
-        };
-
-        if let Err(e) = io_result {
-            println!(
-                "Cannot write access log to {}: {e:?}",
-                self.backend.as_ref()
-            );
+        if let Err(e) = log_arguments(args, &mut self.backend, &mut self.buffer) {
+            println!("Could not write log to {}: {e:?}", self.backend.as_ref());
         }
     }
 
-    pub fn log_access(&mut self, pid: i32, tag: &str, level_tag: &str, log: RequestRecord) {
-        let (now, precise_time) = now();
+    pub fn log_access(&mut self, log: RequestRecord) {
         let backend = self.access_backend.as_mut().unwrap_or(&mut self.backend);
 
-        let io_result = match self.access_log_format {
+        let io_result = match self.access_format {
             AccessLogFormat::Protobuf => {
-                let protobuf_log = unsafe { log.into_protobuf_access_log(precise_time, tag) };
-                // println!("protobuf_log length: {:?}", protobuf_log);
-                let log_length = protobuf_log.encoded_len();
+                let binary_log = unsafe { log.into_binary_access_log() };
+                let log_length = binary_log.encoded_len();
                 let total_length = log_length + encoded_len_varint(log_length as u64);
                 self.buffer.clear();
-                if self.buffer.capacity() < total_length {
-                    self.buffer.reserve(total_length - self.buffer.capacity());
+                let current_capacity = self.buffer.capacity();
+                if current_capacity < total_length {
+                    self.buffer.reserve(total_length - current_capacity);
                 }
 
-                if let Err(e) = protobuf_log.encode_length_delimited(&mut self.buffer) {
+                if let Err(e) = binary_log.encode_length_delimited(&mut self.buffer.0) {
                     Err(IoError::new(IoErrorKind::InvalidData, e))
                 } else {
-                    // println!("length: {}, {:02X?}", &self.buffer.len(), &self.buffer[..]);
                     let bytes = &self.buffer;
                     match backend {
                         LoggerBackend::Stdout(stdout) => {
@@ -217,69 +252,74 @@ impl InnerLogger {
                     .map(|_| ())
                 }
             }
-            AccessLogFormat::Ascii => bind_format_args! {
-                let args = ("{now} {precise_time} {pid} {tag} {level_tag} {log}");
-                // TODO: delete or make it trace
-                println!("ascii access log length: {}", format!("{}", args).len());
-                match backend {
-                    LoggerBackend::Stdout(stdout) => {
-                        let _ = stdout.write_fmt(args);
-                        return Ok(());
-                    }
-                    LoggerBackend::Tcp(socket) => socket.write_fmt(args),
-                    LoggerBackend::File(file) => file.write_fmt(args),
-                    LoggerBackend::Unix(socket) => self.buffer.fmt(args, |b| socket.send(b)),
-                    LoggerBackend::Udp(sock, addr) => self.buffer.fmt(args, |b| sock.send_to(b, *addr)),
+            AccessLogFormat::Ascii => crate::prompt_log! {
+                logger: |args| log_arguments(args, backend, &mut self.buffer),
+                is_access: true,
+                condition: self.access_colored,
+                prompt: [
+                    log.now,
+                    log.precise_time,
+                    log.pid,
+                    log.level,
+                    log.tag,
+                ],
+                standard: {
+                    formats: ["{} {}->{} {}/{}/{}/{} {}->{} [{}] {} {} | {:?}\n"],
+                    args: [
+                        log.context,
+                        log.session_address.as_string_or("X"),
+                        log.backend_address.as_string_or("X"),
+                        LogDuration(Some(log.response_time)),
+                        LogDuration(Some(log.service_time)),
+                        LogDuration(log.client_rtt),
+                        LogDuration(log.server_rtt),
+                        log.bytes_in,
+                        log.bytes_out,
+                        log.full_tags(),
+                        log.protocol,
+                        log.endpoint,
+                        log.error,
+                    ]
+                },
+                colored: {
+                    formats: ["\x1b[;1m{}\x1b[m {}->{} {}/{}/{}/{} {}->{} \x1b[2m[{}] \x1b[;1m{} {}\x1b[m | {:?}\n"],
+                    args: @,
                 }
             },
         };
 
         if let Err(e) = io_result {
-            println!("Cannot write access log to {}: {:?}", backend.as_ref(), e);
+            println!("Could not write access log to {}: {e:?}", backend.as_ref());
         }
-    }
-
-    pub fn compat_log(&mut self, args: Arguments) {
-        let io_result = match &mut self.backend {
-            LoggerBackend::Stdout(stdout) => {
-                let _ = stdout.write_fmt(args);
-                return;
-            }
-            LoggerBackend::Tcp(socket) => socket.write_fmt(args),
-            LoggerBackend::File(file) => file.write_fmt(args),
-            LoggerBackend::Unix(socket) => self.buffer.fmt(args, |b| socket.send(b)),
-            LoggerBackend::Udp(sock, addr) => self.buffer.fmt(args, |b| sock.send_to(b, *addr)),
-        };
-
-        if let Err(e) = io_result {
-            println!(
-                "Cannot write access log to {}: {e:?}",
-                self.backend.as_ref()
-            );
-        }
-    }
-
-    pub fn set_directives(&mut self, directives: Vec<LogDirective>) {
-        self.directives = directives;
     }
 
     pub fn enabled(&self, meta: Metadata) -> bool {
         // Search for the longest match, the vector is assumed to be pre-sorted.
         for directive in self.directives.iter().rev() {
-            match directive.name {
-                Some(ref name) if !meta.target.starts_with(name) => {}
-                Some(..) | None => return meta.level <= directive.level,
+            match &directive.name {
+                Some(name) if !meta.target.starts_with(name) => {}
+                Some(_) | None => return meta.level <= directive.level,
             }
         }
         false
     }
 
+    pub fn cached_enabled(&self, call_site_state: &mut LogLineCachedState, meta: Metadata) -> bool {
+        if call_site_state.version() == self.version {
+            call_site_state.enabled()
+        } else {
+            let enabled = self.enabled(meta);
+            call_site_state.set(self.version, enabled);
+            enabled
+        }
+    }
+
     fn compat_enabled(&self, meta: &log::Metadata) -> bool {
         // Search for the longest match, the vector is assumed to be pre-sorted.
         for directive in self.directives.iter().rev() {
-            match directive.name {
-                Some(ref name) if !meta.target().starts_with(name) => {}
-                Some(..) | None => return Into::<LogLevel>::into(meta.level()) <= directive.level,
+            match &directive.name {
+                Some(name) if !meta.target().starts_with(name) => {}
+                Some(_) | None => return LogLevel::from(meta.level()) <= directive.level,
             }
         }
         false
@@ -295,7 +335,7 @@ pub enum LoggerBackend {
 }
 
 #[repr(usize)]
-#[derive(Copy, Eq, Debug)]
+#[derive(Clone, Copy, Eq, Debug)]
 pub enum LogLevel {
     /// The "error" level.
     ///
@@ -320,13 +360,6 @@ pub enum LogLevel {
 }
 
 static LOG_LEVEL_NAMES: [&str; 6] = ["OFF", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"];
-
-impl Clone for LogLevel {
-    #[inline]
-    fn clone(&self) -> LogLevel {
-        *self
-    }
-}
 
 impl PartialEq for LogLevel {
     #[inline]
@@ -389,7 +422,7 @@ impl LogLevel {
 }
 
 #[repr(usize)]
-#[derive(Copy, Eq, Debug)]
+#[derive(Clone, Copy, Eq, Debug)]
 pub enum LogLevelFilter {
     Off,
     Error,
@@ -397,13 +430,6 @@ pub enum LogLevelFilter {
     Info,
     Debug,
     Trace,
-}
-
-impl Clone for LogLevelFilter {
-    #[inline]
-    fn clone(&self) -> LogLevelFilter {
-        *self
-    }
 }
 
 impl PartialEq for LogLevelFilter {
@@ -550,12 +576,19 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
     dirs
 }
 
+/// start the logger with all logs and access logs on stdout
+pub fn setup_default_logging(log_colored: bool, log_level: &str, tag: &str) {
+    setup_logging("stdout", log_colored, None, None, None, log_level, tag)
+}
+
 /// start the logger from config (takes RUST_LOG into account)
 pub fn setup_logging_with_config(config: &Config, tag: &str) {
     setup_logging(
         &config.log_target,
+        config.log_colored,
         config.log_access_target.as_deref(),
         config.log_access_format.clone(),
+        config.log_access_colored,
         &config.log_level,
         tag,
     )
@@ -567,31 +600,25 @@ pub fn setup_logging_with_config(config: &Config, tag: &str) {
 /// - taking RUST_LOG into account
 pub fn setup_logging(
     log_target: &str,
+    log_colored: bool,
     log_access_target: Option<&str>,
     log_access_format: Option<AccessLogFormat>,
+    log_access_colored: Option<bool>,
     log_level: &str,
     tag: &str,
 ) {
     let backend = target_to_backend(log_target);
     let access_backend = log_access_target.map(target_to_backend);
 
-    if let Ok(env_log_level) = env::var("RUST_LOG") {
-        Logger::init(
-            tag.to_string(),
-            &env_log_level,
-            backend,
-            access_backend,
-            log_access_format,
-        );
-    } else {
-        Logger::init(
-            tag.to_string(),
-            log_level,
-            backend,
-            access_backend,
-            log_access_format,
-        );
-    }
+    Logger::init(
+        tag.to_string(),
+        env::var("RUST_LOG").as_deref().unwrap_or(log_level),
+        backend,
+        log_colored,
+        access_backend,
+        log_access_format,
+        log_access_colored,
+    );
 }
 
 pub fn target_to_backend(target: &str) -> LoggerBackend {
@@ -653,83 +680,173 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
 #[macro_export]
 macro_rules! bind_format_args {
     (let $args: ident = ($($f:tt)+); $($t:tt)*) => {
-        (|$args| { $($t)* })(format_args!($($f)+))
+        (|$args| { $($t)* })($($f)+)
     };
 }
 
-/// write a log with the custom logger (used in other macros, do not use directly)
 #[macro_export]
-macro_rules! log {
-    ($lvl:expr, $format:expr, $level_tag:expr $(, $args:expr)*) => {
-        log!(@ module_path!(), $lvl, $format, $level_tag, [] $(, $args)*)
+macro_rules! prompt_log {
+    {
+        logger: $logger:expr,
+        is_access: $access:expr,
+        condition: $cond:expr,
+        prompt: [$($p:tt)*],
+        standard: {$($std:tt)*}$(,)?
+    } => {
+        $crate::prompt_log!{
+            logger: $logger,
+            is_access: $access,
+            condition: $cond,
+            prompt: [$($p)*],
+            standard: {$($std)*},
+            colored: {$($std)*},
+        }
     };
-    (@ $target:expr, $lvl:expr, $format:expr, $level_tag:expr,
-        [$($ref_args:ident),*], $first_arg:expr $(, $other_args:expr)*) => {{
-        let reg_arg = &$first_arg;
-        log!(@ $target, $lvl, $format, $level_tag, [$($ref_args,)* reg_arg] $(, $other_args)*);
+    {
+        logger: $logger:expr,
+        is_access: $access:expr,
+        condition: $cond:expr,
+        prompt: [$($p:tt)*],
+        standard: {
+            formats: [$($std_fmt:tt)*],
+            args: [$($std_args:expr),*$(,)?]$(,)?
+        },
+        colored: {
+            formats: [$($col_fmt:tt)*],
+            args: @$(,)?
+        }$(,)?
+    } => {
+        $crate::prompt_log!{
+            logger: $logger,
+            is_access: $access,
+            condition: $cond,
+            prompt: [$($p)*],
+            standard: {
+                formats: [$($std_fmt)*],
+                args: [$($std_args),*],
+            },
+            colored: {
+                formats: [$($col_fmt)*],
+                args: [$($std_args),*],
+            },
+        }
+    };
+    {
+        logger: $logger:expr,
+        is_access: $access:expr,
+        condition: $cond:expr,
+        prompt: [$now:expr, $precise_time:expr, $pid:expr, $lvl:expr, $tag:expr$(,)?],
+        standard: {
+            formats: [$($std_fmt:tt)*],
+            args: [$($std_args:expr),*$(,)?]$(,)?
+        },
+        colored: {
+            formats: [$($col_fmt:tt)*],
+            args: [$($col_args:expr),*$(,)?]$(,)?
+        }$(,)?
+    } => {
+        if $cond {
+            $crate::prompt_log!(@bind [$logger, concat!("{} \x1b[2m{} \x1b[;2;1m{} {} \x1b[0;1m{}\x1b[m\t", $($col_fmt)*)] [$now, $precise_time, $pid, $lvl.as_str($access, true), $tag] $($col_args),*)
+        } else {
+            $crate::prompt_log!(@bind [$logger, concat!("{} {} {} {} {}\t", $($std_fmt)*)] [$now, $precise_time, $pid, $lvl.as_str($access, false), $tag] $($std_args),*)
+        }
+    };
+    (@bind [$logger:expr, $fmt:expr] [$($bindings:expr),*] $arg:expr $(, $args:expr)*) => {{
+        let binding = &$arg;
+        $crate::prompt_log!(@bind [$logger, $fmt] [$($bindings),* , binding] $($args),*)
     }};
-    (@ $target:expr, $lvl:expr, $format:expr, $level_tag:expr, [$($final_args:ident),*]) => {{
-        $crate::logging::LOGGER.with(|logger| {
-            let mut logger = logger.borrow_mut();
-            if !logger.enabled($crate::logging::Metadata {
-                level:  $lvl,
-                target: module_path!(),
-            }) { return; }
-            let (pid, tag, inner) = logger.split();
-            let (now, precise_time) = $crate::logging::now();
-            inner.log(
-            format_args!(
-                concat!("{} {} {} {} {}\t", $format, '\n'),
-                now, precise_time, pid, tag,
-                $level_tag $(, $final_args)*)
-            );
-        })
-    }};
-
+    (@bind [$logger:expr, $fmt:expr] [$($bindings:expr),*]) => {
+        $logger(format_args!($fmt, $($bindings),*))
+    };
 }
 
-/// log a failure concerning an HTTP or TCP request
-#[macro_export]
-macro_rules! log_access {
-    ($lvl:expr, $level_tag:expr, $request_record:expr) => {{
-        $crate::logging::LOGGER.with(|logger| {
-            let mut logger = logger.borrow_mut();
-            if !logger.enabled($crate::logging::Metadata {
-                level: $lvl,
-                target: module_path!(),
-            }) {
-                return;
-            }
-            let (pid, tag, inner) = logger.split();
-            inner.log_access(pid, tag, $level_tag, $request_record);
-        })
-    }};
-}
+#[derive(Clone, Copy, Debug)]
+pub struct LogLineCachedState(u8);
+const LOG_LINE_ENABLED: u8 = 1 << 7;
 
-#[macro_export]
-macro_rules! unwrap_or {
-    ({} {$($default:tt)*}) => {
-        $($default)*
-    };
-    ({$($value:tt)*} {$($default:tt)*}) => {
-        $($value)*
+impl LogLineCachedState {
+    pub const fn new() -> Self {
+        Self(0)
+    }
+    #[inline(always)]
+    pub fn version(&self) -> u8 {
+        self.0 & !LOG_LINE_ENABLED
+    }
+    #[inline(always)]
+    pub fn enabled(&self) -> bool {
+        self.0 & LOG_LINE_ENABLED != 0
+    }
+    #[inline(always)]
+    pub fn set(&mut self, version: u8, enabled: bool) {
+        self.0 = version;
+        if enabled {
+            self.0 |= LOG_LINE_ENABLED
+        }
     }
 }
 
 #[macro_export]
+macro_rules! log {
+    ($lvl:expr, $format:expr $(, $args:expr)*) => {{
+        static mut LOG_LINE_CACHED_STATE: $crate::logging::LogLineCachedState = $crate::logging::LogLineCachedState::new();
+        $crate::logging::LOGGER.with(|logger| {
+            let mut logger = logger.borrow_mut();
+            if !logger.cached_enabled(
+                unsafe { &mut LOG_LINE_CACHED_STATE },
+                $crate::logging::Metadata { level: $lvl, target: module_path!() }
+            ) { return; }
+            let (pid, tag, inner) = logger.split();
+            let (now, precise_time) = $crate::logging::now();
+
+            $crate::prompt_log!{
+                logger: |args| inner.log(args),
+                is_access: false,
+                condition: inner.colored,
+                prompt: [now, precise_time, pid, $lvl, tag],
+                standard: {
+                    formats: [$format, '\n'],
+                    args: [$($args),*]
+                }
+            };
+        })
+    }};
+}
+
+#[macro_export]
+macro_rules! log_access {
+    ($lvl:expr, $($request_record_fields:tt)*) => {{
+        static mut LOG_LINE_CACHED_STATE: $crate::logging::LogLineCachedState = $crate::logging::LogLineCachedState::new();
+        $crate::logging::LOGGER.with(|logger| {
+            let mut logger = logger.borrow_mut();
+            if !logger.cached_enabled(
+                unsafe { &mut LOG_LINE_CACHED_STATE },
+                $crate::logging::Metadata { level: $lvl, target: module_path!() }
+            ) { return; }
+            let (pid, tag, inner) = logger.split();
+            let (now, precise_time) = $crate::logging::now();
+
+            inner.log_access(
+                structured_access_log!([$crate::logging::RequestRecord]
+                pid, tag, now, precise_time, level: $lvl, $($request_record_fields)*
+            ));
+        })
+    }};
+}
+
+#[macro_export]
 macro_rules! structured_access_log {
-    ($($k:ident $(: $v:expr)?),* $(,)?) => {
-        $crate::logging::RequestRecord {$(
-            $k: &unwrap_or!({$($v)?} {$k}),
+    ([$($struct_name:tt)+] $($fields:tt)*) => {{
+        $($struct_name)+ {$(
+            $fields
         )*}
-    };
+    }};
 }
 
 /// log a failure concerning an HTTP or TCP request
 #[macro_export]
 macro_rules! error_access {
     ($($request_record_fields:tt)*) => {
-        log_access!($crate::logging::LogLevel::Error, "ERROR", structured_access_log!($($request_record_fields)*));
+        log_access!($crate::logging::LogLevel::Error, $($request_record_fields)*);
     };
 }
 
@@ -737,7 +854,7 @@ macro_rules! error_access {
 #[macro_export]
 macro_rules! info_access {
     ($($request_record_fields:tt)*) => {
-        log_access!($crate::logging::LogLevel::Info, "INFO", structured_access_log!($($request_record_fields)*));
+        log_access!($crate::logging::LogLevel::Info, $($request_record_fields)*);
     };
 }
 
@@ -745,7 +862,7 @@ macro_rules! info_access {
 #[macro_export]
 macro_rules! error {
     ($format:expr $(, $args:expr)* $(,)?) => {
-        log!($crate::logging::LogLevel::Error, $format, "ERROR" $(, $args)*)
+        log!($crate::logging::LogLevel::Error, $format $(, $args)*)
     };
 }
 
@@ -753,7 +870,7 @@ macro_rules! error {
 #[macro_export]
 macro_rules! warn {
     ($format:expr $(, $args:expr)* $(,)?) => {
-        log!($crate::logging::LogLevel::Warn, $format, "WARN" $(, $args)*);
+        log!($crate::logging::LogLevel::Warn, $format $(, $args)*)
     };
 }
 
@@ -761,35 +878,37 @@ macro_rules! warn {
 #[macro_export]
 macro_rules! info {
     ($format:expr $(, $args:expr)* $(,)?) => {
-        log!($crate::logging::LogLevel::Info, $format, "INFO" $(, $args)*);
+        log!($crate::logging::LogLevel::Info, $format $(, $args)*)
     };
 }
 
 /// log a debug with Sōzu’s custom log stack
 #[macro_export]
 macro_rules! debug {
-    ($format:expr $(, $args:expr)* $(,)?) => {
+    ($format:expr $(, $args:expr)* $(,)?) => {{
         #[cfg(any(debug_assertions, feature = "logs-debug", feature = "logs-trace"))]
-        log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format),
-          "DEBUG", module_path!() $(, $args)*);
-    };
+        log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format), module_path!() $(, $args)*);
+        #[cfg(not(any(debug_assertions, feature = "logs-trace")))]
+        {$( let _ = $args; )*}
+    }};
 }
 
 /// log a trace with Sōzu’s custom log stack
 #[macro_export]
 macro_rules! trace {
-    ($format:expr $(, $args:expr)* $(,)?) => (
+    ($format:expr $(, $args:expr)* $(,)?) => {{
         #[cfg(any(debug_assertions, feature = "logs-trace"))]
-        log!($crate::logging::LogLevel::Trace, concat!("{}\t", $format),
-          "TRACE", module_path!() $(, $args)*);
-    );
+        log!($crate::logging::LogLevel::Trace, concat!("{}\t", $format), module_path!() $(, $args)*);
+        #[cfg(not(any(debug_assertions, feature = "logs-trace")))]
+        {$( let _ = $args; )*}
+    }};
 }
 
 /// write a log with a "FIXME" prefix on an info level
 #[macro_export]
 macro_rules! fixme {
     ($(, $args:expr)* $(,)?) => {
-        log!($crate::logging::LogLevel::Info, "FIXME: {}:{} in {}: {}", "INFO", file!(), line!(), module_path!() $(, $args)*);
+        log!($crate::logging::LogLevel::Info, "FIXME: {}:{} in {}: {}", file!(), line!(), module_path!() $(, $args)*)
     };
 }
 
@@ -813,22 +932,25 @@ impl log::Log for CompatLogger {
     }
 
     fn log(&self, record: &log::Record) {
-        LOGGER.with(|l| {
-            let mut l = l.borrow_mut();
-            if !l.compat_enabled(record.metadata()) {
+        LOGGER.with(|logger| {
+            let mut logger = logger.borrow_mut();
+            if !logger.compat_enabled(record.metadata()) {
                 return;
             }
-            let (pid, tag, inner) = l.split();
+            let (pid, tag, inner) = logger.split();
             let (now, precise_time) = now();
-            inner.compat_log(format_args!(
-                concat!("{} {} {} {} {}\t{}\n"),
-                now,
-                precise_time,
-                pid,
-                tag,
-                record.level(),
-                record.args()
-            ));
+            crate::prompt_log! {
+                logger: |args| inner.log(args),
+                is_access: false,
+                condition: inner.colored,
+                prompt: [
+                    now, precise_time, pid, LogLevel::from(record.level()), tag
+                ],
+                standard: {
+                    formats: ["{}\n"],
+                    args: [record.args()]
+                }
+            };
         })
     }
 
@@ -843,6 +965,8 @@ macro_rules! setup_test_logger {
             module_path!().to_string(),
             "error",
             $crate::logging::LoggerBackend::Stdout(::std::io::stdout()),
+            false,
+            None,
             None,
             None,
         );
@@ -850,24 +974,7 @@ macro_rules! setup_test_logger {
 }
 
 pub struct Rfc3339Time {
-    inner: ::time::OffsetDateTime,
-}
-
-impl std::fmt::Display for Rfc3339Time {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
-        let t = self.inner;
-        write!(
-            f,
-            "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
-            t.year(),
-            t.month() as u8,
-            t.day(),
-            t.hour(),
-            t.minute(),
-            t.second(),
-            t.microsecond()
-        )
-    }
+    pub inner: ::time::OffsetDateTime,
 }
 
 pub fn now() -> (Rfc3339Time, i128) {

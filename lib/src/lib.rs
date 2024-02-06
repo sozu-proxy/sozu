@@ -115,7 +115,7 @@
 //!
 //! We can now define a frontend. A frontend is a way to recognize a request and match
 //! it to a `cluster_id`, depending on the hostname and the beginning of the URL path.
-//! The `address` field must match the one of the HTTP listener we defined before:
+//! The `address` field must match the one of the HTTP listener we defined before:
 //!
 //! ```
 //! use std::collections::BTreeMap;
@@ -230,7 +230,7 @@
 //! };
 //!
 //! fn main() -> anyhow::Result<()> {
-//!     setup_logging("stdout", None, None, "info", "EXAMPLE");
+//!     setup_logging("stdout", true, None, None, None, "info", "EXAMPLE");
 //!
 //!     info!("starting up");
 //!
@@ -643,7 +643,7 @@ pub enum ListenerError {
     RemoveFrontend(RouterError),
 }
 
-/// Returned by the HTTP, HTTPS and TCP proxies
+/// Returned by the HTTP, HTTPS and TCP proxies
 #[derive(thiserror::Error, Debug)]
 pub enum ProxyError {
     #[error("error while soft stopping {proxy_protocol} proxy: {error}")]

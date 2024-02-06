@@ -151,7 +151,7 @@ message HttpsListenerConfig {
     required uint32 request_timeout = 10 [default = 10];
     // wether the listener is actively listening on its socket
     required bool active = 11 [default = false];
-    // TLS versions
+    // TLS versions
     repeated TlsVersion versions = 12;
     repeated string cipher_list = 13;
     repeated string cipher_suites = 14;
@@ -306,7 +306,7 @@ message CertificateAndKey {
 message QueryCertificatesFilters {
     // a domain name to filter certificate results
     optional string domain = 1;
-    // a hex-encoded fingerprint of the TLS certificate to find
+    // a hex-encoded fingerprint of the TLS certificate to find
     optional string fingerprint = 2;
 }
 
@@ -612,7 +612,7 @@ message RequestCounts {
 }
 
 // matches std::net::SocketAddr in the Rust library
-// beware that the ports are expressed with uint32 here,
+// beware that the ports are expressed with uint32 here,
 // but they should NOT exceed uint16 value
 message SocketAddress {
     required IpAddress ip = 1;
@@ -675,6 +675,7 @@ message ServerConfig {
     required uint64 max_command_buffer_size = 14 [default = 2000000];
     optional ServerMetricsConfig metrics = 15;
     required ProtobufAccessLogFormat access_log_format = 16;
+    required bool log_colored = 17;
 }
 
 enum ProtobufAccessLogFormat {

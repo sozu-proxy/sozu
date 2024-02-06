@@ -115,8 +115,10 @@ pub fn begin_worker_process(
     // do not try to log anything before this, or the logger will panic
     setup_logging(
         &worker_config.log_target,
+        worker_config.log_colored,
         worker_config.log_access_target.as_deref(),
         Some(access_log_format),
+        Some(worker_config.log_colored),
         &worker_config.log_level,
         &worker_id,
     );

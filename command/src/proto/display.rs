@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fmt::{self, Display, Formatter},
+    fmt::{self, Debug, Display, Formatter},
     net::SocketAddr,
 };
 
@@ -9,22 +9,23 @@ use time::format_description;
 use x509_parser::time::ASN1Time;
 
 use crate::{
-    access_logs::{prepare_user_agent, EndpointRecord, LogContext, LogDuration, RequestRecord},
-    logging::LoggerBackend,
+    access_logs::{prepare_user_agent, EndpointRecord, FullTags, LogContext, LogDuration},
+    config::Config,
+    logging::{LogLevel, LoggerBackend, Rfc3339Time},
     proto::{
         command::{
-            filtered_metrics, request::RequestType, response_content::ContentType,
-            AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificateSummary,
-            CertificatesWithFingerprints, ClusterMetrics, FilteredMetrics,
-            ListOfCertificatesByAddress, ListedFrontends, ListenersList, QueryCertificatesFilters,
-            RequestCounts, Response, ResponseContent, ResponseStatus, RunState, TlsVersion,
-            WorkerInfos, WorkerMetrics, WorkerResponses,
+            filtered_metrics, protobuf_endpoint, request::RequestType,
+            response_content::ContentType, AggregatedMetrics, AvailableMetrics, CertificateAndKey,
+            CertificateSummary, CertificatesWithFingerprints, ClusterMetrics, FilteredMetrics,
+            ListOfCertificatesByAddress, ListedFrontends, ListenersList, ProtobufEndpoint,
+            QueryCertificatesFilters, RequestCounts, Response, ResponseContent, ResponseStatus,
+            RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses,
         },
         DisplayError,
     },
 };
 
-use super::command::{protobuf_endpoint, ProtobufEndpoint, HttpEndpoint, SocketAddress, TcpEndpoint};
+use super::command::{HttpEndpoint, TcpEndpoint};
 
 impl Display for CertificateAndKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -949,6 +950,42 @@ fn create_cluster_table(headers: Vec<&str>, data: &BTreeMap<String, ResponseCont
     table
 }
 
+impl Debug for Config {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("config_path", &self.config_path)
+            .field("command_socket", &self.command_socket)
+            .field("command_buffer_size", &self.command_buffer_size)
+            .field("max_command_buffer_size", &self.max_command_buffer_size)
+            .field("max_connections", &self.max_connections)
+            .field("min_buffers", &self.min_buffers)
+            .field("max_buffers", &self.max_buffers)
+            .field("buffer_size", &self.buffer_size)
+            .field("saved_state", &self.saved_state)
+            .field("automatic_state_save", &self.automatic_state_save)
+            .field("log_level", &self.log_level)
+            .field("log_target", &self.log_target)
+            .field("log_access_target", &self.log_access_target)
+            .field("log_access_format", &self.log_access_format)
+            .field("worker_count", &self.worker_count)
+            .field("worker_automatic_restart", &self.worker_automatic_restart)
+            .field("metrics", &self.metrics)
+            .field("disable_cluster_metrics", &self.disable_cluster_metrics)
+            .field("handle_process_affinity", &self.handle_process_affinity)
+            .field("ctl_command_timeout", &self.ctl_command_timeout)
+            .field("pid_file_path", &self.pid_file_path)
+            .field("activate_listeners", &self.activate_listeners)
+            .field("front_timeout", &self.front_timeout)
+            .field("back_timeout", &self.back_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("zombie_check_interval", &self.zombie_check_interval)
+            .field("accept_queue_timeout", &self.accept_queue_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("worker_timeout", &self.worker_timeout)
+            .finish()
+    }
+}
+
 impl Display for SocketAddress {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", SocketAddr::from(self.clone()))
@@ -1018,6 +1055,63 @@ impl AsRef<str> for LoggerBackend {
     }
 }
 
+impl LogLevel {
+    pub const fn as_str_access(&self) -> &'static str {
+        match self {
+            LogLevel::Error => "\x1b[;35;1mERROR-ACCESS",
+            LogLevel::Info => "\x1b[;35;1mINFO-ACCESS ",
+            _ => "\x1b[;35m???",
+        }
+        // match self {
+        //     LogLevel::Error => "ERROR",
+        //     LogLevel::Warn => "WARN",
+        //     LogLevel::Info => "INFO",
+        //     LogLevel::Debug => "DEBUG",
+        //     LogLevel::Trace => "TRACE",
+        // }
+    }
+    pub const fn as_str(&self, access: bool, colored: bool) -> &'static str {
+        match (self, access, colored) {
+            (LogLevel::Error, false, false) => "ERROR",
+            (LogLevel::Warn, false, false) => "WARN ",
+            (LogLevel::Info, false, false) => "INFO ",
+            (LogLevel::Debug, false, false) => "DEBUG",
+            (LogLevel::Trace, false, false) => "TRACE",
+
+            (LogLevel::Error, false, true) => "\x1b[;31;1mERROR",
+            (LogLevel::Warn, false, true) => "\x1b[;33;1mWARN ",
+            (LogLevel::Info, false, true) => "\x1b[;32;1mINFO ",
+            (LogLevel::Debug, false, true) => "\x1b[;34mDEBUG",
+            (LogLevel::Trace, false, true) => "\x1b[;90mTRACE",
+
+            (LogLevel::Error, true, false) => "ERROR-ACCESS",
+            (LogLevel::Info, true, false) => "INFO-ACCESS ",
+            (_, true, false) => "???",
+
+            (LogLevel::Error, true, true) => "\x1b[;35;1mERROR-ACCESS",
+            (LogLevel::Info, true, true) => "\x1b[;35;1mINFO-ACCESS ",
+            (_, true, true) => "\x1b[;35;1m???",
+        }
+    }
+}
+
+impl Display for Rfc3339Time {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        let t = self.inner;
+        write!(
+            f,
+            "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+            t.year(),
+            t.month() as u8,
+            t.day(),
+            t.hour(),
+            t.minute(),
+            t.second(),
+            t.microsecond()
+        )
+    }
+}
+
 impl Display for LogDuration {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.0 {
@@ -1049,7 +1143,7 @@ impl Display for LogContext<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "{} {} {}",
+            "[{} {} {}]",
             self.request_id,
             self.cluster_id.unwrap_or("-"),
             self.backend_id.unwrap_or("-")
@@ -1081,42 +1175,15 @@ impl Display for EndpointRecord<'_> {
     }
 }
 
-impl Display for RequestRecord<'_> {
+impl<'a> Display for FullTags<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let (tags, ua_separator, user_agent) = match (self.tags, &self.user_agent) {
-            (None, None) => ("-", "", String::new()),
-            (Some(tags), None) => (tags.concatenated.as_str(), "", String::new()),
-            (None, Some(ua)) => ("", "user-agent=", prepare_user_agent(ua)),
-            (Some(tags), Some(ua)) => (
-                tags.concatenated.as_str(),
-                ", user-agent=",
-                prepare_user_agent(ua),
-            ),
-        };
-
-        write!(
-            f,
-            "{} \t{} -> {} \t{}/{}/{}/{} \t{} -> {} \t {}{}{} {} {}",
-            self.context,
-            self.session_address.as_string_or("X"),
-            self.backend_address.as_string_or("X"),
-            LogDuration(Some(*self.response_time)),
-            LogDuration(Some(*self.service_time)),
-            LogDuration(*self.client_rtt),
-            LogDuration(*self.server_rtt),
-            self.bytes_in,
-            self.bytes_out,
-            tags,
-            ua_separator,
-            user_agent,
-            self.protocol,
-            self.endpoint
-        )?;
-
-        if let Some(message) = &self.error {
-            writeln!(f, " | {}", message)
-        } else {
-            writeln!(f)
+        match (self.concatenated, self.user_agent) {
+            (None, None) => write!(f, "-"),
+            (Some(tags), None) => write!(f, "{tags}"),
+            (Some(tags), Some(ua)) if !tags.is_empty() => {
+                write!(f, "{tags}, user-agent={}", prepare_user_agent(ua))
+            }
+            (_, Some(ua)) => write!(f, "user-agent={}", prepare_user_agent(ua)),
         }
     }
 }

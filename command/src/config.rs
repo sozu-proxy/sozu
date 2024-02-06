@@ -1091,8 +1091,13 @@ pub struct FileConfig {
     pub log_level: Option<String>,
     pub log_target: Option<String>,
     #[serde(default)]
+    pub log_colored: bool,
+    #[serde(default)]
     pub log_access_target: Option<String>,
+    #[serde(default)]
     pub log_access_format: Option<AccessLogFormat>,
+    #[serde(default)]
+    pub log_access_colored: Option<bool>,
     pub worker_count: Option<u16>,
     pub worker_automatic_restart: Option<bool>,
     pub metrics: Option<MetricsConfig>,
@@ -1205,6 +1210,7 @@ impl ConfigBuilder {
             handle_process_affinity: file_config.handle_process_affinity.unwrap_or(false),
             log_access_target: file_config.log_access_target.clone(),
             log_access_format: file_config.log_access_format.clone(),
+            log_access_colored: file_config.log_access_colored,
             log_level: file_config
                 .log_level
                 .clone()
@@ -1213,6 +1219,7 @@ impl ConfigBuilder {
                 .log_target
                 .clone()
                 .unwrap_or_else(|| String::from("stdout")),
+            log_colored: file_config.log_colored,
             max_buffers: file_config.max_buffers.unwrap_or(DEFAULT_MAX_BUFFERS),
             max_command_buffer_size: file_config
                 .max_command_buffer_size
@@ -1434,7 +1441,7 @@ impl ConfigBuilder {
 /// Sōzu configuration, populated with clusters and listeners.
 ///
 /// This struct is used on startup to generate `WorkerRequest`s
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct Config {
     pub config_path: String,
     pub command_socket: String,
@@ -1449,9 +1456,11 @@ pub struct Config {
     pub automatic_state_save: bool,
     pub log_level: String,
     pub log_target: String,
+    pub log_colored: bool,
     #[serde(default)]
     pub log_access_target: Option<String>,
     pub log_access_format: Option<AccessLogFormat>,
+    pub log_access_colored: Option<bool>,
     pub worker_count: u16,
     pub worker_automatic_restart: bool,
     pub metrics: Option<MetricsConfig>,
@@ -1783,7 +1792,7 @@ impl From<&Config> for ServerConfig {
             max_command_buffer_size: config.max_command_buffer_size,
             metrics,
             access_log_format: ProtobufAccessLogFormat::from(&config.log_access_format) as i32,
-            // log_colored: config.log_colored,
+            log_colored: config.log_colored,
         }
     }
 }

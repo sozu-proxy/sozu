@@ -338,7 +338,7 @@ impl<T> Timer<T> {
             .map(|state| self.set_timeout(delay_from_now, state))
     }
 
-    // TODO: return Result with context
+    // TODO: return Result with context
     /// Cancel a timeout.
     ///
     /// If the timeout has not yet occurred, the return value holds the

@@ -1033,10 +1033,7 @@ impl ListenerHandler for TcpListener {
 }
 
 impl TcpListener {
-    fn new(
-        config: TcpListenerConfig,
-        token: Token,
-    ) -> Result<TcpListener, ListenerError> {
+    fn new(config: TcpListenerConfig, token: Token) -> Result<TcpListener, ListenerError> {
         Ok(TcpListener {
             cluster_id: None,
             listener: None,
@@ -1192,7 +1189,10 @@ impl TcpProxy {
 
         let mut owned = listener.borrow_mut();
 
-        let taken_listener = owned.listener.take().ok_or(ProxyError::UnactivatedListener)?;
+        let taken_listener = owned
+            .listener
+            .take()
+            .ok_or(ProxyError::UnactivatedListener)?;
 
         Ok((owned.token, taken_listener))
     }

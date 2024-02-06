@@ -9,7 +9,7 @@ use std::thread;
 use anyhow::Context;
 use sozu_command_lib::{
     channel::Channel,
-    logging::setup_logging,
+    logging::setup_default_logging,
     proto::command::{
         request::RequestType, AddBackend, LoadBalancingParams, RequestTcpFrontend, SocketAddress,
         TcpListenerConfig, WorkerRequest,
@@ -17,7 +17,7 @@ use sozu_command_lib::{
 };
 
 fn main() -> anyhow::Result<()> {
-    setup_logging("stdout", None, None, "info", "EXAMPLE");
+    setup_default_logging(true, "info", "EXAMPLE");
 
     info!("starting up");
 
@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
             address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
             ..Default::default()
         };
-        setup_logging("stdout", None, None, "debug", "TCP");
+        setup_default_logging(true, "debug", "TCP");
         sozu_lib::tcp::testing::start_tcp_worker(listener, max_buffers, buffer_size, channel);
     });
 

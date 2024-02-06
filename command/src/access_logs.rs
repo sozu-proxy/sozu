@@ -3,7 +3,12 @@ use std::{collections::BTreeMap, mem::ManuallyDrop, net::SocketAddr};
 use rusty_ulid::Ulid;
 use time::Duration;
 
-use crate::proto::command::{ProtobufAccessLog, ProtobufEndpoint, TcpEndpoint, Uint128};
+use crate::{
+    logging::{LogLevel, Rfc3339Time},
+    proto::command::{
+        protobuf_endpoint, HttpEndpoint, ProtobufAccessLog, ProtobufEndpoint, TcpEndpoint, Uint128,
+    },
+};
 
 /// This uses unsafe to creates a "fake" owner of the underlying data.
 /// Beware that for the compiler it is as legitimate as the original owner.
@@ -97,37 +102,52 @@ impl CachedTags {
     }
 }
 
+#[derive(Debug)]
+pub struct FullTags<'a> {
+    pub concatenated: Option<&'a str>,
+    pub user_agent: Option<&'a str>,
+}
+
 /// Intermediate representation of an access log agnostic of the final format.
 /// Every field is a reference to avoid capturing ownership (as a logger should).
 pub struct RequestRecord<'a> {
-    pub error: &'a Option<&'a str>,
-    pub context: &'a LogContext<'a>,
-    pub session_address: &'a Option<SocketAddr>,
-    pub backend_address: &'a Option<SocketAddr>,
+    pub error: Option<&'a str>,
+    pub context: LogContext<'a>,
+    pub session_address: Option<SocketAddr>,
+    pub backend_address: Option<SocketAddr>,
     pub protocol: &'a str,
-    pub endpoint: &'a EndpointRecord<'a>,
-    pub tags: &'a Option<&'a CachedTags>,
-    pub client_rtt: &'a Option<Duration>,
-    pub server_rtt: &'a Option<Duration>,
-    pub user_agent: &'a Option<String>,
-    pub service_time: &'a Duration,
-    pub response_time: &'a Duration,
-    pub bytes_in: &'a usize,
-    pub bytes_out: &'a usize,
+    pub endpoint: EndpointRecord<'a>,
+    pub tags: Option<&'a CachedTags>,
+    pub client_rtt: Option<Duration>,
+    pub server_rtt: Option<Duration>,
+    pub user_agent: Option<&'a str>,
+    pub service_time: Duration,
+    pub response_time: Duration,
+    pub bytes_in: usize,
+    pub bytes_out: usize,
+
+    // added by the logger itself
+    pub pid: i32,
+    pub tag: &'a str,
+    pub level: LogLevel,
+    pub now: Rfc3339Time,
+    pub precise_time: i128,
 }
 
 impl RequestRecord<'_> {
+    pub fn full_tags(&self) -> FullTags {
+        FullTags {
+            concatenated: self.tags.as_ref().map(|t| t.concatenated.as_str()),
+            user_agent: self.user_agent,
+        }
+    }
+
     /// Converts the RequestRecord in its protobuf representation.
     /// Prost needs ownership over all the fields but we don't want to take it from the user
     /// or clone them, so we use the unsafe DuplicateOwnership.
-    pub unsafe fn into_protobuf_access_log(
-        self,
-        time: i128,
-        tag: &str,
-    ) -> ManuallyDrop<ProtobufAccessLog> {
+    pub unsafe fn into_binary_access_log(self) -> ManuallyDrop<ProtobufAccessLog> {
         let (low, high) = self.context.request_id.into();
         let request_id = Uint128 { low, high };
-        let time: Uint128 = time.into();
 
         let endpoint = match self.endpoint {
             EndpointRecord::Http {
@@ -136,33 +156,29 @@ impl RequestRecord<'_> {
                 path,
                 status,
                 reason,
-            } => crate::proto::command::protobuf_endpoint::Inner::Http(
-                crate::proto::command::HttpEndpoint {
-                    method: method.duplicate().duplicate(),
-                    authority: authority.duplicate().duplicate(),
-                    path: path.duplicate().duplicate(),
-                    status: status.map(|s| s as u32),
-                    reason: reason.duplicate().duplicate(),
-                },
-            ),
-            EndpointRecord::Tcp { context } => {
-                crate::proto::command::protobuf_endpoint::Inner::Tcp(TcpEndpoint {
-                    context: context.duplicate().duplicate(),
-                })
-            }
+            } => protobuf_endpoint::Inner::Http(HttpEndpoint {
+                method: method.duplicate(),
+                authority: authority.duplicate(),
+                path: path.duplicate(),
+                status: status.map(|s| s as u32),
+                reason: reason.duplicate(),
+            }),
+            EndpointRecord::Tcp { context } => protobuf_endpoint::Inner::Tcp(TcpEndpoint {
+                context: context.duplicate(),
+            }),
         };
 
         ManuallyDrop::new(ProtobufAccessLog {
             backend_address: self.backend_address.map(Into::into),
             backend_id: self.context.backend_id.duplicate(),
-            bytes_in: *self.bytes_in as u64,
-            bytes_out: *self.bytes_out as u64,
+            bytes_in: self.bytes_in as u64,
+            bytes_out: self.bytes_out as u64,
             client_rtt: self.client_rtt.map(|t| t.whole_microseconds() as u64),
             cluster_id: self.context.cluster_id.duplicate(),
             endpoint: ProtobufEndpoint {
                 inner: Some(endpoint),
             },
-            error: self.error.duplicate().duplicate(),
+            error: self.error.duplicate(),
             protocol: self.protocol.duplicate(),
             request_id,
             response_time: self.response_time.whole_microseconds() as u64,
@@ -174,8 +190,8 @@ impl RequestRecord<'_> {
                 .map(|tags| tags.tags.duplicate())
                 .unwrap_or_default(),
             user_agent: self.user_agent.duplicate(),
-            tag: tag.duplicate(),
-            time: time.duplicate(),
+            tag: self.tag.duplicate(),
+            time: self.precise_time.into(),
         })
     }
 }
