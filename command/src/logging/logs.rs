@@ -16,11 +16,12 @@ use mio::net::UnixDatagram;
 use prost::{encoding::encoded_len_varint, Message};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 
-use crate::proto::command::ProtobufAccessLogFormat;
-
-pub use crate::access_logs::*;
-
-use crate::{config::Config, proto::display::AsString};
+use crate::{
+    config::Config,
+    logging::{LogDuration, LogMessage, RequestRecord},
+    proto::command::ProtobufAccessLogFormat,
+    AsString,
+};
 
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
@@ -264,7 +265,7 @@ impl InnerLogger {
                     log.tag,
                 ],
                 standard: {
-                    formats: ["{} {}->{} {}/{}/{}/{} {}->{} [{}] {} {} | {:?}\n"],
+                    formats: ["{} {}->{} {}/{}/{}/{} {}->{} [{}] {} {}{}\n"],
                     args: [
                         log.context,
                         log.session_address.as_string_or("X"),
@@ -278,11 +279,11 @@ impl InnerLogger {
                         log.full_tags(),
                         log.protocol,
                         log.endpoint,
-                        log.error,
+                        LogMessage(log.message),
                     ]
                 },
                 colored: {
-                    formats: ["\x1b[;1m{}\x1b[m {}->{} {}/{}/{}/{} {}->{} \x1b[2m[{}] \x1b[;1m{} {}\x1b[m | {:?}\n"],
+                    formats: ["\x1b[;1m{}\x1b[m {}->{} {}/{}/{}/{} {}->{} \x1b[2m[{}] \x1b[;1m{} {}\x1b[m{}\n"],
                     args: @,
                 }
             },

@@ -204,7 +204,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         let endpoint = self.log_endpoint();
         metrics.register_end_of_session(&context);
         info_access!(
-            error: message,
+            message: message,
             context,
             session_address: self.get_session_address(),
             backend_address: self.get_backend_address(),

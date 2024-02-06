@@ -49,7 +49,7 @@
 //! 3. if a variable has not been set in the TOML file, it will be set to a default defined here
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    env,
+    env, fmt,
     fs::{create_dir_all, metadata, File},
     io::{ErrorKind, Read},
     net::SocketAddr,
@@ -1750,6 +1750,42 @@ impl Config {
             path_to_read: path.to_owned(),
             io_error,
         })
+    }
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("config_path", &self.config_path)
+            .field("command_socket", &self.command_socket)
+            .field("command_buffer_size", &self.command_buffer_size)
+            .field("max_command_buffer_size", &self.max_command_buffer_size)
+            .field("max_connections", &self.max_connections)
+            .field("min_buffers", &self.min_buffers)
+            .field("max_buffers", &self.max_buffers)
+            .field("buffer_size", &self.buffer_size)
+            .field("saved_state", &self.saved_state)
+            .field("automatic_state_save", &self.automatic_state_save)
+            .field("log_level", &self.log_level)
+            .field("log_target", &self.log_target)
+            .field("log_access_target", &self.log_access_target)
+            .field("log_access_format", &self.log_access_format)
+            .field("worker_count", &self.worker_count)
+            .field("worker_automatic_restart", &self.worker_automatic_restart)
+            .field("metrics", &self.metrics)
+            .field("disable_cluster_metrics", &self.disable_cluster_metrics)
+            .field("handle_process_affinity", &self.handle_process_affinity)
+            .field("ctl_command_timeout", &self.ctl_command_timeout)
+            .field("pid_file_path", &self.pid_file_path)
+            .field("activate_listeners", &self.activate_listeners)
+            .field("front_timeout", &self.front_timeout)
+            .field("back_timeout", &self.back_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("zombie_check_interval", &self.zombie_check_interval)
+            .field("accept_queue_timeout", &self.accept_queue_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("worker_timeout", &self.worker_timeout)
+            .finish()
     }
 }
 

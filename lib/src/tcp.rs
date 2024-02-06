@@ -198,7 +198,7 @@ impl TcpSession {
         let context = self.log_context();
         self.metrics.register_end_of_session(&context);
         info_access!(
-            error: None,
+            message: None,
             context,
             session_address: self.frontend_address,
             backend_address: None,

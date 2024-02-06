@@ -222,7 +222,7 @@
 //!     channel::Channel,
 //!     config::ListenerBuilder,
 //!     info,
-//!     logging::setup_logging,
+//!     logging::setup_default_logging,
 //!     proto::command::{
 //!         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
 //!         PathRule, Request, RequestHttpFrontend, RulePosition, SocketAddress,WorkerRequest,
@@ -230,7 +230,7 @@
 //! };
 //!
 //! fn main() -> anyhow::Result<()> {
-//!     setup_logging("stdout", true, None, None, None, "info", "EXAMPLE");
+//!     setup_default_logging(true, "info", "EXAMPLE");
 //!
 //!     info!("starting up");
 //!
@@ -360,13 +360,10 @@ use tls::CertificateResolverError;
 
 use sozu_command::{
     logging::{CachedTags, LogContext},
-    proto::{
-        command::{Cluster, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse},
-        display::AsStr,
-    },
+    proto::command::{Cluster, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse},
     ready::Ready,
     state::ClusterId,
-    ObjectKind,
+    AsStr, ObjectKind,
 };
 
 use crate::{backends::BackendMap, router::Route};

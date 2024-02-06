@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fmt::{self, Debug, Display, Formatter},
+    fmt::{self, Display, Formatter},
     net::SocketAddr,
 };
 
@@ -9,26 +9,23 @@ use time::format_description;
 use x509_parser::time::ASN1Time;
 
 use crate::{
-    access_logs::{prepare_user_agent, EndpointRecord, FullTags, LogContext, LogDuration},
-    config::Config,
-    logging::{LogLevel, LoggerBackend, Rfc3339Time},
     proto::{
         command::{
             filtered_metrics, protobuf_endpoint, request::RequestType,
             response_content::ContentType, AggregatedMetrics, AvailableMetrics, CertificateAndKey,
             CertificateSummary, CertificatesWithFingerprints, ClusterMetrics, FilteredMetrics,
-            ListOfCertificatesByAddress, ListedFrontends, ListenersList, ProtobufEndpoint,
-            QueryCertificatesFilters, RequestCounts, Response, ResponseContent, ResponseStatus,
-            RunState, SocketAddress, TlsVersion, WorkerInfos, WorkerMetrics, WorkerResponses,
+            HttpEndpoint, ListOfCertificatesByAddress, ListedFrontends, ListenersList,
+            ProtobufEndpoint, QueryCertificatesFilters, RequestCounts, Response, ResponseContent,
+            ResponseStatus, RunState, SocketAddress, TcpEndpoint, TlsVersion, WorkerInfos,
+            WorkerMetrics, WorkerResponses,
         },
         DisplayError,
     },
+    AsString,
 };
 
-use super::command::{HttpEndpoint, TcpEndpoint};
-
 impl Display for CertificateAndKey {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let versions = self.versions.iter().fold(String::new(), |acc, tls_v| {
             acc + " "
                 + match TlsVersion::try_from(*tls_v) {
@@ -46,13 +43,13 @@ impl Display for CertificateAndKey {
 }
 
 impl Display for CertificateSummary {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}:\t{}", self.fingerprint, self.domain)
     }
 }
 
 impl Display for QueryCertificatesFilters {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if let Some(d) = self.domain.clone() {
             write!(f, "domain:{}", d)
         } else if let Some(fp) = self.fingerprint.clone() {
@@ -950,44 +947,8 @@ fn create_cluster_table(headers: Vec<&str>, data: &BTreeMap<String, ResponseCont
     table
 }
 
-impl Debug for Config {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Config")
-            .field("config_path", &self.config_path)
-            .field("command_socket", &self.command_socket)
-            .field("command_buffer_size", &self.command_buffer_size)
-            .field("max_command_buffer_size", &self.max_command_buffer_size)
-            .field("max_connections", &self.max_connections)
-            .field("min_buffers", &self.min_buffers)
-            .field("max_buffers", &self.max_buffers)
-            .field("buffer_size", &self.buffer_size)
-            .field("saved_state", &self.saved_state)
-            .field("automatic_state_save", &self.automatic_state_save)
-            .field("log_level", &self.log_level)
-            .field("log_target", &self.log_target)
-            .field("log_access_target", &self.log_access_target)
-            .field("log_access_format", &self.log_access_format)
-            .field("worker_count", &self.worker_count)
-            .field("worker_automatic_restart", &self.worker_automatic_restart)
-            .field("metrics", &self.metrics)
-            .field("disable_cluster_metrics", &self.disable_cluster_metrics)
-            .field("handle_process_affinity", &self.handle_process_affinity)
-            .field("ctl_command_timeout", &self.ctl_command_timeout)
-            .field("pid_file_path", &self.pid_file_path)
-            .field("activate_listeners", &self.activate_listeners)
-            .field("front_timeout", &self.front_timeout)
-            .field("back_timeout", &self.back_timeout)
-            .field("connect_timeout", &self.connect_timeout)
-            .field("zombie_check_interval", &self.zombie_check_interval)
-            .field("accept_queue_timeout", &self.accept_queue_timeout)
-            .field("request_timeout", &self.request_timeout)
-            .field("worker_timeout", &self.worker_timeout)
-            .finish()
-    }
-}
-
 impl Display for SocketAddress {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", SocketAddr::from(self.clone()))
     }
 }
@@ -1013,177 +974,6 @@ impl Display for ProtobufEndpoint {
                 write!(f, "{}", context.as_string_or("-"))
             }
             None => Ok(()),
-        }
-    }
-}
-
-pub trait AsString {
-    fn as_string_or(&self, default: &'static str) -> String;
-}
-
-impl<T: ToString> AsString for Option<T> {
-    fn as_string_or(&self, default: &'static str) -> String {
-        match self {
-            None => default.to_string(),
-            Some(t) => t.to_string(),
-        }
-    }
-}
-
-pub trait AsStr {
-    fn as_str_or(&self, default: &'static str) -> &str;
-}
-
-impl<T: AsRef<str>> AsStr for Option<T> {
-    fn as_str_or(&self, default: &'static str) -> &str {
-        match self {
-            None => default,
-            Some(s) => s.as_ref(),
-        }
-    }
-}
-
-impl AsRef<str> for LoggerBackend {
-    fn as_ref(&self) -> &str {
-        match self {
-            LoggerBackend::Stdout(_) => "stdout",
-            LoggerBackend::Unix(_) => "UNIX socket",
-            LoggerBackend::Udp(_, _) => "UDP socket",
-            LoggerBackend::Tcp(_) => "TCP socket",
-            LoggerBackend::File(_) => "file",
-        }
-    }
-}
-
-impl LogLevel {
-    pub const fn as_str_access(&self) -> &'static str {
-        match self {
-            LogLevel::Error => "\x1b[;35;1mERROR-ACCESS",
-            LogLevel::Info => "\x1b[;35;1mINFO-ACCESS ",
-            _ => "\x1b[;35m???",
-        }
-        // match self {
-        //     LogLevel::Error => "ERROR",
-        //     LogLevel::Warn => "WARN",
-        //     LogLevel::Info => "INFO",
-        //     LogLevel::Debug => "DEBUG",
-        //     LogLevel::Trace => "TRACE",
-        // }
-    }
-    pub const fn as_str(&self, access: bool, colored: bool) -> &'static str {
-        match (self, access, colored) {
-            (LogLevel::Error, false, false) => "ERROR",
-            (LogLevel::Warn, false, false) => "WARN ",
-            (LogLevel::Info, false, false) => "INFO ",
-            (LogLevel::Debug, false, false) => "DEBUG",
-            (LogLevel::Trace, false, false) => "TRACE",
-
-            (LogLevel::Error, false, true) => "\x1b[;31;1mERROR",
-            (LogLevel::Warn, false, true) => "\x1b[;33;1mWARN ",
-            (LogLevel::Info, false, true) => "\x1b[;32;1mINFO ",
-            (LogLevel::Debug, false, true) => "\x1b[;34mDEBUG",
-            (LogLevel::Trace, false, true) => "\x1b[;90mTRACE",
-
-            (LogLevel::Error, true, false) => "ERROR-ACCESS",
-            (LogLevel::Info, true, false) => "INFO-ACCESS ",
-            (_, true, false) => "???",
-
-            (LogLevel::Error, true, true) => "\x1b[;35;1mERROR-ACCESS",
-            (LogLevel::Info, true, true) => "\x1b[;35;1mINFO-ACCESS ",
-            (_, true, true) => "\x1b[;35;1m???",
-        }
-    }
-}
-
-impl Display for Rfc3339Time {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
-        let t = self.inner;
-        write!(
-            f,
-            "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
-            t.year(),
-            t.month() as u8,
-            t.day(),
-            t.hour(),
-            t.minute(),
-            t.second(),
-            t.microsecond()
-        )
-    }
-}
-
-impl Display for LogDuration {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.0 {
-            None => write!(f, "-"),
-            Some(duration) => {
-                let secs = duration.whole_seconds();
-                if secs >= 10 {
-                    return write!(f, "{secs}s");
-                }
-
-                let ms = duration.whole_milliseconds();
-                if ms < 10 {
-                    let us = duration.whole_microseconds();
-                    if us >= 10 {
-                        return write!(f, "{us}μs");
-                    }
-
-                    let ns = duration.whole_nanoseconds();
-                    return write!(f, "{ns}ns");
-                }
-
-                write!(f, "{ms}ms")
-            }
-        }
-    }
-}
-
-impl Display for LogContext<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "[{} {} {}]",
-            self.request_id,
-            self.cluster_id.unwrap_or("-"),
-            self.backend_id.unwrap_or("-")
-        )
-    }
-}
-
-impl Display for EndpointRecord<'_> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            Self::Http {
-                method,
-                authority,
-                path,
-                status,
-                ..
-            } => write!(
-                f,
-                "{} {} {} -> {}",
-                authority.as_str_or("-"),
-                method.as_str_or("-"),
-                path.as_str_or("-"),
-                status.as_string_or("-"),
-            ),
-            Self::Tcp { context } => {
-                write!(f, "{}", context.as_str_or("-"))
-            }
-        }
-    }
-}
-
-impl<'a> Display for FullTags<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match (self.concatenated, self.user_agent) {
-            (None, None) => write!(f, "-"),
-            (Some(tags), None) => write!(f, "{tags}"),
-            (Some(tags), Some(ua)) if !tags.is_empty() => {
-                write!(f, "{tags}, user-agent={}", prepare_user_agent(ua))
-            }
-            (_, Some(ua)) => write!(f, "user-agent={}", prepare_user_agent(ua)),
         }
     }
 }

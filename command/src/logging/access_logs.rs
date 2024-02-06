@@ -51,17 +51,7 @@ impl<T> DuplicateOwnership for &[T] {
     }
 }
 
-pub fn prepare_user_agent(user_agent: &str) -> String {
-    let mut user_agent = user_agent.replace(' ', "_");
-    let mut ua_bytes = std::mem::take(&mut user_agent).into_bytes();
-    if let Some(last) = ua_bytes.last_mut() {
-        if *last == b',' {
-            *last = b'!'
-        }
-    }
-    unsafe { String::from_utf8_unchecked(ua_bytes) }
-}
-
+pub struct LogMessage<'a>(pub Option<&'a str>);
 pub struct LogDuration(pub Option<Duration>);
 
 #[derive(Debug)]
@@ -111,7 +101,7 @@ pub struct FullTags<'a> {
 /// Intermediate representation of an access log agnostic of the final format.
 /// Every field is a reference to avoid capturing ownership (as a logger should).
 pub struct RequestRecord<'a> {
-    pub error: Option<&'a str>,
+    pub message: Option<&'a str>,
     pub context: LogContext<'a>,
     pub session_address: Option<SocketAddr>,
     pub backend_address: Option<SocketAddr>,
@@ -178,7 +168,7 @@ impl RequestRecord<'_> {
             endpoint: ProtobufEndpoint {
                 inner: Some(endpoint),
             },
-            error: self.error.duplicate(),
+            error: self.message.duplicate(),
             protocol: self.protocol.duplicate(),
             request_id,
             response_time: self.response_time.whole_microseconds() as u64,
