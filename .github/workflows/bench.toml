@@ -1,0 +1,49 @@
+log_level = "error"
+log_target = "stdout"
+command_socket = "./sozu.sock"
+command_buffer_size = 16384
+max_command_buffer_size = 163840
+worker_count = 1
+worker_automatic_restart = true
+handle_process_affinity = false
+max_connections = 500
+buffer_size = 16393
+activate_listeners = true
+
+[[listeners]]
+protocol = "http"
+# listening address
+address = "0.0.0.0:8080"
+
+[[listeners]]
+protocol = "https"
+address = "0.0.0.0:8443"
+tls_versions = ["TLS_V12", "TLS_V13"]
+cipher_list = [
+    # TLS 1.3 cipher suites
+    "TLS13_AES_256_GCM_SHA384",
+    "TLS13_AES_128_GCM_SHA256",
+    "TLS13_CHACHA20_POLY1305_SHA256",
+    # TLS 1.2 cipher suites
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+]
+
+[clusters]
+[clusters.BenchCluster]
+
+protocol = "http"
+load_balancing = "ROUND_ROBIN"
+frontends = [
+    { address = "0.0.0.0:8080", hostname = "sozu.io"},
+    { address = "0.0.0.0:8443", hostname = "rsa-2048.sozu.io", certificate = "rsa-2048.pem", certificate_chain = "rsa-2048.pem", key = "rsa-2048.key"},
+    { address = "0.0.0.0:8443", hostname = "rsa-4096.sozu.io", certificate = "rsa-4096.pem", certificate_chain = "rsa-4096.pem", key = "rsa-4096.key"},
+    { address = "0.0.0.0:8443", hostname = "ecdsa.sozu.io", certificate = "ecdsa.pem", certificate_chain = "ecdsa.pem", key = "ecdsa.key"},
+]
+backends = [
+    { address = "0.0.0.0:4444"}
+]
