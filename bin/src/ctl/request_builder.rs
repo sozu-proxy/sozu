@@ -18,8 +18,8 @@ use sozu_command_lib::{
 
 use crate::{
     cli::{
-        BackendCmd, ClusterCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, LoggingLevel,
-        MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
+        BackendCmd, ClusterCmd, HttpFrontendCmd, HttpListenerCmd, HttpsListenerCmd, MetricsCmd,
+        TcpFrontendCmd, TcpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -484,8 +484,8 @@ impl CommandManager {
         )
     }
 
-    pub fn logging_filter(&mut self, filter: &LoggingLevel) -> Result<(), CtlError> {
-        self.send_request(RequestType::Logging(filter.to_string().to_lowercase()).into())
+    pub fn logging_filter(&mut self, filter: String) -> Result<(), CtlError> {
+        self.send_request(RequestType::Logging(filter).into())
     }
 
     pub fn add_certificate(

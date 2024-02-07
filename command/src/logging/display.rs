@@ -5,7 +5,7 @@ use crate::{
         EndpointRecord, FullTags, LogContext, LogDuration, LogLevel, LogMessage, LoggerBackend,
         Rfc3339Time,
     },
-    AsStr, AsString,
+    AsStr,
 };
 
 impl LogLevel {
@@ -122,11 +122,11 @@ impl fmt::Display for EndpointRecord<'_> {
                 ..
             } => write!(
                 f,
-                "{} {} {} -> {}",
+                "{} {} {} {}",
                 authority.as_str_or("-"),
                 method.as_str_or("-"),
                 path.as_str_or("-"),
-                status.as_string_or("-"),
+                display_status(*status, f.alternate()),
             ),
             Self::Tcp { context } => {
                 write!(f, "{}", context.as_str_or("-"))
@@ -135,10 +135,21 @@ impl fmt::Display for EndpointRecord<'_> {
     }
 }
 
+fn display_status(status: Option<u16>, pretty: bool) -> String {
+    match (status, pretty) {
+        (Some(s @ 200..=299), true) => format!("\x1b[32m{s}"),
+        (Some(s @ 300..=399), true) => format!("\x1b[34m{s}"),
+        (Some(s @ 400..=499), true) => format!("\x1b[33m{s}"),
+        (Some(s @ 500..=599), true) => format!("\x1b[31m{s}"),
+        (Some(s), _) => s.to_string(),
+        (None, _) => "-".to_string(),
+    }
+}
+
 impl<'a> fmt::Display for FullTags<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match (self.concatenated, self.user_agent) {
-            (None, None) => write!(f, "-"),
+            (None, None) => Ok(()),
             (Some(tags), None) => write!(f, "{tags}"),
             (Some(tags), Some(ua)) if !tags.is_empty() => {
                 write!(f, "{tags}, user-agent={}", prepare_user_agent(ua))

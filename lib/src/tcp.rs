@@ -34,7 +34,6 @@ use crate::{
     server::{push_event, ListenToken, SessionManager, CONN_RETRIES, TIMER},
     socket::{server_bind, stats::socket_rtt},
     sozu_command::{
-        logging,
         proto::command::{
             Event, EventKind, ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig,
             WorkerRequest, WorkerResponse,
@@ -1279,17 +1278,6 @@ impl ProxyConfiguration for TcpProxy {
             }
             RequestType::Status(_) => {
                 info!("{} status", message.id);
-                WorkerResponse::ok(message.id)
-            }
-            RequestType::Logging(logging_filter) => {
-                info!(
-                    "{} changing logging filter to {}",
-                    message.id, logging_filter
-                );
-                logging::LOGGER.with(|l| {
-                    let directives = logging::parse_logging_spec(&logging_filter);
-                    l.borrow_mut().set_directives(directives);
-                });
                 WorkerResponse::ok(message.id)
             }
             RequestType::AddCluster(cluster) => {

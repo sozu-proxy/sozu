@@ -128,7 +128,7 @@ impl Logger {
         access_format: Option<AccessLogFormat>,
         access_colored: Option<bool>,
     ) {
-        let directives = parse_logging_spec(spec);
+        let (directives, _errors) = parse_logging_spec(spec);
         LOGGER.with(|logger| {
             let mut logger = logger.borrow_mut();
             if !logger.initialized {
@@ -283,7 +283,7 @@ impl InnerLogger {
                     ]
                 },
                 colored: {
-                    formats: ["\x1b[;1m{}\x1b[m {}->{} {}/{}/{}/{} {}->{} \x1b[2m[{}] \x1b[;1m{} {}\x1b[m{}\n"],
+                    formats: ["\x1b[;1m{}\x1b[m {}->{} {}/{}/{}/{} {}->{} \x1b[2m[{}] \x1b[;1m{} {:#}\x1b[m{}\n"],
                     args: @,
                 }
             },
@@ -519,18 +519,25 @@ pub struct LogDirective {
     level: LogLevelFilter,
 }
 
-pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
+#[derive(thiserror::Error, Debug)]
+pub enum LogSpecParseError {
+    #[error("Too many '/'s: {0}")]
+    TooManySlashes(String),
+    #[error("Too many '='s: {0}")]
+    TooManyEquals(String),
+    #[error("Invalid log level: {0}")]
+    InvalidLogLevel(String),
+}
+
+pub fn parse_logging_spec(spec: &str) -> (Vec<LogDirective>, Vec<LogSpecParseError>) {
     let mut dirs = Vec::new();
+    let mut errors = Vec::new();
 
     let mut parts = spec.split('/');
     let mods = parts.next();
     let _ = parts.next();
     if parts.next().is_some() {
-        println!(
-            "warning: invalid logging spec '{spec}', \
-                 ignoring it (too many '/'s)"
-        );
-        return dirs;
+        errors.push(LogSpecParseError::TooManySlashes(spec.to_string()));
     }
     if let Some(m) = mods {
         for s in m.split(',') {
@@ -552,18 +559,12 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
                     (Some(part0), Some(part1), None) => match part1.parse() {
                         Ok(num) => (num, Some(part0)),
                         _ => {
-                            println!(
-                                "warning: invalid logging spec '{part1}', \
-                                 ignoring it"
-                            );
+                            errors.push(LogSpecParseError::InvalidLogLevel(s.to_string()));
                             continue;
                         }
                     },
                     _ => {
-                        println!(
-                            "warning: invalid logging spec '{s}', \
-                         ignoring it"
-                        );
+                        errors.push(LogSpecParseError::TooManyEquals(s.to_string()));
                         continue;
                     }
                 };
@@ -574,7 +575,10 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
         }
     }
 
-    dirs
+    for error in &errors {
+        println!("{error:?}");
+    }
+    (dirs, errors)
 }
 
 /// start the logger with all logs and access logs on stdout

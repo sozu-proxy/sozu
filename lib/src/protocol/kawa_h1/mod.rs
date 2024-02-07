@@ -1572,6 +1572,9 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         if self.frontend_readiness.event.is_hup() {
+            if !self.request_stream.is_initial() {
+                self.log_request_error(metrics, "Client disconnected abruptly");
+            }
             return SessionResult::Close;
         }
 

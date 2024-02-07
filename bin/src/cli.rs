@@ -130,8 +130,8 @@ pub enum SubCmd {
     },
     #[clap(name = "logging", about = "change logging level")]
     Logging {
-        #[clap(subcommand)]
-        level: LoggingLevel,
+        #[clap(name = "filter")]
+        filter: String,
     },
     #[clap(name = "state", about = "state management")]
     State {
@@ -229,28 +229,6 @@ pub enum MetricsCmd {
         )]
         no_clusters: bool,
     },
-}
-
-#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
-pub enum LoggingLevel {
-    #[clap(name = "trace", about = "Displays a LOT of logs")]
-    Trace,
-    #[clap(
-        name = "debug",
-        about = "Displays more logs about the inner workings of Sōzu"
-    )]
-    Debug,
-    #[clap(name = "error", about = "Displays occurring errors")]
-    Error,
-    #[clap(name = "warn", about = "Displays warnings about non-critical errors")]
-    Warn,
-    #[clap(name = "info", about = "Displays logs about normal behaviour of Sōzu")]
-    Info,
-}
-impl std::fmt::Display for LoggingLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]

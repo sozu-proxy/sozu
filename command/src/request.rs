@@ -66,16 +66,19 @@ impl Request {
             | RequestType::RemoveBackend(_)
             | RequestType::SoftStop(_)
             | RequestType::HardStop(_)
-            | RequestType::Status(_)
-            | RequestType::QueryClusterById(_)
-            | RequestType::QueryClustersByDomain(_)
-            | RequestType::QueryClustersHashes(_)
-            | RequestType::QueryMetrics(_)
-            | RequestType::Logging(_) => {
+            | RequestType::Status(_) => {
                 proxy_destination.to_http_proxy = true;
                 proxy_destination.to_https_proxy = true;
                 proxy_destination.to_tcp_proxy = true;
             }
+
+            // handled at worker level prior to this call
+            RequestType::ConfigureMetrics(_)
+            | RequestType::QueryMetrics(_)
+            | RequestType::Logging(_)
+            | RequestType::QueryClustersHashes(_)
+            | RequestType::QueryClusterById(_)
+            | RequestType::QueryClustersByDomain(_) => {}
 
             // the Add***Listener and other Listener orders will be handled separately
             // by the notify_proxys function, so we don't give them destinations
@@ -85,7 +88,6 @@ impl Request {
             | RequestType::RemoveListener(_)
             | RequestType::ActivateListener(_)
             | RequestType::DeactivateListener(_)
-            | RequestType::ConfigureMetrics(_)
             | RequestType::ReturnListenSockets(_) => {}
 
             // These won't ever reach a worker anyway

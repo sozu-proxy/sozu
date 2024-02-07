@@ -130,18 +130,18 @@ impl ConfigState {
             RequestType::RemoveBackend(backend) => self.remove_backend(backend),
 
             // This is to avoid the error message
-            &RequestType::Logging(_)
-            | &RequestType::CountRequests(_)
-            | &RequestType::Status(_)
-            | &RequestType::SoftStop(_)
-            | &RequestType::QueryCertificatesFromWorkers(_)
-            | &RequestType::QueryClusterById(_)
-            | &RequestType::QueryClustersByDomain(_)
-            | &RequestType::QueryMetrics(_)
-            | &RequestType::QueryClustersHashes(_)
-            | &RequestType::ConfigureMetrics(_)
-            | &RequestType::ReturnListenSockets(_)
-            | &RequestType::HardStop(_) => Ok(()),
+            RequestType::Logging(_)
+            | RequestType::CountRequests(_)
+            | RequestType::Status(_)
+            | RequestType::SoftStop(_)
+            | RequestType::QueryCertificatesFromWorkers(_)
+            | RequestType::QueryClusterById(_)
+            | RequestType::QueryClustersByDomain(_)
+            | RequestType::QueryMetrics(_)
+            | RequestType::QueryClustersHashes(_)
+            | RequestType::ConfigureMetrics(_)
+            | RequestType::ReturnListenSockets(_)
+            | RequestType::HardStop(_) => Ok(()),
 
             _other_request => Err(StateError::UndispatchableRequest),
         }

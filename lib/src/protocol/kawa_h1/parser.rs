@@ -76,7 +76,7 @@ impl AsRef<str> for Method {
             Self::Delete => "DELETE",
             Self::Trace => "TRACE",
             Self::Connect => "CONNECT",
-            Self::Custom(s) => &s,
+            Self::Custom(custom) => custom,
         }
     }
 }

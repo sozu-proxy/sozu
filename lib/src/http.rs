@@ -17,7 +17,7 @@ use rusty_ulid::Ulid;
 use time::{Duration, Instant};
 
 use sozu_command::{
-    logging::{self, CachedTags},
+    logging::CachedTags,
     proto::command::{
         request::RequestType, Cluster, HttpListenerConfig, ListenerType, RemoveListener,
         RequestHttpFrontend, WorkerRequest, WorkerResponse,
@@ -708,14 +708,6 @@ impl HttpProxy {
 
         Ok(())
     }
-
-    pub fn logging(&mut self, logging_filter: String) -> Result<(), ProxyError> {
-        logging::LOGGER.with(|l| {
-            let directives = logging::parse_logging_spec(&logging_filter);
-            l.borrow_mut().set_directives(directives);
-        });
-        Ok(())
-    }
 }
 
 impl HttpListener {
@@ -843,13 +835,6 @@ impl ProxyConfiguration for HttpProxy {
             Some(RequestType::Status(_)) => {
                 debug!("{} status", request_id);
                 Ok(())
-            }
-            Some(RequestType::Logging(logging_filter)) => {
-                debug!(
-                    "{} changing logging filter to {}",
-                    request_id, logging_filter
-                );
-                self.logging(logging_filter)
             }
             other_command => {
                 debug!(

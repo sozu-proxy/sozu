@@ -223,8 +223,8 @@ impl CommandHub {
         let channel = Channel::new(stream, 4096, u64::MAX);
         let id = self.next_client_id();
         let session = ClientSession::new(channel, id, token);
-        info!("register new client: {}", id);
-        debug!("new client: {:?}", session);
+        info!("Register new client: {}", id);
+        debug!("{:#?}", session);
         self.clients.insert(token, session);
     }
 
@@ -400,7 +400,8 @@ impl CommandHub {
                                     server.handle_client_request(client, request);
                                 }
                                 ClientResult::CloseSession => {
-                                    info!("Closing client {:#?}", client);
+                                    info!("Closing client {}", client.id);
+                                    debug!("{:#?}", client);
                                     self.event_subscribers.remove(&token);
                                     self.clients.remove(&token);
                                 }

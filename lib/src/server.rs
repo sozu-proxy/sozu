@@ -17,6 +17,7 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     channel::Channel,
+    logging,
     proto::command::{
         request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
         CertificatesWithFingerprints, Cluster, ClusterHashes, ClusterInformations,
@@ -673,7 +674,7 @@ impl Server {
                     Some(RequestType::ReturnListenSockets(_)) => {
                         info!("received ReturnListenSockets order");
                         match self.return_listen_sockets() {
-                            Ok(_) => push_queue(WorkerResponse::ok(request.id.clone())),
+                            Ok(_) => push_queue(WorkerResponse::ok(request.id)),
                             Err(error) => push_queue(worker_response_error(
                                 request.id,
                                 format!("Could not send listeners on scm socket: {error:?}"),
@@ -871,18 +872,47 @@ impl Server {
     }
 
     fn notify(&mut self, message: WorkerRequest) {
-        if let Some(RequestType::ConfigureMetrics(configuration)) = &message.content.request_type {
-            if let Ok(metrics_config) = MetricsConfiguration::try_from(*configuration) {
+        match &message.content.request_type {
+            Some(RequestType::ConfigureMetrics(configuration)) => {
+                match MetricsConfiguration::try_from(*configuration) {
+                    Ok(metrics_config) => {
+                        METRICS.with(|metrics| {
+                            (*metrics.borrow_mut()).configure(&metrics_config);
+                            push_queue(WorkerResponse::ok(message.id));
+                        });
+                    }
+                    Err(e) => {
+                        error!("Error configuring metrics: {}", e);
+                        push_queue(WorkerResponse::error(message.id, e));
+                    }
+                }
+                return;
+            }
+            Some(RequestType::QueryMetrics(query_metrics_options)) => {
                 METRICS.with(|metrics| {
-                    (*metrics.borrow_mut()).configure(&metrics_config);
-
-                    push_queue(WorkerResponse::ok(message.id.clone()));
+                    match (*metrics.borrow_mut()).query(query_metrics_options) {
+                        Ok(c) => push_queue(WorkerResponse::ok_with_content(message.id, c)),
+                        Err(e) => {
+                            error!("Error querying metrics: {}", e);
+                            push_queue(WorkerResponse::error(message.id, e))
+                        }
+                    }
                 });
                 return;
             }
-        }
-
-        match &message.content.request_type {
+            Some(RequestType::Logging(logging_filter)) => {
+                info!(
+                    "{} changing logging filter to {}",
+                    message.id, logging_filter
+                );
+                // there should not be any errors as it was already parsed by the main process
+                let (directives, _errors) = logging::parse_logging_spec(logging_filter);
+                logging::LOGGER.with(|logger| {
+                    logger.borrow_mut().set_directives(directives);
+                });
+                push_queue(WorkerResponse::ok(message.id));
+                return;
+            }
             Some(RequestType::QueryClustersHashes(_)) => {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
@@ -943,15 +973,6 @@ impl Server {
                 // if all certificates are queried, or filtered by domain name,
                 // the request will be handled by the https proxy
             }
-            Some(RequestType::QueryMetrics(query_metrics_options)) => {
-                METRICS.with(|metrics| {
-                    match (*metrics.borrow_mut()).query(query_metrics_options) {
-                        Ok(c) => push_queue(WorkerResponse::ok_with_content(message.id.clone(), c)),
-                        Err(e) => error!("Error querying metrics: {}", e),
-                    }
-                });
-                return;
-            }
             _other_request => {}
         }
         self.notify_proxys(message);
@@ -1003,10 +1024,10 @@ impl Server {
 
         match request.content.request_type {
             // special case for adding listeners, because we need to register a listener
-            Some(RequestType::AddHttpListener(ref listener)) => {
+            Some(RequestType::AddHttpListener(listener)) => {
                 push_queue(self.notify_add_http_listener(&req_id, listener));
             }
-            Some(RequestType::AddHttpsListener(ref listener)) => {
+            Some(RequestType::AddHttpsListener(listener)) => {
                 push_queue(self.notify_add_https_listener(&req_id, listener));
             }
             Some(RequestType::AddTcpListener(listener)) => {
@@ -1016,10 +1037,10 @@ impl Server {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
                 self.base_sessions_count -= 1;
                 let response = match ListenerType::try_from(remove.proxy) {
-                    Ok(ListenerType::Http) => self.http.borrow_mut().notify(request.clone()),
-                    Ok(ListenerType::Https) => self.https.borrow_mut().notify(request.clone()),
-                    Ok(ListenerType::Tcp) => self.tcp.borrow_mut().notify(request.clone()),
-                    Err(_) => worker_response_error(req_id, "Wrong variant ListenerType"),
+                    Ok(ListenerType::Http) => self.http.borrow_mut().notify(request),
+                    Ok(ListenerType::Https) => self.https.borrow_mut().notify(request),
+                    Ok(ListenerType::Tcp) => self.tcp.borrow_mut().notify(request),
+                    Err(_) => WorkerResponse::error(req_id, "Wrong variant ListenerType"),
                 };
                 push_queue(response);
             }
@@ -1072,7 +1093,7 @@ impl Server {
     fn notify_add_http_listener(
         &mut self,
         req_id: &str,
-        listener: &HttpListenerConfig,
+        listener: HttpListenerConfig,
     ) -> WorkerResponse {
         debug!("{} add http listener {:?}", req_id, listener);
 
@@ -1084,7 +1105,7 @@ impl Server {
         let entry = session_manager.slab.vacant_entry();
         let token = Token(entry.key());
 
-        match self.http.borrow_mut().add_listener(listener.clone(), token) {
+        match self.http.borrow_mut().add_listener(listener, token) {
             Ok(_token) => {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::HTTPListen,
@@ -1099,7 +1120,7 @@ impl Server {
     fn notify_add_https_listener(
         &mut self,
         req_id: &str,
-        listener: &HttpsListenerConfig,
+        listener: HttpsListenerConfig,
     ) -> WorkerResponse {
         debug!("{} add https listener {:?}", req_id, listener);
 
@@ -1293,12 +1314,14 @@ impl Server {
                 let (token, mut listener) =
                     match self.https.borrow_mut().give_back_listener(address) {
                         Ok((token, listener)) => (token, listener),
-                        Err(e) => return worker_response_error(
-                            req_id,
-                            format!(
+                        Err(e) => {
+                            return worker_response_error(
+                                req_id,
+                                format!(
                                 "Couldn't deactivate HTTPS listener at address {address:?}: {e}",
                             ),
-                        ),
+                            )
+                        }
                     };
                 if let Err(e) = self.poll.registry().deregister(&mut listener) {
                     error!(

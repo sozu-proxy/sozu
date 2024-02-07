@@ -23,9 +23,9 @@ pub enum ScmSocketError {
         blocking: bool,
         error: std::io::Error,
     },
-    #[error("could not send message per SCM socket: {0}")]
+    #[error("could not send message for SCM socket: {0}")]
     Send(String),
-    #[error("could not send message per SCM socket: {0}")]
+    #[error("could not receive message for SCM socket: {0}")]
     Receive(String),
     #[error("invalid char set: {0}")]
     InvalidCharSet(String),
