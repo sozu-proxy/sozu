@@ -87,7 +87,35 @@ jobs:
         with:
           name: sozu
           path: target/release/sozu
-      
+
+  build-bench-logger:
+    name: Build bench_logger 🦀
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install protobuf compiler
+        run:  sudo apt-get install -y protobuf-compiler
+
+      - name: Install rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: true
+          prefix-key: "sozu"
+
+      - name: Build Sozu bench logger (for benchmarking)
+        run: cargo build --release --example bench_logger
+
+      - name: 📤 Upload sozu bench logger
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench_logger
+          path: target/release/examples/bench_logger
+
   bench:
       name: Benchmark 🎯
       runs-on: ubuntu-latest
@@ -154,8 +182,36 @@ jobs:
           chmod +x bombardier
           chmod +x lagging_server
           chmod +x sozu
-      
+
       - name: ⚡ Launch bench
         working-directory: .github/workflows
-        run:
-          python bench.py
+        run: python bench.py
+
+  bench-logs:
+      name: benchmark the logger
+      runs-on: ubuntu-latest
+      needs: [build-sozu, build-bench-logger]
+      steps:
+      - uses: actions/checkout@v4
+
+      - name: 📥 Download sozu
+        uses: actions/download-artifact@v4
+        with:
+          name: sozu
+          path: .github/workflows
+
+      - name: 📥 Download sozu bench logger
+        uses: actions/download-artifact@v4
+        with:
+          name: bench_logger
+          path: .github/workflows
+
+      - name: Fix rights
+        working-directory: .github/workflows
+        run: |
+          chmod +x sozu
+          chmod +x bench_logger
+
+      - name: Bench the logs
+        working-directory: .github/workflows
+        run: python bench_logs.py
