@@ -28,7 +28,8 @@ use rustls::{
         },
         CryptoProvider,
     },
-    CipherSuite, ProtocolVersion, ServerConfig, ServerConnection, SupportedCipherSuite,
+    CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
+    SupportedCipherSuite,
 };
 use rusty_ulid::Ulid;
 use time::{Duration, Instant};
@@ -41,11 +42,10 @@ use sozu_command::{
         request::RequestType, response_content::ContentType, AddCertificate, CertificateSummary,
         CertificatesByAddress, Cluster, HttpsListenerConfig, ListOfCertificatesByAddress,
         ListenerType, RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        ResponseContent, TlsVersion,
+        ResponseContent, TlsVersion, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
-    request::WorkerRequest,
-    response::{HttpFrontend, WorkerResponse},
+    response::HttpFrontend,
     state::ClusterId,
 };
 
@@ -530,7 +530,7 @@ pub struct HttpsListener {
     fronts: Router,
     listener: Option<MioTcpListener>,
     resolver: Arc<MutexWrappedCertificateResolver>,
-    rustls_details: Arc<ServerConfig>,
+    rustls_details: Arc<RustlsServerConfig>,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
@@ -706,7 +706,7 @@ impl HttpsListener {
     pub fn create_rustls_context(
         config: &HttpsListenerConfig,
         resolver: Arc<MutexWrappedCertificateResolver>,
-    ) -> Result<ServerConfig, ListenerError> {
+    ) -> Result<RustlsServerConfig, ListenerError> {
         let cipher_names = if config.cipher_list.is_empty() {
             DEFAULT_CIPHER_SUITES.to_vec()
         } else {
@@ -759,7 +759,7 @@ impl HttpsListener {
             ..ring::default_provider()
         };
 
-        let mut server_config = ServerConfig::builder_with_provider(provider.into())
+        let mut server_config = RustlsServerConfig::builder_with_provider(provider.into())
             .with_protocol_versions(&versions[..])
             .map_err(|err| ListenerError::BuildRustls(err.to_string()))?
             .with_no_client_auth()
@@ -1594,7 +1594,7 @@ mod tests {
         let address = SocketAddress::new_v4(127, 0, 0, 1, 1032);
         let resolver = Arc::new(MutexWrappedCertificateResolver::default());
 
-        let server_config = ServerConfig::builder_with_protocol_versions(&[
+        let server_config = RustlsServerConfig::builder_with_protocol_versions(&[
             &rustls::version::TLS12,
             &rustls::version::TLS13,
         ])

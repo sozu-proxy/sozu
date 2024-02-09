@@ -2,14 +2,15 @@ use std::fmt::Debug;
 
 use libc::pid_t;
 use mio::Token;
-use serde::{de::DeserializeOwned, Serialize};
+use prost::Message;
 
 use sozu_command_lib::{
     channel::Channel,
-    proto::command::{Request, Response, ResponseContent, ResponseStatus, RunState, WorkerInfo},
+    proto::command::{
+        Request, Response, ResponseContent, ResponseStatus, RunState, WorkerInfo, WorkerRequest,
+        WorkerResponse,
+    },
     ready::Ready,
-    request::WorkerRequest,
-    response::WorkerResponse,
     scm_socket::ScmSocket,
 };
 
@@ -264,8 +265,8 @@ impl WorkerSession {
 /// read and parse messages (Requests or Responses) from the channel
 pub fn extract_messages<Tx, Rx>(channel: &mut Channel<Tx, Rx>) -> Vec<Rx>
 where
-    Tx: Debug + Serialize,
-    Rx: Debug + DeserializeOwned,
+    Tx: Debug + Default + Message,
+    Rx: Debug + Default + Message,
 {
     let mut messages = Vec::new();
     loop {

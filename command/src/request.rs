@@ -2,24 +2,23 @@ use std::{
     error,
     fmt::{self, Display},
     fs::File,
-    io::Read,
+    io::{BufReader, Read},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
 };
 
-use nom::{HexDisplay, Offset};
+use prost::{DecodeError, Message};
 
 use crate::{
-    buffer::fixed::Buffer,
-    parser::parse_several_requests,
     proto::{
         command::{
-            ip_address, request::RequestType, IpAddress, LoadBalancingAlgorithms, PathRuleKind,
-            Request, RequestHttpFrontend, RulePosition, SocketAddress, Uint128,
+            ip_address, request::RequestType, InitialState, IpAddress, LoadBalancingAlgorithms,
+            PathRuleKind, Request, RequestHttpFrontend, RulePosition, SocketAddress, Uint128,
+            WorkerRequest,
         },
         display::format_request_type,
     },
-    response::{HttpFrontend, MessageId},
+    response::HttpFrontend,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -27,9 +26,9 @@ pub enum RequestError {
     #[error("invalid value {value} for field '{name}'")]
     InvalidValue { name: String, value: i32 },
     #[error("Could not read requests from file: {0}")]
-    FileError(std::io::Error),
-    #[error("Could not parse requests: {0}")]
-    ParseError(String),
+    ReadFile(std::io::Error),
+    #[error("Could not decode requests: {0}")]
+    Decode(DecodeError),
 }
 
 impl Request {
@@ -122,13 +121,6 @@ impl Request {
     }
 }
 
-/// This is sent only from Sōzu to Sōzu
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, Deserialize)]
-pub struct WorkerRequest {
-    pub id: MessageId,
-    pub content: Request,
-}
-
 impl WorkerRequest {
     pub fn new(id: String, content: Request) -> Self {
         Self { id, content }
@@ -141,51 +133,18 @@ impl fmt::Display for WorkerRequest {
     }
 }
 
-pub fn read_requests_from_file(file: &mut File) -> Result<Vec<WorkerRequest>, RequestError> {
-    let mut acc = Vec::new();
-    let mut buffer = Buffer::with_capacity(200000);
-    loop {
-        let previous = buffer.available_data();
+pub fn read_initial_state_from_file(file: &mut File) -> Result<InitialState, RequestError> {
+    let mut buf_reader = BufReader::new(file);
+    read_initial_state(&mut buf_reader)
+}
 
-        let bytes_read = file.read(buffer.space()).map_err(RequestError::FileError)?;
+pub fn read_initial_state<R: Read>(reader: &mut R) -> Result<InitialState, RequestError> {
+    let mut buffer = Vec::new();
+    reader
+        .read_to_end(&mut buffer)
+        .map_err(RequestError::ReadFile)?;
 
-        buffer.fill(bytes_read);
-
-        if buffer.available_data() == 0 {
-            trace!("read_requests_from_file: empty buffer");
-            break;
-        }
-
-        let mut offset = 0usize;
-        match parse_several_requests::<WorkerRequest>(buffer.data()) {
-            Ok((i, requests)) => {
-                if !i.is_empty() {
-                    trace!("read_requests_from_file: could not parse {} bytes", i.len());
-                    if previous == buffer.available_data() {
-                        break;
-                    }
-                }
-                offset = buffer.data().offset(i);
-
-                acc.push(requests);
-            }
-            Err(nom::Err::Incomplete(_)) => {
-                if buffer.available_data() == buffer.capacity() {
-                    error!(
-                        "read_requests_from_file: message too big, stopping parsing:\n{}",
-                        buffer.data().to_hex(16)
-                    );
-                    break;
-                }
-            }
-            Err(parse_error) => {
-                return Err(RequestError::ParseError(parse_error.to_string()));
-            }
-        }
-        buffer.consume(offset);
-    }
-    let requests = acc.into_iter().flatten().collect();
-    Ok(requests)
+    InitialState::decode(&buffer[..]).map_err(RequestError::Decode)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

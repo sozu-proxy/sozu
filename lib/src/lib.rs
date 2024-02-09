@@ -53,8 +53,7 @@
 //! ```ignore
 //! use sozu_command_lib::{
 //!     channel::Channel,
-//!     request::WorkerRequest,
-//!     response::WorkerResponse,
+//!     proto::command::{WorkerRequest, WorkerResponse},
 //! };
 //!
 //! let (mut command_channel, proxy_channel): (
@@ -167,8 +166,7 @@
 //!
 //! ```ignore
 //! use sozu_command_lib::{
-//!     proto::command::{Request, request::RequestType},
-//!     request::WorkerRequest,
+//!     proto::command::{Request, request::RequestType, WorkerRequest},
 //! };
 //!
 //! command_channel
@@ -227,9 +225,8 @@
 //!     logging::setup_logging,
 //!     proto::command::{
 //!         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
-//!         PathRule, Request, RequestHttpFrontend, RulePosition, SocketAddress,
+//!         PathRule, Request, RequestHttpFrontend, RulePosition, SocketAddress,WorkerRequest,
 //!     },
-//!     request::WorkerRequest,
 //! };
 //!
 //! fn main() -> anyhow::Result<()> {
@@ -361,10 +358,8 @@ use time::{Duration, Instant};
 use tls::CertificateResolverError;
 
 use sozu_command::{
-    proto::command::{Cluster, ListenerType, RequestHttpFrontend},
+    proto::command::{Cluster, ListenerType, RequestHttpFrontend, WorkerRequest, WorkerResponse},
     ready::Ready,
-    request::WorkerRequest,
-    response::WorkerResponse,
     state::ClusterId,
     ObjectKind,
 };
@@ -1121,7 +1116,9 @@ pub mod testing {
     pub use mio::{net::UnixStream, Poll, Registry, Token};
     pub use slab::Slab;
     pub use sozu_command::{
-        proto::command::{HttpListenerConfig, HttpsListenerConfig, TcpListenerConfig},
+        proto::command::{
+            HttpListenerConfig, HttpsListenerConfig, ServerConfig, TcpListenerConfig,
+        },
         scm_socket::{Listeners, ScmSocket},
     };
 
@@ -1131,7 +1128,7 @@ pub mod testing {
         https::HttpsProxy,
         pool::Pool,
         server::Server,
-        server::{ListenSession, ProxyChannel, ServerConfig, SessionManager},
+        server::{ListenSession, ProxyChannel, SessionManager},
         tcp::TcpProxy,
         Protocol, ProxySession,
     };
@@ -1157,7 +1154,7 @@ pub mod testing {
         let event_loop = Poll::new().with_context(|| "Failed at creating event loop")?;
         let backends = Rc::new(RefCell::new(BackendMap::new()));
         let server_config = ServerConfig {
-            max_connections: max_buffers,
+            max_connections: max_buffers as u64,
             ..Default::default()
         };
 

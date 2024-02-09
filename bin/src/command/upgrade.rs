@@ -8,8 +8,8 @@ use sozu_command_lib::{
     config::Config,
     proto::command::{
         request::RequestType, ResponseStatus, ReturnListenSockets, RunState, SoftStop,
+        WorkerResponse,
     },
-    response::WorkerResponse,
     state::ConfigState,
 };
 
@@ -236,8 +236,8 @@ impl Gatherer for UpgradeWorkerTask {
         worker_id: WorkerId,
         message: WorkerResponse,
     ) {
-        match message.status {
-            ResponseStatus::Ok => {
+        match ResponseStatus::try_from(message.status) {
+            Ok(ResponseStatus::Ok) => {
                 self.ok += 1;
                 match self.progress {
                     UpgradeWorkerProgress::RequestingListenSockets { .. } => {}
@@ -249,11 +249,12 @@ impl Gatherer for UpgradeWorkerTask {
                     }
                 }
             }
-            ResponseStatus::Failure => self.errors += 1,
-            ResponseStatus::Processing => client.return_processing(format!(
+            Ok(ResponseStatus::Failure) => self.errors += 1,
+            Ok(ResponseStatus::Processing) => client.return_processing(format!(
                 "Worker {} is processing {}. {}",
                 worker_id, message.id, message.message
             )),
+            Err(e) => warn!("error decoding response status: {}", e),
         }
         self.responses.push((worker_id, message));
     }

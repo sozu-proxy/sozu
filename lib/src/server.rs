@@ -17,17 +17,15 @@ use time::{Duration, Instant};
 
 use sozu_command::{
     channel::Channel,
-    config::Config,
     proto::command::{
         request::RequestType, response_content::ContentType, ActivateListener, AddBackend,
         CertificatesWithFingerprints, Cluster, ClusterHashes, ClusterInformations,
-        DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, ListenerType,
-        LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend, Request,
-        ResponseStatus, TcpListenerConfig as CommandTcpListener,
+        DeactivateListener, Event, HttpListenerConfig, HttpsListenerConfig, InitialState,
+        ListenerType, LoadBalancingAlgorithms, LoadMetric, MetricsConfiguration, RemoveBackend,
+        Request, ResponseStatus, ServerConfig, TcpListenerConfig as CommandTcpListener,
+        WorkerRequest, WorkerResponse,
     },
     ready::Ready,
-    request::WorkerRequest,
-    response::{MessageId, WorkerResponse},
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
     state::ConfigState,
 };
@@ -67,7 +65,7 @@ pub fn push_event(event: Event) {
         (*queue.borrow_mut()).push_back(WorkerResponse {
             id: "EVENT".to_string(),
             message: String::new(),
-            status: ResponseStatus::Processing,
+            status: ResponseStatus::Processing.into(),
             content: Some(ContentType::Event(event).into()),
         });
     });
@@ -99,45 +97,6 @@ impl From<usize> for SessionToken {
 impl From<SessionToken> for usize {
     fn from(val: SessionToken) -> usize {
         val.0
-    }
-}
-
-pub struct ServerConfig {
-    pub max_connections: usize,
-    pub front_timeout: u32,
-    pub back_timeout: u32,
-    pub connect_timeout: u32,
-    pub zombie_check_interval: u32,
-    pub accept_queue_timeout: u32,
-}
-
-impl ServerConfig {
-    pub fn from_config(config: &Config) -> ServerConfig {
-        ServerConfig {
-            max_connections: config.max_connections,
-            front_timeout: config.front_timeout,
-            back_timeout: config.back_timeout,
-            connect_timeout: config.connect_timeout,
-            zombie_check_interval: config.zombie_check_interval,
-            accept_queue_timeout: config.accept_queue_timeout,
-        }
-    }
-
-    fn slab_capacity(&self) -> usize {
-        10 + 2 * self.max_connections
-    }
-}
-
-impl Default for ServerConfig {
-    fn default() -> ServerConfig {
-        ServerConfig {
-            max_connections: 10000,
-            front_timeout: 60,
-            back_timeout: 30,
-            connect_timeout: 3,
-            zombie_check_interval: 30 * 60,
-            accept_queue_timeout: 60,
-        }
     }
 }
 
@@ -274,7 +233,7 @@ pub struct Server {
     scm: ScmSocket,
     sessions: Rc<RefCell<SessionManager>>,
     should_poll_at: Option<Instant>,
-    shutting_down: Option<MessageId>,
+    shutting_down: Option<String>,
     tcp: Rc<RefCell<tcp::TcpProxy>>,
     zombie_check_interval: Duration,
 }
@@ -283,24 +242,23 @@ impl Server {
     pub fn try_new_from_config(
         worker_to_main_channel: ProxyChannel,
         worker_to_main_scm: ScmSocket,
-        config: Config,
-        initial_state: Vec<WorkerRequest>,
+        config: ServerConfig,
+        initial_state: InitialState,
         expects_initial_status: bool,
     ) -> Result<Self, ServerError> {
         let event_loop = Poll::new().map_err(ServerError::CreatePoll)?;
         let pool = Rc::new(RefCell::new(Pool::with_capacity(
-            config.min_buffers,
-            config.max_buffers,
-            config.buffer_size,
+            config.min_buffers as usize,
+            config.max_buffers as usize,
+            config.buffer_size as usize,
         )));
         let backends = Rc::new(RefCell::new(BackendMap::new()));
-        let server_config = ServerConfig::from_config(&config);
 
         //FIXME: we will use a few entries for the channel, metrics socket and the listeners
         //FIXME: for HTTP/2, we will have more than 2 entries per session
         let sessions: Rc<RefCell<SessionManager>> = SessionManager::new(
-            Slab::with_capacity(server_config.slab_capacity()),
-            server_config.max_connections,
+            Slab::with_capacity(config.slab_capacity() as usize),
+            config.max_connections as usize,
         );
         {
             let mut s = sessions.borrow_mut();
@@ -345,7 +303,7 @@ impl Server {
             None,
             Some(https),
             None,
-            server_config,
+            config,
             Some(initial_state),
             expects_initial_status,
         )
@@ -363,7 +321,7 @@ impl Server {
         https: Option<https::HttpsProxy>,
         tcp: Option<tcp::TcpProxy>,
         server_config: ServerConfig,
-        initial_state: Option<Vec<WorkerRequest>>,
+        initial_state: Option<InitialState>,
         expects_initial_status: bool,
     ) -> Result<Self, ServerError> {
         FEATURES.with(|_features| {
@@ -455,8 +413,8 @@ impl Server {
         };
 
         // initialize the worker with the state we got from a file
-        if let Some(requests) = initial_state {
-            for request in requests {
+        if let Some(state) = initial_state {
+            for request in state.requests {
                 trace!("generating initial config request: {:#?}", request);
                 server.notify_proxys(request);
             }
@@ -702,7 +660,9 @@ impl Server {
         }
 
         loop {
-            match self.channel.read_message() {
+            let request = self.channel.read_message();
+            debug!("Received request {:?}", request);
+            match request {
                 Ok(request) => match request.content.request_type {
                     Some(RequestType::HardStop(_)) => {
                         let req_id = request.id.clone();
@@ -894,10 +854,11 @@ impl Server {
             QUEUE.with(|q| {
                 let mut queue = q.borrow_mut();
                 loop {
-                    if let Some(msg) = queue.pop_front() {
-                        if let Err(e) = self.channel.write_message(&msg) {
-                            error!("Could not write message {} on the channel: {}", msg, e);
-                            queue.push_front(msg);
+                    if let Some(resp) = queue.pop_front() {
+                        debug!("Sending response {:?}", resp);
+                        if let Err(e) = self.channel.write_message(&resp) {
+                            error!("Could not write message {} on the channel: {}", resp, e);
+                            queue.push_front(resp);
                         }
                     }
 
@@ -948,9 +909,8 @@ impl Server {
                     ContentType::Clusters(ClusterInformations {
                         vec: self
                             .config_state
-                            .cluster_state(cluster_id)
-                            .into_iter()
-                            .collect(),
+                            .cluster_state(&cluster_id)
+                            .map_or(vec![], |ci| vec![ci]),
                     })
                     .into(),
                 ));

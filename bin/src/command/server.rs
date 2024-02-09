@@ -22,11 +22,9 @@ use sozu_command_lib::{
     config::Config,
     proto::command::{
         request::RequestType, response_content::ContentType, Request, ResponseContent,
-        ResponseStatus, RunState, Status,
+        ResponseStatus, RunState, Status, WorkerRequest, WorkerResponse,
     },
     ready::Ready,
-    request::WorkerRequest,
-    response::WorkerResponse,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
     state::ConfigState,
 };
@@ -155,13 +153,14 @@ impl Gatherer for DefaultGatherer {
         worker_id: WorkerId,
         message: WorkerResponse,
     ) {
-        match message.status {
-            ResponseStatus::Ok => self.ok += 1,
-            ResponseStatus::Failure => self.errors += 1,
-            ResponseStatus::Processing => client.return_processing(format!(
+        match ResponseStatus::try_from(message.status) {
+            Ok(ResponseStatus::Ok) => self.ok += 1,
+            Ok(ResponseStatus::Failure) => self.errors += 1,
+            Ok(ResponseStatus::Processing) => client.return_processing(format!(
                 "Worker {} is processing {}. {}",
                 worker_id, message.id, message.message
             )),
+            Err(e) => warn!("error decoding response status: {}", e),
         }
         self.responses.push((worker_id, message));
     }
@@ -221,7 +220,7 @@ impl CommandHub {
         if let Err(err) = self.register(token, &mut stream) {
             error!("Could not register client: {}", err);
         }
-        let channel = Channel::new(stream, 4096, usize::MAX);
+        let channel = Channel::new(stream, 4096, u64::MAX);
         let id = self.next_client_id();
         let session = ClientSession::new(channel, id, token);
         info!("register new client: {}", id);

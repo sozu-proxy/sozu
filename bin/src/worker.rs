@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::Error as IoError,
     io::Seek,
+    net::SocketAddr,
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
     os::unix::process::CommandExt,
     process::Command,
@@ -25,13 +26,14 @@ use tempfile::tempfile;
 use sozu_command_lib::{
     channel::{Channel, ChannelError},
     config::Config,
-    logging::setup_logging_with_config,
+    logging::setup_logging,
+    proto::command::{ServerConfig, WorkerRequest, WorkerResponse},
     ready::Ready,
-    request::{read_requests_from_file, RequestError, WorkerRequest},
-    response::WorkerResponse,
+    request::{read_initial_state_from_file, RequestError},
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
     state::{ConfigState, StateError},
 };
+
 use sozu_lib::{
     metrics::{self, MetricError},
     server::{Server, ServerError as LibServerError},
@@ -84,10 +86,10 @@ pub fn begin_worker_process(
     worker_to_main_scm_fd: i32,
     configuration_state_fd: i32,
     id: i32,
-    command_buffer_size: usize,
-    max_command_buffer_size: usize,
+    command_buffer_size: u64,
+    max_command_buffer_size: u64,
 ) -> Result<(), WorkerError> {
-    let mut worker_to_main_channel: Channel<WorkerResponse, Config> = Channel::new(
+    let mut worker_to_main_channel: Channel<WorkerResponse, ServerConfig> = Channel::new(
         unsafe { UnixStream::from_raw_fd(worker_to_main_channel_fd) },
         command_buffer_size,
         max_command_buffer_size,
@@ -109,7 +111,12 @@ pub fn begin_worker_process(
     let worker_id = format!("{}-{:02}", "WRK", id);
 
     // do not try to log anything before this, or the logger will panic
-    setup_logging_with_config(&worker_config, &worker_id);
+    setup_logging(
+        &worker_config.log_target,
+        worker_config.log_access_target.as_deref(),
+        &worker_config.log_level,
+        &worker_id,
+    );
 
     trace!(
         "Creating worker {} with config: {:#?}",
@@ -117,7 +124,8 @@ pub fn begin_worker_process(
         worker_config
     );
     info!("worker {} starting...", id);
-    let initial_state = read_requests_from_file(&mut configuration_state_file)
+
+    let initial_state = read_initial_state_from_file(&mut configuration_state_file)
         .map_err(WorkerError::ReadRequestsFromFile)?;
 
     worker_to_main_channel
@@ -132,8 +140,12 @@ pub fn begin_worker_process(
     worker_to_main_channel.readiness.insert(Ready::READABLE);
 
     if let Some(metrics) = worker_config.metrics.as_ref() {
+        let address = metrics
+            .address
+            .parse::<SocketAddr>()
+            .expect("Could not parse metrics address");
         metrics::setup(
-            &metrics.address,
+            &address,
             worker_id,
             metrics.tagged_metrics,
             metrics.prefix.clone(),
@@ -186,7 +198,7 @@ pub fn fork_main_into_worker(
     })?;
 
     state
-        .write_requests_to_file(&mut state_file)
+        .write_initial_state_to_file(&mut state_file)
         .map_err(WorkerError::WriteStateFile)?;
 
     state_file.rewind().map_err(WorkerError::Rewind)?;
@@ -217,10 +229,12 @@ pub fn fork_main_into_worker(
         }
     })?;
 
-    let mut main_to_worker_channel: Channel<Config, WorkerResponse> = Channel::new(
+    let worker_config = ServerConfig::from(config);
+
+    let mut main_to_worker_channel: Channel<ServerConfig, WorkerResponse> = Channel::new(
         main_to_worker,
-        config.command_buffer_size,
-        config.max_command_buffer_size,
+        worker_config.command_buffer_size,
+        worker_config.max_command_buffer_size,
     );
 
     // DISCUSS: should we really block the channel just to write on it?
@@ -235,7 +249,7 @@ pub fn fork_main_into_worker(
         ForkResult::Parent { child: worker_pid } => {
             info!("launching worker {} with pid {}", worker_id, worker_pid);
             main_to_worker_channel
-                .write_message(config)
+                .write_message(&worker_config)
                 .map_err(WorkerError::SendConfig)?;
 
             main_to_worker_channel

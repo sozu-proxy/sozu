@@ -151,8 +151,8 @@ pub fn fork_main_into_new_main(
 pub fn begin_new_main_process(
     new_to_old_channel_fd: i32,
     upgrade_file_fd: i32,
-    command_buffer_size: usize,
-    max_command_buffer_size: usize,
+    command_buffer_size: u64,
+    max_command_buffer_size: u64,
 ) -> Result<(), UpgradeError> {
     let mut fork_confirmation_channel: Channel<bool, ()> = Channel::new(
         unsafe { UnixStream::from_raw_fd(new_to_old_channel_fd) },

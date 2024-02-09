@@ -65,10 +65,9 @@ use crate::{
         request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
         Cluster, HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
         LoadBalancingParams, LoadMetric, MetricsConfiguration, PathRule, ProxyProtocolConfig,
-        Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition, SocketAddress,
-        TcpListenerConfig, TlsVersion,
+        Request, RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig,
+        ServerMetricsConfig, SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest,
     },
-    request::WorkerRequest,
     ObjectKind,
 };
 
@@ -144,20 +143,23 @@ pub const DEFAULT_WORKER_AUTOMATIC_RESTART: bool = true;
 /// wether to save the state automatically (false)
 pub const DEFAULT_AUTOMATIC_STATE_SAVE: bool = false;
 
+/// minimum number of buffers (1)
+pub const DEFAULT_MIN_BUFFERS: u64 = 1;
+
 /// maximum number of buffers (1 000)
-pub const DEFAULT_MAX_BUFFERS: usize = 1_000;
+pub const DEFAULT_MAX_BUFFERS: u64 = 1_000;
 
 /// size of the buffers, in bytes (16 KB)
-pub const DEFAULT_BUFFER_SIZE: usize = 16_393;
+pub const DEFAULT_BUFFER_SIZE: u64 = 16_393;
 
 /// maximum number of simultaneous connections (10 000)
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
 /// size of the buffer for the channels, in bytes. Must be bigger than the size of the data received. (1 MB)
-pub const DEFAULT_COMMAND_BUFFER_SIZE: usize = 1_000_000;
+pub const DEFAULT_COMMAND_BUFFER_SIZE: u64 = 1_000_000;
 
 /// maximum size of the buffer for the channels, in bytes. (2 MB)
-pub const DEFAULT_MAX_COMMAND_BUFFER_SIZE: usize = 2_000_000;
+pub const DEFAULT_MAX_COMMAND_BUFFER_SIZE: u64 = 2_000_000;
 
 /// wether to avoid register cluster metrics in the local drain
 pub const DEFAULT_DISABLE_CLUSTER_METRICS: bool = false;
@@ -700,7 +702,7 @@ impl FileClusterFrontendConfig {
             }
         };
 
-        let chain_opt = match self.certificate_chain.as_ref() {
+        let certificate_chain = match self.certificate_chain.as_ref() {
             None => None,
             Some(path) => {
                 let certificate_chain = Config::load_file(path)?;
@@ -721,7 +723,7 @@ impl FileClusterFrontendConfig {
             hostname,
             certificate: certificate_opt,
             key: key_opt,
-            certificate_chain: chain_opt,
+            certificate_chain,
             tls_versions: self.tls_versions.clone(),
             position: self.position,
             path,
@@ -1075,12 +1077,12 @@ impl ClusterConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct FileConfig {
     pub command_socket: Option<String>,
-    pub command_buffer_size: Option<usize>,
-    pub max_command_buffer_size: Option<usize>,
+    pub command_buffer_size: Option<u64>,
+    pub max_command_buffer_size: Option<u64>,
     pub max_connections: Option<usize>,
-    pub min_buffers: Option<usize>,
-    pub max_buffers: Option<usize>,
-    pub buffer_size: Option<usize>,
+    pub min_buffers: Option<u64>,
+    pub max_buffers: Option<u64>,
+    pub buffer_size: Option<u64>,
     pub saved_state: Option<String>,
     #[serde(default)]
     pub automatic_state_save: Option<bool>,
@@ -1209,7 +1211,7 @@ impl ConfigBuilder {
                 .unwrap_or_else(|| String::from("stdout")),
             max_buffers: file_config.max_buffers.unwrap_or(DEFAULT_MAX_BUFFERS),
             max_command_buffer_size: file_config
-                .command_buffer_size
+                .max_command_buffer_size
                 .unwrap_or(DEFAULT_MAX_COMMAND_BUFFER_SIZE),
             max_connections: file_config
                 .max_connections
@@ -1219,8 +1221,8 @@ impl ConfigBuilder {
                 .disable_cluster_metrics
                 .unwrap_or(DEFAULT_DISABLE_CLUSTER_METRICS),
             min_buffers: std::cmp::min(
-                file_config.min_buffers.unwrap_or(1),
-                file_config.max_buffers.unwrap_or(1000),
+                file_config.min_buffers.unwrap_or(DEFAULT_MIN_BUFFERS),
+                file_config.max_buffers.unwrap_or(DEFAULT_MAX_BUFFERS),
             ),
             pid_file_path: file_config.pid_file_path.clone(),
             request_timeout: file_config
@@ -1432,12 +1434,12 @@ impl ConfigBuilder {
 pub struct Config {
     pub config_path: String,
     pub command_socket: String,
-    pub command_buffer_size: usize,
-    pub max_command_buffer_size: usize,
+    pub command_buffer_size: u64,
+    pub max_command_buffer_size: u64,
     pub max_connections: usize,
-    pub min_buffers: usize,
-    pub max_buffers: usize,
-    pub buffer_size: usize,
+    pub min_buffers: u64,
+    pub max_buffers: u64,
+    pub buffer_size: u64,
     pub saved_state: Option<String>,
     #[serde(default)]
     pub automatic_state_save: bool,
@@ -1741,6 +1743,41 @@ fn display_toml_error(file: &str, error: &toml::de::Error) {
     println!("error parsing the configuration file '{file}': {error}");
     if let Some(Range { start, end }) = error.span() {
         print!("error parsing the configuration file '{file}' at position: {start}, {end}");
+    }
+}
+
+impl ServerConfig {
+    /// size of the slab for the Session manager
+    pub fn slab_capacity(&self) -> u64 {
+        10 + 2 * self.max_connections
+    }
+}
+
+/// reduce the config to the bare minimum needed by a worker
+impl From<&Config> for ServerConfig {
+    fn from(config: &Config) -> Self {
+        let metrics = config.metrics.clone().map(|m| ServerMetricsConfig {
+            address: m.address.to_string(),
+            tagged_metrics: m.tagged_metrics,
+            prefix: m.prefix,
+        });
+        Self {
+            max_connections: config.max_connections as u64,
+            front_timeout: config.front_timeout,
+            back_timeout: config.back_timeout,
+            connect_timeout: config.connect_timeout,
+            zombie_check_interval: config.zombie_check_interval,
+            accept_queue_timeout: config.accept_queue_timeout,
+            min_buffers: config.min_buffers,
+            max_buffers: config.max_buffers,
+            buffer_size: config.buffer_size,
+            log_level: config.log_level.clone(),
+            log_target: config.log_target.clone(),
+            log_access_target: config.log_access_target.clone(),
+            command_buffer_size: config.command_buffer_size,
+            max_command_buffer_size: config.max_command_buffer_size,
+            metrics,
+        }
     }
 }
 

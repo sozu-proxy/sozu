@@ -33,10 +33,9 @@ use crate::{
         logging,
         proto::command::{
             Event, EventKind, ProxyProtocolConfig, RequestTcpFrontend, TcpListenerConfig,
+            WorkerRequest, WorkerResponse,
         },
         ready::Ready,
-        request::WorkerRequest,
-        response::WorkerResponse,
         state::ClusterId,
     },
     timer::TimeoutContainer,
@@ -1518,9 +1517,10 @@ mod tests {
     use sozu_command::{
         channel::Channel,
         config::ListenerBuilder,
-        proto::command::{request::RequestType, LoadBalancingParams, RequestTcpFrontend},
-        request::WorkerRequest,
-        response::WorkerResponse,
+        proto::command::{
+            request::RequestType, LoadBalancingParams, RequestTcpFrontend, WorkerRequest,
+            WorkerResponse,
+        },
     };
     static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
 

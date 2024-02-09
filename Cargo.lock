@@ -1524,6 +1524,7 @@ dependencies = [
  "nom",
  "num_cpus",
  "paw",
+ "prost",
  "serde",
  "serde_json",
  "sozu-command-lib",
