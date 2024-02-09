@@ -1093,11 +1093,11 @@ pub struct FileConfig {
     #[serde(default)]
     pub log_colored: bool,
     #[serde(default)]
-    pub log_access_target: Option<String>,
+    pub access_logs_target: Option<String>,
     #[serde(default)]
-    pub log_access_format: Option<AccessLogFormat>,
+    pub access_logs_format: Option<AccessLogFormat>,
     #[serde(default)]
-    pub log_access_colored: Option<bool>,
+    pub access_logs_colored: Option<bool>,
     pub worker_count: Option<u16>,
     pub worker_automatic_restart: Option<bool>,
     pub metrics: Option<MetricsConfig>,
@@ -1208,9 +1208,9 @@ impl ConfigBuilder {
             ctl_command_timeout: file_config.ctl_command_timeout.unwrap_or(1_000),
             front_timeout: file_config.front_timeout.unwrap_or(DEFAULT_FRONT_TIMEOUT),
             handle_process_affinity: file_config.handle_process_affinity.unwrap_or(false),
-            log_access_target: file_config.log_access_target.clone(),
-            log_access_format: file_config.log_access_format.clone(),
-            log_access_colored: file_config.log_access_colored,
+            access_logs_target: file_config.access_logs_target.clone(),
+            access_logs_format: file_config.access_logs_format.clone(),
+            access_logs_colored: file_config.access_logs_colored,
             log_level: file_config
                 .log_level
                 .clone()
@@ -1458,9 +1458,9 @@ pub struct Config {
     pub log_target: String,
     pub log_colored: bool,
     #[serde(default)]
-    pub log_access_target: Option<String>,
-    pub log_access_format: Option<AccessLogFormat>,
-    pub log_access_colored: Option<bool>,
+    pub access_logs_target: Option<String>,
+    pub access_logs_format: Option<AccessLogFormat>,
+    pub access_logs_colored: Option<bool>,
     pub worker_count: u16,
     pub worker_automatic_restart: bool,
     pub metrics: Option<MetricsConfig>,
@@ -1768,8 +1768,8 @@ impl fmt::Debug for Config {
             .field("automatic_state_save", &self.automatic_state_save)
             .field("log_level", &self.log_level)
             .field("log_target", &self.log_target)
-            .field("log_access_target", &self.log_access_target)
-            .field("log_access_format", &self.log_access_format)
+            .field("access_logs_target", &self.access_logs_target)
+            .field("access_logs_format", &self.access_logs_format)
             .field("worker_count", &self.worker_count)
             .field("worker_automatic_restart", &self.worker_automatic_restart)
             .field("metrics", &self.metrics)
@@ -1823,11 +1823,11 @@ impl From<&Config> for ServerConfig {
             buffer_size: config.buffer_size,
             log_level: config.log_level.clone(),
             log_target: config.log_target.clone(),
-            log_access_target: config.log_access_target.clone(),
+            access_logs_target: config.access_logs_target.clone(),
             command_buffer_size: config.command_buffer_size,
             max_command_buffer_size: config.max_command_buffer_size,
             metrics,
-            access_log_format: ProtobufAccessLogFormat::from(&config.log_access_format) as i32,
+            access_log_format: ProtobufAccessLogFormat::from(&config.access_logs_format) as i32,
             log_colored: config.log_colored,
         }
     }

@@ -27,7 +27,7 @@ There are three configuration options related to logging:
   * `tcp://127.0.0.1:9876`
   * `unix:///var/sozu/logs`
   * `file:///var/logs/sozu.log`
-* `log_access_target`: if activated, sends the access logs to a separate destination
+* `access_logs_target`: if activated, sends the access logs to a separate destination
 
 `log_level` follows [env_logger's level directives](https://docs.rs/env_logger/0.5.13/env_logger/).
 Moreover, the `RUST_LOG` environment variable can be used to override the log level.

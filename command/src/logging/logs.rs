@@ -591,9 +591,9 @@ pub fn setup_logging_with_config(config: &Config, tag: &str) {
     setup_logging(
         &config.log_target,
         config.log_colored,
-        config.log_access_target.as_deref(),
-        config.log_access_format.clone(),
-        config.log_access_colored,
+        config.access_logs_target.as_deref(),
+        config.access_logs_format.clone(),
+        config.access_logs_colored,
         &config.log_level,
         tag,
     )
@@ -606,14 +606,14 @@ pub fn setup_logging_with_config(config: &Config, tag: &str) {
 pub fn setup_logging(
     log_target: &str,
     log_colored: bool,
-    log_access_target: Option<&str>,
-    log_access_format: Option<AccessLogFormat>,
-    log_access_colored: Option<bool>,
+    access_logs_target: Option<&str>,
+    access_logs_format: Option<AccessLogFormat>,
+    access_logs_colored: Option<bool>,
     log_level: &str,
     tag: &str,
 ) {
     let backend = target_to_backend(log_target);
-    let access_backend = log_access_target.map(target_to_backend);
+    let access_backend = access_logs_target.map(target_to_backend);
 
     Logger::init(
         tag.to_string(),
@@ -621,8 +621,8 @@ pub fn setup_logging(
         backend,
         log_colored,
         access_backend,
-        log_access_format,
-        log_access_colored,
+        access_logs_format,
+        access_logs_colored,
     );
 }
 

@@ -670,7 +670,7 @@ message ServerConfig {
     required uint64 buffer_size = 9 [default = 16393];
     required string log_level = 10 [default = "info"];
     required string log_target = 11 [default = "stdout"];
-    optional string log_access_target = 12;
+    optional string access_logs_target = 12;
     required uint64 command_buffer_size = 13 [default = 1000000];
     required uint64 max_command_buffer_size = 14 [default = 2000000];
     optional ServerMetricsConfig metrics = 15;

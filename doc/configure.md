@@ -21,7 +21,7 @@ Parameters in the global section allow you to define the global settings shared 
 | `saved_state`              | path from which sozu tries to load its state at startup                             |                                          |
 | `log_level`                | possible values are                                                                 | `debug`, `trace`, `error`, `warn`, `info`|
 | `log_target`               | possible values are                                                                 | `stdout, tcp or udp address`             |
-| `log_access_target`        | possible values are (if activated, sends access logs to a separate target)          | `stdout`, `tcp` or `udp address`         |
+| `access_logs_target`        | possible values are (if activated, sends access logs to a separate target)          | `stdout`, `tcp` or `udp address`         |
 | `command_socket`           | path to the unix socket command                  |                                          |
 | `command_buffer_size`      | size, in bytes, of the buffer used by the main process to handle commands.          |                                          |
 | `max_command_buffer_size`  | maximum size of the buffer used by the main process to handle commands.             |                                          |

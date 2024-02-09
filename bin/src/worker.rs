@@ -116,7 +116,7 @@ pub fn begin_worker_process(
     setup_logging(
         &worker_config.log_target,
         worker_config.log_colored,
-        worker_config.log_access_target.as_deref(),
+        worker_config.access_logs_target.as_deref(),
         Some(access_log_format),
         Some(worker_config.log_colored),
         &worker_config.log_level,

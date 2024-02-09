@@ -31,7 +31,7 @@ log_target = "stdout"
 
 # optional different target for access logs (IP addresses, domains, URI, HTTP status, etc)
 # It supports the same options as log_target
-# log_access_target = "file:///var/log/sozu-access.log"
+# access_logs_target = "file:///var/log/sozu-access.log"
 
 # path to the unix socket file used to send commands to sozu
 # default value points to "sozu.sock" file in the current directory
