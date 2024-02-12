@@ -522,7 +522,7 @@ impl HttpProxy {
 
     pub fn remove_listener(&mut self, remove: RemoveListener) -> Result<(), ProxyError> {
         let len = self.listeners.len();
-        let remove_address = remove.address.clone().into();
+        let remove_address = remove.address.into();
         self.listeners
             .retain(|_, l| l.borrow().address != remove_address);
 

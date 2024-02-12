@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, str::FromStr};
+use std::{fmt, str::FromStr};
 
 use hex::{FromHex, FromHexError};
 use serde::de::{self, Visitor};
@@ -56,13 +56,10 @@ pub fn parse_x509(pem_bytes: &[u8]) -> Result<X509Certificate, CertificateError>
 
 /// Retrieve from the pem (as bytes) the common name (a.k.a `CN`) and the
 /// subject alternate names (a.k.a `SAN`)
-pub fn get_cn_and_san_attributes(pem_bytes: &[u8]) -> Result<HashSet<String>, CertificateError> {
-    let x509 = parse_x509(pem_bytes)
-        .map_err(|err| CertificateError::InvalidCertificate(err.to_string()))?;
-
-    let mut names: HashSet<String> = HashSet::new();
+pub fn get_cn_and_san_attributes(x509: &X509Certificate) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
     for name in x509.subject().iter_by_oid(&OID_X509_COMMON_NAME) {
-        names.insert(
+        names.push(
             name.as_str()
                 .map(String::from)
                 .unwrap_or_else(|_| String::from_utf8_lossy(name.as_slice()).to_string()),
@@ -74,13 +71,14 @@ pub fn get_cn_and_san_attributes(pem_bytes: &[u8]) -> Result<HashSet<String>, Ce
             if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
                 for name in &san.general_names {
                     if let GeneralName::DNSName(name) = name {
-                        names.insert(name.to_string());
+                        names.push(name.to_string());
                     }
                 }
             }
         }
     }
-    Ok(names)
+    names.dedup();
+    names
 }
 
 // -----------------------------------------------------------------------------
@@ -252,4 +250,30 @@ pub fn load_full_certificate(
         versions,
         names,
     })
+}
+
+impl CertificateAndKey {
+    pub fn fingerprint(&self) -> Result<Fingerprint, CertificateError> {
+        let pem = parse_pem(self.certificate.as_bytes())?;
+        let fingerprint = Fingerprint(Sha256::digest(pem.contents).iter().cloned().collect());
+        Ok(fingerprint)
+    }
+
+    pub fn get_overriding_names(&self) -> Result<Vec<String>, CertificateError> {
+        if self.names.is_empty() {
+            let pem = parse_pem(self.certificate.as_bytes())?;
+            let x509 = parse_x509(&pem.contents)?;
+
+            let overriding_names = get_cn_and_san_attributes(&x509);
+
+            Ok(overriding_names.into_iter().collect())
+        } else {
+            Ok(self.names.to_owned())
+        }
+    }
+
+    pub fn apply_overriding_names(&mut self) -> Result<(), CertificateError> {
+        self.names = self.get_overriding_names()?;
+        Ok(())
+    }
 }
