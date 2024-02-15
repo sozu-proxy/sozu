@@ -702,7 +702,7 @@ message InitialState {
 // An access log, meant to be passed to another agent
 message ProtobufAccessLog {
     // error message if any
-    optional string error = 1;
+    optional string message = 1;
     // LogContext = request_id + cluster_id + backend_id
     required Uint128 request_id = 2;
     // id of the cluster (set of frontend, backend, routing rules)

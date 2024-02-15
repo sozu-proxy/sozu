@@ -164,7 +164,7 @@ impl RequestRecord<'_> {
             endpoint: ProtobufEndpoint {
                 inner: Some(endpoint),
             },
-            error: self.message.duplicate(),
+            message: self.message.duplicate(),
             protocol: self.protocol.duplicate(),
             request_id,
             response_time: self.response_time.whole_microseconds() as u64,
