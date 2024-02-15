@@ -1,6 +1,6 @@
 //! This file is used to bench the logger of Sozu by logging random lines.
 //! You can change the number of logs, log target, log filter and if they are colored with env
-//! variables. 
+//! variables.
 
 use std::time::Instant;
 

@@ -7,7 +7,10 @@ use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::LogContext};
 
 use crate::{
     pool::Checkout,
-    protocol::{pipe::{Pipe, WebSocketContext}, SessionResult, SessionState},
+    protocol::{
+        pipe::{Pipe, WebSocketContext},
+        SessionResult, SessionState,
+    },
     socket::{SocketHandler, SocketResult},
     sozu_command::ready::Ready,
     tcp::TcpListener,

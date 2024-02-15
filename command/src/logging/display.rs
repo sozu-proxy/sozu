@@ -128,7 +128,7 @@ impl fmt::Display for EndpointRecord<'_> {
                 path.as_str_or("-"),
                 display_status(*status, f.alternate()),
             ),
-            Self::Tcp  => {
+            Self::Tcp => {
                 write!(f, "-")
             }
         }

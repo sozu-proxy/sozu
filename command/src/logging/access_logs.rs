@@ -6,7 +6,7 @@ use time::Duration;
 use crate::{
     logging::{LogLevel, Rfc3339Time},
     proto::command::{
-        protobuf_endpoint, HttpEndpoint, ProtobufAccessLog, ProtobufEndpoint, TcpEndpoint, Uint128,
+        protobuf_endpoint, HttpEndpoint, ProtobufAccessLog, ProtobufEndpoint, TcpEndpoint,
     },
 };
 
@@ -134,9 +134,6 @@ impl RequestRecord<'_> {
     /// Prost needs ownership over all the fields but we don't want to take it from the user
     /// or clone them, so we use the unsafe DuplicateOwnership.
     pub unsafe fn into_binary_access_log(self) -> ManuallyDrop<ProtobufAccessLog> {
-        let (low, high) = self.context.request_id.into();
-        let request_id = Uint128 { low, high };
-
         let endpoint = match self.endpoint {
             EndpointRecord::Http {
                 method,
@@ -166,7 +163,7 @@ impl RequestRecord<'_> {
             },
             message: self.message.duplicate(),
             protocol: self.protocol.duplicate(),
-            request_id,
+            request_id: self.context.request_id.into(),
             response_time: self.response_time.whole_microseconds() as u64,
             server_rtt: self.server_rtt.map(|t| t.whole_microseconds() as u64),
             service_time: self.service_time.whole_microseconds() as u64,

@@ -8,6 +8,7 @@ use std::{
 };
 
 use prost::{DecodeError, Message};
+use rusty_ulid::Ulid;
 
 use crate::{
     proto::{
@@ -289,5 +290,19 @@ impl From<u128> for Uint128 {
 impl From<i128> for Uint128 {
     fn from(value: i128) -> Self {
         Uint128::from(value as u128)
+    }
+}
+
+impl From<Ulid> for Uint128 {
+    fn from(value: Ulid) -> Self {
+        let (low, high) = value.into();
+        Uint128 { low, high }
+    }
+}
+
+impl From<Uint128> for Ulid {
+    fn from(value: Uint128) -> Self {
+        let Uint128 { low, high } = value;
+        Ulid::from((low, high))
     }
 }
