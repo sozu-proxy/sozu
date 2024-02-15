@@ -970,8 +970,8 @@ impl Display for ProtobufEndpoint {
                 path.as_string_or("-"),
                 status.as_string_or("-"),
             ),
-            Some(protobuf_endpoint::Inner::Tcp(TcpEndpoint { context })) => {
-                write!(f, "{}", context.as_string_or("-"))
+            Some(protobuf_endpoint::Inner::Tcp(_)) => {
+                write!(f, "-")
             }
             None => Ok(()),
         }

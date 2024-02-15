@@ -756,6 +756,4 @@ message HttpEndpoint {
     optional string reason = 5;
 }
 
-message TcpEndpoint {
-    optional string context = 1;
-}
+message TcpEndpoint {}

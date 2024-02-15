@@ -36,6 +36,8 @@ use crate::{
     RetrieveClusterError, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
 };
 
+use super::pipe::WebSocketContext;
+
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
 type GenericHttpStream = kawa::Kawa<Checkout>;
 
@@ -812,8 +814,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     /// Format the context of the websocket into a loggable String
-    pub fn websocket_context(&self) -> String {
-        format!("{}", self.log_endpoint())
+    pub fn websocket_context(&self) -> WebSocketContext {
+        WebSocketContext::Http {
+            method: self.context.method.clone(),
+            authority: self.context.authority.clone(),
+            path: self.context.path.clone(),
+            reason: self.context.reason.clone(),
+            status: self.context.status,
+        }
     }
 
     pub fn log_request(&mut self, metrics: &SessionMetrics, message: Option<&str>) {

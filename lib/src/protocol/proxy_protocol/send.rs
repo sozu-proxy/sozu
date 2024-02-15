@@ -10,7 +10,7 @@ use rusty_ulid::Ulid;
 use crate::{
     pool::Checkout,
     protocol::{
-        pipe::Pipe,
+        pipe::{Pipe, WebSocketContext},
         proxy_protocol::header::{Command, HeaderV2, ProxyProtocolHeader},
     },
     socket::SocketHandler,
@@ -176,7 +176,7 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
             Protocol::TCP,
             self.request_id,
             addr,
-            None,
+            WebSocketContext::Tcp,
         );
 
         pipe.frontend_readiness = self.frontend_readiness;

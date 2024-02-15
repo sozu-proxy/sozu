@@ -17,6 +17,8 @@ use crate::{
     L7Proxy, ListenerHandler, Protocol, Readiness, SessionMetrics, SessionResult, StateResult,
 };
 
+use super::http::parser::Method;
+
 #[derive(PartialEq, Eq)]
 pub enum SessionStatus {
     Normal,
@@ -29,6 +31,18 @@ enum ConnectionStatus {
     ReadOpen,
     WriteOpen,
     Closed,
+}
+
+/// matches sozu_command_lib::logging::access_logs::EndpointRecords
+pub enum WebSocketContext {
+    Http {
+        method: Option<Method>,
+        authority: Option<String>,
+        path: Option<String>,
+        status: Option<u16>,
+        reason: Option<String>,
+    },
+    Tcp,
 }
 
 pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
@@ -51,7 +65,7 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     protocol: Protocol,
     request_id: Ulid,
     session_address: Option<SocketAddr>,
-    websocket_context: Option<String>,
+    websocket_context: WebSocketContext,
 }
 
 impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
@@ -77,7 +91,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         protocol: Protocol,
         request_id: Ulid,
         session_address: Option<SocketAddr>,
-        websocket_context: Option<String>,
+        websocket_context: WebSocketContext,
     ) -> Pipe<Front, L> {
         let frontend_status = ConnectionStatus::Normal;
         let backend_status = if backend_socket.is_none() {
@@ -622,8 +636,21 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     }
 
     fn log_endpoint(&self) -> EndpointRecord {
-        EndpointRecord::Tcp {
-            context: self.websocket_context.as_deref(),
+        match &self.websocket_context {
+            WebSocketContext::Http {
+                method,
+                authority,
+                path,
+                status,
+                reason,
+            } => EndpointRecord::Http {
+                method: method.as_deref(),
+                authority: authority.as_deref(),
+                path: path.as_deref(),
+                status: status.to_owned(),
+                reason: reason.as_deref(),
+            },
+            WebSocketContext::Tcp => EndpointRecord::Tcp,
         }
     }
 }

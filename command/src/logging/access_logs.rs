@@ -69,9 +69,7 @@ pub enum EndpointRecord<'a> {
         status: Option<u16>,
         reason: Option<&'a str>,
     },
-    Tcp {
-        context: Option<&'a str>,
-    },
+    Tcp,
 }
 
 /// used to aggregate tags in a session
@@ -153,9 +151,7 @@ impl RequestRecord<'_> {
                 status: status.map(|s| s as u32),
                 reason: reason.duplicate(),
             }),
-            EndpointRecord::Tcp { context } => protobuf_endpoint::Inner::Tcp(TcpEndpoint {
-                context: context.duplicate(),
-            }),
+            EndpointRecord::Tcp => protobuf_endpoint::Inner::Tcp(TcpEndpoint {}),
         };
 
         ManuallyDrop::new(ProtobufAccessLog {

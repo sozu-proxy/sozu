@@ -25,6 +25,7 @@ use crate::{
     backends::{Backend, BackendMap},
     pool::{Checkout, Pool},
     protocol::{
+        pipe::WebSocketContext,
         proxy_protocol::{
             expect::ExpectProxyProtocol, relay::RelayProxyProtocol, send::SendProxyProtocol,
         },
@@ -159,7 +160,7 @@ impl TcpSession {
                     Protocol::TCP,
                     request_id,
                     frontend_address,
-                    None,
+                    WebSocketContext::Tcp,
                 );
                 pipe.set_cluster_id(cluster_id.clone());
                 TcpStateMachine::Pipe(pipe)
@@ -202,7 +203,7 @@ impl TcpSession {
             session_address: self.frontend_address,
             backend_address: None,
             protocol: "TCP",
-            endpoint: EndpointRecord::Tcp { context: None },
+            endpoint: EndpointRecord::Tcp,
             tags: listener.get_tags(&listener.get_addr().to_string()),
             client_rtt: socket_rtt(self.state.front_socket()),
             server_rtt: None,

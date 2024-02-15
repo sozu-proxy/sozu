@@ -371,7 +371,7 @@ impl HttpsSession {
             Protocol::HTTP,
             http.context.id,
             http.context.session_address,
-            Some(ws_context),
+            ws_context,
         );
 
         pipe.frontend_readiness.event = http.frontend_readiness.event;
