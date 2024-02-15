@@ -222,6 +222,9 @@ impl InnerLogger {
         }
     }
 
+    /// write an access log to the proper logging target
+    ///
+    /// Protobuf access logs are written with a prost length delimiter before, and 2 empty bytes after
     pub fn log_access(&mut self, log: RequestRecord) {
         let backend = self.access_backend.as_mut().unwrap_or(&mut self.backend);
 
@@ -239,6 +242,7 @@ impl InnerLogger {
                 if let Err(e) = binary_log.encode_length_delimited(&mut self.buffer.0) {
                     Err(IoError::new(IoErrorKind::InvalidData, e))
                 } else {
+                    self.buffer.extend_from_slice(&[0, 0]); // add two empty bytes after each protobuf access log
                     let bytes = &self.buffer;
                     match backend {
                         LoggerBackend::Stdout(stdout) => {
