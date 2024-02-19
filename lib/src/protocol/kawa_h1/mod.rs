@@ -9,7 +9,6 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use kawa;
 use mio::{net::TcpStream, Interest, Token};
 use rusty_ulid::Ulid;
 use sozu_command::{
@@ -476,8 +475,6 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
 
         if self.response_stream.is_terminated() && self.response_stream.is_completed() {
-            save_http_status_metric(self.context.status, self.log_context());
-
             self.log_request_success(metrics);
             metrics.reset();
 
@@ -505,8 +502,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 _ => (),
             }
 
+            let response_length_known = self.response_stream.body_size != kawa::BodySize::Empty;
+            let request_length_known = self.request_stream.body_size != kawa::BodySize::Empty;
             if !(self.request_stream.is_terminated() && self.request_stream.is_completed())
-                && self.request_stream.body_size != kawa::BodySize::Empty
+                && request_length_known
             {
                 error!("Response terminated before request, this case is not handled properly yet");
                 incr!("http.early_response_close");
@@ -519,20 +518,22 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             // with no keepalive on front but keepalive on backend, we could have
             // a pool of connections
             trace!(
-                "============== HANDLE KEEP-ALIVE: {} {}",
+                "============== HANDLE KEEP-ALIVE: {} {} {}",
                 self.context.keep_alive_frontend,
-                self.context.keep_alive_backend
+                self.context.keep_alive_backend,
+                response_length_known
             );
             return match (
                 self.context.keep_alive_frontend,
                 self.context.keep_alive_backend,
+                response_length_known
             ) {
-                (true, true) => {
+                (true, true, true) => {
                     debug!("{} keep alive front/back", self.log_context());
                     self.reset();
                     StateResult::Continue
                 }
-                (true, false) => {
+                (true, false, true) => {
                     debug!("{} keep alive front", self.log_context());
                     self.reset();
                     StateResult::CloseBackend
@@ -848,6 +849,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     }
 
     pub fn log_request_success(&mut self, metrics: &SessionMetrics) {
+        save_http_status_metric(self.context.status, self.log_context());
         self.log_request(metrics, None);
     }
     pub fn log_default_answer_success(&mut self, metrics: &SessionMetrics) {
@@ -1489,10 +1491,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 // check if there is anything left to write
                 if self.response_stream.is_completed() {
                     // we have to close the session now, because writable would short-cut
-                    self.log_request_error(
-                        metrics,
-                        "backend hangs up, can not be sure that response is complete",
-                    );
+                    self.log_request_success(metrics);
                     StateResult::CloseSession
                 } else {
                     // writable() will be called again and finish the session properly
