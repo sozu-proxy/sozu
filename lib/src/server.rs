@@ -909,7 +909,7 @@ impl Server {
                     ContentType::Clusters(ClusterInformations {
                         vec: self
                             .config_state
-                            .cluster_state(&cluster_id)
+                            .cluster_state(cluster_id)
                             .map_or(vec![], |ci| vec![ci]),
                     })
                     .into(),

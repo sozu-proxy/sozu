@@ -295,7 +295,8 @@ message CertificateAndKey {
     repeated string certificate_chain = 2;
     required string key = 3;
     repeated TlsVersion versions = 4;
-    // hostnames linked to the certificate
+    // a list of domain names. Override certificate names
+    // if empty, the names of the certificate will be used
     repeated string names = 5;
 }
 

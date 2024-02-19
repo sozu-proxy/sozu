@@ -351,6 +351,7 @@ use std::{
 };
 
 use backends::BackendError;
+use hex::FromHexError;
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
 use router::RouterError;
@@ -637,8 +638,6 @@ pub enum AcceptError {
 /// returned by the HTTP, HTTPS and TCP listeners
 #[derive(thiserror::Error, Debug)]
 pub enum ListenerError {
-    #[error("failed to acquire the lock, {0}")]
-    Lock(String),
     #[error("failed to handle certificate request, got a resolver error, {0}")]
     Resolver(CertificateResolverError),
     #[error("failed to parse pem, {0}")]
@@ -689,15 +688,17 @@ pub enum ProxyError {
     #[error("could not remove frontend: {0}")]
     RemoveFrontend(ListenerError),
     #[error("could not add certificate: {0}")]
-    AddCertificate(ListenerError),
+    AddCertificate(CertificateResolverError),
     #[error("could not remove certificate: {0}")]
-    RemoveCertificate(ListenerError),
+    RemoveCertificate(CertificateResolverError),
     #[error("could not replace certificate: {0}")]
-    ReplaceCertificate(ListenerError),
+    ReplaceCertificate(CertificateResolverError),
     #[error("wrong certificate fingerprint: {0}")]
-    WrongCertificateFingerprint(String),
+    WrongCertificateFingerprint(FromHexError),
     #[error("this request is not supported by the proxy")]
     UnsupportedMessage,
+    #[error("failed to acquire the lock, {0}")]
+    Lock(String),
 }
 
 use self::server::ListenToken;

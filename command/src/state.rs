@@ -13,7 +13,7 @@ use std::{
 use prost::{DecodeError, Message};
 
 use crate::{
-    certificate::{self, calculate_fingerprint, Fingerprint},
+    certificate::{calculate_fingerprint, CertificateError, Fingerprint},
     proto::{
         command::{
             request::RequestType, ActivateListener, AddBackend, AddCertificate, CertificateAndKey,
@@ -47,7 +47,7 @@ pub enum StateError {
     #[error("Wrong request: {0}")]
     WrongRequest(String),
     #[error("Could not add certificate: {0}")]
-    AddCertificate(String),
+    AddCertificate(CertificateError),
     #[error("Could not remove certificate: {0}")]
     RemoveCertificate(String),
     #[error("Could not replace certificate: {0}")]
@@ -374,16 +374,20 @@ impl ConfigState {
     }
 
     fn add_certificate(&mut self, add: &AddCertificate) -> Result<(), StateError> {
-        let fingerprint = Fingerprint(
-            calculate_fingerprint(add.certificate.certificate.as_bytes()).map_err(
-                |fingerprint_err| StateError::AddCertificate(fingerprint_err.to_string()),
-            )?,
-        );
+        let fingerprint = add
+            .certificate
+            .fingerprint()
+            .map_err(StateError::AddCertificate)?;
 
         let entry = self
             .certificates
             .entry(add.address.clone().into())
             .or_insert_with(HashMap::new);
+
+        let mut add = add.clone();
+        add.certificate
+            .apply_overriding_names()
+            .map_err(StateError::AddCertificate)?;
 
         if entry.contains_key(&fingerprint) {
             info!(
@@ -393,7 +397,7 @@ impl ConfigState {
             return Ok(());
         }
 
-        entry.insert(fingerprint, add.certificate.clone());
+        entry.insert(fingerprint, add.certificate);
         Ok(())
     }
 
@@ -1248,72 +1252,20 @@ impl ConfigState {
         &self,
         filters: QueryCertificatesFilters,
     ) -> BTreeMap<String, CertificateAndKey> {
-        if let Some(domain) = filters.domain {
-            self.certificates
-                .values()
-                .flat_map(|hash_map| hash_map.iter())
-                .flat_map(|(fingerprint, cert)| {
-                    if cert.names.is_empty() {
-                        let pem = certificate::parse_pem(cert.certificate.as_bytes()).ok()?;
-                        let mut c = cert.to_owned();
-
-                        c.names = certificate::get_cn_and_san_attributes(&pem.contents)
-                            .ok()?
-                            .into_iter()
-                            .collect();
-
-                        return Some((fingerprint, c));
-                    }
-
-                    Some((fingerprint, cert.to_owned()))
-                })
-                .filter(|(_, cert)| cert.names.contains(&domain))
-                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert))
-                .collect()
-        } else if let Some(f) = filters.fingerprint {
-            self.certificates
-                .values()
-                .flat_map(|hash_map| hash_map.iter())
-                .filter(|(fingerprint, _cert)| fingerprint.to_string() == f)
-                .flat_map(|(fingerprint, cert)| {
-                    if cert.names.is_empty() {
-                        let pem = certificate::parse_pem(cert.certificate.as_bytes()).ok()?;
-                        let mut c = cert.to_owned();
-
-                        c.names = certificate::get_cn_and_san_attributes(&pem.contents)
-                            .ok()?
-                            .into_iter()
-                            .collect();
-
-                        return Some((fingerprint, c));
-                    }
-
-                    Some((fingerprint, cert.to_owned()))
-                })
-                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert))
-                .collect()
-        } else {
-            self.certificates
-                .values()
-                .flat_map(|hash_map| hash_map.iter())
-                .flat_map(|(fingerprint, cert)| {
-                    if cert.names.is_empty() {
-                        let pem = certificate::parse_pem(cert.certificate.as_bytes()).ok()?;
-                        let mut c = cert.to_owned();
-
-                        c.names = certificate::get_cn_and_san_attributes(&pem.contents)
-                            .ok()?
-                            .into_iter()
-                            .collect();
-
-                        return Some((fingerprint, c));
-                    }
-
-                    Some((fingerprint, cert.to_owned()))
-                })
-                .map(|(fingerprint, cert)| (fingerprint.to_string(), cert))
-                .collect()
-        }
+        self.certificates
+            .values()
+            .flat_map(|hash_map| hash_map.iter())
+            .filter(|(fingerprint, cert)| {
+                if let Some(domain) = &filters.domain {
+                    cert.names.contains(domain)
+                } else if let Some(f) = &filters.fingerprint {
+                    fingerprint.to_string() == *f
+                } else {
+                    true
+                }
+            })
+            .map(|(fingerprint, cert)| (fingerprint.to_string(), cert.to_owned()))
+            .collect()
     }
 
     pub fn list_frontends(&self, filters: FrontendFilters) -> ListedFrontends {
