@@ -45,14 +45,27 @@ but then reserved ports would be accessible by any user than can execute sōzu (
 could setup of TCP proxy for SSH, SMTP etc to their own software).
 The unit file is the recommended way.
 
-## iptables
+## Using unprivileged ports
 
-iptables can be used to route connections to reserved ports to other unprivileged
-ports. You can set it up as follows for 80 -> 8080 and 443 -> 8443 redirections:
+Different firewalls can be used to route connections from reserved ports to other unprivileged ports.
+Most common redirections follow 80 -> 8080 and 443 -> 8443.
+
+### iptables
+
+iptables can be utilized, using a simple nat.
 
 ```
 iptables -t nat -A PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports 8080
 iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-ports 8443
+```
+
+### firewalld
+
+firewalld's syntax is very similiar to iptables. It can be made permanent using `--permanent`.
+
+```
+firewall-cmd --direct --add-rule ipv4 nat PREROUTING 0 -p tcp --dport 80 -j REDIRECT --to-port 8080
+firewall-cmd --direct --add-rule ipv4 nat PREROUTING 0 -p tcp --dport 443 -j REDIRECT --to-port 8443
 ```
 
 Note that any software running under the same uid as sōzu will be able to listen on
