@@ -879,8 +879,7 @@ dependencies = [
 [[package]]
 name = "kawa"
 version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db85695c73b185d8f126377bcb663cede61f31c980cefe7bd0d711b2f949b9e0"
+source = "git+https://github.com/CleverCloud/kawa#813b98e2a28155a18f2f814ff18616bcf49c953c"
 dependencies = [
  "nom",
 ]

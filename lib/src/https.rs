@@ -54,8 +54,9 @@ use crate::{
     protocol::{
         h2::Http2,
         http::{
-            answers::HttpAnswers,
+            answers::{HttpAnswers, RawAnswers},
             parser::{hostname_and_port, Method},
+            ResponseStream,
         },
         proxy_protocol::expect::ExpectProxyProtocol,
         rustls::TlsHandshake,
@@ -356,8 +357,14 @@ impl HttpsSession {
         container_frontend_timeout.reset();
         container_backend_timeout.reset();
 
+        let backend_buffer = if let ResponseStream::BackendAnswer(kawa) = http.response_stream {
+            kawa.storage.buffer
+        } else {
+            return None;
+        };
+
         let mut pipe = Pipe::new(
-            http.response_stream.storage.buffer,
+            backend_buffer,
             http.backend_id,
             http.backend_socket,
             http.backend,
@@ -624,10 +631,14 @@ impl HttpsListener {
             rustls_details: server_config,
             active: false,
             fronts: Router::new(),
-            answers: Rc::new(RefCell::new(HttpAnswers::new(
-                &config.answer_404,
-                &config.answer_503,
-            ))),
+            answers: Rc::new(RefCell::new(
+                HttpAnswers::new(
+                    // &config.answer_404,
+                    // &config.answer_503,
+                    RawAnswers::default(),
+                )
+                .map_err(|(status, error)| ListenerError::TemplateParse(status, error))?,
+            )),
             config,
             token,
             tags: BTreeMap::new(),
@@ -1003,7 +1014,10 @@ impl HttpsProxy {
                     .borrow()
                     .answers
                     .borrow_mut()
-                    .add_custom_answer(&cluster.cluster_id, &answer_503);
+                    .add_custom_answer(&cluster.cluster_id, answer_503.clone())
+                    .map_err(|(status, error)| {
+                        ProxyError::AddCluster(ListenerError::TemplateParse(status, error))
+                    })?;
             }
         }
         self.clusters.insert(cluster.cluster_id.clone(), cluster);
@@ -1582,10 +1596,14 @@ mod tests {
             fronts,
             rustls_details,
             resolver,
-            answers: Rc::new(RefCell::new(HttpAnswers::new(
-                "HTTP/1.1 404 Not Found\r\n\r\n",
-                "HTTP/1.1 503 Service Unavailable\r\n\r\n",
-            ))),
+            answers: Rc::new(RefCell::new(
+                HttpAnswers::new(
+                    // "HTTP/1.1 404 Not Found\r\n\r\n",
+                    // "HTTP/1.1 503 Service Unavailable\r\n\r\n",
+                    RawAnswers::default(),
+                )
+                .unwrap(),
+            )),
             config: default_config,
             token: Token(0),
             active: true,
