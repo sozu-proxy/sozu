@@ -7,7 +7,7 @@ use std::{
     borrow::ToOwned,
     collections::{HashMap, HashSet},
     convert::From,
-    fmt::Debug,
+    fmt,
     io::BufReader,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -390,7 +390,7 @@ impl ResolvesServerCert for MutexCertificateResolver {
     }
 }
 
-impl Debug for MutexCertificateResolver {
+impl fmt::Debug for MutexCertificateResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("MutexWrappedCertificateResolver")
     }

@@ -31,7 +31,7 @@ impl<T> DuplicateOwnership for &T {
 impl<'a, T> DuplicateOwnership for Option<&'a T>
 where
     T: ?Sized,
-    &'a T: DuplicateOwnership + 'a,
+    &'a T: DuplicateOwnership,
 {
     type Target = Option<<&'a T as DuplicateOwnership>::Target>;
     unsafe fn duplicate(self) -> Self::Target {
@@ -133,48 +133,50 @@ impl RequestRecord<'_> {
     /// Converts the RequestRecord in its protobuf representation.
     /// Prost needs ownership over all the fields but we don't want to take it from the user
     /// or clone them, so we use the unsafe DuplicateOwnership.
-    pub unsafe fn into_binary_access_log(self) -> ManuallyDrop<ProtobufAccessLog> {
-        let endpoint = match self.endpoint {
-            EndpointRecord::Http {
-                method,
-                authority,
-                path,
-                status,
-                reason,
-            } => protobuf_endpoint::Inner::Http(HttpEndpoint {
-                method: method.duplicate(),
-                authority: authority.duplicate(),
-                path: path.duplicate(),
-                status: status.map(|s| s as u32),
-                reason: reason.duplicate(),
-            }),
-            EndpointRecord::Tcp => protobuf_endpoint::Inner::Tcp(TcpEndpoint {}),
-        };
+    pub fn into_binary_access_log(self) -> ManuallyDrop<ProtobufAccessLog> {
+        unsafe {
+            let endpoint = match self.endpoint {
+                EndpointRecord::Http {
+                    method,
+                    authority,
+                    path,
+                    status,
+                    reason,
+                } => protobuf_endpoint::Inner::Http(HttpEndpoint {
+                    method: method.duplicate(),
+                    authority: authority.duplicate(),
+                    path: path.duplicate(),
+                    status: status.map(|s| s as u32),
+                    reason: reason.duplicate(),
+                }),
+                EndpointRecord::Tcp => protobuf_endpoint::Inner::Tcp(TcpEndpoint {}),
+            };
 
-        ManuallyDrop::new(ProtobufAccessLog {
-            backend_address: self.backend_address.map(Into::into),
-            backend_id: self.context.backend_id.duplicate(),
-            bytes_in: self.bytes_in as u64,
-            bytes_out: self.bytes_out as u64,
-            client_rtt: self.client_rtt.map(|t| t.whole_microseconds() as u64),
-            cluster_id: self.context.cluster_id.duplicate(),
-            endpoint: ProtobufEndpoint {
-                inner: Some(endpoint),
-            },
-            message: self.message.duplicate(),
-            protocol: self.protocol.duplicate(),
-            request_id: self.context.request_id.into(),
-            response_time: self.response_time.whole_microseconds() as u64,
-            server_rtt: self.server_rtt.map(|t| t.whole_microseconds() as u64),
-            service_time: self.service_time.whole_microseconds() as u64,
-            session_address: self.session_address.map(Into::into),
-            tags: self
-                .tags
-                .map(|tags| tags.tags.duplicate())
-                .unwrap_or_default(),
-            user_agent: self.user_agent.duplicate(),
-            tag: self.tag.duplicate(),
-            time: self.precise_time.into(),
-        })
+            ManuallyDrop::new(ProtobufAccessLog {
+                backend_address: self.backend_address.map(Into::into),
+                backend_id: self.context.backend_id.duplicate(),
+                bytes_in: self.bytes_in as u64,
+                bytes_out: self.bytes_out as u64,
+                client_rtt: self.client_rtt.map(|t| t.whole_microseconds() as u64),
+                cluster_id: self.context.cluster_id.duplicate(),
+                endpoint: ProtobufEndpoint {
+                    inner: Some(endpoint),
+                },
+                message: self.message.duplicate(),
+                protocol: self.protocol.duplicate(),
+                request_id: self.context.request_id.into(),
+                response_time: self.response_time.whole_microseconds() as u64,
+                server_rtt: self.server_rtt.map(|t| t.whole_microseconds() as u64),
+                service_time: self.service_time.whole_microseconds() as u64,
+                session_address: self.session_address.map(Into::into),
+                tags: self
+                    .tags
+                    .map(|tags| tags.tags.duplicate())
+                    .unwrap_or_default(),
+                user_agent: self.user_agent.duplicate(),
+                tag: self.tag.duplicate(),
+                time: self.precise_time.into(),
+            })
+        }
     }
 }

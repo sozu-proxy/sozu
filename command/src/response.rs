@@ -130,7 +130,7 @@ pub fn is_default_path_rule(p: &PathRule) -> bool {
     PathRuleKind::try_from(p.kind) == Ok(PathRuleKind::Prefix) && p.value.is_empty()
 }
 
-impl std::fmt::Display for PathRule {
+impl fmt::Display for PathRule {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match PathRuleKind::try_from(self.kind) {
             Ok(PathRuleKind::Prefix) => write!(f, "prefix '{}'", self.value),

@@ -47,7 +47,7 @@ impl AsRef<str> for LoggerBackend {
 }
 
 impl fmt::Display for Rfc3339Time {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         let t = self.inner;
         write!(
             f,
@@ -100,7 +100,7 @@ impl fmt::Display for LogDuration {
 }
 
 impl fmt::Display for LogContext<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "[{} {} {}]",
@@ -160,12 +160,8 @@ impl<'a> fmt::Display for FullTags<'a> {
 }
 
 fn prepare_user_agent(user_agent: &str) -> String {
-    let mut user_agent = user_agent.replace(' ', "_");
-    let mut ua_bytes = std::mem::take(&mut user_agent).into_bytes();
-    if let Some(last) = ua_bytes.last_mut() {
-        if *last == b',' {
-            *last = b'!'
-        }
-    }
-    unsafe { String::from_utf8_unchecked(ua_bytes) }
+    user_agent
+        .replace(' ', "_")
+        .replace('[', "{")
+        .replace(']', "}")
 }

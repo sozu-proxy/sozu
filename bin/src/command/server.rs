@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fmt::Debug,
+    fmt::{self, Debug},
     io::Error as IoError,
     ops::{Deref, DerefMut},
     os::fd::{AsRawFd, FromRawFd},
@@ -858,8 +858,8 @@ impl Server {
     }
 }
 
-impl std::fmt::Debug for Server {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Server {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Server")
             .field("config", &self.config)
             .field("event_subscribers", &self.event_subscribers)

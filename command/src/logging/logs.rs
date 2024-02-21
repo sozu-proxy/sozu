@@ -230,7 +230,7 @@ impl InnerLogger {
 
         let io_result = match self.access_format {
             AccessLogFormat::Protobuf => {
-                let binary_log = unsafe { log.into_binary_access_log() };
+                let binary_log = log.into_binary_access_log();
                 let log_length = binary_log.encoded_len();
                 let total_length = log_length + encoded_len_varint(log_length as u64);
                 self.buffer.clear();
@@ -269,11 +269,11 @@ impl InnerLogger {
                     log.tag,
                 ],
                 standard: {
-                    formats: ["{} {}->{} {}/{}/{}/{} {}->{} [{}] {} {}{}\n"],
+                    formats: ["{} {} {} {}/{}/{}/{} {} {} [{}] {} {}{}\n"],
                     args: [
                         log.context,
-                        log.session_address.as_string_or("X"),
-                        log.backend_address.as_string_or("X"),
+                        log.session_address.as_string_or("-"),
+                        log.backend_address.as_string_or("-"),
                         LogDuration(Some(log.response_time)),
                         LogDuration(Some(log.service_time)),
                         LogDuration(log.client_rtt),
@@ -287,7 +287,7 @@ impl InnerLogger {
                     ]
                 },
                 colored: {
-                    formats: ["\x1b[;1m{}\x1b[m {}->{} {}/{}/{}/{} {}->{} \x1b[2m[{}] \x1b[;1m{} {:#}\x1b[m{}\n"],
+                    formats: ["\x1b[;1m{}\x1b[m {} {} {}/{}/{}/{} {} {} \x1b[2m[{}] \x1b[;1m{} {:#}\x1b[m{}\n"],
                     args: @,
                 }
             },
@@ -795,15 +795,37 @@ impl LogLineCachedState {
 }
 
 #[macro_export]
+macro_rules! log_enabled {
+    ($logger:expr, $lvl:expr) => {{
+        let logger = $logger.borrow_mut();
+        let enable = if cfg!(feature = "logs-cache") {
+            static mut LOG_LINE_CACHED_STATE: $crate::logging::LogLineCachedState =
+                $crate::logging::LogLineCachedState::new();
+            logger.cached_enabled(
+                unsafe { &mut LOG_LINE_CACHED_STATE },
+                $crate::logging::Metadata {
+                    level: $lvl,
+                    target: module_path!(),
+                },
+            )
+        } else {
+            logger.enabled($crate::logging::Metadata {
+                level: $lvl,
+                target: module_path!(),
+            })
+        };
+        if !enable {
+            return;
+        }
+        logger
+    }};
+}
+
+#[macro_export]
 macro_rules! log {
     ($lvl:expr, $format:expr $(, $args:expr)*) => {{
-        static mut LOG_LINE_CACHED_STATE: $crate::logging::LogLineCachedState = $crate::logging::LogLineCachedState::new();
         $crate::logging::LOGGER.with(|logger| {
-            let mut logger = logger.borrow_mut();
-            if !logger.cached_enabled(
-                unsafe { &mut LOG_LINE_CACHED_STATE },
-                $crate::logging::Metadata { level: $lvl, target: module_path!() }
-            ) { return; }
+            let mut logger = $crate::log_enabled!(logger, $lvl);
             let (pid, tag, inner) = logger.split();
             let (now, precise_time) = $crate::logging::now();
 
@@ -824,13 +846,8 @@ macro_rules! log {
 #[macro_export]
 macro_rules! log_access {
     ($lvl:expr, $($request_record_fields:tt)*) => {{
-        static mut LOG_LINE_CACHED_STATE: $crate::logging::LogLineCachedState = $crate::logging::LogLineCachedState::new();
         $crate::logging::LOGGER.with(|logger| {
-            let mut logger = logger.borrow_mut();
-            if !logger.cached_enabled(
-                unsafe { &mut LOG_LINE_CACHED_STATE },
-                $crate::logging::Metadata { level: $lvl, target: module_path!() }
-            ) { return; }
+            let mut logger = $crate::log_enabled!(logger, $lvl);
             let (pid, tag, inner) = logger.split();
             let (now, precise_time) = $crate::logging::now();
 

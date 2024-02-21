@@ -53,6 +53,7 @@ x509-parser = "^0.16.0"
 unstable = []
 logs-debug = []
 logs-trace = []
+logs-cache = []
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }
