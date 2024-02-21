@@ -257,7 +257,7 @@ impl InnerLogger {
                     .map(|_| ())
                 }
             }
-            AccessLogFormat::Ascii => crate::prompt_log! {
+            AccessLogFormat::Ascii => crate::_prompt_log! {
                 logger: |args| log_arguments(args, backend, &mut self.buffer),
                 is_access: true,
                 condition: self.access_colored,
@@ -687,14 +687,7 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
 }
 
 #[macro_export]
-macro_rules! bind_format_args {
-    (let $args: ident = ($($f:tt)+); $($t:tt)*) => {
-        (|$args| { $($t)* })($($f)+)
-    };
-}
-
-#[macro_export]
-macro_rules! prompt_log {
+macro_rules! _prompt_log {
     {
         logger: $logger:expr,
         is_access: $access:expr,
@@ -702,7 +695,7 @@ macro_rules! prompt_log {
         prompt: [$($p:tt)*],
         standard: {$($std:tt)*}$(,)?
     } => {
-        $crate::prompt_log!{
+        $crate::_prompt_log!{
             logger: $logger,
             is_access: $access,
             condition: $cond,
@@ -725,7 +718,7 @@ macro_rules! prompt_log {
             args: @$(,)?
         }$(,)?
     } => {
-        $crate::prompt_log!{
+        $crate::_prompt_log!{
             logger: $logger,
             is_access: $access,
             condition: $cond,
@@ -755,14 +748,14 @@ macro_rules! prompt_log {
         }$(,)?
     } => {
         if $cond {
-            $crate::prompt_log!(@bind [$logger, concat!("{} \x1b[2m{} \x1b[;2;1m{} {} \x1b[0;1m{}\x1b[m\t", $($col_fmt)*)] [$now, $precise_time, $pid, $lvl.as_str($access, true), $tag] $($col_args),*)
+            $crate::_prompt_log!(@bind [$logger, concat!("{} \x1b[2m{} \x1b[;2;1m{} {} \x1b[0;1m{}\x1b[m\t", $($col_fmt)*)] [$now, $precise_time, $pid, $lvl.as_str($access, true), $tag] $($col_args),*)
         } else {
-            $crate::prompt_log!(@bind [$logger, concat!("{} {} {} {} {}\t", $($std_fmt)*)] [$now, $precise_time, $pid, $lvl.as_str($access, false), $tag] $($std_args),*)
+            $crate::_prompt_log!(@bind [$logger, concat!("{} {} {} {} {}\t", $($std_fmt)*)] [$now, $precise_time, $pid, $lvl.as_str($access, false), $tag] $($std_args),*)
         }
     };
     (@bind [$logger:expr, $fmt:expr] [$($bindings:expr),*] $arg:expr $(, $args:expr)*) => {{
         let binding = &$arg;
-        $crate::prompt_log!(@bind [$logger, $fmt] [$($bindings),* , binding] $($args),*)
+        $crate::_prompt_log!(@bind [$logger, $fmt] [$($bindings),* , binding] $($args),*)
     }};
     (@bind [$logger:expr, $fmt:expr] [$($bindings:expr),*]) => {
         $logger(format_args!($fmt, $($bindings),*))
@@ -795,7 +788,7 @@ impl LogLineCachedState {
 }
 
 #[macro_export]
-macro_rules! log_enabled {
+macro_rules! _log_enabled {
     ($logger:expr, $lvl:expr) => {{
         let logger = $logger.borrow_mut();
         let enable = if cfg!(feature = "logs-cache") {
@@ -822,14 +815,14 @@ macro_rules! log_enabled {
 }
 
 #[macro_export]
-macro_rules! log {
+macro_rules! _log {
     ($lvl:expr, $format:expr $(, $args:expr)*) => {{
         $crate::logging::LOGGER.with(|logger| {
-            let mut logger = $crate::log_enabled!(logger, $lvl);
+            let mut logger = $crate::_log_enabled!(logger, $lvl);
             let (pid, tag, inner) = logger.split();
             let (now, precise_time) = $crate::logging::now();
 
-            $crate::prompt_log!{
+            $crate::_prompt_log!{
                 logger: |args| inner.log(args),
                 is_access: false,
                 condition: inner.colored,
@@ -844,15 +837,15 @@ macro_rules! log {
 }
 
 #[macro_export]
-macro_rules! log_access {
+macro_rules! _log_access {
     ($lvl:expr, $($request_record_fields:tt)*) => {{
         $crate::logging::LOGGER.with(|logger| {
-            let mut logger = $crate::log_enabled!(logger, $lvl);
+            let mut logger = $crate::_log_enabled!(logger, $lvl);
             let (pid, tag, inner) = logger.split();
             let (now, precise_time) = $crate::logging::now();
 
             inner.log_access(
-                structured_access_log!([$crate::logging::RequestRecord]
+                $crate::_structured_access_log!([$crate::logging::RequestRecord]
                 pid, tag, now, precise_time, level: $lvl, $($request_record_fields)*
             ));
         })
@@ -860,7 +853,7 @@ macro_rules! log_access {
 }
 
 #[macro_export]
-macro_rules! structured_access_log {
+macro_rules! _structured_access_log {
     ([$($struct_name:tt)+] $($fields:tt)*) => {{
         $($struct_name)+ {$(
             $fields
@@ -868,11 +861,24 @@ macro_rules! structured_access_log {
     }};
 }
 
+#[macro_export]
+/// dynamically chose between info_access and error_access
+macro_rules! log_access {
+    ($error:expr, $($request_record_fields:tt)*) => {
+        let lvl = if $error {
+            $crate::logging::LogLevel::Error
+        } else {
+            $crate::logging::LogLevel::Info
+        };
+        _log_access!(lvl, $($request_record_fields)*);
+    };
+}
+
 /// log a failure concerning an HTTP or TCP request
 #[macro_export]
 macro_rules! error_access {
     ($($request_record_fields:tt)*) => {
-        log_access!($crate::logging::LogLevel::Error, $($request_record_fields)*);
+        $crate::_log_access!($crate::logging::LogLevel::Error, $($request_record_fields)*);
     };
 }
 
@@ -880,7 +886,7 @@ macro_rules! error_access {
 #[macro_export]
 macro_rules! info_access {
     ($($request_record_fields:tt)*) => {
-        log_access!($crate::logging::LogLevel::Info, $($request_record_fields)*);
+        $crate::_log_access!($crate::logging::LogLevel::Info, $($request_record_fields)*);
     };
 }
 
@@ -888,7 +894,7 @@ macro_rules! info_access {
 #[macro_export]
 macro_rules! error {
     ($format:expr $(, $args:expr)* $(,)?) => {
-        log!($crate::logging::LogLevel::Error, $format $(, $args)*)
+        $crate::_log!($crate::logging::LogLevel::Error, $format $(, $args)*)
     };
 }
 
@@ -896,7 +902,7 @@ macro_rules! error {
 #[macro_export]
 macro_rules! warn {
     ($format:expr $(, $args:expr)* $(,)?) => {
-        log!($crate::logging::LogLevel::Warn, $format $(, $args)*)
+        $crate::_log!($crate::logging::LogLevel::Warn, $format $(, $args)*)
     };
 }
 
@@ -904,7 +910,7 @@ macro_rules! warn {
 #[macro_export]
 macro_rules! info {
     ($format:expr $(, $args:expr)* $(,)?) => {
-        log!($crate::logging::LogLevel::Info, $format $(, $args)*)
+        $crate::_log!($crate::logging::LogLevel::Info, $format $(, $args)*)
     };
 }
 
@@ -913,7 +919,7 @@ macro_rules! info {
 macro_rules! debug {
     ($format:expr $(, $args:expr)* $(,)?) => {{
         #[cfg(any(debug_assertions, feature = "logs-debug", feature = "logs-trace"))]
-        log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format), module_path!() $(, $args)*);
+        $crate::_log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format), module_path!() $(, $args)*);
         #[cfg(not(any(debug_assertions, feature = "logs-trace")))]
         {$( let _ = $args; )*}
     }};
@@ -924,7 +930,7 @@ macro_rules! debug {
 macro_rules! trace {
     ($format:expr $(, $args:expr)* $(,)?) => {{
         #[cfg(any(debug_assertions, feature = "logs-trace"))]
-        log!($crate::logging::LogLevel::Trace, concat!("{}\t", $format), module_path!() $(, $args)*);
+        $crate::_log!($crate::logging::LogLevel::Trace, concat!("{}\t", $format), module_path!() $(, $args)*);
         #[cfg(not(any(debug_assertions, feature = "logs-trace")))]
         {$( let _ = $args; )*}
     }};
@@ -934,7 +940,7 @@ macro_rules! trace {
 #[macro_export]
 macro_rules! fixme {
     ($(, $args:expr)* $(,)?) => {
-        log!($crate::logging::LogLevel::Info, "FIXME: {}:{} in {}: {}", file!(), line!(), module_path!() $(, $args)*)
+        $crate::_log!($crate::logging::LogLevel::Info, "FIXME: {}:{} in {}: {}", file!(), line!(), module_path!() $(, $args)*)
     };
 }
 
@@ -965,7 +971,7 @@ impl log::Log for CompatLogger {
             }
             let (pid, tag, inner) = logger.split();
             let (now, precise_time) = now();
-            crate::prompt_log! {
+            crate::_prompt_log! {
                 logger: |args| inner.log(args),
                 is_access: false,
                 condition: inner.colored,

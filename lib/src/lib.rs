@@ -209,19 +209,15 @@
 //! Here is the complete example for reference, it matches the `examples/http.rs` example:
 //!
 //! ```
-//! extern crate time;
-//!
 //! #[macro_use]
 //! extern crate sozu_command_lib;
 //!
 //! use std::{collections::BTreeMap, env, io::stdout, thread};
 //!
 //! use anyhow::Context;
-//!
 //! use sozu_command_lib::{
 //!     channel::Channel,
 //!     config::ListenerBuilder,
-//!     info,
 //!     logging::setup_default_logging,
 //!     proto::command::{
 //!         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,

@@ -212,12 +212,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
     }
 
-    pub fn log_request(&self, metrics: &SessionMetrics, message: Option<&str>) {
+    pub fn log_request(&self, metrics: &SessionMetrics, error: bool, message: Option<&str>) {
         let listener = self.listener.borrow();
         let context = self.log_context();
         let endpoint = self.log_endpoint();
         metrics.register_end_of_session(&context);
-        info_access!(
+        log_access!(
+            error,
             message: message,
             context,
             session_address: self.get_session_address(),
@@ -236,7 +237,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     }
 
     pub fn log_request_success(&self, metrics: &SessionMetrics) {
-        self.log_request(metrics, None);
+        self.log_request(metrics, false, None);
     }
 
     pub fn log_request_error(&self, metrics: &SessionMetrics, message: &str) {
@@ -247,7 +248,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             message
         );
         self.print_state(self.protocol_string());
-        self.log_request(metrics, Some(message));
+        self.log_request(metrics, true, Some(message));
     }
 
     pub fn check_connections(&self) -> bool {

@@ -824,7 +824,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         }
     }
 
-    pub fn log_request(&mut self, metrics: &SessionMetrics, message: Option<&str>) {
+    pub fn log_request(&self, metrics: &SessionMetrics, error: bool, message: Option<&str>) {
         let listener = self.listener.borrow();
         let tags = self.context.authority.as_ref().and_then(|host| {
             let hostname = match host.split_once(':') {
@@ -837,7 +837,8 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let context = self.log_context();
         metrics.register_end_of_session(&context);
 
-        info_access! {
+        log_access! {
+            error,
             message: message,
             context,
             session_address: self.get_session_address(),
@@ -857,12 +858,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
     pub fn log_request_success(&mut self, metrics: &SessionMetrics) {
         save_http_status_metric(self.context.status, self.log_context());
-        self.log_request(metrics, None);
+        self.log_request(metrics, false, None);
     }
-    pub fn log_default_answer_success(&mut self, metrics: &SessionMetrics) {
-        self.log_request(metrics, None);
+
+    pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
+        self.log_request(metrics, false, None);
     }
-    pub fn log_request_error(&mut self, metrics: &mut SessionMetrics, message: &str) {
+    pub fn log_request_error(&self, metrics: &mut SessionMetrics, message: &str) {
         incr!("http.errors");
         error!(
             "{} Could not process request properly got: {}",
@@ -870,7 +872,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             message
         );
         self.print_state(self.protocol_string());
-        self.log_request(metrics, Some(message));
+        self.log_request(metrics, true, Some(message));
     }
 
     pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>) {

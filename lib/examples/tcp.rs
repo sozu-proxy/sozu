@@ -1,8 +1,7 @@
-#![allow(unused_variables, unused_must_use)]
+#![allow(unused_must_use)]
 extern crate sozu_lib;
 #[macro_use]
 extern crate sozu_command_lib;
-extern crate time;
 
 use std::thread;
 
@@ -25,7 +24,6 @@ fn main() -> anyhow::Result<()> {
         Channel::generate(1000, 10000).with_context(|| "should create a channel")?;
 
     let jg = thread::spawn(move || {
-        let max_listeners = 500;
         let max_buffers = 500;
         let buffer_size = 16384;
         let listener = TcpListenerConfig {

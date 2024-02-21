@@ -6,7 +6,7 @@ use std::{
 
 use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
-    info, log,
+    info,
     logging::setup_default_logging,
     proto::command::{
         request::RequestType, ActivateListener, AddCertificate, CertificateAndKey, ListenerType,

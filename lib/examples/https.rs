@@ -1,14 +1,12 @@
-#![allow(unused_variables, unused_must_use)]
+#![allow(unused_must_use)]
 #[macro_use]
 extern crate sozu_lib;
 #[macro_use]
 extern crate sozu_command_lib;
-extern crate time;
 
 use std::thread;
 
 use anyhow::Context;
-
 use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
@@ -194,6 +192,7 @@ fn main() -> anyhow::Result<()> {
     info!("MAIN\tTLS -> {:?}", command2.read_message());
 
     let _ = jg.join();
+    let _ = jg2.join();
     info!("MAIN\tgood bye");
     Ok(())
 }

@@ -1,16 +1,12 @@
-extern crate time;
-
 #[macro_use]
 extern crate sozu_command_lib;
 
 use std::{collections::BTreeMap, thread};
 
 use anyhow::Context;
-
 use sozu_command_lib::{
     channel::Channel,
     config::ListenerBuilder,
-    info,
     logging::setup_default_logging,
     proto::command::{
         request::RequestType, AddBackend, Cluster, LoadBalancingAlgorithms, LoadBalancingParams,
