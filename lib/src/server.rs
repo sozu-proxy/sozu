@@ -1261,11 +1261,13 @@ impl Server {
             Ok(ListenerType::Http) => {
                 let (token, mut listener) = match self.http.borrow_mut().give_back_listener(address)
                 {
-                    Some((token, listener)) => (token, listener),
-                    None => {
+                    Ok((token, listener)) => (token, listener),
+                    Err(e) => {
                         return worker_response_error(
                             req_id,
-                            format!("Couldn't deactivate HTTP listener at address {address:?}"),
+                            format!(
+                                "Couldn't deactivate HTTP listener at address {address:?}: {e}"
+                            ),
                         )
                     }
                 };
@@ -1304,16 +1306,13 @@ impl Server {
             Ok(ListenerType::Https) => {
                 let (token, mut listener) =
                     match self.https.borrow_mut().give_back_listener(address) {
-                        Some((token, listener)) => (token, listener),
-                        None => {
-                            return worker_response_error(
-                                req_id,
-                                format!(
-                                    "Couldn't deactivate HTTPS listener at address {:?}",
-                                    address
-                                ),
-                            )
-                        }
+                        Ok((token, listener)) => (token, listener),
+                        Err(e) => return worker_response_error(
+                            req_id,
+                            format!(
+                                "Couldn't deactivate HTTPS listener at address {address:?}: {e}",
+                            ),
+                        ),
                     };
                 if let Err(e) = self.poll.registry().deregister(&mut listener) {
                     error!(

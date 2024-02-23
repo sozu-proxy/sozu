@@ -985,22 +985,24 @@ impl HttpsProxy {
             .collect()
     }
 
-    // TODO: return <Result, ProxyError>
     pub fn give_back_listener(
         &mut self,
         address: StdSocketAddr,
-    ) -> Option<(Token, MioTcpListener)> {
-        self.listeners
+    ) -> Result<(Token, MioTcpListener), ProxyError> {
+        let listener = self
+            .listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .and_then(|listener| {
-                let mut owned = listener.borrow_mut();
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
 
-                owned
-                    .listener
-                    .take()
-                    .map(|listener| (owned.token, listener))
-            })
+        let mut owned = listener.borrow_mut();
+
+        let taken_listener = owned
+            .listener
+            .take()
+            .ok_or(ProxyError::UnactivatedListener)?;
+
+        Ok((owned.token, taken_listener))
     }
 
     pub fn add_cluster(

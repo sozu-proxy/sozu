@@ -9,7 +9,7 @@ use std::{
 };
 
 use mio::{
-    net::{TcpListener, TcpStream},
+    net::{TcpListener as MioTcpListener, TcpStream},
     unix::SourceFd,
     Interest, Registry, Token,
 };
@@ -389,7 +389,7 @@ pub struct HttpListener {
     answers: Rc<RefCell<HttpAnswers>>,
     config: HttpListenerConfig,
     fronts: Router,
-    listener: Option<TcpListener>,
+    listener: Option<MioTcpListener>,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
@@ -535,7 +535,7 @@ impl HttpProxy {
     pub fn activate_listener(
         &self,
         addr: &SocketAddr,
-        tcp_listener: Option<TcpListener>,
+        tcp_listener: Option<MioTcpListener>,
     ) -> Result<Token, ProxyError> {
         let listener = self
             .listeners
@@ -552,7 +552,7 @@ impl HttpProxy {
             })
     }
 
-    pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
+    pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, MioTcpListener)> {
         self.listeners
             .iter()
             .filter_map(|(_, listener)| {
@@ -566,18 +566,24 @@ impl HttpProxy {
             .collect()
     }
 
-    pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, TcpListener)> {
-        self.listeners
+    pub fn give_back_listener(
+        &mut self,
+        address: SocketAddr,
+    ) -> Result<(Token, MioTcpListener), ProxyError> {
+        let listener = self
+            .listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .and_then(|listener| {
-                let mut owned = listener.borrow_mut();
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
 
-                owned
-                    .listener
-                    .take()
-                    .map(|listener| (owned.token, listener))
-            })
+        let mut owned = listener.borrow_mut();
+
+        let taken_listener = owned
+            .listener
+            .take()
+            .ok_or(ProxyError::UnactivatedListener)?;
+
+        Ok((owned.token, taken_listener))
     }
 
     pub fn add_cluster(&mut self, cluster: Cluster) -> Result<(), ProxyError> {
@@ -732,7 +738,7 @@ impl HttpListener {
     pub fn activate(
         &mut self,
         registry: &Registry,
-        tcp_listener: Option<TcpListener>,
+        tcp_listener: Option<MioTcpListener>,
     ) -> Result<Token, ListenerError> {
         if self.active {
             return Ok(self.token);
