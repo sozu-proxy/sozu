@@ -43,7 +43,7 @@ pub enum TemplateError {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct TemplateVariable {
+pub struct TemplateVariable {
     name: &'static str,
     valid_in_body: bool,
     valid_in_header: bool,
@@ -51,14 +51,14 @@ struct TemplateVariable {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ReplacementType {
+pub enum ReplacementType {
     Variable(usize),
     VariableOnce(usize),
     ContentLength,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Replacement {
+pub struct Replacement {
     block_index: usize,
     typ: ReplacementType,
 }
@@ -82,7 +82,7 @@ impl fmt::Debug for Template {
 }
 
 impl Template {
-    fn new(
+    pub fn new(
         status: u16,
         answer: Vec<u8>,
         variables: &[TemplateVariable],
@@ -235,7 +235,7 @@ impl Template {
                     let variable = std::mem::take(&mut variables_once[var_index]);
                     body_size += variable.len();
                     blocks[replacement.block_index] = Block::Chunk(Chunk {
-                        data: Store::Alloc(variable.into_boxed_slice(), 0),
+                        data: Store::from_vec(variable),
                     })
                 }
                 ReplacementType::ContentLength => unreachable!(),
@@ -249,11 +249,10 @@ impl Template {
                     }
                     ReplacementType::VariableOnce(var_index) => {
                         let variable = std::mem::take(&mut variables_once[var_index]);
-                        pair.val = Store::Alloc(variable.into_boxed_slice(), 0);
+                        pair.val = Store::from_vec(variable);
                     }
                     ReplacementType::ContentLength => {
-                        pair.val =
-                            Store::Alloc(body_size.to_string().into_bytes().into_boxed_slice(), 0)
+                        pair.val = Store::from_string(body_size.to_string())
                     }
                 }
             }
@@ -331,17 +330,36 @@ pub struct HttpAnswers {
 impl Default for RawAnswers {
     fn default() -> Self {
         Self {
-            answer_301: Vec::from(
-                &b"\
+            answer_301: Self::default_answer_301(),
+            answer_400: Self::default_answer_400(),
+            answer_401: Self::default_answer_401(),
+            answer_404: Self::default_answer_404(),
+            answer_408: Self::default_answer_408(),
+            answer_413: Self::default_answer_413(),
+            answer_502: Self::default_answer_502(),
+            answer_503: Self::default_answer_503(),
+            answer_504: Self::default_answer_504(),
+            answer_507: Self::default_answer_507(),
+        }
+    }
+}
+
+impl RawAnswers {
+    fn default_answer_301() -> Vec<u8> {
+        Vec::from(
+            &b"\
 HTTP/1.1 301 Moved Permanently\r
 Location: %REDIRECT_LOCATION\r
 Connection: close\r
 Content-Length: 0\r
 Sozu-Id: %SOZU_ID\r
 \r\n"[..],
-            ),
-            answer_400: Vec::from(
-                &b"\
+        )
+    }
+
+    fn default_answer_400() -> Vec<u8> {
+        Vec::from(
+            &b"\
 HTTP/1.1 400 Bad Request\r
 Cache-Control: no-cache\r
 Connection: close\r
@@ -354,33 +372,45 @@ Sozu-Id: %SOZU_ID\r
 Kawa error: %DETAILS
 <pre>
 "[..],
-            ),
-            answer_401: Vec::from(
-                &b"\
+        )
+    }
+
+    fn default_answer_401() -> Vec<u8> {
+        Vec::from(
+            &b"\
 HTTP/1.1 401 Unauthorized\r
 Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %SOZU_ID\r
 \r\n"[..],
-            ),
-            answer_404: Vec::from(
-                &b"\
+        )
+    }
+
+    fn default_answer_404() -> Vec<u8> {
+        Vec::from(
+            &b"\
 HTTP/1.1 404 Not Found\r
 Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %SOZU_ID\r
 \r\n"[..],
-            ),
-            answer_408: Vec::from(
-                &b"\
+        )
+    }
+
+    fn default_answer_408() -> Vec<u8> {
+        Vec::from(
+            &b"\
 HTTP/1.1 408 Request Timeout\r
 Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %SOZU_ID\r
 \r\n"[..],
-            ),
-            answer_413: Vec::from(
-                &b"\
+        )
+    }
+
+    fn default_answer_413() -> Vec<u8> {
+        Vec::from(
+            &b"\
 HTTP/1.1 413 Payload Too Large\r
 Cache-Control: no-cache\r
 Connection: close\r
@@ -393,9 +423,12 @@ Sozu-Id: %SOZU_ID\r
 Kawa cursors: %DETAILS
 <pre>
 "[..],
-            ),
-            answer_502: Vec::from(
-                &b"\
+        )
+    }
+
+    fn default_answer_502() -> Vec<u8> {
+        Vec::from(
+            &b"\
 HTTP/1.1 502 Bad Gateway\r
 Cache-Control: no-cache\r
 Connection: close\r
@@ -408,9 +441,12 @@ Sozu-Id: %SOZU_ID\r
 Kawa error: %DETAILS
 <pre>
 "[..],
-            ),
-            answer_503: Vec::from(
-                &b"\
+        )
+    }
+
+    fn default_answer_503() -> Vec<u8> {
+        Vec::from(
+            &b"\
 HTTP/1.1 503 Service Unavailable\r
 Cache-Control: no-cache\r
 Connection: close\r
@@ -423,17 +459,23 @@ Sozu-Id: %SOZU_ID\r
 %DETAILS
 <pre>
 "[..],
-            ),
-            answer_504: Vec::from(
-                &b"\
+        )
+    }
+
+    fn default_answer_504() -> Vec<u8> {
+        Vec::from(
+            &b"\
 HTTP/1.1 504 Gateway Timeout\r
 Cache-Control: no-cache\r
 Connection: close\r
 Sozu-Id: %SOZU_ID\r
 \r\n"[..],
-            ),
-            answer_507: Vec::from(
-                &b"\
+        )
+    }
+
+    fn default_answer_507() -> Vec<u8> {
+        Vec::from(
+            &b"\
 HTTP/1.1 507 Insufficient Storage\r
 Cache-Control: no-cache\r
 Connection: close\r
@@ -446,8 +488,7 @@ Sozu-Id: %SOZU_ID\r
 Kawa cursors: %DETAILS
 <pre>
 "[..],
-            ),
-        }
+        )
     }
 }
 
