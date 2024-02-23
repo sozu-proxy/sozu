@@ -1106,7 +1106,7 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Err(e) => {
-                let error = format!("Couldn't add HTTP listener: {e}");
+                let error = format!("Could not add HTTP listener: {e}");
                 error!("{}", error);
                 WorkerResponse::error(req_id, error)
             }
@@ -1133,16 +1133,17 @@ impl Server {
             .borrow_mut()
             .add_listener(listener.clone(), token)
         {
-            Some(_token) => {
+            Ok(_token) => {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::HTTPSListen,
                 })));
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
-            None => {
-                error!("Couldn't add HTTPS listener");
-                WorkerResponse::error(req_id, "cannot add HTTPS listener")
+            Err(e) => {
+                let error = format!("Could not add HTTPS listener: {e}");
+                error!("{}", error);
+                WorkerResponse::error(req_id, error)
             }
         }
     }
@@ -1175,7 +1176,7 @@ impl Server {
                 WorkerResponse::ok(req_id)
             }
             Err(e) => {
-                let error = format!("Couldn't add TCP listener: {e}");
+                let error = format!("Could not add TCP listener: {e}");
                 error!("{}", error);
                 WorkerResponse::error(req_id, error)
             }

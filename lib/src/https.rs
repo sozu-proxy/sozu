@@ -793,15 +793,19 @@ impl HttpsProxy {
         }
     }
 
-    pub fn add_listener(&mut self, config: HttpsListenerConfig, token: Token) -> Option<Token> {
+    pub fn add_listener(
+        &mut self,
+        config: HttpsListenerConfig,
+        token: Token,
+    ) -> Result<Token, ProxyError> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
-                entry.insert(Rc::new(RefCell::new(
-                    HttpsListener::try_new(config, token).ok()?,
-                )));
-                Some(token)
+                let https_listener =
+                    HttpsListener::try_new(config, token).map_err(ProxyError::AddListener)?;
+                entry.insert(Rc::new(RefCell::new(https_listener)));
+                Ok(token)
             }
-            _ => None,
+            _ => Err(ProxyError::ListenerAlreadyPresent),
         }
     }
 

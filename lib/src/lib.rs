@@ -671,7 +671,7 @@ pub enum ProxyError {
     NoListenerFound(SocketAddr),
     #[error("a listener is already present for this token")]
     ListenerAlreadyPresent,
-    #[error("could not create add listener: {0}")]
+    #[error("could not add listener: {0}")]
     AddListener(ListenerError),
     #[error("failed to activate listener with address {address:?}: {listener_error}")]
     ListenerActivation {
