@@ -1043,35 +1043,30 @@ impl TcpListener {
         })
     }
 
-    // TODO: return Result with context
     pub fn activate(
         &mut self,
         registry: &Registry,
         tcp_listener: Option<MioTcpListener>,
-    ) -> Option<Token> {
+    ) -> Result<Token, ProxyError> {
         if self.active {
-            return Some(self.token);
+            return Ok(self.token);
         }
 
-        let mut listener = tcp_listener.or_else(|| {
-            server_bind(self.config.address.clone().into())
-                .map_err(|e| {
-                    error!("could not create listener {:?}: {}", self.config.address, e);
-                })
-                .ok()
-        });
-
-        if let Some(ref mut sock) = listener {
-            if let Err(e) = registry.register(sock, self.token, Interest::READABLE) {
-                error!("error registering socket({:?}): {:?}", sock, e);
+        let mut listener = match tcp_listener {
+            Some(listener) => listener,
+            None => {
+                let address = self.config.address.clone().into();
+                server_bind(address).map_err(|e| ProxyError::BindToSocket(address, e))?
             }
-        } else {
-            return None;
-        }
+        };
 
-        self.listener = listener;
+        registry
+            .register(&mut listener, self.token, Interest::READABLE)
+            .map_err(|io_err| ProxyError::RegisterListener(io_err))?;
+
+        self.listener = Some(listener);
         self.active = true;
-        Some(self.token)
+        Ok(self.token)
     }
 }
 
@@ -1126,7 +1121,6 @@ impl TcpProxy {
         }
     }
 
-    // TODO: return Result with context
     pub fn add_listener(
         &mut self,
         config: TcpListenerConfig,
@@ -1151,16 +1145,18 @@ impl TcpProxy {
         self.listeners.len() < len
     }
 
-    // TODO: return Result with context
     pub fn activate_listener(
         &self,
         addr: &SocketAddr,
         tcp_listener: Option<MioTcpListener>,
-    ) -> Option<Token> {
-        self.listeners
+    ) -> Result<Token, ProxyError> {
+        let listener = self
+            .listeners
             .values()
             .find(|listener| listener.borrow().address == *addr)
-            .and_then(|listener| listener.borrow_mut().activate(&self.registry, tcp_listener))
+            .ok_or(ProxyError::NoListenerFound(*addr))?;
+
+        listener.borrow_mut().activate(&self.registry, tcp_listener)
     }
 
     pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, MioTcpListener)> {
@@ -1177,19 +1173,21 @@ impl TcpProxy {
             .collect()
     }
 
-    // TODO: return Result with context
-    pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, MioTcpListener)> {
-        self.listeners
+    pub fn give_back_listener(
+        &mut self,
+        address: SocketAddr,
+    ) -> Result<(Token, MioTcpListener), ProxyError> {
+        let listener = self
+            .listeners
             .values()
             .find(|listener| listener.borrow().address == address)
-            .and_then(|listener| {
-                let mut owned = listener.borrow_mut();
+            .ok_or(ProxyError::NoListenerFound(address.clone()))?;
 
-                owned
-                    .listener
-                    .take()
-                    .map(|listener| (owned.token, listener))
-            })
+        let mut owned = listener.borrow_mut();
+
+        let taken_listener = owned.listener.take().ok_or(ProxyError::UnactivatedListener)?;
+
+        Ok((owned.token, taken_listener))
     }
 
     pub fn add_tcp_front(&mut self, front: RequestTcpFrontend) -> Result<(), ProxyError> {

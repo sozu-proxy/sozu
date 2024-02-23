@@ -1246,13 +1246,14 @@ impl Server {
 
                 let listener_token = self.tcp.borrow_mut().activate_listener(&address, listener);
                 match listener_token {
-                    Some(token) => {
+                    Ok(token) => {
                         self.accept(ListenToken(token.0), Protocol::TCPListen);
                         WorkerResponse::ok(req_id)
                     }
-                    None => {
-                        error!("Could not activate TCP listener");
-                        WorkerResponse::error(req_id, "cannot activate TCP listener")
+                    Err(e) => {
+                        let error = format!("Could not activate TCP listener: {}", e);
+                        error!("{}", error);
+                        WorkerResponse::error(req_id, error)
                     }
                 }
             }
@@ -1360,10 +1361,12 @@ impl Server {
             Ok(ListenerType::Tcp) => {
                 let (token, mut listener) = match self.tcp.borrow_mut().give_back_listener(address)
                 {
-                    Some((token, listener)) => (token, listener),
-                    None => {
-                        let error =
-                            format!("Couldn't deactivate TCP listener at address {:?}", address);
+                    Ok((token, listener)) => (token, listener),
+                    Err(e) => {
+                        let error = format!(
+                            "Could not deactivate TCP listener at address {:?}: {}",
+                            address, e
+                        );
                         error!("{}", error);
                         return WorkerResponse::error(req_id, error);
                     }

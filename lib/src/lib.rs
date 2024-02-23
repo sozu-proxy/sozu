@@ -355,6 +355,7 @@ use hex::FromHexError;
 use mio::{net::TcpStream, Interest, Token};
 use protocol::http::parser::Method;
 use router::RouterError;
+use socket::ServerBindError;
 use time::{Duration, Instant};
 use tls::CertificateResolverError;
 
@@ -699,6 +700,12 @@ pub enum ProxyError {
     UnsupportedMessage,
     #[error("failed to acquire the lock, {0}")]
     Lock(String),
+    #[error("could not bind to socket {0:?}: {1}")]
+    BindToSocket(SocketAddr, ServerBindError),
+    #[error("error registering socket of listener: {0}")]
+    RegisterListener(std::io::Error),
+    #[error("the listener is not activated")]
+    UnactivatedListener,
 }
 
 use self::server::ListenToken;
