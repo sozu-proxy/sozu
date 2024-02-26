@@ -284,14 +284,6 @@ impl Server {
             })));
         }
 
-        let registry = event_loop
-            .registry()
-            .try_clone()
-            .map_err(ServerError::CloneRegistry)?;
-
-        let https =
-            https::HttpsProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
-
         Server::new(
             event_loop,
             worker_to_main_channel,
@@ -300,7 +292,7 @@ impl Server {
             pool,
             backends,
             None,
-            Some(https),
+            None,
             None,
             config,
             Some(initial_state),
