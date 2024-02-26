@@ -1003,7 +1003,6 @@ pub struct TcpListener {
     cluster_id: Option<String>,
     config: TcpListenerConfig,
     listener: Option<MioTcpListener>,
-    pool: Rc<RefCell<Pool>>,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
@@ -1028,7 +1027,6 @@ impl ListenerHandler for TcpListener {
 impl TcpListener {
     fn new(
         config: TcpListenerConfig,
-        pool: Rc<RefCell<Pool>>,
         token: Token,
     ) -> Result<TcpListener, ListenerError> {
         Ok(TcpListener {
@@ -1036,7 +1034,6 @@ impl TcpListener {
             listener: None,
             token,
             address: config.address.clone().into(),
-            pool,
             config,
             active: false,
             tags: BTreeMap::new(),
@@ -1108,12 +1105,14 @@ pub struct TcpProxy {
     configs: HashMap<ClusterId, ClusterConfiguration>,
     registry: Registry,
     sessions: Rc<RefCell<SessionManager>>,
+    pool: Rc<RefCell<Pool>>,
 }
 
 impl TcpProxy {
     pub fn new(
         registry: Registry,
         sessions: Rc<RefCell<SessionManager>>,
+        pool: Rc<RefCell<Pool>>,
         backends: Rc<RefCell<BackendMap>>,
     ) -> TcpProxy {
         TcpProxy {
@@ -1123,6 +1122,7 @@ impl TcpProxy {
             fronts: HashMap::new(),
             registry,
             sessions,
+            pool,
         }
     }
 
@@ -1130,13 +1130,12 @@ impl TcpProxy {
     pub fn add_listener(
         &mut self,
         config: TcpListenerConfig,
-        pool: Rc<RefCell<Pool>>,
         token: Token,
     ) -> Result<Token, ProxyError> {
         match self.listeners.entry(token) {
             Entry::Vacant(entry) => {
                 let tcp_listener =
-                    TcpListener::new(config, pool, token).map_err(ProxyError::AddListener)?;
+                    TcpListener::new(config, token).map_err(ProxyError::AddListener)?;
                 entry.insert(Rc::new(RefCell::new(tcp_listener)));
                 Ok(token)
             }
@@ -1358,7 +1357,7 @@ impl ProxyConfiguration for TcpProxy {
             .ok_or(AcceptError::IoError)?;
 
         let owned = listener.borrow();
-        let mut pool = owned.pool.borrow_mut();
+        let mut pool = self.pool.borrow_mut();
 
         let (front_buffer, back_buffer) = match (pool.checkout(), pool.checkout()) {
             (Some(fb), Some(bb)) => (fb, bb),
@@ -1466,9 +1465,9 @@ pub mod testing {
             Token(key)
         };
 
-        let mut proxy = TcpProxy::new(registry, sessions.clone(), backends.clone());
+        let mut proxy = TcpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
         proxy
-            .add_listener(config, pool.clone(), token)
+            .add_listener(config, token)
             .with_context(|| "Failed at creating adding the listener")?;
         proxy
             .activate_listener(&address, None)
