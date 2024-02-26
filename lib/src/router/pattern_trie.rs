@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt::Debug, iter, str};
 
 use regex::bytes::Regex;
 
-pub type Key = Vec<u8>;
+pub type Key = &[u8];
 pub type KeyValue<K, V> = (K, V);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -102,12 +102,12 @@ impl<V: Debug + Clone> TrieNode<V> {
             return InsertResult::Failed;
         }
 
-        let insert_result = self.insert_recursive(&key, &key, value);
+        let insert_result = self.insert_recursive(key, key, value);
         assert_ne!(insert_result, InsertResult::Failed);
         insert_result
     }
 
-    pub fn insert_recursive(&mut self, partial_key: &[u8], key: &Key, value: V) -> InsertResult {
+    pub fn insert_recursive(&mut self, partial_key: &[u8], key: Key, value: V) -> InsertResult {
         //println!("insert_rec: key == {}", std::str::from_utf8(partial_key).unwrap());
         assert_ne!(partial_key, &b""[..]);
 
@@ -139,7 +139,7 @@ impl<V: Debug + Clone> TrieNode<V> {
 
                             return res;
                         } else {
-                            let node = TrieNode::new(key.to_vec(), value);
+                            let node = TrieNode::new(key, value);
                             self.regexps.push((r, node));
                             return InsertResult::Ok;
                         }
@@ -159,12 +159,12 @@ impl<V: Debug + Clone> TrieNode<V> {
                     if self.wildcard.is_some() {
                         InsertResult::Existing
                     } else {
-                        self.wildcard = Some((key.to_vec(), value));
+                        self.wildcard = Some((key, value));
                         InsertResult::Ok
                     }
                 } else {
-                    let node = TrieNode::new(key.to_vec(), value);
-                    self.children.insert(partial_key.to_vec(), node);
+                    let node = TrieNode::new(key, value);
+                    self.children.insert(partial_key, node);
                     InsertResult::Ok
                 }
             }
@@ -177,7 +177,7 @@ impl<V: Debug + Clone> TrieNode<V> {
                 let res = node.insert_recursive(&partial_key[..pos], key, value);
 
                 if res == InsertResult::Ok {
-                    self.children.insert(partial_key[pos..].to_vec(), node);
+                    self.children.insert(&partial_key[pos..], node);
                 }
 
                 res
@@ -185,7 +185,7 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
     }
 
-    pub fn remove(&mut self, key: &Key) -> RemoveResult {
+    pub fn remove(&mut self, key: Key) -> RemoveResult {
         self.remove_recursive(key)
     }
 
@@ -416,10 +416,11 @@ impl<V: Debug + Clone> TrieNode<V> {
         self.insert(key, value)
     }
 
-    pub fn domain_remove(&mut self, key: &Key) -> RemoveResult {
+    pub fn domain_remove(&mut self, key: Key) -> RemoveResult {
         self.remove(key)
     }
 
+    // TODO: change the type &[u8] to Key
     pub fn domain_lookup(&self, key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key, V>> {
         self.lookup(key, accept_wildcard)
     }
@@ -473,25 +474,16 @@ mod tests {
         let mut root: TrieNode<u8> = TrieNode::root();
         root.print();
 
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"abcd"[..]), 1),
-            InsertResult::Ok
-        );
+        assert_eq!(root.domain_insert(&b"abcd"[..], 1), InsertResult::Ok);
         root.print();
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"abce"[..]), 2),
-            InsertResult::Ok
-        );
+        assert_eq!(root.domain_insert(&b"abce"[..], 2), InsertResult::Ok);
         root.print();
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"abgh"[..]), 3),
-            InsertResult::Ok
-        );
+        assert_eq!(root.domain_insert(&b"abgh"[..], 3), InsertResult::Ok);
         root.print();
 
         assert_eq!(
             root.domain_lookup(&b"abce"[..], true),
-            Some(&(b"abce"[..].to_vec(), 2))
+            Some(&(&b"abce"[..], 2))
         );
         //assert!(false);
     }
@@ -503,23 +495,23 @@ mod tests {
         root.print();
 
         println!("adding (abcd, 1)");
-        assert_eq!(root.insert(Vec::from(&b"abcd"[..]), 1), InsertResult::Ok);
+        assert_eq!(root.insert(&b"abcd"[..], 1), InsertResult::Ok);
         root.print();
         println!("adding (abce, 2)");
-        assert_eq!(root.insert(Vec::from(&b"abce"[..]), 2), InsertResult::Ok);
+        assert_eq!(root.insert(&b"abce"[..], 2), InsertResult::Ok);
         root.print();
         println!("adding (abgh, 3)");
-        assert_eq!(root.insert(Vec::from(&b"abgh"[..]), 3), InsertResult::Ok);
+        assert_eq!(root.insert(&b"abgh"[..], 3), InsertResult::Ok);
         root.print();
 
         let mut root2: TrieNode<u8> = TrieNode::root();
 
-        assert_eq!(root2.insert(Vec::from(&b"abcd"[..]), 1), InsertResult::Ok);
-        assert_eq!(root2.insert(Vec::from(&b"abgh"[..]), 3), InsertResult::Ok);
+        assert_eq!(root2.insert(&b"abcd"[..], 1), InsertResult::Ok);
+        assert_eq!(root2.insert(&b"abgh"[..], 3), InsertResult::Ok);
 
         println!("before remove");
         root.print();
-        assert_eq!(root.remove(&Vec::from(&b"abce"[..])), RemoveResult::Ok);
+        assert_eq!(root.remove(&b"abce"[..]), RemoveResult::Ok);
         println!("after remove");
         root.print();
 
@@ -527,12 +519,12 @@ mod tests {
         root2.print();
         assert_eq!(root, root2);
 
-        assert_eq!(root.remove(&Vec::from(&b"abgh"[..])), RemoveResult::Ok);
+        assert_eq!(root.remove(&b"abgh"[..]), RemoveResult::Ok);
         println!("after remove");
         root.print();
         println!("expected");
         let mut root3: TrieNode<u8> = TrieNode::root();
-        assert_eq!(root3.insert(Vec::from(&b"abcd"[..]), 1), InsertResult::Ok);
+        assert_eq!(root3.insert(&b"abcd"[..], 1), InsertResult::Ok);
         root3.print();
         assert_eq!(root, root3);
     }
@@ -544,35 +536,26 @@ mod tests {
         root.print();
 
         println!("adding (www./.*/.com, 1)");
-        assert_eq!(
-            root.insert(Vec::from(&b"www./.*/.com"[..]), 1),
-            InsertResult::Ok
-        );
+        assert_eq!(root.insert(&b"www./.*/.com"[..], 1), InsertResult::Ok);
         root.print();
         println!("adding (www.doc./.*/.com, 2)");
-        assert_eq!(
-            root.insert(Vec::from(&b"www.doc./.*/.com"[..]), 2),
-            InsertResult::Ok
-        );
+        assert_eq!(root.insert(&b"www.doc./.*/.com"[..], 2), InsertResult::Ok);
         root.print();
         assert_eq!(
             root.domain_lookup(&b"www.sozu.com".to_vec(), false),
-            Some(&(b"www./.*/.com".to_vec(), 1))
+            Some(&(&b"www./.*/.com"[..], 1))
         );
         assert_eq!(
             root.domain_lookup(&b"www.doc.sozu.com".to_vec(), false),
-            Some(&(b"www.doc./.*/.com".to_vec(), 2))
+            Some(&(&b"www.doc./.*/.com"[..], 2))
         );
 
-        assert_eq!(
-            root.domain_remove(&b"www./.*/.com".to_vec()),
-            RemoveResult::Ok
-        );
+        assert_eq!(root.domain_remove(b"www./.*/.com"), RemoveResult::Ok);
         root.print();
         assert_eq!(root.domain_lookup(&b"www.sozu.com".to_vec(), false), None);
         assert_eq!(
             root.domain_lookup(&b"www.doc.sozu.com".to_vec(), false),
-            Some(&(b"www.doc./.*/.com".to_vec(), 2))
+            Some(&(&b"www.doc./.*/.com"[..], 2))
         );
     }
 
@@ -583,39 +566,33 @@ mod tests {
         println!("creating root1:");
         root1.print();
         println!("adding (abcd, 1)");
-        assert_eq!(root1.insert(Vec::from(&b"abcd"[..]), 1), InsertResult::Ok);
+        assert_eq!(root1.insert(&b"abcd"[..], 1), InsertResult::Ok);
         root1.print();
         println!("adding (abce, 2)");
-        assert_eq!(root1.insert(Vec::from(&b"abce"[..]), 2), InsertResult::Ok);
+        assert_eq!(root1.insert(&b"abce"[..], 2), InsertResult::Ok);
         root1.print();
         println!("adding (abc, 3)");
-        assert_eq!(root1.insert(Vec::from(&b"abc"[..]), 3), InsertResult::Ok);
+        assert_eq!(root1.insert(&b"abc"[..], 3), InsertResult::Ok);
 
         println!("root1:");
         root1.print();
 
         let mut root2: TrieNode<u8> = TrieNode::root();
 
-        assert_eq!(root2.insert(Vec::from(&b"abc"[..]), 3), InsertResult::Ok);
-        assert_eq!(root2.insert(Vec::from(&b"abcd"[..]), 1), InsertResult::Ok);
-        assert_eq!(root2.insert(Vec::from(&b"abce"[..]), 2), InsertResult::Ok);
+        assert_eq!(root2.insert(&b"abc"[..], 3), InsertResult::Ok);
+        assert_eq!(root2.insert(&b"abcd"[..], 1), InsertResult::Ok);
+        assert_eq!(root2.insert(&b"abce"[..], 2), InsertResult::Ok);
 
         println!("root2:");
         root2.print();
-        assert_eq!(root2.remove(&Vec::from(&b"abc"[..])), RemoveResult::Ok);
+        assert_eq!(root2.remove(&&b"abc"[..]), RemoveResult::Ok);
 
         println!("root2 after,remove:");
         root2.print();
         let mut expected: TrieNode<u8> = TrieNode::root();
 
-        assert_eq!(
-            expected.insert(Vec::from(&b"abcd"[..]), 1),
-            InsertResult::Ok
-        );
-        assert_eq!(
-            expected.insert(Vec::from(&b"abce"[..]), 2),
-            InsertResult::Ok
-        );
+        assert_eq!(expected.insert(&b"abcd"[..], 1), InsertResult::Ok);
+        assert_eq!(expected.insert(&b"abce"[..], 2), InsertResult::Ok);
 
         println!("root2 after insert");
         root2.print();
@@ -630,44 +607,38 @@ mod tests {
         root.print();
 
         assert_eq!(
-            root.domain_insert(Vec::from(&b"www.example.com"[..]), 1),
+            root.domain_insert(&b"www.example.com"[..], 1),
             InsertResult::Ok
         );
         root.print();
         assert_eq!(
-            root.domain_insert(Vec::from(&b"test.example.com"[..]), 2),
+            root.domain_insert(&b"test.example.com"[..], 2),
             InsertResult::Ok
         );
         root.print();
         assert_eq!(
-            root.domain_insert(Vec::from(&b"*.alldomains.org"[..]), 3),
+            root.domain_insert(&b"*.alldomains.org"[..], 3),
             InsertResult::Ok
         );
         root.print();
         assert_eq!(
-            root.domain_insert(Vec::from(&b"alldomains.org"[..]), 4),
+            root.domain_insert(&b"alldomains.org"[..], 4),
             InsertResult::Ok
         );
         assert_eq!(
-            root.domain_insert(Vec::from(&b"pouet.alldomains.org"[..]), 5),
+            root.domain_insert(&b"pouet.alldomains.org"[..], 5),
+            InsertResult::Ok
+        );
+        root.print();
+        assert_eq!(root.domain_insert(&b"hello.com"[..], 6), InsertResult::Ok);
+        assert_eq!(root.domain_insert(&b"*.hello.com"[..], 7), InsertResult::Ok);
+        assert_eq!(
+            root.domain_insert(&b"images./cdn[0-9]+/.hello.com"[..], 8),
             InsertResult::Ok
         );
         root.print();
         assert_eq!(
-            root.domain_insert(Vec::from(&b"hello.com"[..]), 6),
-            InsertResult::Ok
-        );
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"*.hello.com"[..]), 7),
-            InsertResult::Ok
-        );
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"images./cdn[0-9]+/.hello.com"[..]), 8),
-            InsertResult::Ok
-        );
-        root.print();
-        assert_eq!(
-            root.domain_insert(Vec::from(&b"/test[0-9]+/.www.hello.com"[..]), 9),
+            root.domain_insert(&b"/test[0-9]+/.www.hello.com"[..], 9),
             InsertResult::Ok
         );
         root.print();
@@ -678,36 +649,36 @@ mod tests {
             None
         );
         assert_eq!(
-            root.domain_lookup(&b"www.example.com"[..], true),
-            Some(&(b"www.example.com"[..].to_vec(), 1))
+            root.domain_lookup(b"www.example.com", true),
+            Some(&(&b"www.example.com"[..], 1))
         );
         assert_eq!(
             root.domain_lookup(&b"alldomains.org"[..], true),
-            Some(&(b"alldomains.org"[..].to_vec(), 4))
+            Some(&(&b"alldomains.org"[..], 4))
         );
         assert_eq!(
             root.domain_lookup(&b"test.hello.com"[..], true),
-            Some(&(b"*.hello.com"[..].to_vec(), 7))
+            Some(&(&b"*.hello.com"[..], 7))
         );
         assert_eq!(
             root.domain_lookup(&b"images.cdn10.hello.com"[..], true),
-            Some(&(b"images./cdn[0-9]+/.hello.com"[..].to_vec(), 8))
+            Some(&(&b"images./cdn[0-9]+/.hello.com"[..], 8))
         );
         assert_eq!(
             root.domain_lookup(&b"test42.www.hello.com"[..], true),
-            Some(&(b"/test[0-9]+/.www.hello.com"[..].to_vec(), 9))
+            Some(&(&b"/test[0-9]+/.www.hello.com"[..], 9))
         );
         assert_eq!(
             root.domain_lookup(&b"test.alldomains.org"[..], true),
-            Some(&(b"*.alldomains.org"[..].to_vec(), 3))
+            Some(&(&b"*.alldomains.org"[..], 3))
         );
         assert_eq!(
             root.domain_lookup(&b"hello.alldomains.org"[..], true),
-            Some(&(b"*.alldomains.org"[..].to_vec(), 3))
+            Some(&(&b"*.alldomains.org"[..], 3))
         );
         assert_eq!(
             root.domain_lookup(&b"pouet.alldomains.org"[..], true),
-            Some(&(b"pouet.alldomains.org"[..].to_vec(), 5))
+            Some(&(&b"pouet.alldomains.org"[..], 5))
         );
         assert_eq!(
             root.domain_lookup(&b"blah.test.alldomains.org"[..], true),
@@ -715,7 +686,7 @@ mod tests {
         );
 
         assert_eq!(
-            root.domain_remove(&Vec::from(&b"alldomains.org"[..])),
+            root.domain_remove(&&b"alldomains.org"[..]),
             RemoveResult::Ok
         );
         println!("after remove");
@@ -723,19 +694,19 @@ mod tests {
         assert_eq!(root.domain_lookup(&b"alldomains.org"[..], true), None);
         assert_eq!(
             root.domain_lookup(&b"test.alldomains.org"[..], true),
-            Some(&(b"*.alldomains.org"[..].to_vec(), 3))
+            Some(&(&b"*.alldomains.org"[..], 3))
         );
         assert_eq!(
             root.domain_lookup(&b"hello.alldomains.org"[..], true),
-            Some(&(b"*.alldomains.org"[..].to_vec(), 3))
+            Some(&(&b"*.alldomains.org"[..], 3))
         );
         assert_eq!(
             root.domain_lookup(&b"pouet.alldomains.org"[..], true),
-            Some(&(b"pouet.alldomains.org"[..].to_vec(), 5))
+            Some(&(&b"pouet.alldomains.org"[..], 5))
         );
         assert_eq!(
             root.domain_lookup(&b"test.hello.com"[..], true),
-            Some(&(b"*.hello.com"[..].to_vec(), 7))
+            Some(&(&b"*.hello.com"[..], 7))
         );
         assert_eq!(
             root.domain_lookup(&b"blah.test.alldomains.org"[..], true),
@@ -747,16 +718,16 @@ mod tests {
     fn wildcard() {
         let mut root: TrieNode<u8> = TrieNode::root();
         root.print();
-        root.domain_insert("*.clever-cloud.com".as_bytes().to_vec(), 2u8);
-        root.domain_insert("services.clever-cloud.com".as_bytes().to_vec(), 0u8);
-        root.domain_insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
+        root.domain_insert("*.clever-cloud.com".as_bytes(), 2u8);
+        root.domain_insert("services.clever-cloud.com".as_bytes(), 0u8);
+        root.domain_insert("*.services.clever-cloud.com".as_bytes(), 1u8);
 
         let res = root.domain_lookup(b"test.services.clever-cloud.com", true);
         println!("query result: {res:?}");
 
         assert_eq!(
             root.domain_lookup(b"pgstudio.services.clever-cloud.com", true),
-            Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8))
+            Some(&("*.services.clever-cloud.com".as_bytes(), 1u8))
         );
     }
 
@@ -783,7 +754,7 @@ mod tests {
             //println!("inserting key: '{}', value: '{}'", k, v);
             //assert_eq!(root.domain_insert(Vec::from(k.as_bytes()), *v), InsertResult::Ok);
             assert_eq!(
-                root.insert(Vec::from(k.as_bytes()), *v),
+                root.insert(k.as_bytes(), *v),
                 InsertResult::Ok,
                 "could not insert ({k}, {v})"
             );

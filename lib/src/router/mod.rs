@@ -230,7 +230,7 @@ impl Router {
 
                 if empty {
                     self.tree.domain_insert(
-                        hostname.into_bytes(),
+                        hostname.as_bytes(),
                         vec![(path.to_owned(), method.to_owned(), cluster.to_owned())],
                     );
                     return true;
